@@ -147,7 +147,17 @@ one action.
    run uuid is an **empty list, not a 404** (no existence oracle) — so a CLI typo
    can never look like an empty backlog. `rationale_preview` is capped at
    `RationalePreviewMaxRunes = 280` **runes** (never bytes — a byte cut splits
-   UTF-8), ellipsis appended only on an actual cut. **The
+   UTF-8), ellipsis appended only on an actual cut. Occurrence order is
+   `rv.updated_at DESC` (most-recently-**judged** first, so a re-judge counts as
+   recent), not `created_at` — a re-judge upserts in place, bumping `updated_at` and
+   leaving `created_at`, so `created_at` ordering shows staler preview text than the
+   group actually contains. **This depends on a property a future PRD could silently
+   break:** `judge.sql`'s `ON CONFLICT (target_run_id) DO UPDATE … updated_at =
+   now()` is currently the **only** writer of `run_reviews.updated_at` anywhere in
+   `queries/` (verified 2026-07-20), so the column moves only on a re-judge. If any
+   later change adds a status-change or bookkeeping write to that column, this
+   ordering silently stops meaning "freshest rationale" and the preview regresses
+   without a test failing. **The
    read is migration-free; the PRD as a whole is not — Decision 6 ships one
    migration.**
 
@@ -224,6 +234,30 @@ one action.
      filter**; doing so reintroduces exactly that flicker. `items` is capped at
      `JudgeDispositionMaxItems = 100`, deduplicated **before** the cap check so the
      cap counts distinct work rather than body length.
+   - **The item cap does NOT bound the fan-out — members-per-coordinate does, and
+     it is unbounded** (M2 audit, 2026-07-20). One coordinate matches *every*
+     occurrence across *all* the caller's reviews, and the resolve carries no
+     `LIMIT`, so ≤100 coordinates in a ~4 KB body can drive tens of thousands of
+     sequential upserts, each its own round-trip, holding a pool connection, on a
+     mount with no rate limiter. Self-inflicted, own-data and idempotent, so not a
+     vulnerability — but it made M2 materially less bounded than M1, which caps at
+     2000 rows. **Resolution: collapse the N upserts into ONE multi-row `INSERT …
+     ON CONFLICT` driven by `unnest` of the RESOLVED coordinates.** That removes the
+     round-trip amplification and the partial-failure window in a single move while
+     keeping the resolved-not-body invariant intact — and it supersedes the
+     "fail-fast, partial apply surfaces as a 500" note above, since one statement
+     cannot partially apply.
+   - **Why "write the resolved row, never the body" is defence-in-depth rather than
+     the mechanism** (recorded so a future refactor does not undo it): the resolve
+     matches by *equality* (`want.category = rr.category AND want.target =
+     rr.target`), so for any row that matches, the resolved values are
+     byte-identical to the body values. The actual security mechanism is the JOIN
+     plus the owner predicate yielding **zero rows** for anything bogus. The two
+     become observably different only if the match is ever loosened
+     (case-insensitive, `LIKE`, trimming) — at which point writing from the body
+     would start writing attacker-shaped text. So the rule stands even though no
+     test can distinguish it today; that limit is inherent to the design, not a
+     coverage gap.
 
 4. **The notification is KEPT as a ping; only its deep-link retargets to the
    Judge menu.** The `judge_review` payload already anchors `run_id` + `review_id`

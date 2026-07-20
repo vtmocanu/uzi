@@ -172,6 +172,21 @@ type fakeStore struct {
 	stampTargetErr error
 	stampParams    []store.FindCIFixStampTargetParams
 	stamps         []store.StampFixVerdictParams
+
+	// Filed→Done sync (PRD #98 M6) scripting + capture. closeEdges is what the edge
+	// query returns; closeInsertRows is the rows-affected of the DO-NOTHING insert (0
+	// models "the user already had a verdict"); the two slices record what the pass did.
+	// The EDGE SEMANTICS themselves are NOT modelled here — a fake that replayed a
+	// snapshot as events would test the model rather than the mechanism — so the
+	// once-only / Undo-sticks / not-overwritten guarantees live in the live-DB suite
+	// (handler/judge_issue_close_livedb_test.go) and these fields cover only wiring.
+	closeEdges      []store.ListFiledIssueCloseEdgesRow
+	closeEdgesErr   error
+	closeInsertRows int64
+	closeInsertErr  error
+	closeInserts    []store.InsertIssueCloseDispositionParams
+	closeStamps     []uuid.UUID
+	closeStampErr   error
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -221,6 +236,17 @@ func (s *fakeStore) FindCIFixStampTarget(_ context.Context, arg store.FindCIFixS
 func (s *fakeStore) StampFixVerdict(_ context.Context, arg store.StampFixVerdictParams) (int64, error) {
 	s.stamps = append(s.stamps, arg)
 	return 1, nil
+}
+func (s *fakeStore) ListFiledIssueCloseEdges(context.Context, uuid.UUID) ([]store.ListFiledIssueCloseEdgesRow, error) {
+	return s.closeEdges, s.closeEdgesErr
+}
+func (s *fakeStore) InsertIssueCloseDisposition(_ context.Context, arg store.InsertIssueCloseDispositionParams) (int64, error) {
+	s.closeInserts = append(s.closeInserts, arg)
+	return s.closeInsertRows, s.closeInsertErr
+}
+func (s *fakeStore) MarkFiledIssueCloseSynced(_ context.Context, id uuid.UUID) (int64, error) {
+	s.closeStamps = append(s.closeStamps, id)
+	return 1, s.closeStampErr
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

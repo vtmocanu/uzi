@@ -36,7 +36,7 @@ func (q *Queries) DeleteRecommendationDisposition(ctx context.Context, arg Delet
 }
 
 const listDispositionsForReview = `-- name: ListDispositionsForReview :many
-SELECT id, review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_at, updated_at FROM recommendation_dispositions
+SELECT id, review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_at, updated_at, set_via FROM recommendation_dispositions
 WHERE review_id = $1
 ORDER BY set_at ASC, id ASC
 `
@@ -63,6 +63,7 @@ func (q *Queries) ListDispositionsForReview(ctx context.Context, reviewID uuid.U
 			&i.SetByUserID,
 			&i.SetAt,
 			&i.UpdatedAt,
+			&i.SetVia,
 		); err != nil {
 			return nil, err
 		}
@@ -137,7 +138,7 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         set_by_user_id = EXCLUDED.set_by_user_id,
         set_at         = now(),
         updated_at     = now()
-RETURNING id, review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_at, updated_at
+RETURNING id, review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_at, updated_at, set_via
 `
 
 type UpsertRecommendationDispositionParams struct {
@@ -188,6 +189,7 @@ func (q *Queries) UpsertRecommendationDisposition(ctx context.Context, arg Upser
 		&i.SetByUserID,
 		&i.SetAt,
 		&i.UpdatedAt,
+		&i.SetVia,
 	)
 	return i, err
 }

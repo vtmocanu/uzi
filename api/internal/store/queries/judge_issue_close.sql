@@ -1,0 +1,99 @@
+-- Filed→Done sync (PRD #98 Decision 6, M6). Rides the existing poller tick: after a repo's
+-- issue cache is refreshed, any recommendation whose filed issue has just been observed
+-- closed moves to Done, exactly once, without ever overwriting a human's own verdict.
+
+-- name: ListFiledIssueCloseEdges :many
+-- The pass's working set for one repo: SETTLED filed links whose cached issue is closed and
+-- whose open→closed EDGE has not yet been consumed.
+--
+-- THE JOIN KEY IS (repo_id, forge_issue_iid), NEVER forge_issue_iid ALONE. A forge issue
+-- iid is per-project, not global — `issues` is itself keyed `ON CONFLICT (repo_id,
+-- forge_issue_iid)` (forge.sql). Joining on iid alone would let closing issue #7 in repo X
+-- auto-Done a recommendation filed as #7 into repo Y: cross-repo, and since reviews are
+-- owner-scoped while filed rows are not (#68 Decision 8), possibly cross-USER. The
+-- `f.filed_repo_id = @repo_id` equality also excludes NULL-repo rows (filed_repo_id is
+-- ON DELETE SET NULL), which is what makes the documented "a filed issue whose repo was
+-- disabled or disconnected won't auto-Done" limitation a SAFE no-op rather than merely a
+-- silent one — such a row can never be matched to some other repo's issue of the same iid.
+--
+-- The other filters, each load-bearing:
+--   * f.filed_at IS NOT NULL — only SETTLED links (an in-flight #68 claim is not filed, the
+--     same rung the shared BucketOf ladder uses).
+--   * f.close_synced_at IS NULL — the EDGE. Without it the pass is level-triggered and
+--     re-fires every tick for as long as the issue stays closed, which would re-apply after
+--     a human Undo.
+--   * i.state = 'closed' — the cached snapshot. A reopen is NOT handled here on purpose:
+--     close_synced_at stays stamped, so there is no auto-reopen and a flapping issue cannot
+--     ping-pong a user's backlog.
+--
+-- rationale_md comes from a scalar SUBQUERY, not a join, so a review that carries the same
+-- coordinate twice (review_recommendations has no unique constraint on it) cannot fan this
+-- out into duplicate edges for one filed link.
+--
+-- The COALESCE(…, '')::text is REQUIRED, not cosmetic. The subquery yields NULL when the
+-- recommendation was re-judged away while its filed link survived, but sqlc types a bare
+-- scalar subquery as a NON-nullable string — so the generated Scan would fail at runtime on
+-- exactly that row, and only against a real database. Coalescing makes the Go type honest;
+-- the caller then hashes the empty string, which is harmless because the hash only ever
+-- lands on an INSERT that no human verdict is competing with.
+SELECT
+    f.id              AS filed_id,
+    f.review_id       AS review_id,
+    f.category        AS category,
+    f.target          AS target,
+    f.filed_issue_iid AS filed_issue_iid,
+    COALESCE((
+        SELECT rr.rationale_md
+        FROM review_recommendations rr
+        WHERE rr.review_id = f.review_id
+          AND rr.category = f.category
+          AND rr.target = f.target
+        ORDER BY rr.created_at ASC, rr.id ASC
+        LIMIT 1
+    ), '')::text AS rationale_md
+FROM recommendation_filed_issues f
+JOIN issues i
+    ON i.repo_id = f.filed_repo_id
+   AND i.forge_issue_iid = f.filed_issue_iid
+-- The ::uuid cast keeps the parameter NON-nullable in Go. filed_repo_id is nullable, so
+-- without it sqlc would hand the caller a pgtype.UUID and invite someone to pass an
+-- absent/zero value here — which, per the pgUUID contract, would silently match nothing.
+-- The repo id always exists at every call site (it comes from the poller's repo row).
+WHERE f.filed_repo_id = @repo_id::uuid
+  AND f.filed_at IS NOT NULL
+  AND f.close_synced_at IS NULL
+  AND i.state = 'closed'
+ORDER BY f.id ASC;
+
+-- name: InsertIssueCloseDisposition :execrows
+-- Write the automatic Done — INSERT … ON CONFLICT DO NOTHING, emphatically NOT #94's
+-- DO-UPDATE upsert (UpsertRecommendationDisposition, dispositions.sql).
+--
+-- DO NOTHING is the entire "never overwrite a human verdict" guarantee. If the coordinate
+-- already carries ANY disposition — the user dismissed it, or marked it done themselves —
+-- this writes nothing and their row, reason and set_at survive untouched. DO UPDATE would
+-- silently replace a `dismissed` verdict with `done`, which is the bug this shape exists to
+-- prevent.
+--
+-- Provenance is fixed here, not passed in: status is always 'done', set_via is always
+-- 'issue_close', and set_by_user_id is always NULL (the system did it — never
+-- filed_by_user_id, who may be an admin acting on someone else's review, #68 Decision 8).
+-- Returning rows-affected lets the caller distinguish "wrote the Done" from "the user
+-- already had a verdict" for logging, without a second read.
+INSERT INTO recommendation_dispositions
+    (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_via)
+VALUES
+    (@review_id, @category, @target, 'done', NULL, @rationale_hash, NULL, 'issue_close')
+ON CONFLICT (review_id, category, target) DO NOTHING;
+
+-- name: MarkFiledIssueCloseSynced :execrows
+-- Consume the edge. Stamped AFTER the insert attempt, and guarded by
+-- close_synced_at IS NULL so two concurrent pollers cannot both claim the same edge.
+--
+-- Order matters and is not interchangeable: insert-then-stamp means a crash in between
+-- leaves the edge unconsumed, so the next tick retries the (idempotent, DO-NOTHING) insert
+-- and stamps — at worst a no-op repeat. Stamping FIRST would lose the disposition entirely
+-- if the process died before the insert, with no way to notice.
+UPDATE recommendation_filed_issues
+SET close_synced_at = now()
+WHERE id = @id AND close_synced_at IS NULL;
