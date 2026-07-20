@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -278,6 +279,202 @@ func TestRunLogsAfterFilter(t *testing.T) {
 	}
 	if strings.Contains(out, "one") || !strings.Contains(out, "two") {
 		t.Errorf("--after=1 should skip seq 1:\n%s", out)
+	}
+}
+
+// ── PRD #99 M4: instance + label on the human line ───────────────────────────
+
+// twoCoderLogs is the shape this milestone exists for: one lead frame with neither
+// column, then two DISTINCT `coder` invocations. Before M4 the last two rows were
+// byte-identical apart from their seq and payload, so `uzi run watch` could not tell
+// which coder was doing what.
+func twoCoderLogs() map[string][]apitypes.MessageDTO {
+	lead, coder := "lead", "coder"
+	instA, instB := "toolu_01AAAAAAAAAAAAAAAA3v6ptu", "toolu_01BBBBBBBBBBBBBBBB2k9xqf"
+	labelA, labelB := "API wiring", "web gate UX"
+	return map[string][]apitypes.MessageDTO{
+		"r1": {
+			{Seq: 1, Kind: "text", Agent: &lead, Payload: []byte(`{"text":"dispatching"}`)},
+			{Seq: 2, Kind: "tool_use", Agent: &coder, AgentInstance: &instA, AgentLabel: &labelA, Payload: []byte(`{"name":"Edit"}`)},
+			{Seq: 3, Kind: "tool_use", Agent: &coder, AgentInstance: &instB, AgentLabel: &labelB, Payload: []byte(`{"name":"Write"}`)},
+		},
+	}
+}
+
+// The headline requirement (Decision 10): two same-role instances must read
+// DISTINCTLY in the text format. Asserted on the whole actor cell of each line, not
+// on a substring floating anywhere in the output — a fragment test would pass even
+// if both ids landed on one row.
+func TestRunLogsDistinguishesSameRoleInstances(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: twoCoderLogs()}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 message lines, got %d:\n%s", len(lines), out)
+	}
+	// The lead frame carries neither column, so its cell is the bare role: no "/"
+	// short id and no " · " label. This is the legacy/pre-migration rendering.
+	if strings.Contains(lines[0], "/") || strings.Contains(lines[0], " · ") {
+		t.Errorf("a frame with no instance must render the bare role:\n%s", lines[0])
+	}
+	if !strings.Contains(lines[0], "lead") {
+		t.Errorf("lead row lost its role:\n%s", lines[0])
+	}
+	// Both coder rows carry the role, their own short id, and their own label.
+	if !strings.Contains(lines[1], "coder/3v6ptu") || !strings.Contains(lines[1], "API wiring") {
+		t.Errorf("coder A row missing its instance or label:\n%s", lines[1])
+	}
+	if !strings.Contains(lines[2], "coder/2k9xqf") || !strings.Contains(lines[2], "web gate UX") {
+		t.Errorf("coder B row missing its instance or label:\n%s", lines[2])
+	}
+	// …and the two rows are not each other's twin, which is the actual bug.
+	if strings.Contains(lines[1], "2k9xqf") || strings.Contains(lines[2], "3v6ptu") {
+		t.Errorf("the two coder invocations bled into each other:\n%s\n%s", lines[1], lines[2])
+	}
+}
+
+// The short id is a TAIL, not a prefix. An SDK tool-use id begins with a constant
+// `toolu_01`, so a first-N rule would render both invocations above identically —
+// this pins the choice so a future "make it match shortRecID" tidy has to fail a
+// test rather than silently collapse the column.
+func TestShortInstanceIDUsesTheTail(t *testing.T) {
+	const a = "toolu_01AAAAAAAAAAAAAAAA3v6ptu"
+	const b = "toolu_01BBBBBBBBBBBBBBBB2k9xqf"
+	if got := shortInstanceID(a); got != "3v6ptu" {
+		t.Errorf("shortInstanceID(%q) = %q, want the last 6 runes", a, got)
+	}
+	if shortInstanceID(a) == shortInstanceID(b) {
+		t.Errorf("two ids sharing the constant toolu_01 prefix must not collapse: %q", shortInstanceID(a))
+	}
+	// Shorter than the window: returned whole, never padded or panicking.
+	if got := shortInstanceID("toolu_A"); got != "olu_A" && got != "oolu_A" {
+		t.Errorf("shortInstanceID(%q) = %q, want its 6-rune tail", "toolu_A", got)
+	}
+	if got := shortInstanceID("ab"); got != "ab" {
+		t.Errorf("shortInstanceID(%q) = %q, want it unchanged", "ab", got)
+	}
+}
+
+// --json parity is FREE (renderMessage marshals the DTO whole), but "free" is a
+// claim, and an unpinned one would break the moment someone hand-rolls the JSON
+// object. Agents read the FULL instance id here, never the display tail.
+func TestRunLogsJSONCarriesFullInstanceAndLabel(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: twoCoderLogs()}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 NDJSON lines, got %d:\n%s", len(lines), out)
+	}
+	var lead, coderA apitypes.MessageDTO
+	if err := json.Unmarshal([]byte(lines[0]), &lead); err != nil {
+		t.Fatalf("lead line is not JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &coderA); err != nil {
+		t.Fatalf("coder line is not JSON: %v", err)
+	}
+	if lead.AgentInstance != nil || lead.AgentLabel != nil {
+		t.Errorf("absent columns must stay null, got %v / %v", lead.AgentInstance, lead.AgentLabel)
+	}
+	if coderA.AgentInstance == nil || *coderA.AgentInstance != "toolu_01AAAAAAAAAAAAAAAA3v6ptu" {
+		t.Errorf("--json must carry the FULL instance id, not the display tail: %v", coderA.AgentInstance)
+	}
+	if coderA.AgentLabel == nil || *coderA.AgentLabel != "API wiring" {
+		t.Errorf("--json lost the label: %v", coderA.AgentLabel)
+	}
+	// Both keys present even when null (MessageDTO's tags are not omitempty).
+	if !strings.Contains(lines[0], `"agent_instance":null`) || !strings.Contains(lines[0], `"agent_label":null`) {
+		t.Errorf("NULL columns must be emitted as explicit nulls:\n%s", lines[0])
+	}
+}
+
+// agent_label is FREE model-authored prose reaching a TTY — a wider class of
+// untrusted than `agent`, which is a role from a fixed roster. A CSI sequence in it
+// must be stripped on the human path exactly as the judge's free text is (Risk 13),
+// while the visible characters survive.
+func TestRunLogsSanitizesAgentLabelForTTY(t *testing.T) {
+	coder := "coder"
+	inst := "toolu_01AAAAAAAAAAAAAAAA3v6ptu"
+	label := "\x1b[2Jwipe" // CSI screen-clear
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "text", Agent: &coder, AgentInstance: &inst, AgentLabel: &label, Payload: []byte(`{}`)}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("an ESC in agent_label reached the TTY:\n%q", out)
+	}
+	if !strings.Contains(out, "[2Jwipe") {
+		t.Errorf("sanitizing must drop the control byte only, keeping visible text:\n%s", out)
+	}
+}
+
+// The actor cell holds a `·` separator and a possibly non-ASCII label, and the
+// payload column must start at the same RUNE offset on every line. Go's fmt pads
+// `%-*s` by runes, so this passes — but pinning it guards against a future switch to
+// a byte-based manual pad (an earlier draft of this code shipped exactly such a
+// helper, on the false belief that fmt pads by bytes; the mutation test that should
+// have caught it did not, because fmt was already doing the right thing). Rune
+// alignment only: a CJK rune still takes two terminal columns, which this CLI does
+// not model anywhere.
+func TestRunLogsActorColumnAlignsAcrossMultibyteLabels(t *testing.T) {
+	ascii, wide := "lead", "coder"
+	inst := "toolu_01AAAAAAAAAAAAAAAA3v6ptu"
+	label := "日本語" // 3 runes, 9 bytes
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {
+			{Seq: 1, Kind: "text", Agent: &ascii, Payload: []byte(`{"t":1}`)},
+			{Seq: 2, Kind: "text", Agent: &wide, AgentInstance: &inst, AgentLabel: &label, Payload: []byte(`{"t":2}`)},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d:\n%s", len(lines), out)
+	}
+	// The payload starts at the same RUNE offset on both lines.
+	at := func(line, want string) int { return utf8.RuneCountInString(line[:strings.Index(line, want)]) }
+	if got, want := at(lines[1], `{"t":2}`), at(lines[0], `{"t":1}`); got != want {
+		t.Errorf("multibyte label skewed the payload column: rune offset %d vs %d\n%s\n%s", got, want, lines[0], lines[1])
+	}
+	if !strings.Contains(lines[1], "· 日本語") {
+		t.Errorf("the multibyte label did not survive:\n%s", lines[1])
+	}
+}
+
+// An over-long label must not blow the column open; the short id — the part that
+// actually disambiguates — must survive the truncation.
+func TestRunLogsCapsTheActorCell(t *testing.T) {
+	coder := "coder"
+	inst := "toolu_01AAAAAAAAAAAAAAAA3v6ptu"
+	label := strings.Repeat("x", 200)
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "text", Agent: &coder, AgentInstance: &inst, AgentLabel: &label, Payload: []byte(`{"t":1}`)}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	line := strings.TrimRight(out, "\n")
+	if !strings.Contains(line, "coder/3v6ptu") {
+		t.Errorf("truncation ate the short id, the one part that disambiguates:\n%s", line)
+	}
+	if !strings.Contains(line, "…") {
+		t.Errorf("an over-long cell must be visibly truncated:\n%s", line)
+	}
+	// The whole actor cell fits its column: the payload starts right after it.
+	if idx := strings.Index(line, `{"t":1}`); utf8.RuneCountInString(line[:idx]) != 6+17+actorCellWidth+1 {
+		t.Errorf("actor cell overflowed its column, payload at rune %d:\n%s", utf8.RuneCountInString(line[:idx]), line)
 	}
 }
 
