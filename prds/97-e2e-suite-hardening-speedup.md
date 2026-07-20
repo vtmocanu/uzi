@@ -281,7 +281,14 @@ carry explicit author sign-off:
       documented place. Mechanical move, no logic change. Keep the single-stack,
       serial, same-process model — do **not** parallelize (one worker/DB/forge makes
       that impossible). Deferrable; de-risks M4/M6.
-- [ ] **M8 — (optional) harden the `apipost` board-reconcile race (added 2026-07-20, from M2 work)**:
+- [x] **M8 — harden the `apipost` board-reconcile race** — DONE `7d11e6e9`; reviewer
+      APPROVE + auditor PASS. **16** run-create sites routed through `create_run`
+      (more complete than the ~13 originally scoped — it also caught the `hrun` helper,
+      unnamed here, covering 7 further call sites; same class, not scope creep).
+      `create_run`'s body is **byte-identical** across the commit (auditor extracted and
+      diffed it at `7d11e6e9^` vs `7d11e6e9`: 17 lines, unchanged), so the retried-condition
+      set provably did not widen. Skips preserved: `:2182` (409 cross-kind) and `:2230`
+      (422 prdless) stay on `apipost_code`. Original scope below:
       M2 validation on a fast host surfaced pre-existing latent fragility. **M2 is NOT
       blocked on this** — M2's own 8 assertions passed every run (5/5), the M2-stashed
       baseline was green, and run5 (relocated M2) was FULLY green (178 PASS / 0 FAIL),
@@ -299,7 +306,24 @@ carry explicit author sign-off:
       404, fails hard otherwise). It does **not** fix class (b) (a write-path retry is
       deliberately avoided per M3/Decision 3 — double-execute risk); a fuller
       infra-transient fix is a separate, harder question. In the spirit of M3's
-      false-green work. **Gate: a full `./e2e/run-e2e.sh` green after the sweep.**
+      false-green work.
+
+      **Gate (corrected — the original wording overclaimed).** The claim M8 makes is
+      **structural, not statistical**: when the race fires it is either *absorbed* (exact-body
+      404, ≤6 attempts) or *surfaced* with a real HTTP status + response body + the site
+      name. The information-free `curl: (22)` is gone from every run-create path — that is
+      a diagnostics upgrade, so net coverage goes UP. The full green run (182 PASS / 0 FAIL,
+      incl. PRD #41) proves **no regression from the sweep** (behaviour-preserving across
+      182 assertions); it does **not** prove the flake is gone, since one green run is
+      equally consistent with a low-rate race simply not firing that time. Do not read
+      "0 curl-404" as "fixed".
+
+      **M8 cannot eliminate the flake, by design.** It covers class (a) — the run-create
+      board-reconcile 404 — only. Class (b), the api-routing transient 404 on a *fixed*
+      route (PRD #32 vault; `VaultLock` cannot 404 by design), is deliberately untouched:
+      it is not a run-create, and a write-path retry there would reintroduce exactly the
+      double-execute risk M3/Decision 3 rejected. **A future abort remains possible and
+      may well be class (b).** Stated explicitly so a future reader does not re-derive it.
 
 **Dependency graph**: **M1, M3, M5 are independent** (git-auth leg / assertion
 hardening / mechanical timing — separate parts of the file and the overlay) and can
