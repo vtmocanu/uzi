@@ -1331,12 +1331,18 @@ export const mockApi = {
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
   hostedConfig: async () => delay({ enabled: true, quota: 2 }),
-  provisionHostedWorker: async (template: string, size: string, _docker = false, name?: string) => {
+  provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
       // Empty name → the server derives one from template + size (handler's
-      // derivedHostedWorkerName). The M5 form sends none, so this is the live path.
-      name: name?.trim() || `${template} (${size.toUpperCase()})`,
+      // derivedHostedWorkerName), now AWS-style `base.l-<4-hex>`: dot notation,
+      // lowercase t-shirt letter, random hex suffix. The M5 form sends none, so this
+      // is the live path. The real suffix is crypto/rand; the mock stands in a
+      // counter-derived 4-hex from workerCounter (already ++'d for the id) to stay
+      // deterministic-enough for tests — a plausible suffix, not byte-for-byte parity.
+      name:
+        name?.trim() ||
+        `${template}.${size.toLowerCase()}-${(workerCounter & 0xffff).toString(16).padStart(4, "0")}`,
       // Offline until the controller starts the pod and it registers — the same
       // lifecycle a hand-run worker has, just with the controller doing the running.
       status: "offline",
@@ -1345,6 +1351,7 @@ export const mockApi = {
       max_concurrent_runs: null,
       kind: "hosted" as const,
       hosted_size: size,
+      docker,
       template_declared: template,
       template_reported: null,
       version: null,

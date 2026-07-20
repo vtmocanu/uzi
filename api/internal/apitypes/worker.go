@@ -17,6 +17,10 @@ type WorkerDTO struct {
 	// RunDTO.
 	Kind       string  `json:"kind"`
 	HostedSize *string `json:"hosted_size"`
+	// Docker is the worker's DinD capability, mirroring HostedSize's semantics: null
+	// for an external worker (docker not applicable), false for a hosted worker without
+	// the rootless-DinD sidecar, true for a docker-capable hosted worker (PRD #83 M3).
+	Docker *bool `json:"docker"`
 	// Busy is the any-kind non-terminal signal (PRD #42 Decision 10): true whenever
 	// the worker holds ANY active run, chat included — so a lone active chat still
 	// reads as busy even though active_runs (run-lane only) is 0.
