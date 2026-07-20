@@ -908,14 +908,16 @@ export const mockWorkers: Worker[] = [
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
-    // ONLINE with a live sample so the hosted + size badges are seen on a realistic
+    // ONLINE with a live sample so the hosted + docker badges are seen on a realistic
     // row rather than on a permanently-pending one — and so the demo starts at 1 of
-    // its quota of 2, one provision away from the at-quota state.
+    // its quota of 2, one provision away from the at-quota state. docker:true (PRD #83
+    // M3) exercises the docker badge; the other seeded hosted rows leave it undefined.
     id: "w-hosted-eu",
-    name: "base (M)", // derived by the server from template + size; the form sends no name
+    name: "base.m-1a2b", // derived by the server from template + size (AWS-style base.m-<hex>); the form sends no name
     status: "online",
     kind: "hosted",
     hosted_size: "m",
+    docker: true,
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,

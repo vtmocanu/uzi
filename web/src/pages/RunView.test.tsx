@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary, JudgePanel } from "./RunView";
-import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunReview } from "../lib/api";
+import { PlanPanel, AgentRosterSummary, JudgePanel, derivePlanRevision } from "./RunView";
+import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
 // run's own_agents instead). listAgentTemplates is mocked only so a test can assert
@@ -660,5 +660,155 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     fireEvent.click(await screen.findByText("Mark done"));
     expect(await screen.findByText("Marked done")).toBeTruthy();
+  });
+});
+
+// ── Plan revision at the gate (PRD #41) ────────────────────────────────────────
+function planMsg(seq: number, kind: string, payload: unknown): RunMessage {
+  return { seq, kind, agent: "lead", payload, created_at: "2026-07-04T00:00:00.000Z" };
+}
+
+describe("derivePlanRevision (PRD #41)", () => {
+  it("counts versions from `plan` and rounds from `plan_feedback`; re-gated after a newer plan", () => {
+    const rev = derivePlanRevision([
+      planMsg(1, "plan", { plan_md: "v1" }),
+      planMsg(2, "plan_feedback", { feedback: "drop step 1" }),
+      planMsg(3, "plan_revising", { round: 1 }),
+      planMsg(4, "plan", { plan_md: "v2" }),
+    ]);
+    expect(rev.versions).toBe(2);
+    expect(rev.rounds).toBe(1);
+    expect(rev.revising).toBe(false); // latest of {plan, plan_revising} by seq is the v2 plan
+    expect(rev.latestFeedback).toBe("drop step 1");
+    expect(rev.priorPlans).toEqual(["v1"]);
+  });
+
+  it("is `revising` when the latest of {plan, plan_revising} by seq is plan_revising", () => {
+    const rev = derivePlanRevision([
+      planMsg(1, "plan", { plan_md: "v1" }),
+      planMsg(2, "plan_feedback", { feedback: "please rework" }),
+      planMsg(3, "plan_revising", { round: 1 }),
+    ]);
+    expect(rev.revising).toBe(true);
+    expect(rev.versions).toBe(1);
+    expect(rev.rounds).toBe(1);
+    expect(rev.latestFeedback).toBe("please rework");
+  });
+
+  it("uses the latest feedback bubble by seq", () => {
+    const rev = derivePlanRevision([
+      planMsg(1, "plan", { plan_md: "v1" }),
+      planMsg(2, "plan_feedback", { feedback: "first" }),
+      planMsg(3, "plan", { plan_md: "v2" }),
+      planMsg(4, "plan_feedback", { feedback: "second" }),
+    ]);
+    expect(rev.latestFeedback).toBe("second");
+    expect(rev.rounds).toBe(2);
+  });
+});
+
+describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
+  const baseMessages = [planMsg(1, "plan", { plan_md: "# Plan\n- step one" })];
+
+  function renderGate(
+    over: {
+      run?: Partial<Run>;
+      messages?: RunMessage[];
+      onRequestChanges?: (f: string) => void;
+      onCancel?: () => void;
+    } = {},
+  ) {
+    const onRequestChanges = over.onRequestChanges ?? vi.fn();
+    const onCancel = over.onCancel ?? vi.fn();
+    const utils = render(
+      <PlanPanel
+        run={run(over.run ?? { repo_agents: [], own_agents: [] })}
+        messages={over.messages ?? baseMessages}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+        onRequestChanges={onRequestChanges}
+        onCancel={onCancel}
+      />,
+    );
+    return { ...utils, onRequestChanges, onCancel };
+  }
+
+  it("shows Approve / Request changes / Reject with a v1 chip and 'revision 0 of 3'", () => {
+    const { getByRole, container } = renderGate();
+    expect(getByRole("button", { name: /approve plan/i })).toBeTruthy();
+    expect(getByRole("button", { name: /request changes/i })).toBeTruthy();
+    expect(getByRole("button", { name: /^reject$/i })).toBeTruthy();
+    expect(container.textContent).toContain("v1");
+    expect(container.textContent).toContain("revision 0 of 3");
+  });
+
+  it("Request changes reveals the composer and hides the header gate actions", () => {
+    const { getByRole, queryByRole } = renderGate();
+    fireEvent.click(getByRole("button", { name: /request changes/i }));
+    expect(getByRole("button", { name: /send & revise/i })).toBeTruthy();
+    expect(queryByRole("button", { name: /approve plan/i })).toBeNull();
+    expect(queryByRole("button", { name: /^reject$/i })).toBeNull();
+  });
+
+  it("Cancel restores the header actions and closes the composer", () => {
+    const { getByRole, queryByRole } = renderGate();
+    fireEvent.click(getByRole("button", { name: /request changes/i }));
+    fireEvent.click(getByRole("button", { name: /^cancel$/i }));
+    expect(getByRole("button", { name: /approve plan/i })).toBeTruthy();
+    expect(queryByRole("button", { name: /send & revise/i })).toBeNull();
+  });
+
+  it("Send & revise calls onRequestChanges with the typed feedback", () => {
+    const onRequestChanges = vi.fn();
+    const { getByRole, container } = renderGate({ onRequestChanges });
+    fireEvent.click(getByRole("button", { name: /request changes/i }));
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "build it client-side" } });
+    fireEvent.click(getByRole("button", { name: /send & revise/i }));
+    expect(onRequestChanges).toHaveBeenCalledWith("build it client-side");
+  });
+
+  it("Send & revise is disabled until the feedback is non-empty", () => {
+    const { getByRole } = renderGate();
+    fireEvent.click(getByRole("button", { name: /request changes/i }));
+    expect((getByRole("button", { name: /send & revise/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("renders the revising parked state when latest-by-seq is plan_revising", () => {
+    const messages = [
+      planMsg(1, "plan", { plan_md: "v1 body" }),
+      planMsg(2, "plan_feedback", { feedback: "rework the endpoint" }),
+      planMsg(3, "plan_revising", { round: 1 }),
+    ];
+    const onCancel = vi.fn();
+    const { container, getByRole, queryByRole } = renderGate({ messages, onCancel });
+    expect(container.textContent).toContain("Revising the plan");
+    expect(container.textContent).toContain("rework the endpoint");
+    expect(container.textContent).toContain("revision 1 of 3");
+    // Parked: the approve gate is gone, replaced by a Cancel-run affordance.
+    expect(queryByRole("button", { name: /approve plan/i })).toBeNull();
+    fireEvent.click(getByRole("button", { name: /cancel run/i }));
+    expect(onCancel).toHaveBeenCalled();
+  });
+
+  it("flips back to an open v2 gate with a history accordion when a newer plan arrives", () => {
+    const messages = [
+      planMsg(1, "plan", { plan_md: "v1 body" }),
+      planMsg(2, "plan_feedback", { feedback: "rework the endpoint" }),
+      planMsg(3, "plan_revising", { round: 1 }),
+      planMsg(4, "plan", { plan_md: "v2 body" }),
+    ];
+    const { container, getByRole } = renderGate({
+      run: { repo_agents: [], own_agents: [], plan_md: "# Plan v2\n- new step" },
+      messages,
+    });
+    expect(getByRole("button", { name: /approve plan/i })).toBeTruthy();
+    expect(container.textContent).toContain("Updated plan awaiting your approval");
+    expect(container.textContent).toContain("v2");
+    expect(container.textContent).toContain("revision 1 of 3");
+    // The superseded v1 is preserved in the collapsed history accordion.
+    expect(container.textContent).toContain("superseded");
+    expect(container.textContent).toContain("v1 body");
   });
 });

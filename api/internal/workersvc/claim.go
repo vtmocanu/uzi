@@ -161,6 +161,9 @@ type ClaimConfig struct {
 	RunTimeoutSeconds  int     `json:"run_timeout_seconds"`
 	IdleTimeoutSeconds int     `json:"idle_timeout_seconds"`
 	MaxIterations      int     `json:"max_iterations"`
+	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
+	// approval gate (server-authoritative; the server also caps in SubmitInput).
+	PlanMaxRevisions   int     `json:"plan_max_revisions"`
 	DefaultModel       *string `json:"default_model,omitempty"`
 	// SkillMaxBytes and SkillsMaxPerRun are the skill caps the server configured,
 	// delivered so the worker enforces the same limits (no hardcoded drift): the

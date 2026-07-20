@@ -132,12 +132,17 @@ interface CtxProbe {
 
 function makeCtx(
   overrides: Partial<RunContext> = {},
-  verdict: PlanVerdict = { kind: "approve", selection: { status: "absent" } },
+  verdict: PlanVerdict | PlanVerdict[] = { kind: "approve", selection: { status: "absent" } },
 ): CtxProbe {
   const emits: EmittedMessage[] = [];
   const sessionIds: string[] = [];
   const gated: string[] = [];
   const iterations: number[] = [];
+  // A SEQUENCE of verdicts (PRD #41): the gate loop calls gatePlan once per round, so
+  // tests script [revise, …, approve/reject/cancel]. The last entry sticks for any
+  // further calls. A bare verdict behaves as a one-element sequence (unchanged).
+  const verdicts = Array.isArray(verdict) ? verdict : [verdict];
+  let gateCall = 0;
   const ctx: RunContext = {
     runId: "r1",
     issueIid: 5,
@@ -153,7 +158,9 @@ function makeCtx(
     onSessionId: (s) => sessionIds.push(s),
     gatePlan: async (planMd) => {
       gated.push(planMd);
-      return verdict;
+      const v = verdicts[Math.min(gateCall, verdicts.length - 1)]!;
+      gateCall++;
+      return v;
     },
     pullFollowUp: () => undefined,
     reportIteration: (n) => iterations.push(n),
@@ -221,6 +228,135 @@ describe("SdkExecutor plan gate", () => {
       /without submitting a plan/,
     );
     assert.deepStrictEqual(probe.gated, []); // gate never reached
+  });
+});
+
+describe("SdkExecutor plan revision loop (PRD #41)", () => {
+  const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+
+  it("revise → new plan → re-gate → approve: runs a revision turn then proceeds to implement", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // revision turn
+      [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] }, [revise("add a rollback step"), approve]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // The gate saw v1, then the REVISED v2 (one revision round, one approval budget).
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2"]);
+    // A revision turn ran with the revise prompt: the feedback + the submit_plan/STOP
+    // contract, framed as an authoritative instruction (not untrusted).
+    assert.match(turns[1]!.promptText ?? "", /add a rollback step/);
+    assert.match(turns[1]!.promptText ?? "", /submit_plan/);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /UNTRUSTED/i);
+    // The revision turn is a PLANNING turn ⇒ runs with the OWN roster (Decision 5).
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    // It RESUMES the v1 planning session (§340/§344: full planning context, no transcript
+    // replay) — the revision continues the same session that produced v1 ("sess-1").
+    assert.strictEqual(turns[1]!.options.resume, "sess-1");
+    // The run proceeded to implement (plan + revision + one loop turn) and reported the branch.
+    assert.strictEqual(turns.length, 3);
+    assert.deepStrictEqual(probe.iterations, [1]);
+    assert.strictEqual(result.branch, "agent/issue-5");
+  });
+
+  it("a revision turn that submits no plan fails with REASON_NO_PLAN", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [assistantText("I forgot to submit"), resultSuccess()], // revision turn, no plan
+    ]);
+    const probe = makeCtx({}, [revise("redo it"), approve]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /without submitting a plan/,
+    );
+    // The gate was reached once (v1) but never re-gated — the revision turn failed first.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1"]);
+  });
+
+  it("reject mid-loop (revise then reject) surfaces the user's reason verbatim", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+    ]);
+    const probe = makeCtx({}, [revise("try again"), { kind: "reject", reason: "still not thorough" }]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      (err: unknown) => err instanceof PlanRejectedError && err.reason === "still not thorough",
+    );
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2"]);
+  });
+
+  it("cancel mid-loop (revise then cancel) cancels the run", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+    ]);
+    const probe = makeCtx({}, [revise("try again"), { kind: "cancel" }]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /run cancelled/);
+  });
+
+  it("emits plan_feedback + plan_revising with the right feedback and 1-based round numbers", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning
+      [submitPlan("# Plan v2"), resultSuccess()], // revision round 1
+      [submitPlan("# Plan v3"), resultSuccess()], // revision round 2
+      [signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] }, [revise("first fix"), revise("second fix"), approve]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const feedbacks = probe.emits.filter((m) => m.kind === "plan_feedback").map((m) => m.payload["feedback"]);
+    assert.deepStrictEqual(feedbacks, ["first fix", "second fix"]);
+    const rounds = probe.emits.filter((m) => m.kind === "plan_revising").map((m) => m.payload["round"]);
+    assert.deepStrictEqual(rounds, [1, 2], "round numbers are 1-based and increment per revision turn");
+    // Ordering: each plan_feedback precedes its plan_revising (feed never lags the gate).
+    const kinds = probe.emits.filter((m) => m.kind === "plan_feedback" || m.kind === "plan_revising").map((m) => m.kind);
+    assert.deepStrictEqual(kinds, ["plan_feedback", "plan_revising", "plan_feedback", "plan_revising"]);
+  });
+
+  it("a revision turn is subject to the shared wall-clock budget (armWall/disarmWall run per turn)", async () => {
+    // The planning turn completes instantly (≈0ms debited); the revision turn then hangs.
+    // Because each turn — including the revision turn — arms the SAME wall pool, the
+    // budget trips DURING the revision turn rather than running it unbounded.
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning: instant
+      (signal) => hangUntilAbort(signal), // revision turn: hangs → wall trips
+    ]);
+    const probe = makeCtx({ config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.03 } }, [revise("keep going"), approve]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /wall-clock timeout/);
+  });
+
+  it("hits the worker-side revision cap: re-gates the current plan without another turn (fail-closed)", async () => {
+    // Belt-and-suspenders (Decision 3c + Success Criterion 5): the SERVER caps revises,
+    // but if a revise arrives past plan_max_revisions the worker must NOT run another
+    // planning turn — it emits a "revision budget exhausted" feed notice and re-gates the
+    // CURRENT plan. With plan_max_revisions=1, the 2nd revise trips the cap: only ONE
+    // revision turn runs, and the same v2 plan is re-gated (then approved).
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // the single allowed revision turn
+      [signalDone(), resultSuccess()], // loop turn 1 (after the re-gate approve)
+    ]);
+    // [revise, revise, approve]: the 2nd revise is over-cap → re-gate-without-turn → approve.
+    const probe = makeCtx({ config: { plan_max_revisions: 1 } }, [revise("first fix"), revise("over-cap fix"), approve]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // Exactly ONE revision turn ran (planning + 1 revision + 1 implement = 3 turns); the
+    // over-cap revise did NOT drive a 4th turn.
+    assert.strictEqual(turns.length, 3, "the over-cap revise ran no planning turn");
+    // The current (v2) plan was re-gated after the cap, not a fresh v3.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2", "# Plan v2"]);
+    // The fail-closed feed notice was emitted.
+    const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+    assert.ok(statuses.some((t) => t.includes("revision budget exhausted")), statuses.join("\n"));
+    // Only ONE revision round was announced (plan_revising round=1), never a round 2.
+    const rounds = probe.emits.filter((m) => m.kind === "plan_revising").map((m) => m.payload["round"]);
+    assert.deepStrictEqual(rounds, [1]);
+    // The run still proceeded to implement on the re-gate approval.
+    assert.strictEqual(result.branch, "agent/issue-5");
   });
 });
 

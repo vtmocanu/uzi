@@ -86,6 +86,135 @@ describe("SteeringChannel", () => {
   });
 });
 
+// PRD #41: plan revision at the gate. The channel epoch-stamps every verdict/revise so
+// one written against a stale plan version is discardable, and a revise both enqueues
+// (FIFO) and wakes the gate.
+describe("SteeringChannel — plan revision (PRD #41)", () => {
+  /** A client whose input batches are pushed on demand, so a test can interleave epoch
+   *  bumps between what the poll loop consumes. Returns [] until a batch is pushed. */
+  function pushableClient(): { client: WorkerClient; push: (b: UserInput[]) => void } {
+    const queue: UserInput[][] = [];
+    const client = { getInputs: async () => queue.shift() ?? [] } as unknown as WorkerClient;
+    return { client, push: (b) => queue.push(b) };
+  }
+
+  it("routes revise_plan into a FIFO queue, one round per awaitGateEvent", async () => {
+    const { ch } = makeChannel([[inp("revise_plan", "first"), inp("revise_plan", "second")]]);
+    const e = ch.bumpEpoch();
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "first" } satisfies PlanVerdict);
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "second" });
+    await ch.stop();
+  });
+
+  it("a lone revise wakes a parked gate immediately (no verdict buffered)", async () => {
+    const { ch } = makeChannel([[inp("revise_plan", "adjust the approach")]]);
+    const e = ch.bumpEpoch();
+    ch.start();
+    // awaitGateEvent parks first (nothing buffered), then the routed revise wakes it.
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "adjust the approach" });
+    await ch.stop();
+  });
+
+  it("a current-epoch revise beats a buffered current-epoch approve ([revise, approve] batch)", async () => {
+    // Both land in ONE batch at the same epoch. The gate must take the revision round —
+    // approving the pre-feedback plan would defeat the point of the feedback.
+    const { ch } = makeChannel([[inp("revise_plan", "please tweak"), inp("approve_plan")]]);
+    const e = ch.bumpEpoch();
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "please tweak" });
+    await ch.stop();
+  });
+
+  it("order within the batch does not matter: [approve, revise] still takes the revise, not the approve", async () => {
+    // The gate is serviced once per poll batch (not per input), so an approve at the HEAD
+    // of the batch can't resolve the gate before the trailing revise routes. Servicing
+    // per-input would silently drop the revise (and still burn a server cap slot). The
+    // approve is left buffered — proven stale at the next epoch — not consumed.
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const e = ch.bumpEpoch();
+    ch.start();
+    push([inp("approve_plan"), inp("revise_plan", "tweak it")]); // approve FIRST in the batch
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "tweak it" });
+    // The batched approve was buffered, not dropped: at the next epoch it is the stale
+    // pre-feedback version and is discarded with a notice, and a fresh approve then lands.
+    const e2 = ch.bumpEpoch();
+    const p = ch.awaitGateEvent(e2);
+    push([inp("approve_plan")]);
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Approval ignored")), notices.join("\n"));
+    await ch.stop();
+  });
+
+  it("discards a PRIOR-epoch approve with a feed notice; a current-epoch approve lands", async () => {
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    ch.bumpEpoch(); // epoch 1
+    ch.start();
+    push([inp("approve_plan")]); // consumed + buffered at epoch 1
+    await tick();
+    const e2 = ch.bumpEpoch(); // the plan was revised; epoch 1 is now stale
+    // The buffered epoch-1 approve is discarded (with a notice) the moment we await epoch 2.
+    const p = ch.awaitGateEvent(e2);
+    push([inp("approve_plan")]); // a fresh approve, stamped at epoch 2
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Approval ignored")), notices.join("\n"));
+    await ch.stop();
+  });
+
+  it("discards a PRIOR-epoch reject with a verdict-specific feed notice (not 'Approval ignored')", async () => {
+    // PRD #41 Decision 3: a stale REJECT is discarded exactly like a stale approve (only
+    // cancel is epoch-exempt), but the feed wording must read correctly for a rejection.
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    ch.bumpEpoch(); // epoch 1
+    ch.start();
+    push([inp("reject_plan", "no thanks")]); // consumed + buffered at epoch 1
+    await tick();
+    const e2 = ch.bumpEpoch(); // the plan was revised; the epoch-1 reject is now stale
+    const p = ch.awaitGateEvent(e2);
+    push([inp("approve_plan")]); // a fresh approve at epoch 2 resolves the gate
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Rejection ignored")), notices.join("\n"));
+    assert.ok(!notices.some((n) => n.includes("Approval ignored")), "reject must not read as an approval notice");
+    await ch.stop();
+  });
+
+  it("discards a stale (prior-epoch) queued revise with a feed notice", async () => {
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    ch.bumpEpoch(); // epoch 1
+    ch.start();
+    push([inp("revise_plan", "old feedback")]); // queued at epoch 1
+    await tick();
+    const e2 = ch.bumpEpoch(); // plan moved on; the queued revise is now stale
+    const p = ch.awaitGateEvent(e2); // drops the stale revise (with a notice), then parks
+    push([inp("approve_plan")]); // fresh approve at epoch 2 resolves the gate
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Feedback ignored")), notices.join("\n"));
+    await ch.stop();
+  });
+
+  it("cancel is epoch-exempt: it applies even when stamped at an older epoch", async () => {
+    const cancel = new AbortController();
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel);
+    ch.bumpEpoch(); // epoch 1
+    ch.start();
+    push([inp("cancel")]); // seen at epoch 1
+    await tick();
+    ch.bumpEpoch(); // epoch 2 — a stale approve would be dropped here, but cancel is exempt
+    assert.deepStrictEqual(await ch.awaitGateEvent(2), { kind: "cancel" } satisfies PlanVerdict);
+    assert.strictEqual(cancel.signal.aborted, true);
+    await ch.stop();
+  });
+});
+
 // ChatSteering (PRD #39 Decision 2): the chat lane's blocking await-next-follow-up.
 // It owns the idle clock inside the poll loop, so a follow_up consumed on the same
 // poll where idle would elapse is delivered, never dropped (team task #8).

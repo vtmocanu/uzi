@@ -9190,3 +9190,179 @@ state ("filed", PRD #68) and had no way to record "handled", "won't do", or
   re-emitted rationale differs — warning the human rather than silently
   re-suppressing a possibly-different concern. Cleaned only by the
   review-deletion cascade (`review_id ON DELETE CASCADE`).
+
+# PRD #41 — Plan revision at the approval gate ("Request changes")
+
+Serves human Feature #41: at the plan gate the user can request changes (bounded
+rounds) to steer the plan without killing the run. Builds on PRD #4 (plan gate +
+steering wire), PRD #33 (`stop_kind` semantics), and rides §51's SDK session resume.
+The single user decision is Decision 10 (Slack gets full gate parity — see and steer
+the plan from Slack — a deliberate, user-approved 2026-07-10 reversal of PRD #25's
+plan-content minimization); the rest is AI design within the "steer, don't kill"
+constraint. Full rationale + accepted residuals: `prds/41-plan-revision-gate.md`.
+Migration is draft `00070` — renumber above the merged head at landing (live head
+`00051`, PRD #37 holds `00061`, PRD #39 holds `00065`).
+
+## 339. `revise_plan` is a fourth steering-input kind — plain server-side enqueue, whitelisted in every site (D1, D7, D12)
+
+- **A distinct `revise_plan` kind, not repurposed `follow_up`.** Follow-up's
+  "queue for the next implementation turn" semantics are load-bearing (a user may
+  park an implementation note while deciding on the plan); overloading it would make
+  gate behavior depend on run status at delivery time — a race. `PlanVerdict` gains
+  `{kind: "revise", feedback}`.
+- **Server handling mirrors `approve_plan`, not `reject_plan`:** in `SubmitInput` it
+  is a plain enqueue — no stop-verdict CTE, no `stop_kind` stamp, no server-side
+  transition on a stale poller. A revise aimed at a parked/dead worker waits for the
+  requeue+affinity resume, same as an approve. `ErrRunTerminal` still guards terminal
+  runs.
+- **The kind whitelist moves in every place it lives, one commit:** the DB
+  `run_user_inputs.kind` CHECK (migration widens to include `revise_plan`; Down
+  restores the 4-kind CHECK and fails once any `revise_plan` row exists — accepted),
+  the handler's `runInputKinds` map + its error string, and web's `RunInputKind`. A
+  partial update fails oddly (400 vs 500 on CHECK violation).
+- Accepted residual: a worker that consumed the revise and then died loses it (the
+  consume path has no ack); the user re-sends — parity with existing steering.
+
+## 340. Round-awareness via a monotonic gate epoch, barrier AT the re-report — the no-unseen-plan guarantee (D2, D3)
+
+- **One epoch-tagged gate-event mechanism, not a second delivery primitive.**
+  `steering.ts` keeps today's latest-wins buffer for approve/reject (cancel
+  additionally trips the AbortController) and adds a FIFO revise queue; the gate waits
+  on a single epoch-tagged select that is woken by a revise enqueue as well as by
+  verdict delivery. Precedence, enforced in one place: a current-epoch revise beats a
+  buffered current-epoch approve (batch `[revise, approve]` → one revision round then a
+  fresh gate, never an approve of the pre-feedback plan). The phase-1 loop becomes
+  `plan → gate → (revise → resume session with feedback → require new plan →
+  re-gate)*`, **fail-closed** (any exit that is not an explicit approve/reject/cancel
+  is an error).
+- **The gate epoch is incremented at each `awaiting_approval` (re-)report — NOT when a
+  revise is taken.** This is the barrier: the whole revision turn (minutes) is guarded.
+  Every verdict is stamped with its arrival epoch; the select accepts approve/reject
+  only from the **current** epoch and discards older ones with a feed notice
+  ("approval ignored — the plan changed"). Queued revises are epoch-stamped and
+  discarded the same way (feedback authored against v1 does not silently spend a round
+  revising a v2 the user hasn't seen). `cancel` is epoch-exempt (always applies). The
+  server keeps accepting approve on any non-terminal run; staleness is resolved at the
+  single consumer, the gate.
+- **Guarantee: no plan version is ever implemented without a human having seen it.** An
+  approve sent at ANY instant between feedback and the re-report is discarded.
+- The planning session is resumed via the same `resumeId` the executor threads between
+  turns (§51) — full planning context, no transcript replay.
+
+## 341. Bounded rounds — `PLAN_MAX_REVISIONS` (default 3), enforced twice, counting the same thing (D6)
+
+- **Server** (`SubmitInput`): rejects the N+1th `revise_plan` with a clear 4xx (409),
+  counting **all persisted `revise_plan` rows for the run with NO `consumed_at`
+  filter** — `ConsumeRunInputs` marks-consumed but never deletes, so counting only
+  pending rows would silently defeat the cap. This is the authoritative bound and must
+  never be "optimized" to count pending rows. New `CountRunReviseInputs` query.
+- **Worker**: an independent round counter refuses further rounds with "revision budget
+  exhausted" in the feed; it resets on requeue by design (which is why the server count
+  is authoritative). Off-by-one: N revisions allowed, N+1th refused.
+- Cap rides claim config (`plan_max_revisions`), env `PLAN_MAX_REVISIONS` on the API.
+- Accepted residuals: a discarded stale revise (§340) still burns a server-side cap
+  slot (spend-strictness favored; the feed notice invites a re-send); a requeue re-plan
+  counts already-consumed revise rows, so a resumed run may have fewer rounds left than
+  its fresh plan suggests.
+
+## 342. Clocks — one absolute 24h gate deadline across all rounds; revisions drain the single wall budget (D5, D4)
+
+- **Total gate deadline is one absolute deadline computed at first gate entry** and
+  threaded through every round (the `wallRemainingMs` threading pattern), NOT a fresh
+  24h `setTimeout` per round (which would reset each round, ~4×24h worst case).
+  Timeout still resolves as reject with "plan approval timed out".
+- **Revision turns spend the run's single cumulative wall budget** — no per-revision
+  wall clock; N slow revisions genuinely starve the implement/review loop's budget. The
+  round cap is the practical bound. Existing `driveTurn` idle detection applies
+  unchanged inside a revision turn.
+
+## 343. No new run status — the run stays `awaiting_approval` while revising; UI derives the state from the feed (D4, D9)
+
+- **No `revising_plan` status.** A new status would touch the status CHECK, the
+  sweeper, the board lifecycle maps, badges, and every web status switch — for a
+  worker-internal, short state. Instead the worker emits new run-message kinds
+  `plan_feedback` (the user's feedback) and `plan_revising`, plus a re-emitted `plan`
+  message per version. `run_messages.kind` carries no CHECK, so no migration for the
+  new kinds.
+- **UI derivation rule:** the panel's revising state is the **latest of {`plan`,
+  `plan_revising`} by `seq`** (not "a `plan_revising` exists", else the chip sticks
+  after re-gate). Both new kinds render escaped/Markdown-safe (react-markdown, no
+  rehype-raw), never a raw sink.
+- **Feed / plan-row contract:** `runs.plan_md` always holds the currently-gated plan;
+  the feed holds every version plus the feedback that produced it. Ordering mirrors
+  today's flush-before-re-report — `plan` message flushed, then `awaiting_approval`
+  re-reported — so the feed never lags the state.
+- Consequence: `RUN_TIMEOUT` continues not to apply while parked-or-revising
+  (`SweepRunningTimeout` matches `status='running'` only); the bounds are §342's clocks.
+  Avoids the trap where flipping to `running` mid-revision insta-fails a long-parked run.
+
+## 344. Revision feedback is the owner's authoritative instruction — not untrusted-fenced; scrubbed of the run's own secrets, admin-visible (D11)
+
+- The prompt injected into the resumed planning session (`buildRevisePlanPrompt`,
+  reviewer-instruction framing, full-plan-required contract identical to the plan
+  prompt's) frames feedback as the plan reviewer's authoritative instruction — it IS
+  the human owner speaking, unlike forge-derived text, so no untrusted-evidence
+  wrapping.
+- Redaction honesty: the run redactor knows only the run's own four secrets; feedback
+  containing an unrelated pasted secret is stored verbatim in `run_messages` and is
+  admin-visible like all run content — parity with reject reasons and follow-ups, not a
+  new hole. `docs/` states feedback is stored in the feed and admin-visible.
+
+## 345. Autopilot is structurally unaffected (D8)
+
+- The auto-approve short-circuit resolves the gate before any `/inputs` wait, so an
+  autopilot run can never receive a revise verdict. No code change; one test pins it.
+
+## 346. Slack gate parity — see the plan, steer the plan; a deliberate trust-model reversal for `plan_md` only (D10)
+
+- **User decision (2026-07-10):** Slack gets full parity — on every gate and re-gate
+  the notifier posts the plan into the run thread, and the gate gains a third button
+  **Request changes**. Supersedes the review's minimal-fix scoping and, for `plan_md`
+  only, PRD #25's content minimization.
+- **Plan-in-thread pipeline, exact order:** `ScrubSecrets` → **`EscapeMrkdwn` on the
+  entire plan blob** → truncate on a rune boundary to Slack's 3000-char section-block
+  limit → append the "full plan in uzi" deep link as separate trusted markup outside
+  the truncated region. Whole-blob escaping is deliberate (the opposite of
+  `EscapeMrkdwn`'s per-field doc rule, correct here because the blob contains no trusted
+  markup): plan_md quotes attacker-influenceable forge content, so unescaped mrkdwn
+  (`<https://evil|Open in uzi>`, `<!here>`, `<@U…>`) would render as spoofed
+  links/mentions in the owner's DM. The thread copy is lossy by design; the deep link
+  is the canonical rendering. Bound to the fresh-gate-post branch, generation-keyed —
+  never to `handle()`, which runs on every `awaiting_approval` re-broadcast.
+- **Request-changes button:** flips the gate anchor to a new `revise-pending` state
+  (mirroring `gateStateRejectPending`); the next thread reply is the feedback — the
+  replier gains a `revise-pending` branch submitting `revise_plan` (same stale-status
+  guard as reasoned-reject). A bare reply during an open gate keeps nudging (string
+  names all three actions).
+- **The re-gate hazard is real and fixed with five named mechanisms:**
+  (a) **`slack_run_messages.gate_generation` column** carries Decision 3's epoch to the
+  Slack anchor; `handleGate` keys re-posting on generation change (not "gate already
+  open", which the `gateOpen` short-circuit swallows). Each re-gate posts a fresh gate
+  message (plan vN), edits the previous one button-free to "superseded by plan vN", and
+  updates `gate_ts` + `gate_generation`.
+  (b) **Server-enforced supersede:** the gatekeeper refuses a click whose
+  `a.MessageTS != anchor.GateTs` ("this gate was superseded"), so the no-unseen-plan
+  guarantee never rests on a best-effort message edit, and a stale click can't overwrite
+  the live anchor's `gate_ts`.
+  (c) **Revise-pending reply accept is a compare-and-swap** (the reject-pending guard
+  does not transfer — reject makes the run terminal, revision keeps it
+  `awaiting_approval`, so two replies would both pass): accepting the first reply
+  atomically clears `revise_pending` (conditional `SetSlackRunGate`, single winner); the
+  loser gets the nudge.
+  (d) **All gate-anchor writes are generation-guarded** (one ordering rule): the
+  notifier writes `gate_ts`/`gate_generation` when posting generation N; gatekeeper /
+  replier clears are conditional on the anchor still pointing at the message they acted
+  on — stale writers lose, so a replier clear can never clobber the freshly-posted v2
+  anchor.
+  (e) **The plan-in-thread post is bound to the fresh-gate branch, keyed by the same
+  generation** — never `handle()`; §340's worker-side epoch discard covers verdicts sent
+  *before* the re-report, (a)+(b) cover clicks *after* it.
+- **Deliberate trust-model change (accepted residual):** plan content now leaves the box
+  to Slack's cloud (retention, admin export, e-discovery). Plan bodies quote source /
+  issue content, and neither the worker redactor (the run's four secrets) nor
+  `ScrubSecrets` (three credential patterns) catches an unrelated secret a model quoted
+  into a plan (`AKIA…`, a plain password). Gate posts go to the owner's 1:1 DM, so the
+  boundary is Slack's cloud + workspace admin/export, not other members. Scoped to
+  `plan_md` only — all other content minimization stands. `docs/slack.md` and
+  ARCHITECTURE.md's trust model MUST say plan content now goes to Slack's cloud and
+  non-pattern secrets in plans are unscrubbed.

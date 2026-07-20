@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -145,16 +146,46 @@ func TestProvisionHostedWorkerRejectsMalformedBody(t *testing.T) {
 
 // The M5 dialog collects type + size only, but workers.name is NOT NULL. The
 // derived name is cosmetic (the controller never reads it — its poll deliberately
-// does not select the name), so this pins only the shape the UI will show.
+// does not select the name) and carries a random hex suffix so two same-size workers
+// self-disambiguate, so this pins the FORMAT (base.l-<rand>) rather than an exact
+// string.
 func TestDerivedHostedWorkerName(t *testing.T) {
-	if got := derivedHostedWorkerName("base", "m"); got != "base (M)" {
-		t.Fatalf("derivedHostedWorkerName = %q, want %q", got, "base (M)")
+	got, err := derivedHostedWorkerName("base", "m")
+	if err != nil {
+		t.Fatalf("derivedHostedWorkerName: %v", err)
 	}
-	if got := derivedHostedWorkerName("jvm", "l"); got != "jvm (L)" {
-		t.Fatalf("derivedHostedWorkerName = %q, want %q", got, "jvm (L)")
+	if !regexp.MustCompile(`^base\.m-[0-9a-f]{4}$`).MatchString(got) {
+		t.Fatalf("derivedHostedWorkerName = %q, want to match base.m-<hex4>", got)
 	}
-	if len(derivedHostedWorkerName("base", "m")) > maxWorkerNameBytes {
-		t.Fatal("derived name must fit the name cap")
+	if len(got) > maxWorkerNameBytes {
+		t.Fatalf("derived name %q must fit the name cap", got)
+	}
+
+	got, err = derivedHostedWorkerName("jvm", "l")
+	if err != nil {
+		t.Fatalf("derivedHostedWorkerName: %v", err)
+	}
+	if !regexp.MustCompile(`^jvm\.l-[0-9a-f]{4}$`).MatchString(got) {
+		t.Fatalf("derivedHostedWorkerName = %q, want to match jvm.l-<hex4>", got)
+	}
+
+	// The suffix must actually vary — that is the whole point of appending random
+	// hex (two same-size workers self-disambiguate). A constant/zero suffix would
+	// still pass the format regex above, so prove distinctness directly. Across 8
+	// calls with identical inputs we require at least two distinct names; the only
+	// way that fails is if the suffix is not random. (Two independent 16-bit
+	// suffixes collide with p≈1/65536, so 8 draws collapsing to a single value has
+	// probability ~(1/65536)^7 — a negligible-but-nonzero flake we accept.)
+	seen := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		n, err := derivedHostedWorkerName("base", "m")
+		if err != nil {
+			t.Fatalf("derivedHostedWorkerName: %v", err)
+		}
+		seen[n] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("derivedHostedWorkerName produced only one distinct name across 8 calls (%v); random suffix is not varying", seen)
 	}
 }
 

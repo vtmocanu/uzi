@@ -79,6 +79,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			RunTimeoutSeconds:  7200,
 			IdleTimeoutSeconds: 600,
 			MaxIterations:      5,
+			PlanMaxRevisions:   3, // PRD #41 plan-revision cap
 			DefaultModel:       strptr("sonnet"),
 			SkillMaxBytes:      65536,
 			SkillsMaxPerRun:    32,

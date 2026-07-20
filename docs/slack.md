@@ -7,8 +7,9 @@ audience: user
 # Slack notifications
 
 uzi can DM you about runs you own: started, needs your approval, finished with
-a merge request, or failed — and you can **Approve** or **Reject** a plan
-gate right from Slack, or reply in the thread to steer a live run. The bot is
+a merge request, or failed — and you can **Approve**, **Reject**, or
+**Request changes** to a plan gate right from Slack, or reply in the thread
+to steer a live run. The bot is
 **outbound-only** (Socket Mode): it opens a connection out to Slack, so there's
 no public URL or inbound port to expose. See
 [ARCHITECTURE.md](../ARCHITECTURE.md#slack-integration-outbound-only) for the
@@ -111,10 +112,23 @@ Open **Settings → Notifications**:
 
 ## Using it
 
-- **Plan gate**: the `awaiting_approval` DM carries **Approve** / **Reject** /
-  **Open in uzi**. Approve resumes the run immediately. Reject swaps in a
-  **Reject without reason** button and asks you to reply in the thread with a
-  reason instead — a threaded reply there *is* the rejection.
+- **Plan gate**: the `awaiting_approval` DM carries **Approve** /
+  **Request changes** / **Reject** / **Open in uzi**, and the plan body
+  itself is posted into the run thread so you can read it without leaving
+  Slack (see the privacy note below). Approve resumes the run immediately.
+  Reject swaps in a **Reject without reason** button and asks you to reply
+  in the thread with a reason instead — a threaded reply there *is* the
+  rejection.
+- **Requesting changes from Slack**: press **Request changes**, then reply
+  in the thread with your feedback — that reply *is* the feedback, sent to
+  the same planning session that produced the plan. The agent revises on
+  the same run, and the updated plan (v2, v3, ...) posts as a fresh gate
+  message in the thread with the previous one marked "superseded"; a click
+  on a superseded message is refused rather than silently ignored, so you
+  can never approve a plan you didn't actually see. Rounds are bounded, and
+  a full round — see plan, request changes, reply with feedback, see the
+  new plan, approve — works from Slack alone. See [Plan approval
+  gate](./run-activity.md#plan-approval-gate) for the web-side equivalent.
 - **Choosing agents from Slack**: when the repo ships its own agents in
   `.claude/agents/`, the gate shows **two** approve buttons — **Approve · repo
   agents (N)** and **Approve · my templates** — and lists the repo agent names
@@ -125,9 +139,11 @@ Open **Settings → Notifications**:
   as before, and so do gate messages posted before this feature shipped.
 - **Steering a live run**: reply in the thread outside a gate and it's
   submitted as a follow-up instruction, with a ✅ reaction as the ack.
-- Only status, repository path, issue number and title, MR link, and failure
-  reason ever appear in a message — never the plan body or a diff; the plan
-  is one click away behind the deep link.
+- Otherwise only status, repository path, issue number and title, MR link,
+  and failure reason ever appear in a message — diff content never leaves
+  uzi. **The plan body is the one exception**, deliberately (see the
+  privacy note below): a gated plan, and each revision, does leave the box
+  for the run thread.
 - Approving or rejecting from the web UI updates the Slack message too (and
   vice versa), so a stale button press just gets a quiet "already handled".
 - **Run judge and self-improvement**: if you've opted into the [run
@@ -145,7 +161,7 @@ Open **Settings → Notifications**:
   <flag>` suffix, and you get one threaded nudge — at most once per cooldown
   window (30 minutes by default, admin-tunable) even if the run flaps
   between flags in that time. An approval-idle nudge threads under the
-  existing plan-gate message, right next to the Approve/Reject buttons.
+  existing plan-gate message, right next to its action buttons.
   When the run recovers, the root label reverts on its own and nudging
   stops — no action needed.
 
@@ -159,6 +175,18 @@ Open **Settings → Notifications**:
   `.claude/agents/`, the agent **names** (short kebab-case identifiers, at most
   16, ≤64 chars each) also appear in the gate DM so you can choose that roster;
   their **descriptions** are never sent.
+- **Plan content also leaves the box, deliberately.** Every gated plan (and
+  each revision from a Request-changes round) is posted into the run's
+  Slack thread in full — a user-approved trade so a whole approval round can
+  be driven from Slack alone. This is a real widening of what leaves uzi:
+  plan bodies quote source and issue content, and **only known credential
+  *patterns*** (Slack/Anthropic/GitLab/uzi token shapes) are stripped before
+  posting — a secret a model happens to quote into a plan verbatim (a pasted
+  API key, a password) is **not** caught by any layer. Gate posts still go
+  only to your own 1:1 DM, so the added exposure is Slack's cloud (retention,
+  admin export, e-discovery) and your workspace's own admin boundary, not
+  other members. See [ARCHITECTURE.md](../ARCHITECTURE.md#slack-integration-outbound-only)
+  and `prds/41-plan-revision-gate.md` (Decision 10) for the full rationale.
 - **Rotating a token from Settings**: uzi hot-reloads a changed token within
   one settings poll (about 5 seconds) and tears down the old socket — there's
   a brief window where the previous connection can still be live.

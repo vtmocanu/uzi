@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -102,7 +104,13 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		name = derivedHostedWorkerName(template, size)
+		derived, err := derivedHostedWorkerName(template, size)
+		if err != nil {
+			slog.Error("derive hosted worker name", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		name = derived
 	}
 	if len(name) > maxWorkerNameBytes {
 		httpx.Error(w, http.StatusBadRequest, "name must be at most 200 characters")
@@ -154,10 +162,21 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 // (the M5 dialog collects type + size, but workers.name is NOT NULL). Names are not
 // unique-constrained and the controller never reads one — its desired-state poll
 // deliberately does not select the name, since object names derive from the uuid —
-// so a derived, non-unique name is safe and purely cosmetic. Size upper-cases for
-// display only; the stored/wire value stays lowercase.
-func derivedHostedWorkerName(template, size string) string {
-	return fmt.Sprintf("%s (%s)", template, strings.ToUpper(size))
+// so a derived, non-unique name is safe and purely cosmetic.
+//
+// The format is AWS-style dot notation: template + the t-shirt letter, plus a short
+// random hex id, e.g. "base.l-a32f". The random suffix lets the name self-disambiguate
+// so two large `base` workers never visibly collide; random (not a counter) means no
+// new state to keep and no reused or gap numbers after a delete. The name stays
+// cosmetic and is NOT unique-constrained. Generating the suffix reads from crypto/rand,
+// which can in principle fail — hence the error return, matching jointoken.Generate.
+func derivedHostedWorkerName(template, size string) (string, error) {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("derived worker name: read random: %w", err)
+	}
+	suffix := hex.EncodeToString(b[:])
+	return fmt.Sprintf("%s.%s-%s", template, strings.ToLower(size), suffix), nil
 }
 
 // provisionHostedWorker is the provision transaction: lock, count, insert, seal,

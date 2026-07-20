@@ -1,7 +1,7 @@
 # PRD #41: Plan revision at the approval gate — "Request changes" instead of kill-and-retry
 
 **GitLab Issue**: [vtmocanu/uzi#41](https://gitlab.example.com/vtmocanu/uzi/-/issues/41)
-**Status**: Draft — two review rounds 2026-07-10, 3 agents each (design, security, fact-check). Round 1 findings marked ↳review; round 2 (fresh-eyes on the revised text + the Slack parity scope) marked ↳review-r2 — its blockers reshaped Decisions 2/3 into the single epoch-tagged gate-event mechanism and hardened Decision 10's anchor lifecycle. Fact-checks: round 1 all 24 claims verified; round 2 all claims verified (2 wording nits fixed).
+**Status**: Complete — implemented via MR !85 (merged to main 2026-07-20), plus a post-merge review-hardening pass: gate-anchor compare-and-swap on the reject/revise-pending transition (Decision 10d, closes a cross-surface re-gate orphaning race), an atomic FOR-UPDATE revision-cap enqueue (closes the count-then-insert TOCTOU), notifier count-error skip (no generation burn), a replier feedback-loss ephemeral, and batch-once gate servicing so `[approve, revise]` takes the revision. Design: two review rounds 2026-07-10, 3 agents each (design, security, fact-check); round 2 (↳review-r2) reshaped Decisions 2/3 into the single epoch-tagged gate-event mechanism and hardened Decision 10's anchor lifecycle. Fact-checks: round 1 all 24 claims verified; round 2 all claims verified (2 wording nits fixed).
 **Priority**: Medium
 **Created**: 2026-07-10
 **Mockup**: `prds/mockups/41-plan-revision-mock.html` (4 states: gate open → Request-changes composer → revising → re-gated v2)

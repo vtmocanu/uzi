@@ -594,6 +594,10 @@ export interface Worker {
   // controller-internal and the DTO does not carry it.
   kind: "external" | "hosted";
   hosted_size: string | null;
+  // Whether this hosted worker carries the rootless-DinD sidecar (PRD #83 M3).
+  // Absent/undefined or null for an external worker (docker is not applicable),
+  // false for a hosted worker without the sidecar, true for a docker-capable one.
+  docker?: boolean;
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
@@ -1024,7 +1028,7 @@ export interface RunMessage {
   created_at: string;
 }
 
-export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
+export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "revise_plan" | "cancel";
 
 // SteerInput is one follow_up steer-queue entry (PRD #95), from GET /api/runs/{id}/
 // inputs. Delivery status is derived client-side: consumed_at null ⇒ Queued (the worker

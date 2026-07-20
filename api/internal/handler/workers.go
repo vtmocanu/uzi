@@ -71,12 +71,23 @@ func int8PtrValue(i pgtype.Int8) *int64 {
 	return &v
 }
 
+// boolPtrValue applies the JSON-null vs value convention to a nullable bool column
+// (worker.docker_enabled, PRD #83 M3): NULL → JSON null (docker not applicable to an
+// external worker), else the stored true/false.
+func boolPtrValue(b pgtype.Bool) *bool {
+	if !b.Valid {
+		return nil
+	}
+	v := b.Bool
+	return &v
+}
+
 // maxWorkerNameBytes bounds a worker's human label.
 const maxWorkerNameBytes = 200
 
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
-	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true,
+	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
 }
 
 // -------------------------------------------------------------------------
@@ -98,6 +109,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) apitypes.Wor
 		Status:             w.Status,
 		Kind:               w.Kind,
 		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:             boolPtrValue(w.DockerEnabled),
 		Busy:               busy,
 		ActiveRuns:         activeRuns,
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
@@ -120,6 +132,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) apitypes.WorkerDTO {
 		Status:             w.Status,
 		Kind:               w.Kind,
 		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:             boolPtrValue(w.DockerEnabled),
 		Busy:               w.Busy,
 		ActiveRuns:         int(w.ActiveRuns),
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
@@ -534,7 +547,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan")
 		return
 	}
 
@@ -545,6 +558,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrReviseCapReached):
+			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		default:

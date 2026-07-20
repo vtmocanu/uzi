@@ -11,6 +11,32 @@ The run view's activity pane shows your crew at work: a roster strip for
 scroll position around, and a steer queue that tells you whether a
 follow-up you sent actually reached the worker.
 
+## Plan approval gate
+
+Before implementation starts, a run parks at `awaiting_approval` with the
+lead's plan on screen and three actions:
+
+| Action | What happens |
+|---|---|
+| **Approve plan** | Locks in the agent selection and starts implementation. |
+| **Request changes** | Send feedback in a text box; it goes to the *same* planning session (same run, same branch, full context retained), the agent revises, and the gate re-opens with an updated plan (`v2`, `v3`, ...) for you to review. |
+| **Reject** | Fails the run with your free-text reason — unchanged. |
+
+Revision rounds are bounded (the header shows "revision N of 3" by
+default) and share the run's single approval-timeout budget across every
+round — three rounds do not buy three separate 24h windows, see [Worker
+setup](./worker-setup.md#concurrent-runs). An approve or reject sent while
+a revision is in flight is discarded rather than silently applied to a
+plan you never saw: only a decision made against the plan actually on
+screen ever takes effect. Superseded plan versions collapse into a
+history accordion below the current one, and your feedback for each round
+is stored in the run feed alongside the plan it produced — visible to
+admins the same way a reject reason or a follow-up already is.
+
+Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
+A full revision round also works end to end from
+[Slack](./slack.md#using-it), without opening the web UI.
+
 ## Crew roster
 
 One chip per agent, with a state dot:

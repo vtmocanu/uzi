@@ -169,6 +169,7 @@ func run() error {
 		RunTimeout:                  cfg.RunTimeout,
 		RunIdleTimeout:              cfg.RunIdleTimeout,
 		RunMaxIterations:            cfg.RunMaxIterations,
+		PlanMaxRevisions:            cfg.PlanMaxRevisions,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
@@ -693,6 +694,11 @@ func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (sto
 // selection (reject_plan / — never approve_plan from the gate).
 func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
 	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body, nil)
+	// PRD #41: translate the revision-cap sentinel so the Slack replier can show
+	// the "revision limit reached" ephemeral (mirrors ErrSelectionRejected below).
+	if errors.Is(err, workersvc.ErrReviseCapReached) {
+		return slacksvc.ErrReviseCapReached
+	}
 	return err
 }
 

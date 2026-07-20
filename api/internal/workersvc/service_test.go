@@ -129,6 +129,13 @@ type fakeStore struct {
 	workerByID         store.Worker
 	workerByIDErr      error
 	createdInput       *store.CreateRunInputParams
+	// reviseCount is the number of persisted revise_plan rows the fake pretends the run
+	// already has (PRD #41 plan-revision cap); reviseCountRunID captures the run id the
+	// read-only cap query was asked about. reviseCapArg captures the atomic capped-enqueue
+	// call, which enforces the cap against reviseCount vs arg.MaxRevisions.
+	reviseCount        int64
+	reviseCountRunID   *uuid.UUID
+	reviseCapArg       *store.CreateRunReviseInputIfUnderCapParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
@@ -426,6 +433,19 @@ func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputPa
 	f.createdInput = &arg
 	return store.RunUserInput{}, nil
 }
+func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (int64, error) {
+	f.reviseCountRunID = &runID
+	return f.reviseCount, nil
+}
+func (f *fakeStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error) {
+	f.reviseCapArg = &arg
+	// Emulate the atomic cap: the insert happens only while the already-persisted count
+	// is strictly under the cap, else no row (pgx.ErrNoRows) — same as the real query.
+	if f.reviseCount >= int64(arg.MaxRevisions) {
+		return store.RunUserInput{}, pgx.ErrNoRows
+	}
+	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: "revise_plan", Body: arg.Body}, nil
+}
 func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.createdStopVerdict = &arg
 	return store.RunUserInput{}, nil
@@ -490,6 +510,7 @@ func testParams() Params {
 		RunTimeout:            2 * time.Hour,
 		RunIdleTimeout:        10 * time.Minute,
 		RunMaxIterations:      5,
+		PlanMaxRevisions:      3,
 		RunMaxRequeues:        1,
 		WorkerHeartbeatStale:  45 * time.Second,
 		WorkerAffinityGrace:   2 * time.Minute,
@@ -1476,6 +1497,109 @@ func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "completed"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil); err != ErrRunTerminal {
+		t.Fatalf("err = %v, want ErrRunTerminal", err)
+	}
+}
+
+// A revise_plan is a plain enqueue (PRD #41): it goes through the atomic capped-enqueue
+// query with the feedback body and never stamps a stop signal, so it is NOT a
+// deliberate-stop verdict like cancel/reject_plan, and it never takes the plain
+// CreateRunInput path (which has no cap).
+func TestSubmitInputRevisePlanEnqueuesPlain(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{
+		runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+		reviseCount: 0,
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "use pgx not gorm", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("revise_plan is never a server-side transition")
+	}
+	if fs.reviseCapArg == nil || fs.reviseCapArg.RunID != runID {
+		t.Fatalf("revise_plan not enqueued via the capped path: %+v", fs.reviseCapArg)
+	}
+	if fs.reviseCapArg.Body.String != "use pgx not gorm" {
+		t.Fatalf("revise body = %q, want feedback text", fs.reviseCapArg.Body.String)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("revise_plan must not use the uncapped CreateRunInput path, got %+v", fs.createdInput)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatalf("revise_plan must not use the stop-verdict path, got %+v", fs.createdStopVerdict)
+	}
+}
+
+// The cap counts ALL revise_plan rows (no consumed_at filter): the cap query is
+// asked about the run, and a count already at the limit rejects with
+// ErrReviseCapReached before any enqueue.
+func TestSubmitInputRevisePlanCapReached(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	// PlanMaxRevisions is 3; a run already at 3 persisted revisions (consumed or not)
+	// is at the cap, so the next revise is rejected.
+	fs := &fakeStore{
+		runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+		reviseCount: 3,
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "again", nil); err != ErrReviseCapReached {
+		t.Fatalf("err = %v, want ErrReviseCapReached", err)
+	}
+	if fs.reviseCapArg == nil || fs.reviseCapArg.RunID != runID {
+		t.Fatalf("capped enqueue not scoped to run %s, got %v", runID, fs.reviseCapArg)
+	}
+	if fs.reviseCapArg.MaxRevisions != 3 {
+		t.Fatalf("cap passed to the query = %d, want PlanMaxRevisions 3", fs.reviseCapArg.MaxRevisions)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("no plain enqueue expected once capped, got %+v", fs.createdInput)
+	}
+}
+
+// Off-by-one at the cap boundary: with PlanMaxRevisions=3, an existing count of 2
+// (the 3rd revise) is accepted, but a count of 3 (the 4th) is rejected.
+func TestSubmitInputRevisePlanCapBoundary(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	svc := func(count int64) (*fakeStore, *Service) {
+		fs := &fakeStore{
+			runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+			reviseCount: count,
+		}
+		return fs, New(fs, newBox(t), testParams())
+	}
+
+	// 3rd revise (2 already persisted) → accepted.
+	fs3, s3 := svc(2)
+	if _, err := s3.SubmitInput(context.Background(), user, runID, "revise_plan", "third", nil); err != nil {
+		t.Fatalf("3rd revise should be accepted: %v", err)
+	}
+	if fs3.reviseCapArg == nil {
+		t.Fatal("3rd revise should have enqueued via the capped path")
+	}
+
+	// 4th revise (3 already persisted) → rejected.
+	_, s4 := svc(3)
+	if _, err := s4.SubmitInput(context.Background(), user, runID, "revise_plan", "fourth", nil); err != ErrReviseCapReached {
+		t.Fatalf("4th revise err = %v, want ErrReviseCapReached", err)
+	}
+}
+
+// A revise on a terminal run is blocked by the existing terminal guard (before the
+// cap query runs).
+func TestSubmitInputRevisePlanRejectsTerminalRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "failed"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "x", nil); err != ErrRunTerminal {
 		t.Fatalf("err = %v, want ErrRunTerminal", err)
 	}
 }

@@ -63,14 +63,15 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
 
   it("derives a name from template + size when the form sends none", async () => {
     // The M5 form collects type + size and no name, so this is the live path, not a
-    // fallback: it mirrors the handler's derivedHostedWorkerName. Upper-case is for
-    // display only — hosted_size above stays lowercase.
+    // fallback: it mirrors the handler's derivedHostedWorkerName, now AWS-style
+    // `base.s-<4-hex>` (dot notation, lowercase letter, hex suffix). The mock's suffix
+    // is counter-derived rather than crypto/rand, so we match the shape, not a literal.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect((await api.provisionHostedWorker("base", "s")).worker.name).toBe("base (S)");
+    expect((await api.provisionHostedWorker("base", "s")).worker.name).toMatch(/^base\.s-[0-9a-f]{4}$/);
     // docker=false, then a WHITESPACE name (4th arg) → still derived. The name arg
     // moved behind docker (PRD #83 M3), so it is passed positionally here.
-    expect((await api.provisionHostedWorker("jvm", "m", false, "  ")).worker.name).toBe("jvm (M)");
+    expect((await api.provisionHostedWorker("jvm", "m", false, "  ")).worker.name).toMatch(/^jvm\.m-[0-9a-f]{4}$/);
   });
 
   it("marks every seeded hand-run worker external, so the badge means something", async () => {
