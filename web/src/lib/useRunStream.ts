@@ -112,6 +112,11 @@ export function useRunStream(runId: string) {
       ws.onopen = () => {
         setConnected(true);
         void replay();
+        // Reconcile the steer queue on every (re)connect, alongside the message
+        // replay (PRD #95 S1): the `input` frame is droppable, so a follow-up
+        // consumed while we were disconnected would otherwise strand at Queued —
+        // this refetch is the source of truth that self-heals it.
+        void refreshInputs();
       };
       ws.onmessage = (ev) => {
         let frame: WsEvent;
@@ -127,6 +132,12 @@ export function useRunStream(runId: string) {
         // without a reconnect — and a burst of frames coalesces into one REST call.
         if (effects.replay) scheduleCatchup();
         if (effects.refreshRun) void refreshRun();
+        // Refetch the steer queue on the data-less `input` frame (the fast path) AND
+        // on any state/health-driven refresh (PRD #95 S1): consuming a follow-up flips
+        // the run to running from awaiting_approval too, so state/health frames co-fire
+        // with the input frame — refetching on both keeps the queue live even if the
+        // hub dropped the input frame for a slow subscriber.
+        if (frame.type === "input" || effects.refreshRun) void refreshInputs();
       };
       ws.onclose = () => {
         setConnected(false);
@@ -164,6 +175,37 @@ export function useRunStream(runId: string) {
 
   const submit = useCallback(
     async (kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
+      // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
+      // optimistically prepend a temp entry (the queue is newest-first), then adopt
+      // the real id + created_at the write returns so a later refetch — which replaces
+      // the list wholesale — reconciles cleanly on the same id. On failure, roll the
+      // optimistic entry back and rethrow so the caller's act() surfaces the error.
+      if (kind === "follow_up") {
+        const tempId = -Date.now();
+        const optimistic: SteerInput = {
+          id: tempId,
+          body,
+          created_at: new Date().toISOString(),
+          consumed_at: null,
+        };
+        setInputs((prev) => [optimistic, ...prev]);
+        let res: { id?: number; created_at?: string };
+        try {
+          res = await api.submitRunInput(runId, kind, body, selection);
+        } catch (e) {
+          setInputs((prev) => prev.filter((i) => i.id !== tempId));
+          throw e;
+        }
+        setInputs((prev) =>
+          prev.map((i) =>
+            i.id === tempId
+              ? { ...i, id: res.id ?? i.id, created_at: res.created_at ?? i.created_at }
+              : i,
+          ),
+        );
+        void refreshRun();
+        return;
+      }
       await api.submitRunInput(runId, kind, body, selection);
       void refreshRun();
     },

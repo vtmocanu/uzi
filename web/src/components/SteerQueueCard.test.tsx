@@ -1,0 +1,184 @@
+// @vitest-environment jsdom
+//
+// PRD #95 M3: the steer queue's five delivery states (Decision 7) are derived
+// client-side from (consumed_at, run.status), and the queue must SURVIVE the run
+// going terminal (B1) — it lives in its own card lifted to useRunStream, not inside
+// the !terminal-gated composer, so "Not delivered — run finished" is reachable.
+
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { SteerQueueCard } from "./SteerQueueCard";
+import type { SteerInput } from "../lib/api";
+
+afterEach(cleanup);
+
+function input(over: Partial<SteerInput> = {}): SteerInput {
+  return { id: 1, body: "resume the agent", created_at: "2026-07-20T10:00:00Z", consumed_at: null, ...over };
+}
+
+const noop = () => {};
+
+describe("SteerQueueCard delivery states (Decision 7)", () => {
+  it("NULL consumed_at + live, not-at-gate → Queued", () => {
+    render(
+      <SteerQueueCard inputs={[input()]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(screen.getByText("Queued")).toBeTruthy();
+  });
+
+  it("NULL consumed_at + awaiting_approval → still Queued (worker has not consumed it yet)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input()]}
+        terminal={false}
+        status="awaiting_approval"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Queued")).toBeTruthy();
+    expect(screen.queryByText(/applies after approval/)).toBeNull();
+  });
+
+  it("consumed + awaiting_approval → 'Delivered — applies after approval' (the honest gate copy, S3)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
+        terminal={false}
+        status="awaiting_approval"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Delivered — applies after approval")).toBeTruthy();
+    // The bare "Delivered" chip must NOT also appear for this entry.
+    expect(screen.queryByText(/^Delivered$/)).toBeNull();
+  });
+
+  it("consumed + running → plain Delivered", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Delivered")).toBeTruthy();
+  });
+
+  it("consumed + terminal → plain Delivered (a delivered input stays delivered after the run ends)", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
+        terminal={true}
+        status="completed"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Delivered")).toBeTruthy();
+  });
+
+  it("NULL consumed_at + terminal → 'Not delivered — run finished'", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input()]}
+        terminal={true}
+        status="completed"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Not delivered — run finished")).toBeTruthy();
+  });
+
+  it("gate copy degrades to plain Delivered when status is not provided", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
+        terminal={false}
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Delivered")).toBeTruthy();
+    expect(screen.queryByText(/applies after approval/)).toBeNull();
+  });
+});
+
+describe("SteerQueueCard survives the terminal transition (B1)", () => {
+  it("renders the queue read-only (no composer, no Stop) on a terminal run with a non-empty queue", () => {
+    render(
+      <SteerQueueCard
+        inputs={[input()]}
+        terminal={true}
+        status="completed"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    // Queue still shows...
+    expect(screen.getByText("resume the agent")).toBeTruthy();
+    // ...but the live-only steering controls are gone.
+    expect(screen.queryByText("Send follow-up")).toBeNull();
+    expect(screen.queryByText("Stop run")).toBeNull();
+  });
+
+  it("renders nothing on a terminal run with an empty queue", () => {
+    const { container } = render(
+      <SteerQueueCard inputs={[]} terminal={true} status="completed" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("a live run shows the composer + Stop alongside the queue", () => {
+    render(
+      <SteerQueueCard inputs={[input()]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(screen.getByText("Send follow-up")).toBeTruthy();
+    expect(screen.getByText("Stop run")).toBeTruthy();
+  });
+
+  it("a stable transition keeps a delivered entry's chip: same queue, terminal flips", () => {
+    const rows = [input({ id: 5, consumed_at: "2026-07-20T10:01:00Z" })];
+    const { rerender } = render(
+      <SteerQueueCard inputs={rows} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(screen.getByText("Delivered")).toBeTruthy();
+    // The run completes; the same lifted queue re-renders read-only, chip unchanged.
+    rerender(
+      <SteerQueueCard inputs={rows} terminal={true} status="completed" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(screen.getByText("Delivered")).toBeTruthy();
+    expect(screen.queryByText("Send follow-up")).toBeNull();
+  });
+});
+
+// A silent-onSend guard: the card must not throw when send/stop are wired to noops
+// (RunView routes them through act()); this is a smoke assertion, not a behavior test.
+describe("SteerQueueCard smoke", () => {
+  it("does not crash rendering an optimistic (negative temp id) entry as Queued", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    render(
+      <SteerQueueCard
+        inputs={[input({ id: -1700000000000 })]}
+        terminal={false}
+        status="running"
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Queued")).toBeTruthy();
+    vi.restoreAllMocks();
+  });
+});
