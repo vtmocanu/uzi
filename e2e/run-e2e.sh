@@ -1153,6 +1153,139 @@ else
 fi
 
 # =============================================================================
+# PRD #97 M2 — live /api/ws frame assertion + uzi CLI smoke. Two full-wire-only
+# consumers no lower layer reaches: the browser's primary real-time transport
+# (/api/ws — every OTHER stream assertion in this harness uses the REST ?after=<seq>
+# replay path, so the hub-broadcast → client wire is never exercised end to end) and
+# the `uzi` CLI (a co-equal API consumer, api/cmd/uzi, that silently rots when a
+# route/DTO change updates only web/). Both are separate HTTP clients on the real wire.
+#
+# PLACEMENT (deliberate): M2 sits BEFORE the M1 git-auth leg, not after it. M2 drives two
+# runs to completion, so it must NOT be the phase immediately preceding the timing-sensitive
+# PRD #95 steer-queue phase, whose assertion needs a follow-up to still be Queued *before*
+# the worker claims+steers the run — a worker freshly freed by an M2 run (warm clone cache)
+# claims the next run fast enough to consume the follow-up first (observed: consumed 7ms
+# after submit). Landing M2 here keeps the proven M1 → main-reject git-probes → PRD #95
+# sequence intact between M2 and PRD #95.
+#
+# --- Leg 1: live /api/ws frame assertion -------------------------------------
+# /api/ws authenticates via the session JWT cookie (uzi_auth), NOT a bearer token —
+# it is a GET upgrade behind RequireAuth (handler.go: the cookie-only tail), with an
+# Origin==Host same-origin check (CSWSH defense) and per-run owner/admin authz in
+# ServeWS (ws.go). No new tooling (fable review): the agent container's Node 22 has a
+# global WebSocket that honours a {headers} option, so we plumb the admin jar's cookie
+# into the upgrade and reach the api directly at ws://api:8080 (UZI_API_URL) — the SAME
+# WS server the browser hits through nginx, so this proves the api hub→client wire, not
+# nginx. A frame is live-only (no replay), so the probe subscribes FIRST, then on socket
+# open approves the parked plan from inside node; the run resumes and broadcasts its
+# persisted run_messages only AFTER the subscription exists (mirrors ServeWS's unit test
+# "publish after dial"). Receiving a run_message frame proves the wire; a DTO/route drift
+# or a broken hub→client path yields none ⇒ TIMEOUT ⇒ FAIL. A no-cookie upgrade is
+# separately asserted to be REJECTED, so a "would accept anything" gate cannot pass here.
+say "PRD #97 M2: a live /api/ws subscription receives a run_message frame during a run (not REST replay)"
+
+# Build the Cookie header for the upgrade. The auth cookie (uzi_auth) is HttpOnly, so curl
+# writes it into the Netscape jar with a "#HttpOnly_" domain prefix — a naive /^#/ skip
+# drops it (leaving only the non-HttpOnly uzi_csrf, which RequireAuth then 401s). awk
+# field-splits that prefix into $1, so name/value stay $6/$7; extract uzi_auth (authN) and
+# uzi_csrf (for the in-probe approve's CSRF check) by NAME, mirroring csrf() ($6=="uzi_csrf").
+WS_CSRF="$(csrf)"
+WS_AUTH="$(awk '$6=="uzi_auth"{print $7}' "$JAR")"
+{ [ -n "$WS_AUTH" ] && [ -n "$WS_CSRF" ]; } || fail "could not read uzi_auth/uzi_csrf from the admin jar ($JAR)"
+WS_COOKIE="uzi_auth=$WS_AUTH; uzi_csrf=$WS_CSRF"
+WS_API="http://api:8080"                       # the agent reaches the api here (UZI_API_URL)
+WS_ORIGIN="http://api:8080"                     # match Host so ServeWS's same-origin Accept passes
+
+# A run parked at the plan gate, dedicated to this leg (the probe's approve is its real
+# approval).
+IID_WS="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E ws","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+{ [ -n "$IID_WS" ] && [ "$IID_WS" != null ]; } || fail "could not create the /api/ws issue"
+RUN_WS="$(create_run "$REPO_ID" "$IID_WS")" || fail "ws-leg run was not created"
+wait_status "$RUN_WS" awaiting_approval
+
+# NEGATIVE control FIRST (run still parked, so a valid run id — the ONLY rejection reason
+# is the missing cookie): a no-cookie upgrade must be refused (RequireAuth 401s before any
+# upgrade), proving the auth gate is real and the positive assertion non-vacuous.
+WS_NEG_PROBE='const wsurl=process.argv[1], origin=process.argv[2];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Origin:origin}});ws.addEventListener("open",()=>finish(1,"OPENED_WITHOUT_COOKIE"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
+if NEG_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WS_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WS" "$WS_ORIGIN")"; then
+  pass "no-cookie /api/ws upgrade is rejected ($NEG_OUT) — the WS auth gate is real"
+else
+  fail "no-cookie /api/ws upgrade was NOT rejected (probe: ${NEG_OUT:-<none>}) — the cookie auth gate is broken/vacuous"
+fi
+
+# POSITIVE: subscribe with the admin cookie, approve on open, assert a run_message frame.
+WS_PROBE='const wsurl=process.argv[1], cookie=process.argv[2], approveUrl=process.argv[3], csrf=process.argv[4], origin=process.argv[5];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Cookie:cookie,Origin:origin}});ws.addEventListener("open",()=>{ fetch(approveUrl,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":csrf,"Cookie":cookie},body:JSON.stringify({kind:"approve_plan",body:""})}).catch(e=>finish(2,"APPROVE_ERR="+e.message)); });ws.addEventListener("message",(ev)=>{ let f; try{ f=JSON.parse(ev.data); }catch(e){ return; } if(f.type==="message"&&f.seq>0){ finish(0,"FRAME type=message seq="+f.seq+(f.agent?(" agent="+f.agent):"")+" kind="+(f.kind||"")); } });ws.addEventListener("error",(e)=>{ fetch(wsurl.replace(/^ws/,"http"),{headers:{Cookie:cookie,Origin:origin}}).then(r=>finish(5,"WS_ERR http_probe_status="+r.status+" msg="+((e&&e.message)||""))).catch(err=>finish(5,"WS_ERR msg="+((e&&e.message)||"")+" (diag_fetch_failed="+err.message+")")); });setTimeout(()=>finish(6,"TIMEOUT no live /api/ws run_message frame"),25000);'
+if WS_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WS_PROBE" \
+    "$WS_API/api/ws?run=$RUN_WS" "$WS_COOKIE" "$WS_API/api/runs/$RUN_WS/inputs" "$WS_CSRF" "$WS_ORIGIN")"; then
+  pass "live /api/ws frame received during a real run: $WS_OUT"
+else
+  fail "no live /api/ws run_message frame (probe: ${WS_OUT:-<none>}) — hub-broadcast wire or DTO drift"
+fi
+# The probe's approve drove the run: confirm it advances to completed (closes the loop and
+# leaves RUN_WS terminal, not parked).
+wait_status "$RUN_WS" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "the WS-triggered approve drove RUN_WS to completed"
+
+# --- Leg 2: uzi CLI smoke against the live api -------------------------------
+# The uzi CLI (api/cmd/uzi, docs/cli.md) is a second consumer of the SAME API the web UI
+# drives; a route/DTO/behavior change that only touches web/ can leave it silently stale
+# (CLAUDE.md: "New uzi functionality ⇒ check api/cmd/uzi/"). Build it and drive a thin but
+# real flow — a list that must MATCH the api's own view, then a state-changing approve —
+# so DTO/route drift in the CLI turns the run red. It runs on the HOST against $BASE (the
+# loopback http origin the CLI accepts for 127.0.0.1), authed headless via a minted uzc_
+# $UZI_TOKEN — no cookie, no browser (docs/cli.md).
+say "PRD #97 M2: uzi CLI drives the live api (run list matches + approve advances a run)"
+command -v go >/dev/null 2>&1 || fail "the uzi CLI leg needs 'go' on PATH to build api/cmd/uzi (host tool)"
+UZI_BIN="$RUNROOT/uzi"
+# Build the throwaway CLI: prefer the clean build so VCS stamping is preserved in a normal
+# checkout; fall back to -buildvcs=false ONLY when a linked worktree blocks VCS status
+# (the team's PRD layout — a plain `go build` there fails with "error obtaining VCS status").
+# The flag rides only this test-binary build, never a product/CI build path. A real compile
+# error still surfaces: the fallback build (no 2>/dev/null) prints it before `fail`.
+( cd "$ROOT/api" && go build -o "$UZI_BIN" ./cmd/uzi 2>/dev/null ) \
+  || ( cd "$ROOT/api" && go build -buildvcs=false -o "$UZI_BIN" ./cmd/uzi ) \
+  || fail "could not build the uzi CLI (go build ./cmd/uzi)"
+pass "built the uzi CLI binary"
+
+# Mint a uzc_ (user-scope) CLI token from the harness admin session: POST /api/me/cli-tokens
+# is cookie-only (RequireAuth + CSRF, via apipost) and returns the plaintext token exactly
+# once in .token (handler CreateCLIToken; docs/cli.md "Settings → Access"). scope defaults
+# to "user" ⇒ a uzc_ token capped to the owner's (admin's) own authority.
+UZI_TOKEN_VAL="$(apipost "/api/me/cli-tokens" '{"name":"e2e-m2-cli-smoke"}' | jq -r '.token')"
+{ [ -n "$UZI_TOKEN_VAL" ] && [ "$UZI_TOKEN_VAL" != null ] && [ "${UZI_TOKEN_VAL#uzc_}" != "$UZI_TOKEN_VAL" ]; } \
+  || fail "did not mint a uzc_ CLI token via POST /api/me/cli-tokens (got '${UZI_TOKEN_VAL:-<none>}')"
+pass "minted a uzc_ CLI token via POST /api/me/cli-tokens (headless \$UZI_TOKEN auth)"
+
+# Run the CLI hermetically: HOME → the scratch rundir so it never reads/writes the
+# operator's ~/.config/uzi or ~/.claude; UZI_URL/UZI_TOKEN override any config file;
+# UZI_SKILL_AUTO_UPGRADE=0 so it drops no Claude Code skill.
+uzi_cli() { env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" UZI_SKILL_AUTO_UPGRADE=0 "$UZI_BIN" "$@"; }
+
+# (1) `uzi run list --json` must parse AND its run-id set must equal GET /api/runs's — a
+# DTO/route drift (renamed envelope key, changed id field, moved route) makes them diverge.
+CLI_RUNS="$(uzi_cli run list --json)" || fail "uzi run list --json failed (exit $?)"
+echo "$CLI_RUNS" | jq -e 'type=="array"' >/dev/null || fail "uzi run list --json is not a JSON array: $CLI_RUNS"
+API_IDS="$(apiget /api/runs | jq -S '[.runs[].id]|sort')"
+CLI_IDS="$(echo "$CLI_RUNS" | jq -S '[.[].id]|sort')"
+[ "$API_IDS" = "$CLI_IDS" ] \
+  || fail "uzi run list run-ids diverge from GET /api/runs (cli=$CLI_IDS api=$API_IDS)"
+pass "uzi run list --json parses and matches GET /api/runs ($(echo "$CLI_IDS" | jq 'length') runs)"
+
+# (2) A real state-changing round-trip through the CLI: create + park a run, then
+# `uzi run approve` it (the CLI's own submitInput → POST /api/runs/{id}/inputs) and assert
+# it advances to completed. Owner-scoped: the uzc_ token owns these runs (minted from the
+# same admin session that created them).
+IID_CLI="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E cli approve","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+{ [ -n "$IID_CLI" ] && [ "$IID_CLI" != null ]; } || fail "could not create the cli-approve issue"
+RUN_CLI="$(create_run "$REPO_ID" "$IID_CLI")" || fail "cli-leg run was not created"
+wait_status "$RUN_CLI" awaiting_approval
+uzi_cli run approve "$RUN_CLI" >/dev/null || fail "uzi run approve failed (exit $?)"
+wait_status "$RUN_CLI" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve route/DTO intact)"
+
+# =============================================================================
 # PRD #97 M1 — git-over-HTTPS Basic-auth push (on EVERY default run) + the
 # main-push-refused backstop. Two full-wire-only properties the lower layers cannot
 # reach.

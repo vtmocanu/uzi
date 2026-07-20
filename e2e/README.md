@@ -13,7 +13,8 @@ side; this exercises the real wire).
 ```
 
 Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
-host. **Docker Engine >= 25** is recommended: the overlay's healthchecks set
+host — plus **`go`** (the PRD #97 M2 CLI leg builds `api/cmd/uzi` on the host and
+drives the running api with it). **Docker Engine >= 25** is recommended: the overlay's healthchecks set
 `start_interval: 1s` (probe every second during `start_period`), which trims the
 first-probe floor off the full-stack `--wait` boots. Older engines silently ignore
 the field, so the suite still runs correctly — just a few seconds slower per boot.
@@ -113,6 +114,20 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
    already concurrency-safe, so this exercises the worker-loop + server + API path,
    **not** the M1 per-run executor kill/reap isolation fix (guarded by an `agent/`
    unit test).
+10. **Live `/api/ws` + `uzi` CLI (PRD #97 M2)** — two full-wire-only consumers no
+    lower layer reaches. **WS**: the agent's Node 22 global `WebSocket` subscribes to
+    `/api/ws?run=<id>` (the browser's primary real-time transport; every *other*
+    stream assertion here uses the REST `?after=<seq>` replay), authenticating with
+    the admin **session cookie** plumbed into the upgrade — a GET upgrade behind
+    `RequireAuth`, with a same-origin (CSWSH) check and per-run authz. It subscribes
+    **first**, then approves the parked plan on socket open, and asserts it receives a
+    live `run_message` frame (hub-broadcast → client wire, not REST replay); a
+    **no-cookie** upgrade is separately asserted to be **rejected**, so the gate is
+    non-vacuous. **CLI**: `api/cmd/uzi` is built on the host and pointed at the live
+    api, authed headless via a minted `uzc_` `$UZI_TOKEN` (from `POST
+    /api/me/cli-tokens`); `uzi run list --json` must parse and its run-id set must
+    equal `GET /api/runs`'s, then `uzi run approve` drives a parked run to
+    `completed` — so DTO/route drift in either consumer turns the run red.
 
 ## How the fakes are wired (no real GitLab, no live session)
 
