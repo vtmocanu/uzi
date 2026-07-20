@@ -3,7 +3,7 @@ import { applyFrame, emptyStream, ingest, ingestMany, startRunGate } from "./run
 import type { RunMessage } from "./api";
 
 function msg(seq: number): RunMessage {
-  return { seq, kind: "text", agent: null, payload: `m${seq}`, created_at: "" };
+  return { seq, kind: "text", agent: null, agent_instance: null, agent_label: null, payload: `m${seq}`, created_at: "" };
 }
 
 function seqs(msgs: RunMessage[]): number[] {
@@ -74,6 +74,31 @@ describe("applyFrame", () => {
     const r = applyFrame(s, { type: "message", seq: 2, kind: "text", payload: "x" });
     expect(r.effects).toEqual({ replay: false, refreshRun: false });
     expect(seqs(r.state.messages)).toEqual([1, 2]);
+  });
+
+  it("carries agent_instance + agent_label off the live frame, defaulting to null", () => {
+    // PRD #99 Decision 6: applyFrame is the ONLY place a live message becomes a
+    // RunMessage — there is no REST re-read — so a subagent frame that loses its
+    // instance id here lands in the wrong lane until the next replay.
+    const s = emptyStream();
+    const withInstance = applyFrame(s, {
+      type: "message",
+      seq: 1,
+      kind: "tool_use",
+      agent: "coder",
+      agent_instance: "toolu_A",
+      agent_label: "web gate UX",
+      payload: "x",
+    });
+    expect(withInstance.state.messages[0].agent_instance).toBe("toolu_A");
+    expect(withInstance.state.messages[0].agent_label).toBe("web gate UX");
+
+    // A lead frame omits both keys; they must become null, never undefined — the
+    // lane key is `agent_instance ?? agent ?? "lead"`, and the pane's fallback
+    // reads a null, not an absent property.
+    const lead = applyFrame(withInstance.state, { type: "message", seq: 2, kind: "text", agent: "lead", payload: "x" });
+    expect(lead.state.messages[1].agent_instance).toBeNull();
+    expect(lead.state.messages[1].agent_label).toBeNull();
   });
 
   it("flags a replay when a message frame arrives past a gap", () => {

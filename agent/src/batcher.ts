@@ -47,6 +47,10 @@ export class MessageBatcher {
     // if a tool_result echoed the OAuth token from the agent's env.
     const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: this.redact(msg.payload) };
     if (msg.agent !== undefined) out.agent = msg.agent;
+    // PRD #99: copied the same way as `agent` — present only when the frame had
+    // them, so the API's pgText("") maps absence to SQL NULL rather than "".
+    if (msg.agentInstance !== undefined) out.agent_instance = msg.agentInstance;
+    if (msg.agentLabel !== undefined) out.agent_label = msg.agentLabel;
     // Every outgoing run message passes through here — the single chokepoint for
     // dumping raw frames to the operator's `docker logs` at debug level (PRD #11
     // §4). Log the redacted payload (the child logger's SecretRegistry scrubs the

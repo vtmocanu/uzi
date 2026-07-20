@@ -16,7 +16,7 @@ function m(
   agent = "lead",
   created_at = "2026-07-04T00:00:00.000Z",
 ): RunMessage {
-  return { seq, kind, agent, payload, created_at };
+  return { seq, kind, agent, agent_instance: null, agent_label: null, payload, created_at };
 }
 
 // A minimal Run fixture — the crew ladder reads only status + health; the rest is

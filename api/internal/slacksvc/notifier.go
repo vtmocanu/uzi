@@ -161,7 +161,8 @@ func (n *Notifier) PublishState(runID uuid.UUID, status string) {
 
 // PublishMessage is a deliberate no-op: run message CONTENT never goes to Slack
 // (content minimization — only status/title/links do).
-func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
+func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, string, string, []byte, time.Time) {
+}
 
 // PublishInput is a deliberate no-op (PRD #95): the steer-queue delivery ack is a
 // web/CLI concern (browsers re-read the owner-gated queue). Steer text never goes to

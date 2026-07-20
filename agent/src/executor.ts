@@ -17,6 +17,11 @@ const execFileAsync = promisify(execFile);
 export interface EmittedMessage {
   kind: MessageKind;
   agent?: string;
+  /** The subagent INVOCATION id (SDK `parent_tool_use_id`) and the task it was
+   *  given (SDK `task_description`), PRD #99. Both are pure per-frame fields —
+   *  no correlation state — and absent for the lead and for infra frames. */
+  agentInstance?: string;
+  agentLabel?: string;
   payload: Record<string, unknown>;
 }
 

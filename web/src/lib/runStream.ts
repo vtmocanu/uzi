@@ -93,6 +93,11 @@ export function applyFrame(
       seq: frame.seq,
       kind: frame.kind ?? "",
       agent: frame.agent ?? null,
+      // PRD #99: the lane identity rides the frame, so a live subagent message
+      // lanes correctly with no REST re-read. Absent ⇒ null (the lead, an infra
+      // frame, or a pre-migration replay), which the pane falls back off.
+      agent_instance: frame.agent_instance ?? null,
+      agent_label: frame.agent_label ?? null,
       payload: frame.payload,
       created_at: frame.created_at ?? new Date().toISOString(),
     };

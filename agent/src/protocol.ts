@@ -457,6 +457,12 @@ export interface WorkerRunMessage {
   seq: number;
   kind: string;
   agent: string | null;
+  /** PRD #99 subagent invocation id + task label. The API serves these on every
+   *  MessageDTO (including the judge's trace of a target issue run, where two
+   *  parallel same-role subagents differ only here), so the READ type declares
+   *  them; optional because a pre-#99 API omits the keys entirely. */
+  agent_instance?: string | null;
+  agent_label?: string | null;
   payload: Record<string, unknown> | null;
   created_at: string;
 }
@@ -520,6 +526,13 @@ export interface OutgoingMessage {
   kind: MessageKind;
   /** Which (sub)agent produced it (lead|coder|reviewer|…); worker for infra. */
   agent?: string;
+  /** Which INVOCATION of that agent produced it (PRD #99) — the SDK's per-frame
+   *  `parent_tool_use_id`. Absent for the lead and for infra frames. Two parallel
+   *  same-role subagents differ only here, so the pane can lane them apart. */
+  agent_instance?: string;
+  /** What that invocation was asked to do (PRD #99) — the SDK's per-frame
+   *  `task_description`. Absent for the lead and whenever the SDK omits it. */
+  agent_label?: string;
   payload: Record<string, unknown>;
 }
 

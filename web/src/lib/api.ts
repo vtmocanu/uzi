@@ -1024,6 +1024,12 @@ export interface RunMessage {
   seq: number;
   kind: string;
   agent: string | null;
+  // agent_instance is the subagent INVOCATION id (the SDK's per-frame
+  // parent_tool_use_id, PRD #99), agent_label the task description that
+  // invocation was given. Both null for the lead, for infra frames, and for every
+  // pre-migration message — consumers fall back to `agent`.
+  agent_instance: string | null;
+  agent_label: string | null;
   payload: unknown;
   created_at: string;
 }
@@ -1077,6 +1083,12 @@ export interface WsEvent {
   seq?: number;
   kind?: string;
   agent?: string | null;
+  // PRD #99: the live frame carries the lane identity itself — useRunStream
+  // builds its RunMessage straight from the frame with no REST re-read, so a
+  // subagent message can only land in the right lane if the frame says which
+  // invocation produced it. Omitted (not "") when absent, exactly like `agent`.
+  agent_instance?: string | null;
+  agent_label?: string | null;
   payload?: unknown;
   created_at?: string;
   status?: string;

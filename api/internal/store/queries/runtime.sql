@@ -577,15 +577,18 @@ WHERE worker_id = @worker_id
 -- name: InsertRunMessage :execrows
 -- Idempotent seq-numbered append: a re-delivered batch (worker retry) is a
 -- no-op on the duplicate (run_id, seq).
-INSERT INTO run_messages (run_id, seq, kind, agent, payload)
-VALUES (@run_id, @seq, @kind, @agent, @payload)
+INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
+VALUES (@run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload)
 ON CONFLICT (run_id, seq) DO NOTHING;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
 -- cache on top of this.
-SELECT id, run_id, seq, kind, agent, payload, created_at
+-- Column order matches the run_messages table order (the two PRD #99 columns were
+-- appended by 00076), so sqlc keeps returning store.RunMessage rather than
+-- minting a separate ...Row type.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -744,7 +747,9 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 -- A bounded page of a run's messages after a seq (the worker read tool's paging).
 -- Authorization (the run is the worker's user's) is checked by the caller before
 -- this; here @lim caps the page so a single response can't be unbounded.
-SELECT id, run_id, seq, kind, agent, payload, created_at
+-- Column order matches the table (see ListRunMessagesAfter) so the row stays
+-- store.RunMessage.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC

@@ -102,6 +102,8 @@ export function appendMessage(
     seq: (log[log.length - 1]?.seq ?? 0) + 1,
     kind,
     agent,
+    agent_instance: null,
+    agent_label: null,
     payload,
     created_at: new Date().toISOString(),
   };

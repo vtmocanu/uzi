@@ -65,3 +65,57 @@ describe("MessageBatcher debug logging (PRD #11 M4)", () => {
     assert.equal(debugLines.length, 2);
   });
 });
+
+// PRD #99: the batcher is the single place an EmittedMessage becomes an
+// OutgoingMessage, so it is the only place the instance id + task label can be
+// dropped on the way to the API. Absence must stay ABSENT (key omitted), not "",
+// because the API maps the empty string to SQL NULL only by never receiving it as
+// a meaningful value — an explicit "" would persist as NULL too, but a key that is
+// present-and-empty muddies the wire contract the read side asserts on.
+describe("MessageBatcher instance/label pass-through (PRD #99)", () => {
+  it("copies agentInstance + agentLabel onto the outgoing message", async () => {
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(client, "run-1", 0, 0, logger);
+
+    batcher.emit({
+      kind: "tool_use",
+      agent: "coder",
+      agentInstance: "toolu_A",
+      agentLabel: "web gate UX",
+      payload: { name: "Edit" },
+    });
+    await batcher.close();
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]?.agent_instance, "toolu_A");
+    assert.equal(sent[0]?.agent_label, "web gate UX");
+  });
+
+  it("omits both keys for a lead frame that carries neither", async () => {
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(client, "run-1", 0, 0, logger);
+
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "delegating" } });
+    await batcher.close();
+
+    assert.equal(sent.length, 1);
+    const out = sent[0] as unknown as Record<string, unknown>;
+    assert.ok(!("agent_instance" in out), "a lead frame must not carry an agent_instance key");
+    assert.ok(!("agent_label" in out), "a lead frame must not carry an agent_label key");
+  });
+
+  it("carries an instance with no label independently", async () => {
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(client, "run-1", 0, 0, logger);
+
+    batcher.emit({ kind: "text", agent: "reviewer", agentInstance: "toolu_C", payload: { text: "x" } });
+    await batcher.close();
+
+    assert.equal(sent[0]?.agent_instance, "toolu_C");
+    const out = sent[0] as unknown as Record<string, unknown>;
+    assert.ok(!("agent_label" in out), "a labelless frame must not carry an agent_label key");
+  });
+});

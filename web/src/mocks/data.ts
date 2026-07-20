@@ -1448,6 +1448,8 @@ const dm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++doneSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: doneAt(minAgo),
 });
@@ -1501,6 +1503,8 @@ const am = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++awaitSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1521,6 +1525,8 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
   seq: ++failSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: daysAgo(1.15),
 });
@@ -1558,6 +1564,8 @@ const cm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++crewSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1587,6 +1595,8 @@ const gm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++degradedSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1757,6 +1767,8 @@ function makeChatLog(entries: [kind: string, agent: string | null, payload: unkn
     seq: i + 1,
     kind,
     agent,
+    agent_instance: null,
+    agent_label: null,
     payload,
     created_at: minsAgo(6 - i * 0.5),
   }));

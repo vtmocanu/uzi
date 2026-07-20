@@ -296,8 +296,10 @@ type Params struct {
 // serves no live channel. Every method is best-effort and must never block or
 // error the persistence path (the DB write is authoritative).
 type Broadcaster interface {
-	// PublishMessage forwards one newly-persisted run message.
-	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
+	// PublishMessage forwards one newly-persisted run message. agentInstance and
+	// agentLabel are the PRD #99 per-frame subagent invocation id + task label,
+	// empty for the lead and for infra frames.
+	PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
 	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
@@ -322,9 +324,9 @@ type Broadcaster interface {
 // valid no-op broadcaster.
 type MultiBroadcaster []Broadcaster
 
-func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time) {
+func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time) {
 	for _, b := range m {
-		b.PublishMessage(runID, seq, kind, agent, payload, createdAt)
+		b.PublishMessage(runID, seq, kind, agent, agentInstance, agentLabel, payload, createdAt)
 	}
 }
 
@@ -888,10 +890,15 @@ func decodePackageList(raw []byte) []string {
 
 // IncomingMessage is one seq-numbered message a worker appends.
 type IncomingMessage struct {
-	Seq     int32           `json:"seq"`
-	Kind    string          `json:"kind"`
-	Agent   string          `json:"agent"`
-	Payload json.RawMessage `json:"payload"`
+	Seq   int32  `json:"seq"`
+	Kind  string `json:"kind"`
+	Agent string `json:"agent"`
+	// AgentInstance/AgentLabel are the PRD #99 per-frame subagent invocation id
+	// (the SDK's parent_tool_use_id) and its task description. Both are absent
+	// for the lead and for infra frames; empty string persists as SQL NULL.
+	AgentInstance string          `json:"agent_instance,omitempty"`
+	AgentLabel    string          `json:"agent_label,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
 }
 
 // AppendMessages persists a worker's batched messages (idempotent on
@@ -917,11 +924,13 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
 		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
-			RunID:   runID,
-			Seq:     m.Seq,
-			Kind:    m.Kind,
-			Agent:   pgText(m.Agent),
-			Payload: []byte(m.Payload),
+			RunID:         runID,
+			Seq:           m.Seq,
+			Kind:          m.Kind,
+			Agent:         pgText(m.Agent),
+			AgentInstance: pgText(m.AgentInstance),
+			AgentLabel:    pgText(m.AgentLabel),
+			Payload:       []byte(m.Payload),
 		})
 		if err != nil {
 			return err
@@ -953,7 +962,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if s.bcast != nil {
 		now := s.now()
 		for _, m := range inserted {
-			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, []byte(m.Payload), now)
+			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, m.AgentInstance, m.AgentLabel, []byte(m.Payload), now)
 		}
 	}
 	return nil
