@@ -178,6 +178,27 @@ describe("ActivityFeed crew roster", () => {
     expect(getByTitle("lead: idle")).toBeTruthy(); // quiet, non-active
   });
 
+  it("the header one-liner never reuses the crew-state lexicon (a tool_result reads 'Ran a tool')", () => {
+    // web-ux regression: agentOneLiner returned the literal "Working" for a
+    // tool_result, so a blocked/non-active agent's header read "Working" while its
+    // crew chip read "idle" — a momentary contradiction. The one-liner must use a
+    // non-state phrase.
+    const now = Date.now();
+    const old = new Date(now - 60_000).toISOString();
+    const fresh = new Date(now - 500).toISOString();
+    const msgs = [
+      m(1, "text", { text: "planning" }, "lead", old),
+      m(2, "tool_use", { id: "u1", name: "Read", input: { file_path: "/x" } }, "lead", old),
+      m(3, "tool_result", { tool_use_id: "u1", content: "ok" }, "lead", old), // lead's newest → idle
+      m(4, "text", { text: "implementing" }, "worker", fresh), // active
+    ];
+    const { getByText, getByTitle } = renderFeed(msgs, { status: "running", health: "ok" });
+    // lead is non-active + quiet → its chip reads `idle`…
+    expect(getByTitle("lead: idle")).toBeTruthy();
+    // …so its header one-liner must NOT echo a state word — a tool_result reads "Ran a tool".
+    expect(getByText("Ran a tool")).toBeTruthy();
+  });
+
   it("a terminal run reads every agent `done`", () => {
     const { getByTitle, container } = renderFeed(leadWorkerLead(), { status: "completed" });
     expect(getByTitle("lead: done")).toBeTruthy();
