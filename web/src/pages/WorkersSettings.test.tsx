@@ -113,29 +113,49 @@ describe("WorkersSettings resource gauges (PRD #49)", () => {
 describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
   const hosted = aWorker({ id: "w-h", name: "base (M)", kind: "hosted", hosted_size: "m" });
 
-  it("marks a hosted row with its kind and size, and leaves external rows unmarked", async () => {
+  it("marks a hosted row with its kind, leaves external rows unmarked, and shows no size badge", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [hosted, aWorker({ id: "w-x", name: "laptop" })] });
     renderPage();
 
     // One list, marked — not two lists: a hosted worker is an ordinary worker whose
     // container the controller runs, so it keeps the same row, status and delete.
     expect(await screen.findByText("hosted")).toBeTruthy();
-    expect(screen.getByText("size M")).toBeTruthy(); // upper-cased for reading; "m" on the wire
     expect(screen.getAllByText("hosted")).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(2);
+    // The size now lives in the derived name ("base (M)"), not a badge — the "size X"
+    // chip was dropped (it duplicated the name) in favour of a docker badge.
+    expect(screen.queryByText(/^size /)).toBeNull();
   });
 
-  it("carries the size in the chip's TEXT, where every user can reach it", async () => {
-    // Not a title and not sr-only. Badge renders a bare <span> — ARIA role `generic`,
-    // where naming is prohibited — so a title is a hover tooltip no screen reader must
-    // read, and sr-only would answer the screen reader while leaving a sighted keyboard
-    // or touch user an unexplained letter with nothing to hover. Text reaches all three.
+  it("renders no size badge for a hosted worker (size lives in the name now)", async () => {
+    // The "size M" chip is gone: it repeated what the derived name already says
+    // ("base (M)"). Nothing in the row carries a bare-letter or "size ..." badge.
     mockApi.listWorkers.mockResolvedValue({ workers: [hosted] });
     renderPage();
-    const chip = await screen.findByText("size M");
-    expect(chip.textContent).toBe("size M");
-    // The lone letter is gone: nothing in the row says just "M".
-    expect(screen.queryByText("M")).toBeNull();
+    await screen.findByText("hosted");
+    expect(screen.queryByText(/^size /)).toBeNull();
+    expect(screen.queryByText("size M")).toBeNull();
+  });
+
+  it("shows a docker badge for a docker-capable hosted worker, and none otherwise", async () => {
+    // The docker capability (PRD #83 M3) is real TEXT — the word "docker". true renders
+    // the badge; false/undefined renders nothing (absence needs no badge).
+    const dockerHosted = aWorker({ id: "w-hd", name: "base (M)", kind: "hosted", hosted_size: "m", docker: true });
+    const plainHosted = aWorker({ id: "w-hp", name: "base (S)", kind: "hosted", hosted_size: "s", docker: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [dockerHosted, plainHosted] });
+    renderPage();
+
+    await screen.findByText("base (M)");
+    expect(screen.getByText("docker")).toBeTruthy();
+    // Exactly one docker badge: the sidecar-less worker (docker:false) shows none.
+    expect(screen.getAllByText("docker")).toHaveLength(1);
+
+    // And a hosted worker with docker undefined shows no badge either.
+    cleanup();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ id: "w-hu", name: "base (L)", kind: "hosted", hosted_size: "l" })] });
+    renderPage();
+    await screen.findByText("base (L)");
+    expect(screen.queryByText("docker")).toBeNull();
   });
 
   it("badges a hosted row even when hosting is switched off (never leave a row lying)", async () => {

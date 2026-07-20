@@ -179,7 +179,7 @@ func TestPipelineDTOTags(t *testing.T) {
 // workerDTOKeys is the WorkerDTO tag set (no omitempty fields). Shared by the
 // WorkerDTO pin and the AdminWorkerDTO embed pin.
 var workerDTOKeys = []string{
-	"id", "name", "status", "kind", "hosted_size", "busy", "active_runs",
+	"id", "name", "status", "kind", "hosted_size", "docker", "busy", "active_runs",
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",

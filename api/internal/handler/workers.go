@@ -71,6 +71,17 @@ func int8PtrValue(i pgtype.Int8) *int64 {
 	return &v
 }
 
+// boolPtrValue applies the JSON-null vs value convention to a nullable bool column
+// (worker.docker_enabled, PRD #83 M3): NULL → JSON null (docker not applicable to an
+// external worker), else the stored true/false.
+func boolPtrValue(b pgtype.Bool) *bool {
+	if !b.Valid {
+		return nil
+	}
+	v := b.Bool
+	return &v
+}
+
 // maxWorkerNameBytes bounds a worker's human label.
 const maxWorkerNameBytes = 200
 
@@ -98,6 +109,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) apitypes.Wor
 		Status:             w.Status,
 		Kind:               w.Kind,
 		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:             boolPtrValue(w.DockerEnabled),
 		Busy:               busy,
 		ActiveRuns:         activeRuns,
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
@@ -120,6 +132,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) apitypes.WorkerDTO {
 		Status:             w.Status,
 		Kind:               w.Kind,
 		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:             boolPtrValue(w.DockerEnabled),
 		Busy:               w.Busy,
 		ActiveRuns:         int(w.ActiveRuns),
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),

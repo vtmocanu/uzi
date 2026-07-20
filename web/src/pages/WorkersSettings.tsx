@@ -7,7 +7,6 @@ import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Sel
 import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
-import { sizeLabel } from "../lib/workerSizes";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
@@ -321,23 +320,17 @@ export function WorkersSettings() {
                         <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
                           hosted
                         </Badge>
-                        {/* A bare letter here, deliberately. M6 put the quantities in
-                            the provision picker ("M — up to 2 CPU / 4Gi RAM / 10Gi
-                            disk"), which is where they inform anything: choice time.
-                            And once the worker reports, the memory bar below this row
-                            spells the ceiling out ("1.1/4 GiB · 27%"), so the row can
-                            recover what the size bought. Repeating the quantities on
-                            every row would be noise on a list.
-                            If anyone ever does want them here, they must go in the
-                            TEXT: Badge renders a bare <span>, whose ARIA role is
-                            `generic`, and naming is PROHIBITED on generic — aria-label
-                            is ignored outright and title degrades to a hover tooltip no
-                            screen reader is obliged to read. sr-only would answer the
-                            screen reader and still leave a sighted KEYBOARD or TOUCH
-                            user with an unexplained letter and nothing to hover. Text
-                            is the only channel that reaches all three at once, and it
-                            needs no ARIA to do it. */}
-                        {w.hosted_size && <Badge>size {sizeLabel(w.hosted_size)}</Badge>}
+                        {/* The docker capability (PRD #83 M3) is real TEXT — the word
+                            "docker" — not a letter or an icon. Badge renders a bare
+                            <span>, whose ARIA role is `generic`, where naming is
+                            PROHIBITED: aria-label is ignored outright and title degrades
+                            to a hover tooltip no screen reader is obliged to read, while
+                            sr-only would answer the screen reader and still leave a
+                            sighted keyboard or touch user a symbol with nothing to hover.
+                            A word reaches sighted, keyboard, and screen-reader users at
+                            once, and needs no ARIA to do it. Absence needs no badge, so a
+                            worker without the sidecar renders nothing. */}
+                        {w.docker === true && <Badge>docker</Badge>}
                       </>
                     )}
                     {hasTemplateDrift(w.template_declared, w.template_reported) && (
