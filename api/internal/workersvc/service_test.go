@@ -1761,6 +1761,7 @@ type fakeBroadcaster struct {
 	statuses     []string
 	healths      []string
 	healthNudges []bool
+	inputRuns    []uuid.UUID
 }
 
 func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ []byte, _ time.Time) {
@@ -1772,6 +1773,9 @@ func (b *fakeBroadcaster) PublishState(_ uuid.UUID, status string) {
 func (b *fakeBroadcaster) PublishHealth(_ uuid.UUID, health, _ string, nudge bool) {
 	b.healths = append(b.healths, health)
 	b.healthNudges = append(b.healthNudges, nudge)
+}
+func (b *fakeBroadcaster) PublishInput(runID uuid.UUID) {
+	b.inputRuns = append(b.inputRuns, runID)
 }
 
 func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {
@@ -1825,6 +1829,72 @@ func TestSetStateBroadcastsAppliedStatus(t *testing.T) {
 	}
 	if len(b.statuses) != 1 || b.statuses[0] != "running" {
 		t.Fatalf("state broadcast = %v, want [running]", b.statuses)
+	}
+}
+
+// TestConsumeInputsBroadcastsOnFollowUp: consuming a batch that includes a follow_up
+// fires exactly one input frame for the run (PRD #95 Decision 5) so the browser
+// re-reads its steer queue and flips Queued → Delivered.
+func TestConsumeInputsBroadcastsOnFollowUp(t *testing.T) {
+	w := worker()
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		consumeRows: []store.ConsumeRunInputsRow{
+			{ID: 1, Kind: "follow_up", Body: pgText("do the thing")},
+		},
+	}
+	svc := New(fs, newBox(t), testParams())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	if _, err := svc.ConsumeInputs(context.Background(), w, runID); err != nil {
+		t.Fatalf("ConsumeInputs: %v", err)
+	}
+	if len(b.inputRuns) != 1 || b.inputRuns[0] != runID {
+		t.Fatalf("input broadcast = %v, want [%s] (one frame for the run)", b.inputRuns, runID)
+	}
+}
+
+// TestConsumeInputsNoBroadcastWithoutFollowUp: a consume of only non-follow_up inputs
+// (approve_plan/cancel/reject own their own UI, never the queue) fires NO input frame,
+// and an empty consume fires none either.
+func TestConsumeInputsNoBroadcastWithoutFollowUp(t *testing.T) {
+	w := worker()
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		consumeRows: []store.ConsumeRunInputsRow{
+			{ID: 1, Kind: "approve_plan"},
+		},
+	}
+	svc := New(fs, newBox(t), testParams())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	if _, err := svc.ConsumeInputs(context.Background(), w, runID); err != nil {
+		t.Fatalf("ConsumeInputs: %v", err)
+	}
+	if len(b.inputRuns) != 0 {
+		t.Fatalf("input broadcast = %v, want none (approve_plan is not a queue entry)", b.inputRuns)
+	}
+}
+
+// TestConsumeInputsNilBroadcasterFollowUp: ConsumeInputs never broadcast before PRD #95,
+// so a service with no broadcaster (the common test/deploy case) must consume a follow_up
+// without panicking — the nil-guard mirrors AppendMessages.
+func TestConsumeInputsNilBroadcasterFollowUp(t *testing.T) {
+	w := worker()
+	runID := uuid.New()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: runID, WorkerID: pgUUID(w.ID)},
+		consumeRows: []store.ConsumeRunInputsRow{
+			{ID: 1, Kind: "follow_up", Body: pgText("resume")},
+		},
+	}
+	svc := New(fs, newBox(t), testParams()) // no SetBroadcaster → s.bcast is nil
+	if _, err := svc.ConsumeInputs(context.Background(), w, runID); err != nil {
+		t.Fatalf("ConsumeInputs with nil broadcaster: %v", err)
 	}
 }
 

@@ -286,6 +286,11 @@ type Broadcaster interface {
 	// event to a WS run-update (browsers re-read the run, picking up the owner-gated
 	// reason over REST) and ignores nudge. Best-effort, never blocks the sweep.
 	PublishHealth(runID uuid.UUID, health, reason string, nudge bool)
+	// PublishInput signals that a run's follow_up steer queue changed (PRD #95) — the
+	// worker consumed a follow-up, stamping consumed_at. Carries no data; the live hub
+	// pokes browsers to re-read GET /runs/{id}/inputs (owner-gated), the Slack notifier
+	// no-ops it (steer text never goes to Slack). Best-effort, never blocks the consume.
+	PublishInput(runID uuid.UUID)
 }
 
 // MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
@@ -309,6 +314,12 @@ func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
 	for _, b := range m {
 		b.PublishHealth(runID, health, reason, nudge)
+	}
+}
+
+func (m MultiBroadcaster) PublishInput(runID uuid.UUID) {
+	for _, b := range m {
+		b.PublishInput(runID)
 	}
 }
 
@@ -1259,8 +1270,21 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		return nil, err
 	}
 	out := make([]InputDTO, 0, len(rows))
+	consumedFollowUp := false
 	for _, row := range rows {
+		if row.Kind == "follow_up" {
+			consumedFollowUp = true
+		}
 		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+	}
+	// Delivery ack (PRD #95 Decision 5): a follow-up is now consumed (consumed_at
+	// stamped, committed above), so poke the browser to re-read its steer queue and
+	// flip Queued → Delivered. Only for follow_up — approve_plan/cancel/reject own
+	// their own UI and never render in the queue. Nil-guarded (mirrors AppendMessages):
+	// ConsumeInputs never broadcast before, so an unset broadcaster (many tests) must
+	// not panic. Best-effort; the REST refetch is the source of truth if this is dropped.
+	if consumedFollowUp && s.bcast != nil {
+		s.bcast.PublishInput(runID)
 	}
 	return out, nil
 }
