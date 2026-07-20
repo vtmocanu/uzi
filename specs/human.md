@@ -265,6 +265,12 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`
 - The Slack plan-approval gate offers the same source choice (two Approve buttons: repo agents / my templates); excluding individual agents is done in the web UI. [user 2026-07-10]
 - The shipped picker is validated visually against the approved mock (`prds/mockups/37-agent-picker-mock.html`). [user 2026-07-10]
 
+## Feature #41 — Plan revision at the approval gate
+
+Tracked as GitLab issue vtmocanu/uzi#41; PRD at `prds/41-plan-revision-gate.md`.
+
+- At the plan gate the user can request changes (bounded rounds) to steer the plan without killing the run.
+
 ## Feature #40 — Token usage & cost reporting (per run / per user / factory-wide)
 
 Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/40-token-usage-reporting.md`.

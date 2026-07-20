@@ -14,6 +14,7 @@ import {
   type EmittedMessage,
   type RunContext,
 } from "../src/executor.js";
+import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
 
 // A throwaway git worktree the stub can write its marker into and commit. No
@@ -145,5 +146,81 @@ describe("StubExecutor — PRD #47 M6 run-health sentinels", () => {
       wt.cleanup();
     }
     assert.equal(tools(emitted, "tool_use").length, 0, "a normal run emits no stub tool calls");
+  });
+});
+
+describe("StubExecutor — PRD #41 plan gate revision loop", () => {
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+
+  // A gate that replays a scripted sequence of verdicts (last entry sticks), recording
+  // the plan text handed to each gatePlan call so the test can assert the stub re-gates
+  // a REVISED plan rather than the original — mirroring sdk-executor.test's makeCtx.
+  function gatePlanScript(verdicts: PlanVerdict[]): { gatePlan: RunContext["gatePlan"]; plans: string[] } {
+    const plans: string[] = [];
+    let call = 0;
+    return {
+      gatePlan: async (planMd) => {
+        plans.push(planMd);
+        return verdicts[Math.min(call++, verdicts.length - 1)]!;
+      },
+      plans,
+    };
+  }
+
+  it("revise → revised plan → re-gate → approve: emits plan_feedback + plan_revising and implements the run", async () => {
+    const wt = makeWorktree();
+    const gate = gatePlanScript([revise("add a rollback step"), approve]);
+    const { ctx, emitted } = makeCtx({ worktreePath: wt.path, gatePlan: gate.gatePlan });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+
+    // The revision was recorded on the feed: a plan_feedback carrying the reviewer's
+    // words, then a 1-based plan_revising round — each precedes the re-gate (feed never
+    // lags the gate).
+    const feedbacks = emitted.filter((m) => m.kind === "plan_feedback");
+    const revisings = emitted.filter((m) => m.kind === "plan_revising");
+    assert.equal(feedbacks.length, 1, "one plan_feedback for the single revise");
+    assert.equal(feedbacks[0]!.payload.feedback, "add a rollback step", "feedback carried verbatim");
+    assert.equal(revisings.length, 1, "one plan_revising for the single revise");
+    assert.equal(revisings[0]!.payload.round, 1, "round is 1-based");
+    assert.ok(
+      emitted.indexOf(feedbacks[0]!) < emitted.indexOf(revisings[0]!),
+      "plan_feedback precedes plan_revising",
+    );
+
+    // The gate ran twice; the second call received a REVISED plan (the original plus a
+    // revision marker), NOT the un-revised plan the stub first submitted.
+    assert.equal(gate.plans.length, 2, "gatePlan called once per round (revise + approve)");
+    assert.ok(gate.plans[1]!.startsWith(gate.plans[0]!), "the revised plan extends the original");
+    assert.notEqual(gate.plans[1], gate.plans[0], "the re-gated plan differs from the original");
+    assert.match(gate.plans[1]!, /revision 1/, "the revised plan carries a revision marker");
+
+    // On approve the stub implemented: it announced approval and committed its work.
+    assert.ok(
+      emitted.some((m) => m.kind === "status" && String(m.payload.text).includes("plan approved")),
+      "the run proceeds to implement after approval",
+    );
+    assert.ok(
+      emitted.some((m) => m.kind === "text" && String(m.payload.text).includes("committed locally")),
+      "the stub committed its work (implemented)",
+    );
+  });
+
+  it("does not revise when the plan is approved on the first gate call", async () => {
+    const wt = makeWorktree();
+    const gate = gatePlanScript([approve]);
+    const { ctx, emitted } = makeCtx({ worktreePath: wt.path, gatePlan: gate.gatePlan });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.equal(gate.plans.length, 1, "a first-call approve gates exactly once");
+    assert.equal(emitted.filter((m) => m.kind === "plan_feedback").length, 0, "no plan_feedback without a revise");
+    assert.equal(emitted.filter((m) => m.kind === "plan_revising").length, 0, "no plan_revising without a revise");
   });
 });
