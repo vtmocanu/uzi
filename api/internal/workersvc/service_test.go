@@ -122,6 +122,11 @@ type fakeStore struct {
 	dispositionDeleteRows int64
 	judgeTriageRows       []store.ListJudgeTriageRowsForUserRow
 	judgeTriageRowsErr    error
+	// judgeBacklogRows backs ListJudgeRecommendationRowsForUser (the PRD #98 M1 grouped
+	// read); backlogUserArg records the id it was scoped to. Both are consumed in
+	// judge_backlog_test.go, which also defines the fake's method.
+	judgeBacklogRows []store.ListJudgeRecommendationRowsForUserRow
+	backlogUserArg   uuid.UUID
 
 	// Submit input.
 	runByID            store.Run

@@ -138,6 +138,28 @@ func TestTriageDTOTags(t *testing.T) {
 		"total", "todo", "filed", "done", "dismissed", "false_positives")
 }
 
+func TestJudgeOccurrenceDTOTags(t *testing.T) {
+	// filed_issue is omitempty: an unfiled (or claimed-but-unsettled) occurrence omits it
+	// entirely rather than shipping a null the consumer has to special-case.
+	assertTags(t, "JudgeOccurrenceDTO", JudgeOccurrenceDTO{},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket")
+	assertTags(t, "JudgeOccurrenceDTO(filed)", JudgeOccurrenceDTO{FiledIssue: &JudgeFiledIssueRefDTO{}},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "filed_issue")
+}
+
+func TestJudgeFiledIssueRefDTOTags(t *testing.T) {
+	assertTags(t, "JudgeFiledIssueRefDTO", JudgeFiledIssueRefDTO{}, "issue_iid", "issue_url", "filed_at")
+}
+
+func TestJudgeRecommendationGroupDTOTags(t *testing.T) {
+	assertTags(t, "JudgeRecommendationGroupDTO", JudgeRecommendationGroupDTO{},
+		"category", "target", "bucket", "open_count", "run_count", "rationale_preview", "occurrences")
+}
+
+func TestJudgeBacklogDTOTags(t *testing.T) {
+	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "triage")
+}
+
 func TestIssueDraftDTOTags(t *testing.T) {
 	assertTags(t, "IssueDraftDTO", IssueDraftDTO{},
 		"default_repo_id", "title", "description", "labels", "provenance", "default_note")

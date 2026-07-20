@@ -75,6 +75,75 @@ type TriageDTO struct {
 	FalsePositives int `json:"false_positives"`
 }
 
+// JudgeFiledIssueRefDTO is the forge issue a single occurrence was filed as (PRD #98 M1).
+// It is the lean, coordinate-free cousin of FiledIssueDTO: inside an occurrence the
+// (category, target) coordinate is the enclosing group's, so only the issue itself is
+// carried. Present ONLY on a SETTLED link — an in-flight claim is omitted, matching the
+// run-page panel and the "filed means settled" rung of the #94 ladder.
+type JudgeFiledIssueRefDTO struct {
+	IssueIID int64     `json:"issue_iid"`
+	IssueURL string    `json:"issue_url"`
+	FiledAt  time.Time `json:"filed_at"`
+}
+
+// JudgeOccurrenceDTO is one run's instance of a deduped recommendation (PRD #98
+// Decision 2): the group is a display construct, but triage state stays PER-COORDINATE,
+// so every occurrence carries its own bucket and its own filed link. run_title is the
+// target run's issue_title. Bucket comes from the shared workersvc.BucketOf ladder
+// (#94 Decision 2) — never a SQL CASE, never a second implementation.
+type JudgeOccurrenceDTO struct {
+	RunID      string `json:"run_id"`
+	RunTitle   string `json:"run_title"`
+	ReviewID   string `json:"review_id"`
+	RecID      string `json:"rec_id"`
+	Verdict    string `json:"verdict"`
+	Confidence string `json:"confidence"`
+	Bucket     string `json:"bucket"`
+	// FiledIssue is the settled forge issue for this occurrence's coordinate, nil when
+	// the coordinate was never filed (or the claim is still in flight).
+	FiledIssue *JudgeFiledIssueRefDTO `json:"filed_issue,omitempty"`
+}
+
+// JudgeRecommendationGroupDTO is one (category, target) coordinate deduped across every
+// run it recurs in (PRD #98 Decisions 1/2) — the Judge menu's row. OpenCount is the
+// number of members whose bucket is todo ("open" means todo; a FILED member is not open,
+// it is on the filed rung). RunCount is the DISTINCT run count behind the group — the
+// "seen in N runs" evidence chip, and the frequency signal the backlog ranks by. Bucket
+// is the group rollup: todo whenever OpenCount >= 1, otherwise the HIGHEST member state
+// on the #94 ladder (dismissed > done > filed).
+//
+// RationalePreview is the most-recent occurrence's rationale_md, TRUNCATED to a preview
+// cap (workersvc.RationalePreviewMaxRunes) and shipped as PLAIN TEXT — deliberately NOT
+// server-side HTML-escaped. It is scrubbed at ingest, and the no-raw-render guarantee is
+// CLIENT-side: every consumer must render it as escaped text (React's default, as
+// web/src/pages/RunView.tsx does for the same fields), never as markdown or HTML.
+// Escaping it here would double-escape in the SPA and print HTML entities into the
+// terminal from `uzi review backlog`.
+type JudgeRecommendationGroupDTO struct {
+	Category         string               `json:"category"`
+	Target           string               `json:"target"`
+	Bucket           string               `json:"bucket"`
+	OpenCount        int                  `json:"open_count"`
+	RunCount         int                  `json:"run_count"`
+	RationalePreview string               `json:"rationale_preview"`
+	Occurrences      []JudgeOccurrenceDTO `json:"occurrences"`
+}
+
+// JudgeBacklogDTO is GET /api/me/judge/recommendations (PRD #98 M1): the caller's
+// all-time, owner-scoped recommendation backlog, deduped by (category, target).
+//
+// Bucket echoes the applied ?bucket= filter (default todo) and Run echoes the ?run=
+// anchor ("" when absent). Triage is deliberately computed over the caller's ENTIRE
+// unfiltered row set — it is the same aggregate GET /me/judge/stats serves, from the
+// same shared BucketTriage ladder, so the page's bucket tabs, the nav badge and the
+// strip cannot drift no matter which filter is applied.
+type JudgeBacklogDTO struct {
+	Bucket string                        `json:"bucket"`
+	Run    string                        `json:"run"`
+	Groups []JudgeRecommendationGroupDTO `json:"groups"`
+	Triage TriageDTO                     `json:"triage"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {

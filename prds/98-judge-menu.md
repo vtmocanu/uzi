@@ -1,7 +1,7 @@
 # PRD #98: Judge menu — a dedicated cross-run recommendation workbench
 
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
-**Status**: Draft (2026-07-20)
+**Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 **Priority**: Medium
 **Mockup**: static concept mock (ember shell + buckets + worklist + the three deltas) at the design artifact; **note** it renders the worklist grouped *by run* — a precursor. This PRD supersedes that with **group-by-target + dedup** (Decision 2); a revised in-repo mock lands with M3 as `prds/mockups/98-judge-menu-mock.html`.
 **Depends on**: PRD #46 (the judge: `run_reviews` + `review_recommendations`, `users.judge_enabled`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed claim-first file flow), PRD #94 (`recommendation_dispositions`, the `bucketOf` ladder, `GET /me/judge/stats`, the global RunsList strip this promotes). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #69 (the judge **control plane** — mode/model/spend/accuracy/consent; this PRD is the complementary output workbench, cleanly separable — see Decision 5's digest-scope note), PRD #47 (RunHealth badge — the per-row badge grammar this mirrors).
@@ -89,8 +89,15 @@ one action.
    target)`**. Per group: `{category, target, occurrences: [{run_id, run_title,
    review_id, rec_id, verdict, confidence, bucket, filed_issue?}], open_count,
    run_count, rationale_preview}` where `rationale_preview` is the most-recent
-   occurrence's escaped `rationale_md` (the panel's no-raw-render rule,
-   `RunView.tsx`) and each `bucket` comes from the shared **`bucketOf`** (PRD #94
+   occurrence's `rationale_md`, truncated and length-capped, shipped as **plain
+   text — NOT server-side HTML-escaped**. (Corrected 2026-07-20 against the code,
+   which this PRD had wrong: the no-raw-render guarantee is **client-side**.
+   `RunView.tsx:959` renders these fields "as escaped plain text (React's default
+   + whitespace-pre-wrap), never markdown/HTML", and `apitypes/review.go:8` ships
+   the scrubbed free text raw; secrets and control chars are already stripped at
+   the review-POST ingest (`workersvc/judge_review.go`). Escaping server-side
+   would double-escape in the SPA and print HTML entities into the terminal from
+   `uzi review backlog`.) Each `bucket` comes from the shared **`bucketOf`** (PRD #94
    Decision 2 — same helper, no re-implementation), so the page's tab totals and
    the nav badge equal the existing strip exactly. A
    `?bucket=todo|filed|done|dismissed|all` filter (default `todo`) and a `?run=`
@@ -212,6 +219,15 @@ one action.
      disposition lands on the **review owner's** coordinate regardless of who
      filed — **filed issues are NOT owner-scoped** (#68 Decision 8 keeps admin
      filing on another user's review; `filed_by_user_id` may be an admin).
+   - **Join the issue cache on `(repo_id, forge_issue_iid)` — never on iid alone —
+     and skip rows whose `filed_repo_id IS NULL`** (audit requirement, 2026-07-20,
+     verified against the code). `issues` is keyed `ON CONFLICT (repo_id,
+     forge_issue_iid)` (`queries/forge.sql:174`): an iid is **per-project, not
+     global**. Since `filed_repo_id` is `ON DELETE SET NULL`, a NULL-repo row joined
+     on iid alone would match any repo's issue with that number — closing issue #7
+     in repo X would auto-Done a recommendation filed as #7 into repo Y, cross-repo
+     and possibly cross-user. Excluding NULL-repo rows makes the documented
+     disabled-repo no-op below a **safe** no-op, not just a silent one.
    - **Preconditions (documented limits):** the issue cache only holds
      **PRD-labeled issues of enabled repos** (`forgesvc/service.go` — reconcile
      evicts de-labeled issues), and `filed_repo_id` is `ON DELETE SET NULL`. So a
@@ -298,7 +314,8 @@ exactly as #68 already does.
       **wider** query (the #94 join shape plus the `runs` join for `issue_title` and
       the verdict/confidence/filed projection, Decision 1), returning groups keyed
       `(category, target)` with the occurrence list, `open_count` (= `bucket==todo`),
-      `run_count`, and escaped `rationale_preview`. **Read is migration-free.**
+      `run_count`, and a plain-text (NOT server-escaped) `rationale_preview`.
+      **Read is migration-free.**
       Store/handler test: dedup groups the same `(category, target)` across ≥2 runs
       into one group with a correct occurrence list; the bucketed totals equal `GET
       /me/judge/stats` for the same fixture (shared `BucketOf`, no re-implementation).
@@ -309,7 +326,20 @@ exactly as #68 already does.
       its own; `IsAdmin` never consulted); idempotent double-call; a partial group
       (some members already settled) dismisses/marks only the open ones. Depends on
       M1 (shared coordinate-resolve helper + DTO). **Bulk filing is NOT here** — see
-      the follow-up note below.
+      the follow-up note below. **Audit requirements folded in 2026-07-20** (each
+      re-derived from the code): this endpoint is the **first place a
+      `category`/`target` arrives from a request body**, and `00071`/`00073` both
+      carry a verbatim comment that they omit a category CHECK *on purpose* because
+      "the handler never accepts a category from the request body" — so the
+      disposition row must be written off the **resolved** recommendation, never
+      echoed from the body (a bogus coordinate then resolves to zero members and
+      writes nothing); `len(items)` is **capped** (400 above it) since this is N
+      resolves + N upserts on a no-CSRF token path; and the response carries **no
+      per-item existence oracle** — "absent" and "another user's" both yield zero
+      members (#94 Decision 5's one-404 rule). The `admin_ro`-on-another-user's-rows
+      test asserts at the **DB level** (their row unchanged), not on HTTP status:
+      with coordinates there is no id to 404 on, so a status-only assertion is
+      vacuous.
 - [ ] **M3 — Judge page + nav (web)**: route `/judge` (with the `?run=` filter for
       the notification deep-link); `<NavItem>` in the Factory group with the
       `triage.todo` badge poll (Decisions 8/9); bucket tabs from `triage`; the
@@ -458,14 +488,13 @@ Judge page header). Single repo, so no cross-repo phase.
   digest** — judge Slack DMs stay one-per-review. **Keyboard triage (j/k)** and a
   **target-file staleness marker** (distinct from #94's rationale-hash stale flag)
   are **Future Work**. [user-decided 2026-07-20]
-- **OPEN — the one scope item to confirm: bulk "file N as one issue" is descoped to
-  a follow-up.** fable's PRD pass showed it is a mini-PRD, not a #68 reuse (repo
-  pick + aggregated human draft + `forgeLimiter` + a `RequireAuth`→`RequireUser`
-  posture change). **Recommendation:** ship v1 with bulk *disposition* + per-rec
-  browser filing (as written), and take bulk file-as-one-issue as a separate PRD.
-  If instead we want it in v1, M2/M3/M7 grow to carry all four of those, and the
-  CLI gains a `file` verb that breaks #68's browser-only stance. Confirm before
-  M2.
+- **RESOLVED — bulk "file N as one issue" is descoped to a follow-up.**
+  [user-decided 2026-07-20] fable's PRD pass showed it is a mini-PRD, not a #68
+  reuse (repo pick + aggregated human draft + `forgeLimiter` + a
+  `RequireAuth`→`RequireUser` posture change). v1 ships bulk *disposition* +
+  per-recommendation browser filing as written; bulk file-as-one-issue becomes a
+  separate PRD. M2/M3/M7 therefore do **not** grow to carry those four concerns,
+  and the CLI gains **no** `file` verb (#68's browser-only stance stands).
 - **This PRD ships exactly one migration** (Decision 6: `set_via` +
   `close_synced_at`); everything else is a new query, new endpoints, and web. The
   read model (M1) is migration-free.

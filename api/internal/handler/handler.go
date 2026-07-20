@@ -355,6 +355,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/me/judge", func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/stats", h.JudgeStats)
+			// The Judge menu's grouped backlog (PRD #98 M1): the same owner-scoped,
+			// all-time aggregate, deduped by (category, target) with the per-run
+			// occurrences. Same mount as /stats so `uzi review backlog` works from a CLI
+			// token; read-only, so no CSRF and no spend.
+			r.Get("/recommendations", h.JudgeRecommendations)
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped

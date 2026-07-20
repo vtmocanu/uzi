@@ -1,0 +1,51 @@
+-- The Judge menu's grouped read model (PRD #98 M1, Decision 1). Same JOIN SPINE as
+-- #94's ListJudgeTriageRowsForUser (dispositions.sql) — the caller's reviews →
+-- recommendations, LEFT JOINed to the filed link + the disposition on the
+-- (review_id, category, target) coordinate — but a genuinely NEW, WIDER query: it
+-- additionally joins `runs` (for issue_title → run_title) and projects the verdict,
+-- the recommendation's confidence/rationale, the rec id, and the filed issue. It is
+-- deliberately NOT a superset reuse of the narrow stats query: that one stays a
+-- three-column scan so the strip's cost never tracks this page's payload.
+
+-- name: ListJudgeRecommendationRowsForUser :many
+-- ONE ROW PER RECOMMENDATION across every review the caller owns, carrying everything
+-- the (category, target) grouping needs. Grouping, bucketing, filtering and the group
+-- rollup all happen in GO (workersvc.GroupJudgeRecommendations): there is deliberately
+-- NO SQL CASE and no GROUP BY here, because the bucket ladder is the one shared Go
+-- helper BucketOf (PRD #94 Decision 2) and a SQL ladder would be a second copy of it.
+--
+-- Nullability: `d.*` and `f.*` come from LEFT JOINs, so sqlc types them nullable even
+-- where the column is NOT NULL in its table. The (f.filed_at IS NOT NULL)::bool cast is
+-- REQUIRED — without it sqlc types the boolean expression column as interface{} (same
+-- note as dispositions.sql). Neither side-table join can fan out: both are UNIQUE on the
+-- coordinate. The `runs` join is 1:1 (rv.target_run_id → runs.id, and target_run_id is
+-- itself UNIQUE), so it cannot fan out either.
+--
+-- Order: most-recent review first, then the review's own recommendation order. The Go
+-- grouper relies on this — a group's FIRST row is its most-recent occurrence, which is
+-- the one whose rationale_md becomes rationale_preview (Decision 1).
+SELECT
+    rv.id                          AS review_id,
+    rv.target_run_id               AS run_id,
+    rv.verdict                     AS verdict,
+    r.issue_title                  AS run_title,
+    rr.id                          AS rec_id,
+    rr.category                    AS category,
+    rr.target                      AS target,
+    rr.rationale_md                AS rationale_md,
+    rr.confidence                  AS confidence,
+    d.status                       AS disposition_status,
+    d.dismiss_reason               AS dismiss_reason,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled,
+    f.filed_issue_iid              AS filed_issue_iid,
+    f.filed_issue_url              AS filed_issue_url,
+    f.filed_at                     AS filed_at
+FROM run_reviews rv
+JOIN runs r ON r.id = rv.target_run_id
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+WHERE rv.user_id = @user_id
+ORDER BY rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC;
