@@ -1,0 +1,268 @@
+# PRD #97: e2e suite hardening & speedup
+
+**GitLab Issue**: [#97](https://gitlab.example.com/vtmocanu/uzi/-/issues/97)
+**Status**: Not started
+**Priority**: Medium
+**Origin**: Three-agent read-only review of the e2e suite (2026-07-20) — coverage (add/drop), speed, and harness-structure passes. Two independent agents flagged the git Basic-auth default as the single highest-value gap.
+**Scope note**: All work is on the test harness and its compose overlay, with two small exceptions that touch product code (a `SWEEP_INTERVAL` config knob in M6, called out explicitly). No product behaviour changes; no e2e assertion is weakened — every "drop" is verified redundant against a cheaper layer, every "faster" preserves the assertion.
+
+## Problem
+
+The e2e harness (`e2e/run-e2e.sh`, 2984 lines, one serial script driving the full
+compose stack with the stub executor + `forge-fake` sidecar) is the local
+pre-merge gate. A three-pass review found it is unusually disciplined about
+false-greens, but has real gaps in three directions:
+
+1. **A shipped-bug-shaped coverage hole.** The default run rewrites the worker's
+   push URL to a local bare repo via `insteadOf` (`run-e2e.sh:559-566`), so git
+   ignores all `http.*` config and the worker's `Authorization: Basic` header is
+   **never sent**. `e2e/README.md:130-137` says this in plain text: this is
+   exactly why the harness "(like every prior test) would not have caught the
+   `PRIVATE-TOKEN`-vs-Basic auth bug; the live run did." The fix is already wired
+   (`E2E_GIT_SMART_HTTP=1` → forge-fake's smart-HTTP endpoint that 401s without
+   valid Basic, asserts at `:1007-1016`) but is **opt-in and off** in the standard
+   gate.
+
+2. **Missing full-wire coverage that only the stack can prove.** The top directive
+   "`main` is never touched" has **no e2e backstop** — the fake remote would accept
+   a push to `main` and the stub run never loads the SDK deny-hook (`guardrails.ts`).
+   `/api/ws` (the primary real-time transport) has **zero references** in the
+   harness — every stream assertion uses REST `?after=<seq>` replay. The `uzi` CLI,
+   a co-equal API consumer that silently rots on DTO/route drift, is **never
+   invoked** against the live stack.
+
+3. **A few vacuous negatives, some now-redundant phases, and removable wall-clock.**
+   Two secret-hygiene scans pass vacuously if log/`/data` retrieval returns empty
+   (no positive control, unlike the scrupulous `/proc` and Decision-3 checks).
+   Several phases now duplicate assertions covered more cheaply against real
+   Postgres or with handler fakes. And ~55–150s of the ~20-min run is removable
+   without dropping a single assertion.
+
+## Solution Overview
+
+One PRD, sequenced so the safe mechanical wins land first and the structural ones
+carry explicit author sign-off:
+
+- **Add the full-wire-only coverage** the lower layers cannot reach: git Basic-auth
+  push ON by default, a `main`-push-rejection backstop, a live `/api/ws` frame
+  assertion, and a thin `uzi` CLI smoke against the running api.
+- **Harden the false-greens**: give the two secret-hygiene scans a positive control
+  (prove the corpus is non-empty first, mirroring the CI `test:api-store-it`
+  gate-on-the-gate), and wrap point-in-time reads so one transient blip doesn't
+  abort a 20-min run.
+- **Drop / downgrade the verified-redundant phases** — each confirmed (test opened,
+  not filename-guessed) to be covered against real Postgres or with handler fakes.
+- **Land the speedups** — mechanical (healthcheck `start_interval`, negative-window
+  sleeps) then structural (parallelize the health phase, a sweeper interval knob),
+  never touching a `wait_*` timeout ceiling (those return on success; lowering only
+  adds flake).
+- **Optional M7**: extract `e2e/lib.sh` + split phases into `e2e/phases/NN-*.sh`,
+  making the phase registry and the implicit inter-phase contract explicit. Keeps
+  the single-stack serial model. This de-risks the reorder/parallelize work but is
+  not required for the rest.
+
+## Design Decisions
+
+1. **Git Basic-auth: run by default, don't just document the flag.** The `insteadOf`
+   local-path rewrite is what makes the default run fast and hermetic, so keep it as
+   one pass but add a **second push pass** (or flip the seeded repo to the
+   smart-HTTP remote for the happy-path leg) so `Authorization: Basic` is actually
+   exercised on every run. A flag nobody sets is not coverage. This is the one gap
+   both the coverage and structure passes flagged independently.
+
+2. **`main`-push backstop asserts rejection, not just agent-branch success.** Today
+   the harness only asserts the *agent* branch was pushed + MR opened
+   (`:992-1001`); it never attempts a `main` push and asserts it is refused. The
+   fake remote is a bare repo with `http.receivepack true` and no protected-branch /
+   pre-receive hook (`:513-518`; forge-fake.mjs `GIT_HTTP_EXPORT_ALL=1`,
+   `:383-396`), so this needs a real ref-filter on the fake (a pre-receive hook that
+   rejects `refs/heads/main`) for the assertion to mean anything. The invariant
+   currently rests entirely on unit tests.
+
+3. **Drops are downgrades to the cheapest layer that still proves the property, not
+   deletions of coverage.** Each dropped/downgraded phase was verified against the
+   named lower-layer test. The residual "the HTTP route is wired to the store" glue
+   is accepted as covered by handler router tests. See M4 for the table and the
+   explicit **do-NOT-drop** guard list.
+
+4. **Timeout ceilings are off-limits; only real wall-clock is touched.** `wait_*`
+   helpers return the instant state is reached (`run-e2e.sh:302,347`), so
+   `UZI_E2E_COMPLETE_TIMEOUT` and the 30/40/60/120 ceilings cost ~0 on the happy
+   path. Speedups target only: blind `sleep N`, negative-assertion windows,
+   healthcheck detection latency, and structural serialization. Lowering a ceiling
+   buys nothing and adds flake under host contention — explicitly out of scope.
+
+5. **Negative-window sleeps floor at 2 poll ticks.** With `FORGE_POLL_INTERVAL=2s`,
+   a "prove X did not happen" window needs one tick to act + one to confirm-stable =
+   4s. 6→4s is safe; below 4s is not. Applied uniformly.
+
+6. **`SWEEP_INTERVAL` is a real (if tiny) product change.** `sweeper.New()` already
+   accepts an interval (`api/internal/sweeper/sweeper.go:51`) but `main.go:357`
+   passes `0`→15s default (`sweeper.go:19`). Wiring a config var is one line of
+   product code and lets the overlay shrink stall-detection latency + the nudge-once
+   `sleep 18` (`:2781`). Flagged as product-touching; goes through the normal MR
+   flow, not the PRD-doc-to-main path.
+
+7. **Structural speedups carry author sign-off gates.** Parallelizing the health
+   phase (M6) and dropping the heartbeat-stale recreate (`:2685`) depend on
+   assumptions about per-run state isolation and the 45s stale default that only the
+   author can confirm. They are separated from the mechanical wins so a "no" on one
+   doesn't block the rest.
+
+## Touchpoints
+
+- `e2e/run-e2e.sh` — the harness (all milestones).
+- `e2e/docker-compose.e2e.yml` — overlay: healthcheck `start_interval` (M5), chat
+  idle / sweep / stale env (M6).
+- `e2e/forge-fake/forge-fake.mjs` — pre-receive `main`-reject hook (M2), and (if
+  the GitLab-lane single-pipeline gap is addressed) a newest-first `/pipelines`
+  list.
+- `e2e/README.md` — document the new default git-auth pass, the WS/CLI legs, and any
+  new knobs.
+- `api/internal/sweeper/sweeper.go` + `api/cmd/server/main.go` — the `SWEEP_INTERVAL`
+  knob (M6, product code, normal MR flow).
+- (M7 only) new `e2e/lib.sh` + `e2e/phases/NN-*.sh` + a thin driver.
+
+## Milestones
+
+- [ ] **M1 — git Basic-auth default + `main`-push backstop** (highest value):
+      make the worker's git-over-HTTPS Basic-auth push run on **every** default run
+      (Decision 1) — either flip the happy-path leg to the smart-HTTP remote or add
+      a mandatory second push pass — so `Authorization: Basic` is exercised and a
+      credential-injection regression turns the git-layer assertions red. Add a
+      pre-receive `refs/heads/main`-reject hook to `forge-fake` and a phase that
+      attempts a `main` push and **asserts it is refused** (Decision 2). Update
+      `README.md` to drop the "would not catch the Basic-auth bug" caveat.
+- [ ] **M2 — live `/api/ws` + `uzi` CLI smoke**: a WS client (e.g. `websocat`, added
+      to the harness image or run from a sidecar) subscribes to a live run over
+      `/api/ws` and asserts it receives live frames during a real run (not just the
+      REST `?after=` replay). A thin CLI leg logs in and drives `runs list --json` →
+      approve a plan against the running api, catching DTO/route drift the
+      web-driven phases miss. Both are separate HTTP clients on the real wire — no
+      lower layer exercises them.
+- [ ] **M3 — false-green hardening**: give the container-log scan (`:1176-1179`) and
+      the `/data` scan (`:1182-1186`) a **positive control** — prove the corpus is
+      non-empty before asserting the secret's absence (mirror the M6 `/proc` control
+      at `:1312-1313` and the Decision-3 control at `:2943-2944`, and the CI
+      gate-on-the-gate in `test:api-store-it`). Wrap point-in-time reads
+      (`apiget`/`fake_state`/`db_psql`) in a light retry so one transient
+      curl/exec blip does not abort a ~20-min run (the `fake_has_label` hardening at
+      `:388-392` did this for one call site only). Tighten the weak Forgejo `<16`
+      secondary grep (`:689`, the `version` alternative matches almost anything).
+- [ ] **M4 — drop / downgrade verified-redundant phases**: with each redundancy
+      confirmed against the named lower-layer test —
+      - PRD #94 triage (`:2182`) → **drop** (covered by
+        `store/recommendation_dispositions_integration_test.go` +
+        `handler/review_disposition_test.go`, incl. the store-double-panic proof of
+        no-spend/no-forge).
+      - PRD #53 rate-limits (`:2832`) → **one-liner** (union covered by
+        `handler/ratelimits_test.go`).
+      - PRD #46 Phase B re-judge (`:2085`) → **drop, keep Phase A** (fallback covered
+        by `agent/test/judge-runner.test.ts` + `workersvc/judge_m3_test.go`; Phase A
+        committed-terminal→judge→notification is genuinely full-wire).
+      - PRD #33 (`:1392`) → keep verbatim-reason-through-worker; **drop the stop_kind
+        SQL half** (`store/stop_kind_integration_test.go`).
+      - PRD #40 (`:1023`) → keep "worker frame parsed & folded"; **drop the rollup
+        math** (`store/run_usage_integration_test.go`).
+      - PRD #16 skills authz (`:870`) → **collapse to router glue** (matrix in
+        `handler/skills_test.go`).
+
+      **Do NOT drop** (look redundant, are not — different topology / live kernel,
+      full-wire-only): #58 XFF (`:1263`, empty-`TRUSTED_PROXIES` compose vs unit's
+      k8s CIDR), #51 uid boundary (`:1299`), secret-hygiene (`:1175`), #83 Decision-3
+      (`:2879`). This guard list ships in the phase comments so a future reader does
+      not "finish the job."
+- [ ] **M5 — mechanical speedups (~55–80s, low/zero risk)**: add `start_interval: 1s`
+      to the db + api + forge-fake healthchecks in the **overlay only** (base
+      `docker-compose.yml` defaults untouched) — cuts the ~4s first-probe floor off
+      every `up --wait` / api recreate (~24s across the run). Tighten
+      negative-window sleeps to 2 poll ticks (Decision 5): `:1441,:1473,:1676` 6→4s,
+      `:1690` 5→4s, `assert_no_run_for_issue` default `:434` 6→4s (hits
+      `:1663,:1700`), vault `:1962` 3→1.5s.
+- [ ] **M6 — structural speedups (~130–150s, author sign-off gated)**: parallelize
+      the PRD #47 health legs a/b/c on a `WORKER_MAX_CONCURRENT_RUNS≥3` worker
+      (`:2735`; per-run `health`/`health_notified_at`, same assertions run
+      concurrently → wall clock ~max instead of ~sum, ~120s) — **gated on** the
+      author confirming the three sentinels don't interfere and the nudge-once window
+      still isolates each run. Wire the `SWEEP_INTERVAL` knob (Decision 6; ~2s in the
+      overlay → shrinks stall/loop latency and the `sleep 18` at `:2781`). Move
+      `E2E_WORKER_HEARTBEAT_STALE=15s` into the initial env-file and **delete the
+      dedicated api recreate** at `:2685` (~20s) — **gated on** no earlier phase
+      leaning on the 45s default. Halve the chat idle window (overlay
+      `WORKER_CHAT_IDLE_TIMEOUT` 20→10s, ~10s) — **gated on** no gap in the
+      red-team→propose→confirm→dismiss sequence (`:2329-2422`) exceeding 10s.
+- [ ] **M7 — (optional) harness structural refactor**: extract the helper library
+      (`:190-467` + the `/_e2e` helpers) into `e2e/lib.sh`, and split the ~30 phases
+      into `e2e/phases/NN-<name>.sh` sourced **in order** by a thin driver that owns
+      the one shared stack + globals. Makes the phase registry explicit and pulls the
+      implicit inter-phase contract (poller sped to 2s at `:1429`, judge toggled off
+      at `:2171`, cap bumped, `IID`/`RUN`/`MR_IID` reused 400 lines later) into one
+      documented place. Mechanical move, no logic change. Keep the single-stack,
+      serial, same-process model — do **not** parallelize (one worker/DB/forge makes
+      that impossible). Deferrable; de-risks M4/M6.
+
+**Dependency graph**: **M1, M3, M5 are independent** (git-auth leg / assertion
+hardening / mechanical timing — separate parts of the file and the overlay) and can
+run as parallel agents. **M2** (new WS + CLI legs) is independent of those but larger.
+**M4** (drops) is safest **after** M7 if M7 is done (phase boundaries become explicit),
+else standalone. **M6** is independent but gated on author sign-off per leg. **M7**, if
+taken, should land **first** as it moves every phase; otherwise skip it and treat
+M1–M6 as the deliverable. Suggested: Phase 1 = {M1, M3, M5} parallel; Phase 2 = {M2,
+M4}; Phase 3 = M6 (sign-off gated); M7 optional bookend/opener.
+
+## Success Criteria
+
+- Every default `./e2e/run-e2e.sh` run exercises the worker's git `Authorization:
+  Basic` push, and a phase attempts a `main` push and asserts it is refused — a
+  credential-injection or protected-branch regression turns the run red (M1).
+- A live `/api/ws` subscription receives frames during a real run, and a `uzi` CLI
+  leg drives the running api — DTO/route drift in either consumer fails the run (M2).
+- The two secret-hygiene scans fail if their corpus is empty (positive control), and
+  a single transient read no longer aborts the run (M3).
+- The dropped phases are gone/collapsed with **no** net loss of asserted behaviour —
+  each property still proven by its cited lower-layer test; the do-NOT-drop guard
+  list is in the phase comments (M4).
+- Wall-clock drops by ~55–80s from the mechanical changes alone with **zero** assertion
+  weakened, and by a further ~130–150s if the sign-off-gated structural changes land
+  (M5, M6). No `wait_*` timeout ceiling was lowered.
+- (If M7) the harness is a helper lib + an ordered phase registry driven by a thin
+  driver; the inter-phase contract is documented in one place; the run is behaviour-
+  identical to before.
+
+## Risks
+
+- **Structural speedups can introduce flake if the isolation assumptions are wrong.**
+  Parallelizing the health legs and removing the heartbeat recreate rest on per-run
+  state isolation and the 45s stale default. Mitigation: each is behind an explicit
+  author sign-off gate (Decision 7); land the mechanical wins first and treat the
+  structural ones as a separate, revertable step.
+- **Dropping phases risks a future reader "finishing the job" and cutting real
+  coverage.** The do-NOT-drop guard list (#58 / #51 / secret-hygiene / #83) ships in
+  the phase comments precisely because those four look redundant but read the live
+  kernel/container and are full-wire-only.
+- **The `main`-push backstop is only as real as the fake's ref filter.** A pre-receive
+  hook on `forge-fake` that rejects `refs/heads/main` is load-bearing; without it the
+  new assertion is vacuous (the current fake would accept the push). Test the hook
+  itself (push main → refused; push agent branch → accepted) as part of M1.
+- **CI posture is deliberately unchanged.** `run-e2e.sh` stays local-only (needs
+  docker-compose on the runner); this PRD does not promote it to CI. The
+  silent-rot gap (nothing signals it still passes on `main`) is acknowledged and left
+  as-is — a protected-ref-only periodic run is a possible follow-up, out of scope here.
+
+## Out of Scope
+
+- Promoting `run-e2e.sh` (or any subset) into CI. The local-only split is correct;
+  `test:api-store-it` and `e2e:kind-smoke` already cover what can run on the runner.
+- The GitLab-lane single-pipeline-per-ref fake limitation (`forge-fake.mjs:555`,
+  D10a already deferred) and REST auth/scope enforcement on the fake — noted by the
+  review, but larger fidelity work than this hardening pass.
+- Any product behaviour change beyond the one-line `SWEEP_INTERVAL` knob (M6).
+
+## Open Questions (for author sign-off before M6)
+
+- Do the three PRD #47 health sentinels interfere when run concurrently on a cap-3
+  worker, and does the nudge-once window still isolate each run?
+- Does any phase between `:574` and `:2685` rely on the 45s heartbeat-stale default
+  (i.e. is it safe to set 15s from boot)?
+- Does any gap in the chat sequence (`:2329-2422`) exceed 10s (i.e. is halving the
+  idle window safe)?
