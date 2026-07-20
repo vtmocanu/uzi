@@ -38,8 +38,34 @@ LEFT JOIN recommendation_dispositions d
 LEFT JOIN recommendation_filed_issues f
     ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
 WHERE rv.user_id = $1
+  -- The ?run= anchor (the judge notification's /judge?run={id} deep-link) is pushed DOWN
+  -- here rather than post-filtered in Go, so an anchored pull reads only the rows it will
+  -- return. It is a SEMI-join, not an equality: keep every occurrence of a coordinate that
+  -- ALSO occurs in the anchor run, so a group arrived at from a notification still shows
+  -- the other runs it recurs in — the whole point of the dedup. The subquery is scoped
+  -- rv2.user_id = rv.user_id, so it can only ever see the CALLER's own reviews: an anchor
+  -- naming another user's (or a nonexistent) run matches nothing, with no existence oracle.
+  AND (
+      $2::uuid IS NULL
+      OR EXISTS (
+          SELECT 1
+          FROM run_reviews rv2
+          JOIN review_recommendations rr2 ON rr2.review_id = rv2.id
+          WHERE rv2.user_id = rv.user_id
+            AND rv2.target_run_id = $2::uuid
+            AND rr2.category = rr.category
+            AND rr2.target = rr.target
+      )
+  )
 ORDER BY rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
+LIMIT $3
 `
+
+type ListJudgeRecommendationRowsForUserParams struct {
+	UserID    uuid.UUID   `json:"user_id"`
+	RunAnchor pgtype.UUID `json:"run_anchor"`
+	Lim       int32       `json:"lim"`
+}
 
 type ListJudgeRecommendationRowsForUserRow struct {
 	ReviewID          uuid.UUID          `json:"review_id"`
@@ -83,8 +109,14 @@ type ListJudgeRecommendationRowsForUserRow struct {
 // Order: most-recent review first, then the review's own recommendation order. The Go
 // grouper relies on this — a group's FIRST row is its most-recent occurrence, which is
 // the one whose rationale_md becomes rationale_preview (Decision 1).
-func (q *Queries) ListJudgeRecommendationRowsForUser(ctx context.Context, userID uuid.UUID) ([]ListJudgeRecommendationRowsForUserRow, error) {
-	rows, err := q.db.Query(ctx, listJudgeRecommendationRowsForUser, userID)
+// A hard row bound: an all-time backlog with ?bucket=all is otherwise unbounded (the PRD's
+// Risks section concedes this). The caller passes cap+1 and reports `truncated` when the
+// extra row comes back, so the cut is exact rather than inferred. Because the order is
+// most-recent-review-first, a cut drops the OLDEST occurrences — never the newest. The
+// triage tally is deliberately NOT computed from these rows (the service reads the #94
+// stats query for that), so the canonical counts stay whole even when this page is cut.
+func (q *Queries) ListJudgeRecommendationRowsForUser(ctx context.Context, arg ListJudgeRecommendationRowsForUserParams) ([]ListJudgeRecommendationRowsForUserRow, error) {
+	rows, err := q.db.Query(ctx, listJudgeRecommendationRowsForUser, arg.UserID, arg.RunAnchor, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

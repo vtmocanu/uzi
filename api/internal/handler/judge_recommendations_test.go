@@ -31,14 +31,14 @@ type backlogStore struct {
 
 	rows []store.ListJudgeRecommendationRowsForUserRow
 
-	backlogUserArg uuid.UUID
-	statsUserArg   uuid.UUID
-	calls          []string
+	backlogArg   *store.ListJudgeRecommendationRowsForUserParams
+	statsUserArg uuid.UUID
+	calls        []string
 }
 
-func (s *backlogStore) ListJudgeRecommendationRowsForUser(_ context.Context, userID uuid.UUID) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
+func (s *backlogStore) ListJudgeRecommendationRowsForUser(_ context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
 	s.calls = append(s.calls, "ListJudgeRecommendationRowsForUser")
-	s.backlogUserArg = userID
+	s.backlogArg = &arg
 	return s.rows, nil
 }
 
@@ -124,8 +124,8 @@ func TestJudgeRecommendationsDedupsAcrossRuns(t *testing.T) {
 		t.Fatalf("GET = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	got := decodeBacklog(t, rec)
-	if st.backlogUserArg != caller.ID {
-		t.Fatalf("backlog query scoped to %v, want the caller %v (owner-scoped)", st.backlogUserArg, caller.ID)
+	if st.backlogArg == nil || st.backlogArg.UserID != caller.ID {
+		t.Fatalf("backlog query args = %+v, want it scoped to the caller %v (owner-scoped)", st.backlogArg, caller.ID)
 	}
 	if len(got.Groups) != 3 {
 		t.Fatalf("want 3 groups (the two rg rows dedup into one), got %d: %+v", len(got.Groups), got.Groups)
@@ -284,24 +284,85 @@ func TestJudgeRecommendationsUnauthenticatedIs401(t *testing.T) {
 // ---- no spend, no forge write -------------------------------------------------------
 
 // TestJudgeRecommendationsReadsOnly proves the endpoint is a pure read: across every
-// parameter combination it calls exactly ONE store method — the backlog query. The
-// embedded nil workersvc.Store means any other call would additionally panic; here the
-// call set is asserted positively.
+// parameter combination it calls exactly TWO store methods — the backlog query and the
+// #94 stats query the canonical triage tally comes from. Nothing else. The embedded nil
+// workersvc.Store means any other call would additionally panic; here the call set is
+// asserted positively.
 func TestJudgeRecommendationsReadsOnly(t *testing.T) {
 	rows, anchor := backlogFixtureRows()
 	st := &backlogStore{rows: rows}
 	caller := store.User{ID: uuid.New()}
 	h := newRunsHandler(t, st)
 
-	for _, q := range []string{"", "bucket=all", "bucket=dismissed", "run=" + anchor.String()} {
+	queries := []string{"", "bucket=all", "bucket=dismissed", "run=" + anchor.String()}
+	for _, q := range queries {
 		h.JudgeRecommendations(httptest.NewRecorder(), backlogReq(caller, q))
 	}
+	allowed := map[string]bool{
+		"ListJudgeRecommendationRowsForUser": true, // the page
+		"ListJudgeTriageRowsForUser":         true, // the canonical tally
+	}
 	for _, c := range st.calls {
-		if c != "ListJudgeRecommendationRowsForUser" {
-			t.Fatalf("the backlog read called %q — it must touch nothing but its own query (no spend, no forge write); calls=%v", c, st.calls)
+		if !allowed[c] {
+			t.Fatalf("the backlog read called %q — it must touch nothing but its two reads (no spend, no forge write); calls=%v", c, st.calls)
 		}
 	}
-	if len(st.calls) != 4 {
-		t.Fatalf("want one query per request, got %v", st.calls)
+	if len(st.calls) != 2*len(queries) {
+		t.Fatalf("want exactly the two reads per request, got %v", st.calls)
+	}
+}
+
+// TestJudgeRecommendationsPushesRunAnchorToTheQuery: the ?run= anchor reaches the QUERY as
+// a parameter (it is filtered inside the owner-scoped WHERE, not in Go afterwards), and an
+// absent anchor is sent as a SQL NULL rather than the all-zero uuid — which would filter
+// every unanchored request down to nothing.
+func TestJudgeRecommendationsPushesRunAnchorToTheQuery(t *testing.T) {
+	rows, anchor := backlogFixtureRows()
+	caller := store.User{ID: uuid.New()}
+
+	st := &backlogStore{rows: rows}
+	h := newRunsHandler(t, st)
+	h.JudgeRecommendations(httptest.NewRecorder(), backlogReq(caller, "run="+anchor.String()))
+	if st.backlogArg == nil || !st.backlogArg.RunAnchor.Valid || uuid.UUID(st.backlogArg.RunAnchor.Bytes) != anchor {
+		t.Fatalf("run anchor param = %+v, want %v pushed into the query", st.backlogArg, anchor)
+	}
+
+	st = &backlogStore{rows: rows}
+	h = newRunsHandler(t, st)
+	h.JudgeRecommendations(httptest.NewRecorder(), backlogReq(caller, ""))
+	if st.backlogArg == nil || st.backlogArg.RunAnchor.Valid {
+		t.Fatalf("no ?run= must send a NULL anchor, got %+v", st.backlogArg)
+	}
+}
+
+// TestJudgeRecommendationsReportsTruncation: the response carries the hard-cap flag so the
+// SPA and the CLI can say "showing the most recent N" instead of silently presenting a cut
+// backlog as complete.
+func TestJudgeRecommendationsReportsTruncation(t *testing.T) {
+	caller := store.User{ID: uuid.New()}
+	over := make([]store.ListJudgeRecommendationRowsForUserRow, 0, workersvc.JudgeBacklogMaxRows+1)
+	for i := 0; i <= workersvc.JudgeBacklogMaxRows; i++ {
+		over = append(over, store.ListJudgeRecommendationRowsForUserRow{
+			ReviewID: uuid.New(), RunID: uuid.New(), Verdict: "ok", RecID: uuid.New(),
+			Category: "improve_uzi", Target: uuid.NewString(),
+		})
+	}
+	h := newRunsHandler(t, &backlogStore{rows: over})
+	rec := httptest.NewRecorder()
+	h.JudgeRecommendations(rec, backlogReq(caller, "bucket=all"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d, want 200", rec.Code)
+	}
+	if got := decodeBacklog(t, rec); !got.Truncated || len(got.Groups) != workersvc.JudgeBacklogMaxRows {
+		t.Fatalf("truncated=%v groups=%d, want true / %d", got.Truncated, len(got.Groups), workersvc.JudgeBacklogMaxRows)
+	}
+
+	// The un-truncated fixture must NOT set the flag.
+	rows, _ := backlogFixtureRows()
+	h = newRunsHandler(t, &backlogStore{rows: rows})
+	rec = httptest.NewRecorder()
+	h.JudgeRecommendations(rec, backlogReq(caller, "bucket=all"))
+	if decodeBacklog(t, rec).Truncated {
+		t.Fatal("a small backlog must not be flagged truncated")
 	}
 }

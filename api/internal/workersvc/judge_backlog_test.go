@@ -15,11 +15,20 @@ import (
 )
 
 // judgeBacklogRows backs ListJudgeRecommendationRowsForUser on the shared fakeStore, and
-// backlogUserArg records the id the query was scoped to (the owner-scoping assertion).
-// Declared here so the PRD #98 fixture lives next to the tests that use it.
-func (f *fakeStore) ListJudgeRecommendationRowsForUser(_ context.Context, userID uuid.UUID) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
-	f.backlogUserArg = userID
-	return f.judgeBacklogRows, nil
+// backlogArg records the params the query was called with (the owner-scoping, anchor
+// push-down and row-cap assertions). Declared here so the PRD #98 fixture lives next to
+// the tests that use it.
+//
+// The fake applies the query's own LIMIT so the service's cap+1 truncation probe behaves
+// as it does against Postgres. The ?run= semi-join is NOT modelled — it is SQL, asserted
+// by the params rather than re-implemented here, which is the point of pushing it down.
+func (f *fakeStore) ListJudgeRecommendationRowsForUser(_ context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
+	f.backlogArg = &arg
+	rows := f.judgeBacklogRows
+	if lim := int(arg.Lim); lim >= 0 && len(rows) > lim {
+		rows = rows[:lim]
+	}
+	return rows, nil
 }
 
 // ---- fixture builder ----------------------------------------------------------------
@@ -312,6 +321,27 @@ func TestGroupJudgeRecommendationsRanksByRecurrence(t *testing.T) {
 
 // ---- service: filters, owner scoping, and the shared-ladder triage -------------------
 
+// triageRowsFrom projects wide backlog rows onto the narrow #94 stats shape — the same
+// projection that query's SELECT list performs on the same join. Used to keep the fake's
+// two judge queries derived from ONE fixture, so a test cannot accidentally prove
+// agreement between two hand-written row sets.
+func triageRowsFrom(rows []store.ListJudgeRecommendationRowsForUserRow) []store.ListJudgeTriageRowsForUserRow {
+	out := make([]store.ListJudgeTriageRowsForUserRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, store.ListJudgeTriageRowsForUserRow{
+			DispositionStatus: r.DispositionStatus,
+			DismissReason:     r.DismissReason,
+			FiledSettled:      r.FiledSettled,
+		})
+	}
+	return out
+}
+
+// backlogStoreFor wires a fakeStore whose BOTH judge queries are served from one fixture.
+func backlogStoreFor(rows []store.ListJudgeRecommendationRowsForUserRow) *fakeStore {
+	return &fakeStore{judgeBacklogRows: rows, judgeTriageRows: triageRowsFrom(rows)}
+}
+
 // backlogFixture is one owner's backlog spanning three coordinates and four runs, with a
 // member in every rung of the ladder — enough to exercise every bucket filter and the
 // run anchor from ONE fixture.
@@ -342,7 +372,7 @@ func backlogFixture() (rows []store.ListJudgeRecommendationRowsForUserRow, ancho
 // applied filter.
 func TestJudgeRecommendationBacklogFilters(t *testing.T) {
 	rows, _ := backlogFixture()
-	fs := &fakeStore{judgeBacklogRows: rows}
+	fs := backlogStoreFor(rows)
 	svc := New(fs, newBox(t), testParams())
 	owner := uuid.New()
 
@@ -377,21 +407,32 @@ func TestJudgeRecommendationBacklogFilters(t *testing.T) {
 					t.Errorf("bucket=%s missing the %q group: %+v", tc.bucket, want, got.Groups)
 				}
 			}
-			// Owner scoping: the query is always called with the caller's id.
-			if fs.backlogUserArg != owner {
-				t.Errorf("backlog query scoped to %v, want the caller %v", fs.backlogUserArg, owner)
+			// Owner scoping + the bounded pull: the query is always called with the
+			// caller's id and the cap+1 probe, with no anchor when none was asked for.
+			if fs.backlogArg == nil || fs.backlogArg.UserID != owner {
+				t.Errorf("backlog query args = %+v, want UserID = the caller %v", fs.backlogArg, owner)
+			}
+			if fs.backlogArg.RunAnchor.Valid {
+				t.Errorf("no ?run= was given, so the anchor param must be NULL, got %+v", fs.backlogArg.RunAnchor)
+			}
+			if fs.backlogArg.Lim != JudgeBacklogMaxRows+1 {
+				t.Errorf("limit = %d, want the cap+1 truncation probe %d", fs.backlogArg.Lim, JudgeBacklogMaxRows+1)
 			}
 		})
 	}
 }
 
-// TestJudgeRecommendationBacklogRunAnchor: ?run= (the notification deep-link) keeps only
-// groups that recur in that run — but never trims the occurrence list, because seeing that
-// the recommendation ALSO recurs elsewhere is the reason to land here. An unknown run id
-// simply matches nothing (no ownership oracle).
-func TestJudgeRecommendationBacklogRunAnchor(t *testing.T) {
+// TestJudgeRecommendationBacklogRunAnchorIsPushedDown: the ?run= anchor is handed to the
+// QUERY (as the nullable run_anchor param, inside the owner-scoped WHERE), not applied in
+// Go afterwards. That is the whole point of the push-down — an anchored pull reads only
+// the rows it returns — so what this level can prove is that the parameter travels and
+// that no Go-side filter second-guesses it. The semi-join's own behaviour (kept groups
+// keep their other-run occurrences; another user's run matches nothing) is SQL, and is
+// pinned by TestJudgeBacklogRunAnchorLiveDB in internal/store.
+func TestJudgeRecommendationBacklogRunAnchorIsPushedDown(t *testing.T) {
 	rows, anchor := backlogFixture()
-	svc := New(&fakeStore{judgeBacklogRows: rows}, newBox(t), testParams())
+	fs := backlogStoreFor(rows)
+	svc := New(fs, newBox(t), testParams())
 	owner := uuid.New()
 
 	got, err := svc.JudgeRecommendationBacklog(context.Background(), owner, "all", anchor)
@@ -401,29 +442,71 @@ func TestJudgeRecommendationBacklogRunAnchor(t *testing.T) {
 	if got.Run != anchor.String() {
 		t.Errorf("echoed run = %q, want %q", got.Run, anchor)
 	}
-	if len(got.Groups) != 1 || got.Groups[0].Target != "rg" {
-		t.Fatalf("run anchor returned %+v, want only the group occurring in that run", got.Groups)
+	if fs.backlogArg == nil || !fs.backlogArg.RunAnchor.Valid || uuid.UUID(fs.backlogArg.RunAnchor.Bytes) != anchor {
+		t.Fatalf("run anchor param = %+v, want the anchor %v pushed into the query", fs.backlogArg, anchor)
 	}
-	if len(got.Groups[0].Occurrences) != 2 {
-		t.Errorf("the anchor must not trim the occurrence list, got %d occurrences", len(got.Groups[0].Occurrences))
+	// No Go-side re-filtering: whatever the query returned is what is grouped.
+	if len(got.Groups) != 3 {
+		t.Fatalf("the service must not re-filter the query's rows, got %d groups", len(got.Groups))
 	}
+}
 
-	got, err = svc.JudgeRecommendationBacklog(context.Background(), owner, "all", uuid.New())
-	if err != nil {
-		t.Fatalf("backlog (unknown run): %v", err)
+// TestJudgeRecommendationBacklogTruncates: an all-time ?bucket=all backlog is bounded by
+// a hard row cap. The service asks for cap+1 and reports truncated=true only when that
+// extra row comes back, so an exactly-full page is NOT falsely flagged, and the returned
+// rows are trimmed back to the cap. Triage still comes from the separate stats query, so
+// the canonical counts survive the cut.
+func TestJudgeRecommendationBacklogTruncates(t *testing.T) {
+	mk := func(n int) []store.ListJudgeRecommendationRowsForUserRow {
+		out := make([]store.ListJudgeRecommendationRowsForUserRow, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, backlogRow{
+				runID: uuid.New(), reviewID: uuid.New(), recID: uuid.New(),
+				category: "improve_uzi", target: uuid.NewString(), // a distinct group each
+			}.row())
+		}
+		return out
 	}
-	if len(got.Groups) != 0 {
-		t.Fatalf("an unknown run anchor must match nothing, got %+v", got.Groups)
+	for _, tc := range []struct {
+		name          string
+		rows          int
+		wantGroups    int
+		wantTruncated bool
+	}{
+		{"under the cap", 3, 3, false},
+		{"exactly the cap is NOT truncated", JudgeBacklogMaxRows, JudgeBacklogMaxRows, false},
+		{"over the cap is trimmed and flagged", JudgeBacklogMaxRows + 25, JudgeBacklogMaxRows, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := mk(tc.rows)
+			svc := New(backlogStoreFor(rows), newBox(t), testParams())
+
+			got, err := svc.JudgeRecommendationBacklog(context.Background(), uuid.New(), "all", uuid.Nil)
+			if err != nil {
+				t.Fatalf("backlog: %v", err)
+			}
+			if got.Truncated != tc.wantTruncated {
+				t.Errorf("truncated = %v, want %v", got.Truncated, tc.wantTruncated)
+			}
+			if len(got.Groups) != tc.wantGroups {
+				t.Errorf("groups = %d, want %d (the page is trimmed to the cap)", len(got.Groups), tc.wantGroups)
+			}
+			// The canonical tally counts every row the caller owns, cut page or not.
+			if got.Triage.Total != tc.rows {
+				t.Errorf("triage.total = %d, want %d — the tally must not follow the truncated page", got.Triage.Total, tc.rows)
+			}
+		})
 	}
 }
 
 // TestJudgeRecommendationBacklogTriageIgnoresFilters: Triage is the ONE canonical tally
 // (PRD #98 Decision 1 / Success Criteria — the nav badge, the notification and the To
-// triage tab must show the same number). It is computed over the caller's WHOLE row set
-// through the shared BucketTriage, so narrowing ?bucket=/?run= never moves it.
+// triage tab must show the same number). It is read from the SEPARATE #94 stats query, not
+// tallied off the (possibly filtered, possibly truncated) page rows, so narrowing
+// ?bucket=/?run= never moves it.
 func TestJudgeRecommendationBacklogTriageIgnoresFilters(t *testing.T) {
 	rows, anchor := backlogFixture()
-	svc := New(&fakeStore{judgeBacklogRows: rows}, newBox(t), testParams())
+	svc := New(backlogStoreFor(rows), newBox(t), testParams())
 	owner := uuid.New()
 
 	want := apitypes.TriageDTO{Total: 4, Todo: 1, Filed: 1, Done: 1, Dismissed: 1, FalsePositives: 1}

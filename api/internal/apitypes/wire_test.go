@@ -157,7 +157,7 @@ func TestJudgeRecommendationGroupDTOTags(t *testing.T) {
 }
 
 func TestJudgeBacklogDTOTags(t *testing.T) {
-	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "triage")
+	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "truncated", "triage")
 }
 
 func TestIssueDraftDTOTags(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -58,6 +59,18 @@ func rationalePreview(s string) string {
 	return strings.TrimRight(string(runes[:RationalePreviewMaxRunes]), " \t\r\n") + "…"
 }
 
+// nullableUUID maps the absent-anchor sentinel to a SQL NULL. It exists because the shared
+// pgUUID helper always sets Valid=true: handing it uuid.Nil would send the all-zero uuid as
+// a REAL value, the query's `run_anchor IS NULL` escape hatch would not fire, and every
+// unanchored backlog request would silently filter against a run that does not exist —
+// i.e. return nothing at all.
+func nullableUUID(id uuid.UUID) pgtype.UUID {
+	if id == uuid.Nil {
+		return pgtype.UUID{}
+	}
+	return pgUUID(id)
+}
+
 // coord is the dedup grain (PRD #98 Decision 2): the (category, target) pair. It is a
 // DISPLAY key — #68/#94 key filed/disposition state per (review_id, category, target), so
 // the same idea in two runs stays two coordinates with independent triage state.
@@ -65,6 +78,15 @@ type coord struct {
 	category string
 	target   string
 }
+
+// JudgeBacklogMaxRows is the hard row bound on the grouped read. An all-time backlog with
+// ?bucket=all is otherwise unbounded (the PRD's Risks section concedes this), so the pull
+// is capped now rather than retrofitted as pagination later. It bounds ROWS — one per
+// recommendation — not groups: capping rows is what actually bounds the DB read and the
+// response, and a group is at most one row per run it recurs in. At ≤50 recommendations per
+// review (ReviewMaxRecommendations) this is ≥40 fully-loaded reviews, and typically many
+// hundreds. When the cap bites, JudgeBacklogDTO.Truncated says so.
+const JudgeBacklogMaxRows = 2000
 
 // JudgeRecommendationBacklog is the Judge menu's grouped read (PRD #98 M1, Decision 1):
 // every recommendation across every review the caller owns, deduped by (category, target),
@@ -74,41 +96,45 @@ type coord struct {
 // there is no ownership oracle to leak and IsAdmin is never consulted (a uza_ admin_ro
 // token sees its OWN backlog and nothing else).
 //
-// bucket filters the returned GROUPS (see filterGroups); runAnchor, when non-nil, keeps
-// only groups that recur in that run — the notification deep-link's /judge?run={id}
-// (Decision 4). Neither narrows Triage: that tally is always the caller's whole row set,
-// bucketed by the SAME BucketTriage that backs GET /me/judge/stats, so the two agree to
-// the digit whatever the filter.
+// runAnchor (the notification deep-link's /judge?run={id}) is pushed DOWN into the query's
+// owner-scoped WHERE as a semi-join, so an anchored pull reads only rows it will return
+// while still carrying each kept group's other-run occurrences. bucket filters the
+// resulting GROUPS in Go, because it matches the group ROLLUP, which is computed from the
+// shared BucketOf (a SQL bucket filter would be the forbidden second ladder).
+//
+// Triage is deliberately read from the SEPARATE #94 stats query rather than tallied off
+// these rows. That is what makes it the ONE canonical number (Success Criteria: nav badge
+// == notification == To-triage tab): it is literally the aggregate GET /me/judge/stats
+// serves, so neither the ?bucket=/?run= narrowing nor a truncated page can move it.
 func (s *Service) JudgeRecommendationBacklog(ctx context.Context, ownerUserID uuid.UUID, bucket string, runAnchor uuid.UUID) (apitypes.JudgeBacklogDTO, error) {
-	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, ownerUserID)
+	rows, err := s.q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+		UserID:    ownerUserID,
+		RunAnchor: nullableUUID(runAnchor), // uuid.Nil → SQL NULL → the anchor predicate is a no-op
+		// One over the cap, so a full page is distinguished from an exactly-full one
+		// without a second COUNT.
+		Lim: JudgeBacklogMaxRows + 1,
+	})
+	if err != nil {
+		return apitypes.JudgeBacklogDTO{}, err
+	}
+	truncated := len(rows) > JudgeBacklogMaxRows
+	if truncated {
+		rows = rows[:JudgeBacklogMaxRows]
+	}
+	triage, err := s.JudgeTriageStats(ctx, ownerUserID)
 	if err != nil {
 		return apitypes.JudgeBacklogDTO{}, err
 	}
 	out := apitypes.JudgeBacklogDTO{
-		Bucket: bucket,
-		Groups: filterGroups(GroupJudgeRecommendations(rows), bucket, runAnchor),
-		Triage: BucketTriage(triageRowsOf(rows)),
+		Bucket:    bucket,
+		Groups:    filterGroups(GroupJudgeRecommendations(rows), bucket),
+		Truncated: truncated,
+		Triage:    triage,
 	}
 	if runAnchor != uuid.Nil {
 		out.Run = runAnchor.String()
 	}
 	return out, nil
-}
-
-// triageRowsOf projects the wide backlog rows onto the narrow TriageRow the shared
-// bucketer consumes. This is the single-ladder guarantee in one line: the backlog page
-// and the /stats strip tally the identical facts through the identical helper, so a
-// wider projection can never grow a second bucketing rule.
-func triageRowsOf(rows []store.ListJudgeRecommendationRowsForUserRow) []TriageRow {
-	tr := make([]TriageRow, 0, len(rows))
-	for _, r := range rows {
-		tr = append(tr, TriageRow{
-			Status:       r.DispositionStatus.String, // "" when the LEFT JOIN found no disposition
-			Reason:       r.DismissReason.String,
-			FiledSettled: r.FiledSettled,
-		})
-	}
-	return tr
 }
 
 // GroupJudgeRecommendations dedups the flat rows by (category, target) (PRD #98
@@ -216,36 +242,19 @@ func filedIssueRef(r store.ListJudgeRecommendationRowsForUserRow) *apitypes.Judg
 	}
 }
 
-// filterGroups applies the ?bucket= filter and the ?run= anchor to the grouped rows.
-//
-// bucket matches the GROUP ROLLUP, so "todo" is exactly "open_count >= 1" (Decision 2)
-// and the settled rungs are mutually exclusive with it. The run anchor keeps a group if
-// ANY of its occurrences is in that run, but never trims the occurrence list — the whole
-// point of arriving from a notification is to see that the recommendation also recurs
-// elsewhere.
-func filterGroups(groups []apitypes.JudgeRecommendationGroupDTO, bucket string, runAnchor uuid.UUID) []apitypes.JudgeRecommendationGroupDTO {
-	anchor := ""
-	if runAnchor != uuid.Nil {
-		anchor = runAnchor.String()
-	}
+// filterGroups applies the ?bucket= filter to the grouped rows. It matches the GROUP
+// ROLLUP, so "todo" is exactly "open_count >= 1" (Decision 2) and the settled rungs are
+// mutually exclusive with it. This one filter stays in Go because the rollup is computed
+// from the shared BucketOf — expressing it in SQL would be the second ladder #94
+// Decision 2 forbids. The ?run= anchor is NOT here: it is pushed down into the query's
+// owner-scoped WHERE.
+func filterGroups(groups []apitypes.JudgeRecommendationGroupDTO, bucket string) []apitypes.JudgeRecommendationGroupDTO {
 	out := make([]apitypes.JudgeRecommendationGroupDTO, 0, len(groups))
 	for _, g := range groups {
 		if bucket != "all" && bucket != "" && g.Bucket != bucket {
 			continue
 		}
-		if anchor != "" && !groupHasRun(g, anchor) {
-			continue
-		}
 		out = append(out, g)
 	}
 	return out
-}
-
-func groupHasRun(g apitypes.JudgeRecommendationGroupDTO, runID string) bool {
-	for _, o := range g.Occurrences {
-		if o.RunID == runID {
-			return true
-		}
-	}
-	return false
 }

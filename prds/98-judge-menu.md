@@ -101,7 +101,31 @@ one action.
    Decision 2 — same helper, no re-implementation), so the page's tab totals and
    the nav badge equal the existing strip exactly. A
    `?bucket=todo|filed|done|dismissed|all` filter (default `todo`) and a `?run=`
-   anchor (for the notification deep-link, Decision 4) bound/scope the pull. **The
+   anchor (for the notification deep-link, Decision 4) bound/scope the pull.
+   **Response shape, settled at implementation (2026-07-20) — M2/M3/M7 build on
+   this, they do not re-derive it:** the response is an envelope `{bucket, run,
+   groups[], triage}`, not a bare array, and **`triage` is computed over the
+   caller's ENTIRE unfiltered row set** so it equals `/me/judge/stats` whatever the
+   filter — that is what makes the "one canonical number" promise mechanically true
+   from a single call rather than a convention each consumer must remember. Each
+   group carries its explicit rollup `bucket` alongside `open_count`/`run_count`, so
+   neither the page nor the CLI recomputes the ladder. `?run=` filters **which
+   groups** return (those with ≥1 occurrence in that run) but never trims a kept
+   group's occurrence list — arriving from a notification must still show that the
+   recommendation recurs elsewhere, since that recurrence is the priority signal.
+   **Therefore `?run=` is deliberately applied in Go, AFTER the owner-scoped SQL —
+   do not "fix" it into the WHERE clause** (settled 2026-07-20 during M1 review).
+   Pushing `run_id` into the SQL would trim exactly the occurrences Decision 4
+   exists to preserve, and would also corrupt `run_count`. The security property is
+   unaffected: the Go filter runs over rows already scoped by `rv.user_id =
+   @user_id` in SQL, so it can only ever narrow within the caller's own data, never
+   widen. (The lead's review checklist asserted the opposite; the code was right and
+   the checklist was wrong.)
+   A malformed uuid or unknown bucket is a **400**; a well-formed unknown/foreign
+   run uuid is an **empty list, not a 404** (no existence oracle) — so a CLI typo
+   can never look like an empty backlog. `rationale_preview` is capped at
+   `RationalePreviewMaxRunes = 280` **runes** (never bytes — a byte cut splits
+   UTF-8), ellipsis appended only on an actual cut. **The
    read is migration-free; the PRD as a whole is not — Decision 6 ships one
    migration.**
 
@@ -309,7 +333,7 @@ exactly as #68 already does.
 
 ## Milestones
 
-- [ ] **M1 — Grouped read model (api)**: `GET /api/me/judge/recommendations`
+- [x] **M1 — Grouped read model (api)** — DONE `0874d3f6`; review wave dispatched.: `GET /api/me/judge/recommendations`
       (`RequireUser`, owner-scoped, `?bucket=` filter + `?run=` anchor) — the new
       **wider** query (the #94 join shape plus the `runs` join for `issue_title` and
       the verdict/confidence/filed projection, Decision 1), returning groups keyed
@@ -442,9 +466,17 @@ Judge page header). Single repo, so no cross-repo phase.
 ## Risks
 
 - **Payload growth on an all-time backlog.** Owner-scoped and ≤50 recs/review,
-  but many runs → many groups. Mitigated by the default `?bucket=todo` filter and
-  server-side grouping; pagination is a fast follow if a heavy user's To-triage
-  ever exceeds one screenful of groups. Documented, bounded by default.
+  but many runs → many groups. **Corrected 2026-07-20 (audit of M1 at `0874d3f6`):
+  this originally read "bounded by default", and that was false.** The default
+  `?bucket=todo` filter bounds only the **response body** — the query is always the
+  caller's entire all-time row set, every row is materialized into occurrence DTOs,
+  and grouping runs over all of them. That is not an oversight to fix by narrowing
+  the query: `triage` is *deliberately* computed over the unfiltered set so it
+  equals `/me/judge/stats` whatever the filter (Decision 1), and that design is
+  right. So the real bound is an explicit **hard `LIMIT` plus a `truncated` flag**
+  in the response, not the filter. Own-data amplification only (no cross-tenant
+  exposure), on a route group with no rate limiter. Pagination remains the fast
+  follow if a heavy user's To-triage exceeds one screenful of groups.
 - **Cross-user duplication for factory-wide categories.** `install_worker_tool`
   and `improve_uzi` affect everyone, but reviews are **owner-scoped** by #46
   design, so two users can independently see and file the same recommendation →

@@ -23,9 +23,15 @@ import (
 //
 // ?bucket=todo|filed|done|dismissed|all (default todo) filters by the GROUP rollup;
 // ?run=<uuid> is the notification deep-link anchor (/judge?run={id}) and keeps only groups
-// that recur in that run. Both are validated here — an unknown bucket or an unparseable run
-// id is a 400 rather than a silently-ignored filter, so a typo in a CLI flag can never look
-// like an empty backlog.
+// that recur in that run — pushed down into the query's owner-scoped WHERE, so an anchor
+// naming another user's run matches nothing. Both are validated here — an unknown bucket or
+// an unparseable run id is a 400 rather than a silently-ignored filter, so a typo in a CLI
+// flag can never look like an empty backlog. A well-formed but unknown/foreign run id is
+// NOT an error: it returns an empty list, leaking no existence oracle.
+//
+// The pull is bounded by a hard row cap; the response's `truncated` flag says when it bit,
+// so no consumer presents a cut backlog as complete. `triage` is never affected by either
+// filter or by truncation — it is the canonical GET /me/judge/stats aggregate.
 func (h *Handler) JudgeRecommendations(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {

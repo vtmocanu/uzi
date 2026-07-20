@@ -133,15 +133,21 @@ type JudgeRecommendationGroupDTO struct {
 // all-time, owner-scoped recommendation backlog, deduped by (category, target).
 //
 // Bucket echoes the applied ?bucket= filter (default todo) and Run echoes the ?run=
-// anchor ("" when absent). Triage is deliberately computed over the caller's ENTIRE
-// unfiltered row set — it is the same aggregate GET /me/judge/stats serves, from the
-// same shared BucketTriage ladder, so the page's bucket tabs, the nav badge and the
-// strip cannot drift no matter which filter is applied.
+// anchor ("" when absent). Triage is deliberately NOT tallied from Groups: it is the
+// aggregate GET /me/judge/stats serves, read from the same query through the same shared
+// BucketTriage ladder, so the page's bucket tabs, the nav badge and the strip cannot drift
+// no matter which filter is applied or whether the page was truncated.
+//
+// Truncated says the backlog hit its hard row cap (workersvc.JudgeBacklogMaxRows) and the
+// Groups below are therefore a partial view — the OLDEST occurrences are the ones missing,
+// since the read is most-recent-first. Triage stays whole regardless, so the canonical
+// counts are still correct when this is true.
 type JudgeBacklogDTO struct {
-	Bucket string                        `json:"bucket"`
-	Run    string                        `json:"run"`
-	Groups []JudgeRecommendationGroupDTO `json:"groups"`
-	Triage TriageDTO                     `json:"triage"`
+	Bucket    string                        `json:"bucket"`
+	Run       string                        `json:"run"`
+	Groups    []JudgeRecommendationGroupDTO `json:"groups"`
+	Truncated bool                          `json:"truncated"`
+	Triage    TriageDTO                     `json:"triage"`
 }
 
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md

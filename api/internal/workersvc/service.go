@@ -147,8 +147,9 @@ type Store interface {
 	ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error)
 	// Judge menu grouped read (PRD #98 M1): the wider per-recommendation join the
 	// (category, target) dedup groups. Same spine as the triage row above, plus the
-	// runs join and the verdict/confidence/filed projection.
-	ListJudgeRecommendationRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeRecommendationRowsForUserRow, error)
+	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor
+	// and a hard row cap.
+	ListJudgeRecommendationRowsForUser(ctx context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
