@@ -9,6 +9,7 @@ import {
   type RunInputKind,
   type RunMessage,
   type RunSocketLike,
+  type SteerInput,
   type WsEvent,
 } from "./api";
 import { applyFrame, emptyStream, ingestMany, type StreamState } from "./runStream";
@@ -27,6 +28,12 @@ export function useRunStream(runId: string) {
   const [messages, setMessages] = useState<RunMessage[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
+  // The follow_up steer queue (PRD #95). Lifted HERE — not into the FollowUpComposer,
+  // which is !terminal-gated and unmounts the instant a run completes — so the queue
+  // survives the terminal transition (Decision 7/B1) and can still show "Not delivered
+  // — run finished". M1 fetches it once on mount; the live refetch triggers (onopen /
+  // state / health / the data-less `input` frame) and optimistic send land in M3.
+  const [inputs, setInputs] = useState<SteerInput[]>([]);
 
   const streamRef = useRef<StreamState>(emptyStream());
   const statusRef = useRef<string>("");
@@ -56,6 +63,20 @@ export function useRunStream(runId: string) {
     }
   }, [runId]);
 
+  // refreshInputs re-reads the steer queue (PRD #95). Best-effort and SILENT on error:
+  // a non-owner viewer (an admin on someone else's run) 404s here, which Decision 8/N2
+  // says to treat as "no queue to show" — never a run-level error banner. M1 calls it
+  // once on mount; M3 adds the onopen / state / health / `input`-frame triggers so a
+  // dropped frame self-heals.
+  const refreshInputs = useCallback(async () => {
+    try {
+      const { inputs } = await api.getRunInputs(runId);
+      setInputs(inputs);
+    } catch {
+      // 404 (non-owner) or transient: leave the queue as-is; never surface an error.
+    }
+  }, [runId]);
+
   useEffect(() => {
     let closed = false;
     let ws: RunSocketLike | null = null;
@@ -67,6 +88,7 @@ export function useRunStream(runId: string) {
     setMessages([]);
     setRun(null);
     setError("");
+    setInputs([]);
     // Load the run and its message history on MOUNT, independent of the socket.
     // The persisted log is authoritative and a page load must show existing
     // history (and current status) immediately — even if the WS is slow to
@@ -74,6 +96,7 @@ export function useRunStream(runId: string) {
     // its onopen replay backfills anything that landed during the connect window.
     void refreshRun();
     void replay();
+    void refreshInputs();
 
     const scheduleCatchup = () => {
       if (catchup != null) return;
@@ -137,7 +160,7 @@ export function useRunStream(runId: string) {
         }
       }
     };
-  }, [runId, replay, refreshRun, commit]);
+  }, [runId, replay, refreshRun, refreshInputs, commit]);
 
   const submit = useCallback(
     async (kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
@@ -147,5 +170,7 @@ export function useRunStream(runId: string) {
     [runId, refreshRun],
   );
 
-  return { run, messages, connected, error, submit, refreshRun };
+  // inputs + refreshInputs are the PRD #95 steer queue: M3 wires refreshInputs into the
+  // live triggers and the queue card reads `inputs`.
+  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs };
 }

@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { RunMessage } from "../lib/api";
+import type { Run, RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
 import { buildToolIndex, describeError, describeStatus, RunEventRow, truncate } from "./RunEvent";
@@ -128,6 +128,11 @@ export function ActivityFeed({
   phaseUsageBySeq,
 }: {
   messages: RunMessage[];
+  // run is threaded in by the M1 seam (PRD #95 Decision 9) for M2's crew roster, which
+  // reads run.health / run.status to derive the per-agent state ladder. Optional and
+  // NOT yet consumed here — M2 destructures it and builds the roster; landing it now is
+  // what keeps M2 a change to THIS file only, never to RunView.
+  run?: Run;
   runningLive: boolean;
   connected: boolean;
   terminal: boolean;
