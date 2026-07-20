@@ -127,6 +127,12 @@ WHERE rr.category = 'improve_uzi' AND rr.addressed_by_run_id IS NULL
         AND f.category  = rr.category
         AND f.target    = rr.target
   )
+  AND NOT EXISTS (
+      SELECT 1 FROM recommendation_dispositions d
+      WHERE d.review_id = rr.review_id
+        AND d.category  = rr.category
+        AND d.target    = rr.target
+  )
 ORDER BY rr.created_at ASC
 LIMIT $1
 `
@@ -145,13 +151,22 @@ type ListOpenImproveUziRecommendationsRow struct {
 // longest-waiting items lead; @lim caps the block the prompt carries so a large
 // backlog can't blow the prompt budget.
 //
-// PRD #68 Decision 12: also exclude any coordinate that has a row in
-// recommendation_filed_issues — a CLAIMED-OR-FILED NOT EXISTS (the row EXISTING is the
-// exclusion, NOT filed_at IS NOT NULL), so a hand-filed OR mid-filing improve_uzi issue
-// and this backlog never cover the same coordinate twice; a reverted (deleted) claim
-// re-includes it next cycle. This is the only mechanism — a partial index cannot cross
-// tables; the filed table's UNIQUE (review_id, category, target) index serves the
-// correlated lookup.
+// TWO coordinate exclusions, either of which drops the recommendation from the backlog:
+//
+//	PRD #68 Decision 12: any coordinate with a row in recommendation_filed_issues — a
+//	CLAIMED-OR-FILED NOT EXISTS (the row EXISTING is the exclusion, NOT
+//	filed_at IS NOT NULL), so a hand-filed OR mid-filing improve_uzi issue and this
+//	backlog never cover the same coordinate twice; a reverted (deleted) claim re-includes
+//	it next cycle.
+//
+//	PRD #94 Decision 9: any coordinate with a row in recommendation_dispositions — a
+//	dismissed improve_uzi is a human "no", a done one is handled, so either way the engine
+//	must not fold it into its aggregated tracking issue. Row-existence is the exclusion
+//	(ANY disposition, regardless of status/reason); Undo (row deleted) re-includes it next
+//	cycle.
+//
+// Both are the only mechanism — a partial index cannot cross tables; each side-table's
+// UNIQUE (review_id, category, target) index serves its correlated lookup.
 func (q *Queries) ListOpenImproveUziRecommendations(ctx context.Context, lim int32) ([]ListOpenImproveUziRecommendationsRow, error) {
 	rows, err := q.db.Query(ctx, listOpenImproveUziRecommendations, lim)
 	if err != nil {

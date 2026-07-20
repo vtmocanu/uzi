@@ -181,6 +181,19 @@ type PipelineStatus struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type RecommendationDisposition struct {
+	ID            uuid.UUID          `json:"id"`
+	ReviewID      uuid.UUID          `json:"review_id"`
+	Category      string             `json:"category"`
+	Target        string             `json:"target"`
+	Status        string             `json:"status"`
+	DismissReason pgtype.Text        `json:"dismiss_reason"`
+	RationaleHash string             `json:"rationale_hash"`
+	SetByUserID   pgtype.UUID        `json:"set_by_user_id"`
+	SetAt         pgtype.Timestamptz `json:"set_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RecommendationFiledIssue struct {
 	ID            uuid.UUID          `json:"id"`
 	ReviewID      uuid.UUID          `json:"review_id"`
