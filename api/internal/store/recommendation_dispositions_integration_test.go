@@ -77,6 +77,17 @@ func TestRecommendationDispositionsLiveDB(t *testing.T) {
 		t.Fatalf("UpsertRunReviewWithRecommendations: %v", err)
 	}
 
+	// Isolation: the self-improve backlog query (ListOpenImproveUziRecommendations) is
+	// INSTANCE-WIDE, and this test deliberately ends with an OPEN improve_uzi/'' rec (the
+	// tail Undo re-includes it). In the shared-DB LiveDB run that row would otherwise leak
+	// into a later test's global backlog assertion — it broke TestRecommendationFiledIssuesLiveDB
+	// (which asserts its own claimed improve_uzi/'' is excluded, but saw this one lingering).
+	// Deleting the review cascades its recommendations, dispositions, and filed links. Runs
+	// before the deferred pool.Close (LIFO), and on failure too (Fatalf runs defers).
+	defer func() {
+		mustExec(ctx, t, pool, `DELETE FROM run_reviews WHERE id = $1`, reviewID)
+	}()
+
 	// ── (b) the status/reason CHECK, on a throwaway coordinate ──
 	// dismissed with NULL reason must fail.
 	if _, err := q.UpsertRecommendationDisposition(ctx, store.UpsertRecommendationDispositionParams{
