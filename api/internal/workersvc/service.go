@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -888,6 +889,46 @@ func decodePackageList(raw []byte) []string {
 	return out
 }
 
+// Caps for the two PRD #99 attribution fields on the UNTRUSTED worker insert
+// path. `agent_label` is free, model-authored prose stored in a bare `text`
+// column, and Decision 1 repeats it on EVERY frame of an invocation — so one
+// label is stored N times, where N is that subagent's whole frame count. The
+// only other ceiling in the path is httpx.DecodeJSON's 1 MiB LimitReader, which
+// is PER BATCH, so a single message could otherwise carry a ~1 MiB label.
+//
+// This belongs here rather than in the pane: web-side truncation is a render
+// concern that does nothing for storage and nothing for `api/cmd/uzi`, a second
+// consumer that would print the full string to a terminal.
+//
+// 80 runes matches maxChatTitleRunes (workersvc/chat.go) — the closest analogue,
+// a one-line title derived from untrusted text — and the field is exactly that:
+// a lane title. The SDK's `task_description` mirrors the Agent tool's short
+// `description` argument (RunEvent.tsx already renders it through `firstLine`,
+// i.e. one line by construction), and the stub fixture's real labels are ~11
+// runes, so 80 is generous for the intended content while bounding the
+// amplification. NOT measured against a live SDK run — no live session is
+// available here; revisit if real labels are seen to clip.
+//
+// Truncate, never reject: a rejected batch is a lost message, and the label is
+// cosmetic. Rune-based, not byte-based, per the house idiom — byte-slicing can
+// split a multibyte rune into invalid UTF-8, which the INSERT then rejects
+// (spelled out at handler/cli_auth_flow.go:148).
+const (
+	maxAgentLabelRunes    = 80
+	maxAgentInstanceRunes = 128 // an SDK `toolu_*` id is ~30; this is headroom, not a fit
+)
+
+// truncateRunes caps s at n runes, cutting on a rune boundary so the result is
+// always valid UTF-8. No ellipsis: unlike a chat title this value is also a
+// grouping key on the read side, and appending a character would make a
+// truncated label collide differently than the raw one.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
+
 // IncomingMessage is one seq-numbered message a worker appends.
 type IncomingMessage struct {
 	Seq   int32  `json:"seq"`
@@ -912,11 +953,19 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written (all-or-nothing), so a
 	// [valid, valid, invalid] batch never leaves the first two half-persisted.
+	//
+	// The same pass CAPS the two PRD #99 attribution fields. It writes through the
+	// index (not a range copy) on purpose, so the capped value is what the insert,
+	// the WS broadcast and the usage fold all see — otherwise the stored row and
+	// the live frame would disagree.
 	var maxSeq int32
-	for _, m := range msgs {
+	for i := range msgs {
+		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
+		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
+		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
 		if m.Seq > maxSeq {
 			maxSeq = m.Seq
 		}

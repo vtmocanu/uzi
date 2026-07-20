@@ -3,8 +3,10 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -66,6 +68,87 @@ func TestAppendMessagesCarriesInstanceAndLabel(t *testing.T) {
 	if noLabel := fs.insertedMessages[3]; !noLabel.AgentInstance.Valid || noLabel.AgentLabel.Valid {
 		t.Fatalf("an instance frame with no task_description must persist instance-valid/label-NULL, got %+v / %+v",
 			noLabel.AgentInstance, noLabel.AgentLabel)
+	}
+}
+
+// TestAppendMessagesCapsAttributionFields proves the server-side bound on the
+// UNTRUSTED worker insert path. The only other ceiling is httpx.DecodeJSON's
+// 1 MiB LimitReader, which is PER BATCH, so without this one message could carry
+// a ~1 MiB label — stored once per FRAME of that invocation (Decision 1 repeats
+// the label on every frame). Truncate, never reject: a rejected batch is a lost
+// message. Web-side truncation would not cover this — it does nothing for storage
+// and nothing for the `uzi` CLI, which prints to a terminal.
+func TestAppendMessagesCapsAttributionFields(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	svc := New(fs, newBox(t), testParams())
+	b := &instanceBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	long := strings.Repeat("x", 5000)
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "text", Agent: "coder", AgentInstance: long, AgentLabel: long, Payload: json.RawMessage(`{}`)},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("an over-long label must be TRUNCATED, not rejected: %v", err)
+	}
+	got := fs.insertedMessages[0]
+	if n := utf8.RuneCountInString(got.AgentLabel.String); n != maxAgentLabelRunes {
+		t.Fatalf("agent_label capped to %d runes, want %d", n, maxAgentLabelRunes)
+	}
+	if n := utf8.RuneCountInString(got.AgentInstance.String); n != maxAgentInstanceRunes {
+		t.Fatalf("agent_instance capped to %d runes, want %d", n, maxAgentInstanceRunes)
+	}
+	// The cap must reach the LIVE frame too, not just the stored row — otherwise
+	// the browser renders a label the database does not hold.
+	if n := utf8.RuneCountInString(b.labels[0]); n != maxAgentLabelRunes {
+		t.Fatalf("the broadcast label is %d runes, want the same %d cap as the insert", n, maxAgentLabelRunes)
+	}
+}
+
+// TestAppendMessagesCapCutsOnRuneBoundary is the half a byte-slice would get
+// wrong. Byte-slicing multibyte text splits a rune into invalid UTF-8, which
+// Postgres then REJECTS on insert — turning a cosmetic cap into a 500 and a lost
+// batch. (handler/cli_auth_flow.go:148 documents the same trap.)
+func TestAppendMessagesCapCutsOnRuneBoundary(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	svc := New(fs, newBox(t), testParams())
+
+	// 3-byte runes: a byte cut lands mid-sequence for most offsets.
+	label := strings.Repeat("日", 500)
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "text", Agent: "coder", AgentLabel: label, Payload: json.RawMessage(`{}`)},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	got := fs.insertedMessages[0].AgentLabel.String
+	if !utf8.ValidString(got) {
+		t.Fatalf("the truncated label must stay valid UTF-8, got %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n != maxAgentLabelRunes {
+		t.Fatalf("multibyte label capped to %d runes, want %d", n, maxAgentLabelRunes)
+	}
+}
+
+// TestAppendMessagesLeavesShortAttributionAlone guards the other direction: the
+// cap must be inert for realistic values, or every lane title silently changes.
+func TestAppendMessagesLeavesShortAttributionAlone(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "text", Agent: "coder", AgentInstance: "toolu_A", AgentLabel: "web gate UX", Payload: json.RawMessage(`{}`)},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	got := fs.insertedMessages[0]
+	if got.AgentLabel.String != "web gate UX" || got.AgentInstance.String != "toolu_A" {
+		t.Fatalf("a normal-length label must pass through verbatim, got %q / %q",
+			got.AgentInstance.String, got.AgentLabel.String)
 	}
 }
 
