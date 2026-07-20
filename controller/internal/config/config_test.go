@@ -306,6 +306,50 @@ func TestLoadRequiresEveryWorkerSetting(t *testing.T) {
 	}
 }
 
+// The per-worker slot cap defaults to 1 (unset), takes a valid integer, and rejects a
+// non-integer or a value < 1 at boot rather than silently clamping — the same "fail at
+// boot" rule the CA/https and docker-tier couplings follow.
+func TestLoadParsesTheMaxConcurrentRuns(t *testing.T) {
+	t.Run("unset defaults to 1", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxConcurrentRuns != 1 {
+			t.Errorf("WorkerMaxConcurrentRuns = %d, want the default 1", cfg.WorkerMaxConcurrentRuns)
+		}
+	})
+
+	t.Run("a valid value is read", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_MAX_CONCURRENT_RUNS", "3")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerMaxConcurrentRuns != 3 {
+			t.Errorf("WorkerMaxConcurrentRuns = %d, want 3", cfg.WorkerMaxConcurrentRuns)
+		}
+	})
+
+	for _, bad := range []string{"0", "-1", "abc"} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_MAX_CONCURRENT_RUNS", bad)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_MAX_CONCURRENT_RUNS") {
+				t.Fatalf("err = %v, want a boot error naming UZI_WORKER_MAX_CONCURRENT_RUNS", err)
+			}
+		})
+	}
+}
+
 // The storage class is the one optional knob: empty legitimately means "the cluster
 // default", which is a real configuration rather than a missing one.
 func TestLoadLeavesTheStorageClassOptional(t *testing.T) {

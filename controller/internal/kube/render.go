@@ -357,6 +357,12 @@ type RenderConfig struct {
 	APIURL string
 	// StorageClass is optional; empty means the cluster default.
 	StorageClass string
+	// MaxConcurrentRuns is the per-worker slot cap rendered into the pod's
+	// WORKER_MAX_CONCURRENT_RUNS. Zero (a RenderConfig{} built in a test, or a caller
+	// that never set it) renders "1", so the default stays 1 everywhere; see config.go,
+	// which validates and defaults it. Raising it opts into the intra-user concurrency
+	// residuals documented in docs/worker-setup.md (PRD #58 Decision 7).
+	MaxConcurrentRuns int
 	// APICAPEM is the api's CA, relayed to workers through the per-worker Secret this
 	// controller already creates — no new RBAC verb, so Decision 1's Secrets line
 	// stays verbatim. Empty means the worker verifies against the system roots.
@@ -602,14 +608,21 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	fsGroupPolicy := corev1.FSGroupChangeOnRootMismatch
 	allowPrivilegeEscalation := false
 
+	// Default 1, operator-configurable via UZI_WORKER_MAX_CONCURRENT_RUNS (chart
+	// workers.maxConcurrentRuns). A zero-value cfg (e.g. a RenderConfig{} in a test)
+	// still renders "1", so the default holds everywhere. Raising it opts into the
+	// intra-user concurrency residuals documented in docs/worker-setup.md (Decision 7),
+	// so a preset must be sized to hold that many concurrent runs.
+	maxConcurrentRuns := cfg.MaxConcurrentRuns
+	if maxConcurrentRuns < 1 {
+		maxConcurrentRuns = 1
+	}
+
 	env := []corev1.EnvVar{
 		{Name: "UZI_API_URL", Value: cfg.APIURL},
 		{Name: "UZI_WORKER_TOKEN_FILE", Value: tokenPath},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},
-		// Pinned at 1 for every preset (Decision 7): a size buys headroom for ONE run,
-		// never parallelism. Raising it would server-provision the intra-user
-		// concurrency residuals documented in docs/worker-setup.md.
-		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: "1"},
+		{Name: "WORKER_MAX_CONCURRENT_RUNS", Value: strconv.Itoa(maxConcurrentRuns)},
 	}
 	if len(cfg.APICAPEM) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch

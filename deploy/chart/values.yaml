@@ -356,6 +356,13 @@ workers:
   # own CNPG already runs on storage-class here, so this is a default worth thinking about,
   # not a blocker.
   storageClass: ""
+  # The per-hosted-worker run-slot cap (→ UZI_WORKER_MAX_CONCURRENT_RUNS → the pod's
+  # WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe): a hosted worker takes ONE run at a
+  # time regardless of size. Raising it opts into the intra-user concurrency residuals
+  # documented in docs/worker-setup.md (PRD #58 Decision 7) and means a busy worker no
+  # longer leaves a user's other runs queued behind it — so size the preset to fit that
+  # many concurrent runs. The controller rejects a non-integer or a value < 1 at boot.
+  maxConcurrentRuns: 1
   # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
   # quota: an app-level bug must not noisy-neighbour a shared cluster.
   #

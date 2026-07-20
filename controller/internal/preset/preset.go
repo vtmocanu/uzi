@@ -92,9 +92,11 @@ func IsUnknown(err error) bool {
 // M6 bullet — a real SDK run peaks at 676 MiB, idle 148 MiB, and compose grants
 // 2 CPU / 4 GiB for 1 run slot + 1 chat session).
 //
-// `m` is compose parity at the limit and is the default. Every preset pins
-// WORKER_MAX_CONCURRENT_RUNS=1 (Decision 7), so a size buys headroom for ONE run,
-// never parallelism.
+// `m` is compose parity at the limit and is the default. The default cap is 1
+// (WORKER_MAX_CONCURRENT_RUNS), so a size still buys headroom for ONE run. That cap
+// is now operator-configurable (chart workers.maxConcurrentRuns → the controller's
+// UZI_WORKER_MAX_CONCURRENT_RUNS), and an operator raising it must pick a size that
+// fits that many concurrent runs.
 //
 // MustParse is right here: these are compile-time constants, so a typo is a
 // programmer error that must not be papered over into a zero quantity — and it
