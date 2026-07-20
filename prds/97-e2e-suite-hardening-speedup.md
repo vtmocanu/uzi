@@ -395,9 +395,53 @@ carry explicit author sign-off:
         interrogated against forge-fake + api logs instead of being torn down), and to
         fix only once the mechanism is known. If it proves environmental, say so with
         evidence; do not reclassify it as a flake to make the suite green.
+        **MECHANISM NARROWED (2026-07-20) — and it kills the timeout theory outright.**
+        `SetIssuePrdless` (`board.go:711-717`) is **strictly forge-first and
+        synchronous**: on forge failure it returns **502 and leaves the cache
+        untouched**, and the card it returns is built from the post-write issue. So a
+        **200 whose card lacks PRDLESS proves the forge write already returned
+        success**. `wait_eq no 20` is therefore **not waiting on a poll at all** — it
+        waits for something that by construction happened *before the HTTP response
+        returned*. **The timeout value is irrelevant: 20s, 60s or 600s fail
+        identically.** Not a too-tight window, not the fable class, not any M8 class.
+        Three remaining candidates to chase with `KEEP_STACK=1`: (1) forge-fake
+        accepted the removal but didn't persist it; (2) something re-added the label;
+        (3) `fake_has_label`/`fake_state` read stale or wrong-issue state. Note the
+        *apply* leg passed on the **same issue** seconds earlier, so forge-fake's
+        add path works — which argues for (1) or (2).
       - **FullSync-eviction `sleep 6`** → **8s**, the 2-reconcile-period floor the fable
         review identified. M5 correctly declined to *lower* it; M9 raises it to the floor.
-      - **Margin diagnostics** — the durable part. Timing-sensitive assertions must emit
+      **FULL-SUITE INVENTORY (2026-07-20) — the fragility is far narrower than feared,
+      and it re-scopes M9.** Cadence baseline: the overlay's poller is **24h (effectively
+      OFF)** and is only sped to 2s by the api recreate at `:1860`, so **nothing before
+      `:1860` can be racing the forge poller at all**. After it: poll 2s, reconcile
+      period 4s, worker claim/steer poll 500ms. Floors: poll-driven negative 4s,
+      reconcile-driven negative 8s. Against that, the whole suite contains:
+      - **Exactly ONE genuine point-in-time race**: `:1487` (#95 `consumed_at == null`).
+        `:984` *looks* identical but is **safe by construction** — it runs before any
+        worker exists (join token minted at `:993`); add an inline note so a future
+        hardening pass doesn't "fix" a non-race. `:2394` is the same shape but asserts a
+        **stable** state — and it is **already the vault-lock pattern, working today** in
+        the PRD #32 phase. So the #95 fix is not a new mechanism; it is a pattern the
+        suite already relies on.
+      - **Exactly ONE sub-floor window**: `:2108 sleep 6` (FullSync-eviction) needs 8s.
+      - **At floor, verified not assumed** (no action): `:1873`, `:1905`, `:2122`
+        `sleep 4` = 2 poll ticks; `:2095`, `:2132` `assert_no_run_for_issue 4`;
+        `:2394 sleep 1.5` = 3 worker cycles. `:2110`'s zero-width negative sits directly
+        behind `:2108`, so raising that to 8s covers it.
+      - **One marginal timeout**: `:1901 wait_card_column … 10` is reconcile-driven at
+        2.5 periods — above the 8s floor but the tightest in the suite (every other
+        `wait_*` is ≥20s ≈ ≥5 periods). **Do NOT pre-emptively raise it. Instrument it
+        and decide from the measurement** — guessing at timeouts is what produced the
+        #22 error.
+      - **Margin diagnostics — instrument the `wait_*` HELPERS CENTRALLY, not per site.**
+        There are ~40 `wait_*` calls; per-site diagnostics don't scale. The helpers
+        already loop until the condition holds, so recording elapsed-vs-timeout and
+        emitting it costs nothing and converts **every** timing-sensitive assertion in
+        the suite into a measurement in one change. This is **M9's core deliverable**;
+        per-site diagnostics (like #95's) are the exception. Had this existed, it would
+        have surfaced `:1901`'s 2.5-period margin long ago instead of us finding it by
+        reading. Timing-sensitive assertions must emit
         their margin (e.g. `#95`'s submit→consume delta), so a run yields a
         **measurement** rather than a pass/fail coin flip. A bare PASS hides a near-miss.
       **Gate (deliberately NOT "one green run")**: a full `./e2e/run-e2e.sh` green **AND**
