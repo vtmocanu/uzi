@@ -41,6 +41,25 @@ func TestFakeReviewTriState(t *testing.T) {
 	}
 }
 
+// The fake's RunInputs mirrors the owner-only endpoint: a present key returns the
+// queue (empty allowed), an absent key is the non-owner/unknown 404 path.
+func TestFakeRunInputs(t *testing.T) {
+	body := "steer me"
+	f := &FakeClient{InputsByID: map[string][]apitypes.SteerInputDTO{
+		"mine":  {{ID: 1, Body: &body}},
+		"empty": {},
+	}}
+	if in, err := f.RunInputs(context.Background(), "mine"); err != nil || len(in) != 1 {
+		t.Errorf("mine: in=%v err=%v", in, err)
+	}
+	if in, err := f.RunInputs(context.Background(), "empty"); err != nil || len(in) != 0 {
+		t.Errorf("empty: in=%v err=%v", in, err)
+	}
+	if _, err := f.RunInputs(context.Background(), "foreign"); ExitCodeFor(err) != ExitNotFound {
+		t.Errorf("foreign: exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
+	}
+}
+
 func TestFakeErrPropagates(t *testing.T) {
 	sentinel := Exitf(ExitAuth, "nope")
 	f := &FakeClient{Err: sentinel}
@@ -130,6 +149,25 @@ func TestHTTPClientReview404(t *testing.T) {
 	_, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
+	}
+}
+
+// RunInputs decodes the {"inputs": [...]} envelope into the DTO list, carrying
+// consumed_at through as a pointer (null → nil = Queued, set → Delivered).
+func TestHTTPClientRunInputs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"inputs":[{"id":2,"body":"b2","created_at":"2026-07-20T10:00:00Z","consumed_at":"2026-07-20T10:01:00Z"},{"id":1,"body":"b1","created_at":"2026-07-20T09:00:00Z","consumed_at":null}]}`))
+	}))
+	defer srv.Close()
+	in, err := newTestClient(srv).RunInputs(context.Background(), "r1")
+	if err != nil || len(in) != 2 {
+		t.Fatalf("RunInputs: in=%+v err=%v", in, err)
+	}
+	if in[0].ID != 2 || in[0].ConsumedAt == nil {
+		t.Errorf("first row should be consumed (Delivered): %+v", in[0])
+	}
+	if in[1].ID != 1 || in[1].ConsumedAt != nil {
+		t.Errorf("second row should be unconsumed (Queued): %+v", in[1])
 	}
 }
 
@@ -271,6 +309,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"get-run", func(c *HTTPClient) error { _, e := c.GetRun(context.Background(), "r1"); return e }},
 		{"run-logs", func(c *HTTPClient) error { _, e := c.RunLogs(context.Background(), "r1", 0); return e }},
 		{"run-review", func(c *HTTPClient) error { _, e := c.RunReview(context.Background(), "r1"); return e }},
+		{"run-inputs", func(c *HTTPClient) error { _, e := c.RunInputs(context.Background(), "r1"); return e }},
 		{"list-workers", func(c *HTTPClient) error { _, e := c.ListWorkers(context.Background()); return e }},
 		{"list-repos", func(c *HTTPClient) error { _, e := c.ListRepos(context.Background()); return e }},
 		{"admin-users", func(c *HTTPClient) error { _, e := c.AdminListUsers(context.Background()); return e }},

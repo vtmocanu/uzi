@@ -651,6 +651,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}", h.GetRun)
 				r.Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
+				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
+				// closing a leak (follow-ups are never in run_messages). RequireUser so
+				// `uzi run inputs` reads it from a CLI token.
+				r.Get("/{id}/inputs", h.ListRunInputs)
 				// Judge surfacing (PRD #46 M4 / Decision 21): read the review
 				// (owner-or-admin, GetReviewForTarget → GetRunForViewer-scoped, capped by
 				// the same RequireUser masking as GetRun).

@@ -27,6 +27,7 @@ import type {
   RunMessage,
   RunUsage,
   SecretMeta,
+  SteerInput,
   Skill,
   ToolAllowlistEntry,
   User,
@@ -1541,6 +1542,149 @@ export const mockFailedMessages: RunMessage[] = [
     modelUsage: { "claude-sonnet-5": { inputTokens: 8_200, outputTokens: 1_900, cacheReadInputTokens: 42_000, cacheCreationInputTokens: 0, costUSD: 0.11 } },
   }),
 ];
+
+// ── Crew-roster demo runs (PRD #95 M2) ───────────────────────────────────────
+// These exist to exercise the crew-state ladder + the collapse/Follow UX in mock
+// mode: a multi-agent BURST that used to yank the pane (now updates the crew strip
+// + one-liners in place), plus health-varied runs so every crew state renders.
+// Combined with the existing seeds — run-live (working), run-awaiting (waiting at
+// gate), run-done (done), run-queued (empty) — these two cover the remaining
+// stalled + waiting_worker + non-active idle/waiting split.
+
+let crewSeq = 0;
+const cm = (kind: string, agent: string | null, payload: unknown, minAgo: number): RunMessage => ({
+  seq: ++crewSeq,
+  kind,
+  agent,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+// A three-agent burst: lead handed off long ago (idle), coder spoke recently
+// (waiting), reviewer is the newest speaker (the active one). On run-crew's
+// `looping` health the active reviewer reads amber `stalled`, never green.
+export const mockCrewMessages: RunMessage[] = [
+  cm("status", null, { event: "init", model: "claude-opus-4-8" }, 12),
+  cm("text", "lead", { text: "Scoping the crew-roster work; handing the implementation to coder." }, 11),
+  cm("tool_use", "lead", { id: "cw-1", name: "Read", input: { file_path: "prds/95-activity-pane-v2.md" } }, 11),
+  cm("tool_result", "lead", { tool_use_id: "cw-1", content: "# PRD 95 — activity pane v2…" }, 11),
+  cm("text", "coder", { text: "Building the crew strip + collapse-by-default accordion." }, 1),
+  cm("tool_use", "coder", { id: "cw-2", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 1),
+  cm("tool_result", "coder", { tool_use_id: "cw-2", content: "ok" }, 1),
+  cm("tool_use", "coder", { id: "cw-3", name: "Bash", input: { command: "cd web && npm run typecheck" } }, 0.9),
+  cm("tool_result", "coder", { tool_use_id: "cw-3", content: "typecheck clean" }, 0.8),
+  cm("tool_use", "coder", { id: "cw-4", name: "Bash", input: { command: "cd web && npx vitest run src/components/ActivityFeed.test.tsx" } }, 0.6),
+  cm("tool_result", "coder", { tool_use_id: "cw-4", content: "✓ 29 tests passed" }, 0.5),
+  cm("text", "reviewer", { text: "Reviewing the ladder — checking that a long tool call still reads working." }, 0.3),
+  cm("tool_use", "reviewer", { id: "cw-5", name: "Grep", input: { pattern: "STALE_MS", path: "web/src" } }, 0.2),
+  cm("tool_use", "reviewer", { id: "cw-6", name: "Bash", input: { command: "go test ./..." } }, 0.1),
+];
+
+let degradedSeq = 0;
+const gm = (kind: string, agent: string | null, payload: unknown, minAgo: number): RunMessage => ({
+  seq: ++degradedSeq,
+  kind,
+  agent,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+// run-degraded: the worker went quiet (health=waiting_worker), so the whole crew
+// reads `waiting` regardless of who spoke last.
+export const mockDegradedMessages: RunMessage[] = [
+  gm("status", null, { event: "init", model: "claude-opus-4-8" }, 8),
+  gm("text", "lead", { text: "Working the fix; last heartbeat was a while ago." }, 7),
+  gm("tool_use", "lead", { id: "dg-1", name: "Bash", input: { command: "go build ./..." } }, 6),
+];
+
+function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">): Run {
+  return {
+    repo_id: "repo-uzi",
+    issue_iid: 24,
+    issue_title: over.issue_title ?? "Crew roster demo run",
+    issue_description: "Demo run exercising the PRD #95 crew-state ladder.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: "agent/issue-24",
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    claimed_at: minsAgo(12),
+    started_at: minsAgo(12),
+    finished_at: null,
+    created_at: minsAgo(13),
+    updated_at: minsAgo(1),
+    ...over,
+  };
+}
+
+export const mockCrewRuns: Run[] = [
+  demoIssueRun({
+    id: "run-crew",
+    issue_title: "Crew roster: looping worker (stalled active speaker)",
+    status: "running",
+    health: "looping",
+    health_reason: "no new tool calls in the last few minutes",
+    health_since: minsAgo(3),
+  }),
+  demoIssueRun({
+    id: "run-degraded",
+    issue_title: "Crew roster: worker went quiet (waiting on a worker)",
+    status: "running",
+    health: "waiting_worker",
+    health_reason: "the worker's heartbeat is stale",
+    health_since: minsAgo(2),
+  }),
+];
+
+// Sample steer queue per run (PRD #95), so M3's SteerQueueCard has demo data across
+// every delivery state without needing a live consume: NULL consumed_at → Queued,
+// set → Delivered; the run's status decides the gate/terminal copy client-side.
+const steerInput = (
+  id: number,
+  body: string,
+  createdMinAgo: number,
+  consumedMinAgo: number | null,
+): SteerInput => ({
+  id,
+  body,
+  created_at: minsAgo(createdMinAgo),
+  consumed_at: consumedMinAgo == null ? null : minsAgo(consumedMinAgo),
+});
+
+export const mockRunInputs: Record<string, SteerInput[]> = {
+  // Live run: one delivered, one still queued (newest-first).
+  [LIVE_RUN_ID]: [
+    steerInput(2, "also add a Prometheus histogram for heartbeat age", 1, null),
+    steerInput(1, "focus on the metrics endpoint first", 3, 2),
+  ],
+  // At the gate: a follow-up consumed while parked → "Delivered — applies after approval".
+  "run-awaiting": [steerInput(3, "prefer email over Slack for the first cut", 5, 4)],
+  // Finished run: a follow-up that was never consumed → "Not delivered — run finished".
+  "run-done": [steerInput(4, "one more nit: memoize the tool index", 186, null)],
+  "run-crew": [
+    steerInput(6, "check the reduced-motion path too", 1, null),
+    steerInput(5, "make sure a long tool call still reads working", 6, 5),
+  ],
+};
 
 // ── Chat conversations (PRD #39 M4) ──────────────────────────────────────────
 // Chat rides the run machinery, so a conversation is a run with kind='chat' and

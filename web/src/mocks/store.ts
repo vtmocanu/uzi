@@ -11,6 +11,9 @@ import {
   mockBoards,
   mockChatMessages,
   mockChatRuns,
+  mockCrewMessages,
+  mockCrewRuns,
+  mockDegradedMessages,
   mockDoneMessages,
   mockFailedMessages,
   mockProposals,
@@ -37,7 +40,11 @@ function seed(): MockState {
   for (const r of mockRuns) runs.set(r.id, { ...r });
   // Chat conversations ride the same run + message maps (PRD #39).
   for (const r of mockChatRuns) runs.set(r.id, { ...r });
+  // Crew-roster demo runs (PRD #95 M2): health-varied so every crew state renders.
+  for (const r of mockCrewRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
+  messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
+  messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));
   messages.set("run-done", [...mockDoneMessages]);
   // run-closed is a completed run (its MR was later closed unmerged); reuse the
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).

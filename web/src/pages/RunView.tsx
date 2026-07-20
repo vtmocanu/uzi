@@ -43,6 +43,7 @@ import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
+import { SteerQueueCard } from "../components/SteerQueueCard";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
 import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
@@ -120,7 +121,7 @@ function HealthFlag({ run }: { run: Run }) {
 
 export function RunView() {
   const { id = "" } = useParams();
-  const { run, messages, connected, error, submit } = useRunStream(id);
+  const { run, messages, connected, error, submit, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -395,6 +396,7 @@ export function RunView() {
       <Card className="p-4">
         <ActivityFeed
           messages={messages}
+          run={run}
           runningLive={run.status === "running"}
           connected={connected}
           terminal={terminal}
@@ -402,13 +404,19 @@ export function RunView() {
         />
       </Card>
 
-      {!terminal && (
-        <FollowUpComposer
-          busy={busy}
-          onStop={() => act(() => submit("cancel"))}
-          onSend={(text) => act(() => submit("follow_up", text))}
-        />
-      )}
+      {/* Steer queue + composer (PRD #95). Rendered UNCONDITIONALLY — including for a
+          terminal run — so the queue survives the run finishing (Decision 7/B1); the card
+          gates the composer/Stop on !terminal internally. Its inputs are lifted into
+          useRunStream, not held here or in the composer. */}
+      <SteerQueueCard
+        inputs={inputs}
+        terminal={terminal}
+        status={run.status}
+        canSteer={canSteer}
+        busy={busy}
+        onStop={() => act(() => submit("cancel"))}
+        onSend={(text) => act(() => submit("follow_up", text))}
+      />
     </div>
   );
 }
@@ -546,43 +554,6 @@ export function AgentRosterSummary({ run }: { run: Run }) {
         </div>
       )}
       {excluded.size > 0 && <p className="text-xs text-faint">Excluded: {[...excluded].join(", ")}</p>}
-    </Card>
-  );
-}
-
-function FollowUpComposer({
-  busy,
-  onStop,
-  onSend,
-}: {
-  busy: boolean;
-  onStop: () => void;
-  onSend: (text: string) => void;
-}) {
-  const [text, setText] = useState("");
-  const send = () => {
-    const t = text.trim();
-    if (!t) return;
-    onSend(t);
-    setText("");
-  };
-  return (
-    <Card className="space-y-3 p-4">
-      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Steer this run</h2>
-      <Textarea
-        rows={2}
-        placeholder="Send a follow-up message (resumes the agent as its next turn)"
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-      />
-      <div className="flex gap-2">
-        <Button disabled={busy || text.trim() === ""} onClick={send}>
-          Send follow-up
-        </Button>
-        <Button variant="danger" disabled={busy} onClick={onStop}>
-          Stop run
-        </Button>
-      </div>
     </Card>
   );
 }

@@ -821,6 +821,17 @@ consumed AS (
 )
 SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
 
+-- name: ListFollowUpInputsForRun :many
+-- The follow-up steer queue for a run, NEWEST FIRST and UNCAPPED (PRD #95 Decision 4):
+-- the web + CLI steer queue reads exactly kind='follow_up', with delivery status derived
+-- client-side from consumed_at (NULL → Queued, set → Delivered). Deliberately NOT the
+-- judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that would drop
+-- the newest follow-ups behind its cap on a busy/chat run. Owner-scoping is enforced at
+-- the run resolve (GetRunByIDForUser), not here.
+SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
+WHERE run_id = @run_id AND kind = 'follow_up'
+ORDER BY id DESC;
+
 -- Column automation (PRD #12 M1) ------------------------------------------
 
 -- name: GetRunMoveContext :one

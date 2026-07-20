@@ -75,6 +75,7 @@ uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
+uzi run inputs <id> [--json]
 uzi review show <id> | resolve <id> <rec> | dismiss <id> <rec> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
 uzi worker list | rm <id>
@@ -105,6 +106,13 @@ A few worth knowing:
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
   below. There's still no `rejudge` verb: re-running the judge spends the
   owner's Anthropic budget and stays a web action.
+- **`run inputs <id>`** lists the steer queue — a table of `body` / `state`
+  / `age`, newest first — same delivery states as the web pane, see
+  [Run activity pane](./run-activity.md#steer-queue). `--json` prints the raw
+  DTO instead. **Chat caveat**: a chat run seeds every turn as a follow-up
+  row, so `run inputs` against a chat run lists the whole conversation, not
+  just steering messages; an issue or CI-fix run's queue starts empty and
+  only ever holds what you actually sent mid-run.
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports

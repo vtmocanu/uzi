@@ -134,7 +134,25 @@ type RunInputRequest struct {
 
 // RunInputResponse is the POST /api/runs/{id}/inputs reply: server_side reports
 // whether the input was applied server-side (cancel/plan-rejection with no live
-// poller) rather than queued for the worker.
+// poller) rather than queued for the worker. ID + CreatedAt are the created steer
+// row (PRD #95 S2), present ONLY on a follow_up write so the web's optimistic queue
+// entry can adopt the real id + timestamp; omitted (nil) for approve/cancel/reject,
+// which surface no queue row.
 type RunInputResponse struct {
-	ServerSide bool `json:"server_side"`
+	ServerSide bool       `json:"server_side"`
+	ID         *int64     `json:"id,omitempty"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+}
+
+// SteerInputDTO is one follow_up steer-queue entry (PRD #95), served by
+// GET /api/runs/{id}/inputs (owner-only): the message body plus its delivery status.
+// ConsumedAt NULL ⇒ Queued (the worker has not drained it), set ⇒ Delivered (the
+// worker consumed it for its next turn). Body is a pointer for the JSON-null vs value
+// convention, though a follow_up always carries one. This is a DISTINCT struct from
+// the worker-facing workersvc.InputDTO, which has no consumed_at.
+type SteerInputDTO struct {
+	ID         int64      `json:"id"`
+	Body       *string    `json:"body"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ConsumedAt *time.Time `json:"consumed_at"`
 }

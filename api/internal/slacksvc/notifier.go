@@ -155,6 +155,11 @@ func (n *Notifier) PublishState(runID uuid.UUID, status string) {
 // (content minimization — only status/title/links do).
 func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
 
+// PublishInput is a deliberate no-op (PRD #95): the steer-queue delivery ack is a
+// web/CLI concern (browsers re-read the owner-gated queue). Steer text never goes to
+// Slack — same content-minimization reason PublishMessage no-ops.
+func (n *Notifier) PublishInput(uuid.UUID) {}
+
 // PublishHealth implements workersvc.Broadcaster for the run-health flag (PRD #47).
 // Like PublishState it MUST NOT block: it enqueues and returns, dropping the event
 // if the queue is full (Slack is strictly best-effort). The drain goroutine

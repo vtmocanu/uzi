@@ -6,6 +6,7 @@
 // someone is actually watching.
 
 import type { RunSocketLike } from "../lib/api";
+import { LIVE_RUN_ID } from "./data";
 import { ensureLive } from "./engine";
 import { subscribe } from "./store";
 
@@ -26,7 +27,11 @@ export class MockRunSocket implements RunSocketLike {
         this.onmessage?.({ data: JSON.stringify(frame) });
       });
       this.onopen?.();
-      ensureLive(runId);
+      // Only the dedicated live-run fixture gets its timed script woken on subscribe
+      // (mirrors mockApi.getRun). Waking it for EVERY running run hijacked the seeded
+      // crew-demo runs (run-crew, run-degraded) — the planning script overwrote the
+      // exact health states they exist to demo (PRD #95 M2). Gate it like getRun does.
+      if (runId === LIVE_RUN_ID) ensureLive(runId);
     }, 30);
   }
 
