@@ -436,6 +436,14 @@ Non-goals (v1):
    concurrency residuals (`docs/worker-setup.md` §Concurrent runs). Type and
    size are validated server-side against the built-in lists; user input never
    reaches an image reference or pod spec as free text.
+   - **CORRECTED 2026-07-20: the pin is no longer hardcoded.** The cap is now
+     operator-configurable via the chart value `workers.maxConcurrentRuns`
+     (→ controller `UZI_WORKER_MAX_CONCURRENT_RUNS` → `RenderConfig.MaxConcurrentRuns`
+     → the pod's `WORKER_MAX_CONCURRENT_RUNS`), threaded exactly like `storageClass`.
+     **Default stays 1** — this is a safe opt-in, not a change of default — and raising
+     it is still the same explicit trade into the intra-user concurrency residuals this
+     Decision names (`docs/worker-setup.md` §Concurrent runs); an operator raising it
+     must pick a size that fits that many concurrent runs. dev-cluster is set to 3.
 8. **Self-service + one quota knob.** Any user may provision up to the
    admin-set per-user quota (single admin setting, default 2, 0 disables
    self-service). Enforcement is atomic: the provision transaction takes
