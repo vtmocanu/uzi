@@ -906,6 +906,20 @@ carry explicit author sign-off:
       **unplanned** second payoff. That is not an argument for adding assertions speculatively — it
       is an argument for asserting **pass-through rather than a constant**, which happens to be
       robust against a whole class of degradations rather than only the one it was aimed at.
+      **Sharper rule (auditor), which PREDICTS the C3 split instead of describing it — use this one:
+      an assertion is vacuous-able exactly when its expected value equals its type's zero value.**
+      `non-admin_caller` expects `is_admin == false`, and `false` **is** the zero `bool`, so a capture
+      that failed and a capture that succeeded produce the identical observation. `admin_caller`
+      expects `true`, which no zero value can produce, so it cannot be fooled. The viewer assertions
+      expect `actor.ID` — non-zero — and are robust one-sided for the same reason.
+      This matters because "always add the mirror" would become a ritual: the two-sided test is **the
+      remedy for one specific shape**, not a general practice. The fragile shapes are booleans
+      expecting `false`, ints expecting `0`, strings expecting `""`, pointers expecting `nil`; each
+      needs either a mirror case or a loud capture guard. **An assertion whose expectation is
+      non-zero already has the property for free.**
+      *Scope, labelled as the auditor asked: the boolean case was **measured**. The extension to other
+      zero values is **reasoning from Go's semantics, not a run.** Recorded as such rather than as a
+      measured result.*
       **Two hardenings neither the auditor nor the lead proposed, both from the coder:**
       (1) the **mirror** mutation — hardcoding `IsAdmin: false` — is not a bypass, so it does not
       surface when hunting for one, but it silently strips admins of the cross-scope read the flag
