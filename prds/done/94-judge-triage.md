@@ -1,7 +1,7 @@
 # PRD #94: Triage judge recommendations — resolve, dismiss, and count
 
 **GitLab Issue**: [#94](https://gitlab.example.com/vtmocanu/uzi/-/issues/94)
-**Status**: Draft
+**Status**: Complete (2026-07-20; merged via MR [!81](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/81))
 **Priority**: Medium
 **Mockup**: [`prds/mockups/94-judge-triage-mock.html`](mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + row states + CLI)
 **Depends on**: PRD #46 (the judge, `run_reviews` + `review_recommendations`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed side-table pattern this reuses verbatim, and the `improve_uzi` backlog `NOT EXISTS` this extends). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #19 (`selfimprove` engine backlog).
@@ -285,7 +285,7 @@ not).
 
 ## Milestones
 
-- [ ] **M1 — Schema + store**: migration (draft `00073` — the live head is
+- [x] **M1 — Schema + store**: migration (draft `00073` — the live head is
       `00072`; renumber above the live head at merge per `CLAUDE.md`) creating
       `recommendation_dispositions` keyed `(review_id, category, target)` with the
       status/reason CHECKs, the `rationale_hash` column (Decision 3), and FK rules
@@ -302,14 +302,14 @@ not).
       `dismissed > done > filed(settled) > open` and treats an unsettled claim as
       not-filed; a disposed `improve_uzi` **leaves the backlog** and Undo
       re-includes it.
-- [ ] **M2 — API**: `PUT`/`DELETE .../disposition` on `RequireUser`, **owner-only**
+- [x] **M2 — API**: `PUT`/`DELETE .../disposition` on `RequireUser`, **owner-only**
       (Decision 5) — enum validation (bad `status`/`reason` → 400), recID→coordinate
       resolve, idempotent upsert / undo (Decision 6); `GET /me/judge/stats`
       (Decision 8); `ReviewDTO` gains `dispositions` (with server-computed `stale`)
       + `triage`, both via the shared **`bucketOf`** helper (Decisions 2/7). Its own
       handler file (e.g. `handler/review_disposition.go`) plus the shared helper;
       the single `handler.go` route-block edit and the DTO additions are expected.
-- [ ] **M3 — Web**: the JudgePanel gains a per-row **status chip** +
+- [x] **M3 — Web**: the JudgePanel gains a per-row **status chip** +
       `Mark done` / `Dismiss ▾ (Won't do / Not an issue)` controls + **Undo** +
       the **collapse-dismissed** toggle + the **stale-disposition** flag (rendered
       from the DTO's `stale`, "recommendation changed since you resolved"); a
@@ -317,12 +317,12 @@ not).
       strip** on the RunsList header; counts read the server `triage` (never
       re-derived in TS). `mockApi.ts` + `data.ts` extended so the mock stack
       renders every state (to-do / filed / done / dismissed×2 / stale).
-- [ ] **M4 — CLI**: the `uzi review` group + the `uzi run review` deprecated alias
+- [x] **M4 — CLI**: the `uzi review` group + the `uzi run review` deprecated alias
       (Decision 10), the short-rec-id column + triage line in `renderReview`, and
       the four mutating/stats verbs; `api/cmd/uzi/commands_test.go` covers the verbs,
       the `--reason` enum mapping, the short-id resolution, and that a uza_ token is
       refused on a mutation.
-- [ ] **M5 — Tests**: Go handler tests — the **owner-only** authz matrix (owner
+- [x] **M5 — Tests**: Go handler tests — the **owner-only** authz matrix (owner
       sets; non-owner session → 404; a **uza_ `admin_ro` token → 404 mutating
       *another* user's review** — but 200 on `show`/`stats`, and allowed to write
       its **own** review, matching `CreateRunInput`; assert the write path uses
@@ -334,7 +334,7 @@ not).
       a stubbed review and asserts it drops out of the `improve_uzi` backlog (and
       re-includes on undo), that **no run is enqueued**, and that **no forge write**
       happens.
-- [ ] **M6 — Docs**: `docs/judge.md` gains the triage lifecycle (the four states,
+- [x] **M6 — Docs**: `docs/judge.md` gains the triage lifecycle (the four states,
       sticky-across-re-judge, the hash-based stale flag, the false-positive count,
       the self-improve exclusion, the orphan behaviour); `docs/cli.md` gains the
       `uzi review` group and states the uza_ read-only ceiling is preserved (mutations
