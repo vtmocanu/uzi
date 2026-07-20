@@ -82,7 +82,7 @@ func TestRunDTOTags(t *testing.T) {
 func TestRunListItemDTOTags(t *testing.T) {
 	// Embeds RunDTO (keys flatten in) plus repo_path + worker_name; owner_email is
 	// omitempty (absent when nil).
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "worker_name")
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "worker_name", "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"

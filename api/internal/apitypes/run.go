@@ -107,6 +107,21 @@ type RunListItemDTO struct {
 	RepoPath   string  `json:"repo_path"`
 	WorkerName *string `json:"worker_name"`
 	OwnerEmail *string `json:"owner_email,omitempty"`
+	// Judge badge (PRD #98 M4, Decision 7). JudgeVerdict is the run's review verdict
+	// (ideal|ok|issues), nil when the run was never judged — rendered as NO badge, never
+	// as a neutral one, since "unjudged" and "judged fine" are different facts.
+	//
+	// JudgeTodoCount is the run's still-to-triage recommendation count, bucketed in Go
+	// through the shared BucketOf (never a SQL ladder — #94 Decision 2). It is 0 both for
+	// an unjudged run and for a fully-triaged one; the row appends it to the badge only
+	// when > 0, so the single grammar is "verdict, optionally a count" (⚖ issues · 2,
+	// ⚖ ideal) rather than two competing grammars.
+	//
+	// The two travel together but come from DIFFERENT mechanisms on purpose: the verdict
+	// via a safe UNIQUE join in the list query, the count via a separate bounded fetch
+	// bucketed in Go. See queries/runtime.sql for why the count cannot ride the join.
+	JudgeVerdict   *string `json:"judge_verdict"`
+	JudgeTodoCount int     `json:"judge_todo_count"`
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting

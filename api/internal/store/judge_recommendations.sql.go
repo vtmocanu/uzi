@@ -168,3 +168,69 @@ func (q *Queries) ListJudgeRecommendationRowsForUser(ctx context.Context, arg Li
 	}
 	return items, nil
 }
+
+const listJudgeTriageRowsForRuns = `-- name: ListJudgeTriageRowsForRuns :many
+SELECT
+    rv.target_run_id               AS run_id,
+    d.status                       AS disposition_status,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+WHERE rv.user_id = $1
+  AND rv.target_run_id = ANY($2::uuid[])
+LIMIT $3
+`
+
+type ListJudgeTriageRowsForRunsParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RunIds []uuid.UUID `json:"run_ids"`
+	Lim    int32       `json:"lim"`
+}
+
+type ListJudgeTriageRowsForRunsRow struct {
+	RunID             uuid.UUID   `json:"run_id"`
+	DispositionStatus pgtype.Text `json:"disposition_status"`
+	FiledSettled      bool        `json:"filed_settled"`
+}
+
+// The per-recommendation triage facts for a SET of runs — the input to the /runs list's
+// judge_todo_count (PRD #98 M4, Decision 7).
+//
+// This exists as a separate query precisely BECAUSE the count must not be computed in the
+// run-list join. Two independent reasons, both from #94: joining review_recommendations
+// into ListRunsForUser would fan it out (≤50 recs per review → up to 50 duplicate run
+// rows), and counting `todo` in SQL would re-implement the ladder's bottom rung
+// (disposition IS NULL AND filed_at IS NULL), which #94 Decision 2 forbids outright. So
+// this returns the same three flat facts the shared Go BucketOf consumes — no CASE, no
+// aggregation — plus the run id to attach the tally to.
+//
+// Owner-scoped by rv.user_id, so the caller's own page can never surface another user's
+// recommendation counts even if a run id were somehow spoofed into the list.
+//
+// BOUNDED (@lim), like every other enumeration in this PRD. The run list is capped at 200
+// and a review carries ≤50 recommendations (ReviewMaxRecommendations), so a full page tops
+// out around 10,000 rows; the cap is the guardrail for that product, applied here rather
+// than discovered later.
+func (q *Queries) ListJudgeTriageRowsForRuns(ctx context.Context, arg ListJudgeTriageRowsForRunsParams) ([]ListJudgeTriageRowsForRunsRow, error) {
+	rows, err := q.db.Query(ctx, listJudgeTriageRowsForRuns, arg.UserID, arg.RunIds, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJudgeTriageRowsForRunsRow{}
+	for rows.Next() {
+		var i ListJudgeTriageRowsForRunsRow
+		if err := rows.Scan(&i.RunID, &i.DispositionStatus, &i.FiledSettled); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

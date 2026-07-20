@@ -20,6 +20,7 @@ import { formatTokens, formatCost } from "../lib/formatTokens";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
+import { JudgeRunBadge } from "../components/JudgeRunBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -111,6 +112,9 @@ function RunRow({
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run. */}
               <RunHealthBadge run={run} />
+              {/* The judge verdict (PRD #98 M4) sits with the other per-run pills;
+                  absent entirely on an unjudged run. */}
+              <JudgeRunBadge run={run} />
               <StatusPill status={pillStatus} />
             </>
           )}

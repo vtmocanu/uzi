@@ -154,6 +154,9 @@ type Store interface {
 	// of (category, target) coordinates' member recommendations. It is the security
 	// boundary of the fan-out — the disposition is written off the rows it returns, never
 	// off the request body.
+	// /runs judge badge (PRD #98 M4): per-recommendation triage facts for the runs on one
+	// page, bucketed in Go by the shared BucketOf — never counted in SQL.
+	ListJudgeTriageRowsForRuns(ctx context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error)
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
 	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).

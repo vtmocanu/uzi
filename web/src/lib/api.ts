@@ -672,6 +672,9 @@ export type StopKind = "cancelled" | "plan_rejected";
 // healthy default. It is orthogonal to RunStatus and never kills a run — the
 // existing timeouts remain the only liveness backstops. runBadge renders the warn
 // variant only while the run is in a flaggable status.
+/** The judge's verdict on a run (PRD #46). Mirrors run_reviews.verdict's CHECK. */
+export type JudgeVerdict = "ideal" | "ok" | "issues";
+
 export type RunHealth =
   | "ok"
   | "stalled"
@@ -781,6 +784,16 @@ export interface RunUsage {
 // RunListItem is a run row for the index + admin overview: the run plus display
 // context. owner_email is present only on the admin (all-users) list.
 export interface RunListItem extends Run {
+  /** Judge badge (PRD #98 M4). judge_verdict is the run's review verdict, null when
+   *  the run was never judged — rendered as NO badge, never a neutral one, since
+   *  "unjudged" and "judged fine" are different facts. judge_todo_count is the run's
+   *  still-to-triage recommendation count, bucketed server-side by the ONE shared
+   *  BucketOf ladder (never a SQL tally), so it agrees with the Judge page and the nav
+   *  badge by construction. 0 for both an unjudged and a fully-triaged run; the row
+   *  appends it only when > 0. */
+  judge_verdict: JudgeVerdict | null;
+  judge_todo_count: number;
+
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;

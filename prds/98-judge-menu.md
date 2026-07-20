@@ -256,7 +256,23 @@ one action.
      row a second time` (SQLSTATE 21000) at runtime: rare, data-dependent, and
      invisible to any fake. `dedupeCoords` does **not** cover this — it dedupes the
      *request* coordinates, while the duplication arises inside the *resolved member
-     set*. The per-member loop was immune only because each upsert was its own
+     set*. **The member set stays deliberately UNBOUNDED in v1, and a hard cap was
+     considered and rejected** (2026-07-20). Collapsing to one statement removed the
+     round-trip amplification and the partial-apply window, but not the bound: the
+     item cap bounds **coordinates** (100), not **members**, since one coordinate
+     matches every occurrence across all the caller's reviews. What the collapse
+     traded is many short autocommit statements for **one statement whose parameter
+     arrays scale with member count, in a single transaction holding row locks on
+     every affected row for its duration** — better on round trips, longer on lock
+     hold under concurrency. A cap returning 400 was drafted and **withdrawn**: it
+     would make a large group *permanently un-dispositionable*, which is precisely
+     the failure the SQLSTATE 21000 crash caused and which this PRD just fixed —
+     reintroducing it by policy rather than by bug is not an improvement. If it is
+     ever bounded, the shape is a `LIMIT` on the resolve paired with a `truncated`
+     signal so the client repeats (mirroring M1), **never** a rejection. The
+     operation is own-data, idempotent and authenticated; the honest
+     characterisation lives in the query comment where the next reader will find it.
+     The per-member loop was immune only because each upsert was its own
      statement, which is a reason nobody had written down until changing the shape
      removed it. **This was missed on the first attempt and shipped a hard 500** —
      worth recording *why*, because the reason is structural rather than careless.
@@ -272,6 +288,26 @@ one action.
      sharing a `review_id` — otherwise the next change hits the same wall. A test
      helper that cannot construct the failing input silently bounds every test built
      on it.
+     **The dedup key is the full `(review_id, category, target)` triple and MUST NOT
+     be reduced to `(category, target)`** — caught during implementation, before it
+     shipped. Keying on the pair looks natural, because the pair is what the request
+     carries and what the group is named by. But members legitimately repeat a
+     coordinate **across different reviews**, and that recurrence is the entire
+     premise of this PRD. Deduping on the pair would have silently disposed **one
+     run per group instead of all of them** — the fan-out this endpoint exists to
+     perform. It is the same shape as the crash it was fixing: a guard whose
+     correctness depends on a distinction nobody had written down. The dedup test
+     therefore carries a **negative control** — reducing the key to the pair must
+     fail with "wrote 1 members, want 2".
+     *(This note originally said the pair-keyed version would have shipped "with
+     every existing test still green". **Measured false** in the `e4934c2c` review:
+     re-keying to the pair is caught in two independent places — the fake-backed
+     control, and three live-DB tests led by `TestBulkDispositionFansOutAcrossRunsLiveDB`
+     with `updated = 1, want 3 (one per run the coordinate recurs in)`. So the suite
+     would have caught it; the coder self-caught it earlier, which is better, but the
+     safety net was real. The claim was the implementer's, relayed by the lead
+     without checking — the same inherited-assertion failure this PRD keeps finding,
+     this time in the PRD's own prose.)*
    - **Why "write the resolved row, never the body" is defence-in-depth rather than
      the mechanism** (recorded so a future refactor does not undo it): the resolve
      matches by *equality* (`want.category = rr.category AND want.target =

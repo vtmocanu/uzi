@@ -93,3 +93,36 @@ ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, 
 -- triage tally is deliberately NOT computed from these rows (the service reads the #94
 -- stats query for that), so the canonical counts stay whole even when this page is cut.
 LIMIT @lim;
+
+-- name: ListJudgeTriageRowsForRuns :many
+-- The per-recommendation triage facts for a SET of runs — the input to the /runs list's
+-- judge_todo_count (PRD #98 M4, Decision 7).
+--
+-- This exists as a separate query precisely BECAUSE the count must not be computed in the
+-- run-list join. Two independent reasons, both from #94: joining review_recommendations
+-- into ListRunsForUser would fan it out (≤50 recs per review → up to 50 duplicate run
+-- rows), and counting `todo` in SQL would re-implement the ladder's bottom rung
+-- (disposition IS NULL AND filed_at IS NULL), which #94 Decision 2 forbids outright. So
+-- this returns the same three flat facts the shared Go BucketOf consumes — no CASE, no
+-- aggregation — plus the run id to attach the tally to.
+--
+-- Owner-scoped by rv.user_id, so the caller's own page can never surface another user's
+-- recommendation counts even if a run id were somehow spoofed into the list.
+--
+-- BOUNDED (@lim), like every other enumeration in this PRD. The run list is capped at 200
+-- and a review carries ≤50 recommendations (ReviewMaxRecommendations), so a full page tops
+-- out around 10,000 rows; the cap is the guardrail for that product, applied here rather
+-- than discovered later.
+SELECT
+    rv.target_run_id               AS run_id,
+    d.status                       AS disposition_status,
+    (f.filed_at IS NOT NULL)::bool AS filed_settled
+FROM run_reviews rv
+JOIN review_recommendations rr ON rr.review_id = rv.id
+LEFT JOIN recommendation_dispositions d
+    ON d.review_id = rv.id AND d.category = rr.category AND d.target = rr.target
+LEFT JOIN recommendation_filed_issues f
+    ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
+WHERE rv.user_id = @user_id
+  AND rv.target_run_id = ANY(@run_ids::uuid[])
+LIMIT @lim;

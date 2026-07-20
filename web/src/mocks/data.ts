@@ -1427,6 +1427,36 @@ function demoRunUsage(r: Run): RunUsage | null {
   };
 }
 
+// hashCode is a tiny stable string hash — enough to spread demo runs deterministically
+// across the judge-badge states without pulling in a dependency.
+function hashCode(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+// demoJudge gives the demo run list every judge-badge state (PRD #98 M4): unjudged,
+// a clean verdict with no count, and a verdict carrying a to-triage count. Keyed off the
+// run id so a given run looks the same on every render — a demo that reshuffles its
+// badges on refresh is worse than no demo.
+function demoJudge(r: Run): Pick<RunListItem, "judge_verdict" | "judge_todo_count"> {
+  // Only finished runs get judged (PRD #46 enqueues at the terminal transition).
+  if (r.status !== "completed" && r.status !== "failed") {
+    return { judge_verdict: null, judge_todo_count: 0 };
+  }
+  const bucket = hashCode(r.id) % 4;
+  switch (bucket) {
+    case 0:
+      return { judge_verdict: null, judge_todo_count: 0 }; // judged-less: no badge at all
+    case 1:
+      return { judge_verdict: "ideal", judge_todo_count: 0 }; // ⚖ ideal
+    case 2:
+      return { judge_verdict: "ok", judge_todo_count: 0 }; // ⚖ ok
+    default:
+      return { judge_verdict: "issues", judge_todo_count: 2 }; // ⚖ issues · 2
+  }
+}
+
 export function runListItem(r: Run, ownerEmail?: string): RunListItem {
   const repo = mockRepos.find((x) => x.id === r.repo_id);
   const worker = mockWorkers.find((w) => w.id === r.worker_id);
@@ -1435,6 +1465,7 @@ export function runListItem(r: Run, ownerEmail?: string): RunListItem {
     ...r,
     repo_path: repo?.path_with_namespace ?? r.repo_id ?? "",
     worker_name: worker?.name ?? null,
+    ...demoJudge(r),
     ...(usage ? { usage } : {}),
     ...(ownerEmail ? { owner_email: ownerEmail } : {}),
   };
