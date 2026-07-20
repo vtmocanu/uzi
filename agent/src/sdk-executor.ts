@@ -618,10 +618,11 @@ export class SdkExecutor implements Executor {
         // PRD #99: alarm on a frame that carries an invocation id but no role
         // field. Logged HERE rather than in the mapper because sdk-messages.ts is
         // a pure module with no logger, and this is the only executor that can
-        // produce subagent frames at all (chat-executor and judge-runner both put
-        // NESTED_AGENT_TOOL in disallowedTools). The `kind` is the ONLY thing
-        // logged — no id, no label — so nothing new reaches `docker logs`, keeping
-        // the deliberate omission at batcher.ts's debug line intact.
+        // produce subagent frames at all (chat-executor and judge-runner both
+        // prevent the Agent tool — chat via disallowedTools, judge via a deny-all
+        // PreToolUse hook). The `kind` is the ONLY thing logged — no id, no label —
+        // so nothing new reaches `docker logs`, keeping the deliberate omission at
+        // batcher.ts's debug line intact.
         const orphanKind = orphanInstanceKind(msg);
         if (orphanKind !== undefined) {
           this.log.warn("frame carried parent_tool_use_id without subagent_type", {
