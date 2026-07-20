@@ -373,6 +373,61 @@ func TestBulkDispositionClearsIssueCloseProvenanceLiveDB(t *testing.T) {
 	}
 }
 
+// ---- 4c. a duplicated coordinate does not crash the single-statement write ------------
+
+// TestBulkDispositionHandlesDuplicateCoordinateLiveDB guards a runtime crash that the
+// single-statement rewrite introduced and that NO fake can surface.
+//
+// review_recommendations has no unique constraint on (review_id, category, target), so a
+// judge may legitimately emit the same coordinate twice in ONE review. The per-member loop
+// was immune — each upsert was its own statement — but feeding both rows into one multi-row
+// `ON CONFLICT DO UPDATE` makes Postgres raise SQLSTATE 21000, "ON CONFLICT DO UPDATE
+// command cannot affect row a second time". It would have fired only for users whose judge
+// happened to duplicate a coordinate: rare, data-dependent, and invisible to every unit
+// test. dedupeCoords does NOT protect against it — that dedupes the REQUEST, while the
+// duplication arises inside the RESOLVED member set.
+//
+// The resolve's DISTINCT ON is the fix, and this is the test that would have caught it.
+func TestBulkDispositionHandlesDuplicateCoordinateLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	userID := bulkFixture(ctx, t, pool, 1, [2]string{"install_worker_tool", "rg"})
+	user := store.User{ID: userID}
+
+	// The SAME coordinate a second time in the SAME review — what a repetitive judge emits.
+	var reviewID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM run_reviews WHERE user_id = $1`, userID).Scan(&reviewID); err != nil {
+		t.Fatalf("pick review: %v", err)
+	}
+	mustExecT(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md)
+		 VALUES ($1, 'install_worker_tool', 'rg', 'said it twice')`, reviewID)
+	var recs int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM review_recommendations
+		  WHERE review_id = $1 AND category = 'install_worker_tool' AND target = 'rg'`,
+		reviewID).Scan(&recs); err != nil {
+		t.Fatalf("count recs: %v", err)
+	}
+	if recs != 2 {
+		t.Fatalf("fixture: want 2 recommendations on one coordinate, got %d", recs)
+	}
+
+	rec, got := doBulk(t, h, user, `{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200 — a duplicated coordinate must not blow up the write; body=%s",
+			rec.Code, rec.Body.String())
+	}
+	// ONE disposition, because the coordinate IS the disposition's key: two recommendations
+	// sharing a coordinate share one verdict.
+	if got.Updated != 1 {
+		t.Fatalf("updated = %d, want 1 — the duplicate must collapse to a single member", got.Updated)
+	}
+	if rows := dispositionRowsFor(ctx, t, pool, userID); len(rows) != 1 || rows["install_worker_tool/rg"] != "done" {
+		t.Fatalf("disposition rows = %v, want exactly one done row", rows)
+	}
+}
+
 // ---- 5. the body never becomes a coordinate ------------------------------------------
 
 // TestBulkDispositionRejectsBodyCoordinateLiveDB is the live-DB proof of the invariant

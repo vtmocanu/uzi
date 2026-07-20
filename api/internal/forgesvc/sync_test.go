@@ -173,20 +173,19 @@ type fakeStore struct {
 	stampParams    []store.FindCIFixStampTargetParams
 	stamps         []store.StampFixVerdictParams
 
-	// Filed→Done sync (PRD #98 M6) scripting + capture. closeEdges is what the edge
-	// query returns; closeInsertRows is the rows-affected of the DO-NOTHING insert (0
-	// models "the user already had a verdict"); the two slices record what the pass did.
-	// The EDGE SEMANTICS themselves are NOT modelled here — a fake that replayed a
-	// snapshot as events would test the model rather than the mechanism — so the
-	// once-only / Undo-sticks / not-overwritten guarantees live in the live-DB suite
-	// (handler/judge_issue_close_livedb_test.go) and these fields cover only wiring.
-	closeEdges      []store.ListFiledIssueCloseEdgesRow
-	closeEdgesErr   error
-	closeInsertRows int64
-	closeInsertErr  error
-	closeInserts    []store.InsertIssueCloseDispositionParams
-	closeStamps     []uuid.UUID
-	closeStampErr   error
+	// Filed→Done sync (PRD #98 M6) scripting + capture. The EDGE SEMANTICS are NOT
+	// modelled here — a fake replaying a snapshot as events would test the model rather
+	// than the mechanism — so once-only / Undo-sticks / not-overwritten live in the
+	// live-DB suite (handler/judge_issue_close_livedb_test.go). What these DO cover is
+	// wiring, and TestSyncFiledIssueClosesWiring asserts on every one of them: an
+	// unasserted capture field is worse than an honest gap, because it looks like
+	// coverage (audit B8).
+	closeEdges     []store.ListFiledIssueCloseEdgesRow
+	closeEdgesErr  error
+	closeEdgeArgs  []store.ListFiledIssueCloseEdgesParams
+	closeApplied   []store.ApplyFiledIssueCloseEdgeParams
+	closeApplyErr  error
+	closeApplyRows store.ApplyFiledIssueCloseEdgeRow
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -237,16 +236,13 @@ func (s *fakeStore) StampFixVerdict(_ context.Context, arg store.StampFixVerdict
 	s.stamps = append(s.stamps, arg)
 	return 1, nil
 }
-func (s *fakeStore) ListFiledIssueCloseEdges(context.Context, uuid.UUID) ([]store.ListFiledIssueCloseEdgesRow, error) {
+func (s *fakeStore) ListFiledIssueCloseEdges(_ context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error) {
+	s.closeEdgeArgs = append(s.closeEdgeArgs, arg)
 	return s.closeEdges, s.closeEdgesErr
 }
-func (s *fakeStore) InsertIssueCloseDisposition(_ context.Context, arg store.InsertIssueCloseDispositionParams) (int64, error) {
-	s.closeInserts = append(s.closeInserts, arg)
-	return s.closeInsertRows, s.closeInsertErr
-}
-func (s *fakeStore) MarkFiledIssueCloseSynced(_ context.Context, id uuid.UUID) (int64, error) {
-	s.closeStamps = append(s.closeStamps, id)
-	return 1, s.closeStampErr
+func (s *fakeStore) ApplyFiledIssueCloseEdge(_ context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error) {
+	s.closeApplied = append(s.closeApplied, arg)
+	return s.closeApplyRows, s.closeApplyErr
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

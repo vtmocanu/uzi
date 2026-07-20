@@ -10,6 +10,11 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// FiledIssueCloseBatch bounds how many close edges one repo's tick applies. Each edge is a
+// single statement, so this caps the serial work a repo can impose on the shared poller
+// tick; leftovers ride the next tick.
+const FiledIssueCloseBatch = 200
+
 // SyncFiledIssueCloses moves a judge recommendation to Done when the issue it was filed as
 // (#68) has been observed CLOSED — PRD #98 Decision 6, the Filed→Done sync.
 //
@@ -32,8 +37,16 @@ import (
 // carries on with the next repo), while a per-edge failure is logged and skipped WITHOUT
 // stamping, so the unconsumed edge is simply retried on the next tick — the same
 // retry-through-the-poller-cadence contract as the MR-close watcher (mr_watch.go).
+//
+// The per-tick batch is BOUNDED (FiledIssueCloseBatch). Edges are near-zero in practice, but
+// a mass issue closure would otherwise make one repo's tick run a statement per edge
+// serially and delay every repo behind it. The remainder is picked up next tick — an
+// unconsumed edge stays unconsumed, so nothing is lost by deferring it.
 func (s *Service) SyncFiledIssueCloses(ctx context.Context, repoID uuid.UUID) error {
-	edges, err := s.q.ListFiledIssueCloseEdges(ctx, repoID)
+	edges, err := s.q.ListFiledIssueCloseEdges(ctx, store.ListFiledIssueCloseEdgesParams{
+		RepoID: repoID,
+		Lim:    FiledIssueCloseBatch,
+	})
 	if err != nil {
 		return err
 	}
@@ -46,18 +59,22 @@ func (s *Service) SyncFiledIssueCloses(ctx context.Context, repoID uuid.UUID) er
 	return nil
 }
 
-// syncOneFiledIssueClose applies one close edge: write the automatic Done, then consume the
-// edge. The ORDER IS LOAD-BEARING. Insert-then-stamp means a crash in between leaves the
-// edge unconsumed, so the next tick retries the insert (idempotent — DO NOTHING) and
-// stamps. Stamping first would lose the disposition outright if the process died before the
-// insert, with nothing left to indicate it should have happened.
+// syncOneFiledIssueClose applies one close edge in a SINGLE atomic statement: the automatic
+// Done and the edge stamp together.
 //
-// A stamp still happens when the insert wrote NOTHING (rows == 0, i.e. the user already had
-// a verdict on this coordinate). That is deliberate: the close has been accounted for, and
-// leaving the edge open would make the pass re-examine the same row on every future tick
-// forever.
+// This used to be two calls, insert-then-stamp. That was the right ordering of the two
+// (stamping first would lose the disposition outright if the process died in between), but
+// it was not sufficient: if the process died or the stamp errored inside the window, the
+// edge stayed open, and a user who hit Undo BEFORE the next tick would have it silently
+// re-applied — the retry's insert is NOT a no-op once the row has been deleted, which
+// defeats exactly the guarantee M6 exists to provide. One statement removes the window
+// rather than narrowing it (audit B7).
+//
+// The edge is consumed even when the insert wrote nothing (the user already had a verdict).
+// That is deliberate: leaving it open would make the pass re-examine the same row on every
+// future tick forever.
 func (s *Service) syncOneFiledIssueClose(ctx context.Context, repoID uuid.UUID, e store.ListFiledIssueCloseEdgesRow) {
-	rows, err := s.q.InsertIssueCloseDisposition(ctx, store.InsertIssueCloseDispositionParams{
+	res, err := s.q.ApplyFiledIssueCloseEdge(ctx, store.ApplyFiledIssueCloseEdgeParams{
 		ReviewID: e.ReviewID,
 		Category: e.Category,
 		Target:   e.Target,
@@ -65,21 +82,15 @@ func (s *Service) syncOneFiledIssueClose(ctx context.Context, repoID uuid.UUID, 
 		// (#94 Decision 3) — so the panel's stale flag compares against the same key.
 		// Empty when the recommendation was re-judged away under a surviving filed link.
 		RationaleHash: workersvc.RationaleHash(e.RationaleMd),
+		FiledID:       e.FiledID,
 	})
 	if err != nil {
-		// Not an edge: leave close_synced_at NULL so the next tick retries.
-		slog.Warn("forgesvc: filed-issue close disposition failed",
+		// Atomic: nothing was applied, so the edge is still open and the next tick retries.
+		slog.Warn("forgesvc: filed-issue close edge failed",
 			"repo", repoID, "review", e.ReviewID, "category", e.Category, "error", err)
 		return
 	}
-	if _, err := s.q.MarkFiledIssueCloseSynced(ctx, e.FiledID); err != nil {
-		// The disposition landed but the edge is unconsumed. Harmless: the retry's insert
-		// is a DO-NOTHING no-op and only the stamp is re-attempted.
-		slog.Warn("forgesvc: filed-issue close edge stamp failed",
-			"repo", repoID, "filed", e.FiledID, "error", err)
-		return
-	}
-	if rows > 0 {
+	if res.Disposed > 0 {
 		slog.Info("forgesvc: recommendation auto-resolved by issue close",
 			"repo", repoID, "review", e.ReviewID, "category", e.Category, "target", e.Target,
 			"issue_iid", e.FiledIssueIid.Int64)

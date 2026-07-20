@@ -74,9 +74,8 @@ type IssueStore interface {
 	StampFixVerdict(ctx context.Context, arg store.StampFixVerdictParams) (int64, error)
 	// Filed→Done sync (PRD #98 M6): the open→closed edge over the freshly-synced issue
 	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
-	ListFiledIssueCloseEdges(ctx context.Context, repoID uuid.UUID) ([]store.ListFiledIssueCloseEdgesRow, error)
-	InsertIssueCloseDisposition(ctx context.Context, arg store.InsertIssueCloseDispositionParams) (int64, error)
-	MarkFiledIssueCloseSynced(ctx context.Context, id uuid.UUID) (int64, error)
+	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
+	ApplyFiledIssueCloseEdge(ctx context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error)
 }
 
 // LabelConfig resolves the configured PRD label the sync filters query by

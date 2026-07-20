@@ -51,7 +51,23 @@ WITH want AS (
     FROM unnest(@categories::text[]) WITH ORDINALITY AS c(val, ord)
     JOIN unnest(@targets::text[]) WITH ORDINALITY AS t(val, ord) ON t.ord = c.ord
 )
-SELECT
+-- DISTINCT ON is REQUIRED, and it is a correctness fix rather than a tidy-up.
+-- review_recommendations has NO unique constraint on (review_id, category, target) — only
+-- pkey(id), idx(review_id) and the partial improve_uzi index — so a judge may legitimately
+-- emit the same coordinate twice in one review (M1's grouper comment says so, and
+-- TestGroupJudgeRecommendationsRunCountIsDistinctRuns pins it). Without this, such a review
+-- yields the same coordinate twice, and feeding both into the single multi-row upsert makes
+-- Postgres raise SQLSTATE 21000, "ON CONFLICT DO UPDATE command cannot affect row a second
+-- time" — at runtime, only for the users whose judge happened to duplicate, and invisible to
+-- every fake. The per-member loop this replaced was immune because each upsert was its own
+-- statement; changing the shape removed the reason it was safe.
+--
+-- One row per coordinate is also simply the right GRAIN: recommendation_dispositions is
+-- keyed on (review_id, category, target), so two recommendations sharing a coordinate share
+-- ONE disposition. Both duplicates carry identical disposition/filed state anyway (those
+-- joins are on the coordinate, not on rr.id), so the ladder verdict is unaffected by which
+-- row wins; the ORDER BY makes the choice deterministic — oldest recommendation first.
+SELECT DISTINCT ON (rv.id, rr.category, rr.target)
     rv.id                          AS review_id,
     rr.id                          AS rec_id,
     rr.category                    AS category,
@@ -67,7 +83,7 @@ LEFT JOIN recommendation_dispositions d
 LEFT JOIN recommendation_filed_issues f
     ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
 WHERE rv.user_id = @user_id
-ORDER BY rr.category ASC, rr.target ASC, rv.created_at DESC, rr.id ASC;
+ORDER BY rv.id, rr.category, rr.target, rr.created_at ASC, rr.id ASC;
 
 -- name: UpsertDispositionsForResolvedCoords :execrows
 -- Write the whole fan-out in ONE statement (PRD #98 M2, audit NB-A).
@@ -117,6 +133,8 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         dismiss_reason = EXCLUDED.dismiss_reason,
         rationale_hash = EXCLUDED.rationale_hash,
         set_by_user_id = EXCLUDED.set_by_user_id,
-        set_via        = EXCLUDED.set_via, -- NULL: a human write clears the sync's provenance
+        -- Literal NULL, not EXCLUDED.set_via — see dispositions.sql for why the EXCLUDED
+        -- form is a latent trap. A human write always means human provenance.
+        set_via        = NULL,
         set_at         = now(),
         updated_at     = now();

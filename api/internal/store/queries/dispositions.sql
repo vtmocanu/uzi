@@ -30,9 +30,16 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         -- so the row's provenance becomes "a person set this". Without the reset, a
         -- coordinate previously auto-resolved by the Filed→Done sync would keep
         -- set_via='issue_close' after the user overrode it, and the panel would label
-        -- their own verdict "done via #IID". EXCLUDED.set_via is NULL here because the
-        -- INSERT column list above omits set_via, so it takes the column default.
-        set_via        = EXCLUDED.set_via,
+        -- their own verdict "done via #IID" — attributing a human decision to the system,
+        -- the exact mirror of what PF-4 prevents.
+        --
+        -- Written as a literal NULL, NOT as EXCLUDED.set_via. The two are equivalent only
+        -- because the INSERT column list above omits set_via; if anyone ever adds it there,
+        -- the EXCLUDED form would silently start carrying system provenance through a human
+        -- write with NO edit to this line. NULL states the invariant itself — a human write
+        -- always means human provenance — instead of depending on a column list elsewhere
+        -- in the same statement staying as it is.
+        set_via        = NULL,
         set_at         = now(),
         updated_at     = now()
 RETURNING *;

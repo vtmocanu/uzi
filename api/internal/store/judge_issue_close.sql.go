@@ -12,46 +12,77 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const insertIssueCloseDisposition = `-- name: InsertIssueCloseDisposition :execrows
-INSERT INTO recommendation_dispositions
-    (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_via)
-VALUES
-    ($1, $2, $3, 'done', NULL, $4, NULL, 'issue_close')
-ON CONFLICT (review_id, category, target) DO NOTHING
+const applyFiledIssueCloseEdge = `-- name: ApplyFiledIssueCloseEdge :one
+WITH ins AS (
+    INSERT INTO recommendation_dispositions
+        (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_via)
+    VALUES
+        ($1, $2, $3, 'done', NULL, $4, NULL, 'issue_close')
+    ON CONFLICT (review_id, category, target) DO NOTHING
+    RETURNING 1
+),
+stamped AS (
+    UPDATE recommendation_filed_issues f
+    SET close_synced_at = now()
+    WHERE f.id = $5 AND f.close_synced_at IS NULL
+    RETURNING 1
+)
+SELECT
+    (SELECT count(*) FROM ins)::bigint     AS disposed,
+    (SELECT count(*) FROM stamped)::bigint AS stamped
 `
 
-type InsertIssueCloseDispositionParams struct {
+type ApplyFiledIssueCloseEdgeParams struct {
 	ReviewID      uuid.UUID `json:"review_id"`
 	Category      string    `json:"category"`
 	Target        string    `json:"target"`
 	RationaleHash string    `json:"rationale_hash"`
+	FiledID       uuid.UUID `json:"filed_id"`
 }
 
-// Write the automatic Done — INSERT … ON CONFLICT DO NOTHING, emphatically NOT #94's
-// DO-UPDATE upsert (UpsertRecommendationDisposition, dispositions.sql).
+type ApplyFiledIssueCloseEdgeRow struct {
+	Disposed int64 `json:"disposed"`
+	Stamped  int64 `json:"stamped"`
+}
+
+// Apply ONE close edge atomically: write the automatic Done and consume the edge in a
+// SINGLE statement.
 //
-// DO NOTHING is the entire "never overwrite a human verdict" guarantee. If the coordinate
-// already carries ANY disposition — the user dismissed it, or marked it done themselves —
-// this writes nothing and their row, reason and set_at survive untouched. DO UPDATE would
-// silently replace a `dismissed` verdict with `done`, which is the bug this shape exists to
-// prevent.
+// WHY ONE STATEMENT rather than two calls (even in the right order). The insert and the
+// stamp used to be separate round-trips with no transaction. If the process died — or the
+// stamp errored — in between, the edge stayed open, which is the safe direction ONLY as
+// long as nothing else changed meanwhile. But if the user hit **Undo before the next tick**,
+// the retry's insert was NOT a no-op: the row was gone, so it re-applied Done and DEFEATED
+// THE UNDO. Narrow (needs a crash or DB error in that window plus an Undo before the next
+// tick) but real, and it is exactly the guarantee M6 exists to provide. In one statement the
+// window does not exist: either both happen or neither does.
 //
-// Provenance is fixed here, not passed in: status is always 'done', set_via is always
-// 'issue_close', and set_by_user_id is always NULL (the system did it — never
-// filed_by_user_id, who may be an admin acting on someone else's review, #68 Decision 8).
-// Returning rows-affected lets the caller distinguish "wrote the Done" from "the user
-// already had a verdict" for logging, without a second read.
-func (q *Queries) InsertIssueCloseDisposition(ctx context.Context, arg InsertIssueCloseDispositionParams) (int64, error) {
-	result, err := q.db.Exec(ctx, insertIssueCloseDisposition,
+// Postgres executes data-modifying CTEs exactly once and always to completion, independently
+// of whether the primary query reads their output — so `disposed` running dry does not stop
+// `stamped`. That is deliberate: the edge is consumed even when the insert wrote nothing
+// (the user already had a verdict), otherwise the pass would re-examine that row on every
+// future tick forever.
+//
+// The insert is ON CONFLICT DO NOTHING, emphatically NOT #94's DO-UPDATE upsert: it is the
+// entire "never overwrite a human verdict" guarantee. Provenance is fixed in the query text
+// rather than parameterised — status 'done', set_via 'issue_close', set_by_user_id NULL —
+// so no call site can pass filed_by_user_id (who may be an admin acting on someone else's
+// review, #68 Decision 8) by mistake.
+//
+// The stamp is itself guarded `close_synced_at IS NULL`, so two concurrent pollers cannot
+// both consume one edge. Returns both counts so the caller can log an actual auto-resolve
+// without a second read.
+func (q *Queries) ApplyFiledIssueCloseEdge(ctx context.Context, arg ApplyFiledIssueCloseEdgeParams) (ApplyFiledIssueCloseEdgeRow, error) {
+	row := q.db.QueryRow(ctx, applyFiledIssueCloseEdge,
 		arg.ReviewID,
 		arg.Category,
 		arg.Target,
 		arg.RationaleHash,
+		arg.FiledID,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var i ApplyFiledIssueCloseEdgeRow
+	err := row.Scan(&i.Disposed, &i.Stamped)
+	return i, err
 }
 
 const listFiledIssueCloseEdges = `-- name: ListFiledIssueCloseEdges :many
@@ -80,7 +111,13 @@ WHERE f.filed_repo_id = $1::uuid
   AND f.close_synced_at IS NULL
   AND i.state = 'closed'
 ORDER BY f.id ASC
+LIMIT $2
 `
+
+type ListFiledIssueCloseEdgesParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Lim    int32     `json:"lim"`
+}
 
 type ListFiledIssueCloseEdgesRow struct {
 	FiledID       uuid.UUID   `json:"filed_id"`
@@ -131,8 +168,14 @@ type ListFiledIssueCloseEdgesRow struct {
 // without it sqlc would hand the caller a pgtype.UUID and invite someone to pass an
 // absent/zero value here — which, per the pgUUID contract, would silently match nothing.
 // The repo id always exists at every call site (it comes from the poller's repo row).
-func (q *Queries) ListFiledIssueCloseEdges(ctx context.Context, repoID uuid.UUID) ([]ListFiledIssueCloseEdgesRow, error) {
-	rows, err := q.db.Query(ctx, listFiledIssueCloseEdges, repoID)
+// Bounded per tick (audit B9). Edges are near-zero in practice and the partial index is
+// exactly this working set, but a mass issue closure would otherwise make one repo's tick
+// run a statement per edge serially and delay every repo queued behind it. The remainder is
+// picked up next tick: nothing is lost, because an unconsumed edge stays unconsumed. This is
+// the third enumeration in this PRD to need a bound (M1's rows, M2's fan-out, now this) —
+// bound them where they are written.
+func (q *Queries) ListFiledIssueCloseEdges(ctx context.Context, arg ListFiledIssueCloseEdgesParams) ([]ListFiledIssueCloseEdgesRow, error) {
+	rows, err := q.db.Query(ctx, listFiledIssueCloseEdges, arg.RepoID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -156,25 +199,4 @@ func (q *Queries) ListFiledIssueCloseEdges(ctx context.Context, repoID uuid.UUID
 		return nil, err
 	}
 	return items, nil
-}
-
-const markFiledIssueCloseSynced = `-- name: MarkFiledIssueCloseSynced :execrows
-UPDATE recommendation_filed_issues
-SET close_synced_at = now()
-WHERE id = $1 AND close_synced_at IS NULL
-`
-
-// Consume the edge. Stamped AFTER the insert attempt, and guarded by
-// close_synced_at IS NULL so two concurrent pollers cannot both claim the same edge.
-//
-// Order matters and is not interchangeable: insert-then-stamp means a crash in between
-// leaves the edge unconsumed, so the next tick retries the (idempotent, DO-NOTHING) insert
-// and stamps — at worst a no-op repeat. Stamping FIRST would lose the disposition entirely
-// if the process died before the insert, with no way to notice.
-func (q *Queries) MarkFiledIssueCloseSynced(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, markFiledIssueCloseSynced, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
