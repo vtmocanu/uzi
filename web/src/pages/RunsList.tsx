@@ -9,8 +9,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
+import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage, type TriageCounts } from "../lib/api";
 import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { TriageSummary } from "./RunView";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
@@ -129,6 +130,10 @@ export function RunsList() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [showPast, setShowPast] = useState(false);
+  // Global judge-triage backlog (PRD #94): the caller's counts across ALL their runs,
+  // all-time. It DELIBERATELY ignores the list's filters/paging — it is a global
+  // backlog, not the filtered view — so it rides its own fetch, not `load`.
+  const [judgeStats, setJudgeStats] = useState<TriageCounts | null>(null);
 
   const load = useCallback(async () => {
     setError("");
@@ -153,12 +158,37 @@ export function RunsList() {
     load();
   }, [load]);
 
+  // The global strip fetches once on mount. On error (or total 0) it stays hidden —
+  // an unobtrusive backlog, never a loud failure surface on the runs page.
+  useEffect(() => {
+    let alive = true;
+    api
+      .getJudgeStats()
+      .then((stats) => {
+        if (alive) setJudgeStats(stats);
+      })
+      .catch(() => {
+        if (alive) setJudgeStats(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const active = runs.filter((r) => !isTerminalRun(r.status));
   const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
 
   return (
     <div className="space-y-6">
       <PageHeader title="Runs" description="Your agent runs. Open one to watch it live." />
+
+      {judgeStats && judgeStats.total > 0 && (
+        <TriageSummary
+          triage={judgeStats}
+          title="Judge recommendations · all your runs"
+          aside="all time"
+        />
+      )}
 
       {error && <Alert message={error} />}
       {loading && <ListSkeleton rows={4} />}

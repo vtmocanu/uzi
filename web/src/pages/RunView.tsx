@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -15,6 +15,7 @@ import {
   preferForgeUrl,
   isTerminalRun,
   type AgentSelectionInput,
+  type Disposition,
   type FiledIssue,
   type IssueDraft,
   type Repo,
@@ -22,6 +23,7 @@ import {
   type Run,
   type RunMessage,
   type RunReview,
+  type TriageCounts,
 } from "../lib/api";
 import { recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
@@ -639,6 +641,22 @@ export function JudgePanel({ run }: { run: Run }) {
     return m;
   }, [review]);
 
+  // Triage dispositions keyed by the SAME coordinate (PRD #94), mirroring filedByCoord
+  // — so a row renders its status chip, its Undo control, and the server-computed stale
+  // flag. Only coordinates with a current matching recommendation are in the DTO.
+  const dispByCoord = useMemo(() => {
+    const m = new Map<string, Disposition>();
+    for (const d of review?.dispositions ?? []) m.set(coordKey(d.category, d.target), d);
+    return m;
+  }, [review]);
+
+  // Panel-level collapse for the dismissed rows (default: show). The toggle label
+  // reads the server-computed count DIRECTLY (PRD #94 Decision 7 — never re-derive a
+  // triage aggregate in TS); dismissed is the top of the ladder, so this equals the
+  // number of dismissed rows on screen.
+  const [showDismissed, setShowDismissed] = useState(true);
+  const dismissedCount = review?.triage?.dismissed ?? 0;
+
   // Bounded background poll after a re-run: the fresh verdict arrives when the new
   // judge run finishes, so check every few seconds for a changed updated_at, giving
   // up after ~1 minute so a stuck/queued judge doesn't poll forever.
@@ -725,29 +743,74 @@ export function JudgePanel({ run }: { run: Run }) {
           {review.summary_md.trim() !== "" && (
             <p className="whitespace-pre-wrap text-sm text-muted">{review.summary_md}</p>
           )}
+
+          {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
+              meter, rendered DIRECTLY from review.triage — never re-derived from the
+              rows on screen, so it agrees with `uzi review show` and the global strip. */}
+          <TriageSummary
+            triage={review.triage}
+            title="Triage"
+            aside={`${review.triage.filed + review.triage.done + review.triage.dismissed} of ${review.triage.total} handled`}
+          />
+
           {review.recommendations.length > 0 ? (
             <ul className="space-y-2">
-              {review.recommendations.map((rec) => (
-                <li key={rec.id} className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge tone="info">{recommendationLabel(rec.category)}</Badge>
-                    {rec.target.trim() !== "" && (
-                      <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{rec.target}</code>
+              {review.recommendations.map((rec) => {
+                const disp = dispByCoord.get(coordKey(rec.category, rec.target));
+                const filed = filedByCoord.get(coordKey(rec.category, rec.target));
+                // Collapse-dismissed: hide a dismissed row while the toggle is off.
+                if (!showDismissed && disp?.status === "dismissed") return null;
+                return (
+                  <li key={rec.id} className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge tone="info">{recommendationLabel(rec.category)}</Badge>
+                      {rec.target.trim() !== "" && (
+                        <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{rec.target}</code>
+                      )}
+                      {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
+                      <span className="ml-auto">
+                        <DispositionChip disp={disp} filedSettled={filed !== undefined} />
+                      </span>
+                    </div>
+                    {rec.rationale_md.trim() !== "" && (
+                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
                     )}
-                    {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
-                  </div>
-                  {rec.rationale_md.trim() !== "" && (
-                    <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
-                  )}
-                  <RecommendationFiler
-                    runId={run.id}
-                    rec={rec}
-                    filed={filedByCoord.get(coordKey(rec.category, rec.target))}
-                    reviewUpdatedAt={review.updated_at}
-                    repos={repos}
-                  />
+                    {/* A settled disposition (done/dismissed) hides the create-issue
+                        affordance (File / draft) but NOT an already-filed link: a rec that
+                        was filed and then marked done keeps both facts visible (Resolved Q:
+                        "you can file then later mark done"). RecommendationFiler renders the
+                        filed-issue link regardless, and `actionHidden` suppresses only the
+                        create action once a disposition exists. */}
+                    <RecommendationFiler
+                      runId={run.id}
+                      rec={rec}
+                      filed={filed}
+                      reviewUpdatedAt={review.updated_at}
+                      repos={repos}
+                      actionHidden={disp !== undefined}
+                    />
+                    <DispositionControls
+                      runId={run.id}
+                      recId={rec.id}
+                      disp={disp}
+                      onChanged={fetchReview}
+                      onError={setActionErr}
+                    />
+                  </li>
+                );
+              })}
+              {dismissedCount > 0 && (
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => setShowDismissed((v) => !v)}
+                    aria-expanded={showDismissed}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-faint underline underline-offset-2 transition-colors hover:text-fg"
+                  >
+                    {showDismissed ? "Hide" : "Show"} dismissed ({dismissedCount})
+                  </button>
                 </li>
-              ))}
+              )}
             </ul>
           ) : (
             <p className="text-sm text-faint">No recommendations — the judge found nothing to change.</p>
@@ -775,12 +838,17 @@ function RecommendationFiler({
   filed,
   reviewUpdatedAt,
   repos,
+  actionHidden = false,
 }: {
   runId: string;
   rec: ReviewRecommendation;
   filed?: FiledIssue;
   reviewUpdatedAt: string;
   repos: Repo[];
+  // A disposed row suppresses the create-issue affordance (the "File issue" button and
+  // its draft) while STILL showing an existing filed link below — so a filed-then-done
+  // rec keeps its clickable issue link but offers no way to file a second issue.
+  actionHidden?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<IssueDraft | null>(null);
@@ -827,6 +895,10 @@ function RecommendationFiler({
       </div>
     );
   }
+
+  // Past this point is the create-issue affordance. A disposed row with no filed link
+  // renders nothing here (the filed row above already returned when a link exists).
+  if (actionHidden) return null;
 
   const openDraft = async () => {
     setOpen(true);
@@ -981,6 +1053,287 @@ function RecommendationFiler({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// DispositionChip renders a recommendation's triage status by the D#2 precedence
+// ladder — disposition (done/dismissed) wins over a settled filed link, which wins
+// over the open "To do" default. Tones mirror the mockup: a not_an_issue (false
+// positive) reads danger and reserves the only warm/red chip; a wont_do reads neutral
+// grey (a valid-but-parked call is not a warning), done reads ok, filed reads info.
+function DispositionChip({ disp, filedSettled }: { disp?: Disposition; filedSettled: boolean }) {
+  if (disp?.status === "dismissed") {
+    return disp.reason === "not_an_issue" ? (
+      <Badge tone="danger">Dismissed · Not an issue</Badge>
+    ) : (
+      <Badge tone="neutral">Dismissed · Won't do</Badge>
+    );
+  }
+  // The ✓ is decorative — aria-hidden so a screen reader reads just "Done", not
+  // "check mark Done".
+  if (disp?.status === "done")
+    return (
+      <Badge tone="ok">
+        <span aria-hidden="true">✓</span> Done
+      </Badge>
+    );
+  if (filedSettled) return <Badge tone="info">Filed</Badge>;
+  return <Badge tone="neutral">To do</Badge>;
+}
+
+// resolvedAgo renders a disposition's set_at as a coarse "resolved Xh ago". The panel
+// shows only a relative time, never the actor — under owner-only the setter is always
+// the owner (D#6). Guards an unparseable timestamp.
+function resolvedAgo(setAt: string): string {
+  const t = Date.parse(setAt);
+  if (!Number.isFinite(t)) return "resolved";
+  return `resolved ${formatElapsed(Date.now() - t)} ago`;
+}
+
+// DispositionControls is the per-row triage affordance (PRD #94). With no disposition
+// it offers Mark done + Dismiss ▾ (Won't do / Not an issue); with one it shows the
+// server-computed stale flag and an Undo. EVERY mutation refetches the review
+// (onChanged) so the triage bar, chips, and stale flag re-read from the server — the
+// panel never re-derives triage state in TS.
+function DispositionControls({
+  runId,
+  recId,
+  disp,
+  onChanged,
+  onError,
+}: {
+  runId: string;
+  recId: string;
+  disp?: Disposition;
+  onChanged: () => Promise<void>;
+  onError: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  // A polite sr-only live region announces the mutation result; it lives OUTSIDE the
+  // disp/no-disp branch so the branch swap after a mutation doesn't drop the message.
+  const [announce, setAnnounce] = useState("");
+
+  // Refs for a11y. The ui Button is a plain (non-forwardRef) component, so focus targets
+  // that are Buttons (Mark done, Dismiss trigger) are located by querySelector off a stable
+  // container ref rather than a direct ref; Undo is a raw <button> and takes a ref directly.
+  // menuWrapRef also backs the outside-click hit test. rootRef is the no-disp branch root.
+  const menuWrapRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const undoRef = useRef<HTMLButtonElement>(null);
+  // Set true just before the refetch so the disp-transition effect below knows the change
+  // was user-initiated (skips focus-stealing on the initial mount / passive re-renders).
+  const focusAfterMutation = useRef(false);
+
+  // Escape closes the menu (focus back to the Dismiss trigger — the first button in the
+  // wrapper); a pointerdown outside the wrapper closes it too. Wired only while open, torn
+  // down on close/unmount.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        menuWrapRef.current?.querySelector<HTMLElement>("button")?.focus();
+      }
+    };
+    const onPointerDown = (e: Event) => {
+      if (menuWrapRef.current && !menuWrapRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [menuOpen]);
+
+  // After a mutation + refetch re-renders this row into the other branch, move focus to the
+  // successor control that just mounted (disp → Undo; no disp → Mark done, the first button
+  // in the root). Keyed on disp AND busy: the successor button is `disabled={busy}` and busy
+  // only clears in the finally AFTER the refetch, so we defer the focus until busy drops
+  // (a disabled element ignores .focus()). The armed flag survives the intervening renders.
+  useEffect(() => {
+    if (!focusAfterMutation.current || busy) return;
+    focusAfterMutation.current = false;
+    if (disp) undoRef.current?.focus();
+    else rootRef.current?.querySelector<HTMLElement>("button")?.focus();
+  }, [disp, busy]);
+
+  const act = async (fn: () => Promise<unknown>, message: string) => {
+    onError("");
+    setBusy(true);
+    try {
+      await fn();
+      // Arm the focus move BEFORE the refetch so the disp-transition effect (fired by the
+      // parent's re-render on refetch) sees the flag set.
+      focusAfterMutation.current = true;
+      setAnnounce(message);
+      await onChanged();
+    } catch (e) {
+      focusAfterMutation.current = false;
+      onError(e instanceof ApiError ? e.message : "Could not update the disposition");
+    } finally {
+      setBusy(false);
+      setMenuOpen(false);
+    }
+  };
+
+  // The live region is shared by both branches so an announcement survives the branch swap.
+  const liveRegion = (
+    <span className="sr-only" role="status" aria-live="polite">
+      {announce}
+    </span>
+  );
+
+  if (disp) {
+    return (
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        {liveRegion}
+        <span className="text-faint">{resolvedAgo(disp.set_at)}</span>
+        {disp.stale && (
+          <Badge
+            tone="warning"
+            title="The judge re-ran and this recommendation's rationale changed since you resolved it."
+          >
+            recommendation changed since you resolved
+          </Badge>
+        )}
+        <button
+          type="button"
+          ref={undoRef}
+          disabled={busy}
+          onClick={() => act(() => api.deleteDisposition(runId, recId), "Disposition undone")}
+          className="font-medium text-faint underline underline-offset-2 transition-colors hover:text-fg disabled:opacity-50"
+        >
+          Undo
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={rootRef} className="mt-2 flex flex-wrap items-center gap-2">
+      {liveRegion}
+      <Button
+        size="sm"
+        variant="secondary"
+        disabled={busy}
+        onClick={() => act(() => api.setDisposition(runId, recId, "done"), "Marked done")}
+      >
+        Mark done
+      </Button>
+      <div className="relative" ref={menuWrapRef}>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={busy}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onClick={() => setMenuOpen((o) => !o)}
+        >
+          Dismiss ▾
+        </Button>
+        {menuOpen && (
+          <div
+            role="menu"
+            className="absolute z-10 mt-1 w-56 rounded-lg border border-edge-strong bg-surface p-1 shadow-lg"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy}
+              onClick={() => act(() => api.setDisposition(runId, recId, "dismissed", "wont_do"), "Dismissed — won't do")}
+              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
+            >
+              Won't do
+              <span className="text-xs text-faint">Valid, but not worth acting on</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy}
+              onClick={() =>
+                act(() => api.setDisposition(runId, recId, "dismissed", "not_an_issue"), "Dismissed — not an issue")
+              }
+              className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
+            >
+              Not an issue
+              <span className="text-xs text-faint">False positive — the judge got it wrong</span>
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// TriageSummary renders a TriageCounts bundle DIRECTLY — a segmented meter plus the
+// counts line (to do / filed / done / dismissed, with the false-positive sub-count).
+// It never derives a number itself: the same server bundle backs the per-review bar,
+// the global strip, and `uzi review show`, so they cannot disagree (D#7/D#8). Exported
+// so RunsList's global strip renders the identical visual from getJudgeStats.
+export function TriageSummary({
+  triage,
+  title,
+  aside,
+  className = "",
+}: {
+  triage: TriageCounts;
+  title: string;
+  aside?: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cx("rounded-lg border border-edge bg-ink/40 p-3", className)}>
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">{title}</h3>
+        {aside != null && <span className="ml-auto text-xs text-faint">{aside}</span>}
+      </div>
+      <TriageMeter triage={triage} />
+      <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
+        <TriageCount dotClass="bg-edge-strong" n={triage.todo} label="to do" />
+        <TriageCount dotClass="bg-info" n={triage.filed} label="filed" />
+        <TriageCount dotClass="bg-ok" n={triage.done} label="done" />
+        <TriageCount dotClass="bg-muted/60" n={triage.dismissed} label="dismissed" />
+        {triage.dismissed > 0 && (
+          <span className="text-faint">
+            {triage.false_positives} of {triage.dismissed} dismissed{" "}
+            {triage.dismissed === 1 ? "was a false positive" : "were false positives"}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TriageCount({ dotClass, n, label }: { dotClass: string; n: number; label: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1.5">
+      <span aria-hidden="true" className={cx("inline-block h-2 w-2 self-center rounded-full", dotClass)} />
+      <b className="text-sm font-semibold tabular-nums text-fg">{n}</b>
+      <span className="uppercase tracking-wide text-faint">{label}</span>
+    </span>
+  );
+}
+
+// TriageMeter is the segmented bar: one span per non-zero bucket, width proportional
+// to its share of the total, tinted with the same tone tokens as the counts dots. A
+// total of 0 yields an empty track.
+function TriageMeter({ triage }: { triage: TriageCounts }) {
+  const total = triage.total;
+  const seg = (n: number, cls: string, key: string) =>
+    n > 0 && total > 0 ? (
+      <span key={key} className={cx("h-full", cls)} style={{ width: `${(n / total) * 100}%` }} />
+    ) : null;
+  return (
+    <div className="mt-2 flex h-2 overflow-hidden rounded-full bg-raised" aria-hidden="true">
+      {seg(triage.todo, "bg-edge-strong", "todo")}
+      {seg(triage.filed, "bg-info", "filed")}
+      {seg(triage.done, "bg-ok", "done")}
+      {seg(triage.dismissed, "bg-muted/60", "dismissed")}
     </div>
   );
 }

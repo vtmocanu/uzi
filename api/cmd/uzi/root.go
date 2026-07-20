@@ -54,11 +54,11 @@ type Env struct {
 func DefaultEnv() Env {
 	store, _ := uzicli.DefaultStore() // nil store tolerated; env/flags still work
 	return Env{
-		Stdout:    os.Stdout,
-		Stderr:    os.Stderr,
-		Stdin:     os.Stdin,
-		StdoutTTY: uzicli.IsTerminal(os.Stdout),
-		StdinTTY:  uzicli.IsTerminal(os.Stdin),
+		Stdout:           os.Stdout,
+		Stderr:           os.Stderr,
+		Stdin:            os.Stdin,
+		StdoutTTY:        uzicli.IsTerminal(os.Stdout),
+		StdinTTY:         uzicli.IsTerminal(os.Stdin),
 		NewClient:        func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Store:            store,
 		AutoUpgradeSkill: true,
@@ -135,6 +135,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newAuthCmd(env, gf),
 		newWhoamiCmd(env, gf),
 		newRunCmd(env, gf),
+		newReviewCmd(env, gf),
 		newWorkerCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newRepoCmd(env, gf),

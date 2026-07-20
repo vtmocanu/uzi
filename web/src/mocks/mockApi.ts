@@ -16,6 +16,7 @@ import {
   type CliToken,
   type CliTokenScope,
   type CreatedIssue,
+  type Disposition,
   type IssueDraft,
   type Memory,
   type Notification,
@@ -36,6 +37,7 @@ import {
   type SkillUpdateInput,
   type TemplateAllocation,
   type TemplateAllocationsInput,
+  type TriageCounts,
   type ToolAllowlistEntry,
   type ToolAllowlistWriteInput,
   type User,
@@ -197,7 +199,53 @@ const reviews: MockReview[] = mockReviews.map((r) => ({
   ...r,
   recommendations: r.recommendations.map((x) => ({ ...x })),
   filed_issues: r.filed_issues.map((x) => ({ ...x })),
+  dispositions: r.dispositions.map((x) => ({ ...x })),
 }));
+
+// coordKey mirrors RunView's (category, target) key — the coordinate the disposition
+// and filed-link side-tables share (PRD #94/#68).
+const coordKey = (category: string, target: string) => `${category} ${target}`;
+
+// recomputeTriage buckets a review's recommendations through the SAME precedence
+// ladder as the server (dismissed > done > filed[settled] > todo), so the mock's
+// per-review counts and the global stats can never drift from the panel (PRD #94 D#2).
+// false_positives is the not_an_issue sub-count of dismissed.
+function recomputeTriage(review: MockReview): TriageCounts {
+  const dispByCoord = new Map(review.dispositions.map((d) => [coordKey(d.category, d.target), d]));
+  const filedCoords = new Set(review.filed_issues.map((f) => coordKey(f.category, f.target)));
+  const counts: TriageCounts = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+  for (const rec of review.recommendations) {
+    counts.total += 1;
+    const d = dispByCoord.get(coordKey(rec.category, rec.target));
+    if (d?.status === "dismissed") {
+      counts.dismissed += 1;
+      if (d.reason === "not_an_issue") counts.false_positives += 1;
+    } else if (d?.status === "done") {
+      counts.done += 1;
+    } else if (filedCoords.has(coordKey(rec.category, rec.target))) {
+      counts.filed += 1;
+    } else {
+      counts.todo += 1;
+    }
+  }
+  return counts;
+}
+
+// reviewDTO deep-clones a review for the wire and derives its server-computed fields:
+// triage (via the ladder) and the disposition list filtered to coordinates that still
+// have a current recommendation (D#7 — an orphaned disposition is inert, never sent).
+function reviewDTO(review: MockReview): MockReview {
+  const recCoords = new Set(review.recommendations.map((r) => coordKey(r.category, r.target)));
+  return {
+    ...review,
+    recommendations: review.recommendations.map((x) => ({ ...x })),
+    filed_issues: review.filed_issues.map((x) => ({ ...x })),
+    dispositions: review.dispositions
+      .filter((d) => recCoords.has(coordKey(d.category, d.target)))
+      .map((x) => ({ ...x })),
+    triage: recomputeTriage(review),
+  };
+}
 
 // Monotonic iid for issues the preview files (PRD #68), above the seeded #71.
 let nextFiledIssueIid = 90;
@@ -1474,18 +1522,75 @@ export const mockApi = {
   getRunReview: async (id: string) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     const review = reviews.find((r) => r.target_run_id === id);
-    return delay(
-      {
-        review: review
-          ? {
-              ...review,
-              recommendations: review.recommendations.map((x) => ({ ...x })),
-              filed_issues: review.filed_issues.map((x) => ({ ...x })),
-            }
-          : null,
-      },
-      60,
+    return delay({ review: review ? reviewDTO(review) : null }, 60);
+  },
+
+  // ── Triage a recommendation (PRD #94) ──────────────────────────────────────
+  // Owner-only local upserts on the coordinate — no token spend, no forge write.
+  // The panel refetches the review after each, so triage/stale re-read via reviewDTO.
+  setDisposition: async (
+    runId: string,
+    recId: string,
+    status: "done" | "dismissed",
+    reason?: "wont_do" | "not_an_issue",
+  ) => {
+    requireSession();
+    if (!getRun(runId)) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === runId);
+    const rec = review?.recommendations.find((x) => x.id === recId);
+    if (!review || !rec) throw new ApiError(404, "recommendation not found");
+    // Enum validation, mirroring the server: reason required iff dismissed.
+    if (status === "dismissed") {
+      if (reason !== "wont_do" && reason !== "not_an_issue") {
+        throw new ApiError(400, "reason is required for a dismissal (wont_do | not_an_issue)");
+      }
+    } else if (status === "done") {
+      if (reason !== undefined) throw new ApiError(400, "reason must be omitted for a done disposition");
+    } else {
+      throw new ApiError(400, "status must be 'done' or 'dismissed'");
+    }
+    // Idempotent upsert on the coordinate; a set re-stamps set_at and clears stale.
+    const next: Disposition = {
+      category: rec.category,
+      target: rec.target,
+      status,
+      reason: status === "dismissed" ? (reason as "wont_do" | "not_an_issue") : "",
+      set_at: new Date().toISOString(),
+      stale: false,
+    };
+    const existing = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+    if (existing) Object.assign(existing, next);
+    else review.dispositions.push(next);
+    return delay(null, 120); // 204 No Content
+  },
+  deleteDisposition: async (runId: string, recId: string) => {
+    requireSession();
+    if (!getRun(runId)) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === runId);
+    const rec = review?.recommendations.find((x) => x.id === recId);
+    if (!review || !rec) throw new ApiError(404, "recommendation not found");
+    // Idempotent: dropping an absent coordinate is a no-op success — mirrors the
+    // client's soft-404 handling, so Undo never surfaces a loud error in the demo.
+    review.dispositions = review.dispositions.filter(
+      (d) => !(d.category === rec.category && d.target === rec.target),
     );
+    return delay(null, 120);
+  },
+  getJudgeStats: async () => {
+    requireSession();
+    // Global backlog: bucket EVERY recommendation across all the caller's reviews
+    // through the same ladder (the demo owns one review, so this sums to it).
+    const total: TriageCounts = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+    for (const review of reviews) {
+      const t = recomputeTriage(review);
+      total.total += t.total;
+      total.todo += t.todo;
+      total.filed += t.filed;
+      total.done += t.done;
+      total.dismissed += t.dismissed;
+      total.false_positives += t.false_positives;
+    }
+    return delay(total, 60);
   },
 
   // ── File a forge issue from a recommendation (PRD #68 M4 preview) ────────────

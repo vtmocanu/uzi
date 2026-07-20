@@ -119,12 +119,23 @@ func TestRecommendationDTOTags(t *testing.T) {
 func TestReviewDTOTags(t *testing.T) {
 	assertTags(t, "ReviewDTO", ReviewDTO{},
 		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
-		"created_at", "updated_at", "recommendations", "filed_issues")
+		"created_at", "updated_at", "recommendations", "filed_issues",
+		"dispositions", "triage")
 }
 
 func TestFiledIssueDTOTags(t *testing.T) {
 	assertTags(t, "FiledIssueDTO", FiledIssueDTO{},
 		"category", "target", "issue_iid", "issue_url", "filed_at")
+}
+
+func TestDispositionDTOTags(t *testing.T) {
+	assertTags(t, "DispositionDTO", DispositionDTO{},
+		"category", "target", "status", "reason", "set_at", "stale")
+}
+
+func TestTriageDTOTags(t *testing.T) {
+	assertTags(t, "TriageDTO", TriageDTO{},
+		"total", "todo", "filed", "done", "dismissed", "false_positives")
 }
 
 func TestIssueDraftDTOTags(t *testing.T) {

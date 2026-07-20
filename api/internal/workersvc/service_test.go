@@ -72,11 +72,11 @@ type fakeStore struct {
 	// Register + heartbeat.
 	failOverCap      *store.FailWorkerRunsOverCapParams
 	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
-	requeueWorker  *store.RequeueWorkerRunsParams
-	registerParams *store.RegisterWorkerParams
-	registerResult store.Worker
-	heartbeat      store.Worker
-	callOrder      []string
+	requeueWorker    *store.RequeueWorkerRunsParams
+	registerParams   *store.RegisterWorkerParams
+	registerResult   store.Worker
+	heartbeat        store.Worker
+	callOrder        []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -90,27 +90,38 @@ type fakeStore struct {
 	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
 
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
-	runByIDPlain          store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
-	runByIDPlainErr       error
-	userByID              store.User
-	userByIDErr           error
-	createdJudgeRun       *store.CreateJudgeRunParams
-	createJudgeRunErr     error
-	activeJudgeRun        store.Run
-	activeJudgeRunErr     error
-	toolResultPayloads    [][]byte
-	toolResultPayloadsErr error
-	runInputs             []store.RunUserInput
-	workerPageMessages    []store.RunMessage
-	workerPageErr         error
-	upsertedReview        *store.UpsertRunReviewWithRecommendationsParams
-	upsertReviewErr       error
-	reviewByTarget        store.RunReview
-	reviewByTargetErr     error
-	recsByReview          []store.ReviewRecommendation
-	recsByReviewErr       error
-	filedByReview         []store.RecommendationFiledIssue
-	filedByReviewErr      error
+	runByIDPlain            store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
+	runByIDPlainErr         error
+	userByID                store.User
+	userByIDErr             error
+	createdJudgeRun         *store.CreateJudgeRunParams
+	createJudgeRunErr       error
+	activeJudgeRun          store.Run
+	activeJudgeRunErr       error
+	toolResultPayloads      [][]byte
+	toolResultPayloadsErr   error
+	runInputs               []store.RunUserInput
+	workerPageMessages      []store.RunMessage
+	workerPageErr           error
+	upsertedReview          *store.UpsertRunReviewWithRecommendationsParams
+	upsertReviewErr         error
+	reviewByTarget          store.RunReview
+	reviewByTargetErr       error
+	recsByReview            []store.ReviewRecommendation
+	recsByReviewErr         error
+	filedByReview           []store.RecommendationFiledIssue
+	filedByReviewErr        error
+	dispositionsByReview    []store.RecommendationDisposition
+	dispositionsByReviewErr error
+	// PRD #94 disposition write path + global stats aggregate. upsertedDisposition /
+	// deletedDisposition capture the coordinate the service wrote; dispositionDeleteRows
+	// is the rows-affected the DELETE returns (0 → the handler 404s an undo of nothing);
+	// judgeTriageRows backs ListJudgeTriageRowsForUser for JudgeTriageStats.
+	upsertedDisposition   *store.UpsertRecommendationDispositionParams
+	deletedDisposition    *store.DeleteRecommendationDispositionParams
+	dispositionDeleteRows int64
+	judgeTriageRows       []store.ListJudgeTriageRowsForUserRow
+	judgeTriageRowsErr    error
 
 	// Submit input.
 	runByID            store.Run
@@ -388,6 +399,25 @@ func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]
 }
 func (f *fakeStore) ListFiledIssuesForReview(context.Context, uuid.UUID) ([]store.RecommendationFiledIssue, error) {
 	return f.filedByReview, f.filedByReviewErr
+}
+func (f *fakeStore) ListDispositionsForReview(context.Context, uuid.UUID) ([]store.RecommendationDisposition, error) {
+	return f.dispositionsByReview, f.dispositionsByReviewErr
+}
+
+// PRD #94 disposition write path + global stats aggregate.
+func (f *fakeStore) UpsertRecommendationDisposition(_ context.Context, arg store.UpsertRecommendationDispositionParams) (store.RecommendationDisposition, error) {
+	f.upsertedDisposition = &arg
+	return store.RecommendationDisposition{
+		ID: uuid.New(), ReviewID: arg.ReviewID, Category: arg.Category, Target: arg.Target,
+		Status: arg.Status, DismissReason: arg.DismissReason, RationaleHash: arg.RationaleHash,
+	}, nil
+}
+func (f *fakeStore) DeleteRecommendationDisposition(_ context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error) {
+	f.deletedDisposition = &arg
+	return f.dispositionDeleteRows, nil
+}
+func (f *fakeStore) ListJudgeTriageRowsForUser(_ context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error) {
+	return f.judgeTriageRows, f.judgeTriageRowsErr
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr

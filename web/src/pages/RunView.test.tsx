@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { PlanPanel, AgentRosterSummary, JudgePanel } from "./RunView";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunReview } from "../lib/api";
 
@@ -20,6 +20,9 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRepos: vi.fn().mockResolvedValue({ repos: [] }),
       getIssueDraft: vi.fn(),
       fileIssue: vi.fn(),
+      // PRD #94 M3: triage mutations. Defaulted to resolve so a click + refetch settles.
+      setDisposition: vi.fn().mockResolvedValue(null),
+      deleteDisposition: vi.fn().mockResolvedValue(null),
     },
   };
 });
@@ -228,6 +231,10 @@ describe("JudgePanel (PRD #46 M4)", () => {
         },
       ],
       filed_issues: [],
+      // PRD #94: default to an untriaged review (every rec reads "To do"). The triage
+      // bar reads these server counts directly — the panel never re-derives them.
+      dispositions: [],
+      triage: { total: 1, todo: 1, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
       ...over,
     };
   }
@@ -441,5 +448,217 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // Cancel dismisses the failed card, restoring the File-issue button.
     fireEvent.click(screen.getByText("Cancel"));
     expect(await screen.findByText("File issue")).toBeTruthy();
+  });
+
+  // ── Triage: chips, controls, stale flag, triage bar, collapse (PRD #94 M3) ────────────
+  function rec(
+    id: string,
+    category: string,
+    target: string,
+    rationale = `rationale ${id}`,
+  ): RunReview["recommendations"][number] {
+    return {
+      id,
+      category: category as RunReview["recommendations"][number]["category"],
+      target,
+      rationale_md: rationale,
+      confidence: "",
+      created_at: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  it("renders a status chip per row by the disposition→filed→to-do ladder", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        recommendations: [
+          rec("rc1", "install_worker_tool", "shellcheck"),
+          rec("rc2", "improve_agent", "reviewer"),
+          rec("rc3", "improve_uzi", "poller"),
+          rec("rc4", "add_agent", "deploy-agent"),
+          rec("rc5", "improve_uzi", "timeout"),
+        ],
+        filed_issues: [
+          {
+            category: "add_agent",
+            target: "deploy-agent",
+            issue_iid: 72,
+            issue_url: "https://gitlab.example/x/-/issues/72",
+            filed_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+        dispositions: [
+          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+          { category: "improve_agent", target: "reviewer", status: "dismissed", reason: "wont_do", set_at: "2026-01-01T00:00:00Z", stale: false },
+          { category: "improve_uzi", target: "timeout", status: "dismissed", reason: "not_an_issue", set_at: "2026-01-01T00:00:00Z", stale: false },
+        ],
+        triage: { total: 5, todo: 1, filed: 1, done: 1, dismissed: 2, false_positives: 1 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // The ✓ is a decorative aria-hidden glyph, so the chip's own text is just "Done".
+    expect(await screen.findByText("Done")).toBeTruthy(); // done > filed
+    expect(screen.getByText("Dismissed · Won't do")).toBeTruthy();
+    expect(screen.getByText("Dismissed · Not an issue")).toBeTruthy();
+    expect(screen.getByText("To do")).toBeTruthy(); // no disposition, not filed
+    expect(screen.getByText("Filed")).toBeTruthy(); // settled link, no disposition
+  });
+
+  it("Mark done sets a done disposition (no reason) and refetches the review", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    await waitFor(() => expect(mockApi.setDisposition).toHaveBeenCalledWith("r1", "rc1", "done"));
+    // Refetch: getRunReview ran on mount AND again after the mutation.
+    await waitFor(() => expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("Dismiss → Not an issue sets a not_an_issue dismissal", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Dismiss ▾"));
+    fireEvent.click(await screen.findByText("Not an issue"));
+    await waitFor(() =>
+      expect(mockApi.setDisposition).toHaveBeenCalledWith("r1", "rc1", "dismissed", "not_an_issue"),
+    );
+  });
+
+  it("Undo clears the disposition via deleteDisposition and refetches", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        dispositions: [
+          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+        ],
+        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Undo"));
+    await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledWith("r1", "rc1"));
+    await waitFor(() => expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("renders the stale note straight from the DTO's stale flag", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        dispositions: [
+          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: true },
+        ],
+        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    expect(await screen.findByText(/recommendation changed since you resolved/i)).toBeTruthy();
+  });
+
+  it("renders the triage bar from server counts, never re-derived from the on-screen rows", async () => {
+    // ONE recommendation is rendered, but the server triage totals 5 — so the bar's
+    // numbers can only come from review.triage, proving no TS re-derivation.
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({ triage: { total: 5, todo: 2, filed: 1, done: 1, dismissed: 1, false_positives: 1 } }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    expect(await screen.findByText("3 of 5 handled")).toBeTruthy(); // filed+done+dismissed of total
+    expect(screen.getByText("2")).toBeTruthy(); // the server todo count, though 1 row shows
+    expect(screen.getByText(/1 of 1 dismissed was a false positive/)).toBeTruthy();
+  });
+
+  it("collapse-dismissed toggle hides the dismissed rows", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        recommendations: [
+          rec("rc1", "install_worker_tool", "shellcheck", "keep me"),
+          rec("rc2", "improve_agent", "reviewer", "hide me"),
+        ],
+        dispositions: [
+          { category: "improve_agent", target: "reviewer", status: "dismissed", reason: "wont_do", set_at: "2026-01-01T00:00:00Z", stale: false },
+        ],
+        triage: { total: 2, todo: 1, filed: 0, done: 0, dismissed: 1, false_positives: 0 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    expect(await screen.findByText("hide me")).toBeTruthy();
+    expect(screen.getByText("keep me")).toBeTruthy();
+    fireEvent.click(screen.getByText(/Hide dismissed \(1\)/));
+    await waitFor(() => expect(screen.queryByText("hide me")).toBeNull());
+    expect(screen.getByText("keep me")).toBeTruthy();
+  });
+
+  // A rec filed THEN marked done keeps both facts: the "Done" chip AND the clickable
+  // issue link, but NOT the create-issue affordance (you can't file a second issue).
+  it("a filed-then-done row keeps the issue link but drops the File-issue action", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        recommendations: [rec("rc1", "add_agent", "deploy-agent")],
+        filed_issues: [
+          {
+            category: "add_agent",
+            target: "deploy-agent",
+            issue_iid: 72,
+            issue_url: "https://gitlab.example/x/-/issues/72",
+            filed_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+        dispositions: [
+          { category: "add_agent", target: "deploy-agent", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+        ],
+        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // Done wins the chip ladder…
+    expect(await screen.findByText("Done")).toBeTruthy();
+    // …but the filed issue link survives the disposition (Resolved Q: file then done).
+    const link = screen.getByRole("link", { name: /#72/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example/x/-/issues/72");
+    // No way to file a second issue on a disposed row.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
+  it("Escape closes the Dismiss menu and returns focus to the trigger (a11y)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const trigger = await screen.findByRole("button", { name: /Dismiss/ });
+    fireEvent.click(trigger);
+    expect(await screen.findByText("Won't do")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByText("Won't do")).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("moves focus to the Undo control after a mutation, not to <body> (a11y)", async () => {
+    // Mount reads untriaged; the post-mutation refetch reads the row as done, so the row
+    // swaps to the Undo branch and focus must land there.
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review() })
+      .mockResolvedValue({
+        review: review({
+          dispositions: [
+            { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+          ],
+          triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+        }),
+      });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    const undo = await screen.findByText("Undo");
+    await waitFor(() => expect(document.activeElement).toBe(undo));
+  });
+
+  it("announces the mutation result via the polite live region (a11y)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    expect(await screen.findByText("Marked done")).toBeTruthy();
   });
 });

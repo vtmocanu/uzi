@@ -58,6 +58,23 @@ type FakeClient struct {
 	Memories            []apitypes.AgentMemoryDTO
 	LastDeletedMemoryID string
 
+	// Disposition triage (PRD #94): SetDisposition/DeleteDisposition record the
+	// (run, rec) they were called with and the wire status/reason, so a test can
+	// assert the exact mapping. JudgeStatsResult is the canned `stats` reply.
+	// SetDispositionErr / DeleteDispositionErr, when set, are returned by the
+	// matching write in preference to Err, so a test can model the OWNER-ONLY
+	// refusal precisely — a uza_ token READS the review fine (RunReview succeeds)
+	// and is refused only on the WRITE (404) — which a global Err cannot express
+	// (it would fail the resolve read first). The (run, rec) capture still records,
+	// so a test can assert the write was actually REACHED before being refused.
+	LastDispositionRunID  string
+	LastDispositionRecID  string
+	LastDispositionStatus string
+	LastDispositionReason string
+	JudgeStatsResult      apitypes.TriageDTO
+	SetDispositionErr     error
+	DeleteDispositionErr  error
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -147,6 +164,33 @@ func (f *FakeClient) ListMemory(context.Context) ([]apitypes.AgentMemoryDTO, err
 func (f *FakeClient) DeleteMemory(_ context.Context, id string) error {
 	f.LastDeletedMemoryID = id
 	return f.Err
+}
+
+func (f *FakeClient) SetDisposition(_ context.Context, runID, recID, status, reason string) error {
+	f.LastDispositionRunID = runID
+	f.LastDispositionRecID = recID
+	f.LastDispositionStatus = status
+	f.LastDispositionReason = reason
+	if f.SetDispositionErr != nil {
+		return f.SetDispositionErr
+	}
+	return f.Err
+}
+
+func (f *FakeClient) DeleteDisposition(_ context.Context, runID, recID string) error {
+	f.LastDispositionRunID = runID
+	f.LastDispositionRecID = recID
+	if f.DeleteDispositionErr != nil {
+		return f.DeleteDispositionErr
+	}
+	return f.Err
+}
+
+func (f *FakeClient) JudgeStats(context.Context) (apitypes.TriageDTO, error) {
+	if f.Err != nil {
+		return apitypes.TriageDTO{}, f.Err
+	}
+	return f.JudgeStatsResult, nil
 }
 
 func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {

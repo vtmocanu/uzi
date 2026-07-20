@@ -82,6 +82,11 @@ uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run inputs <run-id>
+uzi review show <run-id>
+uzi review resolve <run-id> <rec-id>
+uzi review dismiss <run-id> <rec-id> --reason wont-do|not-an-issue
+uzi review undo <run-id> <rec-id>
+uzi review stats
 uzi worker list
 uzi worker rm <worker-id>
 uzi memory list
@@ -146,11 +151,27 @@ uzi version
   set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
   chat turn as a follow-up, so its queue lists them all (issue runs start empty).
 
-### Reading the judge's review
+### Reading and triaging the judge's review
 
-`uzi run review <run-id>` prints the judge's verdict, summary, and its list of
-recommendations. It is **read-only** — there is no `rejudge` verb (re-running the
-judge spends the owner's Anthropic budget and stays a web action).
+`uzi review show <run-id>` prints the judge's verdict, summary, a **triage line**
+(the per-review tally), and its list of recommendations — each with a git-style
+**short rec id** and its current disposition. Reading is **read-only** — there is
+no `rejudge` verb (re-running the judge spends the owner's Anthropic budget and
+stays a web action). (`uzi run review` is a deprecated alias of `uzi review show`.)
+
+Triage a recommendation with its short id from `show`:
+
+- `uzi review resolve <run-id> <rec-id>` — mark it **done**.
+- `uzi review dismiss <run-id> <rec-id> --reason wont-do|not-an-issue` —
+  dismiss it (`not-an-issue` counts as a false positive).
+- `uzi review undo <run-id> <rec-id>` — clear its disposition (no disposition to
+  undo is not an error).
+- `uzi review stats` — your all-time triage totals across every run.
+
+The short id is resolved against the run's **current** review; an ambiguous
+prefix asks for a longer id and an unknown id asks you to refresh. Triage
+mutations are owner-only: a read-only `uza_` token can `show`/`stats` across the
+factory but is refused (exit 4) writing another user's review.
 
 A visible-but-unjudged run prints `not judged` and exits **0** (not 4). A
 fallback review carries wire status `"failed"` (the web badge says "judge

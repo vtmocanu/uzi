@@ -295,8 +295,10 @@ not).
       delete-disposition, list-for-review, and the **global flat-join** feeding
       the Go bucketer (Decision 8, returns per-rec `status` + `filed_settled`, no
       SQL `CASE`). A store integration test proves: a disposition **survives a
-      re-judge** delete-reinsert; a **byte-identical re-judge does not flag it
-      stale** while a **changed rationale does** (the hash); the ladder buckets
+      re-judge** delete-reinsert with its stored `rationale_hash` **untouched** (the
+      stale *flag* is the API-layer hash compare — Decision 3 keeps hashing out of
+      the store — so the both-ways stale assertion lives in M5's
+      `TestGetRunReviewStaleFlag`, not here); the ladder buckets
       `dismissed > done > filed(settled) > open` and treats an unsettled claim as
       not-filed; a disposed `improve_uzi` **leaves the backlog** and Undo
       re-includes it.

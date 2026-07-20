@@ -159,29 +159,26 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	logs.Flags().Bool("follow", false, "keep polling for new messages")
 	logs.Flags().Int32("after", 0, "only show messages after this sequence number")
 
+	// review is now a HIDDEN, DEPRECATED alias of `uzi review show` (PRD #94
+	// Decision 10). It shares runReviewShow so the two stay byte-identical.
+	// SetOut(env.Stderr) forces cobra's deprecation notice — printed via
+	// OutOrStderr, which the root's SetOut(env.Stdout) would otherwise route to
+	// STDOUT — onto stderr, keeping --json output pure (TestRunReviewJSON*).
 	review := &cobra.Command{
-		Use:   "review <run-id>",
-		Short: "Show the judge's review for a run (read-only)",
-		Args:  cobra.ExactArgs(1),
+		Use:        "review <run-id>",
+		Short:      "Show the judge's review for a run (read-only)",
+		Args:       cobra.ExactArgs(1),
+		Hidden:     true,
+		Deprecated: "use \"uzi review show\"",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			rv, err := c.RunReview(cmd.Context(), args[0])
-			if err != nil {
-				return err
-			}
-			p := env.printer(gf)
-			if p.Format == uzicli.FormatJSON {
-				// Pass the envelope through: {"review": <dto>|null}. A nil rv
-				// serializes to {"review": null} — the exact shape the endpoint
-				// returns for a visible-but-unjudged run (D21).
-				return p.JSON(map[string]any{"review": rv})
-			}
-			return renderReview(p, args[0], rv)
+			return runReviewShow(env, gf, c, cmd, args[0])
 		},
 	}
+	review.SetOut(env.Stderr)
 
 	create := &cobra.Command{
 		Use:   "create",
@@ -621,9 +618,17 @@ func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO) error {
 	}
 	if len(rv.Recommendations) > 0 {
 		p.Println()
+		p.Println(triageLine(rv.Triage))
 		p.Printf("recommendations (%d):\n", len(rv.Recommendations))
+		disp := dispositionsByCoord(rv.Dispositions)
 		for _, rec := range rv.Recommendations {
-			p.Printf("- [%s] %s → %s\n", rec.Confidence, rec.Category, sanitizeTTY(rec.Target))
+			// The short id (git-style, first 8 hex of the rec UUID) is what the
+			// mutation verbs accept — printing it makes `uzi review resolve/dismiss`
+			// usable straight from this output (Decision 10). Its disposition, if
+			// any, is matched on the (category, target) coordinate.
+			p.Printf("- %s [%s] %s → %s%s\n",
+				shortRecID(rec.ID), rec.Confidence, rec.Category, sanitizeTTY(rec.Target),
+				dispositionSuffix(disp[coordKey(rec.Category, rec.Target)]))
 			if r := sanitizeTTY(strings.TrimSpace(rec.RationaleMd)); r != "" {
 				for _, line := range strings.Split(r, "\n") {
 					p.Printf("    %s\n", line)
@@ -632,4 +637,57 @@ func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO) error {
 		}
 	}
 	return nil
+}
+
+// shortRecID is the git-style short recommendation id: the first 8 hex characters
+// of the rec UUID. The mutation verbs accept it (resolved back to the full id
+// against the current review); --json always carries the full id.
+func shortRecID(id string) string {
+	if len(id) >= 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// coordKey is the (category, target) coordinate a disposition is keyed on — the
+// same coordinate the filed-issue link uses. NUL-joined so no category/target
+// pair can collide with another.
+func coordKey(category, target string) string {
+	return category + "\x00" + target
+}
+
+// dispositionsByCoord indexes a review's dispositions by their coordinate so each
+// recommendation row can find its own verdict in one lookup (mirrors the panel's
+// dispByCoord map).
+func dispositionsByCoord(ds []apitypes.DispositionDTO) map[string]apitypes.DispositionDTO {
+	out := make(map[string]apitypes.DispositionDTO, len(ds))
+	for _, d := range ds {
+		out[coordKey(d.Category, d.Target)] = d
+	}
+	return out
+}
+
+// dispositionSuffix renders a recommendation's disposition as a trailing chip,
+// e.g. "  (done)" / "  (dismissed: not_an_issue, stale)". An empty (zero-value)
+// disposition — the common "to do" case — renders nothing.
+func dispositionSuffix(d apitypes.DispositionDTO) string {
+	if d.Status == "" {
+		return ""
+	}
+	label := d.Status
+	if d.Reason != "" {
+		label += ": " + d.Reason
+	}
+	if d.Stale {
+		label += ", stale"
+	}
+	return "  (" + label + ")"
+}
+
+// triageLine is the one-line per-review tally the panel's triage bar mirrors
+// (Decision 7): rendered straight from the server-computed TriageDTO so the CLI
+// and web never disagree.
+func triageLine(t apitypes.TriageDTO) string {
+	return fmt.Sprintf("triage: %d total · %d to do · %d filed · %d done · %d dismissed (%d false positive)",
+		t.Total, t.Todo, t.Filed, t.Done, t.Dismissed, t.FalsePositives)
 }

@@ -44,6 +44,10 @@ type ReviewWithRecommendations struct {
 	Review          store.RunReview
 	Recommendations []store.ReviewRecommendation
 	FiledIssues     []store.RecommendationFiledIssue
+	// Dispositions are the user's triage verdicts on this review's coordinates (PRD #94),
+	// keyed like the filed links so they survive a re-judge; the DTO matches them to the
+	// current recommendations by (category, target) and flags stale via the rationale hash.
+	Dispositions []store.RecommendationDisposition
 }
 
 // GetReviewForTarget returns the judge's review of a run for the run-page panel
@@ -74,7 +78,14 @@ func (s *Service) GetReviewForTarget(ctx context.Context, userID uuid.UUID, isAd
 	if err != nil {
 		return nil, err
 	}
-	return &ReviewWithRecommendations{Review: review, Recommendations: recs, FiledIssues: filed}, nil
+	// The dispositions (PRD #94): also keyed by the review, they survive the re-judge
+	// delete-reinsert, so the DTO matches them to recommendations by (category, target) and
+	// renders the triage chip + the (hash-based) stale flag.
+	dispositions, err := s.q.ListDispositionsForReview(ctx, review.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &ReviewWithRecommendations{Review: review, Recommendations: recs, FiledIssues: filed, Dispositions: dispositions}, nil
 }
 
 // RerunJudge enqueues a fresh judge run for a terminal run at the OWNER's explicit
