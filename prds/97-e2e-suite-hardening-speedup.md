@@ -43,11 +43,41 @@
    M9's `#22` entry). Catch it with `KEEP_STACK=1` and interrogate forge-fake before concluding.
 5. Then `/prd-done` up to PR creation.
 
-**Known environmental issue (not a code defect):** the harness **leaks 4 docker images per run**
-and never reclaims them — 646 of 768 images on the dev machine were `uzi-e2e-*` orphans (~125GB).
-A partial prune ran (~523 removed, ~123 left). One run died on a `No such container` daemon error,
-plausibly but *unprovenly* related. Candidate fix: `down -v --rmi local` in teardown, suppressed
-under `KEEP_STACK=1`. Not yet scoped to a milestone.
+**Harness image leak — real, and now scoped (candidate M10).** The harness **leaks 4 docker images
+per run**: `down -v` reclaims containers and volumes but never images, and the PID-derived project
+name guarantees the next run cannot reuse them. Result: 646 of 768 images on the dev machine were
+`uzi-e2e-*` orphans (~125GB). A partial prune ran (~523 removed, ~123 left).
+**Fix: add `--rmi local` to the teardown `down`.** Verified what that touches: it removes exactly
+the four per-run built images (`api`/`web`/`agent`/`forge-fake`, which Compose names
+`<project>-<service>` with no user `image:` tag — precisely what `local` means) and **preserves the
+pinned externals** (`postgres:17@sha256:…`, `alpine:3.22@sha256:…`, `docker:28-dind-rootless@sha256:…`),
+which matters since re-pulling those each run would be a real cost. `KEEP_STACK=1` is **already
+exempt by construction** (that branch returns before the `down`) — worth an inline comment saying so
+deliberately rather than by accident. Wall-clock cost is near zero: `--rmi local` removes the tagged
+image, not the build cache, so the next `compose build` hits cached layers and re-tags. Corollary:
+**it stops the ~4-image/run growth but does NOT reclaim the ~71GB build cache** — that is a separate
+decision, and the cache is what makes rebuilds cheap, so keep it. Belongs as its own small item
+(M10) or a standalone issue; **must not gate M4/M9**.
+
+**⚠️ CORRECTION — the `No such container` daemon error was NOT a daemon fault.** An earlier note here
+attributed it to Docker misbehaving under ~145GB of dead state. That is **not supported**. It was
+self-inflicted: a run was SIGKILLed mid `up -d --wait`, then `docker compose … down -v
+--remove-orphans` was run manually, so the in-flight `up` looked up a container the teardown had just
+deleted. The decisive evidence is that the very next run came up cleanly on the same daemon minutes
+later. **The leak is real; the daemon fault is not, and nothing so far demonstrates the leak has
+caused a failure.**
+
+**Regenerating the auditor's leg-by-leg baseline** (the artifact it called decisive; it lived in a
+session scratchpad and does not survive):
+```sh
+git show 27f72255:e2e/run-e2e.sh | grep -nE '^[[:space:]]*pass "' > /tmp/before.txt
+git show aad3c201:e2e/run-e2e.sh | grep -nE '^[[:space:]]*pass "' > /tmp/after.txt
+diff /tmp/before.txt /tmp/after.txt
+```
+Every vanished leg must map to a named intended drop, and the restored `#16` leg 3 must **appear**.
+**Caveat that must travel with it: static pass-legs (196 at base) are NOT runtime PASSes (182)** —
+the forgejo lane and the `--profile agent-docker` block are conditional and don't run by default.
+Valid for the DELTA only; quoting the static count against 182 is an apples-to-oranges error.
 
 **Two lead errors corrected in-document, kept for the next reader:** the `#68` option-(b)
 recommendation (would have raced `UNIQUE (run_id, seq)`) and the `#22` "too-tight window"
