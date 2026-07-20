@@ -424,6 +424,16 @@ Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/83-docker-capable-worker.m
 - k8s is the first-class test/runtime environment (not the deferred track). [user]
 - k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
 
+## Feature #95 — Run activity pane v2: crew roster, opt-in follow, steer-queue delivery
+
+Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/95-activity-pane-v2.md`. Rebuilds Feature #38 (activity feed); the follow behavior amends Feature #11.
+
+- Three user-reported UX problems to fix:
+  - The activity pane must not auto-scroll / jerk to the bottom on every incoming frame — watch a live run without being dragged along. [user 2026-07-20]
+  - Show a real "who's alive": glance at the pane and see each agent's state — working / waiting / done / blocked. [user 2026-07-20]
+  - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
+- Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
