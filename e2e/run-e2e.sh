@@ -222,13 +222,33 @@ trap cleanup EXIT
 # runner uid cannot read it (PRD #51 M5) — no per-start file re-delivery needed.
 WTOKEN=""
 
+# retry_read CMD [ARGS...] — run a READ-ONLY command with a short bounded retry, so one
+# transient curl/exec blip does not abort the ~20-min run under `set -euo pipefail` (a
+# bare point-in-time GET that hiccups would otherwise kill the whole suite). RESTRICTED to
+# idempotent GETs — only apiget + fake_state are wrapped below. A retried WRITE could
+# double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch/
+# apidelete, fake_post) and db_psql (also used for INSERTs, :2087/:2191/:2843) are
+# deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
+# non-zero after 3 tries: this smooths a blip, it never masks a persistent failure. curl -f
+# writes nothing to stdout on a failed attempt, so a retry cannot double the captured body.
+retry_read() {
+  local n=1 rc
+  while :; do
+    "$@" && return 0
+    rc=$?
+    [ "$n" -ge 3 ] && return "$rc"
+    n=$((n + 1))
+    sleep 0.5
+  done
+}
+
 # --- api helpers (session cookie + CSRF, like scripts/smoke.sh) --------------
 csrf() { awk '$6=="uzi_csrf"{print $7}' "$JAR"; }
 login() {
   curl -fsS -c "$JAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
     -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" >/dev/null
 }
-apiget()  { curl -fsS -b "$JAR" "$BASE$1"; }
+apiget()  { retry_read curl -fsS -b "$JAR" "$BASE$1"; }
 apipost() { curl -fsS -b "$JAR" -X POST "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/json' \
@@ -379,8 +399,10 @@ fake_post() { curl -fsSk -X POST "$FAKE_BASE$1" -H 'Content-Type: application/js
 # merging an MR (PRD #24).
 flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')" >/dev/null; }
 
-# fake_state — the fake's recorded state (issues, MRs, notes, label events).
-fake_state() { curl -fsSk "$FAKE_BASE/_e2e/state"; }
+# fake_state — the fake's recorded state (issues, MRs, notes, label events). Read-only
+# GET, wrapped in retry_read (like apiget) so a transient blip on a point-in-time read
+# does not abort the run; the /_e2e mutators (fake_post) stay unwrapped (writes).
+fake_state() { retry_read curl -fsSk "$FAKE_BASE/_e2e/state"; }
 
 # fake_has_label IID LABEL — "yes" if the fake forge currently shows LABEL on issue
 # IID, else "no". Use with wait_eq to POLL rather than read once: a label toggle is
@@ -730,7 +752,15 @@ if [ "$FORGE" = forgejo ]; then
   FJLOW="$RUNROOT/fj-low.json"
   LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJLOW")"
   case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, got $LC ($(cat "$FJLOW"))";; esac
-  grep -qi "16.0.0\|older than the minimum\|version" "$FJLOW" || fail "the <16 refusal must name the version, got $(cat "$FJLOW")"
+  # Assert the ACTUAL version-downgrade finding (D4), not the bare word "version" (PRD #97
+  # M3): the old `\|version` alternative was a false-green — nearly every forge error body
+  # contains "version" (the driver's own message says "server version …"), so a generic
+  # "token verification failed" with the downgrade finding ABSENT would have passed. The
+  # driver names the required floor as `Forgejo 16.0.0` in both refusal paths ("below the
+  # required Forgejo 16.0.0" for a recognized <16 server, "Forgejo 16.0.0 or newer" for an
+  # unparseable one — forgejo.go:179/182, min renders without the leading v).
+  grep -qE "below the required Forgejo 16\.0\.0|Forgejo 16\.0\.0 or newer" "$FJLOW" \
+    || fail "the <16 refusal must state the version-downgrade finding (required Forgejo 16.0.0), got $(cat "$FJLOW")"
   pass "forgejo connect POST refused against a < 16.0.0 instance, naming the required version (save-time gate) ✓"
   fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
   # c) over-privileged token -> 422 + violations (D6b save-time scope block).
@@ -1354,17 +1384,31 @@ pass "steer queue survives terminal: the Delivered follow_up is still listed on 
 
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
+# POSITIVE CONTROL (PRD #97 M3): both scans below assert a secret is ABSENT, which passes
+# VACUOUSLY on an empty corpus (a `compose logs` that errored past the `|| true`, an /data
+# exec that returned nothing). Prove the corpus is real BEFORE asserting absence — mirror
+# the /proc control (:1312) that proves the cmdline is readable first, the Decision-3
+# control (:2943) that proves a container reads its own /etc/hostname, and the CI
+# test:api-store-it gate-on-the-gate. Here: postgres unconditionally logs this benign
+# banner on boot, so its presence proves the log corpus is the real, populated stream.
+printf '%s' "$LOGS" | grep -qF "database system is ready to accept connections" \
+  || fail "positive control: the container-log corpus is empty/unreadable (no db boot banner) — the secret-absence scan below would pass vacuously"
 for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do
   printf '%s' "$LOGS" | grep -qF "$sec" && fail "a secret leaked into container logs"
 done
-pass "no PAT / Anthropic token / join token in any container log"
+pass "no PAT / Anthropic token / join token in any container log (corpus non-empty: db boot banner present)"
 
+# POSITIVE CONTROL (PRD #97 M3): prove /data has scannable files first, else a failed exec
+# or an empty /data makes the absence grep pass vacuously. By now the worker has cloned the
+# bare cache + worktrees, so /data holds files; assert at least one before scanning.
+"${COMPOSE[@]}" exec -T agent sh -c 'find /data -type f 2>/dev/null | head -1' | grep -q . \
+  || fail "positive control: the worker's /data has no files to scan — the secret-absence scan below would pass vacuously"
 for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do
   if "${COMPOSE[@]}" exec -T agent sh -c "grep -rlF '$sec' /data 2>/dev/null | head -1" | grep -q .; then
     fail "a secret is present on the worker's /data disk"
   fi
 done
-pass "no secret on the worker's /data (bare clone cache, worktrees, sessions)"
+pass "no secret on the worker's /data (bare clone cache, worktrees, sessions; corpus non-empty)"
 
 # /proc hardening (M6): the join token is delivered by file (the `worker_token` Docker
 # secret), not env, so it must not appear in any environ. Two NON-vacuous checks — the
