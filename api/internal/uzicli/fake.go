@@ -22,6 +22,7 @@ type FakeClient struct {
 	Runs         []apitypes.RunListItemDTO
 	RunByID      map[string]apitypes.RunDTO
 	LogsByID     map[string][]apitypes.MessageDTO
+	InputsByID   map[string][]apitypes.SteerInputDTO
 	Reviews      map[string]*apitypes.ReviewDTO
 	Workers      []apitypes.WorkerDTO
 	Repos        []apitypes.RepoDTO
@@ -107,6 +108,19 @@ func (f *FakeClient) RunReview(_ context.Context, id string) (*apitypes.ReviewDT
 	}
 	if r, ok := f.Reviews[id]; ok {
 		return r, nil // r may be nil: a visible-but-unjudged run
+	}
+	return nil, Exitf(ExitNotFound, "run %s not found", id)
+}
+
+// RunInputs mirrors the live owner-only endpoint: a key present in InputsByID is
+// the caller's own run (return its queue, possibly empty); a key absent is a
+// non-owner / unknown run → ExitNotFound (exit 4), matching the server's 404.
+func (f *FakeClient) RunInputs(_ context.Context, id string) ([]apitypes.SteerInputDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	if in, ok := f.InputsByID[id]; ok {
+		return in, nil
 	}
 	return nil, Exitf(ExitNotFound, "run %s not found", id)
 }

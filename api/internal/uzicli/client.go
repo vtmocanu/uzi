@@ -35,6 +35,11 @@ type Client interface {
 	// or not visible is a real 404 → *ExitError{ExitNotFound}. The two cases are
 	// deliberately distinct: nil is exit 0 "not judged", 404 is exit 4.
 	RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, error)
+	// RunInputs returns a run's follow_up steer queue (newest-first) with delivery
+	// status (PRD #95). Owner-only server-side (GetRunByIDForUser): a non-owner —
+	// including an admin_ro token on another user's run — gets a 404 →
+	// *ExitError{ExitNotFound}, never another user's steer text.
+	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
 	ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
@@ -362,6 +367,16 @@ func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.Review
 		return nil, err
 	}
 	return env.Review, nil
+}
+
+func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error) {
+	var env struct {
+		Inputs []apitypes.SteerInputDTO `json:"inputs"`
+	}
+	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/inputs", &env); err != nil {
+		return nil, err
+	}
+	return env.Inputs, nil
 }
 
 func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error) {

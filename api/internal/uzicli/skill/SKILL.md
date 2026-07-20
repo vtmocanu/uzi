@@ -81,6 +81,7 @@ uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
+uzi run inputs <run-id>
 uzi worker list
 uzi worker rm <worker-id>
 uzi memory list
@@ -135,6 +136,15 @@ uzi version
 - `uzi run cancel <run-id>` — cancel a run.
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
+- `uzi run inputs <run-id>` — the run's steer queue: the follow-ups sent to it
+  (newest first) with a delivery state — `queued` (not yet drained by the worker)
+  or `delivered` (handed to the worker for its next turn; at a plan gate it reads
+  `delivered (applies after approval)`, and an unconsumed input on a finished run
+  reads `not delivered (run finished)`). Owner-only — a read-only admin token gets
+  a 404 on another user's run. `--json` emits the raw `{id, body, created_at,
+  consumed_at}` list (derive the state yourself: `consumed_at` null = queued,
+  set = delivered). Only `follow_up` inputs appear; a **chat** run seeds every
+  chat turn as a follow-up, so its queue lists them all (issue runs start empty).
 
 ### Reading the judge's review
 
