@@ -269,6 +269,25 @@ carry explicit author sign-off:
       documented place. Mechanical move, no logic change. Keep the single-stack,
       serial, same-process model — do **not** parallelize (one worker/DB/forge makes
       that impossible). Deferrable; de-risks M4/M6.
+- [ ] **M8 — (optional) harden the `apipost` board-reconcile race (added 2026-07-20, from M2 work)**:
+      M2 validation on a fast host surfaced pre-existing latent fragility. **M2 is NOT
+      blocked on this** — M2's own 8 assertions passed every run (5/5), the M2-stashed
+      baseline was green, and run5 (relocated M2) was FULLY green (178 PASS / 0 FAIL),
+      so M2 shipped green. The intermittent downstream aborts across earlier runs were
+      pre-existing **environmental transients of two DIFFERENT classes** (coder's
+      Assessment 1): (a) a genuine board-reconcile `404` on run-create when the 2s
+      poller lags (PRD #16, run2) — the exact case `create_run` (`:246`) already retries;
+      (b) an api-routing transient `404` on a *fixed* route under host contention
+      (PRD #32 vault, run4 — `VaultLock` cannot 404 by design). M8 hardens class (a)
+      ONLY: route the ~13 plain-`apipost` run-create sites (~10 exposed after the
+      poller-speedup, plus the `skill_run` helper) through `create_run`'s retry (or an
+      equivalent read-only-safe wrapper — NOT `db_psql`, and NOT the intentional
+      non-200 gates like the PRDLESS 422). Mostly a mechanical sweep (~1-2h + one
+      validation run); low blast radius (`create_run` retries only the one documented
+      404, fails hard otherwise). It does **not** fix class (b) (a write-path retry is
+      deliberately avoided per M3/Decision 3 — double-execute risk); a fuller
+      infra-transient fix is a separate, harder question. In the spirit of M3's
+      false-green work. **Gate: a full `./e2e/run-e2e.sh` green after the sweep.**
 
 **Dependency graph**: **M1, M3, M5 are independent** (git-auth leg / assertion
 hardening / mechanical timing — separate parts of the file and the overlay) and can
