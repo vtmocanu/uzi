@@ -1,6 +1,6 @@
 # PRD #99: Activity pane v3 — per-instance lanes, per-lane status dot, and a conditional role roster
 
-**GitLab Issue**: #99 — **PROVISIONAL** (forge unreachable at authoring time; reconcile with the real issue iid before creating the issue and rename the file + mockup to match)
+**GitLab Issue**: [#99](https://gitlab.example.com/vtmocanu/uzi/-/issues/99)
 **Status**: Draft
 **Priority**: Medium
 **Mockup**: [`prds/mockups/99-activity-instance-lanes-mock.html`](mockups/99-activity-instance-lanes-mock.html) (before/after: the current repeated-bar transcript vs. instance lanes with per-lane dots + task labels; plus the "busy crew" role-rollup variant)
@@ -97,4 +97,3 @@ Rebuild the feed around **one lane per real actor (invocation)**, key identity t
 - **Subagent lanes are prose-empty until `forwardSubagentText` (Decision 11).** A lane may show only a tool rail; the companion knob is flagged as follow-up, not bundled (cost/volume change). No regression versus today.
 - **`parent_tool_use_id == spawn tool_use id` is unverified** (native CLI binary). No longer load-bearing — the label comes from `task_description`, not a join — so this is informational, not a risk to the label.
 - **SDK drift on `parent_tool_use_id` / `task_description`.** A reshape degrades `asString(...)` to `undefined` → NULL columns → role-fallback lane (today's behaviour), never a crash — the defensive-probe posture `sdk-messages.ts` already uses.
-- **Provisional issue number.** This file is `#99` by guess (forge unreachable at authoring); reconcile with the real GitLab issue iid and rename the file + mockup before the issue is created.
