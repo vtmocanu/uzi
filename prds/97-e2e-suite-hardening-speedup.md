@@ -357,6 +357,42 @@ carry explicit author sign-off:
       double-execute risk M3/Decision 3 rejected. **A future abort remains possible and
       may well be class (b).** Stated explicitly so a future reader does not re-derive it.
 
+- [ ] **M9 — timing-fragility hardening (added 2026-07-20; BLOCKS M4's gate and M6)**:
+      Running this PRD ~10 times exposed that the suite carries several undisclosed
+      coin flips. Observed across our runs: **6 timing failures across 4 distinct
+      phases, only ONE of which was a real bug** (M2's WS cookie defect). The rest:
+      `#16`/`#39` run-create reconcile 404s (M8 fixed that class), `#95` follow_up
+      read-after-write race (×2), `#22` PRDLESS-remove propagation timeout, `#32`
+      api-routing transient. **Every "182 PASS / 0 FAIL" run was a suite containing
+      multiple races that happened not to fire.** That is why M9 comes before M4's
+      gate and M6: neither is measurable on a suite whose green is this weak a signal.
+      Scope:
+      - **`#95` read-after-write race** → the agreed **vault-lock** design: PRD #32
+        already proves a locked owner's run stays queued/never-claimed, so lock →
+        create → submit → assert Queued (now a **stable** state) → unlock → assert
+        Queued→Delivered as today. Touches only the one racing read (`:1455-1459`);
+        everything downstream already polls-until-reached. Ensure the vault ends
+        unlocked and the window doesn't collide with the dedicated vault phase.
+        **Blocking weakening criteria** (agreed before the diff existed): no accepting
+        `consumed_at != null` in any form; no dropping Queued for Delivered-only; no
+        retry that tolerates either outcome (waiting for a state to *stabilise* is
+        fine, accepting the opposite is not); no substituting the write-response for
+        `GET /inputs` (distinct surfaces — assert both or neither); and no merely
+        making the read earlier, which shortens the window without closing it.
+      - **`#22` propagation timeout** (`wait_eq no 20` at `:2293` ≈ 6s) → widen to
+        **≥2 reconcile periods**. At `FORGE_POLL_INTERVAL=2s` + `FORGE_RECONCILE_EVERY=2`
+        the reconcile period is 4s, so ~6s is barely 1.5 periods.
+      - **FullSync-eviction `sleep 6`** → **8s**, the 2-reconcile-period floor the fable
+        review identified. M5 correctly declined to *lower* it; M9 raises it to the floor.
+      - **Margin diagnostics** — the durable part. Timing-sensitive assertions must emit
+        their margin (e.g. `#95`'s submit→consume delta), so a run yields a
+        **measurement** rather than a pass/fail coin flip. A bare PASS hides a near-miss.
+      **Gate (deliberately NOT "one green run")**: a full `./e2e/run-e2e.sh` green **AND**
+      the margin diagnostics showing comfortable headroom on the previously-fragile
+      assertions. This is the M8 gate lesson applied up front: one green run is equally
+      consistent with a race not firing, so the gate must measure the margin, not observe
+      an outcome.
+
 **Dependency graph**: **M1, M3, M5 are independent** (git-auth leg / assertion
 hardening / mechanical timing — separate parts of the file and the overlay) and can
 run as parallel agents. **M2** (new WS + CLI legs) is independent of those but larger.
