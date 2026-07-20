@@ -64,12 +64,32 @@ WITH want AS (
 --
 -- One row per coordinate is also simply the right GRAIN: recommendation_dispositions is
 -- keyed on (review_id, category, target), so two recommendations sharing a coordinate share
--- ONE disposition. Both duplicates carry identical disposition/filed state anyway (those
--- joins are on the coordinate, not on rr.id), so the ladder verdict is unaffected by which
--- row wins; the ORDER BY makes the choice deterministic — oldest recommendation first.
+-- ONE disposition.
+--
+-- WHICH duplicate survives matters for exactly one of the two things the write stores, and
+-- the distinction is worth stating because the convenient half is the one that is obvious:
+--
+--   * The LADDER verdict is genuinely unaffected. Both duplicates carry identical
+--     disposition/filed state, because those LEFT JOINs are on the coordinate, not on rr.id
+--     — there is only one disposition row and one filed row to find.
+--   * The rationale_HASH is NOT. Duplicates are separate recommendations with their own
+--     rationale_md, and the surviving row supplies the hash the caller stamps — which is
+--     #94 Decision 3's staleness key, so it decides whether this coordinate later shows as
+--     "the recommendation changed since you resolved it".
+--
+-- ORDER BY … rr.created_at ASC, rr.id ASC makes that deterministic: the OLDEST
+-- recommendation on the coordinate wins, so the stale flag is measured against the text
+-- that has been there longest rather than against whichever row the planner happened to
+-- return first. A later re-judge that rewrites either duplicate still flips the flag; what
+-- this ordering buys is that it flips for a stable reason.
+-- NOTE there is deliberately no rec_id here. It used to be projected and read by nothing,
+-- which was not merely dead weight: an unused per-recommendation id is a standing claim
+-- that per-recommendation granularity still matters on this path, and that assumption is
+-- exactly what made the duplicate-coordinate crash invisible. The write is keyed on the
+-- COORDINATE, so the coordinate is what this returns. If a future change needs the
+-- recommendation id, it must first answer what it means when two share a coordinate.
 SELECT DISTINCT ON (rv.id, rr.category, rr.target)
     rv.id                          AS review_id,
-    rr.id                          AS rec_id,
     rr.category                    AS category,
     rr.target                      AS target,
     rr.rationale_md                AS rationale_md,

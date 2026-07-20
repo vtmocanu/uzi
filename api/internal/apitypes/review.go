@@ -173,11 +173,11 @@ type JudgeBacklogDTO struct {
 // share ONE verdict and contribute ONE to this count. So Updated can be lower than the
 // number of recommendations a group visibly spans, and that is correct.
 //
-// It is deliberately an aggregate and never a per-item breakdown: a coordinate that does not exist and one that
-// belongs to another user both resolve to zero members, so neither the count nor anything
-// else in this DTO can be used to tell them apart (#94 Decision 5's one-404 rule — no
-// existence oracle). A caller learning "0 written" learns only that none of THEIR rows
-// matched.
+// It is deliberately an aggregate and never a per-item breakdown: a coordinate that does
+// not exist and one that belongs to another user both resolve to zero members, so neither
+// the count nor anything else in this DTO can be used to tell them apart (#94 Decision 5's
+// one-404 rule — no existence oracle). A caller learning "0 written" learns only that none
+// of THEIR rows matched.
 //
 // Groups are the affected coordinates re-read after the writes (all buckets, so a group
 // that just left To triage is still returned with its new rollup), and Triage is the

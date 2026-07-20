@@ -174,6 +174,15 @@ type ListFiledIssueCloseEdgesRow struct {
 // picked up next tick: nothing is lost, because an unconsumed edge stays unconsumed. This is
 // the third enumeration in this PRD to need a bound (M1's rows, M2's fan-out, now this) —
 // bound them where they are written.
+//
+// The bound is FIFO by id, and a FAILING edge is not consumed — so a persistent poison edge
+// HOLDS ITS SLOT in every subsequent batch. The usual drain argument ("applied edges leave
+// the working set permanently, so the set strictly shrinks") is true and has exactly this
+// exception: if a full batch of low-id edges failed on every tick, newer edges would never
+// enter the window. Left as-is deliberately — it needs @lim edges failing simultaneously and
+// indefinitely, which the CTE”'s realistic failure modes (a dead DB, which stops the whole
+// tick anyway) do not produce. Written down so the exception is known rather than
+// rediscovered.
 func (q *Queries) ListFiledIssueCloseEdges(ctx context.Context, arg ListFiledIssueCloseEdgesParams) ([]ListFiledIssueCloseEdgesRow, error) {
 	rows, err := q.db.Query(ctx, listFiledIssueCloseEdges, arg.RepoID, arg.Lim)
 	if err != nil {

@@ -537,7 +537,23 @@ exactly as #68 already does.
       from `RunsList.tsx`** (its aggregate moves to this page's header — Decision 7).
       `mockApi.ts` + `data.ts` render every state. A revised in-repo mock
       `prds/mockups/98-judge-menu-mock.html` (by-target). Depends on M1 + M2.
-- [ ] **M4 — `/runs` per-row badge (web + api)**: `judge_verdict` via the safe
+- [x] **M4 — `/runs` per-row badge (web + api)** — DONE `1da5ac32`; review dispatched.
+      **Three behaviours settled at implementation, recorded so M3 does not re-decide
+      them differently:** (a) the `judge_todo_count` read is **best-effort** — a
+      failure logs and leaves counts at 0 rather than 500-ing the whole run list,
+      because a badge is decoration and an ornament must not cause an outage;
+      (b) an **unjudged run renders no badge at all**, not a neutral pill — "never
+      judged" and "judged and fine" are different claims and a placeholder asserts
+      the second (the same reason the DTO field is nullable rather than defaulted);
+      (c) the **verdict survives a cleared backlog** (`⚖ issues` with count 0),
+      because the badge reports the judge's finding, not the triage state. All three
+      are pinned by tests so the intent is visible to the next reader.
+      **Trap for anyone adding a field here:** the Go and TS type structures are NOT
+      symmetric — Go has separate `RunDTO`/`RunListItemDTO`, while TS has
+      `RunListItem extends Run`. A field added to the TS `Run` therefore *inherits*
+      into `RunListItem` instead of erroring, silently telling the client that
+      `GET /runs/{id}` returns something the API only ever sends on the list. Caught
+      here by `tsc` via the run-view fixtures, and only by that.: `judge_verdict` via the safe
       single `run_reviews` join + `judge_todo_count` **bucketed in Go** (never a SQL
       ladder; Decision 7); `RunListItem` type + the one-grammar per-row badge.
       Independent of the endpoints (own join) — starts immediately. (The strip

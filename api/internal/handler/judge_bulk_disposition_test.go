@@ -106,7 +106,7 @@ func memberRow(category, target, disposition string, filedSettled bool) store.Li
 // the same coordinate on ONE review — the duplicate the schema permits and the judge emits.
 func memberRowIn(reviewID uuid.UUID, category, target, disposition string, filedSettled bool) store.ListOwnedRecommendationsForCoordsRow {
 	row := store.ListOwnedRecommendationsForCoordsRow{
-		ReviewID: reviewID, RecID: uuid.New(),
+		ReviewID: reviewID,
 		Category: category, Target: target, RationaleMd: "because",
 		FiledSettled: filedSettled,
 	}
