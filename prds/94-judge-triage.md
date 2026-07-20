@@ -3,8 +3,9 @@
 **GitLab Issue**: [#94](https://gitlab.example.com/vtmocanu/uzi/-/issues/94)
 **Status**: Draft
 **Priority**: Medium
-**Mockup**: [`prds/mockups/94-judge-triage-mock.html`](mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + five row states + CLI)
+**Mockup**: [`prds/mockups/94-judge-triage-mock.html`](mockups/94-judge-triage-mock.html) (global strip + per-review triage bar + row states + CLI)
 **Depends on**: PRD #46 (the judge, `run_reviews` + `review_recommendations`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed side-table pattern this reuses verbatim, and the `improve_uzi` backlog `NOT EXISTS` this extends). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #19 (`selfimprove` engine backlog).
+**Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: owner-**only** authz (a uza_ `admin_ro` token keeps `IsAdmin` on `RequireUser`, so owner-or-admin would break the read-only ceiling); the ladder is computed **once in Go** for both counters (a Go helper cannot back a SQL `CASE`); "filed" means a **settled** link (`filed_at IS NOT NULL`), since claim rows are nullable/in-flight; the stale flag keys on a **rationale hash**, not `set_at < updated_at` (which fires on every re-judge). The CSRF worry on the `RequireUser` mount was checked and is a non-issue (presence-dispatch: a Bearer request never reads the cookie; the cookie path is the unmodified CSRF-enforcing `RequireAuth`).
 
 ## Problem
 
@@ -31,12 +32,14 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
   false positive, re-run the judge, it stays dismissed.
 - **No token spend, no forge write.** Setting a disposition is a single local
   row upsert. Nothing is enqueued, nothing is written to GitLab.
-- **Two counters, one ladder.** A per-review triage bar (`to do / filed / done /
-  dismissed`, with the false-positive sub-count) and a global "across all your
-  runs" strip, both computed from one precedence ladder so the numbers agree.
-- **CLI parity in the same MR.** `uzi review resolve / dismiss / undo / stats`
-  drive the same endpoints — the CLAUDE.md "second consumer" obligation, and the
-  reason the write endpoint is `RequireUser` (CLI-reachable), not cookie-only.
+- **Two counters, one ladder — in one place.** A per-review triage bar (`to do /
+  filed / done / dismissed`, with the false-positive sub-count) and a global
+  "across all your runs" strip, both bucketed by **one Go helper** so the numbers
+  cannot drift.
+- **CLI parity in the same MR.** A `uzi review` command group (`show / resolve /
+  dismiss / undo / stats`) drives the same endpoints — the CLAUDE.md "second
+  consumer" obligation, and the reason the write endpoint is `RequireUser`
+  (CLI-reachable), owner-only, not cookie-only.
 - **Folds into self-improvement.** A dismissed or done `improve_uzi`
   recommendation drops out of the engine's backlog, the same way a filed one
   already does.
@@ -49,57 +52,77 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
    rows are **deleted-and-reinserted on every re-judge**
    (`UpsertRunReviewWithRecommendations`, `queries/judge.sql:45`), so a per-row
    status is wiped on re-run — the exact trap PRD #68 Decision 6 hit.
-   `recommendation_filed_issues` is the wrong host because its row exists **only
-   when an issue is filed** (`filed_issue_iid`/`filed_issue_url`/`filed_at` are
-   NOT NULL, `00071:36-50`), whereas a disposition routinely exists with **no
-   issue** — dismiss-without-filing and mark-done-without-filing are the common
-   cases (most of the six categories are settings toggles or template edits the
-   admin does directly, never a GitLab issue). Folding disposition onto that row
-   would force those columns nullable and entangle the disposition lifecycle with
-   the claim-first filing concurrency (D#68 Decision 7), for no gain.
+   `recommendation_filed_issues` is the wrong host because its lifecycle is
+   entangled with the claim-first filing flow and its row exists in states a
+   disposition has no business sharing: a row is present both for an **in-flight
+   claim** and a **settled link** (`filed_issue_iid`/`filed_at` are **nullable**,
+   `00071:42,45`; only `filed_issue_url` is `NOT NULL DEFAULT ''`, `00071:43`),
+   while a disposition routinely exists with **no issue at all**
+   (dismiss-without-filing and mark-done-without-filing are the common cases —
+   most of the six categories are settings toggles or template edits the admin
+   does directly, never a GitLab issue). Folding disposition onto that row would
+   nullable-taint nothing new but would entangle a plain state field with the
+   claim-first concurrency machinery (D#68 Decision 7) for no gain.
 
    New table `recommendation_dispositions`, UNIQUE `(review_id, category,
    target)`:
    - `status TEXT NOT NULL CHECK (status IN ('done','dismissed'))`
    - `dismiss_reason TEXT CHECK (dismiss_reason IN ('wont_do','not_an_issue'))`,
      with a table CHECK that it is non-NULL **iff** `status='dismissed'`
+   - `rationale_hash TEXT NOT NULL` — sha256 of the recommendation's
+     `rationale_md` at the moment the disposition was set (Decision 3)
    - `set_by_user_id`, `set_at`, `updated_at`
    - FKs: `review_id` **ON DELETE CASCADE** (the disposition dies with the
      review, correct), `set_by_user_id` **ON DELETE SET NULL** (deleting an
-     unrelated user must not delete the row; keep the verdict, drop the
-     attribution — the `filed_by_user_id` SET-NULL shape).
+     unrelated user must not delete the row).
 
    It survives the recommendation delete-reinsert because the review row is
    **stable across a re-judge** (same `target_run_id`, upserted not replaced) —
    the identical guarantee the filed table relies on.
 
-2. **Two axes on the coordinate, one precedence ladder.** A recommendation now
-   carries two independent facts on its coordinate: **filed** (D#68) and
-   **disposition** (this PRD). They compose freely — a row can be filed and then
-   marked done, or dismissed without ever being filed. The single bucket a row
-   (and every count) falls into, highest wins:
+2. **Two axes on the coordinate, one precedence ladder — bucketed once, in Go.**
+   A recommendation carries two independent facts on its coordinate: **filed**
+   (D#68) and **disposition** (this PRD). They compose freely — a row can be
+   filed and then marked done, or dismissed without ever being filed. The single
+   bucket a row (and every count) falls into, highest wins:
 
    > **dismissed  >  done  >  filed  >  to-do (open)**
 
-   Rationale: a dismissal is a human "no" and overrides everything; done is
-   resolved; filed is in-progress; open is untouched. The row chip, the
-   per-review bar, and the global strip all use this one ladder, defined **once
-   in a Go helper** consumed by both the per-review DTO (Decision 7) and the
-   global aggregate (Decision 8) so the two counters cannot drift.
+   Two hard rules make the two counters agree:
+   - **The ladder is one Go function** — `bucketOf(dispositionStatus,
+     filedSettled bool) → bucket` — consumed by **both** the per-review DTO
+     (Decision 7) and the global stats handler (Decision 8). There is **no SQL
+     `CASE`**: the global query is a plain join that returns, per recommendation
+     row, its coordinate's disposition status and a `filed_settled` boolean, and
+     Go buckets it. (An earlier draft had the global aggregate bucket in SQL — a
+     Go helper cannot back a SQL `CASE`, so that would have re-implemented the
+     ladder twice and reintroduced exactly the drift this decision prevents.)
+   - **"filed" means a *settled* link** (`filed_at IS NOT NULL`), everywhere — the
+     per-review path already skips unsettled claims (`reviewToDTO`,
+     `handler/judge.go:100-104`, `!f.FiledAt.Valid → continue`), and the global
+     join must match, or an in-flight/stranded claim would count as "filed"
+     globally while the panel shows "to do".
 
-3. **Sticky across re-judge; stale-flagged, never auto-reopened.** Because the
-   disposition is coordinate-keyed and the review row is stable, a done/dismissed
-   survives a re-judge untouched — which is the whole point: dismiss a false
-   positive, re-run the judge, and it does **not** come back as open to be
-   re-triaged. When a re-judge re-emits the same coordinate with a materially
-   changed rationale (`set_at < review.updated_at`), the disposition is **kept**
-   but the panel flags it "set for an earlier version of this recommendation" so
-   the human can Undo if the change matters — mirroring PRD #68's stale-filed
-   flag exactly. Inherits the same **`target=''` collapse** (D#68 Decision 6):
-   several empty-target recs share one coordinate and therefore one disposition;
-   accepted, identical to the filed case, and **inherent to the survive-re-judge
-   key** (folding a row-id or rationale-hash into the key would reintroduce the
-   carry-forward problem the coordinate key exists to avoid).
+3. **Sticky across re-judge; the stale flag keys on a rationale hash, not a
+   timestamp.** Because the disposition is coordinate-keyed and the review row is
+   stable, a done/dismissed survives a re-judge untouched — which is the whole
+   point: dismiss a false positive, re-run the judge, and it does **not** come
+   back as open to be re-triaged. To warn the human when the underlying
+   recommendation has genuinely changed *under* their disposition, each row
+   stores `rationale_hash` at set-time; the panel flags the disposition **stale
+   iff the current recommendation's `rationale_md` hashes differently**. A naïve
+   `set_at < review.updated_at` was rejected on review: `UpsertRunReview...` sets
+   `updated_at = now()` on **every** conflict, byte-identical re-judge included
+   (`queries/judge.sql:56-62`), so that predicate means "any re-judge has
+   happened", firing a false stale badge on every quietly-dismissed row after any
+   re-run — which would gut the flagship "dismiss a false positive, re-judge, it
+   stays quietly dismissed" behaviour. The hash makes an unchanged re-judge
+   produce **no** stale flag and a changed rationale produce one, so the flag
+   means what it says and the success criterion is testable. Inherits the
+   **`target=''` collapse** (D#68 Decision 6): several empty-target recs share one
+   coordinate and thus one disposition and one hash (of the first such row);
+   accepted, identical to the filed case, and inherent to the survive-re-judge
+   key.
 
 4. **Enum-only reasons; no free-text note in v1.** Dismiss carries a reason enum:
    `wont_do` ("valid, but not worth acting on") or `not_an_issue` ("false
@@ -111,65 +134,84 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
    `not_an_issue` tally is the **"false positives"** number in both counters.
    Revisit only if users ask to annotate *why* they dismissed.
 
-5. **Set/clear is `RequireUser` (session OR user-scoped CLI token) — a local,
-   non-spend, non-forge mutation.** `PUT
-   /api/runs/{id}/review/recommendations/{recID}/disposition` `{status,
-   reason?}` and `DELETE .../disposition` (undo) mount on **`RequireUser`**,
-   mirroring `POST /{id}/inputs` (`CreateRunInput`, `handler.go:644`) — the
-   established posture for a run mutation that is CLI-reachable and neither spends
-   tokens nor writes a forge. This is deliberately **not** the cookie-only
-   `RequireAuth` path that `rejudge` (`handler.go:661`) and `FileIssue`
-   (`handler.go:666`) sit on: those are cookie-only precisely because they mint a
-   token-spending run / write to a forge, and the disposition write does neither.
-   Mounting it on `RequireUser` is exactly what makes `uzi review resolve/dismiss`
-   work from a CLI token (Decision 10). Authorization: **owner-or-admin** to
-   resolve the recommendation (the same `GetReviewForTarget` / viewer scoping the
-   review read and `FileIssue` use) — and **no** caller-owns-repo check, because
-   there is no forge repo in play. recID → coordinate is resolved server-side as
-   `FileIssue` does (`handler/review_issue_file.go`); a recID not present in the
-   current review returns 404 ("refresh — the review changed"). No forge limiter,
-   no CSRF posture beyond whatever `RequireUser` already applies to `inputs` — do
-   not invent a new one.
+5. **Set/clear is `RequireUser` + OWNER-ONLY — a local, non-spend, non-forge
+   mutation.** `PUT /api/runs/{id}/review/recommendations/{recID}/disposition`
+   `{status, reason?}` and `DELETE .../disposition` (undo) mount on
+   **`RequireUser`**, mirroring `POST /{id}/inputs` (`CreateRunInput`,
+   `handler.go:644`) — the established posture for a run mutation that is
+   CLI-reachable and neither spends tokens nor writes a forge. This is
+   deliberately **not** the cookie-only `RequireAuth` path that `rejudge`
+   (`handler.go:661`) and `FileIssue` (`handler.go:666`) sit on: those are
+   cookie-only because they mint a token-spending run / write to a forge, and the
+   disposition write does neither. Mounting on `RequireUser` is what makes `uzi
+   review resolve/dismiss` work from a CLI token (Decision 10).
+
+   **Authorization is owner-ONLY, not owner-or-admin** — this is the review's
+   load-bearing authz correction. `RequireUser` hands a non-`admin_ro` CLI token a
+   copy of the user row with `IsAdmin` cleared, degrading owner-or-admin handlers
+   to owner-only for free — **but a uza_ `admin_ro` token keeps `IsAdmin`**
+   (`middleware/cli_auth.go`, `if row.Scope != ScopeAdminRO { user.IsAdmin =
+   false }`), and uza_ is documented **read-only across the whole factory**
+   (`clitoken/clitoken.go`, `docs/cli.md`). So an owner-**or-admin** mutation here
+   would be the first admin-reaching write on the `RequireUser` path and would let
+   a read-only uza_ token mutate any user's triage. The claimed precedent is in
+   fact owner-only (`SubmitInput(r.Context(), user.ID, …)`, `workers.go:541`,
+   guarded by `TestCreateRunInputIsOwnerOnly`, `runs_test.go:243`) — `IsAdmin` is
+   never consulted. So the disposition handlers resolve the run owner-scoped
+   (`GetRunForViewer`/`GetReviewForTarget` → owner or 404) and act only when the
+   caller **is** the owner; a non-owner (session or any token, uza_ included) gets
+   404. recID → coordinate is resolved server-side as `FileIssue` does
+   (`handler/review_issue_file.go:60-96`, 404 on a stale recID re-judged away). No
+   forge limiter, no caller-owns-repo, no new CSRF posture.
 
 6. **PUT is an idempotent upsert on the coordinate; DELETE is undo — no
-   claim-first dance.** Setting done, switching done→dismissed, or changing the
-   reason is the same `PUT` re-run (upsert on the unique coordinate), so
-   re-clicking is safe and last-writer-wins. Undo is a `DELETE` of the coordinate
-   row, returning the row to whatever the **filed** axis says (filed → "Filed",
-   else "To do"). None of PRD #68's claim-first concurrency machinery is needed:
-   there is **no external side effect** to make exactly-once (no forge issue is
-   created), so two concurrent PUTs simply converge on the last value and a DELETE
-   is idempotent. The row records `set_by_user_id`/`set_at` for provenance
-   ("resolved by X, 2h ago").
+   claim-first dance, no actor display.** Setting done, switching done→dismissed,
+   or changing the reason is the same `PUT` re-run (upsert on the unique
+   coordinate; it re-stamps `rationale_hash`), so re-clicking is safe and
+   last-writer-wins. Undo is a `DELETE` of the coordinate row, returning it to
+   whatever the **settled-filed** axis says (settled link → "Filed", else "To
+   do"). None of PRD #68's claim-first machinery is needed: there is **no external
+   side effect** to make exactly-once, so two concurrent PUTs converge on the last
+   value and a DELETE is idempotent. The row keeps `set_by_user_id`/`set_at` for
+   forensics, but the panel shows only a relative time ("resolved 2h ago"), **not
+   an actor** — under owner-only the setter is always the owner, so a name is
+   redundant, and an admin *reading* another user's review must not see a
+   misleading "resolved by you".
 
-7. **Per-review counts ride the review DTO; the ladder is computed server-side,
-   once.** `ReviewDTO` (`apitypes/review.go:52`) gains:
-   - `dispositions []DispositionDTO` (`{category, target, status, reason,
-     set_at}`), alongside `filed_issues`, so the panel renders each row's chip and
-     Undo control (a `dispByCoord` map, mirroring the existing `filedByCoord` at
-     `RunView.tsx:665`);
+7. **Per-review counts ride the review DTO; the panel never re-derives them.**
+   `ReviewDTO` (`apitypes/review.go:52`) gains:
+   - `dispositions []DispositionDTO` (`{category, target, status, reason, set_at,
+     stale bool}`, alongside `filed_issues`) so the panel renders each row's chip,
+     its Undo control, and the (server-computed) stale flag — a `dispByCoord` map
+     mirroring the existing `filedByCoord` at `RunView.tsx:665`. `stale` is
+     computed server-side (the hash compare, Decision 3) so the browser never sees
+     a hash;
    - `triage TriageDTO` (`{total, todo, filed, done, dismissed,
      false_positives}`), computed in `reviewToDTO` (`handler/judge.go:88`) by the
-     shared ladder helper (Decision 2).
+     shared `bucketOf` helper (Decision 2), with `filed` = settled only.
 
-   The web renders `triage` **directly** — it does not re-derive counts in TS —
-   so the per-review bar and `uzi review show` display identical numbers.
+   The web renders `triage` **directly** — it does not re-derive counts in TS — so
+   the bar and `uzi review show` display identical numbers.
 
-8. **The global strip is a server aggregate over the caller's reviews, per-row
-   grain, same ladder.** `GET /api/me/judge/stats` (`RequireUser`, owner-scoped —
-   mirrors `/me/memory` at `handler.go:346`, so `uzi review stats` works) returns
-   the same `TriageDTO` aggregated across every `run_reviews` row where
-   `user_id = caller`, counted **per `review_recommendations` row** with its
-   coordinate's disposition/filed status — a `LEFT JOIN` of recommendations to
-   the two side-tables, a `CASE` expressing the Decision-2 ladder, `GROUP BY`
-   bucket. The denominator is **recommendation rows** (what the user actually sees
-   on screen), NOT coordinates — the `target=''` collapse means shared-coordinate
-   rows share a status, accepted exactly as in the per-review count. **All-time,
+8. **The global strip is a server aggregate over the caller's reviews, bucketed
+   in Go, per-row grain.** `GET /api/me/judge/stats` (`RequireUser`, owner-scoped
+   — mirrors `/me/memory` at `handler.go:345`, so `uzi review stats` works)
+   joins `run_reviews` (where `user_id = caller` — the column exists, `00059:24`,
+   `idx_run_reviews_user`) → `review_recommendations` → LEFT JOIN the two
+   side-tables on the coordinate, returning **one flat row per recommendation**
+   with `(disposition_status, filed_settled = filed_at IS NOT NULL)`; the handler
+   buckets those rows through the **same `bucketOf` helper** and returns a
+   `TriageDTO`. The denominator is **recommendation rows** (what the user sees on
+   screen), NOT coordinates — the `target=''` collapse means shared-coordinate
+   rows share a status, accepted exactly as in the per-review count. The two
+   side-table joins cannot fan out (both UNIQUE on the coordinate). **All-time,
    not windowed**: "to do" and "filed" are a true backlog an old row still belongs
-   to; a rolling window is a later refinement, not v1. Renders on the
-   **RunsList** header (`web/src/pages/RunsList.tsx`, the "your runs" page); it is
-   a global backlog and deliberately does **not** respect the list's current
-   filters (wiring it to the filtered query would be a bug).
+   to; a rolling window is a later refinement. Owner-scoped and ≤50 recs/review
+   means the flat-row pull is small; bucketing in Go (not SQL) is what keeps the
+   ladder single-source. Renders on the **RunsList** header
+   (`web/src/pages/RunsList.tsx`); it is a global backlog and deliberately does
+   **not** respect the list's current filters (wiring it to the filtered query
+   would be a bug).
 
 9. **A disposed recommendation drops out of the self-improvement backlog — the
    same exclusion the filed link already gets.** `ListOpenImproveUziRecommendations`
@@ -180,86 +222,106 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
    the engine must not fold it into its aggregated tracking issue, exactly as
    PRD #68 Decision 12 kept a hand-filed one out. **Row-existence is the
    exclusion** (any disposition excludes, regardless of status); Undo (row
-   deleted) re-includes it next cycle. Folds into **M1** because it changes the
-   backlog query in the same migration that adds the table; the disposition
-   table's own UNIQUE coordinate index serves the correlated lookup (a partial
-   index cannot cross tables — same reasoning as #68). `addressed_by_run_id`
-   stays an independent, internal marker: a row can be both engine-addressed and
-   user-disposed; the panel never shows `addressed`, and its chip precedence is
-   the Decision-2 ladder.
+   deleted) re-includes it next cycle — no claim-first machinery needed, since the
+   upsert is atomic and there is no forge write to make exactly-once. Folds into
+   **M1** because it changes the backlog query in the same migration that adds the
+   table; the disposition table's own UNIQUE coordinate index serves the
+   correlated lookup (a partial index cannot cross tables — same reasoning as #68).
+   `addressed_by_run_id` stays an independent internal marker; the panel never
+   shows it, and its chip precedence is the Decision-2 ladder.
 
-10. **CLI: four verbs on the same endpoints, plus a status column on `review
-    show`.** Discharges the CLAUDE.md "second consumer" check in this MR:
-    - `uzi review resolve <run> <rec>` → `PUT` `status=done`
-    - `uzi review dismiss <run> <rec> --reason wont-do|not-an-issue` → `PUT`
-      `status=dismissed`
-    - `uzi review undo <run> <rec>` → `DELETE`
-    - `uzi review stats [--json]` → `GET /me/judge/stats`
-
-    `uzi review show` (`api/cmd/uzi/run.go:162`) gains a per-recommendation
-    **status column** and a per-review **triage line**, read from the DTO's
-    `dispositions`/`triage` (`renderReview`, `run.go:474`). `<rec>` is the
-    recommendation id the `show --json` envelope already carries (`rec.id`); the
-    verbs act by recID exactly as the web does. The endpoints being `RequireUser`
-    (Decision 5) is precisely what lets the CLI token reach them — `dismiss`/
-    `resolve` are the first CLI-driven mutations on the judge surface (today the
-    CLI can only *read* the review, PRD #68 left filing browser-only).
+10. **CLI: a `uzi review` command group, absorbing the existing read; rec IDs in
+    the human output.** Today the only judge verb is `uzi run review <run-id>`
+    (`api/cmd/uzi/run.go:163`, a `run` subcommand) and its human formatter prints
+    **no** recommendation IDs (`renderReview`, `run.go:474-517`) — so a naïve
+    top-level `uzi review resolve <run> <rec>` would both collide with the noun
+    tree and be unusable without `--json`. Resolution:
+    - Introduce a top-level **`uzi review` group**: `show <run>`,
+      `resolve <run> <rec>`, `dismiss <run> <rec> --reason wont-do|not-an-issue`,
+      `undo <run> <rec>`, `stats [--json]`. `uzi review show` **absorbs** today's
+      read (verdict + recommendations + a new triage line). `uzi run review` is
+      kept as a **hidden deprecated alias** → `uzi review show`, removable once no
+      script depends on it (the CLI is young, PRD #64).
+    - `uzi review show` prints a **short rec id** (first 8 hex of the rec UUID,
+      git-style) per recommendation plus its status; the mutation verbs accept that
+      short id (unambiguous-prefix match against the run's *current* review, else
+      "refresh — the review changed"), so the verbs are usable straight from the
+      human output. `--json` still carries the full `rec.id`.
+    - Endpoints: `resolve`→`PUT status=done`, `dismiss`→`PUT status=dismissed`,
+      `undo`→`DELETE`, `stats`→`GET /me/judge/stats`. The `RequireUser` +
+      owner-only mount (Decision 5) is exactly what lets a uzc_ token drive them;
+      a uza_ read-only token can `show`/`stats` but not mutate (owner-only → 404).
 
 **Interactions (for completeness):** the **notifications inbox** needs nothing —
-disposition is a self-action, self-notifying is noise. **Run deletion** cascades
-the review and its recommendations away, and the `recommendation_dispositions`
-rows with them (`review_id` CASCADE); no forge issue is involved. **Hosted
-workers** are untouched — this is an API + browser + CLI feature with no worker,
-claim, or agent code. The **board cache** is untouched — no forge write. **The
-`improve_uzi` self-improve engine** is touched only through the Decision-9
-backlog predicate.
+disposition is a self-action. **Run deletion** cascades the review and its
+recommendations away, and the `recommendation_dispositions` rows with them
+(`review_id` CASCADE). **Hosted workers** are untouched — API + browser + CLI
+only, no worker/claim/agent code. The **board cache** is untouched — no forge
+write. **Orphaned ("zombie") dispositions:** when a re-judge stops emitting a
+coordinate, its disposition row persists (review-keyed, the review survives) but
+joins to no recommendation — so it is **inert while orphaned**: absent from the
+panel, absent from both counters (per-row denominator), suppressing nothing (the
+self-improve exclusion only bites when a rec row exists), and not undoable (both
+endpoints are recID-addressed and no recID resolves to it). If a later re-judge
+re-emits the coordinate, the old disposition reappears — and the rationale-hash
+stale flag (Decision 3) fires **iff** the re-emitted rationale differs, warning
+the human rather than silently re-suppressing a possibly-different concern; a
+byte-identical re-emission correctly keeps the disposition. Orphans are cleaned by
+the review-deletion cascade. Accepted as a documented limitation (same shape as
+#68's filed-link orphan, but the hash flag covers the resurrection case #68 could
+not).
 
 ## Milestones
 
 - [ ] **M1 — Schema + store**: migration (draft `00073` — the live head is
       `00072`; renumber above the live head at merge per `CLAUDE.md`) creating
       `recommendation_dispositions` keyed `(review_id, category, target)` with the
-      status/reason CHECKs (Decision 1) and FK rules (review→CASCADE,
-      user→SET NULL); the **same** migration extends
+      status/reason CHECKs, the `rationale_hash` column (Decision 3), and FK rules
+      (review→CASCADE, user→SET NULL); the **same** migration extends
       `ListOpenImproveUziRecommendations` with the disposition `NOT EXISTS`
-      (Decision 9). sqlc + queries: upsert-disposition, delete-disposition,
-      list-for-review, and the **global per-row aggregate** (Decision 8). A store
-      integration test proves: a disposition **survives a re-judge** (the
-      `UpsertRunReviewWithRecommendations` delete-reinsert leaves the disposition
-      table untouched); the ladder buckets correctly including the
-      **dismissed > done > filed > open** precedence; a disposed `improve_uzi`
-      **leaves the backlog** and Undo re-includes it.
-- [ ] **M2 — API**: `PUT`/`DELETE .../disposition` on `RequireUser` (Decision 5)
-      — enum validation (bad `status`/`reason` → 400), owner-or-admin,
-      recID→coordinate resolve, idempotent upsert / undo (Decision 6); `GET
-      /me/judge/stats` (Decision 8); `ReviewDTO` gains `dispositions` + `triage`
-      via the **shared ladder helper** (Decisions 2/7). Its own handler file (e.g.
-      `handler/review_disposition.go`) plus the shared ladder helper; the single
-      `handler.go` route-block edit and the DTO additions are expected and
-      trivial.
+      (Decision 9). sqlc + queries: upsert-disposition (re-stamps the hash),
+      delete-disposition, list-for-review, and the **global flat-join** feeding
+      the Go bucketer (Decision 8, returns per-rec `status` + `filed_settled`, no
+      SQL `CASE`). A store integration test proves: a disposition **survives a
+      re-judge** delete-reinsert; a **byte-identical re-judge does not flag it
+      stale** while a **changed rationale does** (the hash); the ladder buckets
+      `dismissed > done > filed(settled) > open` and treats an unsettled claim as
+      not-filed; a disposed `improve_uzi` **leaves the backlog** and Undo
+      re-includes it.
+- [ ] **M2 — API**: `PUT`/`DELETE .../disposition` on `RequireUser`, **owner-only**
+      (Decision 5) — enum validation (bad `status`/`reason` → 400), recID→coordinate
+      resolve, idempotent upsert / undo (Decision 6); `GET /me/judge/stats`
+      (Decision 8); `ReviewDTO` gains `dispositions` (with server-computed `stale`)
+      + `triage`, both via the shared **`bucketOf`** helper (Decisions 2/7). Its own
+      handler file (e.g. `handler/review_disposition.go`) plus the shared helper;
+      the single `handler.go` route-block edit and the DTO additions are expected.
 - [ ] **M3 — Web**: the JudgePanel gains a per-row **status chip** +
       `Mark done` / `Dismiss ▾ (Won't do / Not an issue)` controls + **Undo** +
-      the **collapse-dismissed** toggle + the **stale-disposition** flag
-      (`set_at` < review `updated_at`); a **triage bar** (counts + segmented
-      meter) at the panel top; the **global strip** on the RunsList header; the
-      counts read the server `triage` (never re-derived in TS). `mockApi.ts` +
-      `data.ts` extended so the mock stack renders every state
-      (to-do/filed/done/dismissed×2/stale).
-- [ ] **M4 — CLI**: `uzi review resolve/dismiss/undo/stats` and the `review show`
-      status column + triage line (Decision 10); `api/cmd/uzi/commands_test.go`
-      coverage of the verbs, the `--reason` enum mapping, and the `stats` output.
-- [ ] **M5 — Tests**: Go handler tests — authz matrix (owner sets; admin sets on
-      another user's review; non-owner-non-admin → 404), enum validation, an
-      idempotent double-PUT, undo, the **global-stats aggregate** including the
-      precedence ladder and the **self-improve exclusion**; vitest for the panel
-      states + the strip; CLI tests (M4); an **e2e leg** that dismisses a
-      recommendation from a stubbed review and asserts it drops out of the
-      `improve_uzi` backlog (and re-includes on undo), that **no run is enqueued**,
-      and that **no forge write** happens.
+      the **collapse-dismissed** toggle + the **stale-disposition** flag (rendered
+      from the DTO's `stale`, "recommendation changed since you resolved"); a
+      **triage bar** (counts + segmented meter) at the panel top; the **global
+      strip** on the RunsList header; counts read the server `triage` (never
+      re-derived in TS). `mockApi.ts` + `data.ts` extended so the mock stack
+      renders every state (to-do / filed / done / dismissed×2 / stale).
+- [ ] **M4 — CLI**: the `uzi review` group + the `uzi run review` deprecated alias
+      (Decision 10), the short-rec-id column + triage line in `renderReview`, and
+      the four mutating/stats verbs; `api/cmd/uzi/commands_test.go` covers the verbs,
+      the `--reason` enum mapping, the short-id resolution, and that a uza_ token is
+      refused on a mutation.
+- [ ] **M5 — Tests**: Go handler tests — the **owner-only** authz matrix (owner
+      sets; non-owner session → 404; a **uza_ `admin_ro` token → 404 on the
+      mutation** but 200 on `show`/`stats`), enum validation, an idempotent
+      double-PUT, undo, the **global-stats aggregate** (precedence ladder,
+      unsettled-claim-is-not-filed, the self-improve exclusion); vitest for the
+      panel states + the strip; an **e2e leg** that dismisses a recommendation from
+      a stubbed review and asserts it drops out of the `improve_uzi` backlog (and
+      re-includes on undo), that **no run is enqueued**, and that **no forge write**
+      happens.
 - [ ] **M6 — Docs**: `docs/judge.md` gains the triage lifecycle (the four states,
-      sticky-across-re-judge, the false-positive count, the self-improve
-      exclusion); `docs/cli.md` gains the four verbs; `specs/ai.md` records the
-      decisions.
+      sticky-across-re-judge, the hash-based stale flag, the false-positive count,
+      the self-improve exclusion, the orphan behaviour); `docs/cli.md` gains the
+      `uzi review` group and states the uza_ read-only ceiling is preserved (mutations
+      owner-only); `specs/ai.md` records the decisions.
 
 **Dependency graph** (house convention): **M1 → M2 → { M3, M4 } in parallel →
 { M5, M6 } in parallel.** M2 is one migration-dependent API layer; M3 (web) and
@@ -270,16 +332,18 @@ M4 (CLI) are independent consumers of the same endpoints touching separate files
 
 - From a judged run, a user marks a recommendation **Done** or **Dismissed** (with
   a reason) in one click, and the panel's triage bar updates to match.
-- A dismissal **survives a re-run of the judge** for an unchanged coordinate — the
-  recommendation stays dismissed, not re-surfaced as open; a materially changed
-  rationale flags it stale rather than silently reopening.
+- A dismissal **survives a re-run of the judge**: an unchanged re-judge leaves it
+  quietly dismissed with **no** stale flag; a re-judge that changes the
+  recommendation's rationale flags it stale (hash-based, testable both ways) —
+  never silently reopening it.
 - The **false-positive** count reflects `not_an_issue` dismissals, per review and
-  across all runs, and the per-review and global counts agree with each other and
-  with the on-screen rows (one shared ladder).
+  across all runs; the per-review and global counts agree with each other and with
+  the on-screen rows (one `bucketOf` helper, `filed` = settled).
 - A dismissed **or** done `improve_uzi` recommendation no longer appears in the
   self-improvement engine's backlog; **Undo** re-includes it.
 - `uzi review resolve/dismiss/undo/stats` drive the **same state** as the web,
-  from a CLI token, with no cookie/CSRF.
+  from a uzc_ CLI token; a read-only uza_ token can `show`/`stats` but is refused
+  (404) on a mutation.
 - **No Anthropic token is spent and no forge write happens** anywhere in the flow
   — proven by the M5 e2e leg.
 
@@ -291,10 +355,9 @@ M4 (CLI) are independent consumers of the same endpoints touching separate files
   judge that populates distinct `target` values (which the prompt already asks
   for) avoids it. Documented, not fixed — fixing reintroduces the carry-forward
   problem the coordinate key exists to avoid.
-- **Sticky dispositions can mask a materially changed recommendation.** A re-judge
-  that meaningfully rewrites a dismissed rec keeps it hidden; mitigated by the
-  stale flag, not by auto-reopening (auto-reopen would re-nag exactly the false
-  positives the user silenced).
+- **Orphaned dispositions accumulate as inert cruft** until the review is deleted
+  (Interactions). They affect nothing while orphaned and the hash flag guards
+  their resurrection, so this is a storage-tidiness cost, not a correctness one.
 - **Two exclusion sources on the self-improve backlog** (filed + disposition)
   widen the ways an `improve_uzi` silently leaves the engine's view. Intended, but
   the backlog query comment must name **both** `NOT EXISTS` so a future reader is
@@ -310,6 +373,11 @@ M4 (CLI) are independent consumers of the same endpoints touching separate files
 - **False positive is a *reason* under Dismiss, not a top-level action.** Keeps
   each row to three actions (File / Done / Dismiss ▾); the strip still surfaces
   the FP count separately (the `not_an_issue` sub-count).
+- **Mutations are owner-only, not owner-or-admin.** The `RequireUser` mount is
+  what makes the CLI work, but a uza_ `admin_ro` token keeps `IsAdmin` there;
+  owner-only (matching the `CreateRunInput` precedent) both fixes that and needs no
+  scope inspection in the handler. Admins keep read access to others' reviews;
+  they do not triage them.
 - **All existing reviews get triage with no backfill or re-judge.**
   `recommendation_dispositions` starts empty ⇒ every recommendation reads "to
   do"; the controls appear on every recommendation already on screen, old or new,
