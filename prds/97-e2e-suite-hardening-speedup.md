@@ -1007,6 +1007,23 @@ were references and characterisations, not logic.** Every one was a claim *about
 than the code itself, and every one passed its author's reading before a re-test caught it. Mutation
 discipline catches the logic; references need the same reflex — **resolve it, or do not write it.**
 
+**There IS a mechanical Go equivalent of `shfmt -mn`, and it wants a home in the repo.** The lead
+asserted there was none (so a Go comment-only claim had to be proven by re-mutation instead); the
+auditor built one in ~20 lines and disproved it: parse with `go/parser` **without**
+`parser.ParseComments`, so comments never enter the AST, then reprint with `go/printer`.
+Byte-identical output across two revisions ⇒ the diff touched only comments and formatting. It is
+**not** fooled by the case that motivated the doubt: a commented-out assertion is *not* comment-only,
+because the statement leaves the AST and the output changes. Proven with both controls rather than
+trusted — inserting genuine comments prints IDENTICAL (no false alarm), and commenting out the
+`if gotIsAdmin { t.Error(…) }` block prints DIFFERS and names the vanished statement. `13508b36` vs
+`e0a9bd41`: byte-identical, 10099 bytes both sides.
+**Follow-up: give it a home** (`api/tools/` or a `scripts/` one-liner) as the standing Go counterpart
+to the build gate. It lived in a session scratchpad and does not survive. Not landed here — it is a
+new change and does not belong on a branch going to MR.
+**Two independent methods agreeing is the real proof**: the AST check proves no assertion *text*
+changed; the mutations prove the assertions still *bite*. A commit could pass the first and fail the
+second, so the pair is what closes it.
+
 **Methodology note worth carrying: a mutation that does not COMPILE is not a surviving mutant.** The
 auditor's first probe harness inferred survival from the *absence* of `--- FAIL` lines, so a probe
 that failed to build read as "nothing catches this" — which **overstates** coverage gaps, the
