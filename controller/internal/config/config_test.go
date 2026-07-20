@@ -337,7 +337,10 @@ func TestLoadParsesTheMaxConcurrentRuns(t *testing.T) {
 		}
 	})
 
-	for _, bad := range []string{"0", "-1", "abc"} {
+	// "257" and "100000" are ABOVE the [1, 256] ceiling (the api's advertised-cap sanity
+	// band). They matter because the worker only WARNS above its soft ceiling rather than
+	// rejecting, so an unbounded typo would boot and render into the pod.
+	for _, bad := range []string{"0", "-1", "abc", "257", "100000"} {
 		t.Run("rejects "+bad, func(t *testing.T) {
 			setWorkerEnv(t)
 			t.Setenv("UZI_API_URL", "https://uzi.example.com")

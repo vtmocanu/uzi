@@ -15,6 +15,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// workerMaxConcurrentRunsCeiling is the sanity ceiling for UZI_WORKER_MAX_CONCURRENT_RUNS.
+// It mirrors the api's maxAdvertisedConcurrentRuns band (api/internal/handler/
+// worker_protocol.go): the api validates a worker's self-reported cap to [1, 256], so 256
+// is the natural boot-time ceiling here too. Above the worker's own soft ceiling the
+// worker only WARNS (it does not reject), so without this bound a typo would render a
+// nonsense cap straight into the pod.
+const workerMaxConcurrentRunsCeiling = 256
+
 // Config holds the controller's runtime settings.
 type Config struct {
 	// APIBaseURL is the uzi api's base URL (scheme://host[:port], no path). https
@@ -230,18 +238,21 @@ func loadWorkerSettings(cfg *Config) error {
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
-	// operator-configurable. A non-integer or a value < 1 is a boot error rather than a
-	// silent clamp — the same "fail at boot, not at the far end" rule the CA/https and
-	// docker-tier couplings above follow. Raising it opts into the intra-user concurrency
-	// residuals documented in docs/worker-setup.md (PRD #58 Decision 7).
+	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
+	// out-of-range value is a boot error rather than a silent clamp — the same "fail at
+	// boot, not at the far end" rule the CA/https and docker-tier couplings above follow.
+	// The upper bound matters because the worker only WARNS above its soft ceiling (it
+	// does not reject), so a typo like 100000 would otherwise boot and render into the
+	// pod. Raising it opts into the intra-user concurrency residuals documented in
+	// docs/worker-setup.md (PRD #58 Decision 7).
 	cfg.WorkerMaxConcurrentRuns = 1
 	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_MAX_CONCURRENT_RUNS")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil {
-			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%q is not an integer: %w", raw, err)
+			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%q is not an integer (accepted range [1, %d])", raw, workerMaxConcurrentRunsCeiling)
 		}
-		if n < 1 {
-			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%d must be >= 1 (a worker with no run slot can never claim a run)", n)
+		if n < 1 || n > workerMaxConcurrentRunsCeiling {
+			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%d out of range: accepted [1, %d] (a worker with no run slot can never claim a run; the ceiling matches the api's advertised-cap sanity band)", n, workerMaxConcurrentRunsCeiling)
 		}
 		cfg.WorkerMaxConcurrentRuns = n
 	}
