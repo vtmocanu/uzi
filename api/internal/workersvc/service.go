@@ -174,6 +174,9 @@ type Store interface {
 	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
 	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
+	// ListFollowUpInputsForRun backs the web/CLI steer queue (PRD #95): kind='follow_up'
+	// only, newest-first, uncapped. Owner-scoped by the run resolve, not the query.
+	ListFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]store.RunUserInput, error)
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
 	// selection atomically (PRD #37).
@@ -1570,6 +1573,19 @@ func (s *Service) ListRunMessages(ctx context.Context, userID, runID uuid.UUID, 
 	return s.q.ListRunMessagesAfter(ctx, store.ListRunMessagesAfterParams{RunID: runID, AfterSeq: afterSeq})
 }
 
+// ListFollowUpInputs returns a run's follow_up steer queue (newest-first, uncapped)
+// for the web/CLI queue (PRD #95). GetRun resolves owner-or-404 FIRST, so a non-owner
+// — including an admin_ro token on another user's run — gets ErrRunNotFound and the
+// handler 404s. This is strict owner-only (matching the follow-up WRITE), NOT the
+// owner-or-admin view: follow-ups are never in run_messages, so an owner-or-admin read
+// here would leak another user's steer text.
+func (s *Service) ListFollowUpInputs(ctx context.Context, userID, runID uuid.UUID) ([]store.RunUserInput, error) {
+	if _, err := s.GetRun(ctx, userID, runID); err != nil {
+		return nil, err
+	}
+	return s.q.ListFollowUpInputsForRun(ctx, runID)
+}
+
 // GetRunForViewer returns a run visible to the viewer: the owner sees their own
 // run; an admin sees any run. A non-owner non-admin gets ErrRunNotFound, exactly
 // as an unknown id would — the same authorization REST and WS both enforce.
@@ -1649,6 +1665,12 @@ type SubmitInputResult struct {
 	// ServerSide is true when a cancel/reject was applied directly because no
 	// live poller would ever consume it.
 	ServerSide bool
+	// ID + CreatedAt are the created run_user_inputs row (PRD #95 S2), set only on the
+	// follow_up plain-input path so the handler can return them — the web's optimistic
+	// queue entry adopts the real id + timestamp instead of stranding a temp one. Zero
+	// on the server-side and approve_plan paths (no queue row to surface).
+	ID        int64
+	CreatedAt time.Time
 }
 
 // SubmitInput records a steering input (approve/reject/follow-up/cancel) for a
@@ -1727,13 +1749,15 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 
 	// A plain steering input (approve_plan / follow_up): enqueue for the worker with
-	// no stop signal and no runs-row touch.
-	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
+	// no stop signal and no runs-row touch. Return the created row (PRD #95 S2) so the
+	// handler can surface id + created_at for a follow_up's optimistic reconcile.
+	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: kind, Body: pgText(body),
-	}); err != nil {
+	})
+	if err != nil {
 		return SubmitInputResult{}, err
 	}
-	return SubmitInputResult{ServerSide: false}, nil
+	return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 }
 
 // submitApproval enqueues an approve_plan carrying an agent selection (PRD #37):
