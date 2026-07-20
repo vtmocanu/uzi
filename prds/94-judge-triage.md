@@ -157,12 +157,23 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
    a read-only uza_ token mutate any user's triage. The claimed precedent is in
    fact owner-only (`SubmitInput(r.Context(), user.ID, …)`, `workers.go:541`,
    guarded by `TestCreateRunInputIsOwnerOnly`, `runs_test.go:243`) — `IsAdmin` is
-   never consulted. So the disposition handlers resolve the run owner-scoped
-   (`GetRunForViewer`/`GetReviewForTarget` → owner or 404) and act only when the
-   caller **is** the owner; a non-owner (session or any token, uza_ included) gets
-   404. recID → coordinate is resolved server-side as `FileIssue` does
-   (`handler/review_issue_file.go:60-96`, 404 on a stale recID re-judged away). No
-   forge limiter, no caller-owns-repo, no new CSRF posture.
+   never consulted. So the disposition handlers must resolve the review by
+   **strict caller-ownership** (the run's `user_id == caller`, `IsAdmin` never
+   consulted — the `SubmitInput(ctx, user.ID, …)` pattern), **NOT** the
+   owner-**or-admin** viewer helpers (`GetRunForViewer`/`GetReviewForTarget`,
+   `handler.go:646`) that back the review *read* and `FileIssue`: those admit an
+   `IsAdmin=true` caller to *any* user's run, so reusing them for the write would
+   readmit exactly the cross-user write a uza_ token could otherwise make. Only
+   after the review is owner-resolved is `recID → coordinate` looked up **within
+   it** (404 if the recID is not in the current review, re-judged away). **Stated
+   precisely (the practical consequence, per code review):** because there is no
+   scope gate a handler can read, a uza_ token is refused (404) only on
+   **another** user's review — on **its own** review `caller == owner`, so it is
+   allowed to write, exactly like `CreateRunInput` today. uza_'s "read-only" reach
+   is therefore *cross-user*, not "cannot write anything"; an admin can always
+   triage their **own** judge runs (web session or any of their own tokens), and
+   is blocked only from triaging **other** users' reviews. No forge limiter, no
+   caller-owns-repo, no new CSRF posture.
 
 6. **PUT is an idempotent upsert on the coordinate; DELETE is undo — no
    claim-first dance, no actor display.** Setting done, switching done→dismissed,
@@ -250,7 +261,8 @@ or **Dismissed** with a reason (**Won't do** / **Not an issue** = false positive
     - Endpoints: `resolve`→`PUT status=done`, `dismiss`→`PUT status=dismissed`,
       `undo`→`DELETE`, `stats`→`GET /me/judge/stats`. The `RequireUser` +
       owner-only mount (Decision 5) is exactly what lets a uzc_ token drive them;
-      a uza_ read-only token can `show`/`stats` but not mutate (owner-only → 404).
+      a uza_ read-only token can `show`/`stats` across the factory, and its writes
+      are owner-only (Decision 5) — refused (404) on another user's review.
 
 **Interactions (for completeness):** the **notifications inbox** needs nothing —
 disposition is a self-action. **Run deletion** cascades the review and its
@@ -309,8 +321,11 @@ not).
       the `--reason` enum mapping, the short-id resolution, and that a uza_ token is
       refused on a mutation.
 - [ ] **M5 — Tests**: Go handler tests — the **owner-only** authz matrix (owner
-      sets; non-owner session → 404; a **uza_ `admin_ro` token → 404 on the
-      mutation** but 200 on `show`/`stats`), enum validation, an idempotent
+      sets; non-owner session → 404; a **uza_ `admin_ro` token → 404 mutating
+      *another* user's review** — but 200 on `show`/`stats`, and allowed to write
+      its **own** review, matching `CreateRunInput`; assert the write path uses
+      strict caller-ownership, not the owner-or-admin viewer helper), enum
+      validation, an idempotent
       double-PUT, undo, the **global-stats aggregate** (precedence ladder,
       unsettled-claim-is-not-filed, the self-improve exclusion); vitest for the
       panel states + the strip; an **e2e leg** that dismisses a recommendation from
@@ -376,8 +391,12 @@ M4 (CLI) are independent consumers of the same endpoints touching separate files
 - **Mutations are owner-only, not owner-or-admin.** The `RequireUser` mount is
   what makes the CLI work, but a uza_ `admin_ro` token keeps `IsAdmin` there;
   owner-only (matching the `CreateRunInput` precedent) both fixes that and needs no
-  scope inspection in the handler. Admins keep read access to others' reviews;
-  they do not triage them.
+  scope inspection in the handler. **"Owner-only" here means strict
+  caller-ownership** (the `SubmitInput(user.ID)` pattern) — **not** the
+  owner-or-admin viewer helper (`GetRunForViewer`/`GetReviewForTarget`) that backs
+  the review read and `FileIssue`; reusing that helper for the write would readmit
+  the cross-user hole. Admins keep read access to others' reviews and can triage
+  their **own** judge runs; they cannot triage **other** users' reviews.
 - **All existing reviews get triage with no backfill or re-judge.**
   `recommendation_dispositions` starts empty ⇒ every recommendation reads "to
   do"; the controls appear on every recommendation already on screen, old or new,
