@@ -258,7 +258,20 @@ one action.
      *request* coordinates, while the duplication arises inside the *resolved member
      set*. The per-member loop was immune only because each upsert was its own
      statement, which is a reason nobody had written down until changing the shape
-     removed it.
+     removed it. **This was missed on the first attempt and shipped a hard 500** —
+     worth recording *why*, because the reason is structural rather than careless.
+     The bulk suite's fake `memberRow` helper mints `ReviewID: uuid.New()` per
+     member, so every member the fake can produce carries a **distinct**
+     `review_id` — the fake is incapable of constructing the colliding triple. The
+     headline test of the new statement (`TestBulkDispositionIsOneRoundTrip`, 500
+     members on one coordinate) passes precisely because those 500 members all have
+     different review ids, and no live-DB test seeded a duplicate. **The one shape
+     that breaks the write was the one shape no existing test could construct.** The
+     `DISTINCT` must therefore be keyed `(review_id, category, target)` on the
+     RESOLVED member set, and the fixture helper must be able to mint members
+     sharing a `review_id` — otherwise the next change hits the same wall. A test
+     helper that cannot construct the failing input silently bounds every test built
+     on it.
    - **Why "write the resolved row, never the body" is defence-in-depth rather than
      the mechanism** (recorded so a future refactor does not undo it): the resolve
      matches by *equality* (`want.category = rr.category AND want.target =

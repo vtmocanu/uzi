@@ -140,9 +140,24 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	writeTargets := make([]string, 0, len(members))
 	hashes := make([]string, 0, len(members))
 	for _, rec := range members {
-		// scope=open skips anything the SHARED ladder does not call todo, so a filed or
-		// already-settled member keeps its state unless the caller asked for ScopeAll.
-		if scope == ScopeOpen && BucketOf(rec.DispositionStatus.String, rec.FiledSettled) != "todo" {
+		// Every scope must state its member selection EXPLICITLY here, with a default that
+		// refuses. An `if scope == ScopeOpen` would have the same fail-open shape the
+		// top-level guard exists to remove, just moved: adding a third scope to the
+		// accepted set without touching this line would silently give it the WIDEST
+		// semantics — re-asserting over settled verdicts. A switch makes the compiler's
+		// reader ask "what does this new scope select?" at the point it matters.
+		var include bool
+		switch scope {
+		case ScopeOpen:
+			// Only what the SHARED ladder calls todo: a filed or already-settled member
+			// keeps its state (PRD #98 Decision 2's definition of open).
+			include = BucketOf(rec.DispositionStatus.String, rec.FiledSettled) == "todo"
+		case ScopeAll:
+			include = true
+		default:
+			return apitypes.JudgeDispositionResultDTO{}, ErrInvalidScope
+		}
+		if !include {
 			continue
 		}
 		reviewIDs = append(reviewIDs, rec.ReviewID)
