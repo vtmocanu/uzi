@@ -195,6 +195,11 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
 cleanup() {
   local code=$?
+  # Margin report BEFORE teardown (PRD #97 M9) — on the failure path too, where it is
+  # most useful: a red run's margins usually show the whole suite running hot, which is
+  # the difference between "this assertion is wrong" and "this host was slow". Wrapped
+  # so a broken diagnostic can never change the exit code we are about to return.
+  report_margins 2>/dev/null || true
   # KEEP_STACK leaves the whole stack running (containers + volumes + rundir) so
   # the auditor can inspect logs, the claim payload path, and the worker's /data
   # against a live run. Tear it down manually with the printed command.
@@ -315,12 +320,45 @@ wait_http() {
 # poll GETTER until its output equals WANT. Every simple equality wait shares this
 # skeleton; only the waits with extra early-fail conditions (wait_status,
 # wait_autopilot_done, wait_notes) keep bespoke loops.
+# ── margin instrumentation (PRD #97 M9) ───────────────────────────────────────
+# Every wait_* below records how long it ACTUALLY waited against the ceiling it was
+# given; the tightest are printed at the end of the run. A bare PASS cannot distinguish
+# "settled instantly" from "made it with 200ms to spare on a 20s ceiling", and that
+# difference is the whole question when deciding whether a phase is safe to speed up or
+# is quietly one slow host away from red. Instrumenting the SHARED helper (rather than
+# per site) covers every wait_eq wrapper — wait_worker_online / wait_board_pipeline /
+# wait_card_pipeline / wait_verdict / wait_card_column / wait_run_mr_state /
+# wait_health — plus wait_status, in one place.
+#
+# Diagnostic ONLY: record_margin never asserts and never fails a run — a broken
+# diagnostic must not be able to turn a good run red. Resolution is whole seconds
+# ($SECONDS, portable everywhere); that cannot resolve sub-second waits, but the
+# question it answers is "which ceilings are we approaching", where 1s granularity is
+# ample. Sub-second precision where it matters is done per site (see PRD #95).
+MARGINS_FILE=""   # assigned once RUNROOT exists (see the mkdir below)
+record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
+  [ -n "$MARGINS_FILE" ] || return 0
+  printf '%s\t%s\t%s\n' "$2" "$3" "$1" >> "$MARGINS_FILE" 2>/dev/null || true
+}
+
+# report_margins — print the waits that came closest to their ceiling. Sorted by
+# headroom (timeout - waited) ascending, so the most fragile are first.
+report_margins() {
+  [ -n "$MARGINS_FILE" ] && [ -s "$MARGINS_FILE" ] || return 0
+  say "PRD #97 M9 — wait_* margin report (tightest first; headroom = ceiling - actual)"
+  # Emit "<headroom>\t<line>", numeric-sort on the leading key, then strip it — sorting
+  # the rendered text directly does not work (the number is not at a field boundary).
+  awk -F'\t' '{ printf "%d\t  %-46s waited %3ss of %3ss ceiling (headroom %3ss)\n", $2-$1, substr($3,1,46), $1, $2, $2-$1 }' \
+    "$MARGINS_FILE" | sort -n -k1,1 | cut -f2- | head -12
+  printf '  (%s instrumented waits this run; whole-second resolution)\n' "$(wc -l < "$MARGINS_FILE" | tr -d ' ')"
+}
+
 wait_eq() {
   local want="$1" timeout="$2" desc="$3"; shift 3
-  local deadline=$((SECONDS + timeout)) got
+  local start=$SECONDS deadline=$((SECONDS + timeout)) got
   while [ $SECONDS -lt $deadline ]; do
     got="$("$@")"
-    [ "$got" = "$want" ] && return 0
+    if [ "$got" = "$want" ]; then record_margin "$desc -> $want" "$((SECONDS - start))" "$timeout"; return 0; fi
     sleep 0.3
   done
   fail "timeout: $desc never reached '$want' (last: '${got:-none}')"
@@ -362,9 +400,10 @@ wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"
 # if it lands in an unexpected terminal state.
 wait_status() {
   local run="$1" want="$2" timeout="${3:-90}" deadline=$((SECONDS + ${3:-90})) s
+  local start=$SECONDS
   while [ $SECONDS -lt $deadline ]; do
     s="$(apiget "/api/runs/$run" | jq -r '.run.status')"
-    [ "$s" = "$want" ] && return 0
+    if [ "$s" = "$want" ]; then record_margin "run status -> $want" "$((SECONDS - start))" "$timeout"; return 0; fi
     case "$s" in
       failed|cancelled)
         [ "$s" = "$want" ] && return 0
@@ -488,6 +527,10 @@ wait_notes() {
 say "provisioning scratch dir $RUNROOT (project $PROJECT, web $BASE, executor $EXECUTOR)"
 mkdir -p "$RUNROOT/certs" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
 chmod a+rwX "$RUNROOT/forge-fake-state"  # forge-fake persists its recorded state here (survives the restart)
+# Arm the wait_* margin recorder now that the scratch dir exists (PRD #97 M9). Waits
+# before this point (there are none that matter) simply go unrecorded.
+MARGINS_FILE="$RUNROOT/wait-margins.tsv"
+: > "$MARGINS_FILE"
 
 # Self-signed cert for forge-fake.e2e (trusted by api/worker/git in the overlay).
 cat > "$RUNROOT/certs/openssl.cnf" <<'EOF'
@@ -981,6 +1024,11 @@ say "cancel path: a queued run is cancelled server-side (no live poller)"
 IID_C="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E cancel","description":"cancel me — see prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_C="$(create_run "$REPO_ID" "$IID_C")" || fail "cancel-path run-create failed (non-transient; see stderr)"
+# NOT a race, despite looking exactly like the one PRD #95 had to fix with a vault lock:
+# no worker EXISTS yet at this point in the suite (the join token is minted and the agent
+# started immediately below), so nothing can claim this run and `queued` is stable by
+# construction. Left as a bare read deliberately — do not "harden" it (PRD #97 M9 swept
+# the suite for this class; this is the one instance that is already safe).
 [ "$(apiget "/api/runs/$RUN_C" | jq -r '.run.status')" = queued ] || fail "cancel-path run should start queued"
 SS="$(apipost "/api/runs/$RUN_C/inputs" '{"kind":"cancel","body":""}' | jq -r '.server_side')"
 [ "$SS" = true ] || fail "cancel of a queued run should be applied server-side (got server_side=$SS)"
@@ -1438,24 +1486,54 @@ pass "smart-HTTP transport: a non-main branch push is accepted (hook rejects onl
 #
 # The stub DOES consume inputs naturally — no /_e2e mutator or hand-driven worker call
 # is needed: the runner's SteeringChannel polls GET /api/worker/runs/{id}/inputs
-# (→ ConsumeInputs) every WORKER_POLL_INTERVAL (3s), consuming EVERY pending input and
-# buffering a follow_up for the agent's next turn. To observe Queued DETERMINISTICALLY
-# we submit the follow-up in the queued/claiming window BEFORE the run is owned and its
-# steering poll has run (clone+plan take seconds, so consumed_at is still NULL at the
-# immediate read); the gate's poll then flips it to Delivered while the run sits at
-# awaiting_approval — the S3 "Delivered — applies after approval" case, driven end to
-# end by the real worker poll. (The dropped-frame reconnect self-heal, S1, is proven in
+# (→ ConsumeInputs), consuming EVERY pending input and buffering a follow_up for the
+# agent's next turn. We submit the follow-up in the queued/claiming window BEFORE the
+# run is owned and its steering poll has run, then read it back as Queued; the gate's
+# poll then flips it to Delivered while the run sits at awaiting_approval — the S3
+# "Delivered — applies after approval" case, driven end to end by the real worker poll.
+# (The dropped-frame reconnect self-heal, S1, is proven in
 # web/src/lib/useRunStream.test.tsx — e2e has no browser WS, so it is not re-tested here.)
+#
+# ── THE Queued OBSERVATION IS MADE DETERMINISTIC BY A VAULT LOCK (PRD #97 M9) ──
+# History, because the wrong version of this comment cost two runs: it used to state the
+# steering poll runs "every WORKER_POLL_INTERVAL (3s)" and that Queued was therefore
+# observed "DETERMINISTICALLY". Both were false, and the second followed from the first:
+#   • 3s is the PRODUCT DEFAULT (`agent/src/config.ts:220`).
+#   • This harness OVERRIDES it to 500ms (`e2e/docker-compose.e2e.yml:182`), and that is
+#     what drives the SteeringChannel poll (main.ts:124 -> runner.ts:173 -> steering.ts:252/389).
+# So the window in which `consumed_at` is still NULL was ~500ms, not ~3s, and the read
+# was a coin flip: observed failing 2026-07-20 with consumed_at 332ms after created_at.
+#
+# The fix is NOT a wider timeout — the property is real; the PRECONDITION was unenforced.
+# We now enforce it: lock the owner's vault so the worker gate provably withholds the run
+# (PRD #32 asserts exactly this at the vault phase — "a locked owner's run must stay
+# queued (never claimed, never failed)"), which turns "unclaimed" from a ~500ms window
+# into a STABLE state. We then assert Queued twice across several worker poll cycles —
+# strictly STRONGER than the old single read, which could not tell a stable state from a
+# lucky snapshot — before unlocking and asserting the real Queued -> Delivered transition
+# through the live worker exactly as before. No assertion is weakened; one is added.
 say "PRD #95: steer-queue delivery — Queued → Delivered on consume, no run_message, no forge/token"
 STEER_MRS_BEFORE="$(fake_state | jq '.mrs | length')"
+
+# Lock FIRST: the run must be un-claimable from the instant it exists.
+apipost /api/vault/lock '' >/dev/null
+[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = false ] \
+  || fail "PRD #95: the vault must lock before the steer run is created — without it the Queued read below is a ~500ms race, not an assertion"
+
 IID_S="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E steer","description":"steer me — see prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_S="$(create_run "$REPO_ID" "$IID_S")" || fail "steer-path run-create failed (non-transient; see stderr)"
 { [ -n "$RUN_S" ] && [ "$RUN_S" != null ]; } || fail "steer-path run was not created"
 
-# Submit the follow-up immediately (the run is still queued/claiming — its worker has
-# not cloned or started steering yet), then read the owner queue: the write returns the
-# created row (S2) and the queue shows it Queued (consumed_at null).
+# The vault gate withholds the run at CLAIM, so it cannot be owned and no steering poll
+# can exist for it. Assert that precondition explicitly: if a future change lets this run
+# be claimed, it fails HERE with a clear cause instead of resurfacing as a mystery flake
+# in the consumed_at assertion below.
+[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')" = queued ] \
+  || fail "PRD #95: the vault lock must keep run $RUN_S unclaimed (got $(apiget "/api/runs/$RUN_S" | jq -r '.run.status')) — the Queued observation would be a race again"
+
+# Submit the follow-up, then read the owner queue: the write returns the created row (S2)
+# and the queue shows it Queued (consumed_at null).
 STEER_BODY="please also update the changelog"
 SUB="$(apipost "/api/runs/$RUN_S/inputs" "$(jq -cn --arg b "$STEER_BODY" '{kind:"follow_up",body:$b}')")"
 [ "$(echo "$SUB" | jq -r '.server_side')" = false ] \
@@ -1468,10 +1546,24 @@ Q="$(apiget "/api/runs/$RUN_S/inputs")"
 [ "$(echo "$Q" | jq -r '.inputs[0].body')" = "$STEER_BODY" ] || fail "queued follow_up body mismatch"
 [ "$(echo "$Q" | jq -r '.inputs[0].consumed_at')" = null ] \
   || fail "a freshly-submitted follow_up must be Queued (consumed_at null), got $(echo "$Q" | jq -c '.inputs[0]')"
-pass "follow_up submitted: write returned the row (id=$STEER_ID), queue shows it Queued (consumed_at null)"
 
-# The run reaches the gate; the steering poll there consumes the follow_up (stamping
-# consumed_at) while the run stays awaiting_approval — Delivered, S3 flavor.
+# STABILITY (PRD #97 M9): re-read after several worker poll cycles. Under the lock this
+# must STILL be Queued — that is what distinguishes an enforced precondition from a lucky
+# snapshot, and it is the assertion the old single read could never make.
+sleep 1.5   # ~3 worker poll cycles (500ms each, overlay :182)
+[ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" = null ] \
+  || fail "PRD #95: the follow_up was consumed while the owner's vault was LOCKED — the worker gate should have withheld run $RUN_S entirely"
+[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')" = queued ] \
+  || fail "PRD #95: run $RUN_S left 'queued' while the vault was locked"
+pass "follow_up submitted: write returned the row (id=$STEER_ID); Queued is STABLE across ~3 worker poll cycles under the vault lock (not a snapshot)"
+
+# Unlock: the worker may now claim, and the run proceeds to the gate where its steering
+# poll consumes the follow_up (stamping consumed_at) while the run stays
+# awaiting_approval — Delivered, S3 flavor. Everything from here is the ORIGINAL
+# assertion set, driven by the real worker poll.
+apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null
+[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
+  || fail "PRD #95: the vault must be unlocked again — later phases (and the dedicated PRD #32 phase) assume an unlocked admin vault"
 wait_status "$RUN_S" awaiting_approval
 wait_eq delivered 30 "run $RUN_S follow-up delivery" run_input_delivery "$RUN_S"
 DLV="$(apiget "/api/runs/$RUN_S/inputs")"
@@ -1479,6 +1571,23 @@ DLV="$(apiget "/api/runs/$RUN_S/inputs")"
 [ "$(echo "$DLV" | jq -r '.inputs[0].id')" = "$STEER_ID" ] || fail "delivered row id drifted from the submitted id"
 [ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')" = awaiting_approval ] \
   || fail "the run should still be at the gate when the follow_up is consumed (S3 delivered-applies-after-approval)"
+# DIAGNOSTIC (PRD #97 M4/M9), not an assertion. READ THE LABEL CAREFULLY: since M9 this
+# number spans the DELIBERATE vault-lock window, so it is a total submit→delivery span,
+# NOT a race margin. There is no race margin here any more — the lock makes Queued a
+# stable state by construction, so the old "how close did we come" reading no longer
+# applies and reporting it as one would be a lie of exactly the kind M9 exists to remove.
+# It is still worth printing: a sudden jump means delivery-after-unlock got slower.
+# Never fails the run — a jq hiccup degrades to "unknown" rather than aborting a ~9-min
+# suite over a print. jq's fromdateiso8601 cannot parse fractional seconds, so split the
+# timestamp and add the milliseconds back by hand (verified against the real 2026-07-20
+# failure pair: .296723Z → .628886Z yields 332).
+STEER_MARGIN_MS="$(jq -rn --arg c "$(echo "$DLV" | jq -r '.inputs[0].created_at')" \
+                          --arg d "$(echo "$DLV" | jq -r '.inputs[0].consumed_at')" '
+  def epochms: capture("^(?<t>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<f>[0-9]+))?Z$")
+    | ((.t + "Z") | fromdateiso8601) * 1000 + (((.f // "0") + "000")[0:3] | tonumber);
+  (($d | epochms) - ($c | epochms)) | tostring' 2>/dev/null || echo unknown)"
+[ -n "$STEER_MARGIN_MS" ] || STEER_MARGIN_MS=unknown
+say "PRD #95 DIAGNOSTIC: total submit→delivery span ≈ ${STEER_MARGIN_MS}ms (spans the deliberate vault-lock window — NOT a race margin; the lock removed the race)"
 pass "worker consumed the follow_up at the gate: queue Queued → Delivered, run still awaiting_approval (S3)"
 
 # Decision 4 — the headline invariant: the follow_up is a DTO over run_user_inputs,
@@ -1865,7 +1974,15 @@ pass "MR reopened → card #$IID returned In Progress → Human Review; run mr_s
 flip_mr "$MR_IID" closed
 wait_card_column "$IID" "In Progress" 40
 apipost "/api/repos/$REPO_ID/issues/$IID/move" '{"to_column":"Later"}' >/dev/null
-wait_card_column "$IID" "Later" 10   # the move is forge-first; let any in-flight reconcile settle
+# The move is forge-first; let any in-flight reconcile settle.
+# ⚠️ DELIBERATELY LEFT AT 10s (PRD #97 M9). This is the tightest wait_* ceiling in the
+# suite — it waits on a reconcile (4s period), so 10s is only ~2.5 periods, against
+# siblings at 20-40s. It is still ABOVE the 2-period floor, and raising it on that hunch
+# alone is exactly the move that produced M9's own worst error (a timeout "fixed" on a
+# guess, masking rather than diagnosing). The margin instrumentation now records what
+# this wait ACTUALLY takes; if the data shows it running near the wire, raise it then,
+# with evidence. Do not raise it without that measurement.
+wait_card_column "$IID" "Later" 10
 flip_mr "$MR_IID" opened
 # Two ticks (2s each) must pass with the card LEFT in Later (a fight would yank it
 # to Human Review within one tick; Decision 5 floors this at 2 ticks = 4s, PRD #97 M5).
@@ -2069,10 +2186,13 @@ wait_notes "$IID_NC" 2 40
 pass "label remove+re-add (new event id) → re-evaluated once → second comment"
 
 # A FullSync (eviction + resync of the issue cache) must NOT re-comment: the dedup
-# marker lives in autopilot_triggers, not the evictable issue cache. Several 2s
-# ticks (>= one reconcile at FORGE_RECONCILE_EVERY=2) with no new label event →
-# still 2.
-sleep 6
+# marker lives in autopilot_triggers, not the evictable issue cache. This is a
+# RECONCILE-driven negative, so Decision 5's floor is 2 RECONCILE periods, not 2 poll
+# ticks: FORGE_POLL_INTERVAL=2s x FORGE_RECONCILE_EVERY=2 = a 4s reconcile period, so
+# the floor is 8s. It sat at 6s — the only sub-floor window in the suite (PRD #97 M9;
+# M5 correctly refused to LOWER it, M9 raises it to the floor). One reconcile to evict
+# + one to confirm no re-comment followed.
+sleep 8
 [ "$(note_count "$IID_NC")" = 2 ] || fail "a FullSync eviction re-commented (trigger dedup must survive eviction)"
 assert_no_run_for_issue "$IID_NC" 0
 pass "no re-comment (and still no run) across a FullSync eviction"
