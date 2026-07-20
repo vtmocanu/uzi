@@ -71,9 +71,12 @@ function agentOf(msg: Record<string, unknown>): string {
  * state here: nothing is remembered between frames, which is what makes this
  * correct across resume and across two subagents running at once.
  *
- * `parent_tool_use_id` is `string | null` and is null for the lead, so `asString`
- * collapses "lead" and "absent" to the same `undefined` — the lead is simply the
- * parentless actor.
+ * `parent_tool_use_id` is `string | null` and is null on the ORCHESTRATOR's own
+ * turns, so `asString` collapses null and absent to the same `undefined`. Read
+ * that as "this frame has no parent invocation", NOT as `agent === "lead"`: a
+ * repo roster may ship an agent NAMED `lead`, which is a real subagent and does
+ * carry a `parent_tool_use_id` (see `orphanInstanceKind` below for why the two
+ * must never be conflated).
  */
 interface FrameAttribution {
   agent: string;
