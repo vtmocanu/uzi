@@ -285,7 +285,16 @@ carry explicit author sign-off:
       `assert_no_run_for_issue` "default `:434` 6→4s" is a no-op** (fable review): the
       `:434` default is never used — every call site passes an explicit arg (`:1663`=6,
       `:1700`=6, `:1678`=0); change the explicit `6`s at `:1663`/`:1700`, leave `:1678`.
-- [ ] **M6 — structural speedups (~110–135s net, author sign-off gated)**: parallelize
+- [~] **M6 — DEFERRED to [issue #100](https://gitlab.example.com/vtmocanu/uzi/-/issues/100)**
+      (2026-07-20, user's direction, so PRD #97 can land). Not dropped — it is the single
+      largest remaining wall-clock win, but it is also the riskiest milestone (it
+      parallelises a phase and moves three timing knobs in a suite this PRD has just
+      proven timing-sensitive), and it is **unmeasurable until M9 ships**: its entire
+      value is a timing claim and the suite had no instrument. M9's central `wait_*`
+      margin instrumentation also answers open question 3 outright and informs 1.
+      Corrected estimate carried to #100: **~105s net**, not ~120s — the worker sits at
+      cap 2 entering #47 (asserted `cap==2`), so cap≥3 costs an extra agent recreate
+      + register wait (~15s). Original scope retained below for reference: parallelize
       the PRD #47 health legs a/b/c on a `WORKER_MAX_CONCURRENT_RUNS≥3` worker
       (`:2735`; per-run `health`/`health_notified_at`, same assertions run
       concurrently → wall clock ~max instead of ~sum, ~120s) — **gated on** the
