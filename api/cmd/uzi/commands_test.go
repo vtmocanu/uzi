@@ -56,7 +56,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run":    {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up"},
+		"run":    {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "inputs"},
 		"worker": {"list", "rm"},
 		"repo":   {"list"},
 		"admin":  {"users", "runs", "workers", "usage", "rate-limits"},
@@ -400,6 +400,127 @@ func TestRunLogsFollowStopsOnTerminal(t *testing.T) {
 	}
 	if ff.getRunCalls < 3 {
 		t.Errorf("GetRun polled %d times, want >= 3 (should poll until terminal)", ff.getRunCalls)
+	}
+}
+
+// The steer-queue table renders each follow-up's body and its delivery state.
+// A non-consumed input on a live run is "queued"; a consumed one is "delivered".
+func TestRunInputsTableStates(t *testing.T) {
+	consumed := time.Now().Add(-time.Minute)
+	queued := "please add a test"
+	delivered := "and fix the lint"
+	fc := &uzicli.FakeClient{
+		RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "running", Kind: "issue"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"r1": {
+			{ID: 2, Body: &delivered, CreatedAt: time.Now().Add(-30 * time.Second), ConsumedAt: &consumed},
+			{ID: 1, Body: &queued, CreatedAt: time.Now().Add(-2 * time.Minute)},
+		}},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{"BODY", "STATE", "AGE", queued, "queued", delivered, "delivered"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inputs table missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// --json emits the raw DTO list (id/body/created_at/consumed_at); state is
+// derived by the agent from these fields, so the CLI does NOT fetch the run in
+// --json mode — proven here by the absence of any RunByID entry.
+func TestRunInputsJSON(t *testing.T) {
+	body := "queued msg"
+	fc := &uzicli.FakeClient{InputsByID: map[string][]apitypes.SteerInputDTO{
+		"r1": {{ID: 7, Body: &body, CreatedAt: time.Now()}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"id": 7`) || !strings.Contains(out, `"consumed_at": null`) {
+		t.Errorf("--json did not emit the raw DTO list:\n%s", out)
+	}
+}
+
+// GET /inputs is owner-only (Decision 8): the caller reads its OWN run's queue,
+// but another owner's run (absent from the fake, as the server 404s a non-owner)
+// is exit 4 — never another user's steer text.
+func TestRunInputsOwn200Foreign404(t *testing.T) {
+	body := "mine"
+	fc := &uzicli.FakeClient{InputsByID: map[string][]apitypes.SteerInputDTO{
+		"mine": {{ID: 1, Body: &body, CreatedAt: time.Now()}},
+	}}
+	if _, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "mine", "--json"); code != uzicli.ExitOK {
+		t.Fatalf("own run: exit = %d, want 0", code)
+	}
+	if _, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "someone-else"); code != uzicli.ExitNotFound {
+		t.Fatalf("foreign run: exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+}
+
+// The gate and terminal nuances (Decision 7) render when the run's status is
+// known: a follow-up consumed at a plan gate reads "delivered (applies after
+// approval)"; an unconsumed one on a terminal run reads "not delivered".
+func TestRunInputsGateAndTerminalStates(t *testing.T) {
+	consumed := time.Now().Add(-time.Minute)
+	atGate := "approve me"
+	stranded := "too late"
+	gate := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"g": {ID: "g", Status: "awaiting_approval", Kind: "issue"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"g": {{ID: 1, Body: &atGate, CreatedAt: time.Now(), ConsumedAt: &consumed}}},
+	}
+	out, _, code := runCLI(t, fakeEnv(gate), "run", "inputs", "g")
+	if code != uzicli.ExitOK {
+		t.Fatalf("gate: exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "applies after approval") {
+		t.Errorf("gate state missing the approval nuance:\n%s", out)
+	}
+	term := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"t": {ID: "t", Status: "completed", Kind: "issue"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"t": {{ID: 1, Body: &stranded, CreatedAt: time.Now()}}},
+	}
+	out, _, code = runCLI(t, fakeEnv(term), "run", "inputs", "t")
+	if code != uzicli.ExitOK {
+		t.Fatalf("terminal: exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "not delivered (run finished)") {
+		t.Errorf("terminal state missing 'not delivered':\n%s", out)
+	}
+}
+
+// The chat caveat (N3) prints to stderr ONLY for a chat run (whose queue lists
+// every chat turn); an issue run's output stays clean.
+func TestRunInputsChatCaveatNote(t *testing.T) {
+	body := "first turn"
+	chat := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"c": {ID: "c", Status: "running", Kind: "chat"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"c": {{ID: 1, Body: &body, CreatedAt: time.Now()}}},
+	}
+	if _, errOut, code := runCLI(t, fakeEnv(chat), "run", "inputs", "c"); code != uzicli.ExitOK || !strings.Contains(errOut, "chat run") {
+		t.Fatalf("chat run: exit=%d, stderr=%q — want exit 0 with the chat caveat", code, errOut)
+	}
+	issue := &uzicli.FakeClient{
+		RunByID:    map[string]apitypes.RunDTO{"i": {ID: "i", Status: "running", Kind: "issue"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"i": {{ID: 1, Body: &body, CreatedAt: time.Now()}}},
+	}
+	if _, errOut, _ := runCLI(t, fakeEnv(issue), "run", "inputs", "i"); strings.Contains(errOut, "chat run") {
+		t.Errorf("issue run must NOT print the chat caveat:\n%s", errOut)
+	}
+}
+
+// An empty queue renders the header row and exits 0 without fetching the run
+// (no RunByID entry present), proving the empty-queue fast path.
+func TestRunInputsEmpty(t *testing.T) {
+	fc := &uzicli.FakeClient{InputsByID: map[string][]apitypes.SteerInputDTO{"r1": {}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "BODY") {
+		t.Errorf("empty queue should still render the header row:\n%s", out)
 	}
 }
 

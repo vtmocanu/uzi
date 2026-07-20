@@ -278,7 +278,55 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
 
-	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp)
+	inputs := &cobra.Command{
+		Use:   "inputs <run-id>",
+		Short: "List a run's steer queue (follow-ups) with delivery status",
+		Long: "List the follow-ups sent to a run (the steer queue, PRD #95), newest first, " +
+			"each with its delivery state — queued (the worker has not drained it yet) or " +
+			"delivered (handed to the worker for its next turn) — plus a relative age. " +
+			"Owner-only: a read-only admin token gets 404 on another user's run.\n\n" +
+			"Only kind='follow_up' rows are shown (approve/reject/cancel are omitted). " +
+			"A chat run seeds every chat turn as a follow_up, so `uzi run inputs` on a " +
+			"chat run lists the seeded prompt and all chat turns; an issue run's queue " +
+			"starts empty (its prompt rides the claim payload, not an input row).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			list, err := c.RunInputs(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				// The agent contract: emit the raw DTO list. State is derived
+				// client-side (from consumed_at + the run's status), so an agent
+				// computes it from these fields itself — the CLI never fetches the
+				// run in --json mode.
+				return p.JSON(list)
+			}
+			// Human render only: derive the delivery state (Decision 7), which needs
+			// the run's live status for the gate/terminal nuance. One cheap GetRun; if
+			// it fails, status stays "" and the state degrades to the queued/delivered
+			// floor (Decision 10). Skipped entirely for an empty queue.
+			status := ""
+			if len(list) > 0 {
+				if run, err := c.GetRun(cmd.Context(), args[0]); err == nil {
+					status = run.Status
+					if run.Kind == "chat" {
+						// N3: a chat run's queue is every chat turn. Note it only when it
+						// actually applies, so an issue run's output stays clean.
+						fmt.Fprintln(env.Stderr, "note: chat run — this queue lists every chat turn as a follow-up (chat has its own web composer, unaffected)")
+					}
+				}
+			}
+			return renderRunInputs(p, list, status)
+		},
+	}
+
+	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp, inputs)
 	return cmd
 }
 
@@ -462,13 +510,82 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 // human table. The payload is server-forwarded run content; it is DATA, printed
 // verbatim (never interpreted).
 func compactPayload(raw json.RawMessage) string {
-	s := sanitizeTTY(strings.TrimSpace(string(raw)))
+	return compactText(string(raw))
+}
+
+// compactText sanitizes untrusted free text and folds it to a single truncated
+// line for a human table cell (Risk 13): C0/C1 controls stripped, newlines
+// collapsed to spaces, capped at 200 chars. Shared by compactPayload (message
+// payloads) and the steer-queue body column.
+func compactText(s string) string {
+	s = sanitizeTTY(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "\n", " ")
 	const max = 200
 	if len(s) > max {
 		return s[:max] + "…"
 	}
 	return s
+}
+
+// renderRunInputs prints the steer queue (follow-ups, newest-first) as a
+// body/state/age table (PRD #95 M4). The body is the user's own follow-up text,
+// sanitized like any free text bound for a TTY. State is derived from
+// (consumed_at, runStatus); age is relative to created_at.
+func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string) error {
+	rows := make([][]string, 0, len(inputs))
+	for _, in := range inputs {
+		body := "-"
+		if in.Body != nil {
+			body = compactText(*in.Body)
+		}
+		rows = append(rows, []string{body, steerState(in.ConsumedAt, runStatus), relAge(in.CreatedAt)})
+	}
+	return p.Table([]string{"BODY", "STATE", "AGE"}, rows)
+}
+
+// steerState derives a follow-up's delivery label from its consumed_at and the
+// run's live status, mirroring PRD #95 Decision 7 as closely as the CLI can:
+//   - not consumed, run terminal  → "not delivered (run finished)"
+//   - not consumed, otherwise     → "queued"
+//   - consumed, run at plan gate  → "delivered (applies after approval)"
+//   - consumed, otherwise         → "delivered"
+//
+// runStatus may be "" when the run's status could not be fetched (Decision 10
+// floor): the gate/terminal nuance is then dropped and only queued/delivered
+// show — the acceptable CLI minimum.
+func steerState(consumedAt *time.Time, runStatus string) string {
+	if consumedAt == nil {
+		if terminalRunStatuses[runStatus] {
+			return "not delivered (run finished)"
+		}
+		return "queued"
+	}
+	if runStatus == "awaiting_approval" {
+		return "delivered (applies after approval)"
+	}
+	return "delivered"
+}
+
+// relAge renders a coarse relative age (e.g. "5s", "12m", "3h", "2d") for a
+// timestamp, for the steer-queue AGE column. A zero or future time renders "-"
+// and "0s" respectively; sub-second precision is not useful here.
+func relAge(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	d := time.Since(t)
+	switch {
+	case d < 0:
+		return "0s"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
 }
 
 // renderReview prints the judge's review: a verdict line, an incomplete caveat
