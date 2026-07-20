@@ -72,7 +72,30 @@ type Client interface {
 	// DeleteMemory purges one of the caller's memory entries: DELETE
 	// /api/me/memory/{id} (204 on success). An unknown/foreign id is a 404 (exit 4).
 	DeleteMemory(ctx context.Context, id string) error
+	// SetDisposition records a triage verdict on a judge recommendation (PRD #94
+	// Decision 10): PUT /api/runs/{id}/review/recommendations/{recID}/disposition
+	// {status, reason?}. status ∈ {done, dismissed}; reason (∈ {wont_do,
+	// not_an_issue}) is sent only for a dismissal and omitted otherwise. Owner-only
+	// on RequireUser (Decision 5): a uza_ read-only token mutating another user's
+	// review gets a 404 (exit 4). 204 → nil.
+	SetDisposition(ctx context.Context, runID, recID, status, reason string) error
+	// DeleteDisposition undoes a recommendation's disposition (PRD #94 Decision 6):
+	// DELETE the same path. A 404 means no disposition existed — returned as the
+	// sentinel ErrNoDisposition (a plain error, NOT an *ExitError) so the command
+	// can soften it to "already undone" and exit 0. Every other failure propagates
+	// as an *ExitError with the documented exit code.
+	DeleteDisposition(ctx context.Context, runID, recID string) error
+	// JudgeStats returns the caller's all-time triage totals across every run (PRD
+	// #94 Decision 8): GET /api/me/judge/stats. Owner-scoped; the reply is an
+	// unenveloped TriageDTO.
+	JudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
 }
+
+// ErrNoDisposition is returned by DeleteDisposition when the recommendation had
+// no disposition to undo (the endpoint answers 404). It is a plain error, NOT an
+// *ExitError, so `uzi review undo` can treat it as "already undone" (a friendly
+// message, exit 0) instead of a hard not-found failure.
+var ErrNoDisposition = errors.New("no disposition to undo")
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
 // hostile endpoint cannot make the CLI allocate without bound. 32 MiB is far above
@@ -212,6 +235,17 @@ func (c *HTTPClient) get(ctx context.Context, path string, out any) error {
 // out (out may be nil). Non-2xx maps to the documented exit code via statusError.
 func (c *HTTPClient) postJSON(ctx context.Context, path string, reqBody, out any) error {
 	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, reqBody)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, out)
+}
+
+// put executes a PUT with a JSON body and, on a 2xx, decodes the reply into out
+// (out may be nil — the disposition endpoint answers 204). Non-2xx maps to the
+// documented exit code via statusError. Mirrors postJSON with http.MethodPut.
+func (c *HTTPClient) put(ctx context.Context, path string, reqBody, out any) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodPut, path, reqBody)
 	if err != nil {
 		return err
 	}
@@ -390,6 +424,46 @@ func (c *HTTPClient) ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO,
 
 func (c *HTTPClient) DeleteMemory(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/me/memory/"+url.PathEscape(id))
+}
+
+// dispositionPath builds the disposition endpoint path for a (run, rec) pair,
+// escaping both id segments.
+func dispositionPath(runID, recID string) string {
+	return "/api/runs/" + url.PathEscape(runID) + "/review/recommendations/" + url.PathEscape(recID) + "/disposition"
+}
+
+func (c *HTTPClient) SetDisposition(ctx context.Context, runID, recID, status, reason string) error {
+	reqBody := map[string]string{"status": status}
+	// reason is required iff dismissed; omit it otherwise so a "done" PUT never
+	// carries a stray (and server-rejected) reason field.
+	if reason != "" {
+		reqBody["reason"] = reason
+	}
+	return c.put(ctx, dispositionPath(runID, recID), reqBody, nil)
+}
+
+func (c *HTTPClient) DeleteDisposition(ctx context.Context, runID, recID string) error {
+	// The command resolves recID against the current review before calling, so the
+	// run and recommendation exist; a 404 here therefore means "no disposition on
+	// this coordinate" — softened to ErrNoDisposition (a plain error) so undo can
+	// report "already undone" and exit 0, per Decision 6. Any other non-2xx keeps
+	// its real exit code.
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, dispositionPath(runID, recID), nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNoDisposition
+	}
+	return decode2xx(resp, body, dispositionPath(runID, recID), nil)
+}
+
+func (c *HTTPClient) JudgeStats(ctx context.Context) (apitypes.TriageDTO, error) {
+	var out apitypes.TriageDTO
+	if err := c.get(ctx, "/api/me/judge/stats", &out); err != nil {
+		return apitypes.TriageDTO{}, err
+	}
+	return out, nil
 }
 
 func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) {

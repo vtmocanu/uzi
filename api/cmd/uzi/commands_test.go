@@ -46,7 +46,7 @@ func TestCommandTree(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 
 	topWant := []string{
-		"login", "logout", "auth", "whoami", "run",
+		"login", "logout", "auth", "whoami", "run", "review",
 		"worker", "repo", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
@@ -57,6 +57,7 @@ func TestCommandTree(t *testing.T) {
 
 	subWant := map[string][]string{
 		"run":    {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up"},
+		"review": {"show", "resolve", "dismiss", "undo", "stats"},
 		"worker": {"list", "rm"},
 		"repo":   {"list"},
 		"admin":  {"users", "runs", "workers", "usage", "rate-limits"},
