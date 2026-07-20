@@ -6,6 +6,7 @@
 **Mockup**: static concept mock (ember shell + buckets + worklist + the three deltas) at the design artifact; **note** it renders the worklist grouped *by run* — a precursor. This PRD supersedes that with **group-by-target + dedup** (Decision 2); a revised in-repo mock lands with M3 as `prds/mockups/98-judge-menu-mock.html`.
 **Depends on**: PRD #46 (the judge: `run_reviews` + `review_recommendations`, `users.judge_enabled`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed claim-first file flow), PRD #94 (`recommendation_dispositions`, the `bucketOf` ladder, `GET /me/judge/stats`, the global RunsList strip this promotes). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #69 (the judge **control plane** — mode/model/spend/accuracy/consent; this PRD is the complementary output workbench, cleanly separable — see Decision 5's digest-scope note), PRD #47 (RunHealth badge — the per-row badge grammar this mirrors).
 **Review**: fable adversarial pass on the concept mock folded in (2026-07-20). Load-bearing corrections adopted: **group by target with cross-run dedup**, not by run (the same recommendation recurs across runs and must be one triage decision, with frequency as the priority signal); **one canonical to-triage number** single-sourced from `triage.todo` so the nav badge, the notification, and the page tab cannot drift; the **/runs badge uses one verdict-first grammar** (`⚖ issues · 2`), not the mock's two grammars; the **triage state machine is already closed by #94** (the mock's flat three-button row under-represented it — Done / Dismiss ▾ Won't-do|Not-an-issue already exist). Deferred by review + user scoping: keyboard triage and target-file staleness → Future Work.
+**PRD review**: a second fable adversarial pass, this one on the PRD itself and verified against the code (2026-07-20). Corrections folded in: **Filed→Done must be edge-triggered** — the poller holds a synced `issues.state` *snapshot*, not transition events, so a naïve "upsert done while closed" re-fires every tick and would make Undo impossible and overwrite a `dismissed` member; fixed with a `close_synced_at` edge marker + `INSERT … ON CONFLICT DO NOTHING` (Decision 6) — **so this PRD is NOT migration-free** (Decision 6 ships one migration). **Bulk file-as-one-issue is descoped to a follow-up** — it needs a repo pick, a human draft gate + the #68 sanitizer, `forgeLimiter`, and reverses #68's cookie+CSRF posture; v1 keeps clean bulk *disposition* + per-rec browser filing (Decision 3 + Open Questions). **M5 re-sequenced after M3** (it deep-links `/judge`, which M3 creates). The **/runs todo count buckets in Go, not a second SQL ladder** (#94 Decision 2 forbids a SQL `CASE`; Decision 7). Honesty edits: the grouped read is a **new, wider query** (same join *shape* as `/stats`, but adds a `runs` join + the filed row — Decision 1); **filed issues are NOT owner-scoped** (#68 Decision 8 lets an admin file on another user's review — Decision 6).
 
 ## Problem
 
@@ -45,11 +46,14 @@ one action.
   listing each run occurrence (run title, verdict, per-run triage state).
   Recurrence, not the judge's self-reported confidence, is the trustworthy
   ranking signal.
-- **A group action fans out to its member coordinates — no new storage.** The
-  group is a *display* construct over #94's per-coordinate rows. "Dismiss" /
-  "Mark done" applies the disposition to every open member; "File issue" opens
-  **one** GitLab issue aggregating the occurrences and links every open member to
-  it. Bulk multi-select does the same across several groups.
+- **A group *disposition* action fans out to its member coordinates — no new
+  storage.** The group is a *display* construct over #94's per-coordinate rows.
+  "Dismiss" / "Mark done" applies the disposition to every open member (`bucket ==
+  todo`); bulk multi-select does the same across several groups. **Filing** in v1
+  stays the existing #68 per-recommendation browser draft (reachable from a
+  group's occurrence expander); **bulk "file N as one issue" is a follow-up** — it
+  needs a repo pick, a human draft gate, and a forge limiter #68 already imposes
+  (Decision 3, Open Questions).
 - **The notification stays a ping — its deep-link just retargets here.** No
   event is removed from the inbox; the `judge_review` row and its Slack DM now
   deep-link to `/judge?run={id}` instead of `/runs/{id}`. Mirror, don't move.
@@ -58,32 +62,41 @@ one action.
   gets a one-grammar `⚖ verdict · N` badge — a per-run glance it never had.
 - **Inbox grouping + Filed→Done sync close the loop at scale.** The in-app inbox
   groups consecutive judge rows (no Slack digest — Slack DMs stay one-per-review);
-  and when a filed issue *closes*, its recommendation auto-moves to Done.
+  and when a filed issue *closes*, its recommendation auto-moves to Done — once,
+  edge-triggered off the poller's synced issue state, never overwriting a human's
+  own verdict.
 - **One canonical number.** The nav badge, the notification, and the page's "To
   triage" tab all read `triage.todo` from #94's shared `bucketOf` helper. "Seen
   in N runs" communicates the grouping without minting a second count.
-- **CLI parity in the same MR** (`uzi review backlog` + bulk verbs), per the
-  CLAUDE.md second-consumer rule.
+- **CLI parity in the same MR** (`uzi review backlog` + bulk *disposition* verbs;
+  filing stays browser-only), per the CLAUDE.md second-consumer rule.
 
 ## Design Decisions
 
-1. **The Judge page is a new READ endpoint over #94's existing flat-join — no
-   migration, no new storage.** `GET /api/me/judge/recommendations`
-   (`RequireUser`, owner-scoped, all-time) runs the *same* join `GET
-   /me/judge/stats` runs today (`handler/judge_stats.go`, `h.JudgeStats` at
-   `handler.go:357`): `run_reviews` where `user_id = caller` → `review_recommendations`
-   → LEFT JOIN `recommendation_filed_issues` and `recommendation_dispositions` on
-   the `(review_id, category, target)` coordinate, one flat row per current
-   recommendation. Where `/stats` buckets those rows into a `TriageDTO` and throws
-   the rows away, this endpoint **returns them grouped by `(category, target)`**.
-   The grouped DTO per group: `{category, target, occurrences: [{run_id,
-   run_title, review_id, rec_id, verdict, confidence, bucket, filed_issue?}],
-   open_count, run_count, rationale_preview}` where `rationale_preview` is the
-   most-recent occurrence's escaped `rationale_md` (the panel's no-raw-render
-   rule, `RunView.tsx`). Counts still come from the shared **`bucketOf`** (PRD #94
-   Decision 2), so the page's tab totals and the nav badge equal the existing
-   strip exactly. A `?bucket=todo|filed|done|dismissed|all` filter (default
-   `todo`) bounds the initial pull.
+1. **The Judge page is a new READ endpoint — the *same join shape* as #94's
+   `/stats`, but a genuinely new, wider query; the read model itself needs no
+   migration.** `GET /api/me/judge/recommendations` (`RequireUser`, owner-scoped,
+   all-time). #94's `ListJudgeTriageRowsForUser` returns only three columns
+   (`queries/dispositions.sql`, the flat per-rec `(disposition_status,
+   filed_settled, category)` the Go `BucketOf` needs). This endpoint keeps that
+   join's spine — `run_reviews` where `user_id = caller` → `review_recommendations`
+   → LEFT JOIN `recommendation_filed_issues` + `recommendation_dispositions` on the
+   `(review_id, category, target)` coordinate — but **additionally joins `runs`**
+   (for `issue_title` → `run_title`) and selects `run_reviews.verdict`, the rec's
+   `confidence`/`rationale_md`, `rec_id`, and the filed row's `filed_issue_iid`/URL.
+   So it is a **new query**, not a reuse of `ListJudgeTriageRowsForUser` verbatim —
+   same shape, wider projection. It returns the rows **grouped by `(category,
+   target)`**. Per group: `{category, target, occurrences: [{run_id, run_title,
+   review_id, rec_id, verdict, confidence, bucket, filed_issue?}], open_count,
+   run_count, rationale_preview}` where `rationale_preview` is the most-recent
+   occurrence's escaped `rationale_md` (the panel's no-raw-render rule,
+   `RunView.tsx`) and each `bucket` comes from the shared **`bucketOf`** (PRD #94
+   Decision 2 — same helper, no re-implementation), so the page's tab totals and
+   the nav badge equal the existing strip exactly. A
+   `?bucket=todo|filed|done|dismissed|all` filter (default `todo`) and a `?run=`
+   anchor (for the notification deep-link, Decision 4) bound/scope the pull. **The
+   read is migration-free; the PRD as a whole is not — Decision 6 ships one
+   migration.**
 
 2. **Grouping grain is `(category, target)`; occurrences stay per-run; triage
    state stays per-coordinate.** Because #68/#94 key filed/disposition on
@@ -96,51 +109,64 @@ one action.
      `uzi review stats` to the digit. "Seen in N runs" carries the grouping.
      (This is the deliberate resolution of the review's competing-numbers worry:
      one canonical to-triage number; the group count is never a second badge.)
-   - A group's bucket **for the tab filter** is derived from its members, display
-     only: it appears under **To triage** iff `open_count ≥ 1`; a fully-settled
-     group rolls up to the highest state among members via the #94 ladder
-     (`dismissed > done > filed > to-do`). The occurrence expander always shows
-     the per-run truth, so a mixed group (2 dismissed, 2 open) is never
+   - **"Open" means `bucket == todo`** (a *filed* member is not open — it is on the
+     ladder's `filed` rung). `open_count` = members with `bucket == todo`; a group
+     is under **To triage** iff `open_count ≥ 1`. A fully-settled group rolls up to
+     the highest state among members via the #94 ladder (`dismissed > done > filed
+     > to-do`) — so a group of 3 done + 1 dismissed shows under **Dismissed**
+     (highest wins; a display quirk, documented). The occurrence expander always
+     shows the per-run truth, so a mixed group (2 dismissed, 2 open) is never
      misrepresented.
 
-3. **A group action FANS OUT to member coordinates — reusing #68/#94 mutation
-   semantics unchanged, owner-only.** Two new bulk endpoints, both `RequireUser`
-   and owner-only by construction (every member is caller-owned — the join is
-   `user_id = caller`, so this is PRD #94 Decision 5's strict-caller-ownership
-   posture applied N times; a uza_ `admin_ro` token is refused a mutation on
-   another user's rows exactly as in #94, and `IsAdmin` is never consulted):
+3. **A group *disposition* action FANS OUT to member coordinates — reusing #94's
+   mutation semantics unchanged, owner-only. Bulk *filing* is descoped to a
+   follow-up.** The one new bulk endpoint in v1:
    - `PUT /api/me/judge/recommendations/disposition`
      `{items: [{category, target}], status, reason?, scope: open|all}` — resolves
      the caller's member coordinates for each item and upserts a disposition on
      each (idempotent per #94 Decision 6; re-stamps the `rationale_hash` per its
-     Decision 3). `scope=open` (default) skips already-settled members; `all`
-     re-asserts. Returns the updated groups.
-   - `POST /api/me/judge/recommendations/file`
-     `{items: [{category, target}], single_issue: bool}` — files GitLab
-     issue(s) via #68's claim-first flow and links **every open member** of each
-     item. `single_issue=false` (default) = one issue per group; `single_issue=true`
-     merges the selected groups into **one** issue whose body enumerates every
-     occurrence (run links / issue IIDs) so the maintainer sees the frequency —
-     this is the review's "file several recs into one issue". Each linked member
-     gets a `recommendation_filed_issues` row on its coordinate (#68), so the
-     per-run panels light up "Filed" consistently.
-   - **Multi-select** across different groups (the checkbox bar) is just a
-     multi-item call to these two endpoints — the UI batches selection, the API
-     contract stays a list of `(category, target)` coordinates. A true
-     single-round-trip multi-coordinate batch is exactly what these endpoints
-     already are; no per-group round-trips.
+     Decision 3). `scope=open` (default) touches only members with `bucket == todo`
+     (Decision 2's definition — a filed member is left filed); `all` re-asserts.
+     Returns the updated groups. **Owner-only by construction**: every member is
+     caller-owned — the resolve is scoped `user_id = caller` (the
+     `SubmitInput(user.ID)` / #94 Decision 5 strict-ownership pattern, verified in
+     `handler/review_disposition.go`), so a uza_ `admin_ro` token can only ever
+     dispose its **own** rows and `IsAdmin` is never consulted. This is the clean
+     half: a local, non-forge, non-spend upsert applied N times.
+   - **Bulk "file N as one issue" is NOT in v1** — fable's PRD pass showed it is a
+     mini-PRD, not a #68 reuse. #68's `FileIssue` (`handler.go:680-687`) files into
+     a **user-picked repo** (`GetRepoForUser`, caller-owns-repo — and #68 Decision 4
+     notes the default repo is *unresolvable* for 4 of 6 categories for
+     non-admins), behind a **human-editable draft** it calls "the primary control"
+     for cross-project secret leakage (#68 Decision 10's fence/`/`-strip/secret
+     scan), on the **cookie+CSRF `RequireAuth` path with `forgeLimiter`**, and is
+     deliberately **browser-only** (filing is out of scope for the CLI, #68
+     Interactions). A bulk endpoint on `RequireUser` with a server-templated
+     aggregate body would drop the repo pick, the draft gate, and the limiter, and
+     reverse the auth posture (letting a uza_ token drive a forge *issue* write). So
+     **v1 keeps per-recommendation filing on the existing #68 browser draft**,
+     reachable from a group's occurrence expander; **bulk file-as-one-issue (repo
+     pick + aggregated draft + limiter + posture decision) is a follow-up PRD.**
+     (Recorded as an Open Question — the one scope item to confirm.)
+   - **Multi-select** across groups (the checkbox bar) is a multi-item call to the
+     disposition endpoint — the UI batches selection, the API takes a list of
+     `(category, target)` coordinates in one round-trip.
 
 4. **The notification is KEPT as a ping; only its deep-link retargets to the
    Judge menu.** The `judge_review` payload already anchors `run_id` + `review_id`
    (#46/#94) and the inbox is a generic surface (`notifysvc` untouched — "the
-   judge is simply tenant #1"). Two one-line link changes, no payload change:
+   judge is simply tenant #1"). No payload change; two link changes:
    - Slack DM: `reviewDeepLink` (`handler/judge_worker.go:318`, today
-     `baseURL + "/runs/" + targetID`) → `baseURL + "/judge?run=" + targetID`.
-   - Web inbox: the `judge_review` row deep-links to the in-app `/judge?run={id}`
-     (its `run_id` anchor) instead of `/runs/{id}`.
-   `/judge?run={id}` opens the menu filtered/scrolled to that run's occurrences,
-   so the ping lands you *on the work*, not on a run page you then have to leave.
-   The inbox row itself stays — the ping's job ("a review landed while you were
+     `baseURL + "/runs/" + targetID`) → `baseURL + "/judge?run=" + targetID` (a
+     true one-liner).
+   - Web inbox: **kind-conditional, not a one-liner.** `Notifications.tsx` links
+     `/runs/${n.run_id}` generically for **any** kind carrying a `run_id`
+     (`Notifications.tsx:59`), so the retarget is a `kind === 'judge_review'` guard
+     that routes to `/judge?run={id}` while every other kind keeps `/runs/{id}`.
+   `/judge?run={id}` opens the menu scrolled/filtered to that run's occurrences —
+   which requires the M1 endpoint's `?run=` anchor (Decision 1) or a client-side
+   occurrence filter, so **M5 depends on M3** (the route + the filter), not Phase
+   1. The inbox row itself stays — the ping's job ("a review landed while you were
    away") is preserved; only its destination changes.
 
 5. **Digest is web-inbox only; NO Slack digest.** At factory throughput a stream
@@ -160,34 +186,68 @@ one action.
      at all, nothing can delay that infra DM — the #56 (Slack notifications UX)
      seam evaporates.
 
-6. **Filed→Done sync — the poller closes the loop.** #68's
+6. **Filed→Done sync — edge-triggered off the poller's synced state, never
+   overwriting a human verdict. This is the PRD's one migration.** #68's
    `recommendation_filed_issues` links a coordinate to a forge issue
-   (`filed_issue_iid`); the poller (`api/internal/poller` + `forgesvc`) already
-   syncs issue state (forge = source of truth). Extend that sync: when a linked
-   filed issue transitions to **closed**, upsert a `done` disposition (#94's
-   idempotent upsert) on **every** coordinate linked to that issue, with a
-   provenance marker (`set_via='issue_close'`, a nullable column on
-   `recommendation_dispositions`, default `NULL`) so the UI can label "done via
-   #IID" and distinguish it from a hand-marked done. The #94 ladder then buckets
-   it as **done** — it leaves To triage and, for `improve_uzi`, the
-   self-improvement backlog (#94 Decision 9). **No auto-reopen** on issue reopen
-   (avoids flapping); a human Undo (#94 `DELETE .../disposition`) restores it.
-   Owner is the review owner (filed issues are owner-scoped). Rides the existing
-   poll loop; no new worker.
+   (`filed_issue_iid` + `filed_repo_id`). Crucially, **the poller has no transition
+   events** — `issues.state` is a synced *snapshot* (`store/migrations/00002_forge.sql`;
+   `forgesvc` FullSync/IncrementalSync upsert the cache). A naïve "upsert `done`
+   while the linked issue's cached state is closed" is **level-triggered**: it
+   re-fires every tick, so a human **Undo** is silently re-applied on the next
+   sync, and reusing #94's `ON CONFLICT DO UPDATE` upsert would **overwrite a
+   member the user had already `dismissed`** with `done`. Both are wrong. So:
+   - **Edge marker:** add `close_synced_at TIMESTAMPTZ` (nullable) to
+     `recommendation_filed_issues`. The post-sync pass acts on a linked issue only
+     on the open→closed **edge** (cached `state = closed` AND `close_synced_at IS
+     NULL`), then stamps `close_synced_at` — exactly once per close.
+   - **Never overwrite:** the disposition is written `INSERT … ON CONFLICT DO
+     NOTHING` (NOT #94's DO-UPDATE upsert), so a coordinate the user already
+     dismissed/marked keeps their verdict, and after Undo deletes the row the edge
+     is already consumed — Undo **sticks**. A reopen does not re-open (no
+     auto-reopen; flapping avoided); a re-close does nothing (`close_synced_at`
+     set).
+   - **Provenance + ownership:** the row carries `set_via='issue_close'` (a nullable
+     column on `recommendation_dispositions`, default `NULL`) so the UI labels
+     "done via #IID"; `set_by_user_id = NULL` marks the system action. The
+     disposition lands on the **review owner's** coordinate regardless of who
+     filed — **filed issues are NOT owner-scoped** (#68 Decision 8 keeps admin
+     filing on another user's review; `filed_by_user_id` may be an admin).
+   - **Preconditions (documented limits):** the issue cache only holds
+     **PRD-labeled issues of enabled repos** (`forgesvc/service.go` — reconcile
+     evicts de-labeled issues), and `filed_repo_id` is `ON DELETE SET NULL`. So a
+     filed issue that loses its PRD label, or whose repo is disabled/disconnected,
+     is no longer observable and **won't auto-Done** — a silent no-op, called out
+     here and in `docs/judge.md`, not a bug.
+   The #94 ladder then buckets an auto-done as **done** — it leaves To triage and,
+   for `improve_uzi`, the self-improvement backlog (#94 Decision 9). Rides the
+   existing poll loop; no new worker. **Migration:** `set_via` on
+   `recommendation_dispositions` + `close_synced_at` on `recommendation_filed_issues`
+   — one migration, draft-numbered above the live head and renumbered at merge per
+   CLAUDE.md.
 
-7. **Per-run verdict badge on `/runs` — a denormalized read on the list query, no
-   new store; the strip moves out.** The runs-list query (`handler/runs.go`) and
-   `RunListItem` (`web/src/lib/api.ts` — today it carries `mr_state`, `health`,
-   … but **no** judge field) gain `judge_verdict` (`ideal|ok|issues|null`) and
-   `judge_todo_count` via a LEFT JOIN `run_reviews` (+ bucketed recs) on
-   `target_run_id = run.id`, owner-scoped like every other column. The row renders
-   **one** compact badge, verdict-first with the count appended only when `> 0`
-   (`⚖ issues · 2`, `⚖ ideal`) — a single grammar, fixing the mock's two-grammar
-   bug, and mirroring the RunHealth badge (#47) placement. Click → the run's
+7. **Per-run verdict badge on `/runs` — verdict via a safe single join, the count
+   bucketed in Go (never a second SQL ladder); the strip moves out.** `RunListItem`
+   (`web/src/lib/api.ts` — today carries `mr_state`, `health`, … but **no** judge
+   field) gains `judge_verdict` (`ideal|ok|issues|null`) and `judge_todo_count`.
+   Two different mechanisms, deliberately:
+   - `judge_verdict`: a **safe LEFT JOIN `run_reviews` ON `target_run_id = run.id`**
+     in the list query (`handler/runs.go` / `ListRunsForUser`). `target_run_id` is
+     UNIQUE, so this stays strictly one-row-per-run — no fan-out.
+   - `judge_todo_count`: **NOT** computed in SQL. Joining through
+     `review_recommendations` would fan the run list out (≤50 recs/review → up to
+     50 duplicate run rows, breaking `ListRunsForUser`'s one-row-per-run
+     contract), and counting `todo` in SQL means re-implementing the ladder's
+     bottom rung (`disposition IS NULL AND filed_at IS NULL`) — which #94 Decision
+     2 categorically forbids (no SQL `CASE`, one Go `BucketOf`). Instead the
+     handler fetches the per-rec rows **for the runs on the page** and buckets them
+     with the shared `BucketOf`, attaching `judge_todo_count` per run in Go.
+   The row renders **one** compact badge, verdict-first with the count appended
+   only when `> 0` (`⚖ issues · 2`, `⚖ ideal`) — a single grammar, fixing the
+   mock's two-grammar bug, mirroring the RunHealth badge (#47). Click → the run's
    `JudgePanel` (unchanged). The global `TriageSummary` strip is **removed** from
-   `RunsList.tsx` (PRD #94 Decision 8's header render + its `getJudgeStats` call);
-   `GET /me/judge/stats` stays — the Judge page header and the nav badge now
-   consume it.
+   `RunsList.tsx` (PRD #94 Decision 8's header render + its `getJudgeStats` call) —
+   but that removal lands **with M3** (the Judge page header is its new home), so
+   the aggregate count is never homeless. `GET /me/judge/stats` stays.
 
 8. **The empty / inbox-zero state is a first-class view — because to-triage = 0
    is the goal.** When `triage.todo == 0`, the Judge page is not blank: it shows a
@@ -209,15 +269,17 @@ one action.
    MR/code-review connotations. The page subtitle ("Recommendations across all
    your runs") carries the backlog framing.
 
-10. **CLI parity — `uzi review backlog` + bulk verbs** (`api/cmd/uzi/review.go`,
-    the #94 group). `uzi review backlog [--bucket todo|filed|done|dismissed|all]
-    [--json]` prints the deduped groups (`category · target · seen in N runs ·
-    open N`) from the M1 endpoint; `uzi review file --category C --target T
-    [--single-issue]` and `uzi review resolve|dismiss --category C --target T
-    [--reason wont-do|not-an-issue]` drive the M2 bulk endpoints (group fan-out).
-    The existing per-run `uzi review show/resolve/dismiss/undo/stats` stay. The
-    web-only surfaces (nav badge, inbox grouping, per-row `/runs` badge)
-    have no CLI analogue and are called out as such.
+10. **CLI parity — `uzi review backlog` + bulk *disposition* verbs**
+    (`api/cmd/uzi/review.go`, the #94 group). `uzi review backlog [--bucket
+    todo|filed|done|dismissed|all] [--json]` prints the deduped groups (`category ·
+    target · seen in N runs · open N`) from the M1 endpoint; `uzi review
+    resolve|dismiss --category C --target T [--reason wont-do|not-an-issue]` drives
+    the M2 bulk **disposition** endpoint (group fan-out). **No `uzi review file`** —
+    filing stays browser-only (#68 Interactions kept it out of the CLI, and bulk
+    file-as-one-issue is a follow-up, Decision 3). The existing per-run `uzi review
+    show/resolve/dismiss/undo/stats` stay. The web-only surfaces (nav badge, inbox
+    grouping, per-row `/runs` badge) have no CLI analogue and are called out as
+    such.
 
 **Interactions (for completeness):** **Hosted workers / claim / agent code** are
 untouched — API + web + CLI + poller only. **Run deletion** cascades the review,
@@ -232,94 +294,119 @@ exactly as #68 already does.
 ## Milestones
 
 - [ ] **M1 — Grouped read model (api)**: `GET /api/me/judge/recommendations`
-      (`RequireUser`, owner-scoped, `?bucket=` filter) over #94's flat-join,
-      returning groups keyed `(category, target)` with the occurrence list,
-      `open_count`, `run_count`, and escaped `rationale_preview` (Decision 1). No
-      migration. Store/handler test: dedup groups the same `(category, target)`
-      across ≥2 runs into one group with a correct occurrence list; the bucketed
-      totals equal `GET /me/judge/stats` for the same fixture (shared `bucketOf`).
-- [ ] **M2 — Bulk mutation (api)**: `PUT .../recommendations/disposition` and
-      `POST .../recommendations/file` (Decision 3) — coordinate fan-out reusing
-      #94's idempotent disposition upsert and #68's claim-first file, `single_issue`
-      aggregation, `scope=open|all`. Owner-only authz matrix (owner fans out;
-      non-owner → 404; uza_ `admin_ro` → 404 on another user's rows, allowed on its
-      own; `IsAdmin` never consulted); idempotent double-call; a partial group
-      (some members already settled) files/dismisses only the open ones. Depends on
-      M1 (shared coordinate-resolve helper + DTO).
-- [ ] **M3 — Judge page + nav (web)**: route `/judge`; `<NavItem>` in the Factory
-      group with the `triage.todo` badge poll (Decisions 8/9); bucket tabs from
-      `triage`; the deduped worklist (group rows + "seen in N runs" + occurrence
-      expander + per-group primary **File issue** and overflow **Mark done /
-      Dismiss ▾**); the multi-select checkbox bar → bulk M2 calls with an undo
-      toast; the **inbox-zero** state (Decision 8). `mockApi.ts` + `data.ts` render
-      every state. A revised in-repo mock `prds/mockups/98-judge-menu-mock.html`
-      (by-target). Depends on M1 + M2. Parallel with M6/M7.
-- [ ] **M4 — `/runs` badge + strip removal (web + api)**: runs-list query gains
-      `judge_verdict` + `judge_todo_count` (Decision 7); `RunListItem` type + the
-      one-grammar per-row badge; **remove** the global `TriageSummary` strip and its
-      `getJudgeStats` call from `RunsList.tsx`. Independent of M1/M2 (own join, own
-      files) — starts immediately.
+      (`RequireUser`, owner-scoped, `?bucket=` filter + `?run=` anchor) — the new
+      **wider** query (the #94 join shape plus the `runs` join for `issue_title` and
+      the verdict/confidence/filed projection, Decision 1), returning groups keyed
+      `(category, target)` with the occurrence list, `open_count` (= `bucket==todo`),
+      `run_count`, and escaped `rationale_preview`. **Read is migration-free.**
+      Store/handler test: dedup groups the same `(category, target)` across ≥2 runs
+      into one group with a correct occurrence list; the bucketed totals equal `GET
+      /me/judge/stats` for the same fixture (shared `BucketOf`, no re-implementation).
+- [ ] **M2 — Bulk disposition (api)**: `PUT .../recommendations/disposition`
+      (Decision 3) — coordinate fan-out reusing #94's idempotent disposition upsert,
+      `scope=open|all` (`open` = `bucket==todo`). Owner-only authz matrix (owner fans
+      out; non-owner → 404; uza_ `admin_ro` → 404 on another user's rows, allowed on
+      its own; `IsAdmin` never consulted); idempotent double-call; a partial group
+      (some members already settled) dismisses/marks only the open ones. Depends on
+      M1 (shared coordinate-resolve helper + DTO). **Bulk filing is NOT here** — see
+      the follow-up note below.
+- [ ] **M3 — Judge page + nav (web)**: route `/judge` (with the `?run=` filter for
+      the notification deep-link); `<NavItem>` in the Factory group with the
+      `triage.todo` badge poll (Decisions 8/9); bucket tabs from `triage`; the
+      deduped worklist (group rows + "seen in N runs" + occurrence expander +
+      per-group overflow **Mark done / Dismiss ▾**, and **per-recommendation File
+      issue via the existing #68 browser draft** from the occurrence expander); the
+      multi-select checkbox bar → bulk **disposition** M2 calls with an undo toast;
+      the **inbox-zero** state (Decision 8). **Also removes the `TriageSummary` strip
+      from `RunsList.tsx`** (its aggregate moves to this page's header — Decision 7).
+      `mockApi.ts` + `data.ts` render every state. A revised in-repo mock
+      `prds/mockups/98-judge-menu-mock.html` (by-target). Depends on M1 + M2.
+- [ ] **M4 — `/runs` per-row badge (web + api)**: `judge_verdict` via the safe
+      single `run_reviews` join + `judge_todo_count` **bucketed in Go** (never a SQL
+      ladder; Decision 7); `RunListItem` type + the one-grammar per-row badge.
+      Independent of the endpoints (own join) — starts immediately. (The strip
+      *removal* is M3's, so the aggregate is never homeless.)
 - [ ] **M5 — Notification retarget + inbox grouping (web + api)**: `reviewDeepLink`
-      → `/judge?run=` and the inbox `judge_review` link → `/judge?run=` (Decision 4);
-      web inbox grouping of consecutive judge rows (Decision 5). **No Slack digest** —
-      Slack DMs keep their current one-per-review cadence, only the link changes.
-      Files: `judge_worker.go` (the link), `Notifications.tsx` (grouping) — parallel
-      from the start.
-- [ ] **M6 — Filed→Done sync (api/poller)**: on a linked filed issue closing,
-      upsert `done` on every linked coordinate with `set_via='issue_close'` (nullable
-      column, Decision 6); no auto-reopen; test that a close drops the rec from To
-      triage and (for `improve_uzi`) from the self-improve backlog, and that Undo
-      restores it. Builds on #68/#94 + the existing poll loop — parallel from the
-      start.
+      → `/judge?run=` (one-liner); the inbox link retarget as a
+      **`kind==='judge_review'` guard** (not a one-liner — `Notifications.tsx:59`
+      links `/runs/${run_id}` for any kind, Decision 4); web inbox grouping of
+      consecutive judge rows (Decision 5). **No Slack digest** — Slack DMs keep their
+      one-per-review cadence, only the link changes. **Depends on M3** (deep-links
+      `/judge` + its `?run=` filter) — Phase 3, not Phase 1.
+- [ ] **M6 — Filed→Done sync (api/poller) — the migration**: add `set_via` on
+      `recommendation_dispositions` + `close_synced_at` on
+      `recommendation_filed_issues` (draft number above the live head, renumber at
+      merge); the post-sync **edge** pass (cached `state=closed` AND `close_synced_at
+      IS NULL` → `INSERT … ON CONFLICT DO NOTHING` a `set_via='issue_close'`,
+      `set_by_user_id=NULL` done → stamp `close_synced_at`), Decision 6. Test: a
+      close drops the rec from To triage and (for `improve_uzi`) the self-improve
+      backlog; **Undo sticks** (next tick does not re-apply); a coordinate the user
+      **dismissed** is **not** overwritten; a reopen does not re-open. Builds on
+      #68/#94 + the existing poll loop — parallel from the start.
 - [ ] **M7 — CLI (`api/cmd/uzi/review.go`)**: `uzi review backlog` (grouped,
-      `--bucket`, `--json`) + `file`/`resolve`/`dismiss --category/--target`
-      (Decision 10); `commands_test.go` covers the grouped output, the bulk fan-out,
-      and a uza_ token refused on a bulk mutation. Depends on M1 + M2.
+      `--bucket`, `--json`) + `resolve`/`dismiss --category/--target` (Decision 10);
+      **no `file` verb** (filing stays browser-only). `commands_test.go` covers the
+      grouped output, the bulk disposition fan-out, and a uza_ token refused on a
+      bulk disposition mutation. Depends on M1 + M2.
 - [ ] **M8 — Tests + Docs**: e2e leg (dedup grouping; a group **Dismiss** fans out
-      across runs and drops an `improve_uzi` rec from the backlog; `single_issue`
-      file opens ONE issue linking all open members; issue-close → Done; the
-      notification deep-links to `/judge?run=`; **no token spend** on any triage);
-      vitest for the page/tabs/zero-state + the `/runs` badge; `docs/judge.md` (the
-      menu, dedup grain, group fan-out, inbox grouping, filed-sync) + `docs/cli.md`
-      (`review backlog` + bulk verbs); `specs/ai.md` records the decisions.
+      across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
+      Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
+      deep-links to `/judge?run=`; **no token spend** on any disposition); vitest for
+      the page/tabs/zero-state + the `/runs` badge; `docs/judge.md` (the menu, dedup
+      grain, group disposition fan-out, inbox grouping, filed-sync incl. its
+      PRD-label/enabled-repo preconditions) + `docs/cli.md` (`review backlog` +
+      disposition verbs); `specs/ai.md` records the decisions.
+
+**Follow-up (not in this PRD): bulk file-as-one-issue.** A `POST
+.../recommendations/file` that files one aggregated GitLab issue linking N members
+across a group (or several groups) needs its own decisions — per-item `repo_id`
+selection (+ caller-owns-repo), an aggregated **human draft** through #68's
+sanitizer, `forgeLimiter`, and a `RequireAuth`→`RequireUser` posture change (or a
+deliberate browser-only stance). Tracked separately; v1 files per-recommendation
+via the existing #68 flow.
 
 **Dependency graph** (house convention):
 
 | Phase | Milestones | Depends on | Touches |
 |---|---|---|---|
-| 1 (parallel) | **M1** grouped read · **M4** /runs badge+strip · **M5** notif retarget+inbox grouping · **M6** filed→Done | existing #46/#68/#94 | `judge_stats`-adjacent · `runs.go`+`RunsList.tsx` · `judge_worker`+`Notifications.tsx` · `poller`/`forgesvc` |
-| 2 | **M2** bulk mutation | M1 | new `handler/judge_bulk.go` + `handler.go` routes |
-| 3 (parallel) | **M3** Judge page+nav · **M7** CLI | M1 + M2 | `web/` · `api/cmd/uzi/` |
+| 1 (parallel) | **M1** grouped read · **M4** /runs badge · **M6** filed→Done (migration) | existing #46/#68/#94 | new judge-recs query/handler · `runs.go`+`RunListItem` · migration + `poller`/`forgesvc` |
+| 2 | **M2** bulk disposition | M1 | new `handler/judge_bulk.go` + `handler.go` route |
+| 3 (parallel) | **M3** Judge page+nav (+ strip removal) · **M5** notif retarget+inbox grouping · **M7** CLI | M1 + M2 (M5 needs M3's route) | `web/` · `judge_worker`+`Notifications.tsx` · `api/cmd/uzi/` |
 | 4 | **M8** tests + docs | all | e2e/vitest/docs |
 
-M4, M5, M6 are independent of the new API core (own joins/files) and run in
-parallel with M1 from day one; M2 gates only the two consumers (M3 web, M7 CLI)
-that mutate. Single repo, so no cross-repo phase.
+M4 and M6 are independent of the API core (own join / own poller pass) and run in
+parallel with M1 from day one; M2 gates the mutating consumers. **M5 moved to
+Phase 3** — it deep-links `/judge` and needs the `?run=` filter, both of which land
+in M3; shipping it in Phase 1 would point every judge notification at a 404. The
+`TriageSummary` **strip removal is folded into M3** (its aggregate's new home is the
+Judge page header). Single repo, so no cross-repo phase.
 
 ## Success Criteria
 
 - From the **Judge** menu a user sees every open recommendation **deduped by
   `(category, target)` across all their runs**, each with a "seen in N runs"
   count and an expander to the per-run occurrences.
-- **One group action settles every occurrence**: a group **Dismiss** / **Mark
-  done** dispositions all open members across runs; **File issue** opens one
-  GitLab issue that links all open members and (with multi-select) can merge
-  several groups into a single issue.
+- **One group *disposition* action settles every occurrence**: a group **Dismiss**
+  / **Mark done** dispositions all open (`bucket==todo`) members across runs, in
+  one call; **filing** is per-recommendation via the existing #68 browser draft
+  (bulk file-as-one-issue is a follow-up).
 - The **nav badge, the notification, and the page's To-triage tab show the same
-  number** (`triage.todo` via the shared `bucketOf`); "seen in N runs" never
+  number** (`triage.todo` via the shared `BucketOf`); "seen in N runs" never
   appears as a competing count.
 - The **judge notification is unchanged as an event** but deep-links to
   `/judge?run={id}` (web and Slack); the in-app inbox groups consecutive judge
   rows (Slack DMs keep their one-per-review cadence — no Slack digest).
 - The `/runs` list shows a **one-grammar per-row judge badge** (`⚖ verdict · N`)
   and **no longer** carries the global strip.
-- A **filed issue closing auto-moves its recommendation to Done** (dropping it
-  from To triage and, for `improve_uzi`, the self-improve backlog); a human Undo
-  restores it; a reopen does not.
-- `uzi review backlog` + the bulk verbs drive the **same state** as the web from a
-  uzc_ token; a uza_ read-only token can `backlog` but is refused (404) on a bulk
-  mutation.
-- **No Anthropic token is spent** by any triage/file/dispose action (proven by
+- A **filed issue closing auto-moves its recommendation to Done exactly once**
+  (edge-triggered), dropping it from To triage and, for `improve_uzi`, the
+  self-improve backlog; a human **Undo sticks** (the next poll tick does not
+  re-apply); a member the user **dismissed** is never overwritten; a reopen does
+  not re-open.
+- `uzi review backlog` + the disposition verbs drive the **same state** as the web
+  from a uzc_ token; a uza_ read-only token can `backlog` but is refused (404) on a
+  bulk disposition mutation.
+- **No Anthropic token is spent** by any disposition/backlog action (proven by
   the M8 e2e leg).
 
 ## Risks
@@ -339,9 +426,17 @@ that mutate. Single repo, so no cross-repo phase.
   dispositions; the group rollup is display-only and group actions default to
   `scope=open`, so nothing silently overwrites a member's prior decision. The
   occurrence expander is the per-run source of truth. Documented.
-- **Filed→Done provenance.** An auto-done (`set_via='issue_close'`) must be
-  visibly distinct from a hand-marked done so a user is not confused by a
-  disposition they did not set; the column + "done via #IID" label carry it.
+- **Filed→Done provenance + observability.** An auto-done (`set_via='issue_close'`,
+  `set_by_user_id=NULL`) must be visibly distinct from a hand-marked done; the
+  column + "done via #IID" label carry it. And because the sync reads the
+  **PRD-labeled, enabled-repo** issue cache, a filed issue that loses its label or
+  whose repo is disabled won't auto-Done — a documented silent no-op, not a bug
+  (Decision 6).
+- **Filed→Done correctness hinges on the edge marker.** Without `close_synced_at`
+  the level-triggered pass would re-apply after Undo and could overwrite a
+  `dismissed` verdict (fable's finding). The marker + `ON CONFLICT DO NOTHING`
+  make it fire once and never clobber a human verdict — but this is the subtle
+  part of M6 and must be the test that gates it.
 
 ## Resolved / Open Questions
 
@@ -358,10 +453,19 @@ that mutate. Single repo, so no cross-repo phase.
 - **The notification is kept, not removed** — the original "move notifications
   into the menu" idea is resolved as *retarget the ping's deep-link*, keeping the
   generic inbox and the "review landed" signal. [discussion-decided]
-- **v1 scope includes** bulk multi-select triage/file, **web-inbox grouping** of
-  judge rows, and Filed→Done issue sync. **No Slack digest** — judge Slack DMs stay
-  one-per-review. **Keyboard triage (j/k)** and a **target-file staleness marker**
-  (distinct from #94's rationale-hash stale flag) are **Future Work**.
-  [user-decided 2026-07-20]
-- **Bulk file default = one issue per group**; multi-select can merge selected
-  groups into a **single** issue (`single_issue=true`).
+- **v1 scope includes** bulk multi-select **disposition** (dismiss / mark-done),
+  **web-inbox grouping** of judge rows, and Filed→Done issue sync. **No Slack
+  digest** — judge Slack DMs stay one-per-review. **Keyboard triage (j/k)** and a
+  **target-file staleness marker** (distinct from #94's rationale-hash stale flag)
+  are **Future Work**. [user-decided 2026-07-20]
+- **OPEN — the one scope item to confirm: bulk "file N as one issue" is descoped to
+  a follow-up.** fable's PRD pass showed it is a mini-PRD, not a #68 reuse (repo
+  pick + aggregated human draft + `forgeLimiter` + a `RequireAuth`→`RequireUser`
+  posture change). **Recommendation:** ship v1 with bulk *disposition* + per-rec
+  browser filing (as written), and take bulk file-as-one-issue as a separate PRD.
+  If instead we want it in v1, M2/M3/M7 grow to carry all four of those, and the
+  CLI gains a `file` verb that breaks #68's browser-only stance. Confirm before
+  M2.
+- **This PRD ships exactly one migration** (Decision 6: `set_via` +
+  `close_synced_at`); everything else is a new query, new endpoints, and web. The
+  read model (M1) is migration-free.
