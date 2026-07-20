@@ -8,8 +8,11 @@
 
 -- name: UpsertRecommendationDisposition :one
 -- Idempotent upsert on the coordinate (Decision 6): set/switch status, set/clear the
--- dismiss reason, and RE-STAMP rationale_hash + updated_at at set-time (Decision 3, the
--- hash is what the stale flag compares against). Re-clicking is safe, last-writer-wins.
+-- dismiss reason, and RE-STAMP rationale_hash + set_at + updated_at at set-time (Decision 3,
+-- the hash is what the stale flag compares against). Re-clicking is safe, last-writer-wins.
+-- set_at is re-stamped on conflict too so the panel's "resolved Xago" reflects the LATEST
+-- disposition action (a done→dismissed switch or reason change reads as "just now", not the
+-- first-ever set); the row is a single triage verdict, not an append log.
 -- dismiss_reason and set_by_user_id are nullable (sqlc.narg) — a 'done' carries no reason
 -- and a SET-NULL'd setter leaves the row. The status/reason invariant is enforced by the
 -- table CHECK, not here.
@@ -23,6 +26,7 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         dismiss_reason = EXCLUDED.dismiss_reason,
         rationale_hash = EXCLUDED.rationale_hash,
         set_by_user_id = EXCLUDED.set_by_user_id,
+        set_at         = now(),
         updated_at     = now()
 RETURNING *;
 
