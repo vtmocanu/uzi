@@ -8760,3 +8760,221 @@ Serves human Feature #4 + Feature #64 (uzi CLI). PRD #90 M6, Decision Log
   cleaned up, but the memory persists) — the owner's ability to see and purge a
   bad-looking or planted entry is the backstop that bounds that residual, which is
   why v1 shipped it unconditionally rather than deferring to a later milestone.
+
+## 323. Crew roster is derived CLIENT-SIDE from the stream + `run.health` — no heartbeat re-plumbing
+
+Serves human Feature #95 (run activity pane v2, the "who's alive" glance). PRD #95
+Decision 1. Rebuilds PRD #38's feed (`web/src/components/ActivityFeed.tsx`), reuses
+PRD #47's health signal.
+
+- **Everything the roster shows is a pure function of data already on the wire.** The
+  pane already receives the full `RunMessage[]` (each carries `agent`, `created_at`,
+  `kind`, `seq`), the `Run` (with `status` + `health`/`health_reason`), and `connected`
+  — so the crew strip adds only a per-agent aggregate (last-activity time, count, last
+  kind) over the existing `groupByAgent` (keyed `m.agent ?? "lead"`) plus a state
+  function. No new backend, no per-agent heartbeat, no schema change.
+- **Liveness reuses `run.health`, NOT the worker's raw `last_heartbeat_at`.** PRD #47's
+  sweeper already derives `waiting_worker` (no live worker) / `stalled` (worker went
+  quiet) server-side and pushes it to this client over the `health` WS frame →
+  `refreshRun`. Surfacing `Worker.last_heartbeat_at` into the pane would duplicate a
+  derivation that already reaches the browser; the pane **maps** `run.health`, it does
+  not re-derive liveness. (Corrects the mock's earlier "surface `last_heartbeat_at`"
+  note.)
+- **Roster is a strip of chips, one per role, each with a state dot; clicking a chip
+  jumps to that agent.** Empty case (`groups.length === 0` — a `queued` run, or one that
+  failed before any agent spoke): a single muted "waiting for the first agent…"
+  placeholder, not zero chips. `empty` is a render branch, deliberately NOT a `CrewState`
+  member.
+
+## 324. The per-agent state ladder — the ACTIVE speaker trusts `run.health`; recency governs only the non-active split
+
+Serves human Feature #95 (Problem 2: a stalled agent must never read healthy).
+PRD #95 Decision 2, blocker fix B2. `crewStateFor` +
+`CrewState = working|stalled|waiting|idle|done` (`ActivityFeed.tsx`).
+
+- **The active speaker's `working` is driven by health, never by a client timer — this
+  is the load-bearing fix.** The original draft gated `working` on a 45s recency
+  (`STALE_MS`), but the server stall flag defaults to **300s** (`health_stall_seconds`,
+  §206), so during any quiet tool call between 45s and 300s (`go test`, a build — the
+  *common* busy case) the pulsing dot would have vanished exactly when the agent was
+  hardest at work. Corrected ladder precedence, evaluated top-down for a live run:
+  1. **terminal** run (`completed`/`failed`/`cancelled`) → every agent `done`.
+  2. `run.status === "awaiting_approval"` **or** `run.health === "waiting_worker"` →
+     every agent `waiting` (blocked on the human gate or on a worker; dominates the view).
+  3. **active speaker** (agent of the newest message): `stalled` if `run.health ∈
+     {stalled, slow, looping}`, else `working`. **Recency does not gate this.**
+  4. **non-active** agent: `now - lastActivity < STALE_MS` ⇒ `waiting` ("recently handed
+     off"), else `idle`.
+- **`looping` maps to amber `stalled`, not green `working`.** It is a PRD #47 *warn* flag
+  ("spinning without progress") and must read consistently with the `HealthFlag` warn
+  chip already rendered for the same run — `STALLED_HEALTH = {stalled, slow, looping}`.
+- **Honesty boundary.** `working`/`stalled`/gate-`waiting`/`done` are now exact (driven by
+  `status`/`health`). The only remaining approximation is the non-active `waiting`↔`idle`
+  split: without an SDK handoff/subagent-boundary event, "blocked on lead" vs "just quiet"
+  is inferred from recency, refreshed coarsely by the existing `useNow(30_000)` tick (up to
+  30s lag). Acceptable because both are non-active cosmetic states; a precise `handoff`
+  control message is the named future refinement. Because the active speaker no longer
+  depends on recency, the coarse tick never affects the `working` dot. The `working` dot's
+  pulse honors `prefers-reduced-motion` (neutralized in `index.css`).
+
+## 325. Collapse-by-default + opt-in Follow REPLACES the global auto-scroll — a per-agent scroll model with a finished-run escape hatch
+
+Serves human Feature #95 (Problem 1: no whole-pane yank on every frame) — a
+USER-AUTHORIZED behavior change to PRD #11/#38's always-tailing feed. PRD #95
+Decision 3, guards S5 + N4. `ActivityFeed.tsx` + `web/src/lib/useFollowScroll.ts`.
+
+- **The default inverts.** Previously `useFollowScroll(messages.length)` owned one scroll
+  container for the whole feed and hard-jumped it (`scrollTop = scrollHeight`) on every
+  per-frame `commit`, and `collapsed` started empty so every agent was expanded. v2: the
+  outer pane does **not** auto-scroll; each *expanded* agent body is its own bounded
+  (`max-height`) scroll region; a `Follow live` toggle (**default off**) tails only the
+  expanded agents. The whole-pane yank is gone. This is a genuine change to shipped
+  behavior, recorded as the explicit user request (see human.md, pending confirmation).
+- **Agents are accordions, closed by default, with a live in-place header.** Each header
+  carries a one-liner ("running `go test ./...`") that updates *in place* (no scroll) and a
+  `+N` unseen-message pill. The pill is a genuine **rewrite** (semantic: "unseen while
+  collapsed"), NOT a repurpose of the old hook's "unseen while scrolled up".
+- **Finished-run regression guard (S5).** Collapse-by-default would turn reading a
+  completed 8-agent run into 8 clicks, so on a **terminal** run (and on a **single-agent**
+  run) the accordion **auto-expands**, and an **Expand all / Collapse all** control is
+  always present.
+- **Kept untouched (N4 accuracy):** the cap-and-expand for very long runs is owned by
+  `ActivityFeed`'s own `showAll` state + array slice (`CAP_TRIGGER`/`CAP_VISIBLE`), NOT by
+  the follow-scroll hook — it is independent and unchanged. Also preserved: the per-tool
+  expanders + Bash clamp (`RunEvent.tsx`), `role="log"` a11y wiring, and the
+  `prefers-reduced-motion` pulse/spin neutralization.
+
+## 326. The steer queue is a DTO over `run_user_inputs`, NOT a `run_message` — sidestepping the gapless-`seq` race
+
+Serves human Feature #95 (Problem 3: follow-ups need a visible queue). PRD #95
+Decision 4, query design S4. `ListFollowUpInputsForRun` (`store/queries/runtime.sql`)
++ `SteerInputDTO` (`apitypes/run.go`).
+
+- **"Just echo the follow-up into the feed" is a trap and is rejected.** `run_messages`
+  carries a **gapless per-run `seq`** with `ON CONFLICT (run_id, seq) DO NOTHING`, and the
+  **worker is the sole seq allocator** (`agent/src/batcher.ts` seeds `seq = lastSeq` once at
+  claim and increments locally without re-reading the DB). An API-injected `user_message` at
+  a server-chosen `last_seq+1` would collide with a seq the worker has assigned locally but
+  not yet flushed, and `ON CONFLICT DO NOTHING` would **silently drop the worker's message**,
+  corrupting the invariant the live stream rests on. A server-owned seq allocator is a
+  cross-cutting rewrite of the batcher/resume/idempotency contract — correctly out of scope.
+- **So the follow-up is a DTO, not a message.** The queue is read from the existing table
+  via a **new `follow_up`-scoped, newest-first, UNCAPPED query** (`ListFollowUpInputsForRun`:
+  `WHERE kind='follow_up' ORDER BY id DESC`) — deliberately NOT the judge's
+  `ListRunInputsForRun` (`ORDER BY id ASC LIMIT @lim`, oldest-first, capped, all kinds),
+  which would drop the *newest* follow-ups behind its cap on a busy or chat run.
+- **Delivery status is `consumed_at`, no new column, no migration:** NULL → Queued, set →
+  Delivered. `SteerInputDTO {id, body, created_at, consumed_at}` is a DISTINCT struct from
+  the worker-facing `workersvc.InputDTO` (which has no `consumed_at`). Same architectural
+  move as the health frame: a fact that lives authoritatively in a table, surfaced by
+  re-read rather than pushed as stream payload.
+
+## 327. Delivery goes live via a data-less `input` WS frame — but REST refetch is the SOURCE OF TRUTH so a dropped frame self-heals
+
+Serves human Feature #95 (a follow-up flips Queued→Delivered without a reload).
+PRD #95 Decision 5, back-pressure fix S1. `Hub.PublishInput` (`hub/hub.go`),
+`Broadcaster` interface + `refreshInputs` (`web/src/lib/useRunStream.ts`).
+
+- **`consumed_at` is committed before the broadcast fires.** It is stamped inside
+  `ConsumeInputs` in a single autocommit statement, so after a consume that included ≥1
+  `follow_up` the service calls `Broadcaster.PublishInput(runID)`, which broadcasts
+  `Event{Type: "input"}` carrying **no data**; the browser re-reads `GET /runs/{id}/inputs`
+  — exactly how `health`/`state` frames work.
+- **The frame is a FAST PATH, not the sole mechanism (S1).** The hub silently drops frames
+  for slow subscribers, and unlike `message` (self-heals via seq gaps) or `health`
+  (continuously re-fired by the ongoing stream), the `input` frame would be the *only*
+  trigger for an inputs refetch — a single drop would strand the queue at "Queued" for an
+  already-delivered input until reload. So `useRunStream.refreshInputs()` runs on **mount**,
+  on **`ws.onopen` / reconnect** (alongside the message `replay()`), on any `state`/`health`-
+  driven `refreshRun`, AND on the `input` frame — true parity with `health`. The M5 e2e's
+  simulated-dropped-frame leg is the guard.
+- **Backend surface is an interface change, not one call site.** `PublishInput` is added to:
+  the `Broadcaster` interface; `MultiBroadcaster`'s fan-out; the hub impl (data-less frame,
+  alongside `PublishHealth`); a **no-op** on the Slack `Notifier` (steer text never goes to
+  Slack — same content-minimization as `PublishMessage`'s no-op); and the `fakeBroadcaster`
+  test double. The `ConsumeInputs` call site is guarded `if consumedFollowUp && s.bcast !=
+  nil` (it never broadcast before, so an unset broadcaster in some tests would otherwise
+  panic). The `Event` struct already marshals a bare `{"type":"input"}`.
+
+## 328. "Delivered" = handed to the worker, not acted-upon; five client-derived states; the queue survives the terminal unmount
+
+Serves human Feature #95 (an honest, persistent delivery signal). PRD #95 Decisions
+6 + 7, blocker B1, gate case S3. `SteerQueueCard.tsx` (`deliveryFor`) + inputs state
+lifted into `useRunStream`.
+
+- **Delivery marks the input consumed with no separate ack — v2 makes the existing
+  contract VISIBLE, it does not change it.** `Delivered = handed to the worker for its next
+  turn`; whether it was *acted upon* shows in the agent's subsequent messages, and an
+  un-acted input surfaces via the run's `health` (`stalled`) so the user re-sends. **Two
+  documented consumed-but-dropped cases** (in Risks, not fixed here): a worker crash right
+  after the GET, and a follow-up consumed at a plan gate that is then **rejected** (buffered
+  worker-side, never acted on).
+- **The chip is derived client-side from `(consumed_at, run.status)` — five states:**
+  - NULL + non-terminal (incl. `awaiting_approval`) → **Queued**
+  - set + `awaiting_approval` → **Delivered — applies after approval** (S3): a follow-up
+    submitted during a gate **is** consumed immediately (`steering.start()` runs the poll
+    loop through the gate, routing `follow_up` to a buffer), so `consumed_at` is stamped and
+    the `input` frame fires while the run is visibly blocked on the human's own approval. A
+    bare "Delivered" there would mislead; the qualified copy is honest. Degrades to plain
+    "Delivered" if the run status is unavailable.
+  - set + running/terminal → **Delivered**
+  - NULL + terminal → **Not delivered — run finished**
+- **Blocker fix B1 — the queue is hoisted into its own card, lifted into `useRunStream`.**
+  "Not delivered — run finished" is *unreachable* if the queue lives inside
+  `FollowUpComposer`, because that component is mounted only when `!terminal` — it would
+  unmount the instant the run completes. So the queue is its own card, rendered (read-only,
+  no textarea) for terminal runs too, and its `inputs` state lives in `useRunStream` (which
+  persists across the terminal transition). The composer keeps only the textarea + send.
+
+## 329. `GET /runs/{id}/inputs` is `RequireUser`, owner-only — a non-owner (incl. `admin_ro`) 404s, and the client hides the surface
+
+Serves human Feature #95 + the read-only-admin ceiling (Feature #64). PRD #95
+Decision 8, richer write S2, degradation N2. `ListRunInputs` (`handler/workers.go`)
++ `canSteer` (`useRunStream.ts`).
+
+- **The read matches the write's authz exactly.** The follow-up **write** (`CreateRunInput`
+  via `SubmitInput(user.ID, …)`) is `RequireUser` + owner-only; the **read** is `RequireUser`,
+  run resolved owner-scoped via `GetRunByIDForUser` (owner or 404), `kind='follow_up'` only.
+  `RequireUser` (not cookie-only `RequireAuth`) is what lets `uzi run inputs` read it from a
+  CLI token. **Owner-only, NOT owner-or-admin** — a `uza_` `admin_ro` token keeps `IsAdmin`,
+  so an owner-or-admin read would leak another user's steer text; since follow-ups are never
+  in `run_messages`, restricting the read genuinely closes a leak.
+- **Graceful degradation for a non-owner viewer (N2).** The run *view* is owner-or-admin, so
+  a non-owner admin can open another user's run and its feed, but `GET /inputs` 404s for them
+  (and `SubmitInput` would too). The client treats a 404 as "no queue to show": `canSteer`
+  (default `true`, flipped `false` on a 404) hides the queue card + composer **silently** —
+  never an error banner, never a broken Send.
+- **Richer write for optimistic reconcile (S2).** `RunInputResponse` gains `id` + `created_at`
+  (`omitempty`, present ONLY on a `follow_up` write), so the web's optimistic queue entry
+  adopts the real row id + timestamp instead of guessing; omitted for approve/cancel/reject,
+  which surface no queue row.
+
+## 330. Frontend-only pane + M1 seam + CLI parity `uzi run inputs` — no migration
+
+Serves human Feature #95 (parallelizable milestones) + the "new API ⇒ check the CLI"
+rule (Feature #64). PRD #95 Decisions 9 + 10, chat caveat N3.
+
+- **The pane redesign is FRONTEND-ONLY; delivery is the only backend touch.** Problems 1
+  (scroll) and 2 (crew) consume data already on the wire (§323). The delivery feature's
+  entire server surface is one owner-scoped read endpoint, one `Broadcaster.PublishInput`
+  fan-out, and returning the created row from the existing write — **no schema change, no
+  goose migration**, so none of the migration-numbering ceremony applies.
+- **M1 pre-lands the shared `RunView` seam so M2/M3 are genuinely file-disjoint.** Both the
+  crew work and the delivery work would otherwise edit `RunView.tsx` (the `ActivityFeed`
+  mount needs the `run` object for `health`/`status`; the composer mount needs reworking).
+  M1 passes the `run` object into `ActivityFeed`, extracts `FollowUpComposer` to its own
+  file, and hoists the queue into its own card lifted to `useRunStream` (§328 B1). After the
+  seam, M2 (crew/scroll: `ActivityFeed.tsx` + the follow-scroll hook) and M3 (delivery:
+  hub/workersvc/`ConsumeInputs` + the queue card + `useRunStream`) touch disjoint files.
+- **CLI parity: `uzi run inputs <run-id>`** (`api/cmd/uzi/run.go` → `RunInputs` client →
+  `GET /runs/{id}/inputs`) prints each follow-up with its delivery state (`queued`/
+  `delivered`) + relative age, `--json` for the raw DTO. Owner-scoped, so a `uzc_` or
+  read-only `uza_` token reads its own and 404s on another owner's.
+- **Chat caveat (N3).** A chat run seeds every turn as a `follow_up` row (`CreateChatRun`/
+  `SubmitChatMessage`), so `uzi run inputs <chat-run-id>` lists the seeded prompt + all chat
+  turns; the command's help notes this (chat has its own web composer, unaffected). An
+  **issue** run's queue starts genuinely empty — its prompt rides the claim payload's
+  `issue_description`, not an input row. The web steer queue is scoped to issue/CI-fix runs;
+  `approve_plan`/`cancel`/`reject_plan` share the table but own dedicated UI, so the queue
+  renders **only `kind='follow_up'`**. Slack steering benefits for free (same rows, now
+  visible in the web queue).
