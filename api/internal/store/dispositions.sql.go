@@ -136,6 +136,13 @@ ON CONFLICT (review_id, category, target) DO UPDATE
         dismiss_reason = EXCLUDED.dismiss_reason,
         rationale_hash = EXCLUDED.rationale_hash,
         set_by_user_id = EXCLUDED.set_by_user_id,
+        -- set_via is CLEARED, not carried over (PRD #98 M6). This path is a HUMAN write,
+        -- so the row's provenance becomes "a person set this". Without the reset, a
+        -- coordinate previously auto-resolved by the Filed→Done sync would keep
+        -- set_via='issue_close' after the user overrode it, and the panel would label
+        -- their own verdict "done via #IID". EXCLUDED.set_via is NULL here because the
+        -- INSERT column list above omits set_via, so it takes the column default.
+        set_via        = EXCLUDED.set_via,
         set_at         = now(),
         updated_at     = now()
 RETURNING id, review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id, set_at, updated_at, set_via

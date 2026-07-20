@@ -62,8 +62,8 @@ var (
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
-	ErrInvalidState        = errors.New("invalid run state")
-	ErrInvalidMessage      = errors.New("invalid run message")
+	ErrInvalidState     = errors.New("invalid run state")
+	ErrInvalidMessage   = errors.New("invalid run message")
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
@@ -155,6 +155,9 @@ type Store interface {
 	// boundary of the fan-out — the disposition is written off the rows it returns, never
 	// off the request body.
 	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
+	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
+	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).
+	UpsertDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
@@ -265,14 +268,14 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout           time.Duration
-	RunIdleTimeout       time.Duration
-	RunMaxIterations     int
+	RunTimeout       time.Duration
+	RunIdleTimeout   time.Duration
+	RunMaxIterations int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
-	PlanMaxRevisions int
-	RunMaxRequeues   int
+	PlanMaxRevisions     int
+	RunMaxRequeues       int
 	WorkerHeartbeatStale time.Duration
 	WorkerAffinityGrace  time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a

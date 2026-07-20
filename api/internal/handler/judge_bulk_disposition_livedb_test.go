@@ -317,6 +317,62 @@ func TestBulkDispositionIdempotentLiveDB(t *testing.T) {
 	}
 }
 
+// ---- 4b. a human write clears the sync's provenance -----------------------------------
+
+// TestBulkDispositionClearsIssueCloseProvenanceLiveDB covers an interaction M6 introduced
+// and #94's upsert did not anticipate: once `set_via` exists, a DO UPDATE that does not
+// touch it CARRIES IT OVER. So a coordinate auto-resolved by the Filed→Done sync
+// (set_via='issue_close') would keep that provenance after a human overrode it, and the
+// panel would label the user's own verdict "done via #IID" — attributing their decision to
+// the system.
+//
+// Both human write paths (this bulk one and #94's single-coordinate route) now reset
+// set_via, so a person's verdict always reads as a person's.
+func TestBulkDispositionClearsIssueCloseProvenanceLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	rg := [2]string{"install_worker_tool", "rg"}
+	userID := bulkFixture(ctx, t, pool, 1, rg)
+	user := store.User{ID: userID}
+
+	// Model what the M6 sync writes: a system 'done' with issue_close provenance.
+	var reviewID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM run_reviews WHERE user_id = $1`, userID).Scan(&reviewID); err != nil {
+		t.Fatalf("pick review: %v", err)
+	}
+	mustExecT(ctx, t, pool,
+		`INSERT INTO recommendation_dispositions
+		     (review_id, category, target, status, rationale_hash, set_by_user_id, set_via)
+		 VALUES ($1, 'install_worker_tool', 'rg', 'done', 'h', NULL, 'issue_close')`, reviewID)
+
+	// The user disagrees and dismisses it. scope=all, since the member is already settled.
+	if _, got := doBulk(t, h, user,
+		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"dismissed",`+
+			`"reason":"not_an_issue","scope":"all"}`); got.Updated != 1 {
+		t.Fatalf("the human override did not land: updated=%d", got.Updated)
+	}
+
+	var status string
+	var setVia *string
+	var setBy *uuid.UUID
+	if err := pool.QueryRow(ctx,
+		`SELECT status, set_via, set_by_user_id FROM recommendation_dispositions
+		  WHERE review_id = $1 AND category = 'install_worker_tool' AND target = 'rg'`,
+		reviewID).Scan(&status, &setVia, &setBy); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "dismissed" {
+		t.Fatalf("status = %q, want dismissed", status)
+	}
+	if setVia != nil {
+		t.Fatalf("set_via = %q, want NULL — a human write must clear the sync's provenance, "+
+			"or the panel labels the user's own verdict \"done via #IID\"", *setVia)
+	}
+	if setBy == nil || *setBy != userID {
+		t.Fatalf("set_by_user_id = %v, want the user who made the call", setBy)
+	}
+}
+
 // ---- 5. the body never becomes a coordinate ------------------------------------------
 
 // TestBulkDispositionRejectsBodyCoordinateLiveDB is the live-DB proof of the invariant

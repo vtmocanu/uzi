@@ -98,15 +98,27 @@ type coord struct {
 //
 // Note what the cap does NOT bound. It applies BEFORE grouping, so a surviving group can
 // lose occurrences and under-report RunCount/OpenCount — and can therefore roll up to the
-// wrong bucket (see JudgeBacklogDTO.Truncated for the consequence). And it bounds the
-// CLIENT side of the read only: the ORDER BY spans run_reviews and review_recommendations,
-// so no index supplies that ordering and Postgres still materializes the caller's full
-// join result and top-N sorts it before LIMIT applies. It is bounded to the caller's own
-// rows by idx_run_reviews_user, never a full-table scan, but "bounded pull" means the wire
-// and this process, not the server's work. (Structural argument from the query text and
-// the index list; not measured with EXPLAIN.) The companion stats read is not capped at
-// all — 3 narrow columns, and it is the same unbounded query /me/judge/stats already
-// serves on this mount — so a request is half-capped, not capped.
+// wrong bucket (see JudgeBacklogDTO.Truncated for the consequence).
+//
+// And it bounds the WIRE and this process, not the server's work. MEASURED with
+// EXPLAIN (ANALYZE, BUFFERS) against a seeded 145k-recommendation database (PRD #98 review,
+// 2026-07-20), not inferred:
+//
+//   - the plan is Limit → Sort (rv.updated_at DESC, …) → Hash Left Join, so the top-N sort
+//     sits ABOVE the entire join and the cap cannot prune it;
+//   - run_reviews is index-bounded to the caller (Bitmap Index Scan on idx_run_reviews_user);
+//   - but review_recommendations and runs are BOTH read by Seq Scan in full — 145,222 and
+//     7,278 rows respectively, to return 1,200. idx_review_recommendations_review exists;
+//     the planner prefers hash joins and does not use it. Same plan shape at 24k and 145k,
+//     so this is not a small-data artifact.
+//
+// So the server-side cost tracks the TOTAL size of review_recommendations/runs across all
+// tenants, not the caller's backlog. This is inherited from #94's join spine — GET
+// /me/judge/stats shows the identical seq scan — and is explicitly NOT addressed in this
+// PRD; an index would be a #94-scoped change needing its own measurement. What #98 adds is
+// that a backlog request runs TWO such reads (this one plus the stats query, which has no
+// LIMIT at all, so a request is half-capped rather than capped) and that the nav badge
+// polls one of them.
 const JudgeBacklogMaxRows = 2000
 
 // JudgeRecommendationBacklog is the Judge menu's grouped read (PRD #98 M1, Decision 1):

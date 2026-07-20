@@ -246,7 +246,19 @@ one action.
      round-trip amplification and the partial-failure window in a single move while
      keeping the resolved-not-body invariant intact — and it supersedes the
      "fail-fast, partial apply surfaces as a 500" note above, since one statement
-     cannot partially apply.
+     cannot partially apply. **That collapse REQUIRES a `DISTINCT` on the
+     coordinate** (verified against live Postgres, 2026-07-20, before the code was
+     written): `review_recommendations` has **no unique constraint on `(review_id,
+     category, target)`** — only `pkey(id)`, the partial `improve_uzi` index, and
+     `idx(review_id)` — because a judge may legitimately emit the same coordinate
+     twice in one review. So the resolve can return that coordinate twice, and a
+     multi-row upsert over it raises `ON CONFLICT DO UPDATE command cannot affect
+     row a second time` (SQLSTATE 21000) at runtime: rare, data-dependent, and
+     invisible to any fake. `dedupeCoords` does **not** cover this — it dedupes the
+     *request* coordinates, while the duplication arises inside the *resolved member
+     set*. The per-member loop was immune only because each upsert was its own
+     statement, which is a reason nobody had written down until changing the shape
+     removed it.
    - **Why "write the resolved row, never the body" is defence-in-depth rather than
      the mechanism** (recorded so a future refactor does not undo it): the resolve
      matches by *equality* (`want.category = rr.category AND want.target =
@@ -315,7 +327,32 @@ one action.
      set).
    - **Provenance + ownership:** the row carries `set_via='issue_close'` (a nullable
      column on `recommendation_dispositions`, default `NULL`) so the UI labels
-     "done via #IID"; `set_by_user_id = NULL` marks the system action. The
+     "done via #IID"; `set_by_user_id = NULL` marks the system action.
+     **A human write MUST clear `set_via` back to `NULL`** (found in the M6 review,
+     2026-07-20, and measured against live Postgres). The tests covered
+     dismiss-then-close; the **reverse order was wrong**. #94's
+     `UpsertRecommendationDisposition` DO-UPDATE sets status, reason, hash,
+     `set_by_user_id`, `set_at` and `updated_at` but **never touches `set_via`** —
+     the column did not exist when that query was written. So a human overriding an
+     auto-done leaves a row claiming `set_by_user_id = <the human>` **and**
+     `set_via = 'issue_close'` simultaneously, and the UI would render that human's
+     `dismissed` verdict with system provenance — destroying exactly the
+     auto-vs-human distinction this decision exists to preserve. It is the precise
+     mirror of PF-4: that stops a system action being attributed to a human, this
+     attributes a human action to the system. **Fix: `set_via = NULL` in that
+     DO-UPDATE**, plus a live-DB test for the auto-done→human-override ordering
+     beside the existing reverse-order one. **This must land before M3 renders the
+     label**; M6 created the interaction by adding the column, so M6 owns it.
+     *(Both validators found this independently and proposed different one-liners:
+     `set_via = NULL` versus `set_via = EXCLUDED.set_via`. They are equivalent
+     today only because the INSERT column list omits `set_via`, so `EXCLUDED` is
+     NULL. `NULL` is chosen deliberately: it states the invariant — a human write
+     always means human provenance — instead of depending on a column list
+     elsewhere in the same statement staying as it is. If someone later adds
+     `set_via` to that INSERT list, the `EXCLUDED` form would silently start
+     carrying system provenance through a human write, with no edit to the line
+     that guarantees it. That is exactly the class of latent breakage this PRD has
+     been finding all run.)* The
      disposition lands on the **review owner's** coordinate regardless of who
      filed — **filed issues are NOT owner-scoped** (#68 Decision 8 keeps admin
      filing on another user's review; `filed_by_user_id` may be an admin).
@@ -463,7 +500,9 @@ exactly as #68 already does.
       consecutive judge rows (Decision 5). **No Slack digest** — Slack DMs keep their
       one-per-review cadence, only the link changes. **Depends on M3** (deep-links
       `/judge` + its `?run=` filter) — Phase 3, not Phase 1.
-- [ ] **M6 — Filed→Done sync (api/poller) — the migration**: add `set_via` on
+- [x] **M6 — Filed→Done sync (api/poller) — the migration** — DONE `d6a8545c`
+      (migration `00075`, draft number — renumber on the landing rebase); review wave
+      dispatched.: add `set_via` on
       `recommendation_dispositions` + `close_synced_at` on
       `recommendation_filed_issues` (draft number above the live head, renumber at
       merge); the post-sync **edge** pass (cached `state=closed` AND `close_synced_at

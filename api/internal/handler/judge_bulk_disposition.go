@@ -75,6 +75,14 @@ func (h *Handler) BulkSetDispositions(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "too many items")
 			return
 		}
+		// Unreachable while the scope check above stands — the service refuses an unknown
+		// scope rather than defaulting to the destructive `all`, and this maps that refusal
+		// to the same 400 the handler would have produced. Two layers, neither load-bearing
+		// alone.
+		if errors.Is(err, workersvc.ErrInvalidScope) {
+			httpx.Error(w, http.StatusBadRequest, "invalid scope")
+			return
+		}
 		slog.Error("bulk set dispositions", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return

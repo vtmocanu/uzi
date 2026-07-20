@@ -22,15 +22,38 @@ const JudgeDispositionMaxItems = 100
 // The handler maps it to 400. Distinct from a resolve miss, which is not an error at all.
 var ErrTooManyItems = errors.New("too many items")
 
-// judgeDispositionScopes is the scope enum: "open" (the default) touches only members the
-// shared ladder buckets as todo — a FILED member is left filed (PRD #98 Decision 2's
-// definition of open) — while "all" re-asserts across every member of the coordinate.
+// ErrInvalidScope — the scope was not one of the accepted values. The handler validates
+// scope before calling, so reaching this means a caller bypassed that gate; the service
+// refuses rather than falling through to the destructive ScopeAll semantics.
+var ErrInvalidScope = errors.New("invalid scope")
+
+// Scope values. Kept as named constants so the service's own switch and the validator
+// cannot drift apart.
+const (
+	// ScopeOpen touches only members the shared ladder buckets as todo — a FILED member is
+	// left filed (PRD #98 Decision 2's definition of open).
+	ScopeOpen = "open"
+	// ScopeAll re-asserts across every member of the coordinate, INCLUDING ones that
+	// already carry a settled verdict.
+	ScopeAll = "all"
+)
+
+// judgeDispositionScopes backs ValidJudgeDispositionScope.
 //
 // Unexported for the same reason as judgeBacklogBuckets: an exported package-level map is
 // mutable from anywhere in the binary, so a validator built on one can be widened out of
 // sight of the handler that relies on it. Here that would be a security-relevant widening,
 // since the scope is what keeps a settled member's verdict from being overwritten.
-var judgeDispositionScopes = map[string]bool{"open": true, "all": true}
+//
+// Note the asymmetry with `bucket`, which fails CLOSED downstream (an unknown bucket
+// matches no group in filterGroups). Scope has no such natural safe default: the service
+// selects members, so anything that is not recognised as `open` would historically have
+// fallen through to `all` semantics — i.e. an unknown scope would RE-ASSERT over settled
+// verdicts, the most destructive of the two. BulkSetDispositions now rejects an
+// unrecognised scope outright rather than defaulting, so the handler's validation is no
+// longer the only thing standing between a typo and an overwrite; this comment stays to
+// explain why BOTH layers exist.
+var judgeDispositionScopes = map[string]bool{ScopeOpen: true, ScopeAll: true}
 
 // ValidJudgeDispositionScope reports whether s is an accepted scope. Anything else is a
 // 400 — never a silent fallback to a scope the caller did not ask for.
@@ -64,24 +87,26 @@ type JudgeDispositionCoord struct {
 // arrives from a body, so echoing it back into the upsert would let a uzc_ token write
 // arbitrary text into a table with no CHECK to catch it.
 //
-// Each write is #94's own idempotent coordinate upsert with the rationale_hash re-stamped
-// from the CURRENT rationale (its Decisions 3/6), so a double-click converges rather than
-// duplicating.
-//
-// PARTIAL-FAILURE CONTRACT. The N upserts are NOT wrapped in a transaction, deliberately:
-// each is a local, side-effect-free, last-writer-wins upsert (there is no forge write and
-// no token spend to make exactly-once), so a partial apply is safely retried and converges.
-// On the first upsert error this returns the ZERO DTO and the error, which the handler maps
-// to a 500 — it does NOT report how many writes landed. So if upsert 2 of 3 fails, one
-// disposition is already committed and the client is told only "internal error".
-//
-// That is the intended behavior, not an oversight: a 500 makes no false claim of success,
-// the landed subset is visible on the very next read, and a retry converges because every
-// write is idempotent. The requirement is that the endpoint must never CLAIM completeness
-// it does not have, and returning nothing satisfies it. A partial-success report (207, or
-// 200 with a `partial` flag) is a deliberate non-goal for v1 — revisit `updated` and the
-// re-read together if that ever changes.
+// The write is ONE multi-row statement, not a loop. The item cap bounds COORDINATES, but a
+// single coordinate matches every occurrence across all the caller's reviews and the
+// resolve has no LIMIT — so a loop turned ≤100 coordinates into an unbounded number of
+// sequential round-trips. One statement also means the write cannot half-apply: it either
+// commits every member or none, so there is no partial state for the response to
+// misrepresent. On error this returns the zero DTO and the error (the handler answers 500),
+// and NOTHING was written. The rationale_hash is re-stamped from each member's CURRENT
+// rationale (#94 Decision 3) and the upsert keeps #94's last-writer-wins semantics, so a
+// double-click converges rather than duplicating.
 func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID, items []JudgeDispositionCoord, status, reason, scope string) (apitypes.JudgeDispositionResultDTO, error) {
+	// Fail CLOSED on an unrecognised scope. The handler validates this too, but scope is
+	// what protects a settled member's verdict from being re-asserted, and a plain
+	// `scope == ScopeOpen` comparison would silently treat anything unknown as ScopeAll —
+	// the destructive rung. Neither layer may be the only one holding (see
+	// judgeDispositionScopes).
+	switch scope {
+	case ScopeOpen, ScopeAll:
+	default:
+		return apitypes.JudgeDispositionResultDTO{}, ErrInvalidScope
+	}
 	coords := dedupeCoords(items)
 	if len(coords) > JudgeDispositionMaxItems {
 		return apitypes.JudgeDispositionResultDTO{}, ErrTooManyItems
@@ -102,27 +127,46 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 		return apitypes.JudgeDispositionResultDTO{}, err
 	}
 
-	updated := 0
+	// Select the members to write, then send them as four ordinal-aligned arrays. Every
+	// value here comes off the RESOLVED row — never the request body — which is what keeps
+	// the 00071/00073 no-category-CHECK invariant true (see the query's comment for what
+	// actually enforces it).
+	// Fresh slices, deliberately not reusing the request-side ones above: those hold the
+	// CALLER's spellings, and quietly recycling their backing arrays here is exactly the
+	// kind of aliasing that turns "we only write resolved values" into a lie after a later
+	// edit.
+	reviewIDs := make([]uuid.UUID, 0, len(members))
+	writeCategories := make([]string, 0, len(members))
+	writeTargets := make([]string, 0, len(members))
+	hashes := make([]string, 0, len(members))
 	for _, rec := range members {
 		// scope=open skips anything the SHARED ladder does not call todo, so a filed or
-		// already-settled member keeps its state unless the caller asked for `all`.
-		if scope == "open" && BucketOf(rec.DispositionStatus.String, rec.FiledSettled) != "todo" {
+		// already-settled member keeps its state unless the caller asked for ScopeAll.
+		if scope == ScopeOpen && BucketOf(rec.DispositionStatus.String, rec.FiledSettled) != "todo" {
 			continue
 		}
-		_, err := s.q.UpsertRecommendationDisposition(ctx, store.UpsertRecommendationDispositionParams{
-			ReviewID: rec.ReviewID,
-			Category: rec.Category, // the RESOLVED row's, never the request body's
-			Target:   rec.Target,   // likewise
-			Status:   status,
+		reviewIDs = append(reviewIDs, rec.ReviewID)
+		writeCategories = append(writeCategories, rec.Category)
+		writeTargets = append(writeTargets, rec.Target)
+		hashes = append(hashes, RationaleHash(rec.RationaleMd))
+	}
+
+	updated := int64(0)
+	if len(reviewIDs) > 0 {
+		n, err := s.q.UpsertDispositionsForResolvedCoords(ctx, store.UpsertDispositionsForResolvedCoordsParams{
+			Status: status,
 			// "" → NULL: a 'done' carries no reason (the table CHECK is the backstop).
-			DismissReason: pgText(reason),
-			RationaleHash: RationaleHash(rec.RationaleMd),
-			SetByUserID:   pgUUID(ownerUserID),
+			DismissReason:   pgText(reason),
+			SetByUserID:     pgUUID(ownerUserID),
+			ReviewIds:       reviewIDs,
+			Categories:      writeCategories,
+			Targets:         writeTargets,
+			RationaleHashes: hashes,
 		})
 		if err != nil {
 			return apitypes.JudgeDispositionResultDTO{}, err
 		}
-		updated++
+		updated = n
 	}
 
 	// Re-read through the M1 grouped model so the response's groups and triage are the
@@ -134,7 +178,7 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 		return apitypes.JudgeDispositionResultDTO{}, err
 	}
 	return apitypes.JudgeDispositionResultDTO{
-		Updated: updated,
+		Updated: int(updated),
 		Groups:  groupsForCoords(backlog.Groups, coords),
 		// Carried through: past the cap, a settled coordinate can fall outside the read
 		// window and have no group here. The flag is how a consumer tells that from

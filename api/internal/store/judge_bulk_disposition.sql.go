@@ -76,13 +76,20 @@ type ListOwnedRecommendationsForCoordsRow struct {
 //     request body — it reads it off the resolved recommendation", so a bogus or oversized
 //     body coordinate must match nothing rather than reach the coordinate columns.
 //
-//     Credit where it is due: the guarantee comes from the `JOIN want ON want.category =
-//     rr.category AND want.target = rr.target`, NOT from the SELECT list naming rr.*. The
-//     join equates the two sides, so selecting want.category instead would be behaviourally
-//     identical (verified by mutation, PRD #98 M2 review). The SELECT list is written off
-//     `rr` because that is the honest source and it keeps the Go caller obviously correct —
-//     but do not mistake it for the enforcement, and do not "simplify" the JOIN on the
-//     theory that the SELECT list is what protects this.
+//     Be precise about WHAT enforces that, because the obvious answer is wrong. The
+//     mechanism is this JOIN plus the owner predicate: together they yield ZERO ROWS for a
+//     coordinate that does not exist or is not the caller's, and a row that does not come
+//     back cannot be written. Selecting `rr.category` rather than `want.category` is
+//     DEFENCE IN DEPTH, not the mechanism — the join equates the two sides, so the swap is
+//     behaviourally inert today (verified by mutation, PRD #98 M2 review).
+//
+//     The two stop being equivalent the moment the match is loosened — case-insensitive,
+//     LIKE, trimming, collation-dependent equality — at which point `want.*` would write
+//     the CALLER's spelling and `rr.*` the stored one. That is exactly when writing from
+//     the resolved row earns its keep, and exactly when a reader who believed them
+//     interchangeable would introduce the bug. So: keep the SELECT list on `rr`, and do not
+//     loosen the JOIN. No test can distinguish the two forms today; that is inherent to an
+//     equality join, not a coverage gap.
 //
 // The requested coordinates arrive as two PARALLEL arrays zipped by ordinal into `want`,
 // so it is the exact list of (category, target) pairs, never their cross product. The
@@ -120,4 +127,83 @@ func (q *Queries) ListOwnedRecommendationsForCoords(ctx context.Context, arg Lis
 		return nil, err
 	}
 	return items, nil
+}
+
+const upsertDispositionsForResolvedCoords = `-- name: UpsertDispositionsForResolvedCoords :execrows
+WITH members AS (
+    SELECT r.val AS review_id, c.val AS category, t.val AS target, h.val AS rationale_hash
+    FROM unnest($4::uuid[]) WITH ORDINALITY AS r(val, ord)
+    JOIN unnest($5::text[]) WITH ORDINALITY AS c(val, ord) ON c.ord = r.ord
+    JOIN unnest($6::text[]) WITH ORDINALITY AS t(val, ord) ON t.ord = r.ord
+    JOIN unnest($7::text[]) WITH ORDINALITY AS h(val, ord) ON h.ord = r.ord
+)
+INSERT INTO recommendation_dispositions
+    (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id)
+SELECT m.review_id, m.category, m.target, $1, $2, m.rationale_hash,
+       $3
+FROM members m
+ON CONFLICT (review_id, category, target) DO UPDATE
+    SET status         = EXCLUDED.status,
+        dismiss_reason = EXCLUDED.dismiss_reason,
+        rationale_hash = EXCLUDED.rationale_hash,
+        set_by_user_id = EXCLUDED.set_by_user_id,
+        set_via        = EXCLUDED.set_via, -- NULL: a human write clears the sync's provenance
+        set_at         = now(),
+        updated_at     = now()
+`
+
+type UpsertDispositionsForResolvedCoordsParams struct {
+	Status          string      `json:"status"`
+	DismissReason   pgtype.Text `json:"dismiss_reason"`
+	SetByUserID     pgtype.UUID `json:"set_by_user_id"`
+	ReviewIds       []uuid.UUID `json:"review_ids"`
+	Categories      []string    `json:"categories"`
+	Targets         []string    `json:"targets"`
+	RationaleHashes []string    `json:"rationale_hashes"`
+}
+
+// Write the whole fan-out in ONE statement (PRD #98 M2, audit NB-A).
+//
+// WHY ONE STATEMENT, not a loop of #94's single-coordinate upsert. The item cap bounds
+// COORDINATES (100), but not MEMBERS: one coordinate matches every occurrence across all
+// the caller's reviews, and the resolve has no LIMIT. So ≤100 coordinates in a ~4 KB body
+// could drive tens of thousands of sequential round-trips, each holding a pool connection,
+// on a mount with no rate limiter. Own-data and idempotent, so not a vulnerability — but it
+// left this endpoint materially less bounded than the M1 read, which caps at 2000 rows.
+// Collapsing to one statement removes the amplification AND the partial-apply window
+// together: a single statement cannot half-succeed, so there is no "some writes landed but
+// the response says nothing" state to document or test around.
+//
+// THE COORDINATES ARE THE RESOLVED ONES. The caller passes the review_id / category /
+// target / rationale_hash it read back from ListOwnedRecommendationsForCoords above — never
+// anything off the request body — so the 00071/00073 no-category-CHECK invariant holds
+// exactly as it did in the loop. review_ids is what makes that airtight: it names rows the
+// owner-scoped resolve already returned, so a caller cannot address a review it does not
+// own even if it forged the category and target.
+//
+// The four arrays are zipped BY ORDINAL into one member per row — a pairwise list, never a
+// cross product (same shape sqlc forced on the read side above: it cannot type a
+// multi-argument unnest, so each array is unnested separately and joined on ordinality).
+//
+// ON CONFLICT DO UPDATE is #94's own last-writer-wins upsert semantics, unchanged
+// (Decision 6) — deliberately NOT the DO NOTHING the Filed→Done sync uses, because this IS
+// the human speaking and their latest verdict must win. set_via is cleared for the same
+// reason it is cleared in dispositions.sql: this row is now a person's, not the sync's.
+// :execrows returns members actually written, which the handler reports as an aggregate
+// `updated` (never per-item — that would rebuild the existence oracle #94 Decision 5
+// forbids).
+func (q *Queries) UpsertDispositionsForResolvedCoords(ctx context.Context, arg UpsertDispositionsForResolvedCoordsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertDispositionsForResolvedCoords,
+		arg.Status,
+		arg.DismissReason,
+		arg.SetByUserID,
+		arg.ReviewIds,
+		arg.Categories,
+		arg.Targets,
+		arg.RationaleHashes,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -42,9 +42,10 @@ type bulkStore struct {
 	upserted    []store.UpsertRecommendationDispositionParams
 	calls       []string
 
-	// failUpsertOn makes the Nth upsert (1-based) fail, for the partial-apply test. 0
-	// disables it.
-	failUpsertOn int
+	// writeArgs captures the multi-row write's params; failUpsert makes that one
+	// statement fail.
+	writeArgs  []store.UpsertDispositionsForResolvedCoordsParams
+	failUpsert bool
 }
 
 func (s *bulkStore) ListOwnedRecommendationsForCoords(_ context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error) {
@@ -58,13 +59,25 @@ func (s *bulkStore) ListOwnedRecommendationsForCoords(_ context.Context, arg sto
 	return out, nil
 }
 
-func (s *bulkStore) UpsertRecommendationDisposition(_ context.Context, arg store.UpsertRecommendationDispositionParams) (store.RecommendationDisposition, error) {
-	s.calls = append(s.calls, "UpsertRecommendationDisposition")
-	s.upserted = append(s.upserted, arg)
-	if s.failUpsertOn > 0 && len(s.upserted) == s.failUpsertOn {
-		return store.RecommendationDisposition{}, errors.New("upsert exploded")
+// UpsertDispositionsForResolvedCoords models the ONE multi-row write. It records the
+// arrays as individual coordinates so the existing assertions read unchanged, and
+// failUpsert makes the whole statement fail — which is the only failure mode there is now
+// that the write is a single statement.
+func (s *bulkStore) UpsertDispositionsForResolvedCoords(_ context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error) {
+	s.calls = append(s.calls, "UpsertDispositionsForResolvedCoords")
+	s.writeArgs = append(s.writeArgs, arg)
+	if s.failUpsert {
+		// Nothing is recorded: a single statement that errors wrote NOTHING.
+		return 0, errors.New("upsert exploded")
 	}
-	return store.RecommendationDisposition{ReviewID: arg.ReviewID, Category: arg.Category, Target: arg.Target, Status: arg.Status}, nil
+	for i := range arg.ReviewIds {
+		s.upserted = append(s.upserted, store.UpsertRecommendationDispositionParams{
+			ReviewID: arg.ReviewIds[i], Category: arg.Categories[i], Target: arg.Targets[i],
+			Status: arg.Status, DismissReason: arg.DismissReason,
+			RationaleHash: arg.RationaleHashes[i], SetByUserID: arg.SetByUserID,
+		})
+	}
+	return int64(len(arg.ReviewIds)), nil
 }
 
 func (s *bulkStore) ListJudgeRecommendationRowsForUser(_ context.Context, _ store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error) {
@@ -202,6 +215,38 @@ func TestBulkDispositionItemCap(t *testing.T) {
 	})
 }
 
+// TestBulkDispositionServiceRejectsUnknownScope pins the SERVICE-side gate independently of
+// the handler's (PRD #98 review A8). The handler already rejects an unknown scope, so this
+// calls the service directly — the only way to observe the second layer.
+//
+// It matters because scope has no safe default: the service selects members, so a plain
+// `scope == ScopeOpen` comparison treats anything unrecognised as ScopeAll, which
+// RE-ASSERTS over settled verdicts. That was found by widening the handler's validator in a
+// mutation and watching the request come back `{"updated":1,…}` — an unknown scope silently
+// writing. Contrast `bucket`, which fails closed naturally (it matches no group). Both
+// layers exist so neither is load-bearing alone.
+func TestBulkDispositionServiceRejectsUnknownScope(t *testing.T) {
+	st := oneOpenMemberStore()
+	h := newRunsHandler(t, st)
+	items := []workersvc.JudgeDispositionCoord{{Category: "install_worker_tool", Target: "rg"}}
+
+	_, err := h.wsvc.BulkSetDispositions(context.Background(), uuid.New(), items, "done", "", "everything")
+	if !errors.Is(err, workersvc.ErrInvalidScope) {
+		t.Fatalf("service err = %v, want ErrInvalidScope — an unknown scope must NOT fall through "+
+			"to `all` semantics and re-assert over settled verdicts", err)
+	}
+	if len(st.calls) != 0 {
+		t.Fatalf("a rejected scope must not reach the store at all, calls=%v", st.calls)
+	}
+	// Positive control: the two accepted values do proceed, so the refusal above is the
+	// scope check and not a broken fixture.
+	for _, ok := range []string{workersvc.ScopeOpen, workersvc.ScopeAll} {
+		if _, err := h.wsvc.BulkSetDispositions(context.Background(), uuid.New(), items, "done", "", ok); err != nil {
+			t.Fatalf("scope %q must be accepted, got %v", ok, err)
+		}
+	}
+}
+
 // ---- what reaches the store ----------------------------------------------------------
 
 // TestBulkDispositionWritesResolvedCoordinateNotBody is the unit-level guard on the
@@ -313,16 +358,15 @@ func TestBulkDispositionScopeSkipsSettledMembers(t *testing.T) {
 
 // ---- partial failure ---------------------------------------------------------------
 
-// TestBulkDispositionPartialFailureIs500 pins the partial-apply contract, which nothing
-// covered before (PRD #98 M2 review, finding N). With the 2nd of 3 upserts failing, one
-// disposition has ALREADY been committed — there is no transaction, by design — and the
-// endpoint responds 500 with the generic error body, reporting no count.
+// TestBulkDispositionFailedWriteChangesNothing pins the all-or-nothing contract the
+// single-statement write buys (PRD #98 M2, audit NB-A superseding review finding N). The
+// fan-out is ONE multi-row upsert, so a failure cannot leave some members written: the
+// endpoint answers 500 and the database is untouched.
 //
-// That is intended: a 500 makes no false claim of success, the landed subset shows up on
-// the next read, and every write is idempotent so a retry converges. The assertion worth
-// keeping is the negative one — a partial apply must never be dressed up as a success with
-// a misleading `updated`.
-func TestBulkDispositionPartialFailureIs500(t *testing.T) {
+// The earlier loop could half-apply, and the best that could be said was "a 500 claims no
+// success". This asserts the stronger property outright — zero rows changed — which is
+// what makes the response's silence honest rather than merely non-committal.
+func TestBulkDispositionFailedWriteChangesNothing(t *testing.T) {
 	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{
 		"improve_uzi/docs": {
 			memberRow("improve_uzi", "docs", "", false),
@@ -330,27 +374,77 @@ func TestBulkDispositionPartialFailureIs500(t *testing.T) {
 			memberRow("improve_uzi", "docs", "", false),
 		},
 	}}
-	st.failUpsertOn = 2 // the second write blows up
+	st.failUpsert = true
 	h := newRunsHandler(t, st)
 
 	rec := httptest.NewRecorder()
 	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
 		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("PUT with a failing upsert = %d, want 500; body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("PUT with a failing write = %d, want 500; body=%s", rec.Code, rec.Body.String())
 	}
-	// One write landed before the failure: the apply really is partial, not atomic.
-	if len(st.upserted) != 2 {
-		t.Fatalf("want 2 attempted upserts (one committed, one failed), got %d", len(st.upserted))
+	// Exactly ONE statement was attempted for all three members — not three.
+	if len(st.writeArgs) != 1 {
+		t.Fatalf("want a single write statement, got %d", len(st.writeArgs))
 	}
-	// And the body claims nothing about it.
+	if n := len(st.writeArgs[0].ReviewIds); n != 3 {
+		t.Fatalf("the one statement must carry all 3 members, got %d", n)
+	}
+	// And nothing landed.
+	if len(st.upserted) != 0 {
+		t.Fatalf("a failed single statement must write NOTHING, got %d rows", len(st.upserted))
+	}
 	if body := rec.Body.String(); !strings.Contains(body, "internal error") {
 		t.Fatalf("body = %s, want the generic internal error", body)
 	}
 	var got apitypes.JudgeDispositionResultDTO
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err == nil && got.Updated != 0 {
-		t.Fatalf("a failed request must not report updated=%d — it must claim no completeness at all", got.Updated)
+		t.Fatalf("a failed request must not report updated=%d", got.Updated)
 	}
+}
+
+// TestBulkDispositionIsOneRoundTrip is audit NB-A's headline: the number of STATEMENTS is
+// independent of the number of members. The item cap bounds coordinates, but one
+// coordinate can match every occurrence across every review the caller owns, so a
+// per-member loop was unbounded round-trips from a ~4 KB body.
+func TestBulkDispositionIsOneRoundTrip(t *testing.T) {
+	members := make([]store.ListOwnedRecommendationsForCoordsRow, 0, 500)
+	for i := 0; i < 500; i++ {
+		members = append(members, memberRow("improve_uzi", "docs", "", false))
+	}
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{"improve_uzi/docs": members}}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	writes := 0
+	for _, c := range st.calls {
+		if c == "UpsertDispositionsForResolvedCoords" {
+			writes++
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("500 members took %d write statements, want exactly 1 — the fan-out must not "+
+			"scale round-trips with member count", writes)
+	}
+	if got := decodeBulk(t, rec).Updated; got != 500 {
+		t.Fatalf("updated = %d, want 500 (rows-affected from the one statement)", got)
+	}
+}
+
+// ---- the response leaks nothing (helper) ---------------------------------------------
+
+func decodeBulk(t *testing.T, rec *httptest.ResponseRecorder) apitypes.JudgeDispositionResultDTO {
+	t.Helper()
+	var got apitypes.JudgeDispositionResultDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	return got
 }
 
 // ---- the response leaks nothing --------------------------------------------------------
@@ -409,10 +503,10 @@ func TestBulkDispositionTouchesStoreOnly(t *testing.T) {
 		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	allowed := map[string]bool{
-		"ListOwnedRecommendationsForCoords":  true, // the owner-scoped resolve
-		"UpsertRecommendationDisposition":    true, // the ONLY write
-		"ListJudgeRecommendationRowsForUser": true, // response groups
-		"ListJudgeTriageRowsForUser":         true, // response triage
+		"ListOwnedRecommendationsForCoords":   true, // the owner-scoped resolve
+		"UpsertDispositionsForResolvedCoords": true, // the ONLY write, and it is ONE statement
+		"ListJudgeRecommendationRowsForUser":  true, // response groups
+		"ListJudgeTriageRowsForUser":          true, // response triage
 	}
 	for _, c := range st.calls {
 		if !allowed[c] {
