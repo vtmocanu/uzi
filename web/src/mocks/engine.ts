@@ -328,8 +328,10 @@ export function handleInput(runId: string, kind: RunInputKind, body: string) {
       });
       return;
     case "follow_up":
-      appendMessage(runId, "status", null, { text: `follow-up from ${"you"}: ${body}` });
-      schedule(runId, say(runId, "lead", `Noted — folding that into the current work: “${body}”.`));
+      // A follow-up is NEVER written to run_messages (PRD #95 Decision 4) — it lives
+      // only in run_user_inputs (the steer queue), so the mock must not echo it into
+      // the activity log the way it used to. It surfaces in the SteerQueueCard, not
+      // here; the worker's eventual response rides the normal message stream.
       return;
   }
 }

@@ -118,7 +118,10 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return toolSummary(p?.name, p?.input);
     }
     case "tool_result":
-      return "Working";
+      // A non-state phrase on purpose: "Working"/"waiting"/"idle" are the crew-CHIP
+      // lexicon, so echoing one here read as a contradiction ("coder Ran a tool" is
+      // fine, but "coder Working" clashed with a `waiting` chip on a blocked agent).
+      return "Ran a tool";
     case "thinking":
       return "Thinking…";
     case "text": {
