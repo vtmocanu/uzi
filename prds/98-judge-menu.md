@@ -603,7 +603,22 @@ exactly as #68 already does.
       `RunListItem extends Run`. A field added to the TS `Run` therefore *inherits*
       into `RunListItem` instead of erroring, silently telling the client that
       `GET /runs/{id}` returns something the API only ever sends on the list. Caught
-      here by `tsc` via the run-view fixtures, and only by that.: `judge_verdict` via the safe
+      here by `tsc` via the run-view fixtures, and only by that.
+      **The verdict join is safe by INVARIANT, not by predicate** (M4 audit): `LEFT
+      JOIN run_reviews rv ON rv.target_run_id = r.id` carries no user predicate, and
+      is correct only because *two* things both hold — the outer query filters
+      `r.user_id = @user_id`, **and** a review's `user_id` always equals its target
+      run's owner (`PostReview` binds `UserID: target.UserID`). The count query, by
+      contrast, is scoped in its own right (`WHERE rv.user_id = @user_id AND
+      rv.target_run_id = ANY(@run_ids)`), so a spoofed run id yields nothing. The
+      cheap hardening is `AND rv.user_id = r.user_id` on the join — free (the planner
+      has both columns) and self-standing, exactly as `ee834583` made the `?run=`
+      semi-join self-standing.
+      **The count has TWO silent-understatement paths, both indistinguishable from a
+      genuine 0:** a failed count read (best-effort → renders `⚖ issues` instead of
+      `⚖ issues · 3`) and truncation, if the page cap and `JudgeRunTodoMaxRows` ever
+      diverge. Acceptable for decoration — and in both cases the load-bearing half,
+      the verdict, is unaffected because it rides the join rather than the count.: `judge_verdict` via the safe
       single `run_reviews` join + `judge_todo_count` **bucketed in Go** (never a SQL
       ladder; Decision 7); `RunListItem` type + the one-grammar per-row badge.
       Independent of the endpoints (own join) — starts immediately. (The strip

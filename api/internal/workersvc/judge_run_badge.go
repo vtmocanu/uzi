@@ -8,12 +8,24 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
+// runListPageCap MUST track ListRunsForUser's `LIMIT 200` (queries/runtime.sql). It is
+// duplicated here because SQL literals are not importable, so this is a coupling the
+// compiler cannot enforce — the same class as spelling a constant instead of referencing
+// it. runtime.sql carries the matching note at the other end.
+//
+// The direction of failure is what makes it worth naming: raise the run-list LIMIT without
+// touching this and the bound drops BELOW the real maximum, so the fetch starts truncating
+// — silently understating badge counts rather than erroring.
+const runListPageCap = 200
+
 // JudgeRunTodoMaxRows bounds the per-run triage fetch behind the /runs judge badge
-// (PRD #98 M4). The run list is capped at 200 rows and a review carries at most
-// ReviewMaxRecommendations (50), so a full page tops out near 10,000 rows; this is the
-// guardrail for that product. Bounded at the point the enumeration is written rather than
-// after a validator finds it — the fourth enumeration in this PRD to need one.
-const JudgeRunTodoMaxRows = 200 * ReviewMaxRecommendations
+// (PRD #98 M4): the page cap times the per-review recommendation cap, i.e. exactly the
+// theoretical maximum a full page can produce — not above it, not below. Bounded at the
+// point the enumeration is written rather than after a validator finds it.
+//
+// ReviewMaxRecommendations is referenced symbolically and so tracks its own changes;
+// runListPageCap cannot, which is why it carries the note it does.
+const JudgeRunTodoMaxRows = runListPageCap * ReviewMaxRecommendations
 
 // JudgeTodoCountsForRuns returns each run's still-to-triage recommendation count, keyed by
 // run id, for the runs on one page of the run list (PRD #98 M4, Decision 7).

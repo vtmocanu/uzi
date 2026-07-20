@@ -184,6 +184,9 @@ WHERE r.user_id = @user_id
   AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
   AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
 ORDER BY r.created_at DESC
+-- NOTE: workersvc.runListPageCap mirrors this 200 to size the judge-badge triage fetch
+-- (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
+-- raise this without raising that and the badge counts start truncating silently.
 LIMIT 200;
 
 -- name: ListActiveRunsAll :many

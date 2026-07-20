@@ -155,15 +155,30 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	writeTargets := make([]string, 0, len(members))
 	hashes := make([]string, 0, len(members))
 
-	// SECOND layer against duplicate (review_id, category, target) triples. The resolve's
-	// DISTINCT ON is the first, and either alone is sufficient TODAY — but a single
+	// SECOND layer against duplicate (review_id, category, target) triples. A single
 	// multi-row ON CONFLICT DO UPDATE raises SQLSTATE 21000 ("cannot affect row a second
-	// time") if the same triple appears twice, so this is a hard 500 rather than a
-	// degradation, and the input that triggers it (a judge emitting one coordinate twice in
-	// one review) is legal and data-dependent. The repo's guardrail rule is not to lean one
-	// layer on another holding: the query keeps the set distinct, and this keeps it distinct
-	// at the point the arrays are actually built, so a future edit to either — a relaxed
-	// DISTINCT, or a second caller of the write — cannot reintroduce the crash on its own.
+	// time") if the same triple appears twice — a hard 500, not a degradation — and the
+	// input that triggers it (a judge emitting one coordinate twice in one review) is legal
+	// and data-dependent.
+	//
+	// UNREACHABLE ON THE LIVE PATH, BY CONSTRUCTION. The resolve is SELECT DISTINCT ON
+	// (rv.id, rr.category, rr.target), so it cannot hand this loop a duplicate triple and
+	// `seen` can never fire against a real database. Only the fake-backed tests exercise it.
+	// That is deliberate, not dead code to delete: a fake cannot model SQL, so a fake-backed
+	// duplicate test is theatre unless the guard also exists here — and this earns its place
+	// the day someone relaxes the DISTINCT ON or adds a second caller of the write.
+	//
+	// AND IT ADDED A NEW WAY TO BE WRONG, which is the honest price of the layering rule.
+	// Divergence between the two layers is ASYMMETRIC:
+	//   * a wrong SQL key is MASKED here — this still keys on the conflict key, so the
+	//     statement stays legal. Degraded, not broken.
+	//   * a wrong key HERE is NOT masked by SQL. This pass runs downstream and can REMOVE
+	//     members the query correctly kept — silently under-disposing, with no error and no
+	//     crash, just some runs left unsettled.
+	// So this is the layer that must carry the test, and it does
+	// (TestBulkDispositionDedupesMembersWithinAReview, including the negative control that
+	// a pair-shaped key would collapse the cross-run fan-out). "Add a second layer" is not
+	// automatically free.
 	// NOTE the key is the full TRIPLE, not `coord`. Members legitimately repeat a
 	// (category, target) across DIFFERENT reviews — that recurrence is the entire point of
 	// the cross-run fan-out — so keying on the pair would collapse the fan-out to a single
@@ -175,6 +190,11 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 		if seen[key] {
 			continue
 		}
+		// Marked BEFORE the scope switch below, and that is safe for a reason rather than
+		// by luck: duplicates of one triple always carry identical disposition_status /
+		// filed_settled, because those joins are on the coordinate and not on rr.id — so
+		// both copies would take the same scope branch anyway. Do not reorder on the
+		// assumption that a skipped member should stay unmarked.
 		seen[key] = true
 		// Every scope must state its member selection EXPLICITLY here, with a default that
 		// refuses. An `if scope == ScopeOpen` would have the same fail-open shape the

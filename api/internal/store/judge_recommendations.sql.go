@@ -182,6 +182,7 @@ LEFT JOIN recommendation_filed_issues f
     ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target
 WHERE rv.user_id = $1
   AND rv.target_run_id = ANY($2::uuid[])
+ORDER BY rv.target_run_id
 LIMIT $3
 `
 
@@ -211,10 +212,19 @@ type ListJudgeTriageRowsForRunsRow struct {
 // Owner-scoped by rv.user_id, so the caller's own page can never surface another user's
 // recommendation counts even if a run id were somehow spoofed into the list.
 //
-// BOUNDED (@lim), like every other enumeration in this PRD. The run list is capped at 200
-// and a review carries ≤50 recommendations (ReviewMaxRecommendations), so a full page tops
-// out around 10,000 rows; the cap is the guardrail for that product, applied here rather
-// than discovered later.
+// BOUNDED (@lim), like every other enumeration in this PRD. The bound is the run-list page
+// cap times the per-review recommendation cap, so it sits exactly at the theoretical
+// maximum — see JudgeRunTodoMaxRows, which names both factors.
+//
+// The ORDER BY exists FOR the LIMIT. A LIMIT without one returns an arbitrary subset, so a
+// truncating read would silently understate SOME runs' badges — and a wrong number is worse
+// than a missing one. Ordering by run id makes any truncation deterministic and
+// whole-runs-first rather than a scatter of half-counted runs.
+//
+// Truncation is unreachable today: review_recommendations has exactly one writer
+// (UpsertRunReviewWithRecommendations) and the ingest path REJECTS over-cap submissions
+// rather than truncating them, so a review cannot exceed the per-review cap. The ORDER BY
+// is here to keep the failure mode sane if either factor ever changes.
 func (q *Queries) ListJudgeTriageRowsForRuns(ctx context.Context, arg ListJudgeTriageRowsForRunsParams) ([]ListJudgeTriageRowsForRunsRow, error) {
 	rows, err := q.db.Query(ctx, listJudgeTriageRowsForRuns, arg.UserID, arg.RunIds, arg.Lim)
 	if err != nil {

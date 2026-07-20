@@ -2054,6 +2054,9 @@ type ListRunsForUserRow struct {
 // re-implement the ladder's bottom rung, which #94 Decision 2 categorically forbids — one
 // Go BucketOf, no SQL CASE. The handler fetches the per-rec rows for the runs on the page
 // and buckets them in Go (ListJudgeTriageRowsForRuns).
+// NOTE: workersvc.runListPageCap mirrors this 200 to size the judge-badge triage fetch
+// (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
+// raise this without raising that and the badge counts start truncating silently.
 func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams) ([]ListRunsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForUser, arg.UserID, arg.RepoID, arg.IssueIid)
 	if err != nil {
