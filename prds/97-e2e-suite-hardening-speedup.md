@@ -172,7 +172,12 @@ carry explicit author sign-off:
       headless via `UZI_TOKEN` (docs/cli.md:61), so **spell out the CLI-token mint from
       the harness admin session**. Both are separate HTTP clients on the real wire —
       no lower layer exercises them.
-- [ ] **M3 — false-green hardening**: give the container-log scan (`:1176-1179`) and
+- [x] **M3 — false-green hardening** — DONE `f4517dba`; reviewer APPROVE + auditor
+      PASS; default e2e green (positive controls + `retry_read` banked). The `<16` grep
+      change is **forgejo-lane-only** (not in the default gate), static-verified against
+      `forgejo.go:179/182` by both validators — bank it with
+      `UZI_E2E_FORGE=forgejo ./e2e/run-e2e.sh` before merge. Original scope:
+      give the container-log scan (`:1176-1179`) and
       the `/data` scan (`:1182-1186`) a **positive control** — prove the corpus is
       non-empty before asserting the secret's absence (mirror the M6 `/proc` control
       at `:1312-1313` and the Decision-3 control at `:2943-2944`, and the CI
@@ -217,7 +222,10 @@ carry explicit author sign-off:
       k8s CIDR), #51 uid boundary (`:1299`), secret-hygiene (`:1175`), #83 Decision-3
       (`:2879`). This guard list ships in the phase comments so a future reader does
       not "finish the job."
-- [ ] **M5 — mechanical speedups (~30–40s, low/zero risk)**: add `start_interval: 1s`
+- [x] **M5 — mechanical speedups (~30–40s, low/zero risk)** — DONE `14b1615b`;
+      reviewer APPROVE + auditor PASS; default e2e green (overlay `start_interval` merge
+      preserves base healthchecks; tightened negative windows; reconcile-driven `:1901`
+      left; no `wait_*` ceiling touched). Original scope: add `start_interval: 1s`
       to the db + api + forge-fake healthchecks in the **overlay only** (base
       `docker-compose.yml` defaults untouched). **Corrected mechanism (fable review):**
       this helps ONLY the two full-stack `up -d --wait db api web forge-fake` boots
