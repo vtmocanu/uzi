@@ -150,6 +150,26 @@ type JudgeBacklogDTO struct {
 	Triage    TriageDTO                     `json:"triage"`
 }
 
+// JudgeDispositionResultDTO is the response to the bulk group-disposition fan-out
+// (PRD #98 M2, Decision 3).
+//
+// Updated is the number of member COORDINATES actually written. It is deliberately an
+// aggregate and never a per-item breakdown: a coordinate that does not exist and one that
+// belongs to another user both resolve to zero members, so neither the count nor anything
+// else in this DTO can be used to tell them apart (#94 Decision 5's one-404 rule — no
+// existence oracle). A caller learning "0 written" learns only that none of THEIR rows
+// matched.
+//
+// Groups are the affected coordinates re-read after the writes (all buckets, so a group
+// that just left To triage is still returned with its new rollup), and Triage is the
+// recomputed canonical tally — together enough for the page to update its rows AND its
+// badge from this one round-trip, with no follow-up GET.
+type JudgeDispositionResultDTO struct {
+	Updated int                           `json:"updated"`
+	Groups  []JudgeRecommendationGroupDTO `json:"groups"`
+	Triage  TriageDTO                     `json:"triage"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {

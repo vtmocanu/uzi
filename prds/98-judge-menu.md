@@ -104,23 +104,45 @@ one action.
    anchor (for the notification deep-link, Decision 4) bound/scope the pull.
    **Response shape, settled at implementation (2026-07-20) — M2/M3/M7 build on
    this, they do not re-derive it:** the response is an envelope `{bucket, run,
-   groups[], triage}`, not a bare array, and **`triage` is computed over the
-   caller's ENTIRE unfiltered row set** so it equals `/me/judge/stats` whatever the
-   filter — that is what makes the "one canonical number" promise mechanically true
-   from a single call rather than a convention each consumer must remember. Each
+   groups[], triage}`, not a bare array, and **`triage` comes from #94's own
+   `/me/judge/stats` query, called directly — not tallied off the page rows.**
+   (Revised 2026-07-20 once the pull became bounded: with a `LIMIT` in play,
+   tallying `triage` off the returned rows would make the canonical number *wrong*
+   on exactly the heavy accounts that need it most. Sourcing it from the stats query
+   makes "nav badge == notification == To-triage tab" **literally the same query**
+   rather than equal-by-construction, and it survives both filters and truncation.
+   Cost: one extra cheap 3-column query per request.) Each
    group carries its explicit rollup `bucket` alongside `open_count`/`run_count`, so
    neither the page nor the CLI recomputes the ladder. `?run=` filters **which
    groups** return (those with ≥1 occurrence in that run) but never trims a kept
    group's occurrence list — arriving from a notification must still show that the
    recommendation recurs elsewhere, since that recurrence is the priority signal.
-   **Therefore `?run=` is deliberately applied in Go, AFTER the owner-scoped SQL —
-   do not "fix" it into the WHERE clause** (settled 2026-07-20 during M1 review).
-   Pushing `run_id` into the SQL would trim exactly the occurrences Decision 4
-   exists to preserve, and would also corrupt `run_count`. The security property is
-   unaffected: the Go filter runs over rows already scoped by `rv.user_id =
-   @user_id` in SQL, so it can only ever narrow within the caller's own data, never
-   widen. (The lead's review checklist asserted the opposite; the code was right and
-   the checklist was wrong.)
+   **`?run=` is therefore a coordinate-level SEMI-JOIN in SQL, not an equality
+   predicate and not a Go post-filter** (settled 2026-07-20; this note previously
+   said "applied in Go, do not fix it into the WHERE clause" and was superseded
+   within the hour — see below). The naive reading is a false dilemma: an equality
+   `WHERE rv.target_run_id = @run` does trim exactly the occurrences Decision 4
+   exists to preserve and corrupts `run_count`, but a Go post-filter is not the only
+   alternative. The shipped form selects *coordinates* —
+   `EXISTS (… WHERE rv2.user_id = rv.user_id AND rv2.target_run_id = @run_anchor
+   AND rr2.category = rr.category AND rr2.target = rr.target)` — so a group opened
+   from a notification keeps its other-run occurrences while coordinates absent from
+   the anchor run drop out, and the bound applies in the database rather than after
+   a full materialization. The subquery is scoped to the caller's own reviews, so an
+   anchor naming another user's run matches nothing (no oracle).
+   **Once the row cap exists, a Go post-filter is not merely inferior — it is a
+   defect.** The `LIMIT` would apply *before* the anchor filter, so an anchored
+   request whose coordinates fall outside the newest `JudgeBacklogMaxRows` rows
+   would return empty while reporting `truncated: true` — the notification
+   deep-link's worst case, silently, on exactly the heavy accounts the cap exists
+   for. In SQL the bound applies after the anchor. The two designs were equivalent
+   before the cap and are not equivalent after it, which is why this note is
+   load-bearing rather than stylistic.
+   **`nullableUUID`, not the shared `pgUUID`, carries the "no anchor" case**: `pgUUID`
+   always sets `Valid=true`, so passing `uuid.Nil` would have sent the all-zero uuid
+   as a *real* anchor, the query's `IS NULL` escape hatch would never fire, and
+   **every unanchored backlog request would have returned nothing**. Caught by the
+   live-DB test, not by a fake.
    A malformed uuid or unknown bucket is a **400**; a well-formed unknown/foreign
    run uuid is an **empty list, not a 404** (no existence oracle) — so a CLI typo
    can never look like an empty backlog. `rationale_preview` is capped at
@@ -477,6 +499,37 @@ Judge page header). Single repo, so no cross-repo phase.
   in the response, not the filter. Own-data amplification only (no cross-tenant
   exposure), on a route group with no rate limiter. Pagination remains the fast
   follow if a heavy user's To-triage exceeds one screenful of groups.
+  **What `JudgeBacklogMaxRows = 2000` does and does not bound** (audit of
+  `d701a388`, 2026-07-20 — state this precisely, because the loose version is
+  already circulating): it bounds rows on the wire, the Go materialization, the
+  grouping pass, and the response. It does **not** bound Postgres's own work. The
+  `ORDER BY` spans two tables (`rv.created_at, rv.id, rr.created_at, rr.id`), so no
+  single index supplies that ordering and the server must produce the caller's full
+  join result and top-N sort it before `LIMIT` applies. `?bucket=all` on a heavy
+  account still walks all of *that caller's* rows server-side — bounded to own data
+  by `idx_run_reviews_user` (`00059`), never a full-table scan, i.e. the same
+  O(own-data) shape `/me/judge/stats` has always had. (Structural argument from the
+  query text and the migration's index list; **not** verified with `EXPLAIN`.) So
+  the claim "an anchored pull reads only the rows it returns" is true of the API and
+  **false of the database** — the `EXISTS` is still evaluated per candidate row.
+  Do not promote that sentence into `docs/judge.md`.
+  Relatedly the request is **half-capped**: the wide read stops at 2000 rows, but
+  the `triage` stats query has no `LIMIT` (one row per recommendation, all-time).
+  Acceptable and non-blocking — it is 3 narrow columns rather than 15 wide ones
+  carrying up to 4 KiB of `rationale_md` each, and it is the identical query
+  `/me/judge/stats` already serves unbounded on the same `RequireUser` mount, so it
+  adds no exposure that is not already shipped.
+- **Truncation understates SURVIVING groups, not merely missing ones — M3 and M7
+  must not render a cut page as authoritative** (found in the `d701a388` review,
+  2026-07-20). The `LIMIT` cuts **rows before grouping**, and the cut is by review
+  recency, so a group that survives the cut can still lose its older occurrences.
+  That understates its `run_count` and `open_count` and **can change its rollup
+  bucket**: a group whose only open occurrence sat among the cut rows rolls up
+  `done`/`dismissed` instead of `todo` and is then filtered *out* of the default
+  `?bucket=todo` view. `truncated: true` honestly flags the page as partial and at
+  2000 rows this is a heavy-user edge case, so the behavior is acceptable — but the
+  consumer contract is "when `truncated` is true, surviving groups' counts and
+  rollup may be understated", NOT "only the oldest occurrences are missing".
 - **Cross-user duplication for factory-wide categories.** `install_worker_tool`
   and `improve_uzi` affect everyone, but reviews are **owner-scoped** by #46
   design, so two users can independently see and file the same recommendation →

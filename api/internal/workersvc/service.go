@@ -150,6 +150,11 @@ type Store interface {
 	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor
 	// and a hard row cap.
 	ListJudgeRecommendationRowsForUser(ctx context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error)
+	// Judge menu bulk-disposition resolve (PRD #98 M2): the owner-scoped lookup of a set
+	// of (category, target) coordinates' member recommendations. It is the security
+	// boundary of the fan-out — the disposition is written off the rows it returns, never
+	// off the request body.
+	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)

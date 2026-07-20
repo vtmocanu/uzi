@@ -360,6 +360,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// occurrences. Same mount as /stats so `uzi review backlog` works from a CLI
 			// token; read-only, so no CSRF and no spend.
 			r.Get("/recommendations", h.JudgeRecommendations)
+			// Bulk group disposition (PRD #98 M2, Decision 3): one triage verdict fanned
+			// out to the member coordinates of N groups. Same RequireUser mount as the
+			// read (so `uzi review resolve|dismiss` works from a CLI token) and
+			// owner-only by construction — the service's resolve is user_id-scoped, so
+			// this route needs no authz of its own. A local upsert applied N times: no
+			// spend, no forge write; the item cap bounds the work per request.
+			r.Put("/recommendations/disposition", h.BulkSetDispositions)
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
