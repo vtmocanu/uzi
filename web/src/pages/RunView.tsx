@@ -808,18 +808,20 @@ export function JudgePanel({ run }: { run: Run }) {
                     {rec.rationale_md.trim() !== "" && (
                       <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
                     )}
-                    {/* A settled disposition (done/dismissed) hides the File / Mark done /
-                        Dismiss affordances and shows only Undo (+ the stale flag); an
-                        open row keeps the File-issue flow and the triage buttons. */}
-                    {!disp && (
-                      <RecommendationFiler
-                        runId={run.id}
-                        rec={rec}
-                        filed={filed}
-                        reviewUpdatedAt={review.updated_at}
-                        repos={repos}
-                      />
-                    )}
+                    {/* A settled disposition (done/dismissed) hides the create-issue
+                        affordance (File / draft) but NOT an already-filed link: a rec that
+                        was filed and then marked done keeps both facts visible (Resolved Q:
+                        "you can file then later mark done"). RecommendationFiler renders the
+                        filed-issue link regardless, and `actionHidden` suppresses only the
+                        create action once a disposition exists. */}
+                    <RecommendationFiler
+                      runId={run.id}
+                      rec={rec}
+                      filed={filed}
+                      reviewUpdatedAt={review.updated_at}
+                      repos={repos}
+                      actionHidden={disp !== undefined}
+                    />
                     <DispositionControls
                       runId={run.id}
                       recId={rec.id}
@@ -869,12 +871,17 @@ function RecommendationFiler({
   filed,
   reviewUpdatedAt,
   repos,
+  actionHidden = false,
 }: {
   runId: string;
   rec: ReviewRecommendation;
   filed?: FiledIssue;
   reviewUpdatedAt: string;
   repos: Repo[];
+  // A disposed row suppresses the create-issue affordance (the "File issue" button and
+  // its draft) while STILL showing an existing filed link below — so a filed-then-done
+  // rec keeps its clickable issue link but offers no way to file a second issue.
+  actionHidden?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<IssueDraft | null>(null);
@@ -921,6 +928,10 @@ function RecommendationFiler({
       </div>
     );
   }
+
+  // Past this point is the create-issue affordance. A disposed row with no filed link
+  // renders nothing here (the filed row above already returned when a link exists).
+  if (actionHidden) return null;
 
   const openDraft = async () => {
     setOpen(true);
@@ -1082,16 +1093,24 @@ function RecommendationFiler({
 // DispositionChip renders a recommendation's triage status by the D#2 precedence
 // ladder — disposition (done/dismissed) wins over a settled filed link, which wins
 // over the open "To do" default. Tones mirror the mockup: a not_an_issue (false
-// positive) reads danger, a wont_do reads warning, done reads ok, filed reads info.
+// positive) reads danger and reserves the only warm/red chip; a wont_do reads neutral
+// grey (a valid-but-parked call is not a warning), done reads ok, filed reads info.
 function DispositionChip({ disp, filedSettled }: { disp?: Disposition; filedSettled: boolean }) {
   if (disp?.status === "dismissed") {
     return disp.reason === "not_an_issue" ? (
       <Badge tone="danger">Dismissed · Not an issue</Badge>
     ) : (
-      <Badge tone="warning">Dismissed · Won't do</Badge>
+      <Badge tone="neutral">Dismissed · Won't do</Badge>
     );
   }
-  if (disp?.status === "done") return <Badge tone="ok">✓ Done</Badge>;
+  // The ✓ is decorative — aria-hidden so a screen reader reads just "Done", not
+  // "check mark Done".
+  if (disp?.status === "done")
+    return (
+      <Badge tone="ok">
+        <span aria-hidden="true">✓</span> Done
+      </Badge>
+    );
   if (filedSettled) return <Badge tone="info">Filed</Badge>;
   return <Badge tone="neutral">To do</Badge>;
 }
@@ -1125,14 +1144,69 @@ function DispositionControls({
 }) {
   const [busy, setBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // A polite sr-only live region announces the mutation result; it lives OUTSIDE the
+  // disp/no-disp branch so the branch swap after a mutation doesn't drop the message.
+  const [announce, setAnnounce] = useState("");
 
-  const act = async (fn: () => Promise<unknown>) => {
+  // Refs for a11y. The ui Button is a plain (non-forwardRef) component, so focus targets
+  // that are Buttons (Mark done, Dismiss trigger) are located by querySelector off a stable
+  // container ref rather than a direct ref; Undo is a raw <button> and takes a ref directly.
+  // menuWrapRef also backs the outside-click hit test. rootRef is the no-disp branch root.
+  const menuWrapRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const undoRef = useRef<HTMLButtonElement>(null);
+  // Set true just before the refetch so the disp-transition effect below knows the change
+  // was user-initiated (skips focus-stealing on the initial mount / passive re-renders).
+  const focusAfterMutation = useRef(false);
+
+  // Escape closes the menu (focus back to the Dismiss trigger — the first button in the
+  // wrapper); a pointerdown outside the wrapper closes it too. Wired only while open, torn
+  // down on close/unmount.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        menuWrapRef.current?.querySelector<HTMLElement>("button")?.focus();
+      }
+    };
+    const onPointerDown = (e: Event) => {
+      if (menuWrapRef.current && !menuWrapRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [menuOpen]);
+
+  // After a mutation + refetch re-renders this row into the other branch, move focus to the
+  // successor control that just mounted (disp → Undo; no disp → Mark done, the first button
+  // in the root). Keyed on disp AND busy: the successor button is `disabled={busy}` and busy
+  // only clears in the finally AFTER the refetch, so we defer the focus until busy drops
+  // (a disabled element ignores .focus()). The armed flag survives the intervening renders.
+  useEffect(() => {
+    if (!focusAfterMutation.current || busy) return;
+    focusAfterMutation.current = false;
+    if (disp) undoRef.current?.focus();
+    else rootRef.current?.querySelector<HTMLElement>("button")?.focus();
+  }, [disp, busy]);
+
+  const act = async (fn: () => Promise<unknown>, message: string) => {
     onError("");
     setBusy(true);
     try {
       await fn();
+      // Arm the focus move BEFORE the refetch so the disp-transition effect (fired by the
+      // parent's re-render on refetch) sees the flag set.
+      focusAfterMutation.current = true;
+      setAnnounce(message);
       await onChanged();
     } catch (e) {
+      focusAfterMutation.current = false;
       onError(e instanceof ApiError ? e.message : "Could not update the disposition");
     } finally {
       setBusy(false);
@@ -1140,9 +1214,17 @@ function DispositionControls({
     }
   };
 
+  // The live region is shared by both branches so an announcement survives the branch swap.
+  const liveRegion = (
+    <span className="sr-only" role="status" aria-live="polite">
+      {announce}
+    </span>
+  );
+
   if (disp) {
     return (
       <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+        {liveRegion}
         <span className="text-faint">{resolvedAgo(disp.set_at)}</span>
         {disp.stale && (
           <Badge
@@ -1154,8 +1236,9 @@ function DispositionControls({
         )}
         <button
           type="button"
+          ref={undoRef}
           disabled={busy}
-          onClick={() => act(() => api.deleteDisposition(runId, recId))}
+          onClick={() => act(() => api.deleteDisposition(runId, recId), "Disposition undone")}
           className="font-medium text-faint underline underline-offset-2 transition-colors hover:text-fg disabled:opacity-50"
         >
           Undo
@@ -1165,16 +1248,17 @@ function DispositionControls({
   }
 
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-2">
+    <div ref={rootRef} className="mt-2 flex flex-wrap items-center gap-2">
+      {liveRegion}
       <Button
         size="sm"
         variant="secondary"
         disabled={busy}
-        onClick={() => act(() => api.setDisposition(runId, recId, "done"))}
+        onClick={() => act(() => api.setDisposition(runId, recId, "done"), "Marked done")}
       >
         Mark done
       </Button>
-      <div className="relative">
+      <div className="relative" ref={menuWrapRef}>
         <Button
           size="sm"
           variant="secondary"
@@ -1194,7 +1278,7 @@ function DispositionControls({
               type="button"
               role="menuitem"
               disabled={busy}
-              onClick={() => act(() => api.setDisposition(runId, recId, "dismissed", "wont_do"))}
+              onClick={() => act(() => api.setDisposition(runId, recId, "dismissed", "wont_do"), "Dismissed — won't do")}
               className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
             >
               Won't do
@@ -1204,7 +1288,9 @@ function DispositionControls({
               type="button"
               role="menuitem"
               disabled={busy}
-              onClick={() => act(() => api.setDisposition(runId, recId, "dismissed", "not_an_issue"))}
+              onClick={() =>
+                act(() => api.setDisposition(runId, recId, "dismissed", "not_an_issue"), "Dismissed — not an issue")
+              }
               className="flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-sm text-fg transition-colors hover:bg-raised disabled:opacity-50"
             >
               Not an issue

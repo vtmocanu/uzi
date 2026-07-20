@@ -496,7 +496,8 @@ describe("JudgePanel (PRD #46 M4)", () => {
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
-    expect(await screen.findByText("✓ Done")).toBeTruthy(); // done > filed
+    // The ✓ is a decorative aria-hidden glyph, so the chip's own text is just "Done".
+    expect(await screen.findByText("Done")).toBeTruthy(); // done > filed
     expect(screen.getByText("Dismissed · Won't do")).toBeTruthy();
     expect(screen.getByText("Dismissed · Not an issue")).toBeTruthy();
     expect(screen.getByText("To do")).toBeTruthy(); // no disposition, not filed
@@ -586,5 +587,78 @@ describe("JudgePanel (PRD #46 M4)", () => {
     fireEvent.click(screen.getByText(/Hide dismissed \(1\)/));
     await waitFor(() => expect(screen.queryByText("hide me")).toBeNull());
     expect(screen.getByText("keep me")).toBeTruthy();
+  });
+
+  // A rec filed THEN marked done keeps both facts: the "Done" chip AND the clickable
+  // issue link, but NOT the create-issue affordance (you can't file a second issue).
+  it("a filed-then-done row keeps the issue link but drops the File-issue action", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        recommendations: [rec("rc1", "add_agent", "deploy-agent")],
+        filed_issues: [
+          {
+            category: "add_agent",
+            target: "deploy-agent",
+            issue_iid: 72,
+            issue_url: "https://gitlab.example/x/-/issues/72",
+            filed_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+        dispositions: [
+          { category: "add_agent", target: "deploy-agent", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+        ],
+        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    // Done wins the chip ladder…
+    expect(await screen.findByText("Done")).toBeTruthy();
+    // …but the filed issue link survives the disposition (Resolved Q: file then done).
+    const link = screen.getByRole("link", { name: /#72/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example/x/-/issues/72");
+    // No way to file a second issue on a disposed row.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
+  it("Escape closes the Dismiss menu and returns focus to the trigger (a11y)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const trigger = await screen.findByRole("button", { name: /Dismiss/ });
+    fireEvent.click(trigger);
+    expect(await screen.findByText("Won't do")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByText("Won't do")).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("moves focus to the Undo control after a mutation, not to <body> (a11y)", async () => {
+    // Mount reads untriaged; the post-mutation refetch reads the row as done, so the row
+    // swaps to the Undo branch and focus must land there.
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review() })
+      .mockResolvedValue({
+        review: review({
+          dispositions: [
+            { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+          ],
+          triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+        }),
+      });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    const undo = await screen.findByText("Undo");
+    await waitFor(() => expect(document.activeElement).toBe(undo));
+  });
+
+  it("announces the mutation result via the polite live region (a11y)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Mark done"));
+    expect(await screen.findByText("Marked done")).toBeTruthy();
   });
 });
