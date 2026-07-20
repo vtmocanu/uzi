@@ -1,7 +1,7 @@
 # PRD #95: Run activity pane v2 — crew roster, collapse-by-default logs, opt-in follow, and steer-queue delivery
 
 **GitLab Issue**: [#95](https://gitlab.example.com/vtmocanu/uzi/-/issues/95)
-**Status**: Implementation complete — MR [!82](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/82) open (pending merge)
+**Status**: Complete (2026-07-20; merged via MR [!82](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/82))
 **Priority**: Medium
 **Mockup**: [`prds/mockups/95-activity-pane-v2-mock.html`](mockups/95-activity-pane-v2-mock.html) (live/interactive: crew strip + collapse-by-default accordion + opt-in Follow toggle + steer queue with Queued→Delivered)
 **Supersedes/extends**: PRD #38 (the activity feed this rebuilds — `ActivityFeed`, `AgentBlock`, `groupByAgent`, the follow-scroll engine). Depends on / reuses: PRD #47 (RunHealth — `run.health`/`health_reason`, the `health` WS frame, the worker-liveness derivation this pane maps instead of re-deriving), PRD #37 (per-agent attribution — `subagent_type ?? "lead"`, `agent/src/sdk-messages.ts:29`), PRD #33 (`run_user_inputs`, the steering queue this surfaces), PRD #64 (the `uzi` CLI, second consumer — `uzi run follow-up`, `api/cmd/uzi/run.go:263`).
