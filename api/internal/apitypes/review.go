@@ -167,8 +167,13 @@ type JudgeBacklogDTO struct {
 // JudgeDispositionResultDTO is the response to the bulk group-disposition fan-out
 // (PRD #98 M2, Decision 3).
 //
-// Updated is the number of member COORDINATES actually written. It is deliberately an
-// aggregate and never a per-item breakdown: a coordinate that does not exist and one that
+// Updated counts member COORDINATES — (review_id, category, target) triples — not
+// recommendation rows. The two differ: a review may carry the same coordinate on two
+// recommendations, and since recommendation_dispositions is keyed on the coordinate, both
+// share ONE verdict and contribute ONE to this count. So Updated can be lower than the
+// number of recommendations a group visibly spans, and that is correct.
+//
+// It is deliberately an aggregate and never a per-item breakdown: a coordinate that does not exist and one that
 // belongs to another user both resolve to zero members, so neither the count nor anything
 // else in this DTO can be used to tell them apart (#94 Decision 5's one-404 rule — no
 // existence oracle). A caller learning "0 written" learns only that none of THEIR rows

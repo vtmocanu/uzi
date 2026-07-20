@@ -11,9 +11,14 @@ import (
 )
 
 // JudgeDispositionMaxItems caps the coordinates one bulk call may carry (PRD #98 M2).
-// #94's single-coordinate route needed no such bound — it was one resolve and one upsert —
-// but this endpoint is N resolves and N upserts on the no-CSRF RequireUser token path, so
-// the work per request is bounded explicitly rather than left to the 1 MiB body limit.
+//
+// The request is now ONE resolve and ONE upsert whatever the member count (audit NB-A), so
+// this no longer bounds round-trips — it bounds the SIZE of the two statements: the
+// coordinate arrays the resolve unnests, and the member arrays the write unnests. That is
+// still worth bounding explicitly on a no-CSRF RequireUser token path rather than leaving it
+// to the 1 MiB body limit, because members-per-coordinate is itself unbounded (one
+// coordinate matches every occurrence across all the caller's reviews).
+//
 // Comfortably above any real multi-select: the UI batches a screenful of groups, not a
 // backlog. Over the cap is a 400, not a silent truncation.
 const JudgeDispositionMaxItems = 100
@@ -58,6 +63,16 @@ var judgeDispositionScopes = map[string]bool{ScopeOpen: true, ScopeAll: true}
 // ValidJudgeDispositionScope reports whether s is an accepted scope. Anything else is a
 // 400 — never a silent fallback to a scope the caller did not ask for.
 func ValidJudgeDispositionScope(s string) bool { return judgeDispositionScopes[s] }
+
+// memberKey is a RESOLVED member's identity: the (review_id, category, target) triple that
+// recommendation_dispositions is actually keyed on. Distinct from coord, which is the
+// display grain — see the dedup in BulkSetDispositions for why conflating them would break
+// the cross-run fan-out.
+type memberKey struct {
+	reviewID uuid.UUID
+	category string
+	target   string
+}
 
 // JudgeDispositionCoord is one requested (category, target) coordinate. It is the
 // caller's REQUEST, not a resolved row: nothing from here is ever written to the database.
@@ -139,7 +154,28 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	writeCategories := make([]string, 0, len(members))
 	writeTargets := make([]string, 0, len(members))
 	hashes := make([]string, 0, len(members))
+
+	// SECOND layer against duplicate (review_id, category, target) triples. The resolve's
+	// DISTINCT ON is the first, and either alone is sufficient TODAY — but a single
+	// multi-row ON CONFLICT DO UPDATE raises SQLSTATE 21000 ("cannot affect row a second
+	// time") if the same triple appears twice, so this is a hard 500 rather than a
+	// degradation, and the input that triggers it (a judge emitting one coordinate twice in
+	// one review) is legal and data-dependent. The repo's guardrail rule is not to lean one
+	// layer on another holding: the query keeps the set distinct, and this keeps it distinct
+	// at the point the arrays are actually built, so a future edit to either — a relaxed
+	// DISTINCT, or a second caller of the write — cannot reintroduce the crash on its own.
+	// NOTE the key is the full TRIPLE, not `coord`. Members legitimately repeat a
+	// (category, target) across DIFFERENT reviews — that recurrence is the entire point of
+	// the cross-run fan-out — so keying on the pair would collapse the fan-out to a single
+	// run and silently under-dispose every group. Only a repeat of the same coordinate
+	// WITHIN one review is the duplicate that breaks the write.
+	seen := make(map[memberKey]bool, len(members))
 	for _, rec := range members {
+		key := memberKey{reviewID: rec.ReviewID, category: rec.Category, target: rec.Target}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		// Every scope must state its member selection EXPLICITLY here, with a default that
 		// refuses. An `if scope == ScopeOpen` would have the same fail-open shape the
 		// top-level guard exists to remove, just moved: adding a third scope to the

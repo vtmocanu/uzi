@@ -90,10 +90,23 @@ func (s *bulkStore) ListJudgeTriageRowsForUser(_ context.Context, _ uuid.UUID) (
 	return []store.ListJudgeTriageRowsForUserRow{}, nil
 }
 
-// memberRow builds one resolved member of a coordinate.
+// memberRow builds one resolved member of a coordinate, on its OWN review.
+//
+// Read memberRowIn before adding tests: this helper mints a fresh ReviewID per call, so
+// members built with it can never share a (review_id, category, target) triple. That is a
+// REAL limit, not a detail — the duplicate-coordinate crash (SQLSTATE 21000) was invisible
+// to every fake-backed test precisely because this helper cannot construct the shape that
+// breaks the single-statement write. A helper that cannot build the failing input silently
+// bounds every test written on top of it.
 func memberRow(category, target, disposition string, filedSettled bool) store.ListOwnedRecommendationsForCoordsRow {
+	return memberRowIn(uuid.New(), category, target, disposition, filedSettled)
+}
+
+// memberRowIn builds a member on a CALLER-CHOSEN review, so a test can put two members of
+// the same coordinate on ONE review — the duplicate the schema permits and the judge emits.
+func memberRowIn(reviewID uuid.UUID, category, target, disposition string, filedSettled bool) store.ListOwnedRecommendationsForCoordsRow {
 	row := store.ListOwnedRecommendationsForCoordsRow{
-		ReviewID: uuid.New(), RecID: uuid.New(),
+		ReviewID: reviewID, RecID: uuid.New(),
 		Category: category, Target: target, RationaleMd: "because",
 		FiledSettled: filedSettled,
 	}
@@ -433,6 +446,67 @@ func TestBulkDispositionIsOneRoundTrip(t *testing.T) {
 	}
 	if got := decodeBulk(t, rec).Updated; got != 500 {
 		t.Fatalf("updated = %d, want 500 (rows-affected from the one statement)", got)
+	}
+}
+
+// TestBulkDispositionDedupesMembersWithinAReview is the fake-backed half of the
+// duplicate-coordinate guard, and it exists because the fixture used to make it
+// unwritable. review_recommendations has no unique constraint on the coordinate, so one
+// review can carry (improve_uzi, docs) twice; feeding both into the single multi-row
+// ON CONFLICT DO UPDATE raises SQLSTATE 21000 and the endpoint 500s.
+//
+// The resolve's DISTINCT ON is the first layer and only a live DB can exercise it. This
+// asserts the SECOND layer — the Go dedup — which is what holds if the query is ever
+// relaxed or a second caller appears.
+//
+// The negative control matters as much as the positive: the SAME coordinate on DIFFERENT
+// reviews must NOT be collapsed, because that recurrence is the cross-run fan-out this
+// whole PRD exists for. A dedup keyed on (category, target) instead of the full triple
+// would pass the first assertion and silently destroy the feature.
+func TestBulkDispositionDedupesMembersWithinAReview(t *testing.T) {
+	sharedReview := uuid.New()
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{
+		"improve_uzi/docs": {
+			// Same coordinate, SAME review — the illegal-to-write duplicate.
+			memberRowIn(sharedReview, "improve_uzi", "docs", "", false),
+			memberRowIn(sharedReview, "improve_uzi", "docs", "", false),
+			// Same coordinate, DIFFERENT review — a legitimate second occurrence.
+			memberRowIn(uuid.New(), "improve_uzi", "docs", "", false),
+		},
+	}}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(st.writeArgs) != 1 {
+		t.Fatalf("want one write statement, got %d", len(st.writeArgs))
+	}
+	arg := st.writeArgs[0]
+	if len(arg.ReviewIds) != 2 {
+		t.Fatalf("wrote %d members, want 2 — the same-review duplicate must collapse and the "+
+			"other review's occurrence must survive; got review ids %v", len(arg.ReviewIds), arg.ReviewIds)
+	}
+	// No triple may repeat — that is what SQLSTATE 21000 punishes.
+	seen := map[string]bool{}
+	for i := range arg.ReviewIds {
+		k := arg.ReviewIds[i].String() + "/" + arg.Categories[i] + "/" + arg.Targets[i]
+		if seen[k] {
+			t.Fatalf("duplicate (review_id, category, target) reached the write: %s", k)
+		}
+		seen[k] = true
+	}
+	// And the cross-run occurrence is still there.
+	distinctReviews := map[uuid.UUID]bool{}
+	for _, id := range arg.ReviewIds {
+		distinctReviews[id] = true
+	}
+	if len(distinctReviews) != 2 {
+		t.Fatalf("want both reviews represented, got %d — deduping on (category, target) "+
+			"instead of the full triple would collapse the cross-run fan-out", len(distinctReviews))
 	}
 }
 
