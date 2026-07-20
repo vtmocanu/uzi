@@ -224,6 +224,55 @@ func TestDeleteDispositionIsOwnerOnly(t *testing.T) {
 	}
 }
 
+// ---- 1. owner-only authz matrix (the OTHER two legs the PRD spells out) --------------
+
+// TestSetDispositionAdminWritesOwnRun completes the write matrix (PRD #94 Decision 5,
+// Resolved Q "an admin can always triage their OWN judge runs"): an admin caller whose id
+// IS the run owner writes normally (204). IsAdmin is never consulted on the write path, so
+// it neither grants a cross-user bypass (the tests above) NOR blocks an admin from their
+// own run (this one) — the caller==owner check in GetRunByIDForUser is all that matters.
+func TestSetDispositionAdminWritesOwnRun(t *testing.T) {
+	st, runID, recID := oneRecStore()
+	ownerAdmin := store.User{ID: st.ownerID, IsAdmin: true} // the owner, who also happens to be an admin
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.SetDisposition(rec, dispReq(http.MethodPut, ownerAdmin, runID, recID, `{"status":"done"}`))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("owner-admin PUT = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(st.upserted) != 1 {
+		t.Fatalf("owner-admin PUT must upsert exactly once, got %d", len(st.upserted))
+	}
+}
+
+// TestGetRunReviewAdminReadsOthers pins the READ side of the matrix (PRD #94 Decision 5): a
+// disposition WRITE is strict-owner-only, but the review READ stays owner-OR-admin (it feeds
+// the admin run-view and FileIssue). A non-owner admin reading ANOTHER user's review gets
+// 200 via the owner-or-admin GetRunByID path — the deliberate asymmetry the owner-only write
+// is layered on top of. Contrast TestSetDispositionIsOwnerOnly, where the same admin's WRITE
+// 404s. A plain (non-admin) non-owner would 404 here too, so the 200 is a real admin signal.
+func TestGetRunReviewAdminReadsOthers(t *testing.T) {
+	st, runID, _ := oneRecStore()
+	admin := store.User{ID: uuid.New(), IsAdmin: true} // NOT the owner
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.GetRunReview(rec, runReq(admin, runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin read of another user's review = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	sawAdminPath := false
+	for _, c := range st.calls {
+		if c == "GetRunByID" { // owner-or-admin resolve, not the owner-scoped GetRunByIDForUser
+			sawAdminPath = true
+		}
+	}
+	if !sawAdminPath {
+		t.Errorf("admin read must resolve via the owner-or-admin GetRunByID, calls=%v", st.calls)
+	}
+}
+
 // ---- 2. enum validation (PUT) -------------------------------------------------------
 
 // TestSetDispositionEnumValidation exercises the handler's validDisposition gate (PRD #94

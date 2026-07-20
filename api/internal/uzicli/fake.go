@@ -60,14 +60,18 @@ type FakeClient struct {
 	// Disposition triage (PRD #94): SetDisposition/DeleteDisposition record the
 	// (run, rec) they were called with and the wire status/reason, so a test can
 	// assert the exact mapping. JudgeStatsResult is the canned `stats` reply.
-	// DeleteDispositionErr, when set, is returned by DeleteDisposition (e.g.
-	// ErrNoDisposition) in preference to Err, so a test can exercise the
-	// already-undone soft path without failing every other method.
+	// SetDispositionErr / DeleteDispositionErr, when set, are returned by the
+	// matching write in preference to Err, so a test can model the OWNER-ONLY
+	// refusal precisely — a uza_ token READS the review fine (RunReview succeeds)
+	// and is refused only on the WRITE (404) — which a global Err cannot express
+	// (it would fail the resolve read first). The (run, rec) capture still records,
+	// so a test can assert the write was actually REACHED before being refused.
 	LastDispositionRunID  string
 	LastDispositionRecID  string
 	LastDispositionStatus string
 	LastDispositionReason string
 	JudgeStatsResult      apitypes.TriageDTO
+	SetDispositionErr     error
 	DeleteDispositionErr  error
 
 	// Err, when non-nil, is returned by every method (before any lookup).
@@ -153,6 +157,9 @@ func (f *FakeClient) SetDisposition(_ context.Context, runID, recID, status, rea
 	f.LastDispositionRecID = recID
 	f.LastDispositionStatus = status
 	f.LastDispositionReason = reason
+	if f.SetDispositionErr != nil {
+		return f.SetDispositionErr
+	}
 	return f.Err
 }
 

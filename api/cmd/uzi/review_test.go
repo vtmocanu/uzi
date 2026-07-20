@@ -242,14 +242,43 @@ func TestReviewShowSanitizesHumanRender(t *testing.T) {
 	}
 }
 
-// A read-only uza_ token is refused (404) on an owner-only mutation (Decision 5):
-// the injected FakeClient errors ExitNotFound on every call, so both the review
-// fetch and any write map to exit 4 — the command never succeeds.
+// A read-only uza_ token is refused (404) on an owner-only mutation (Decision 5).
+// This models uza_ FAITHFULLY: it READS another user's review fine (owner-or-admin,
+// GetReviewForTarget) and is refused ONLY on the strict-owner-only WRITE. So the
+// review fetch succeeds (resolveRecID resolves the short id) and SetDisposition
+// returns the 404 — exit 4. A prior version set a GLOBAL Err, which failed the
+// resolve READ first and never reached the write, so it proved nothing about the
+// write-path refusal; SetDispositionErr expresses "read OK, write 404".
 func TestReviewMutationRefusedForReadOnlyToken(t *testing.T) {
-	fc := &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitNotFound, "run not found")}
+	fc := reviewFake() // a valid, readable review — the uza_ read succeeds
+	fc.SetDispositionErr = uzicli.Exitf(uzicli.ExitNotFound, "run not found")
 	_, _, code := runCLI(t, fakeEnv(fc), "review", "resolve", "r1", "aaaaaaaa-1")
 	if code != uzicli.ExitNotFound {
 		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+	// The write was actually REACHED (read + resolve succeeded) then refused — this
+	// is the owner-only mutation gate, not a read failure. Prove the resolve mapped
+	// the short id to the full rec id and the write carried the intended verdict.
+	if fc.LastDispositionStatus != dispStatusDone {
+		t.Errorf("SetDisposition not reached (status=%q) — the test would pass on any read error, proving nothing", fc.LastDispositionStatus)
+	}
+	if fc.LastDispositionRecID != "aaaaaaaa-1111-4111-8111-000000000001" {
+		t.Errorf("resolve did not map the short id before the refusal, got rec id %q", fc.LastDispositionRecID)
+	}
+}
+
+// The undo (DELETE) path is likewise owner-only: a uza_ token reads the review but
+// its delete is refused (404). Distinct from ErrNoDisposition, which is the benign
+// already-undone soft path (exit 0); a 404 from the write is a hard refusal (exit 4).
+func TestReviewUndoRefusedForReadOnlyToken(t *testing.T) {
+	fc := reviewFake()
+	fc.DeleteDispositionErr = uzicli.Exitf(uzicli.ExitNotFound, "run not found")
+	_, _, code := runCLI(t, fakeEnv(fc), "review", "undo", "r1", "aaaaaaaa-1")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+	if fc.LastDispositionRecID != "aaaaaaaa-1111-4111-8111-000000000001" {
+		t.Errorf("undo did not reach the delete with the resolved rec id, got %q", fc.LastDispositionRecID)
 	}
 }
 

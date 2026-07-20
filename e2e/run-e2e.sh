@@ -281,6 +281,10 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the PRDLESS run-create gate and the disabled label endpoint).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# apidelete_code — a DELETE that echoes only the HTTP status (no -f), for the
+# disposition Undo (PRD #94) which returns 204. CSRF from the admin jar.
+apidelete_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X DELETE "$BASE$1" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)"; }
 
 wait_http() {
   local deadline=$((SECONDS + 90))
@@ -2068,6 +2072,77 @@ pass "cleaned up the filed-issue run (cancelled) so it frees worker capacity for
 apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
 apiput /api/me/judge '{"enabled":false}' >/dev/null
 pass "judge disabled again (global + opt-in) — later sections run unjudged"
+
+# --- PRD #94: triage a judge recommendation (dismiss / undo) ------------------
+# The full-stack proof M5 mandates: dismissing an improve_uzi recommendation drops it
+# from the self-improvement backlog (and Undo re-includes it), and the disposition
+# write SPENDS NO TOKEN and WRITES NOTHING TO THE FORGE. The stubbed judge only ever
+# emits install_worker_tool (its command-not-found fallback), so we PLANT one
+# improve_uzi recommendation on the review that already landed on $J_RUN (a stubbed
+# review) — a fresh coordinate that does not collide with the filed jq row above.
+say "PRD #94: triage a judge recommendation — dismiss drops it from the self-improve backlog; undo re-includes; no spend, no forge write"
+
+DR_REVIEW="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.id')"
+{ [ -n "$DR_REVIEW" ] && [ "$DR_REVIEW" != null ]; } || fail "PRD #94: no review on $J_RUN to triage"
+# Pre-generate the id in SQL (a clean single value) rather than INSERT ... RETURNING,
+# whose psql command tag ("INSERT 0 1") would contaminate the captured id once db_psql
+# strips the newline between them — the existing legs INSERT to /dev/null for the same reason.
+DR_REC="$(db_psql "SELECT gen_random_uuid()")"
+{ [ -n "$DR_REC" ]; } || fail "PRD #94: could not generate a recommendation id"
+db_psql "INSERT INTO review_recommendations (id, review_id, category, target, rationale_md, confidence) VALUES ('$DR_REC','$DR_REVIEW','improve_uzi','e2e-triage','triage e2e: dismiss must drop this from the backlog','high')" >/dev/null
+
+# in_backlog — the ACTUAL ListOpenImproveUziRecommendations predicate (both coordinate
+# NOT EXISTS exclusions), scoped to the planted row: 1 = still in the engine's backlog,
+# 0 = excluded. Mirrors queries/selfimprove.sql so the e2e observes exactly what the
+# self-improve engine would fold into its tracking issue.
+in_backlog() {
+  db_psql "SELECT count(*) FROM review_recommendations rr
+    WHERE rr.id='$DR_REC' AND rr.category='improve_uzi' AND rr.addressed_by_run_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM recommendation_filed_issues f
+                      WHERE f.review_id=rr.review_id AND f.category=rr.category AND f.target=rr.target)
+      AND NOT EXISTS (SELECT 1 FROM recommendation_dispositions d
+                      WHERE d.review_id=rr.review_id AND d.category=rr.category AND d.target=rr.target)"
+}
+[ "$(in_backlog)" = 1 ] || fail "PRD #94: the planted improve_uzi rec must start IN the self-improve backlog"
+pass "planted improve_uzi/e2e-triage recommendation is in the self-improve backlog (baseline)"
+
+# Snapshot the no-spend / no-forge-write invariants: the total run count (a judge or any
+# run enqueue would bump it) and the forge's entire mutable surface (a forge write would
+# change issues/mrs/notes/labelEvents). A disposition must move neither.
+DR_RUNS_BEFORE="$(db_psql "SELECT count(*) FROM runs")"
+forge_sig() { fake_state | jq -Sc '{issues:(.issues|length), mrs:(.mrs|length), notes:(.notes|length), labelEvents:(.labelEvents|length)}'; }
+DR_FORGE_BEFORE="$(forge_sig)"
+
+# Dismiss it as a false positive (not_an_issue) via the real HTTP endpoint → 204.
+DR_PUT_CODE="$(apiput_code "/api/runs/$J_RUN/review/recommendations/$DR_REC/disposition" '{"status":"dismissed","reason":"not_an_issue"}')"
+[ "$DR_PUT_CODE" = 204 ] || fail "PRD #94: dismiss PUT = $DR_PUT_CODE, want 204"
+apiget "/api/runs/$J_RUN/review" \
+  | jq -e '.review.dispositions[] | select(.target=="e2e-triage" and .status=="dismissed" and .reason=="not_an_issue")' >/dev/null \
+  || fail "PRD #94: the review DTO must carry the dismissed disposition"
+apiget "/api/runs/$J_RUN/review" | jq -e '.review.triage.false_positives >= 1' >/dev/null \
+  || fail "PRD #94: the per-review triage must count the not_an_issue dismissal as a false positive"
+[ "$(in_backlog)" = 0 ] || fail "PRD #94: a dismissed improve_uzi rec must DROP OUT of the self-improve backlog"
+pass "dismiss (not_an_issue): the rec left the backlog and shows as a false positive in the triage"
+
+# The invariants: no run enqueued, no forge write.
+[ "$(db_psql "SELECT count(*) FROM runs")" = "$DR_RUNS_BEFORE" ] \
+  || fail "PRD #94: dismissing enqueued a run — a disposition must spend no token"
+[ "$(forge_sig)" = "$DR_FORGE_BEFORE" ] \
+  || fail "PRD #94: dismissing changed the forge state — a disposition must write nothing to the forge"
+pass "the dismissal enqueued NO run and wrote NOTHING to the forge (no spend, no forge write)"
+
+# Undo (DELETE) → 204, and the rec RE-INCLUDES in the backlog; still no run / no forge write.
+DR_DEL_CODE="$(apidelete_code "/api/runs/$J_RUN/review/recommendations/$DR_REC/disposition")"
+[ "$DR_DEL_CODE" = 204 ] || fail "PRD #94: undo DELETE = $DR_DEL_CODE, want 204"
+[ "$(in_backlog)" = 1 ] || fail "PRD #94: Undo must RE-INCLUDE the rec in the self-improve backlog"
+[ "$(db_psql "SELECT count(*) FROM runs")" = "$DR_RUNS_BEFORE" ] \
+  || fail "PRD #94: undo enqueued a run — a disposition must spend no token"
+[ "$(forge_sig)" = "$DR_FORGE_BEFORE" ] \
+  || fail "PRD #94: undo changed the forge state — a disposition must write nothing to the forge"
+pass "undo: the rec re-entered the backlog; still no run enqueued and no forge write"
+
+# Tidy: drop the planted recommendation so it does not linger in later sections' state.
+db_psql "DELETE FROM review_recommendations WHERE id='$DR_REC'" >/dev/null
 
 # =============================================================================
 # PRD #39 — in-app uzi chat agent, end to end on the STUB chat executor.

@@ -679,16 +679,12 @@ export function JudgePanel({ run }: { run: Run }) {
     return m;
   }, [review]);
 
-  // Panel-level collapse for the dismissed rows (default: show). Counts the
-  // dismissed recommendations so the toggle can label itself.
+  // Panel-level collapse for the dismissed rows (default: show). The toggle label
+  // reads the server-computed count DIRECTLY (PRD #94 Decision 7 — never re-derive a
+  // triage aggregate in TS); dismissed is the top of the ladder, so this equals the
+  // number of dismissed rows on screen.
   const [showDismissed, setShowDismissed] = useState(true);
-  const dismissedCount = useMemo(
-    () =>
-      (review?.recommendations ?? []).filter(
-        (r) => dispByCoord.get(coordKey(r.category, r.target))?.status === "dismissed",
-      ).length,
-    [review, dispByCoord],
-  );
+  const dismissedCount = review?.triage?.dismissed ?? 0;
 
   // Bounded background poll after a re-run: the fresh verdict arrives when the new
   // judge run finishes, so check every few seconds for a changed updated_at, giving
