@@ -77,6 +77,7 @@ func (q *Queries) ListDispositionsForReview(ctx context.Context, reviewID uuid.U
 const listJudgeTriageRowsForUser = `-- name: ListJudgeTriageRowsForUser :many
 SELECT
     d.status AS disposition_status,
+    d.dismiss_reason AS dismiss_reason,
     (f.filed_at IS NOT NULL)::bool AS filed_settled
 FROM run_reviews rv
 JOIN review_recommendations rr ON rr.review_id = rv.id
@@ -89,11 +90,13 @@ WHERE rv.user_id = $1
 
 type ListJudgeTriageRowsForUserRow struct {
 	DispositionStatus pgtype.Text `json:"disposition_status"`
+	DismissReason     pgtype.Text `json:"dismiss_reason"`
 	FiledSettled      bool        `json:"filed_settled"`
 }
 
 // The GLOBAL flat join feeding the Go bucketer (Decision 8): from the caller's reviews,
-// ONE ROW PER RECOMMENDATION carrying its coordinate's disposition status (nullable) and
+// ONE ROW PER RECOMMENDATION carrying its coordinate's disposition status + dismiss_reason
+// (both nullable — dismiss_reason feeds the not_an_issue false-positive sub-count) and
 // whether it has a SETTLED filed link (filed_at IS NOT NULL — an in-flight/unsettled claim
 // is NOT "filed", matching the per-review path). There is deliberately NO SQL CASE and no
 // bucketing here: the ladder (dismissed > done > filed > open) is one Go helper consumed by
@@ -109,7 +112,7 @@ func (q *Queries) ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UU
 	items := []ListJudgeTriageRowsForUserRow{}
 	for rows.Next() {
 		var i ListJudgeTriageRowsForUserRow
-		if err := rows.Scan(&i.DispositionStatus, &i.FiledSettled); err != nil {
+		if err := rows.Scan(&i.DispositionStatus, &i.DismissReason, &i.FiledSettled); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

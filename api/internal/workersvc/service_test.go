@@ -72,11 +72,11 @@ type fakeStore struct {
 	// Register + heartbeat.
 	failOverCap      *store.FailWorkerRunsOverCapParams
 	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
-	requeueWorker  *store.RequeueWorkerRunsParams
-	registerParams *store.RegisterWorkerParams
-	registerResult store.Worker
-	heartbeat      store.Worker
-	callOrder      []string
+	requeueWorker    *store.RequeueWorkerRunsParams
+	registerParams   *store.RegisterWorkerParams
+	registerResult   store.Worker
+	heartbeat        store.Worker
+	callOrder        []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -90,27 +90,29 @@ type fakeStore struct {
 	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
 
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
-	runByIDPlain          store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
-	runByIDPlainErr       error
-	userByID              store.User
-	userByIDErr           error
-	createdJudgeRun       *store.CreateJudgeRunParams
-	createJudgeRunErr     error
-	activeJudgeRun        store.Run
-	activeJudgeRunErr     error
-	toolResultPayloads    [][]byte
-	toolResultPayloadsErr error
-	runInputs             []store.RunUserInput
-	workerPageMessages    []store.RunMessage
-	workerPageErr         error
-	upsertedReview        *store.UpsertRunReviewWithRecommendationsParams
-	upsertReviewErr       error
-	reviewByTarget        store.RunReview
-	reviewByTargetErr     error
-	recsByReview          []store.ReviewRecommendation
-	recsByReviewErr       error
-	filedByReview         []store.RecommendationFiledIssue
-	filedByReviewErr      error
+	runByIDPlain            store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
+	runByIDPlainErr         error
+	userByID                store.User
+	userByIDErr             error
+	createdJudgeRun         *store.CreateJudgeRunParams
+	createJudgeRunErr       error
+	activeJudgeRun          store.Run
+	activeJudgeRunErr       error
+	toolResultPayloads      [][]byte
+	toolResultPayloadsErr   error
+	runInputs               []store.RunUserInput
+	workerPageMessages      []store.RunMessage
+	workerPageErr           error
+	upsertedReview          *store.UpsertRunReviewWithRecommendationsParams
+	upsertReviewErr         error
+	reviewByTarget          store.RunReview
+	reviewByTargetErr       error
+	recsByReview            []store.ReviewRecommendation
+	recsByReviewErr         error
+	filedByReview           []store.RecommendationFiledIssue
+	filedByReviewErr        error
+	dispositionsByReview    []store.RecommendationDisposition
+	dispositionsByReviewErr error
 
 	// Submit input.
 	runByID            store.Run
@@ -388,6 +390,9 @@ func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]
 }
 func (f *fakeStore) ListFiledIssuesForReview(context.Context, uuid.UUID) ([]store.RecommendationFiledIssue, error) {
 	return f.filedByReview, f.filedByReviewErr
+}
+func (f *fakeStore) ListDispositionsForReview(context.Context, uuid.UUID) ([]store.RecommendationDisposition, error) {
+	return f.dispositionsByReview, f.dispositionsByReviewErr
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr

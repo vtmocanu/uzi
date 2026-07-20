@@ -47,6 +47,34 @@ type FiledIssueDTO struct {
 	FiledAt  time.Time `json:"filed_at"`
 }
 
+// DispositionDTO is one user triage verdict on a judge recommendation for the run-page
+// panel (PRD #94 Decision 7). Keyed on the same (category, target) coordinate as
+// FiledIssueDTO, so the panel matches it to a recommendation and renders the chip + Undo.
+// Reason is empty unless status=="dismissed". Stale is computed server-side (the
+// rationale-hash compare, Decision 3) — "the recommendation changed since you resolved it"
+// — so the browser never sees a hash.
+type DispositionDTO struct {
+	Category string    `json:"category"`
+	Target   string    `json:"target"`
+	Status   string    `json:"status"`
+	Reason   string    `json:"reason"`
+	SetAt    time.Time `json:"set_at"`
+	Stale    bool      `json:"stale"`
+}
+
+// TriageDTO is the recommendation tally, per-review and global (PRD #94 Decisions 2/7/8).
+// Every count is bucketed by the one shared Go ladder (dismissed > done > filed > todo),
+// so the per-review bar and the global strip cannot drift. FalsePositives is the
+// not_an_issue sub-count of Dismissed. Total is the recommendation-row denominator.
+type TriageDTO struct {
+	Total          int `json:"total"`
+	Todo           int `json:"todo"`
+	Filed          int `json:"filed"`
+	Done           int `json:"done"`
+	Dismissed      int `json:"dismissed"`
+	FalsePositives int `json:"false_positives"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {
@@ -61,4 +89,8 @@ type ReviewDTO struct {
 	Recommendations []RecommendationDTO `json:"recommendations"`
 	// FiledIssues are the settled recommendation→issue links for this review (PRD #68).
 	FiledIssues []FiledIssueDTO `json:"filed_issues"`
+	// Dispositions are the user's triage verdicts on this review's recommendations (PRD #94).
+	Dispositions []DispositionDTO `json:"dispositions"`
+	// Triage is the server-computed per-review tally (PRD #94), rendered directly by the panel.
+	Triage TriageDTO `json:"triage"`
 }

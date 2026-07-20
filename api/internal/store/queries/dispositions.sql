@@ -43,7 +43,8 @@ ORDER BY set_at ASC, id ASC;
 
 -- name: ListJudgeTriageRowsForUser :many
 -- The GLOBAL flat join feeding the Go bucketer (Decision 8): from the caller's reviews,
--- ONE ROW PER RECOMMENDATION carrying its coordinate's disposition status (nullable) and
+-- ONE ROW PER RECOMMENDATION carrying its coordinate's disposition status + dismiss_reason
+-- (both nullable — dismiss_reason feeds the not_an_issue false-positive sub-count) and
 -- whether it has a SETTLED filed link (filed_at IS NOT NULL — an in-flight/unsettled claim
 -- is NOT "filed", matching the per-review path). There is deliberately NO SQL CASE and no
 -- bucketing here: the ladder (dismissed > done > filed > open) is one Go helper consumed by
@@ -52,6 +53,7 @@ ORDER BY set_at ASC, id ASC;
 -- REQUIRED — without it sqlc types the boolean expression column as interface{}.
 SELECT
     d.status AS disposition_status,
+    d.dismiss_reason AS dismiss_reason,
     (f.filed_at IS NOT NULL)::bool AS filed_settled
 FROM run_reviews rv
 JOIN review_recommendations rr ON rr.review_id = rv.id

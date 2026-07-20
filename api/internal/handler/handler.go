@@ -348,6 +348,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Delete("/{id}", h.DeleteMyMemory)
 		})
 
+		// Global judge-triage strip (PRD #94 Decision 8): the caller's "across all your
+		// runs" tally. RequireUser (mirrors /me/memory) so `uzi review stats` works from a
+		// CLI token; owner-scoped by the query's user_id filter, bucketed by the shared
+		// Go ladder so it agrees with the per-review bar.
+		r.Route("/me/judge", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/stats", h.JudgeStats)
+		})
+
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
 		// secret DEK. All authenticated (CSRF applies to the POSTs). Unlock is a
 		// password-guessing surface, so it rides the auth limiter keyed PER USER
@@ -651,6 +660,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// same scoping as the review read); no forge write, no token spend. The
 				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
 				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
+				// Triage a recommendation (PRD #94 Decision 5): set/clear the caller's
+				// disposition. RequireUser (CLI-reachable, no token spend, no forge write) —
+				// NOT the cookie-only RequireAuth path rejudge/FileIssue sit on. OWNER-ONLY:
+				// the service resolves by strict caller-ownership, so a uza_ admin_ro token
+				// (which keeps IsAdmin) is refused on another user's review, like CreateRunInput.
+				r.Put("/{id}/review/recommendations/{recID}/disposition", h.SetDisposition)
+				r.Delete("/{id}/review/recommendations/{recID}/disposition", h.DeleteDisposition)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

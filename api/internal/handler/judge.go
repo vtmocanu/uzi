@@ -97,13 +97,20 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 			CreatedAt:   rc.CreatedAt.Time,
 		})
 	}
+	// coord keys both side-tables to a recommendation (the stable (category, target)
+	// coordinate PRD #68 introduced). The target='' collapse means several recs can share a
+	// coordinate — accepted, identical to the filed case.
+	type coord struct{ category, target string }
+
 	// Only SETTLED links (filed_at valid) surface to the panel; an in-flight claim is
 	// transient. The panel matches them to recommendations by (category, target).
 	filed := make([]apitypes.FiledIssueDTO, 0, len(rw.FiledIssues))
+	filedByCoord := make(map[coord]bool, len(rw.FiledIssues))
 	for _, f := range rw.FiledIssues {
 		if !f.FiledAt.Valid {
 			continue
 		}
+		filedByCoord[coord{f.Category, f.Target}] = true
 		filed = append(filed, apitypes.FiledIssueDTO{
 			Category: f.Category,
 			Target:   f.Target,
@@ -112,6 +119,44 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 			FiledAt:  f.FiledAt.Time,
 		})
 	}
+
+	// dispByCoord indexes the review's dispositions by coordinate (PRD #94). A disposition
+	// with no matching CURRENT recommendation is an orphan (re-judged away) — inert: it is
+	// NOT emitted and does NOT count (both keyed off the current recommendation rows).
+	dispByCoord := make(map[coord]store.RecommendationDisposition, len(rw.Dispositions))
+	for _, d := range rw.Dispositions {
+		dispByCoord[coord{d.Category, d.Target}] = d
+	}
+
+	// Emit one DispositionDTO per (category, target) that has BOTH a current recommendation
+	// and a disposition, deduping the target='' collapse via an emitted set; stale is the
+	// server-side rationale-hash compare against the first current rec on the coordinate.
+	// Triage buckets one row per current recommendation through the shared ladder, so the
+	// bar matches the on-screen rows and the global strip (filed = settled only).
+	dispositions := make([]apitypes.DispositionDTO, 0, len(rw.Dispositions))
+	emitted := make(map[coord]bool, len(rw.Dispositions))
+	triageRows := make([]workersvc.TriageRow, 0, len(rw.Recommendations))
+	for _, rc := range rw.Recommendations {
+		c := coord{rc.Category, rc.Target}
+		d, disposed := dispByCoord[c]
+		triageRows = append(triageRows, workersvc.TriageRow{
+			Status:       dispStatus(disposed, d),
+			Reason:       dispReason(disposed, d),
+			FiledSettled: filedByCoord[c],
+		})
+		if disposed && !emitted[c] {
+			emitted[c] = true
+			dispositions = append(dispositions, apitypes.DispositionDTO{
+				Category: d.Category,
+				Target:   d.Target,
+				Status:   d.Status,
+				Reason:   d.DismissReason.String, // "" when not dismissed
+				SetAt:    d.SetAt.Time,
+				Stale:    workersvc.RationaleHash(rc.RationaleMd) != d.RationaleHash,
+			})
+		}
+	}
+
 	return apitypes.ReviewDTO{
 		ID:              rw.Review.ID.String(),
 		TargetRunID:     rw.Review.TargetRunID.String(),
@@ -123,7 +168,25 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 		UpdatedAt:       rw.Review.UpdatedAt.Time,
 		Recommendations: recs,
 		FiledIssues:     filed,
+		Dispositions:    dispositions,
+		Triage:          workersvc.BucketTriage(triageRows),
 	}
+}
+
+// dispStatus / dispReason read a disposition's fields for the triage bucketer, yielding the
+// "" undisposed sentinels when the coordinate carries no disposition.
+func dispStatus(disposed bool, d store.RecommendationDisposition) string {
+	if !disposed {
+		return ""
+	}
+	return d.Status
+}
+
+func dispReason(disposed bool, d store.RecommendationDisposition) string {
+	if !disposed {
+		return ""
+	}
+	return d.DismissReason.String
 }
 
 // GetRunReview serves the judge's verdict + recommendations for a run, for the
