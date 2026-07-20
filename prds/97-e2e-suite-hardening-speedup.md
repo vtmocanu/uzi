@@ -4,6 +4,7 @@
 **Status**: Not started
 **Priority**: Medium
 **Origin**: Three-agent read-only review of the e2e suite (2026-07-20) — coverage (add/drop), speed, and harness-structure passes. Two independent agents flagged the git Basic-auth default as the single highest-value gap.
+**Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: M1's "flip the happy-path leg to smart-HTTP" is **not** viable (forge-fake routes every repo path to one bare, breaking the PRD #42 two-repo phase) — only the second-push-pass option survives, and the existing `E2E_GIT_SMART_HTTP=1` full run is likely already broken at #42; dropping #46 Phase B (M4) **breaks the downstream #68 phase** that reads the planted `jq` rec; the #16 collapse must **keep** the non-owner repo-PATCH→404 leg (no handler test covers it); M5's healthcheck saving is ~30-40s (not 55-80s — `start_interval` helps only the two `--wait` boots, not the `--force-recreate` api recreates) and its `assert_no_run_for_issue` default change is a no-op (all call sites pass explicit args). The #94/#53/#33/#40/#46-fallback drops were independently re-verified safe.
 **Scope note**: All work is on the test harness and its compose overlay, with two small exceptions that touch product code (a `SWEEP_INTERVAL` config knob in M6, called out explicitly). No product behaviour changes; no e2e assertion is weakened — every "drop" is verified redundant against a cheaper layer, every "faster" preserves the assertion.
 
 ## Problem
@@ -63,12 +64,20 @@ carry explicit author sign-off:
 
 ## Design Decisions
 
-1. **Git Basic-auth: run by default, don't just document the flag.** The `insteadOf`
-   local-path rewrite is what makes the default run fast and hermetic, so keep it as
-   one pass but add a **second push pass** (or flip the seeded repo to the
-   smart-HTTP remote for the happy-path leg) so `Authorization: Basic` is actually
-   exercised on every run. A flag nobody sets is not coverage. This is the one gap
-   both the coverage and structure passes flagged independently.
+1. **Git Basic-auth: run by default via a second push pass, don't just document the
+   flag.** The `insteadOf` local-path rewrite is what makes the default run fast and
+   hermetic, so keep it as one pass and add a **second push pass** against the
+   smart-HTTP remote so `Authorization: Basic` is actually exercised on every run. A
+   flag nobody sets is not coverage. This is the one gap both the coverage and
+   structure passes flagged independently. **Do not "flip the happy-path leg to
+   smart-HTTP" as an equivalent** (fable review): forge-fake routes *every* repo path
+   onto one shared bare (`forge-fake.mjs:381-387`, `PATH_INFO: /repo.git${rest}`),
+   so under smart-HTTP the PRD #42 two-repo phase's independent-bare assertions
+   (`run-e2e.sh:2665-2670`, run B's branch must be on `repo2.git` and absent from
+   `repo.git`) collapse. The second pass must therefore be scoped to a single-repo
+   phase (or forge-fake taught real multi-repo git routing, out of scope). Corollary:
+   the existing opt-in `E2E_GIT_SMART_HTTP=1` full run is almost certainly **already
+   broken at #42** today — M1 must confirm and fix, not just add a new pass.
 
 2. **`main`-push backstop asserts rejection, not just agent-branch success.** Today
    the harness only asserts the *agent* branch was pushed + MR opened
@@ -92,9 +101,14 @@ carry explicit author sign-off:
    healthcheck detection latency, and structural serialization. Lowering a ceiling
    buys nothing and adds flake under host contention — explicitly out of scope.
 
-5. **Negative-window sleeps floor at 2 poll ticks.** With `FORGE_POLL_INTERVAL=2s`,
-   a "prove X did not happen" window needs one tick to act + one to confirm-stable =
-   4s. 6→4s is safe; below 4s is not. Applied uniformly.
+5. **Negative-window sleeps floor at 2 poll ticks — except reconcile-driven ones.**
+   With `FORGE_POLL_INTERVAL=2s`, a "prove X did not happen" window needs one tick to
+   act + one to confirm-stable = 4s. 6→4s is safe there; below 4s is not. **But the
+   FullSync-eviction negative (`:1676`) waits on a *reconcile* tick, which fires only
+   every 2nd poll tick** (`FORGE_RECONCILE_EVERY=2` → 4s period; the poll interval
+   also doubles as the whole-tick deadline, `:1420-1422`). Floor reconcile-driven
+   negatives at **2 reconcile periods**, not 2 poll ticks — do not take `:1676` to 4s
+   (fable review).
 
 6. **`SWEEP_INTERVAL` is a real (if tiny) product change.** `sweeper.New()` already
    accepts an interval (`api/internal/sweeper/sweeper.go:51`) but `main.go:357`
@@ -127,28 +141,41 @@ carry explicit author sign-off:
 
 - [ ] **M1 — git Basic-auth default + `main`-push backstop** (highest value):
       make the worker's git-over-HTTPS Basic-auth push run on **every** default run
-      (Decision 1) — either flip the happy-path leg to the smart-HTTP remote or add
-      a mandatory second push pass — so `Authorization: Basic` is exercised and a
-      credential-injection regression turns the git-layer assertions red. Add a
-      pre-receive `refs/heads/main`-reject hook to `forge-fake` and a phase that
-      attempts a `main` push and **asserts it is refused** (Decision 2). Update
+      via a **second push pass** against the smart-HTTP remote, scoped to a
+      single-repo phase (Decision 1 — a happy-path flip is NOT viable; forge-fake's
+      one-bare routing breaks the #42 two-repo assertions). First **confirm and fix
+      the already-broken `E2E_GIT_SMART_HTTP=1` full run at #42**, then wire the pass
+      so `Authorization: Basic` is exercised and a credential-injection regression
+      turns the git-layer assertions red. Add a pre-receive `refs/heads/main`-reject
+      hook to `forge-fake` and a phase that attempts a `main` push and **asserts it is
+      refused** (Decision 2); the hook must be **portable to both images** — it fires
+      inside the *agent* container for local-path pushes and inside *forge-fake* for
+      smart-HTTP (the bares are one shared host dir, overlay `:35`/`:177`). Self-test
+      the hook (push main → refused; push agent branch → accepted). Update
       `README.md` to drop the "would not catch the Basic-auth bug" caveat.
-- [ ] **M2 — live `/api/ws` + `uzi` CLI smoke**: a WS client (e.g. `websocat`, added
-      to the harness image or run from a sidecar) subscribes to a live run over
-      `/api/ws` and asserts it receives live frames during a real run (not just the
-      REST `?after=` replay). A thin CLI leg logs in and drives `runs list --json` →
-      approve a plan against the running api, catching DTO/route drift the
-      web-driven phases miss. Both are separate HTTP clients on the real wire — no
-      lower layer exercises them.
+- [ ] **M2 — live `/api/ws` + `uzi` CLI smoke**: a WS client subscribes to a live run
+      over `/api/ws` and asserts it receives live frames during a real run (not just
+      the REST `?after=` replay). **No new tooling needed** (fable review): the agent
+      container's Node 22 has a global `WebSocket`, so a `compose exec agent node -e`
+      probe suffices (mirroring the smart-HTTP probe at `:1009`) — but `/api/ws` auth
+      is **cookie-based**, so the session cookie must be plumbed into the probe. A thin
+      CLI leg logs in and drives `runs list --json` → approve a plan against the
+      running api, catching DTO/route drift the web-driven phases miss; it runs
+      headless via `UZI_TOKEN` (docs/cli.md:61), so **spell out the CLI-token mint from
+      the harness admin session**. Both are separate HTTP clients on the real wire —
+      no lower layer exercises them.
 - [ ] **M3 — false-green hardening**: give the container-log scan (`:1176-1179`) and
       the `/data` scan (`:1182-1186`) a **positive control** — prove the corpus is
       non-empty before asserting the secret's absence (mirror the M6 `/proc` control
       at `:1312-1313` and the Decision-3 control at `:2943-2944`, and the CI
-      gate-on-the-gate in `test:api-store-it`). Wrap point-in-time reads
-      (`apiget`/`fake_state`/`db_psql`) in a light retry so one transient
-      curl/exec blip does not abort a ~20-min run (the `fake_has_label` hardening at
-      `:388-392` did this for one call site only). Tighten the weak Forgejo `<16`
-      secondary grep (`:689`, the `version` alternative matches almost anything).
+      gate-on-the-gate in `test:api-store-it`). Wrap point-in-time **reads** in a light
+      retry so one transient curl/exec blip does not abort a ~20-min run (the
+      `fake_has_label` hardening at `:388-392` did this for one call site only). **The
+      retry must be a NEW read-only wrapper, not a change to the shared helpers**
+      (fable review): `db_psql` (`:1924`) is also used for WRITES (`:2087`, `:2191`,
+      `:2843`), and a blanket retry could double-execute a write after an ambiguous
+      failure. Tighten the weak Forgejo `<16` secondary grep (`:689`, the `version`
+      alternative matches almost anything).
 - [ ] **M4 — drop / downgrade verified-redundant phases**: with each redundancy
       confirmed against the named lower-layer test —
       - PRD #94 triage (`:2182`) → **drop** (covered by
@@ -159,38 +186,64 @@ carry explicit author sign-off:
         `handler/ratelimits_test.go`).
       - PRD #46 Phase B re-judge (`:2085`) → **drop, keep Phase A** (fallback covered
         by `agent/test/judge-runner.test.ts` + `workersvc/judge_m3_test.go`; Phase A
-        committed-terminal→judge→notification is genuinely full-wire).
+        committed-terminal→judge→notification is genuinely full-wire). **BLOCKER
+        (fable review): dropping Phase B breaks the downstream PRD #68 phase.** #68 at
+        `:2104` reads the `install_worker_tool/jq` rec (`F_REC`) that exists ONLY
+        because Phase B planted `bash: jq: command not found` (`:2087`) and re-judged;
+        remove Phase B and `:2105` fails, taking #68 with it. The drop must first
+        rework #68's setup — seed the rec row directly (the way #94 does at `:2191`),
+        or plant the signal before Phase A's judge. Do not drop Phase B in isolation.
       - PRD #33 (`:1392`) → keep verbatim-reason-through-worker; **drop the stop_kind
         SQL half** (`store/stop_kind_integration_test.go`).
       - PRD #40 (`:1023`) → keep "worker frame parsed & folded"; **drop the rollup
         math** (`store/run_usage_integration_test.go`).
-      - PRD #16 skills authz (`:870`) → **collapse to router glue** (matrix in
-        `handler/skills_test.go`).
+      - PRD #16 skills authz (`:870`) → **collapse to router glue BUT keep the
+        non-owner repo-PATCH leg** (fable review): `handler/skills_test.go` covers the
+        403-vs-404 skills/template matrix, but the phase's 4th leg — non-owner
+        `PATCH /api/repos/{id}` → 404 (`:889-892`) — is a *repos*-handler property
+        with **no handler test anywhere** (no `repos_test.go`). Keep that leg, or add
+        the handler test before collapsing.
 
       **Do NOT drop** (look redundant, are not — different topology / live kernel,
       full-wire-only): #58 XFF (`:1263`, empty-`TRUSTED_PROXIES` compose vs unit's
       k8s CIDR), #51 uid boundary (`:1299`), secret-hygiene (`:1175`), #83 Decision-3
       (`:2879`). This guard list ships in the phase comments so a future reader does
       not "finish the job."
-- [ ] **M5 — mechanical speedups (~55–80s, low/zero risk)**: add `start_interval: 1s`
+- [ ] **M5 — mechanical speedups (~30–40s, low/zero risk)**: add `start_interval: 1s`
       to the db + api + forge-fake healthchecks in the **overlay only** (base
-      `docker-compose.yml` defaults untouched) — cuts the ~4s first-probe floor off
-      every `up --wait` / api recreate (~24s across the run). Tighten
-      negative-window sleeps to 2 poll ticks (Decision 5): `:1441,:1473,:1676` 6→4s,
-      `:1690` 5→4s, `assert_no_run_for_issue` default `:434` 6→4s (hits
-      `:1663,:1700`), vault `:1962` 3→1.5s.
-- [ ] **M6 — structural speedups (~130–150s, author sign-off gated)**: parallelize
+      `docker-compose.yml` defaults untouched). **Corrected mechanism (fable review):**
+      this helps ONLY the two full-stack `up -d --wait db api web forge-fake` boots
+      (`:592`, `:956`, ~8–12s each via the db→api chain) plus marginally the
+      `--wait agent/dind` calls — NOT the four api recreates (`:753,:1430,:2002,:2685`),
+      which use `up -d --no-deps --force-recreate` **without** `--wait` and then a
+      0.3s `wait_http` curl-poll, so healthcheck cadence is irrelevant to them.
+      Realistic ≈ 30–40s total, not the ~24s-from-every-recreate the first draft
+      claimed. (`start_interval` needs Docker Engine ≥25 — note it in `README.md`;
+      the pinned Docker 29 / Compose 5.1 support it.) Tighten negative-window sleeps
+      (Decision 5): `:1441,:1473` 6→4s, `:1690` 5→4s, vault `:1962` 3→1.5s. **NOT
+      `:1676`** (reconcile-driven — floor at 2 reconcile periods, Decision 5). **The
+      `assert_no_run_for_issue` "default `:434` 6→4s" is a no-op** (fable review): the
+      `:434` default is never used — every call site passes an explicit arg (`:1663`=6,
+      `:1700`=6, `:1678`=0); change the explicit `6`s at `:1663`/`:1700`, leave `:1678`.
+- [ ] **M6 — structural speedups (~110–135s net, author sign-off gated)**: parallelize
       the PRD #47 health legs a/b/c on a `WORKER_MAX_CONCURRENT_RUNS≥3` worker
       (`:2735`; per-run `health`/`health_notified_at`, same assertions run
       concurrently → wall clock ~max instead of ~sum, ~120s) — **gated on** the
       author confirming the three sentinels don't interfere and the nudge-once window
-      still isolates each run. Wire the `SWEEP_INTERVAL` knob (Decision 6; ~2s in the
-      overlay → shrinks stall/loop latency and the `sleep 18` at `:2781`). Move
-      `E2E_WORKER_HEARTBEAT_STALE=15s` into the initial env-file and **delete the
-      dedicated api recreate** at `:2685` (~20s) — **gated on** no earlier phase
-      leaning on the 45s default. Halve the chat idle window (overlay
-      `WORKER_CHAT_IDLE_TIMEOUT` 20→10s, ~10s) — **gated on** no gap in the
-      red-team→propose→confirm→dismiss sequence (`:2329-2422`) exceeding 10s.
+      still isolates each run. **Unstated cost (fable review): the worker is at cap 2
+      entering #47** (set `:2590`, never reverted; `:2648` asserts cap==2), so cap≥3
+      needs an **extra agent recreate + register wait (~15s)** between #42 and #47 —
+      net saving ≈ ~105s, not the full ~120s. Wire the `SWEEP_INTERVAL` knob
+      (Decision 6; ~2s in the overlay → shrinks stall/loop latency and the `sleep 18`
+      at `:2781`). Move `E2E_WORKER_HEARTBEAT_STALE=15s` into the initial env-file and
+      **delete the dedicated api recreate** at `:2685` (~20s) — **gated on** no earlier
+      phase leaning on the 45s default; scrutinize the mid-suite worker restart the
+      gapless-seq assertion spans (`:1018-1021`), where >15s worker downtime would
+      trip a sweeper requeue the 45s default currently absorbs. Halve the chat idle
+      window (~10s) — **gated on** no gap in the red-team→propose→confirm→dismiss
+      sequence (`:2329-2422`) exceeding 10s; **change `WORKER_CHAT_IDLE_TIMEOUT` in
+      BOTH overlay places** (api `:104`, agent `:173`) and keep the api-side
+      `CHAT_IDLE_TIMEOUT: 90s` ordering (`:97-105`).
 - [ ] **M7 — (optional) harness structural refactor**: extract the helper library
       (`:190-467` + the `/_e2e` helpers) into `e2e/lib.sh`, and split the ~30 phases
       into `e2e/phases/NN-<name>.sh` sourced **in order** by a thin driver that owns
@@ -205,10 +258,15 @@ carry explicit author sign-off:
 hardening / mechanical timing — separate parts of the file and the overlay) and can
 run as parallel agents. **M2** (new WS + CLI legs) is independent of those but larger.
 **M4** (drops) is safest **after** M7 if M7 is done (phase boundaries become explicit),
-else standalone. **M6** is independent but gated on author sign-off per leg. **M7**, if
-taken, should land **first** as it moves every phase; otherwise skip it and treat
+else standalone; note M4's #46-Phase-B drop is coupled to reworking #68 first
+(Decision 3 / M4). **M6** is independent but gated on author sign-off per leg. **M7**,
+if taken, should land **first** as it moves every phase; otherwise skip it and treat
 M1–M6 as the deliverable. Suggested: Phase 1 = {M1, M3, M5} parallel; Phase 2 = {M2,
-M4}; Phase 3 = M6 (sign-off gated); M7 optional bookend/opener.
+M4}; Phase 3 = M6 (sign-off gated); M7 optional bookend/opener. **Caveat (fable
+review): "fully parallel" is optimistic** — M1/M3/M5 all edit the same 3000-line
+file; regions are distinct but M3 (helper wrappers) and M5 (scattered sleeps) will
+brush shared areas, so expect minor merge friction. Sequential landing, or M7-first
+to make the boundaries explicit, is smoother.
 
 ## Success Criteria
 
@@ -222,9 +280,10 @@ M4}; Phase 3 = M6 (sign-off gated); M7 optional bookend/opener.
 - The dropped phases are gone/collapsed with **no** net loss of asserted behaviour —
   each property still proven by its cited lower-layer test; the do-NOT-drop guard
   list is in the phase comments (M4).
-- Wall-clock drops by ~55–80s from the mechanical changes alone with **zero** assertion
-  weakened, and by a further ~130–150s if the sign-off-gated structural changes land
-  (M5, M6). No `wait_*` timeout ceiling was lowered.
+- Wall-clock drops by ~30–40s from the mechanical changes alone with **zero** assertion
+  weakened, and by a further ~110–135s net if the sign-off-gated structural changes land
+  (M5, M6 — the health-phase win is offset by a ~15s cap≥3 recreate). No `wait_*`
+  timeout ceiling was lowered.
 - (If M7) the harness is a helper lib + an ordered phase registry driven by a thin
   driver; the inter-phase contract is documented in one place; the run is behaviour-
   identical to before.
