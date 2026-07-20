@@ -1,7 +1,7 @@
 # PRD #97: e2e suite hardening & speedup
 
 **GitLab Issue**: [#97](https://gitlab.example.com/vtmocanu/uzi/-/issues/97)
-**Status**: Not started
+**Status**: In progress — 7 of 9 milestones done (M1/M2/M3/M5/M8 fully closed; M4+M9 committed and gate-passed, review/audit owed). M6 deferred to #100; M7 optional. See RESUME HERE below.
 **Priority**: Medium
 **Origin**: Three-agent read-only review of the e2e suite (2026-07-20) — coverage (add/drop), speed, and harness-structure passes. Two independent agents flagged the git Basic-auth default as the single highest-value gap.
 **Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: M1's "flip the happy-path leg to smart-HTTP" is **not** viable (forge-fake routes every repo path to one bare, breaking the PRD #42 two-repo phase) — only the second-push-pass option survives, and the existing `E2E_GIT_SMART_HTTP=1` full run is likely already broken at #42; dropping #46 Phase B (M4) **breaks the downstream #68 phase** that reads the planted `jq` rec; the #16 collapse must **keep** the non-owner repo-PATCH→404 leg (no handler test covers it); M5's healthcheck saving is ~30-40s (not 55-80s — `start_interval` helps only the two `--wait` boots, not the `--force-recreate` api recreates) and its `assert_no_run_for_issue` default change is a no-op (all call sites pass explicit args). The #94/#53/#33/#40/#46-fallback drops were independently re-verified safe.
@@ -9,7 +9,7 @@
 
 ## ▶ RESUME HERE (session paused 2026-07-20)
 
-**State: 5 of 9 milestones DONE and green; M4+M9 code-complete but NOT gated; M6/M7 deferred.**
+**State: M1/M2/M3/M5/M8 fully closed. M4+M9 committed and GATE PASSED (173/0, comfortable margins) — their review/audit wave is the only thing owed. M6 deferred to #100; M7 optional, never started.**
 
 | milestone | state |
 |---|---|
