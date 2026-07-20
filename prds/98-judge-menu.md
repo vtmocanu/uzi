@@ -204,6 +204,20 @@ one action.
    - **Multi-select** across groups (the checkbox bar) is a multi-item call to the
      disposition endpoint — the UI batches selection, the API takes a list of
      `(category, target)` coordinates in one round-trip.
+   - **Settled at implementation (2026-07-20), both deliberate:** the N upserts are
+     **not wrapped in a transaction**. Each is local, side-effect-free and
+     last-writer-wins, with no forge write and no spend to make exactly-once — #94
+     Decision 6's own reasoning — so a partial failure is safely retried and
+     converges. Two properties keep that honest and must not be dropped: `updated`
+     reflects what actually landed, and the re-read `groups` show the true
+     post-state, so a partial apply is **visible** rather than silently assumed
+     complete. The response is `{updated, groups, triage}` with **`groups` re-read at
+     `bucket=all`** — the subtle part: a just-dismissed group has left To triage but
+     must still come back so M3 can re-render the row instead of having it vanish
+     mid-interaction. **M3 must not "optimize" that re-read down to the active
+     filter**; doing so reintroduces exactly that flicker. `items` is capped at
+     `JudgeDispositionMaxItems = 100`, deduplicated **before** the cap check so the
+     cap counts distinct work rather than body length.
 
 4. **The notification is KEPT as a ping; only its deep-link retargets to the
    Judge menu.** The `judge_review` payload already anchors `run_id` + `review_id`
@@ -365,7 +379,7 @@ exactly as #68 already does.
       Store/handler test: dedup groups the same `(category, target)` across ≥2 runs
       into one group with a correct occurrence list; the bucketed totals equal `GET
       /me/judge/stats` for the same fixture (shared `BucketOf`, no re-implementation).
-- [ ] **M2 — Bulk disposition (api)**: `PUT .../recommendations/disposition`
+- [x] **M2 — Bulk disposition (api)** — DONE `30204a61`; review wave dispatched.: `PUT .../recommendations/disposition`
       (Decision 3) — coordinate fan-out reusing #94's idempotent disposition upsert,
       `scope=open|all` (`open` = `bucket==todo`). Owner-only authz matrix (owner fans
       out; non-owner → 404; uza_ `admin_ro` → 404 on another user's rows, allowed on

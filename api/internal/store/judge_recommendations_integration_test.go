@@ -164,3 +164,83 @@ func TestJudgeBacklogRunAnchorLiveDB(t *testing.T) {
 		t.Fatalf("LIMIT 2 returned %d rows, want 2 — the hard row cap must bind in SQL", len(capped))
 	}
 }
+
+// TestJudgeBacklogPreviewRecencyLiveDB pins the ORDER BY that decides which occurrence
+// supplies a group's rationale_preview (PRD #98 Decision 1). The grouper takes a group's
+// first row, so "most-recent occurrence" is whatever this query's ordering says it is —
+// which makes the choice of timestamp a real behavioural decision, not a formatting one.
+//
+// The failure it guards is specific: UpsertRunReviewWithRecommendations (judge.sql) makes a
+// RE-JUDGE an in-place upsert that rewrites rationale_md and bumps updated_at but LEAVES
+// created_at at the first judging. So run A judged Monday, run B judged Tuesday, run A
+// re-judged Wednesday with new text — ordering by created_at puts B first and the preview
+// quotes Tuesday's text, which the judge has already superseded. Ordering by updated_at
+// puts the re-judged A first, which is what a reader means by "the latest".
+//
+// This can only be tested against a real database: the ordering lives entirely in SQL.
+func TestJudgeBacklogPreviewRecencyLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	owner, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		owner, fmt.Sprintf("preview-%s@e2e", owner))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, owner, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	// Explicit timestamps, so the scenario is exact rather than dependent on insert speed.
+	mon := "2026-07-06 09:00:00+00"
+	tue := "2026-07-07 09:00:00+00"
+	wed := "2026-07-08 09:00:00+00"
+	seed := func(iid int, title, createdAt, updatedAt, rationale string) {
+		runID, reviewID := uuid.New(), uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, $5, 'd', 'completed')`, runID, owner, repoID, iid, title)
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict, created_at, updated_at)
+			 VALUES ($1, $2, $3, 'issues', $4::timestamptz, $5::timestamptz)`,
+			reviewID, runID, owner, createdAt, updatedAt)
+		mustExec(ctx, t, pool,
+			`INSERT INTO review_recommendations (review_id, category, target, rationale_md)
+			 VALUES ($1, 'improve_uzi', 'docs', $2)`, reviewID, rationale)
+	}
+	// Run A: first judged Monday, RE-judged Wednesday — created_at stays Monday.
+	seed(1, "run A", mon, wed, "wednesday re-judge text")
+	// Run B: judged Tuesday and never re-judged. Newer by created_at, older by updated_at.
+	seed(2, "run B", tue, tue, "tuesday text")
+
+	rows, err := q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+		UserID: owner, Lim: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListJudgeRecommendationRowsForUser: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows, got %d", len(rows))
+	}
+	if rows[0].RationaleMd != "wednesday re-judge text" {
+		t.Fatalf("first row's rationale = %q, want the RE-JUDGED text.\n"+
+			"The group preview takes the first row, so ordering by created_at here would quote "+
+			"text the judge already replaced. Order by rv.updated_at.", rows[0].RationaleMd)
+	}
+	if rows[0].RunTitle != "run A" {
+		t.Errorf("first row = %q, want run A (re-judged most recently)", rows[0].RunTitle)
+	}
+}

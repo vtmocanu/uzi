@@ -21,9 +21,19 @@
 -- coordinate. The `runs` join is 1:1 (rv.target_run_id → runs.id, and target_run_id is
 -- itself UNIQUE), so it cannot fan out either.
 --
--- Order: most-recent review first, then the review's own recommendation order. The Go
--- grouper relies on this — a group's FIRST row is its most-recent occurrence, which is
--- the one whose rationale_md becomes rationale_preview (Decision 1).
+-- Order: most-recently-JUDGED review first, then the review's own recommendation order.
+-- The Go grouper relies on this — a group's FIRST row is its most-recent occurrence, and
+-- that row's rationale_md becomes rationale_preview (Decision 1).
+--
+-- The leading key is rv.updated_at, NOT rv.created_at, and the difference is observable:
+-- UpsertRunReviewWithRecommendations (judge.sql) makes a RE-JUDGE an in-place upsert that
+-- rewrites rationale_md and bumps updated_at while LEAVING created_at at the first judging.
+-- Ordering by created_at would therefore show a run judged last week ahead of one
+-- re-judged five minutes ago, and the preview would quote text the judge has already
+-- replaced. created_at stays as the tiebreak so reviews judged in the same instant still
+-- order deterministically. Freezing updated_at (or swapping these two keys) breaks
+-- TestJudgeBacklogPreviewRecencyLiveDB — which is a live-DB test precisely because this
+-- ordering is a property of the SQL and nothing in Go can hold it.
 SELECT
     rv.id                          AS review_id,
     rv.target_run_id               AS run_id,
@@ -67,7 +77,7 @@ WHERE rv.user_id = @user_id
             AND rr2.target = rr.target
       )
   )
-ORDER BY rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
+ORDER BY rv.updated_at DESC, rv.created_at DESC, rv.id DESC, rr.created_at ASC, rr.id ASC
 -- A hard row bound: an all-time backlog with ?bucket=all is otherwise unbounded (the PRD's
 -- Risks section concedes this). The caller passes cap+1 and reports `truncated` when the
 -- extra row comes back, so the cut is exact rather than inferred. Because the order is

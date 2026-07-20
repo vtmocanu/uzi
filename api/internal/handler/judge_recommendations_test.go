@@ -165,11 +165,27 @@ func TestJudgeRecommendationsDedupsAcrossRuns(t *testing.T) {
 
 // ---- the shared-ladder proof --------------------------------------------------------
 
-// TestJudgeBacklogTotalsEqualStats is the M1 no-re-implementation gate: for the SAME
-// fixture, the backlog's triage tally is byte-identical to what GET /me/judge/stats
-// returns, and the per-group open_count sums to triage.todo. Both numbers come from the
-// one shared workersvc.BucketOf ladder (#94 Decision 2) — if anyone re-implemented the
-// bucketing in SQL or in the grouper, these would drift and this test would fail.
+// TestJudgeBacklogTotalsEqualStats makes two assertions that are easy to conflate, and they
+// are NOT equally strong. Stated precisely, because this comment used to claim that both
+// would catch a re-implemented ladder and that is false. Each claim below was verified by
+// mutation against THIS code, not inferred:
+//
+//   - `sumOpen == triage.todo` is the LADDER-SHARING GATE — the line that actually bites.
+//     sum(open_count) is produced by the grouper (which buckets every occurrence through
+//     BucketOf) while triage.todo comes from BucketTriage. Giving the grouper a divergent
+//     local ladder fails exactly here: "sum(open_count) = 2, want triage.todo = 1".
+//   - `got.Triage == stats` is WEAK, and weaker than it looks. Triage no longer passes
+//     through the grouper at all — it is read from the #94 stats query — so a wrong ladder
+//     in the grouper cannot move it. And because this test's fake derives its stats rows
+//     from the same fixture, the line is close to a tautology here: making the backlog
+//     tally triage off its own page rows (the pre-truncation shape, which a LIMIT makes
+//     wrong) does NOT fail this test. What catches that regression is
+//     TestJudgeRecommendationBacklogTruncates in internal/workersvc, which fails with
+//     "triage.total = 2000, want 2025 — the tally must not follow the truncated page".
+//     Keep this line for the shape it pins, not for a guarantee it does not provide.
+//
+// Neither line exercises SQL: the store is faked here. The query's own guarantees are
+// pinned in internal/store/judge_recommendations_integration_test.go against real Postgres.
 func TestJudgeBacklogTotalsEqualStats(t *testing.T) {
 	rows, _ := backlogFixtureRows()
 	st := &backlogStore{rows: rows}

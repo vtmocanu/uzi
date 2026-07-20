@@ -42,7 +42,7 @@ func (h *Handler) JudgeRecommendations(w http.ResponseWriter, r *http.Request) {
 	if bucket == "" {
 		bucket = "todo" // the backlog's reason to exist: what still needs triage
 	}
-	if !workersvc.JudgeBacklogBuckets[bucket] {
+	if !workersvc.ValidJudgeBacklogBucket(bucket) {
 		httpx.Error(w, http.StatusBadRequest, "invalid bucket")
 		return
 	}

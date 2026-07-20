@@ -12,13 +12,22 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// JudgeBacklogBuckets is the ?bucket= filter enum for the Judge menu (PRD #98 M1).
-// "all" is the unfiltered view; the other four are the #94 ladder's rungs, matched
-// against the GROUP rollup (not against a member). Validated by the handler; the
-// service treats an unknown value as "all" only because it can never reach it.
-var JudgeBacklogBuckets = map[string]bool{
+// judgeBacklogBuckets is the ?bucket= filter enum for the Judge menu (PRD #98 M1). "all"
+// is the unfiltered view; the other four are the #94 ladder's rungs, matched against the
+// GROUP rollup (not against a member).
+//
+// Unexported ON PURPOSE, reached only through ValidJudgeBacklogBucket. An exported
+// package-level map is mutable from anywhere in the binary, so any package could have
+// widened the handler's input validation by adding a key — a validator you cannot see from
+// the handler is not a validator. A function gives M3/M7 the same ergonomics with none of
+// the reach.
+var judgeBacklogBuckets = map[string]bool{
 	"todo": true, "filed": true, "done": true, "dismissed": true, "all": true,
 }
+
+// ValidJudgeBacklogBucket reports whether s is an accepted ?bucket= value. The handler
+// rejects anything else with a 400 rather than silently ignoring the filter.
+func ValidJudgeBacklogBucket(s string) bool { return judgeBacklogBuckets[s] }
 
 // bucketRank orders the #94 ladder for the GROUP rollup (PRD #98 Decision 2:
 // dismissed > done > filed > todo). It ranks the OUTPUT of BucketOf; it is not a second
@@ -138,8 +147,9 @@ func (s *Service) JudgeRecommendationBacklog(ctx context.Context, ownerUserID uu
 }
 
 // GroupJudgeRecommendations dedups the flat rows by (category, target) (PRD #98
-// Decisions 1/2). It expects the query's order — most-recent review first — so a group's
-// FIRST row is its most-recent occurrence and supplies rationale_preview.
+// Decisions 1/2). It expects the query's order — most-recently-JUDGED review first, i.e.
+// by rv.updated_at so a re-judge counts as recent — so a group's FIRST row is its
+// most-recent occurrence and supplies rationale_preview.
 //
 // Per group: OpenCount counts members whose bucket is todo; RunCount counts DISTINCT runs
 // (a judge may emit the same coordinate twice in one review, so occurrences can outnumber

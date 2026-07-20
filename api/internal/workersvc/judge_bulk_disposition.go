@@ -22,10 +22,19 @@ const JudgeDispositionMaxItems = 100
 // The handler maps it to 400. Distinct from a resolve miss, which is not an error at all.
 var ErrTooManyItems = errors.New("too many items")
 
-// JudgeDispositionScopes is the scope enum: "open" (the default) touches only members the
+// judgeDispositionScopes is the scope enum: "open" (the default) touches only members the
 // shared ladder buckets as todo — a FILED member is left filed (PRD #98 Decision 2's
 // definition of open) — while "all" re-asserts across every member of the coordinate.
-var JudgeDispositionScopes = map[string]bool{"open": true, "all": true}
+//
+// Unexported for the same reason as judgeBacklogBuckets: an exported package-level map is
+// mutable from anywhere in the binary, so a validator built on one can be widened out of
+// sight of the handler that relies on it. Here that would be a security-relevant widening,
+// since the scope is what keeps a settled member's verdict from being overwritten.
+var judgeDispositionScopes = map[string]bool{"open": true, "all": true}
+
+// ValidJudgeDispositionScope reports whether s is an accepted scope. Anything else is a
+// 400 — never a silent fallback to a scope the caller did not ask for.
+func ValidJudgeDispositionScope(s string) bool { return judgeDispositionScopes[s] }
 
 // JudgeDispositionCoord is one requested (category, target) coordinate. It is the
 // caller's REQUEST, not a resolved row: nothing from here is ever written to the database.

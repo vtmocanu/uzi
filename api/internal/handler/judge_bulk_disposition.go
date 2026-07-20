@@ -64,7 +64,7 @@ func (h *Handler) BulkSetDispositions(w http.ResponseWriter, r *http.Request) {
 	if scope == "" {
 		scope = "open" // the default: settle what is open, never re-assert a settled member
 	}
-	if !workersvc.JudgeDispositionScopes[scope] {
+	if !workersvc.ValidJudgeDispositionScope(scope) {
 		httpx.Error(w, http.StatusBadRequest, "invalid scope")
 		return
 	}
