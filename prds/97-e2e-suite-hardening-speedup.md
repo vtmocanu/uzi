@@ -931,7 +931,12 @@ carry explicit author sign-off:
       **against a param that was never captured**. A test that passes because nothing was recorded
       is the same failure class the commit exists to fix.
 
-### ⚠️ Follow-up found by M9c — OUT OF SCOPE for this PRD, needs its own issue
+### ⚠️ Follow-up found by M9c — OUT OF SCOPE for this PRD → tracked in [issue #101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101)
+
+**All four follow-ups below are filed as [#101](https://gitlab.example.com/vtmocanu/uzi/-/issues/101)**
+(viewer-identity call sites, the remaining `GetSkill` properties, the repo-wide gofmt drift, and
+homing the AST comment-inertness checker), together with the methodology rules. They must **not** be
+folded into this branch. Detail retained here because it is the evidence, and #101 is the tracker.
 
 Chasing the `#16` seam surfaced a **class**, not a one-off. Recorded here with precise wording,
 because the difference matters and is easy to garble:
