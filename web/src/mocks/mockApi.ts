@@ -30,7 +30,6 @@ import {
   type SlackLink,
   type UpdateSettingsPayload,
   type RunInputKind,
-  type SteerInput,
   type SecretMeta,
   type Skill,
   type SkillCreateInput,
@@ -66,6 +65,7 @@ import {
   mockReviews,
   type MockReview,
   mockRepoToolProfiles,
+  mockRunInputs,
   mockSecrets,
   mockSkills,
   mockTemplates,
@@ -1550,11 +1550,13 @@ export const mockApi = {
     if (!log) throw new ApiError(404, "run not found");
     return delay({ messages: log.filter((m) => m.seq > afterSeq).map((m) => ({ ...m })) }, 60);
   },
-  // PRD #95 steer queue. M1 seam: an empty queue for any existing run; M3 seeds the
-  // mock with real delivery-state fixtures.
+  // PRD #95 steer queue (M2 seeds demo data across delivery states so M3's
+  // SteerQueueCard renders every chip). A run with no sample inputs returns an empty
+  // queue; a missing run 404s (which the card treats as "no queue", never an error).
   getRunInputs: async (id: string) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
-    return delay({ inputs: [] as SteerInput[] }, 60);
+    const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
+    return delay({ inputs }, 60);
   },
   submitRunInput: async (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
