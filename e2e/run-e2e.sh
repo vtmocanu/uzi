@@ -545,6 +545,38 @@ for r in repo repo2; do
   rm -rf "$seedwc"
 done
 
+# PRD #97 M1 — protected-branch backstop on the fake remote (Decision 2 / Risk 3).
+# The top directive is "main is never touched"; the fake bare would otherwise ACCEPT a
+# push to main (http.receivepack true, no ref filter), so the "main-push refused"
+# assertion would be vacuous. Install a pre-receive hook that refuses refs/heads/main.
+#
+# It is LOAD-BEARING and must fire under BOTH e2e git transports. Because the bare is
+# ONE shared host dir (mounted /fakeremote in the agent, /gitroot in forge-fake),
+# receive-pack reads THIS hook whether it runs in the agent image (local-path insteadOf
+# push) or in forge-fake (smart-HTTP). Verified: a pushing client's own core.hooksPath
+# override (as the worker's gitEnv sets) does NOT suppress a server-side pre-receive, so
+# the hook fires for worker pushes too — and since it rejects ONLY main, every legitimate
+# agent-branch push still lands. Installed AFTER the seed `main` push above (else it would
+# refuse the seed). POSIX sh + no external tools, so it is portable across the Alpine
+# (agent) and Debian (forge-fake) images.
+for r in repo repo2; do
+  cat > "$RUNROOT/fakeremote/$r.git/hooks/pre-receive" <<'EOF'
+#!/bin/sh
+# uzi e2e: refuse any update to the protected branch main (see run-e2e.sh PRD #97 M1).
+status=0
+while read -r _old _new ref; do
+  case "$ref" in
+    refs/heads/main)
+      echo "pre-receive: refusing push to protected branch main (uzi never touches main)" >&2
+      status=1
+      ;;
+  esac
+done
+exit $status
+EOF
+  chmod 0755 "$RUNROOT/fakeremote/$r.git/hooks/pre-receive"
+done
+
 chmod -R a+rwX "$RUNROOT/fakeremote"
 
 if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
@@ -565,6 +597,18 @@ EOF
   GIT_MODE="local bare remote via insteadOf"
 fi
 say "git remote mode: $GIT_MODE"
+
+# A NEUTRAL global gitconfig for the PRD #97 M1 main-reject backstop's harness-driven
+# git ops inside the agent: it carries ONLY safe.directory=* (trusted, since it is a
+# global config — needed because the bind-mounted bare's owner uid differs from the
+# in-container uid) and deliberately NO insteadOf, so a push to a forge-fake.e2e https URL
+# actually speaks smart-HTTP instead of being rewritten to the local bare. Used via
+# `compose exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral` so those probes are a plain git
+# client, independent of the worker's own gitconfig + pins.
+cat > "$RUNROOT/agent-gitconfig/neutral" <<'EOF'
+[safe]
+	directory = *
+EOF
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
 # the overlay bind-mounts. UZI_WORKER_TOKEN is only a placeholder here (the worker is
@@ -1077,6 +1121,142 @@ else
     || fail "no per-agent (coder) usage-bearing message in the run-view data"
   pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
 fi
+
+# =============================================================================
+# PRD #97 M1 — git-over-HTTPS Basic-auth push (on EVERY default run) + the
+# main-push-refused backstop. Two full-wire-only properties the lower layers cannot
+# reach.
+#
+# (a) The default happy path above pushes the agent branch to a LOCAL bare via the
+# `insteadOf` rewrite (:559-564), so git ignores all http.* config and the worker's
+# `Authorization: Basic` header is NEVER sent — the exact blind spot the shipped
+# PRIVATE-TOKEN-vs-Basic bug slipped through (README). This leg makes the worker push
+# over git-smart-HTTP for real: we drop the insteadOf rewrite (the agent gitconfig is a
+# bind-mounted file GIT_CONFIG_GLOBAL points at, read fresh per git op — no recreate
+# needed; remote.origin.url stored on the warm bare is the https URL, so its fetch/push
+# now go over HTTPS), run one issue on group/repo, and let the worker fetch+push against
+# forge-fake, which 401s any git op lacking a valid Basic uzi-bot:PAT. A run that reaches
+# `completed` with its branch on the bare therefore PROVES the worker sent Basic; a
+# credential-injection regression turns this red. Scoped to the SINGLE repo on purpose
+# (Decision 1): forge-fake routes every repo path to one shared bare, so a smart-HTTP
+# happy-path flip would collapse the PRD #42 two-repo independent-bare asserts (:26xx) —
+# #42 stays on insteadOf. We restore insteadOf before any later phase, which all rely on
+# the local bare.
+say "PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage)"
+: > "$RUNROOT/agent-gitconfig/gitconfig"   # drop insteadOf ⇒ the worker's git speaks smart-HTTP to forge-fake
+# POSITIVE transport control: forge-fake's git bare (/gitroot/repo.git) is the SAME host
+# dir as the local-path bare (/fakeremote/repo.git), so "branch present" alone cannot tell
+# a smart-HTTP push from a local one. Snapshot forge-fake's authenticated-push counter
+# before the run and require it to rise — proving the worker's push actually traversed the
+# Basic-gated smart-HTTP endpoint (a silently-failed insteadOf flip would leave it flat).
+RECV_BEFORE="$(fake_state | jq '.gitStats.receivePackPosts // 0')"
+IID_HA="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E git basic-auth","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+{ [ -n "$IID_HA" ] && [ "$IID_HA" != null ]; } || fail "could not create the git-basic-auth issue"
+RUN_HA="$(create_run "$REPO_ID" "$IID_HA")" || fail "git-basic-auth run was not created"
+wait_status "$RUN_HA" awaiting_approval
+apipost "/api/runs/$RUN_HA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_HA" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+# forge-fake wrote the push into /gitroot/repo.git == $RUNROOT/fakeremote/repo.git. Its
+# presence means the worker's fetch AND push both carried a valid Authorization: Basic
+# (forge-fake 401s otherwise, which would have failed the run before this point).
+git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_HA" \
+  || fail "agent/issue-$IID_HA not on the bare — the worker's git-over-HTTPS Basic push did not land"
+RECV_AFTER="$(fake_state | jq '.gitStats.receivePackPosts // 0')"
+[ "$RECV_AFTER" -gt "$RECV_BEFORE" ] \
+  || fail "forge-fake saw NO authenticated git-receive-pack ($RECV_BEFORE -> $RECV_AFTER) — the worker did not push over smart-HTTP (insteadOf flip failed?)"
+pass "worker pushed agent/issue-$IID_HA over git-over-HTTPS Basic auth (forge-fake receive-pack $RECV_BEFORE -> $RECV_AFTER, gates on uzi-bot:PAT)"
+
+# Prove the smart-HTTP endpoint genuinely GATES on the Basic credential (not a no-op that
+# accepts anything): no credential must 401, the correct Basic header must 200. Probed
+# from inside the agent, which resolves forge-fake.e2e and trusts its cert. (Same probe
+# the opt-in E2E_GIT_SMART_HTTP variant runs at the happy-path assertions.)
+refs_url="https://forge-fake.e2e/group/repo.git/info/refs?service=git-upload-pack"
+probe='const https=require("https");const u=new URL(process.argv[1]);const o={hostname:u.hostname,port:443,path:u.pathname+u.search,headers:{}};if(process.argv[2])o.headers.Authorization=process.argv[2];https.get(o,r=>{console.log(r.statusCode);r.resume();}).on("error",e=>{console.error(e.message);process.exit(2);});'
+auth="Basic $(printf 'uzi-bot:%s' "$DUMMY_FORGE_PAT" | base64 | tr -d '\r\n')"
+code_noauth="$("${COMPOSE[@]}" exec -T agent node -e "$probe" "$refs_url" | tr -d '\r\n')"
+[ "$code_noauth" = 401 ] || fail "git smart-HTTP without a credential should 401 (got '$code_noauth')"
+code_auth="$("${COMPOSE[@]}" exec -T agent node -e "$probe" "$refs_url" "$auth" | tr -d '\r\n')"
+[ "$code_auth" = 200 ] || fail "git smart-HTTP with the correct Basic credential should 200 (got '$code_auth')"
+pass "git smart-HTTP auth gate is real: no credential -> 401, correct Basic -> 200"
+
+# Restore the gitconfig to its AT-SETUP state so later phases use the intended transport.
+# In the default run that means the insteadOf local-bare rewrite (every later phase pushes
+# to the local bare; #42 in particular REQUIRES independent repo.git/repo2.git bares, only
+# possible locally). In the opt-in E2E_GIT_SMART_HTTP full run the whole suite is already
+# smart-HTTP, so leave it empty — restoring insteadOf here would silently flip the rest of
+# that run back to local, breaking its intent (and the #42 shared-bare assertion).
+if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
+  : > "$RUNROOT/agent-gitconfig/gitconfig"
+  pass "kept the smart-HTTP remote (E2E_GIT_SMART_HTTP: the whole suite stays on smart-HTTP)"
+else
+  cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+[url "/fakeremote/repo.git"]
+	insteadOf = https://forge-fake.e2e/group/repo.git
+[url "/fakeremote/repo2.git"]
+	insteadOf = https://forge-fake.e2e/group/repo2.git
+EOF
+  pass "restored the insteadOf local-bare rewrite for the remaining phases"
+fi
+
+# (b) main-push-refused backstop (Decision 2). The fake bare carries a pre-receive hook
+# refusing refs/heads/main (installed at setup, in both bares). Self-test it across BOTH
+# transports — receive-pack runs in the AGENT image for a local push and in FORGE-FAKE
+# for smart-HTTP — from a neutral harness git client (not the worker, whose SDK guardrails
+# already refuse a push higher up; this proves the REMOTE's own filter). Every exec points
+# GIT_CONFIG_GLOBAL at /e2e-git/neutral (safe.directory=* only, NO insteadOf), so each is a
+# plain git that reaches forge-fake over real smart-HTTP for an https URL and trusts the
+# bind-mounted bare; the container keeps GIT_SSL_CAINFO so smart-HTTP trusts the cert.
+say "PRD #97 M1: the fake remote refuses a push to main under BOTH transports (protected-branch backstop)"
+MREJ=/tmp/e2e-main-reject
+B64AUTH="$(printf 'uzi-bot:%s' "$DUMMY_FORGE_PAT" | base64 | tr -d '\r\n')"
+# Stage a FAST-FORWARD commit on top of main, so the ONLY thing that can reject a main
+# push is the hook (never a non-fast-forward). The clone is local (no credential needed).
+"${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent sh -c "
+  set -e
+  rm -rf $MREJ
+  git clone -q /fakeremote/repo.git $MREJ
+  git -C $MREJ config user.email e2e@uzi.e2e
+  git -C $MREJ config user.name 'E2E main-reject'
+  git -C $MREJ config commit.gpgsign false
+  git -C $MREJ checkout -q main
+  echo 'protected-branch probe' >> $MREJ/README.md
+  git -C $MREJ commit -qam 'e2e: main-reject probe (must never land)'
+" || fail "could not stage the main-reject probe commit inside the agent"
+pass "staged a fast-forward main-probe commit (only the pre-receive hook can now reject a main push)"
+
+# LOCAL transport (hook fires in the agent image): main REFUSED, a non-main branch ACCEPTED.
+if "${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent \
+    git -C "$MREJ" push /fakeremote/repo.git HEAD:refs/heads/main >/dev/null 2>&1; then
+  fail "local-transport push to main was NOT refused (pre-receive hook missing/ineffective)"
+fi
+pass "local transport: push to main refused by the fake's pre-receive hook"
+"${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent \
+    git -C "$MREJ" push /fakeremote/repo.git HEAD:refs/heads/e2e-mainreject-local >/dev/null 2>&1 \
+  || fail "local-transport push of a non-main branch was refused (hook is a blanket deny — wrong)"
+pass "local transport: a non-main branch push is accepted (hook rejects only main)"
+
+# SMART-HTTP transport (hook fires in the forge-fake image): main REFUSED, branch ACCEPTED.
+# Basic auth is required by forge-fake; supply it inline so the ONLY rejection reason left
+# is the hook (auth-over-smart-HTTP was already proven green in (a)).
+if "${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent \
+    git -C "$MREJ" -c http.extraHeader="Authorization: Basic $B64AUTH" \
+    push https://forge-fake.e2e/group/repo.git HEAD:refs/heads/main >/dev/null 2>&1; then
+  fail "smart-HTTP push to main was NOT refused (pre-receive hook not portable to the forge-fake image?)"
+fi
+pass "smart-HTTP transport: push to main refused by the fake's pre-receive hook (portable to forge-fake)"
+"${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent \
+    git -C "$MREJ" -c http.extraHeader="Authorization: Basic $B64AUTH" \
+    push https://forge-fake.e2e/group/repo.git HEAD:refs/heads/e2e-mainreject-smarthttp >/dev/null 2>&1 \
+  || fail "smart-HTTP push of a non-main branch was refused (auth or hook wrong on the forge-fake image)"
+pass "smart-HTTP transport: a non-main branch push is accepted (hook rejects only main)"
+
+# Keep the bares pristine for later phases: drop the two probe branches + the scratch clone.
+"${COMPOSE[@]}" exec -e GIT_CONFIG_GLOBAL=/e2e-git/neutral -T agent sh -c "
+  git --git-dir=/fakeremote/repo.git update-ref -d refs/heads/e2e-mainreject-local 2>/dev/null || true
+  git --git-dir=/fakeremote/repo.git update-ref -d refs/heads/e2e-mainreject-smarthttp 2>/dev/null || true
+  rm -rf $MREJ
+" || true
 
 # =============================================================================
 # PRD #95 — steer-queue delivery (Problem 3): a follow-up shows as Queued on submit,
@@ -2662,19 +2842,39 @@ else
     || fail "both concurrent runs must open an MR (got A=$MRA B=$MRB)"
   # Each branch landed on its OWN repo's bare — proving the two runs used
   # independent git caches (repo2's branch is NOT in repo1's bare, and vice versa).
-  git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-    || fail "run A branch not on the repo1 bare"
-  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-    || fail "run B branch not on the repo2 bare (independent bare-cache check)"
-  git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-    && fail "run B's branch leaked into the repo1 bare (caches not independent)"
+  #
+  # This REMOTE-bare independence check holds only for the default (insteadOf) transport,
+  # where repo.git and repo2.git are two distinct local bares. Under E2E_GIT_SMART_HTTP
+  # forge-fake routes EVERY repo path onto the ONE shared bare (forge-fake.mjs
+  # PATH_INFO=/repo.git${rest}), so both branches necessarily land on repo.git and this
+  # check is unsatisfiable by construction — the pre-#97-M1 opt-in smart-HTTP full run was
+  # already red here (PRD #97 M1 confirm-and-fix). The WORKER-side cache independence — the
+  # actual #42 property — still holds under smart-HTTP (repo and repo2 have DISTINCT clone
+  # URLs ⇒ distinct worker bare dirs, no per-repo GitCache lock shared) and is proven by the
+  # concurrency asserts above (both parked at once on the one worker) plus the per-project
+  # MR attribution below. So gate the remote-bare check to the default transport; under
+  # smart-HTTP assert only that both branches reached the shared bare.
+  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then
+    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+      || fail "run A branch not on the repo1 bare"
+    git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+      || fail "run B branch not on the repo2 bare (independent bare-cache check)"
+    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+      && fail "run B's branch leaked into the repo1 bare (caches not independent)"
+  else
+    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+      || fail "run A branch not on the shared smart-HTTP bare"
+    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+      || fail "run B branch not on the shared smart-HTTP bare (forge-fake collapses repo/repo2 — see comment)"
+  fi
   FS="$(fake_state)"
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_A" '[.mrs[]|select(.source_branch==$b)]|length')" -ge 1 ] \
     || fail "fake recorded no MR for run A's branch"
   # The repo2 MR is attributed to project 2 (the multi-project fake resolves :id).
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_B" '[.mrs[]|select(.source_branch==$b)][-1].project_id')" = 2 ] \
     || fail "run B's MR not attributed to forge project 2 (group/repo2)"
-  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), each on its own independent bare"
+  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then bare_note="each on its own independent bare"; else bare_note="both on the one shared smart-HTTP bare"; fi
+  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), $bare_note"
 
   # --- (e) mid-run SIGKILL → sweeper re-queues BOTH (N=2) → restart completes ---
   say "PRD #42: mid-run SIGKILL of the agent with two in-flight runs → sweeper re-queues BOTH → restart completes"

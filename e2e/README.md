@@ -127,14 +127,28 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
   worker reaches it because a `url.<local>.insteadOf` gitconfig rewrites the
   https clone/push URL the api hands out. The worker's clone → worktree → commit
   → **push** path runs for real against it; the branch-pushed assertion reads the
-  bare repo directly. **Fidelity caveat:** because the rewritten remote is a
-  *local path*, git ignores all `http.*` config on it, so the worker's
-  **git-over-HTTPS Basic auth header is NOT exercised** by the default harness —
-  which is exactly why this harness (like every prior test) would not have caught
-  the `PRIVATE-TOKEN`-vs-Basic auth bug; the live run did. (The
-  `E2E_GIT_SMART_HTTP=1` variant, when available, points `clone_url` at a real
-  git-smart-HTTP endpoint on `forge-fake` that 401s without a valid `Authorization:
-  Basic` header, closing this gap and guarding against a git-auth regression.)
+  bare repo directly. This local-path leg stays the fast, hermetic default for
+  every phase (and is the only transport that keeps `repo.git`/`repo2.git` as two
+  independent bares, which the PRD #42 two-repo concurrency phase requires).
+- **git-over-HTTPS Basic auth is exercised on EVERY default run** (PRD #97 M1). A
+  local-path push ignores all `http.*` config, so it never sends the worker's
+  `Authorization: Basic` header — the exact blind spot the shipped
+  `PRIVATE-TOKEN`-vs-Basic auth bug slipped through. So one dedicated leg drops the
+  `insteadOf` rewrite for a single `group/repo` run and lets the worker fetch+push
+  against `forge-fake`'s real git-smart-HTTP endpoint, which **401s any git op
+  lacking a valid `Authorization: Basic` (`uzi-bot:PAT`)**. A run that reaches
+  `completed` with its branch on the bare therefore proves the worker sent Basic; a
+  credential-injection regression turns the run red. (The opt-in
+  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP; because
+  `forge-fake` collapses every repo path to one bare, that variant's #42 phase
+  asserts against the one shared bare — the default run keeps the full independent-
+  bare check.)
+- **`main` is never touched — and the fake remote enforces it** (PRD #97 M1). Each
+  seeded bare carries a `pre-receive` hook that refuses `refs/heads/main`, so the
+  "push to main is refused" assertion is real, not vacuous. The backstop is
+  self-tested under **both** transports (the hook fires in the agent image for a
+  local-path push and in `forge-fake` for smart-HTTP, since the bare is one shared
+  host dir): a `main` push is refused, a non-`main` branch push is accepted.
 - **The executor** is the M2 stub with `UZI_STUB_PLAN_GATE=1`, so it drives the
   full M4 plan gate (emit plan → `awaiting_approval` → await verdict → implement)
   with no SDK.
