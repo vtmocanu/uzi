@@ -4,7 +4,7 @@
 **Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request, then judge run cost/time visibility (M6) folded in per user request; then judge-accuracy work (M7: deterministic env/failure-class signals + gate off pre-start infra failures) folded in 2026-07-18 per user request — from issue #81, surfaced by the #78 provisioning misjudgment)
 **Priority**: Medium
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.
-**Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model).
+**Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model). PRD #98 (Judge menu — the downstream *output workbench*: this PRD is the judge control plane (mode/model/spend/accuracy/consent), #98 is where its recommendations get triaged. Cleanly separable, and no notification seam: #98 adds **no Slack digest** — it only retargets the existing `judge_review` deep-link and groups those rows in the *web* inbox (judge_review-scoped), so this PRD's M7a infra-skip notification is untouched).
 
 ## Problem
 
