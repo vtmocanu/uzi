@@ -1,0 +1,448 @@
+<title>Activity pane — instance lanes (mockup)</title>
+<style>
+  :root {
+    /* uzi "ember" theme — the real app tokens (web/src/index.css) */
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;      /* molten orange */
+    --brand-hover: 253 186 116;
+    --ok: 52 211 153;         /* working  */
+    --warn: 251 191 36;       /* stalled  */
+    --danger: 251 113 133;
+    --info: 56 189 248;       /* waiting  */
+    --ink: rgb(var(--bg));
+
+    --ui: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 82% -8%, rgb(var(--brand) / 0.06), transparent 60%),
+      linear-gradient(rgb(var(--info) / 0.018) 1px, transparent 1px) 0 0 / 100% 34px,
+      rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--ui);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.45;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 24px 72px; }
+
+  /* ── page masthead ────────────────────────────────────── */
+  .eyebrow {
+    font-size: 11px; letter-spacing: .18em; text-transform: uppercase;
+    color: rgb(var(--brand)); font-weight: 600; margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(24px, 3.4vw, 34px); line-height: 1.1; margin: 0 0 10px;
+    font-weight: 650; letter-spacing: -.01em; text-wrap: balance;
+  }
+  .lede { max-width: 64ch; margin: 0; color: rgb(var(--muted)); font-size: 15px; }
+  .lede b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── compare grid ─────────────────────────────────────── */
+  .compare {
+    display: grid; grid-template-columns: 1fr; gap: 20px; margin-top: 34px;
+  }
+  @media (min-width: 900px) { .compare { grid-template-columns: 1fr 1fr; gap: 22px; } }
+
+  .col-tag {
+    display: inline-flex; align-items: center; gap: 8px; margin: 0 0 10px;
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700;
+  }
+  .col-tag .swatch { width: 8px; height: 8px; border-radius: 2px; }
+  .col-tag.now    { color: rgb(var(--faint)); }
+  .col-tag.now .swatch    { background: rgb(var(--faint)); }
+  .col-tag.next   { color: rgb(var(--brand)); }
+  .col-tag.next .swatch   { background: rgb(var(--brand)); }
+  .col-note { margin: -4px 0 12px; font-size: 12.5px; color: rgb(var(--muted)); }
+  .col-note b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── the pane chrome (matches the app) ────────────────── */
+  .pane {
+    border: 1px solid rgb(var(--edge)); border-radius: 14px;
+    background: rgb(var(--surface) / .5); padding: 14px;
+  }
+  .pane-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-bottom: 12px;
+  }
+  .pane-title { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: rgb(var(--faint)); font-weight: 700; }
+  .pane-tools { display: flex; align-items: center; gap: 12px; font-size: 12px; color: rgb(var(--muted)); }
+  .pane-count { color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+
+  /* segmented toggle */
+  .seg { display: inline-flex; border: 1px solid rgb(var(--edge)); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    font: inherit; font-size: 12px; border: 0; cursor: pointer;
+    padding: 3px 10px; background: transparent; color: rgb(var(--muted));
+  }
+  .seg button.on { background: rgb(var(--brand) / .16); color: rgb(var(--brand-hover)); font-weight: 600; }
+
+  .feed { display: flex; flex-direction: column; gap: 10px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--bg) / .6); padding: 12px; }
+
+  /* ── a lane / block row ───────────────────────────────── */
+  .lane {
+    border-left: 2px solid var(--accent, rgb(var(--edge)));
+    background: rgb(var(--surface) / .6);
+    border-radius: 9px; padding: 9px 11px;
+  }
+  .lane-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .chev {
+    width: 18px; height: 18px; flex: none; color: rgb(var(--faint));
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: transform .15s ease;
+  }
+  .lane.open .chev { transform: rotate(90deg); }
+
+  .dot { width: 8px; height: 8px; border-radius: 999px; flex: none; background: var(--dot, rgb(var(--faint))); }
+  .dot.working { background: rgb(var(--ok)); box-shadow: 0 0 0 3px rgb(var(--ok) / .16); animation: pulse 1.8s ease-in-out infinite; }
+  .dot.stalled { background: rgb(var(--warn)); }
+  .dot.waiting { background: rgb(var(--info)); }
+  .dot.idle    { background: rgb(var(--faint)); }
+  .dot.done    { background: rgb(var(--muted)); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot.working { animation: none; } }
+
+  .name { font-weight: 650; font-size: 14px; color: var(--accent, rgb(var(--fg))); flex: none; }
+  .task {
+    font-family: var(--mono); font-size: 12px; color: rgb(var(--muted)); flex: none;
+    padding-left: 2px; white-space: nowrap;
+  }
+  .task .sep { color: rgb(var(--faint)); padding: 0 5px 0 3px; }
+  .oneliner {
+    font-size: 12.5px; color: rgb(var(--muted)); min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+  }
+  .oneliner code { font-family: var(--mono); color: rgb(var(--fg)); font-size: 12px; }
+  .state {
+    font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600;
+    flex: none;
+  }
+  .state.working { color: rgb(var(--ok)); }
+  .state.stalled { color: rgb(var(--warn)); }
+  .state.waiting { color: rgb(var(--info)); }
+  .state.idle    { color: rgb(var(--faint)); }
+  .state.done    { color: rgb(var(--muted)); }
+  .pill {
+    flex: none; font-size: 10px; font-weight: 600; border-radius: 999px;
+    padding: 1px 7px; background: rgb(var(--brand) / .16); color: rgb(var(--brand-hover));
+  }
+  .time { flex: none; font-size: 11px; color: rgb(var(--faint)); font-variant-numeric: tabular-nums; margin-left: 2px; }
+  .lane-head .time.push { margin-left: auto; }
+
+  /* expanded body — a tool rail */
+  .body { margin: 8px 0 2px 27px; border-left: 1px solid rgb(var(--edge)); padding-left: 12px; display: flex; flex-direction: column; gap: 7px; }
+  .rail-row { font-size: 12.5px; color: rgb(var(--muted)); display: flex; gap: 8px; align-items: baseline; }
+  .rail-row .tool { font-family: var(--mono); font-size: 12px; color: rgb(var(--fg)); }
+  .rail-row .arg  { font-family: var(--mono); font-size: 12px; color: rgb(var(--ok)); }
+  .rail-row .ok   { color: rgb(var(--ok)); font-size: 11px; }
+
+  /* "NOW" near-empty repeated bar */
+  .bar { border-left: 2px solid var(--accent); background: rgb(var(--surface) / .55); border-radius: 9px; padding: 10px 11px; display: flex; align-items: center; gap: 9px; }
+  .bar .name { font-size: 14px; }
+  .bar .time { margin-left: auto; }
+  .bar.empty .ghost { font-size: 12px; color: rgb(var(--faint)); font-style: italic; }
+
+  .metric { margin-top: 12px; font-size: 12px; color: rgb(var(--faint)); text-align: center; }
+  .metric b { color: rgb(var(--fg)); font-weight: 600; }
+  .metric .down { color: rgb(var(--ok)); }
+
+  /* ── legend + rationale ───────────────────────────────── */
+  .rationale { margin-top: 40px; }
+  .rationale h2 { font-size: 13px; letter-spacing: .1em; text-transform: uppercase; color: rgb(var(--faint)); font-weight: 700; margin: 0 0 16px; }
+  .cards { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 720px) { .cards { grid-template-columns: repeat(3, 1fr); } }
+  .card { border: 1px solid rgb(var(--edge)); border-radius: 12px; background: rgb(var(--surface) / .45); padding: 16px 16px 17px; }
+  .card .k { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: rgb(var(--brand)); font-weight: 700; margin: 0 0 8px; }
+  .card h3 { font-size: 15px; margin: 0 0 7px; font-weight: 600; }
+  .card p { margin: 0; font-size: 13px; color: rgb(var(--muted)); line-height: 1.5; }
+  .card p code, .card p b { font-family: var(--mono); font-size: 12px; color: rgb(var(--fg)); font-weight: 500; }
+  .card p b.plain { font-family: var(--ui); font-weight: 600; }
+
+  /* folded-in state key inside the rationale card */
+  .statekey { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 12px 0 0; padding: 0; }
+  .statekey li { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: rgb(var(--muted)); }
+
+  /* ── busy-crew: the roster returns as a role rollup ────── */
+  .busy { margin-top: 34px; }
+  .rollup { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 11px; margin-bottom: 11px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--raised) / .5); }
+  .rollup .lbl { font-size: 10.5px; letter-spacing: .13em; text-transform: uppercase; color: rgb(var(--faint)); font-weight: 700; margin-right: 3px; }
+  .rrole { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border: 1px solid rgb(var(--edge)); border-radius: 999px; background: rgb(var(--surface)); font-size: 12.5px; cursor: pointer; }
+  .rrole:hover { border-color: rgb(var(--edge-strong)); }
+  .rrole .rn { color: rgb(var(--fg)); font-weight: 600; }
+  .rrole .rc { color: rgb(var(--faint)); font-variant-numeric: tabular-nums; font-size: 11.5px; }
+  .rrole .rs { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; font-weight: 600; }
+  .rrole .rs.working { color: rgb(var(--ok)); }
+  .rrole .rs.stalled { color: rgb(var(--warn)); }
+  .rrole .rs.idle    { color: rgb(var(--faint)); }
+
+  .foot { margin-top: 34px; font-size: 12px; color: rgb(var(--faint)); border-top: 1px solid rgb(var(--edge)); padding-top: 16px; }
+  .foot code { font-family: var(--mono); color: rgb(var(--muted)); }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Uzi · Activity pane</p>
+  <h1>One lane per real actor</h1>
+  <p class="lede">
+    Today the feed starts a fresh block on every hand-off, so a lead&#8202;↔&#8202;researcher ping-pong
+    stacks up as near-empty repeated bars. The proposal collapses each actor into <b>one lane</b>,
+    puts a live <b>status dot</b> on it, and keys identity to the <b>invocation</b> — so two coders
+    running in parallel become two lanes named by their task, never one merged mess.
+  </p>
+
+  <div class="compare">
+    <!-- ───────────────── NOW ───────────────── -->
+    <section>
+      <p class="col-tag now"><span class="swatch"></span>Now — chronological transcript</p>
+      <p class="col-note">Groups only <b>consecutive</b> messages, and the one-liner shows on an agent's first block only. Repeat turns render as labelled empty bars.</p>
+      <div class="pane">
+        <div class="pane-head">
+          <span class="pane-title">Activity</span>
+          <div class="pane-tools"><span>Expand all</span><span>☑ Follow live</span><span class="pane-count">330 messages</span></div>
+        </div>
+        <div class="feed">
+          <div class="bar" style="--accent: rgb(var(--brand))">
+            <span class="name" style="color: rgb(var(--brand))">worker</span>
+            <span class="oneliner">implement/review iteration 1</span>
+            <span class="pill">+2</span><span class="time">17m</span>
+          </div>
+          <div class="bar" style="--accent: rgb(var(--info))">
+            <span class="name" style="color: rgb(var(--info))">lead</span>
+            <span class="oneliner">description: Phase 1C web gate UX, subagent_type: coder…</span>
+            <span class="pill">+8</span><span class="time">17m</span>
+          </div>
+          <div class="bar" style="--accent: rgb(var(--ok))">
+            <span class="name" style="color: rgb(var(--ok))">researcher</span>
+            <span class="oneliner">Ran a tool</span><span class="time">16m</span>
+          </div>
+          <div class="bar empty" style="--accent: rgb(var(--info))"><span class="name" style="color: rgb(var(--info))">lead</span><span class="ghost">— no summary on repeat block —</span><span class="time">16m</span></div>
+          <div class="bar empty" style="--accent: rgb(var(--ok))"><span class="name" style="color: rgb(var(--ok))">researcher</span><span class="ghost">— no summary on repeat block —</span><span class="time">16m</span></div>
+          <div class="bar empty" style="--accent: rgb(var(--info))"><span class="name" style="color: rgb(var(--info))">lead</span><span class="ghost">— no summary on repeat block —</span><span class="time">15m</span></div>
+          <div class="bar empty" style="--accent: rgb(var(--ok))"><span class="name" style="color: rgb(var(--ok))">researcher</span><span class="ghost">— no summary on repeat block —</span><span class="time">15m</span></div>
+          <div class="bar empty" style="--accent: rgb(var(--info))"><span class="name" style="color: rgb(var(--info))">lead</span><span class="ghost">— no summary on repeat block —</span><span class="time">14m</span></div>
+          <div class="bar empty" style="--accent: rgb(var(--ok))"><span class="name" style="color: rgb(var(--ok))">researcher</span><span class="ghost">— no summary on repeat block —</span><span class="time">14m</span></div>
+        </div>
+        <p class="metric"><b>9 bars</b> shown · really <b>3 agents</b> · 6 are empty labels</p>
+      </div>
+    </section>
+
+    <!-- ───────────────── PROPOSED ───────────────── -->
+    <section>
+      <p class="col-tag next"><span class="swatch"></span>Proposed — instance lanes</p>
+      <p class="col-note">One lane per invocation, dot = live state, subagents titled by their <b>task</b>. The <code style="font-family:var(--mono);font-size:12px">By agent</code> / <code style="font-family:var(--mono);font-size:12px">Timeline</code> toggle keeps the raw stream one click away.</p>
+      <div class="pane">
+        <div class="pane-head">
+          <span class="pane-title">Activity</span>
+          <div class="pane-tools">
+            <span class="seg"><button class="on">By agent</button><button>Timeline</button></span>
+            <span>☑ Follow live</span>
+            <span class="pane-count">330</span>
+          </div>
+        </div>
+        <div class="feed">
+          <!-- lead -->
+          <div class="lane" style="--accent: rgb(var(--info))">
+            <div class="lane-head">
+              <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="dot idle"></span>
+              <span class="name">lead</span>
+              <span class="oneliner">Dispatched 2 coders in parallel</span>
+              <span class="state idle">idle</span>
+              <span class="pill">+8</span><span class="time">17m</span>
+            </div>
+          </div>
+          <!-- researcher -->
+          <div class="lane" style="--accent: rgb(var(--ok))">
+            <div class="lane-head">
+              <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="dot idle"></span>
+              <span class="name">researcher</span>
+              <span class="oneliner">Read 4 files</span>
+              <span class="state idle">idle</span>
+              <span class="pill">+6</span><span class="time">16m</span>
+            </div>
+          </div>
+          <!-- coder #1 — EXPANDED -->
+          <div class="lane open" style="--accent: rgb(var(--warn))">
+            <div class="lane-head">
+              <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="dot working"></span>
+              <span class="name">coder</span>
+              <span class="task"><span class="sep">·</span>Phase 1C web gate UX</span>
+              <span class="oneliner">Running <code>go build ./...</code></span>
+              <span class="state working">working</span>
+              <span class="time push">2m</span>
+            </div>
+            <div class="body">
+              <div class="rail-row"><span class="tool">Edit</span><span class="arg">ActivityFeed.tsx</span><span class="ok">✓ 1 change</span></div>
+              <div class="rail-row"><span class="tool">Bash</span><span class="arg">go build ./...</span><span class="ok">running…</span></div>
+            </div>
+          </div>
+          <!-- coder #2 — the parallel twin -->
+          <div class="lane" style="--accent: rgb(var(--warn))">
+            <div class="lane-head">
+              <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="dot working"></span>
+              <span class="name">coder</span>
+              <span class="task"><span class="sep">·</span>plan-gate API wiring</span>
+              <span class="oneliner">Reading <code>run_messages.go</code></span>
+              <span class="state working">working</span>
+              <span class="pill">+1</span><span class="time">1m</span>
+            </div>
+          </div>
+          <!-- worker -->
+          <div class="lane" style="--accent: rgb(var(--brand))">
+            <div class="lane-head">
+              <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <span class="dot idle"></span>
+              <span class="name">worker</span>
+              <span class="task"><span class="sep">·</span>implement/review iteration 1</span>
+              <span class="oneliner">Committed locally</span>
+              <span class="state idle">idle</span>
+              <span class="pill">+2</span><span class="time">17m</span>
+            </div>
+          </div>
+        </div>
+        <p class="metric"><b>5 lanes</b>, no empties <span class="down">▼ from 9 bars</span> · 2 coders stay distinct</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- busy crew: roster returns as a role rollup -->
+  <section class="busy">
+    <p class="col-tag next"><span class="swatch"></span>When the crew is busy — the roster returns as a role rollup</p>
+    <p class="col-note">7 lanes, two roles doubled. Here a per-role summary adds an altitude the lanes can't: <b>roles &amp; counts</b>, worst-state wins the dot, click to filter. It shows up <b>only</b> when a role has ≥2 instances or the lanes overflow the glance — otherwise the collapsed lanes are the roster and there's no strip.</p>
+    <div class="pane">
+      <div class="pane-head">
+        <span class="pane-title">Activity</span>
+        <div class="pane-tools">
+          <span class="seg"><button class="on">By agent</button><button>Timeline</button></span>
+          <span>☑ Follow live</span>
+          <span class="pane-count">512</span>
+        </div>
+      </div>
+
+      <!-- the role rollup — a summary tier, not a copy of the lanes -->
+      <div class="rollup">
+        <span class="lbl">Crew</span>
+        <span class="rrole"><span class="dot stalled"></span><span class="rn">tester</span><span class="rc">×2</span><span class="rs stalled">stalled</span></span>
+        <span class="rrole"><span class="dot working"></span><span class="rn">coder</span><span class="rc">×2</span><span class="rs working">working</span></span>
+        <span class="rrole"><span class="dot idle"></span><span class="rn">researcher</span><span class="rs idle">idle</span></span>
+        <span class="rrole"><span class="dot idle"></span><span class="rn">lead</span><span class="rs idle">idle</span></span>
+        <span class="rrole"><span class="dot idle"></span><span class="rn">worker</span><span class="rs idle">idle</span></span>
+      </div>
+
+      <div class="feed">
+        <div class="lane" style="--accent: rgb(var(--info))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot idle"></span><span class="name">lead</span>
+            <span class="oneliner">Orchestrating 4 subagents</span>
+            <span class="state idle">idle</span><span class="pill">+12</span><span class="time">18m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--ok))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot idle"></span><span class="name">researcher</span>
+            <span class="oneliner">Read 9 files</span>
+            <span class="state idle">idle</span><span class="pill">+7</span><span class="time">17m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--warn))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot working"></span><span class="name">coder</span>
+            <span class="task"><span class="sep">·</span>web gate UX</span>
+            <span class="oneliner">Running <code>go build ./...</code></span>
+            <span class="state working">working</span><span class="time push">3m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--warn))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot working"></span><span class="name">coder</span>
+            <span class="task"><span class="sep">·</span>plan-gate API wiring</span>
+            <span class="oneliner">Editing <code>run_messages.go</code></span>
+            <span class="state working">working</span><span class="time push">2m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--danger))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot stalled"></span><span class="name">tester</span>
+            <span class="task"><span class="sep">·</span>e2e: approval gate</span>
+            <span class="oneliner">Retrying flaky spec (3×)</span>
+            <span class="state stalled">stalled</span><span class="time push">4m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--danger))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot idle"></span><span class="name">tester</span>
+            <span class="task"><span class="sep">·</span>unit: RunEvent</span>
+            <span class="oneliner">Ran a tool</span>
+            <span class="state idle">idle</span><span class="pill">+1</span><span class="time">6m</span>
+          </div>
+        </div>
+        <div class="lane" style="--accent: rgb(var(--brand))">
+          <div class="lane-head">
+            <span class="chev"><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="dot idle"></span><span class="name">worker</span>
+            <span class="task"><span class="sep">·</span>implement/review iteration 2</span>
+            <span class="oneliner">Committed locally</span>
+            <span class="state idle">idle</span><span class="pill">+2</span><span class="time">18m</span>
+          </div>
+        </div>
+      </div>
+      <p class="metric">roster now = <b>5 role chips</b> summarizing <b>7 lanes</b> · the one stalled tester is the first thing you see</p>
+    </div>
+  </section>
+
+  <!-- rationale -->
+  <div class="rationale">
+    <h2>Three decisions</h2>
+    <div class="cards">
+      <div class="card">
+        <p class="k">Fewer duplicates</p>
+        <h3>Identity = invocation, not order</h3>
+        <p>A lane is keyed by the subagent's <b>parent_tool_use_id</b> (lead = the parentless lane). Non-adjacent turns coalesce, so the ping-pong stops multiplying labelled bars.</p>
+      </div>
+      <div class="card">
+        <p class="k">Status at a glance</p>
+        <h3>A dot on every lane</h3>
+        <p><b class="plain">Collapsed lanes still show life</b>, via the same <code>crewStateFor()</code> ladder the pane already computes. The word beside the dot is the label — so no standing legend, just a <code>title</code> tooltip:</p>
+        <ul class="statekey">
+          <li><span class="dot working"></span>working</li>
+          <li><span class="dot stalled"></span>stalled</li>
+          <li><span class="dot waiting"></span>waiting</li>
+          <li><span class="dot idle"></span>idle</li>
+          <li><span class="dot done"></span>done</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="k">Two coders</p>
+        <h3>Named by task, never "#2"</h3>
+        <p>Each parallel <b>coder</b> is its own lane, titled with the spawning Task's <b class="plain">description</b> (<span style="font-family:var(--mono);font-size:12px;color:rgb(var(--fg))">web gate UX</span> vs <span style="font-family:var(--mono);font-size:12px;color:rgb(var(--fg))">API wiring</span>). You see <i>what</i> each is doing, not a serial number.</p>
+      </div>
+    </div>
+  </div>
+
+  <p class="foot">
+    Mockup only — no code changed. The one thing not free today: <code>parent_tool_use_id</code> + the Task
+    description exist in the Agent SDK but are dropped at <code>sdk-messages.ts:28</code> and absent from the
+    <code>run_messages</code> wire. Making two coders truly distinct needs that field threaded through
+    agent → api (migration) → web. Everything else is a <code>web/</code>-only refactor of <code>ActivityFeed.tsx</code>.
+  </p>
+</div>
