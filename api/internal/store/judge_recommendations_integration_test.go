@@ -349,19 +349,31 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// the assertions had nothing to discriminate. The fix is in the fixture, not the
 	// assertions.
 	//
-	// MEASURED, one fold per run against a FRESH database (PRD #98, 2026-07-21). Each line is
-	// a mutation of judge_recommendations.sql regenerated through sqlc, and each names the
-	// assertion that caught it:
+	// MEASURED, one fold per run against a FRESH database (PRD #98, 2026-07-21). Each line
+	// mutates ListJudgeRecommendationRowsForUser — THE FIRST QUERY BODY in
+	// judge_recommendations.sql, at its lines 69 and 71 — regenerated through sqlc, and each
+	// names the assertion that caught it:
 	//
-	//   drop `AND f.target = rr.target`     RED  — the sibling's filed-link assertion
+	//   drop `AND f.target = rr.target`      RED  — the sibling's filed-link assertion
 	//   drop `AND f.category = rr.category`  RED  — the cross-category coordinate's, below
 	//   drop BOTH coordinate halves          RED  — both of the above fire together
 	//   drop `AND d.target = rr.target`      RED  — the sibling's disposition assertion
 	//   drop `AND d.category = rr.category`  RED  — the cross-category disposition assertion
 	//   `f.filed_at` -> `d.set_at`           RED  — the no-filed-row filed_at assertion
 	//
-	// Before this fixture grew its third and fourth coordinates, the first three of those
-	// were GREEN across the entire live-DB suite.
+	// SCOPE — READ THIS BEFORE CONCLUDING "THE COORDINATE PREDICATE IS PINNED". The SAME two
+	// three-part joins appear a SECOND time in that file, on ListJudgeTriageRowsForRuns (M4's
+	// /runs badge count, lines 144 and 146). Nothing above touches it, and it is NOT pinned:
+	// dropping BOTH coordinate halves off its `f` join, and separately off its `d` join, each
+	// left the ENTIRE live-DB suite green (measured the same day). Its only tests are
+	// fake-backed (judge_run_badge_test.go hands hand-built rows to a fake store), which by
+	// construction cannot observe which column the real query put in which field. Tracked as
+	// an open gap, not closed here.
+	//
+	// PROVENANCE OF THE "was GREEN" CLAIMS, because they are not all the same strength: the
+	// category-half GREEN was measured here, on this fixture with the sibling but before the
+	// fourth coordinate. The target-half and both-halves GREENs are INHERITED from the M3
+	// checkpoint's earlier sweep and were not re-run against the pre-fix tree.
 	const unfiledInAutoRev = "rg-unfiled-sibling"
 	mustExec(ctx, t, pool,
 		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)

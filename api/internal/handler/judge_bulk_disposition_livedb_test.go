@@ -639,9 +639,33 @@ func TestBulkDispositionSettledAddressesAreDistinctPerRunLiveDB(t *testing.T) {
 //     flag's entire purpose, silently inverted, and it is the worse direction.
 //
 // The assertion is the property rather than a literal: the stored hash must equal
-// RationaleHash of the recommendation's CURRENT rationale_md, read back from the table. A
-// test spelling "because" here would pass under the blanking exactly as the fake one does —
-// the value has to come from the database.
+// RationaleHash of the recommendation's CURRENT rationale_md, read back from the table.
+//
+// WHAT ACTUALLY MAKES THAT WORK — and this paragraph replaces a SUPERSEDED criterion that
+// stood here and taught the wrong lesson. It used to read: "a test spelling \"because\" here
+// would pass under the blanking exactly as the fake one does — the value has to come from
+// the database." That is drawn from an experiment whose independent variable could not
+// affect the outcome, and it sends the next reader hunting for LITERALS.
+//
+// THE FIXTURE IS THE PRECONDITION, and it comes first. While bulkFixture wrote 'because' on
+// every row, "read the expected value back from the table" and "spell it in the test" were
+// LITERALLY THE SAME EXPRESSION — both evaluate to sha256("because") — so no assertion style
+// could have rescued it, and the discriminating fold (`rr.rationale_md -> 'because'::text`,
+// a value the fixture already contained) passed. Blanking to the empty string would have
+// been caught by anything; that is why blanking proves nothing.
+//
+// So the two things that carry this test are, in order: (1) bulkFixture giving every ROW a
+// distinct rationale, and (2) the pairwise assertion below — two coordinates with different
+// texts must stamp DIFFERENT hashes, which fails under a fold to ANY constant whichever
+// constant is chosen. Measured (PRD #98, 2026-07-21, fresh database): folding
+// `rr.rationale_md` to `'because'::text` in internal/store/queries/judge_bulk_disposition.sql
+// was GREEN before those two changes and is RED after, at both assertions below.
+//
+// SCOPE OF THAT SWEEP, stated so it is not read as broader than it is: this fixed the
+// LIVE-DB half only. memberRowIn in judge_bulk_disposition_test.go still writes
+// RationaleMd: "because" on every fake member, and the fake suite still asserts against
+// RationaleHash("because"). That is the same uniform-fixture class and it is still live —
+// materially weaker, because a fake cannot observe column mapping at all, but not swept.
 func TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB(t *testing.T) {
 	h, pool, _ := bulkDispositionLiveDB(t)
 	ctx := context.Background()
@@ -692,9 +716,13 @@ func TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB(t *testing.T) {
 			"discriminate a folded projection from a real one", rows[rg[1]].rationale)
 	}
 
-	// Each stamped hash is the hash of ITS OWN current text, read back from the table. The
-	// expected value never appears in this file — a version spelling the rationale here would
-	// pass under a fold to that same spelling, which is exactly the trap this test fell into.
+	// Each stamped hash is the hash of ITS OWN current text, read back from the table.
+	//
+	// Reading it back rather than spelling it is worth doing, but do NOT credit it as the
+	// defence — that is the superseded criterion the doc comment above corrects. On a fixture
+	// where every row said 'because', reading back and spelling it were the same expression.
+	// What defends this loop is that bulkFixture now gives every row a DISTINCT text; the
+	// pairwise check below is what makes a constant fold unsurvivable.
 	for target, got := range rows {
 		if want := workersvc.RationaleHash(got.rationale); got.hash != want {
 			t.Errorf("%s: stamped rationale_hash = %q, want RationaleHash of its CURRENT text %q = %q — "+
