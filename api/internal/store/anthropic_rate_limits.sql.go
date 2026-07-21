@@ -266,6 +266,16 @@ type UpsertRateLimitsParams struct {
 // user_id rides along rather than being looked up: the caller already has it from
 // the poll listing, and it is half of the composite FK that ties this row to a
 // (user, token) pair that exists.
+//
+// The FK is checked on the INSERT path only: ON CONFLICT .. DO UPDATE deliberately
+// does not touch user_id, so an upsert over an EXISTING row rewrites the reading
+// without re-validating ownership. That is safe BY CONSTRUCTION, not by the
+// caller's discipline — user_secret_id is the global PRIMARY KEY of user_secrets,
+// so an id belongs to exactly one owner for its whole life and no call site can
+// construct a mismatched (user_id, user_secret_id) pair to smuggle through the
+// conflict path. Stated this way on purpose: "the poller always passes a matching
+// pair" would be the weaker true reason, and the weaker one is the one that rots
+// the moment someone adds a third caller.
 func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsParams) error {
 	_, err := q.db.Exec(ctx, upsertRateLimits,
 		arg.UserSecretID,

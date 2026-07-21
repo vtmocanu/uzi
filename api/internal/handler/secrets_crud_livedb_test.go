@@ -283,9 +283,21 @@ func TestDeleteAliasMultiToken409LiveDB(t *testing.T) {
 }
 
 // TestConcurrentFirstTokenCreatesLiveDB is a D12 acceptance criterion: N concurrent
-// FIRST-token creates for one user must not both become default. Exactly one row
-// exists and it is the default; no request produces two defaults. The advisory lock
-// + the forced-first-default query are what make this hold.
+// FIRST-token creates for one user must not both become default, AND none may fail.
+//
+// Both halves matter, and they are guarded by different things — which is the point
+// worth not losing. The partial unique index protects the DATA: it makes two
+// defaults impossible whether or not the lock is there, so the countDefaults
+// assertion alone would still pass with the lock removed. The advisory lock
+// protects the USER-VISIBLE OUTCOME: without it the losing goroutines collide on
+// user_secrets_one_default_key, the handler maps that 23505 to a 500, and the
+// default arm of the switch below trips.
+//
+// Measured, not reasoned: neutralising only the pg_advisory_xact_lock call (keeping
+// the transaction) fails this test on every run with several `concurrent create
+// returned 500`. So this test is NOT redundant with the delete-vs-create one — that
+// one proves the lock prevents a corrupt state, this one proves it prevents a
+// broken response. Deleting either loses a real guarantee.
 func TestConcurrentFirstTokenCreatesLiveDB(t *testing.T) {
 	h, pool := secretsCRUDHandler(t)
 	user := mkSecretUser(t, pool)
@@ -386,4 +398,94 @@ func countTokens(t *testing.T, pool *pgxpool.Pool, user uuid.UUID) int {
 		t.Fatalf("count tokens: %v", err)
 	}
 	return n
+}
+
+// TestAliasVsLockedMutationsInvariantLiveDB covers the one interaction the other
+// two concurrency tests miss: the UNLOCKED writer against the locked ones.
+//
+// PUT /api/me/secrets/anthropic_token (the D14 alias) is the single deliberate
+// exception to M2's serialization scheme — it takes no advisory lock, on the
+// reasoning that a single INSERT .. ON CONFLICT DO UPDATE is atomic and so cannot
+// interleave the invariant into a two-default or no-default state. That is exactly
+// the kind of reasoning that stops being true when someone changes the arbiter,
+// adds a lock, or adds a fourth writer, and until now it was asserted nowhere:
+// TestConcurrentFirstTokenCreates is create-vs-create and
+// TestConcurrentDeleteDefaultVsCreate is delete-vs-create. Neither fires the alias.
+//
+// So: hammer one user with all four mutations at once — locked create-as-default,
+// locked set-default, locked delete, and the unlocked alias PUT — and assert the
+// invariant after every round. tokens > 0 ⇒ exactly one default, always.
+//
+// What this test does and does not prove, measured rather than assumed:
+//
+//   - It DOES bite. Breaking a locked mutation so it clears the default without
+//     re-setting it (a half-done set-default swap) fails this within three rounds:
+//     `user holds 2 tokens but 0 defaults`.
+//   - It does NOT catch an alias rewritten to insert a NON-default row — and that
+//     turned out to be informative rather than a gap. The only alias miswrite that
+//     could produce a SECOND default is rejected by the partial unique index
+//     before it commits, so the alias's blast radius on this invariant is smaller
+//     than its unlocked status suggests. The index is doing more of the work here
+//     than the atomicity argument is.
+func TestAliasVsLockedMutationsInvariantLiveDB(t *testing.T) {
+	h, pool := secretsCRUDHandler(t)
+
+	for round := 0; round < 15; round++ {
+		user := mkSecretUser(t, pool)
+		// Seed two tokens so set-default and delete both have something to act on
+		// and the alias has a default to rotate.
+		if rec := h.createToken(t, user, "alpha", "tok-alpha", false); rec.Code != http.StatusCreated {
+			t.Fatalf("round %d seed alpha: %d %s", round, rec.Code, rec.Body.String())
+		}
+		if rec := h.createToken(t, user, "beta", "tok-beta", false); rec.Code != http.StatusCreated {
+			t.Fatalf("round %d seed beta: %d %s", round, rec.Code, rec.Body.String())
+		}
+		listed := listSecrets(t, h, user)
+		if len(listed) != 2 {
+			t.Fatalf("round %d: seeded %d tokens, want 2", round, len(listed))
+		}
+		beta := listed[0].ID
+		for _, s := range listed {
+			if s.Label == "beta" {
+				beta = s.ID
+			}
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+		// 1. Locked: create a THIRD token asking to be the default (clear-then-insert).
+		go func() {
+			defer wg.Done()
+			h.createToken(t, user, "gamma", "tok-gamma", true)
+		}()
+		// 2. Locked: promote beta (the clear-then-set swap).
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRecorder()
+			h.PatchAnthropicToken(r, userReq(http.MethodPatch, "/api/me/secrets/anthropic_token/"+beta,
+				`{"default":true}`, user, map[string]string{"id": beta}))
+		}()
+		// 3. Locked: delete beta (409s when it is the default and others exist).
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRecorder()
+			h.DeleteAnthropicTokenByID(r, userReq(http.MethodDelete, "/api/me/secrets/anthropic_token/"+beta,
+				"", user, map[string]string{"id": beta}))
+		}()
+		// 4. UNLOCKED: the D14 alias, rotating-or-creating the default.
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRecorder()
+			h.PutAnthropicToken(r, userReq(http.MethodPut, "/api/me/secrets/anthropic_token",
+				`{"token":"tok-via-alias"}`, user, nil))
+		}()
+		wg.Wait()
+
+		if n := countTokens(t, pool, user); n > 0 {
+			if d := countDefaults(t, pool, user); d != 1 {
+				t.Fatalf("round %d: user holds %d tokens but %d defaults — the unlocked alias interleaved "+
+					"with a locked mutation and broke the invariant", round, n, d)
+			}
+		}
+	}
 }
