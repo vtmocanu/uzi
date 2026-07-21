@@ -193,6 +193,7 @@ type RecommendationDisposition struct {
 	SetByUserID   pgtype.UUID        `json:"set_by_user_id"`
 	SetAt         pgtype.Timestamptz `json:"set_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	SetVia        pgtype.Text        `json:"set_via"`
 }
 
 type RecommendationFiledIssue struct {
@@ -206,6 +207,7 @@ type RecommendationFiledIssue struct {
 	FiledByUserID pgtype.UUID        `json:"filed_by_user_id"`
 	FiledAt       pgtype.Timestamptz `json:"filed_at"`
 	FilingSince   pgtype.Timestamptz `json:"filing_since"`
+	CloseSyncedAt pgtype.Timestamptz `json:"close_synced_at"`
 }
 
 type Repo struct {

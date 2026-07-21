@@ -72,6 +72,10 @@ type IssueStore interface {
 	// CI-fix verification (PRD #6): stamp a fix run's verdict from its post-fix pipeline.
 	FindCIFixStampTarget(ctx context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error)
 	StampFixVerdict(ctx context.Context, arg store.StampFixVerdictParams) (int64, error)
+	// Filed→Done sync (PRD #98 M6): the open→closed edge over the freshly-synced issue
+	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
+	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
+	ApplyFiledIssueCloseEdge(ctx context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error)
 }
 
 // LabelConfig resolves the configured PRD label the sync filters query by

@@ -155,6 +155,164 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
   });
 });
 
+describe("mockApi judge backlog (PRD #98 M3)", () => {
+  it("dedups by (category, target) across runs, ranks by frequency, and can express a PARTIALLY-settled group", async () => {
+    installStorage();
+    const api = await reload();
+
+    const all = await api.getJudgeBacklog("all");
+    const byCoord = (c: string, t: string) => all.groups.find((g) => g.category === c && g.target === t);
+
+    // poller recurs in all three seeded runs → the top group by frequency.
+    const poller = byCoord("improve_uzi", "api/internal/poller")!;
+    expect(poller.run_count).toBe(3);
+    expect(poller.open_count).toBe(3);
+    expect(poller.bucket).toBe("todo");
+    expect(all.groups[0]).toBe(poller); // ranked first (run_count desc)
+
+    // shellcheck is the PARTIALLY-settled group: DONE in run-done, TODO in run-closed. The
+    // fixture must be able to construct this before any test leans on it (checkpoint).
+    const shellcheck = byCoord("install_worker_tool", "shellcheck")!;
+    expect(shellcheck.run_count).toBe(2);
+    expect(shellcheck.open_count).toBe(1); // one open member among two
+    expect(shellcheck.bucket).toBe("todo"); // any open member → the group rolls up To triage
+    const buckets = shellcheck.occurrences.map((o) => o.bucket).sort();
+    expect(buckets).toEqual(["done", "todo"]);
+
+    // The canonical triage is the SAME query getJudgeStats serves — the two cannot drift.
+    const stats = await api.getJudgeStats();
+    expect(all.triage).toEqual(stats);
+    // Per-recommendation, and still > the open group rows. It was 5 before PRD #98 review
+    // B3 seeded run-closed's ripgrep as an issue-close AUTO-DONE (filed #91, then closed):
+    // that moved one recommendation off the todo rung. The number changed because the
+    // fixture gained a state, not because the tally drifted.
+    expect(stats.todo).toBe(4);
+  });
+
+  it("the ?run= anchor keeps only groups recurring in that run but preserves their other-run occurrences", async () => {
+    installStorage();
+    const api = await reload();
+
+    const anchored = await api.getJudgeBacklog("all", "run-closed");
+    const coords = anchored.groups.map((g) => `${g.category}/${g.target}`).sort();
+    // run-closed's review carries poller, shellcheck, ripgrep — and nothing else survives.
+    expect(coords).toEqual([
+      "enable_tool/ripgrep",
+      "improve_uzi/api/internal/poller",
+      "install_worker_tool/shellcheck",
+    ]);
+    // poller still shows ALL three of its occurrences (the recurrence is the whole point).
+    const poller = anchored.groups.find((g) => g.target === "api/internal/poller")!;
+    expect(poller.run_count).toBe(3);
+
+    // A foreign / unknown run matches nothing (no existence oracle) — never a 404.
+    const foreign = await api.getJudgeBacklog("all", "does-not-exist");
+    expect(foreign.groups).toEqual([]);
+  });
+
+  it("scope=open dispositions ONLY the open members; `updated` counts triples, lower than the visible span", async () => {
+    installStorage();
+    const api = await reload();
+
+    // shellcheck spans 2 occurrences (done + todo). scope=open touches only the open one,
+    // so `updated` is 1 — deliberately lower than the 2 the group visibly spans.
+    const res = await api.bulkSetJudgeDisposition(
+      [{ category: "install_worker_tool", target: "shellcheck" }],
+      "dismissed",
+      "wont_do",
+      "open",
+    );
+    expect(res.updated).toBe(1);
+    // The group is RE-READ at bucket=all and comes back with its new rollup: the done member
+    // remains, the once-open member is now dismissed → highest rung (dismissed) wins.
+    const g = res.groups.find((x) => x.target === "shellcheck")!;
+    expect(g.bucket).toBe("dismissed");
+    expect(g.open_count).toBe(0);
+    // The done member was NOT overwritten (scope=open left it).
+    expect(g.occurrences.map((o) => o.bucket).sort()).toEqual(["dismissed", "done"]);
+
+    // Canonical counts moved: one left To triage, one joined Dismissed. (Baseline todo is 4,
+    // not 5, since B3's seeded auto-done — see the dedup test above.)
+    expect(res.triage.todo).toBe(3);
+    expect(res.triage.dismissed).toBe(3);
+  });
+
+  it("surfaces an issue-close auto-done distinctly, and a human override CLEARS the provenance", async () => {
+    installStorage();
+    const api = await reload();
+
+    const ripgrep = (b: Awaited<ReturnType<typeof api.getJudgeBacklog>>) =>
+      b.groups.find((g) => g.category === "enable_tool" && g.target === "ripgrep")!.occurrences[0];
+
+    // Seeded state: filed as #91, that issue closed, so the M6 sync marked it done. The
+    // ladder puts done above filed, so the bucket is `done` and the provenance is what
+    // distinguishes it from a hand-marked one.
+    const before = ripgrep(await api.getJudgeBacklog("all"));
+    expect(before.bucket).toBe("done");
+    expect(before.set_via).toBe("issue_close");
+    expect(before.filed_issue?.issue_iid).toBe(91);
+
+    // A HUMAN now dismisses it. set_via must go back to "a person decided this" — otherwise
+    // the chip would keep reading "Done via #91" after the user overrode it, attributing
+    // their decision to the system. The server guarantees this with a literal NULL rather
+    // than EXCLUDED.set_via (dispositions.sql); the mock must not diverge, and its
+    // Object.assign upsert makes the omission a live bug rather than a tidiness nit.
+    await api.bulkSetJudgeDisposition(
+      [{ category: "enable_tool", target: "ripgrep" }],
+      "dismissed",
+      "not_an_issue",
+      "all",
+    );
+    const after = ripgrep(await api.getJudgeBacklog("all"));
+    expect(after.bucket).toBe("dismissed");
+    expect(after.set_via).toBeUndefined();
+  });
+
+  // The SINGLE-COORDINATE write path must clear the provenance too, and until now only the
+  // bulk path was driven (PRD #98 review N-a). Measured: removing the clear from
+  // setDisposition left typecheck clean and all 849 tests green — half-defended, which is
+  // the state most likely to read as fully defended.
+  //
+  // It is the path RunView's per-recommendation Mark done / Dismiss drives, and it is
+  // reachable on the very fixture B3 seeded: run-closed's enable_tool/ripgrep is an
+  // issue-close auto-done, and that run's page renders per-rec controls. So without the
+  // clear, hand-marking it from RunView leaves the Judge chip reading "Done via #91" for a
+  // decision the user just made.
+  it("the SINGLE-coordinate write path clears the provenance too, not just the bulk one", async () => {
+    installStorage();
+    const api = await reload();
+
+    const backlog = await api.getJudgeBacklog("all");
+    const group = backlog.groups.find((g) => g.category === "enable_tool" && g.target === "ripgrep")!;
+    const occ = group.occurrences[0];
+    expect(occ.set_via).toBe("issue_close"); // the fixture really is an auto-done
+
+    // A human marks it done from the run page — the #94 per-recommendation route.
+    await api.setDisposition(occ.run_id, occ.rec_id, "done");
+
+    const after = (await api.getJudgeBacklog("all")).groups.find(
+      (g) => g.category === "enable_tool" && g.target === "ripgrep",
+    )!.occurrences[0];
+    expect(after.bucket).toBe("done");
+    expect(after.set_via).toBeUndefined();
+  });
+
+  // The mock must not invent wire fields. set_via is a mock-side extension of the STORED
+  // disposition; the run-page DispositionDTO has no such field, so GET /runs/{id}/review
+  // must not carry it (PRD #98 review N-b). A mock that ships more than the API does makes a
+  // future RunView provenance feature work in demo mode and fail in production.
+  it("does not leak set_via onto the run-page review DTO", async () => {
+    installStorage();
+    const api = await reload();
+
+    // The endpoint answers an ENVELOPE, {review: ...|null}.
+    const { review } = await api.getRunReview("run-closed");
+    const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
+    expect(disp).toBeTruthy();
+    expect("set_via" in (disp as object)).toBe(false);
+  });
+});
+
 // PRD #104: the mock must CASCADE a token delete the way the schema does.
 // Migrations 00078/00079 hang composite FKs off user_secrets (user_id, id) with
 // ON DELETE SET NULL, so deleting a bound token unbinds its workers and the judge.

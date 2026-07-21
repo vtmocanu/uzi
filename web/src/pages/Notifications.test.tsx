@@ -42,7 +42,14 @@ afterEach(() => {
 
 describe("Notifications inbox (PRD #46 M2)", () => {
   it("renders own notifications with the payload title/body and a run deep link", async () => {
-    mockApi.listNotifications.mockResolvedValue({ notifications: [aNotif()], unread: 1, total: 1 });
+    // A NON-judge kind, deliberately (PRD #98 M5). This assertion used to ride a
+    // `judge_review` row, and after the retarget that made it a test of the judge path
+    // wearing the generic path's name — the exact confusion Decision 4 warns about.
+    mockApi.listNotifications.mockResolvedValue({
+      notifications: [aNotif({ kind: "run_failed", payload: { title: "Run failed", body: "exit 1" } })],
+      unread: 1,
+      total: 1,
+    });
 
     render(
       <MemoryRouter>
@@ -50,8 +57,8 @@ describe("Notifications inbox (PRD #46 M2)", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText("Run review ready")).toBeTruthy());
-    expect(screen.getByText("verdict: issues")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("Run failed")).toBeTruthy());
+    expect(screen.getByText("exit 1")).toBeTruthy();
     const link = screen.getByText("· Open run").closest("a");
     expect(link?.getAttribute("href")).toBe("/runs/run-done");
     // Own view was requested (no all-scope), paged from the first offset.
@@ -129,11 +136,60 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(screen.queryByText("Mark read")).toBeNull();
   });
 
-  it("pages the inbox with Load more (offset paging), then hides the button", async () => {
-    const page1 = Array.from({ length: 30 }, (_, i) =>
-      aNotif({ id: `p1-${i}`, payload: { title: `row ${i}`, body: "" } }),
+  it("deep-links a judge review into the Judge workbench, anchored to its run", async () => {
+    mockApi.listNotifications.mockResolvedValue({ notifications: [aNotif()], unread: 1, total: 1 });
+    render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
     );
-    const page2 = [aNotif({ id: "p2-0", payload: { title: "second page row", body: "" } })];
+    await waitFor(() => expect(screen.getByText("Run review ready")).toBeTruthy());
+    const link = screen.getByText("· Open in Judge").closest("a");
+    expect(link?.getAttribute("href")).toBe("/judge?run=run-done");
+    // ...and the generic run link is not also rendered.
+    expect(screen.queryByText("· Open run")).toBeNull();
+  });
+
+  it("collapses consecutive judge reviews into one expandable header (Decision 5)", async () => {
+    const rows = [
+      aNotif({ id: "j1", payload: { title: "review one", body: "" }, created_at: "2026-07-20T12:00:00Z" }),
+      aNotif({ id: "j2", payload: { title: "review two", body: "" }, created_at: "2026-07-20T11:59:00Z" }),
+      aNotif({ id: "j3", payload: { title: "review three", body: "" }, created_at: "2026-07-20T11:58:00Z" }),
+    ];
+    mockApi.listNotifications.mockResolvedValue({ notifications: rows, unread: 3, total: 3 });
+
+    render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("3 reviews ready")).toBeTruthy());
+    // Collapsed: the individual rows are not on screen...
+    expect(screen.queryByText("review one")).toBeNull();
+    // ...and no to-triage number is shown, because no AppShell supplied one. A rendered 0
+    // here would be the page asserting "nothing to triage" on its own authority.
+    expect(screen.queryByText(/to triage/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+
+    // Expanded shows exactly what the ungrouped inbox showed — same rows, same controls.
+    await waitFor(() => expect(screen.getByText("review one")).toBeTruthy());
+    expect(screen.getByText("review two")).toBeTruthy();
+    expect(screen.getByText("review three")).toBeTruthy();
+    expect(screen.getAllByText("Mark read")).toHaveLength(3);
+  });
+
+  it("pages the inbox with Load more (offset paging), then hides the button", async () => {
+    // Non-judge rows, so paging is measured on its own. Thirty consecutive judge_review
+    // rows would collapse into ONE group header (PRD #98 M5, Decision 5) and every
+    // per-row assertion here would be asserting the grouping instead of the paging.
+    const page1 = Array.from({ length: 30 }, (_, i) =>
+      aNotif({ id: `p1-${i}`, kind: "run_failed", payload: { title: `row ${i}`, body: "" } }),
+    );
+    const page2 = [
+      aNotif({ id: "p2-0", kind: "run_failed", payload: { title: "second page row", body: "" } }),
+    ];
     mockApi.listNotifications
       .mockResolvedValueOnce({ notifications: page1, unread: 0, total: 31 })
       .mockResolvedValueOnce({ notifications: page2, unread: 0, total: 31 });

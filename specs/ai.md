@@ -5611,7 +5611,10 @@ with the review/audit findings folded in.
   given; the *producer* is responsible for scrubbing. The judge producer (`buildReviewNotification`,
   `api/internal/handler/judge_worker.go`) ships the verdict + a re-scrubbed 280-rune-capped summary preview + the
   recommendation count and category list — recommendation `target`/`rationale` free text is **never** copied into the
-  notification; it stays on the run page behind the deep link (implementation note 4). Slack delivery of the same
+  notification; it stays behind the deep link (implementation note 4). **Corrected 2026-07-21 (PRD #98 M5): that link
+  is `/judge?run={target}`, not `/runs/{target}`** — the free text now lives behind the Judge workbench anchored to the
+  run, in both the in-app inbox and the Slack DM. The *cadence* is unchanged (one DM per review, no digest); only the
+  destination moved, and the payload is byte-for-byte what it was. Slack delivery of the same
   payload is a **real notifier extension**, not a new string: the notifier was structurally run-state-only
   (`stateEvent{runID,status}` → `GetSlackRunContext` → "run on repo#iid"), so a new event variant + render path was
   required (↳review N6). Every judge free-text field passes `EscapeMrkdwn` + `ScrubSecrets` on the Slack leg too;
@@ -9671,3 +9674,194 @@ the user holds more than one token, because "delete the anthropic token" stopped
 naming one row. Single-token users (every user before this PRD) see no change at all.
 The delete stays **204** on success rather than becoming 200-with-body: it is an
 existing contract with existing consumers, and D14 is about not breaking them.
+
+# PRD #98 — Judge menu (cross-run recommendation workbench)
+
+Serves human: extends the Run retrospective (LLM judge) feature
+(`specs/human.md:280`). PRD #94 gave a recommendation a triage state but no
+cross-run home, so the same recurring idea was re-triaged once per run it
+appeared in. Design record: `prds/98-judge-menu.md`.
+
+## 358. A new, WIDER read on #94's join shape — grouped by `(category, target)`, migration-free (D1)
+
+- `GET /api/me/judge/recommendations` (`RequireUser`, owner-scoped, all-time).
+  It keeps `ListJudgeTriageRowsForUser`'s spine — `run_reviews` where
+  `user_id = caller` → `review_recommendations` → LEFT JOIN
+  `recommendation_filed_issues` + `recommendation_dispositions` on the
+  `(review_id, category, target)` coordinate — and **adds** a `runs` join plus
+  the verdict / confidence / `rationale_md` / filed-issue projection. Same
+  shape, wider row: a **new** query, not a reuse.
+- **The envelope is `{bucket, run, groups[], triage}`, and `triage` comes from
+  #94's own `/me/judge/stats` query, called directly — never tallied off the
+  returned rows.** Once the pull is bounded, tallying would make the canonical
+  number *wrong* on exactly the heavy accounts that need it. Sourcing it
+  separately makes "nav badge == notification == To-triage tab" **literally the
+  same query** rather than equal-by-construction, and it survives both filters
+  and truncation. Cost: one extra 3-column query per request.
+- **`rationale_preview` ships as plain text, NOT server-escaped.** The
+  no-raw-render guarantee is client-side (React's default + `whitespace-pre-wrap`);
+  escaping server-side would double-escape in the SPA and print HTML entities
+  into the terminal from `uzi review backlog`. Secrets and control chars are
+  already stripped at the review-POST ingest.
+- **Bounded at `JudgeBacklogMaxRows = 2000`, and the cap is applied BEFORE
+  grouping.** So `truncated: true` means a group may be **missing entirely** and
+  a *surviving* group's counts may be **understated** — "unknown", never
+  "settled". The `?run=` anchor is the only filter applied before the cap and is
+  therefore the only one that changes what gets cut; `?bucket=` filters the
+  survivors. Stated in `docs/judge-menu.md` and `docs/cli.md` because a consumer
+  that reads truncation as emptiness silently under-reports a backlog.
+
+## 359. The group is a DISPLAY construct — disposition fans out to member coordinates, no new storage (D3)
+
+- `PUT .../recommendations/disposition` resolves each requested
+  `(category, target)` to the caller's member recommendations and reuses #94's
+  idempotent upsert. There is no group entity and no group table.
+- **`scope=open` (the default) means `BucketOf(...) == "todo"`** — the shared Go
+  ladder, so a filed or already-settled member keeps its verdict. `scope=all`
+  re-asserts. The scope switch names each scope explicitly with a **refusing
+  default**, so adding a third scope cannot silently inherit the widest
+  semantics.
+- **`updated` counts `(review_id, category, target)` TRIPLES, not
+  recommendations.** A review may legitimately carry the same coordinate twice
+  (no unique constraint on it) and both share ONE disposition row, so a group of
+  5 correctly reports 4. `DISTINCT ON` in SQL is what makes that safe rather than
+  an `SQLSTATE 21000` at runtime — invisible to every fake, since the per-member
+  loop this replaced was immune by construction.
+- **The resolve is the security boundary.** `rv.user_id = @user_id` is the only
+  thing scoping the fan-out; a coordinate belonging to another user resolves to
+  zero members and is indistinguishable from one that does not exist (#94 D5's
+  no-existence-oracle). `IsAdmin` is never consulted. The write uses the
+  **resolved** row's category/target, never the body's — the `00071`/`00073`
+  no-category-`CHECK` invariant depends on it.
+- **The response re-reads at `bucket=all` deliberately.** A just-dismissed group
+  must come back so the row re-renders at its new rollup instead of vanishing.
+  This is not a filter and must not be documented as one.
+- Coordinates are capped at `JudgeDispositionMaxItems = 100`; the write is ONE
+  statement, because 100 coordinates can match unboundedly many members and a
+  loop would be N round-trips on a no-CSRF token path. One statement also removes
+  the partial-apply window rather than documenting it.
+
+## 360. ONE canonical to-triage number — a shared source is NOT enough; it needs a shared propagation channel
+
+- The nav badge, the Judge page's To-triage tab and the judge notification all
+  read `triage.todo`. That was necessary and **not sufficient**, and the gap is
+  recorded because it shipped green: `AppShell` polls on
+  `[user, location.pathname]`, and a disposition changes neither — nor does a
+  bucket tab, which rewrites the *search*. Measured: after a dispose the nav read
+  3 while the tab read 0, with both correct in isolation and both
+  mutation-defended in their own suites.
+- Fixed with `JudgeTodoContext`, which publishes a **setter** (the Judge page
+  pushes the fresh canonical `triage` its response already carries) and, for M5,
+  a **value** the notification reads. Publishing beats refetching: the number is
+  already in hand, and a refetch reopens the window where the two disagree.
+- **The value is `number | null`; `null` renders NO number.** A displayed `0` is
+  the claim "you have nothing to triage", and a component rendered outside the
+  provider has not been told that.
+- **The regression is only observable when the consumers are mounted TOGETHER.**
+  `JudgeNavBadge.test.tsx` mounts all three as siblings — deliberately not a real
+  route, because a router-faithful version would unmount one to reach another and
+  could never compare them.
+
+## 361. The notification retarget is a GUARD on the web and a plain URL change on the API — the asymmetry is the design (D4/D5)
+
+- `reviewDeepLink` (`handler/judge_worker.go`) becomes
+  `baseURL + "/judge?run=" + targetID`. It is called from exactly one place, the
+  judge review notification, so it is judge-only **by construction**.
+- The web inbox renders **every** kind and linked `/runs/${run_id}` generically,
+  so the same edit there is a `kind === 'judge_review'` guard
+  (`notificationLink`, `web/src/lib/notifications.ts`). **A test that checks only
+  the judge row passes under the unconditional URL change**, which is why the
+  gate is a non-judge kind landing on `/runs/...`.
+- **Payload unchanged, cadence unchanged.** No event is removed, `notifysvc` is
+  untouched, and Slack keeps one DM per review — no digest, no throttle
+  (user-decided 2026-07-20). Only the destination moves.
+- **Inbox grouping is render-only**: a maximal run of adjacent `judge_review`
+  rows within a 24h window collapses under one "N reviews ready" header. It is a
+  pure partition — every row appears exactly once, in order — so ids, read state
+  and offset paging are untouched. A run of one stays a plain row. An unparseable
+  timestamp **breaks** the run: `NaN > window` is false, so the arithmetic alone
+  would fold an unknown-age row in silently.
+- **The anchored deep-link `/judge?run={id}` defaults to `bucket=all`, not
+  `todo`** — a notification's coordinates may already have rolled up settled
+  through another run, and an empty To-triage tab would read as "nothing here".
+  Un-anchored `/judge` still defaults `todo`. The inconsistency is deliberate;
+  user-confirmed.
+
+## 362. Filed→Done is EDGE-triggered off the poller's snapshot, `DO NOTHING` not `DO UPDATE` — the PRD's one migration (D6)
+
+- Migration adds `set_via` on `recommendation_dispositions` and `close_synced_at`
+  on `recommendation_filed_issues`.
+- **The poller holds a synced SNAPSHOT, not transition events.** "Write done
+  while the linked issue is closed" is therefore level-triggered: it re-fires
+  every tick, silently re-applying after a human **Undo**. The pass acts only on
+  the open→closed **edge** (cached `state='closed'` AND `close_synced_at IS
+  NULL`) and consumes it, so Undo **sticks** and a reopen does not re-open.
+- **`INSERT … ON CONFLICT DO NOTHING`, deliberately not #94's DO-UPDATE upsert** —
+  a coordinate the user already dismissed keeps their verdict.
+- **A human write must CLEAR `set_via` back to `NULL`.** #94's upsert sets status,
+  reason, hash, `set_by_user_id`, `set_at`, `updated_at` and never touched
+  `set_via`, so a DO UPDATE would carry the sync's provenance over a person's own
+  decision and label it "done via #IID". Both human write paths reset it.
+- It rides the existing poller tick after the issue cache refresh and makes **no
+  forge call**, so it costs nothing on the wire and is skipped by the same early
+  returns when the forge is unreachable (a stale cache must not manufacture
+  edges). Batch-bounded per repo; leftovers ride the next tick.
+- **Two preconditions inherited from the poller, both user-visible when tripped**
+  (documented in `docs/judge-menu.md`): the repo must still be **enabled** (a
+  disabled repo is not polled), and the issue must still carry the **PRD label**
+  (the issue cache is filtered by `prdLabel`). Filed issues get the label
+  automatically, so only removing it breaks the sync.
+
+## 363. `/runs` per-row badge — one grammar, verdict-first; an unjudged run renders NOTHING (D7)
+
+- `⚖ {verdict} · {N}`, with the count appended only when `> 0`. The concept mock
+  had two grammars (a verdict badge plus a separate count badge); two badges for
+  one run read as two facts.
+- **An unjudged run renders no badge at all**, not a neutral pill: "never judged"
+  and "judged and fine" are different claims and a placeholder asserts the second.
+  Same reason the DTO field is nullable rather than defaulted.
+- **The verdict survives a cleared backlog** (`⚖ issues` with count 0) — the badge
+  reports the judge's finding, not the triage state.
+- The count is **bucketed in Go** via the shared ladder (never a second SQL
+  `CASE`) and its read is **best-effort**: a failure logs and leaves counts at 0
+  rather than 500-ing the run list. An ornament must not cause an outage. That
+  gives the count two silent-understatement paths (failed read, and truncation if
+  the page cap and `JudgeRunTodoMaxRows` diverge), both indistinguishable from a
+  genuine 0 — acceptable because in both cases the load-bearing half, the verdict,
+  rides the join rather than the count.
+- **The verdict join is safe by INVARIANT, not by predicate.** `LEFT JOIN
+  run_reviews rv ON rv.target_run_id = r.id` carries no user predicate and is
+  correct only because the outer query filters `r.user_id` **and** a review's
+  `user_id` always equals its target run's owner. Stated where it is enforced,
+  because removing the outer predicate would make this unsafe.
+
+## 364. What this PRD does NOT cover — the coverage boundary, recorded as a decision
+
+Written here rather than left to be inferred, because every Blocking after M3 was
+about evidence rather than behaviour, and a doc claiming "the judge backlog is
+covered end to end" would be wrong on four counts. All true as of the M8a commit:
+
+- **No e2e coverage exists for this PRD at all.** M8b is deferred. Its value is
+  entirely in assertions fakes structurally cannot make; a happy-path walkthrough
+  would duplicate coverage that exists three times over.
+- **mock↔server fidelity is NOT asserted.** A differential harness found **zero
+  divergence** over the shipped demo fixture (7 groups, 0 field diffs, identical
+  ordering, detection power proven by a deliberate `BUCKET_RANK` swap) — but the
+  fixture contains **no** `occurrences > run_count` case and **no** fully-settled
+  group with disagreeing members, so `topRung` never has to *choose* and the
+  `dismissed > done > filed` precedence ladder, the single most-duplicated logic
+  across the two implementations, is never exercised. That is a coverage gap, not
+  a defect. Truncation is unreachable in demo mode (`mockApi.ts` hardcodes
+  `truncated: false`). Since the fixture *is* the demo, the blind spot is shared
+  by the demo and by every mock-backed vitest.
+- **`OccurrenceFileIssue` has zero tests** — 236 lines, and the only forge-writing
+  web path in this PRD. Its security controls were verified by line-by-line diff
+  against RunView's filer; that duplication duplicated away its coverage.
+- **The query inventory test proves only that someone DECLARED where a query is
+  pinned, not that the pin is good.** It catches "nobody has thought about this
+  query at all" and nothing more, and `ListRunInputsForRun` is declared `UNPINNED`
+  because no live test executes it.
+- **The judge-family SQL sites ARE mutation-pinned**, which is the claim that does
+  hold: each was folded on a fresh database with a positive control, and both
+  copies of the filed-issues join — the M1 read's and the bulk resolve's — redden
+  when their coordinate half is dropped.

@@ -86,7 +86,7 @@ func TestRunDTOTags(t *testing.T) {
 func TestRunListItemDTOTags(t *testing.T) {
 	// Embeds RunDTO (keys flatten in) plus repo_path + worker_name; owner_email is
 	// omitempty (absent when nil).
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "worker_name")
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "worker_name", "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -144,6 +144,109 @@ func TestDispositionDTOTags(t *testing.T) {
 func TestTriageDTOTags(t *testing.T) {
 	assertTags(t, "TriageDTO", TriageDTO{},
 		"total", "todo", "filed", "done", "dismissed", "false_positives")
+}
+
+func TestJudgeOccurrenceDTOTags(t *testing.T) {
+	// filed_issue and set_via are both omitempty: an unfiled (or claimed-but-unsettled)
+	// occurrence omits filed_issue rather than shipping a null the consumer special-cases,
+	// and a hand-set (or absent) disposition omits set_via, which carries meaning only when
+	// present.
+	assertTags(t, "JudgeOccurrenceDTO", JudgeOccurrenceDTO{},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket")
+	assertTags(t, "JudgeOccurrenceDTO(filed)", JudgeOccurrenceDTO{FiledIssue: &JudgeFiledIssueRefDTO{}},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "filed_issue")
+	// The auto-done shape: PRD #98 Decision 6's "done via #IID" needs BOTH, since the label
+	// names the issue whose closure produced the done.
+	assertTags(t, "JudgeOccurrenceDTO(auto-done)",
+		JudgeOccurrenceDTO{SetVia: "issue_close", FiledIssue: &JudgeFiledIssueRefDTO{}},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket",
+		"filed_issue", "set_via")
+}
+
+// A hand-marked done and an issue-close auto-done must be DISTINGUISHABLE on the wire —
+// that is the entire reason set_via exists, and until PRD #98 review B3 the column never
+// left the store, so every client rendered the two identically. Asserting the two encodings
+// DIFFER is the pin; asserting only that an auto-done carries the field would still pass if
+// a hand-set one carried it too.
+func TestJudgeOccurrenceAutoDoneIsDistinguishableOnTheWire(t *testing.T) {
+	handSet, err := json.Marshal(JudgeOccurrenceDTO{Bucket: "done"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	autoDone, err := json.Marshal(JudgeOccurrenceDTO{Bucket: "done", SetVia: "issue_close"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(handSet) == string(autoDone) {
+		t.Fatal("a hand-marked done and an issue_close auto-done encode identically — the provenance never reaches a client")
+	}
+	if strings.Contains(string(handSet), "set_via") {
+		t.Errorf("a hand-set disposition must OMIT set_via, got: %s", handSet)
+	}
+	if !strings.Contains(string(autoDone), `"set_via":"issue_close"`) {
+		t.Errorf("an auto-done must carry set_via=issue_close, got: %s", autoDone)
+	}
+}
+
+func TestJudgeFiledIssueRefDTOTags(t *testing.T) {
+	assertTags(t, "JudgeFiledIssueRefDTO", JudgeFiledIssueRefDTO{}, "issue_iid", "issue_url", "filed_at")
+}
+
+func TestJudgeRecommendationGroupDTOTags(t *testing.T) {
+	assertTags(t, "JudgeRecommendationGroupDTO", JudgeRecommendationGroupDTO{},
+		"category", "target", "bucket", "open_count", "run_count", "rationale_preview", "occurrences")
+}
+
+func TestJudgeBacklogDTOTags(t *testing.T) {
+	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "truncated", "triage")
+}
+
+// The bulk fan-out's reply had NO wire pin at all until PRD #98 review BLK-UNDO, which is
+// why `settled` could be added without anything noticing the shape moved. `settled` is
+// deliberately NOT omitempty: a consumer must be able to distinguish "this call settled
+// nothing" from "this server does not send the field", and an omitted key collapses the two.
+func TestJudgeDispositionResultDTOTags(t *testing.T) {
+	assertTags(t, "JudgeDispositionResultDTO", JudgeDispositionResultDTO{},
+		"updated", "settled", "groups", "truncated", "triage")
+}
+
+func TestJudgeSettledMemberDTOTags(t *testing.T) {
+	assertTags(t, "JudgeSettledMemberDTO", JudgeSettledMemberDTO{}, "run_id", "rec_id")
+}
+
+// An empty fan-out must marshal `settled` as [], never null: the client iterates it to build
+// its undo set, and a null would make "nothing was settled" an error case at every consumer
+// instead of an empty loop. Concretely, `undo: res.settled` → null → UndoToast reading
+// `toast.undo.length` → TypeError on any zero-updated dismiss.
+//
+// READ THIS BEFORE PRUNING EITHER TEST. What follows is a property of encoding/json, NOT of
+// the code that builds the response: it marshals a HAND-BUILT struct whose Settled is
+// already `[]JudgeSettledMemberDTO{}`, so it cannot fail for the reason its name gives
+// (PRD #98 review). Proven: making `settled` a nil slice in the service leaves this test
+// GREEN and reddens handler.TestBulkDispositionSettledEmptyWhenNothingMatched with
+// `{"settled":null}`.
+//
+// THE HANDLER TEST IS THE REAL GUARD. This one is kept as the documented statement of the
+// wire contract — the place a reader looks for what the field must encode as — and is
+// deliberately NOT the thing standing between the codebase and that TypeError. Do not delete
+// the handler test on the theory that the wire pin covers it; it is the other way round.
+func TestJudgeDispositionResultEmptySettledIsArray(t *testing.T) {
+	b, err := json.Marshal(JudgeDispositionResultDTO{Settled: []JudgeSettledMemberDTO{}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"settled":[]`) {
+		t.Errorf("want an empty ARRAY for settled, got: %s", b)
+	}
+	// And the failure mode itself, so the CONTRAST is on the page rather than implied: a nil
+	// slice encodes as null, which is exactly what the service must never produce.
+	nilB, err := json.Marshal(JudgeDispositionResultDTO{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(nilB), `"settled":null`) {
+		t.Errorf("expected a NIL slice to encode as null (the state the service must avoid), got: %s", nilB)
+	}
 }
 
 func TestIssueDraftDTOTags(t *testing.T) {

@@ -16,11 +16,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       adminListRuns: vi.fn(),
       adminListWorkers: vi.fn(),
-      // PRD #94: the global strip fetches this on mount. Default to an empty backlog so
-      // the pre-existing tests keep the strip hidden; the strip tests override it.
-      getJudgeStats: vi
-        .fn()
-        .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
+      // Defined but never expected to fire. PRD #98 Decision 7 removed the aggregate strip
+      // from this page, and the strip's fetch went with it — see the removal test below,
+      // which can only assert that against a mock that EXISTS.
+      getJudgeStats: vi.fn().mockResolvedValue({
+        total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0,
+      }),
     },
   };
 });
@@ -68,6 +69,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     updated_at: "2026-07-05T12:00:00Z",
     repo_path: "grp/proj",
     worker_name: "w1",
+    // PRD #98 M4: unjudged by default, so existing assertions are unchanged.
+    judge_verdict: null,
+    judge_todo_count: 0,
     ...over,
   };
 }
@@ -201,17 +205,9 @@ describe("RunsList — usage meta line (PRD #40)", () => {
   });
 })
 
-describe("RunsList — global judge-triage strip (PRD #94)", () => {
-  it("renders the strip with counts from getJudgeStats (ignores the runs list)", async () => {
-    mockApi.listRuns.mockResolvedValue({ runs: [] });
-    mockApi.getJudgeStats.mockResolvedValue({
-      total: 47,
-      todo: 18,
-      filed: 9,
-      done: 12,
-      dismissed: 8,
-      false_positives: 3,
-    });
+describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", () => {
+  it("no longer renders the aggregate strip (its home is now the Judge page header)", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "A run" })] });
 
     render(
       <MemoryRouter>
@@ -219,35 +215,16 @@ describe("RunsList — global judge-triage strip (PRD #94)", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() =>
-      expect(screen.getByText("Judge recommendations · all your runs")).toBeTruthy(),
-    );
-    // Counts come straight from the global stats, not the (empty) runs list.
-    expect(screen.getByText("18")).toBeTruthy();
-    expect(screen.getByText("9")).toBeTruthy();
-    expect(screen.getByText("12")).toBeTruthy();
-    expect(screen.getByText("8")).toBeTruthy();
-    expect(screen.getByText(/3 of 8 dismissed were false positives/)).toBeTruthy();
-  });
-
-  it("hides the strip when the backlog is empty (total 0)", async () => {
-    mockApi.listRuns.mockResolvedValue({ runs: [] });
-    mockApi.getJudgeStats.mockResolvedValue({
-      total: 0,
-      todo: 0,
-      filed: 0,
-      done: 0,
-      dismissed: 0,
-      false_positives: 0,
-    });
-
-    render(
-      <MemoryRouter>
-        <RunsList />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => expect(screen.getByText("No runs yet")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("A run")).toBeTruthy());
     expect(screen.queryByText("Judge recommendations · all your runs")).toBeNull();
+    // The strip's fetch is gone entirely — RunsList must not CALL getJudgeStats.
+    //
+    // This used to assert `getJudgeStats` was `undefined`, which was a property of THIS
+    // FILE'S mock factory rather than of RunsList: it passed whatever the component did
+    // (PRD #98 review N9). The behaviour was in fact defended — re-adding the call blew up
+    // six tests with a TypeError on an undefined mock — but by accident, and with a failure
+    // that named the wrong cause. The mock is now defined, so this asserts the real thing
+    // and a regression reads as "it was called" instead of "undefined is not a function".
+    expect(mockApi.getJudgeStats).not.toHaveBeenCalled();
   });
 })

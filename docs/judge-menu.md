@@ -1,0 +1,116 @@
+---
+title: Judge menu
+order: 101
+audience: user
+---
+
+# Judge menu
+
+**Factory → Judge** is where you work the judge's backlog. The
+[run judge](./judge.md) produces recommendations one run at a time; this page
+is the cross-run view of all of them, and the place to actually clear them.
+
+The nav item carries a badge: how many recommendations still need triage,
+across every run you own.
+
+## 1. One row per idea, not per run
+
+The same recommendation recurs. "Install `rg` on the worker" can come back in
+twenty runs, and triaging it twenty times is twenty decisions about one idea.
+
+So the worklist **dedups by (category, target)**: one row per idea, however
+many runs raised it, tagged **seen in N runs**. Recurrence is the ranking
+signal — rows are ordered by how many runs raised them, then by how many are
+still open. That is deliberately *not* newest-first: a thing twelve runs
+complained about matters more than the one that finished last.
+
+Expand a row to see each occurrence — the run, its verdict, and that
+occurrence's own triage state.
+
+## 2. Triage a whole group at once
+
+**Mark done** or **Dismiss ▾** (Won't do / Not an issue) on a row applies to
+**every open occurrence across every run**, in one call. Tick several rows and
+the selection bar does the same across all of them.
+
+Three things worth knowing, because each looks like a bug and is not:
+
+- **The count you get back is coordinates, not recommendations.** One review
+  can legitimately carry the same `(category, target)` twice, and both share a
+  single triage state — so dismissing a group of 5 can correctly report 4.
+- **Only *open* occurrences are touched.** An occurrence you already dismissed,
+  marked done, or filed an issue for keeps the state you gave it. Group actions
+  clear the backlog; they do not overwrite your decisions.
+- **After the action, the row stays.** It re-renders at its new state rather
+  than vanishing, so you can see what you just did — and **Undo** in the toast
+  reverts exactly the occurrences that action settled.
+
+Filing an issue is still **per recommendation**, from the occurrence expander,
+using the same draft-and-review flow as
+[the run page](./judge.md#filing-an-issue-from-a-recommendation). There is no
+"file the whole group as one issue" — that needs a repo pick and a human draft
+per item, and it is not built.
+
+## 3. The tabs, and the one number
+
+**To triage / Filed / Done / Dismissed / All.** A recommendation is in exactly
+one, ranked highest-wins: Dismissed > Done > Filed > To triage.
+
+The **To triage** tab, the **Judge** nav badge and the judge notification in
+your inbox are the same number, from the same server-side count — not three
+tallies of what happens to be on screen. **seen in N runs** is a row's
+recurrence, never a competing total.
+
+**If you see a "backlog was truncated" banner, read it as *unknown*, not
+*empty*.** The cap applies before rows are grouped, so a group can be missing
+entirely, and a group that *is* shown can have understated counts. Narrowing by
+`?run=` is the only filter applied before the cap; the bucket tabs filter what
+survived it.
+
+## 4. Where a review shows up now
+
+- **On the runs list**, each judged run carries `⚖ issues · 2` — the verdict
+  first, and the still-to-triage count only when there is one. A run **nobody
+  has judged** carries no badge at all: "never judged" and "judged and fine"
+  are different claims, and a neutral pill would assert the second.
+- **In your inbox**, "Run review ready" now opens **Judge**, anchored to that
+  run (`/judge?run=…`), instead of the run page. Notifications of every other
+  kind still open their run. The Slack DM's link moved the same way; its
+  cadence did not — still one DM per review, no digest.
+- **A run of consecutive judge pings collapses** into one "N reviews ready"
+  header you can expand. The rows underneath are unchanged — same ids, same
+  read state, same **Mark read**.
+
+An anchored link (`/judge?run=…`) opens on the **All** tab, not To triage. That
+is on purpose: the recommendation the notification is about may already have
+been settled through another run, and landing on an empty To-triage tab would
+read as "nothing here". An unanchored **Judge** still opens on To triage.
+
+## 5. Closing a filed issue marks it done
+
+When an issue you filed from a recommendation is **closed** on the forge, uzi
+moves that recommendation to **Done** by itself, and labels it so — "done via
+#IID", visibly distinct from one you marked by hand.
+
+It fires **once**, on the close, and never overwrites you: a recommendation you
+had already dismissed keeps your verdict, and if you **Undo** the automatic
+done it stays undone rather than being re-applied on the next poll. Reopening
+the issue does not reopen the recommendation.
+
+Two preconditions, both easy to trip:
+
+- **The repo must still be enabled in uzi.** The sync rides the normal issue
+  poll, so a disabled repo is not polled and the close is never seen.
+- **The issue must still carry the PRD label.** uzi's issue cache only holds
+  PRD-labelled issues; strip the label and the close goes unobserved. Filed
+  issues get it automatically, so this only bites if someone removes it.
+
+There is no forge call of its own here and no token spent — it reads the cache
+the normal poll already refreshed.
+
+## From the terminal
+
+Everything except filing is available from the
+[uzi CLI](./cli.md#reviewing-and-triaging-from-the-cli): `uzi review backlog`
+is this page, and `uzi review resolve/dismiss --category … --target …` is the
+group action.

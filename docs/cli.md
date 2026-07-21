@@ -76,7 +76,9 @@ uzi run reject <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
 uzi run inputs <id> [--json]
-uzi review show <id> | resolve <id> <rec> | dismiss <id> <rec> --reason wont-do|not-an-issue
+uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all]
+uzi review resolve <id> <rec> | --category <c> --target <t>
+uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
@@ -105,8 +107,8 @@ A few worth knowing:
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
-  contract. The rest of the `review` group (`resolve`/`dismiss`/`undo`/
-  `stats`) triages recommendations — see
+  contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
+  `undo`/`stats`) triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
   below. There's still no `rejudge` verb: re-running the judge spends the
   owner's Anthropic budget and stays a web action.
@@ -176,6 +178,40 @@ uzi review undo <run-id> <rec-id>                            # clear a dispositi
 uzi review stats [--json]                                    # your triage tally, across all runs
 ```
 
+`show` is one run. `backlog` is every recommendation across **all** your runs,
+deduped by `(category, target)`, so one that recurs in five runs is a single
+row reading `seen in 5 runs` — the terminal form of the
+[Judge menu](./judge-menu.md):
+
+```sh
+uzi review backlog                                           # what still needs triage
+uzi review backlog --bucket all --json                       # settled groups too, for an agent
+uzi review backlog --run <run-id>                            # only coordinates that recur in that run
+uzi review resolve --category <c> --target <t>               # mark the whole group done
+uzi review dismiss --category <c> --target <t> --reason wont-do
+```
+
+Three things to know before acting on a group action's output:
+
+- **`updated` counts coordinates, not recommendations.** One review can carry
+  the same `(category, target)` twice and both share a single disposition row,
+  so dismissing a group of 5 can correctly report 4.
+- **`updated: 0` succeeded and wrote nothing**, and *why* is deliberately
+  unknowable: a coordinate that doesn't exist, one already settled, and one
+  belonging to another user are the same answer, so nothing leaks whether it
+  exists. Re-read `backlog` rather than guessing.
+- **`truncated: true` means a missing group is unknown, not settled** — the row
+  cap applies before grouping, so a surviving group's counts can be understated
+  too. Narrow with **`--run <run-id>`**: the anchor is the only filter applied
+  *before* the cap, so it is the only one that changes what gets cut. `--bucket`
+  filters the surviving rows and cannot reach the missing ones. The `triage` tally is exempt: it's the canonical all-time aggregate and
+  matches `uzi review stats` and the web nav badge exactly.
+
+Passing only one of `--category`/`--target` is a usage error (exit 2). An empty
+half is a literal empty string, not a wildcard, so sending it would report a
+successful no-op. Filing an issue from a recommendation stays a web action:
+there is no `file` verb.
+
 `<rec-id>` is the short, git-style id `show` prints as the first column of
 each recommendation (or the full UUID from `--json`); an unambiguous prefix
 resolves against the run's **current** review, so you can paste straight out
@@ -195,11 +231,20 @@ drives `resolve`/`dismiss`/`undo`/`stats` on its own runs, same as clicking
 the buttons yourself. A read-only `uza_` token can `show` anyone's review
 (the same admin reach other judge reads get) and `stats` always reports the
 token owner's *own* tally, but the read-only ceiling still holds for writes:
-`resolve`/`dismiss`/`undo` against **another** user's review is refused
-(exit 4, not found), exactly as for a non-admin `uzc_` token. On its
+the **per-run** `resolve`/`dismiss`/`undo` against **another** user's review is
+refused (exit 4, not found), exactly as for a non-admin `uzc_` token. On its
 **own** runs, though, a `uza_` token can triage same as any owner — the
 ceiling blocks reaching into someone else's review, not every write
 everywhere.
+
+The **group** form is owner-only too, but it refuses *silently* rather than
+with a 404, and the difference is a contract, not an oversight. Its unit is a
+`(category, target)` coordinate, not an id, so there is nothing to report as
+not-found: another user's coordinate simply resolves to zero of *your* rows and
+comes back `200`, `updated: 0` — the same answer a misspelt or already-settled
+coordinate gives. That indistinguishability is the point; a per-item outcome
+would rebuild exactly the existence oracle the 404-on-everything rule removes.
+Don't read `updated: 0` as an error, and don't read it as success either.
 
 ## Anthropic tokens
 

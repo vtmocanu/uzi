@@ -25,7 +25,7 @@ import {
   type RunReview,
   type TriageCounts,
 } from "../lib/api";
-import { recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
   formatElapsed,
@@ -782,16 +782,6 @@ export function AgentRosterSummary({ run }: { run: Run }) {
 // Only issue / ci_fix runs are judged (the enqueue allowlist); a chat/judge/
 // self_improve run never has a review, so the panel is hidden for those kinds.
 const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
-
-// coordKey is the SINGLE source of truth for the (category, target) key that matches a
-// recommendation to its filed link (PRD #68). It MUST be used at both the build and the
-// lookup site — a separator mismatch silently drops a persisted filed link back to the
-// idle "File issue" button (the row 409s on Create, the stale flag never fires). category
-// is a fixed enum with no spaces, so a single space cleanly separates it from the
-// arbitrary target.
-function coordKey(category: string, target: string): string {
-  return `${category} ${target}`;
-}
 
 // JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
 // structured recommendations, plus the "re-run judge" action. It fetches its own

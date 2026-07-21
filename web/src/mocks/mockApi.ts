@@ -18,6 +18,15 @@ import {
   type CreatedIssue,
   type Disposition,
   type IssueDraft,
+  type JudgeBacklog,
+  type JudgeBacklogBucket,
+  type JudgeDispositionCoord,
+  type JudgeDispositionResult,
+  type JudgeSettledMember,
+  type JudgeDispositionScope,
+  type JudgeOccurrence,
+  type JudgeRecommendationGroup,
+  type ReviewVerdict,
   type Memory,
   type Notification,
   type NotificationList,
@@ -45,7 +54,7 @@ import {
   type UserSettingsPatch,
 } from "../lib/api";
 import { isTheme, resolveTheme } from "../lib/theme";
-import { recommendationLabel, verdictLabel } from "../lib/judge";
+import { coordKey, recommendationLabel, verdictLabel } from "../lib/judge";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
@@ -202,10 +211,6 @@ const reviews: MockReview[] = mockReviews.map((r) => ({
   dispositions: r.dispositions.map((x) => ({ ...x })),
 }));
 
-// coordKey mirrors RunView's (category, target) key — the coordinate the disposition
-// and filed-link side-tables share (PRD #94/#68).
-const coordKey = (category: string, target: string) => `${category} ${target}`;
-
 // recomputeTriage buckets a review's recommendations through the SAME precedence
 // ladder as the server (dismissed > done > filed[settled] > todo), so the mock's
 // per-review counts and the global stats can never drift from the panel (PRD #94 D#2).
@@ -242,8 +247,139 @@ function reviewDTO(review: MockReview): MockReview {
     filed_issues: review.filed_issues.map((x) => ({ ...x })),
     dispositions: review.dispositions
       .filter((d) => recCoords.has(coordKey(d.category, d.target)))
-      .map((x) => ({ ...x })),
+      // set_via is STRIPPED here, deliberately. It is a mock-side extension of the stored
+      // disposition (PRD #98 B3) because the run-page DispositionDTO carries no provenance —
+      // only the Judge menu's occurrence does. A spread would leak it onto
+      // GET /runs/{id}/review, where the real API sends no such field, and the mock would be
+      // lying about the wire: a future RunView provenance feature would work in demo mode
+      // and have nothing to read in production.
+      .map(({ set_via: _setVia, ...d }) => ({ ...d })),
     triage: recomputeTriage(review),
+  };
+}
+
+// bucketOfRec buckets ONE recommendation through the shared ladder (dismissed > done >
+// filed > todo), the same precedence recomputeTriage uses — extracted so the Judge
+// backlog (PRD #98) and the stats tally cannot disagree on what a coordinate's state is.
+function bucketOfRec(review: MockReview, category: string, target: string): JudgeBacklogBucket {
+  const disp = review.dispositions.find((d) => d.category === category && d.target === target);
+  const filed = review.filed_issues.some((f) => f.category === category && f.target === target);
+  if (disp?.status === "dismissed") return "dismissed";
+  if (disp?.status === "done") return "done";
+  if (filed) return "filed";
+  return "todo";
+}
+
+// computeTriage sums the per-recommendation ladder over EVERY review the caller owns —
+// the canonical /me/judge/stats aggregate the nav badge, the strip, and the Judge page's
+// tabs all read (never tallied off a filtered/grouped list). The demo owns three reviews.
+function computeTriage(): TriageCounts {
+  const total: TriageCounts = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+  for (const review of reviews) {
+    const t = recomputeTriage(review);
+    total.total += t.total;
+    total.todo += t.todo;
+    total.filed += t.filed;
+    total.done += t.done;
+    total.dismissed += t.dismissed;
+    total.false_positives += t.false_positives;
+  }
+  return total;
+}
+
+// RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280) so the mock's
+// preview truncation matches. Counted in code units here (the demo text is ASCII); the
+// server counts runes.
+const RATIONALE_PREVIEW_MAX = 280;
+function rationalePreview(s: string): string {
+  if (s.length <= RATIONALE_PREVIEW_MAX) return s;
+  return s.slice(0, RATIONALE_PREVIEW_MAX).replace(/[\s]+$/, "") + "…";
+}
+
+const BUCKET_RANK: Record<string, number> = { dismissed: 3, done: 2, filed: 1, todo: 0 };
+const RANK_BUCKET: JudgeBacklogBucket[] = ["todo", "filed", "done", "dismissed"];
+
+// computeBacklog mirrors the server's grouped read (workersvc.GroupJudgeRecommendations):
+// flatten every occurrence, order by review updated_at DESC (a re-judge counts as recent),
+// dedup by (category, target), roll up (todo if any open, else the highest member rung),
+// then sort by frequency (run_count, then open_count). The ?run= anchor keeps only groups
+// that recur in that run (a coordinate-level semi-join) while preserving each kept group's
+// other-run occurrences; ?bucket= filters the GROUP ROLLUP. triage is the canonical
+// aggregate, NEVER tallied from the returned groups.
+function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
+  const ordered = [...reviews].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const byCoord = new Map<string, JudgeRecommendationGroup>();
+  const runsSeen = new Map<string, Set<string>>();
+  const topRung = new Map<string, number>();
+
+  for (const review of ordered) {
+    for (const rec of review.recommendations) {
+      const key = coordKey(rec.category, rec.target);
+      const b = bucketOfRec(review, rec.category, rec.target);
+      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
+      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+      const occ: JudgeOccurrence = {
+        run_id: review.target_run_id,
+        run_title: getRun(review.target_run_id)?.issue_title ?? "",
+        review_id: review.id,
+        rec_id: rec.id,
+        verdict: review.verdict as ReviewVerdict,
+        confidence: rec.confidence,
+        bucket: b,
+        // Provenance rides alongside the bucket, because both a hand-marked and an
+        // auto-done are bucket "done" (PRD #98 Decision 6 / review B3).
+        ...(disp?.set_via ? { set_via: disp.set_via } : {}),
+        ...(filed
+          ? { filed_issue: { issue_iid: filed.issue_iid, issue_url: filed.issue_url, filed_at: filed.filed_at } }
+          : {}),
+      };
+      let g = byCoord.get(key);
+      if (!g) {
+        g = {
+          category: rec.category,
+          target: rec.target,
+          bucket: "todo",
+          open_count: 0,
+          run_count: 0,
+          // First occurrence is the most-recent (ordered above) → its rationale is the preview.
+          rationale_preview: rationalePreview(rec.rationale_md),
+          occurrences: [],
+        };
+        byCoord.set(key, g);
+        runsSeen.set(key, new Set());
+        topRung.set(key, 0);
+      }
+      g.occurrences.push(occ);
+      if (b === "todo") g.open_count += 1;
+      const seen = runsSeen.get(key)!;
+      if (!seen.has(occ.run_id)) {
+        seen.add(occ.run_id);
+        g.run_count += 1;
+      }
+      topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
+    }
+  }
+
+  let groups = [...byCoord.values()];
+  for (const g of groups) {
+    const key = coordKey(g.category, g.target);
+    g.bucket = g.open_count > 0 ? "todo" : RANK_BUCKET[topRung.get(key)!];
+  }
+  // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
+  // run, but keep ALL its occurrences (so a notification still shows the other runs it
+  // recurs in). A foreign/unknown run matches nothing → empty, no existence oracle.
+  if (runAnchor) {
+    groups = groups.filter((g) => g.occurrences.some((o) => o.run_id === runAnchor));
+  }
+  groups.sort((a, b) => (b.run_count - a.run_count) || (b.open_count - a.open_count));
+  const filtered = bucket === "all" ? groups : groups.filter((g) => g.bucket === bucket);
+
+  return {
+    bucket,
+    run: runAnchor,
+    groups: filtered,
+    truncated: false,
+    triage: computeTriage(),
   };
 }
 
@@ -1727,13 +1863,21 @@ export const mockApi = {
       throw new ApiError(400, "status must be 'done' or 'dismissed'");
     }
     // Idempotent upsert on the coordinate; a set re-stamps set_at and clears stale.
-    const next: Disposition = {
+    //
+    // set_via is EXPLICITLY cleared, and the explicitness is the point (PRD #98 Decision 6,
+    // mirroring dispositions.sql's literal NULL). This is a HUMAN write, so the provenance
+    // must stop saying "the system inferred it": overriding an issue-close auto-done has to
+    // read "✓ Done", not "Done via #91". Object.assign copies only the keys `next` HAS, so
+    // omitting this would leave a stale set_via on the existing row and the mock would demo
+    // exactly the misattribution the server's literal NULL exists to prevent.
+    const next: Disposition & { set_via?: "issue_close" } = {
       category: rec.category,
       target: rec.target,
       status,
       reason: status === "dismissed" ? (reason as "wont_do" | "not_an_issue") : "",
       set_at: new Date().toISOString(),
       stale: false,
+      set_via: undefined,
     };
     const existing = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
     if (existing) Object.assign(existing, next);
@@ -1755,19 +1899,90 @@ export const mockApi = {
   },
   getJudgeStats: async () => {
     requireSession();
-    // Global backlog: bucket EVERY recommendation across all the caller's reviews
-    // through the same ladder (the demo owns one review, so this sums to it).
-    const total: TriageCounts = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
-    for (const review of reviews) {
-      const t = recomputeTriage(review);
-      total.total += t.total;
-      total.todo += t.todo;
-      total.filed += t.filed;
-      total.done += t.done;
-      total.dismissed += t.dismissed;
-      total.false_positives += t.false_positives;
+    // Canonical aggregate over every review the caller owns (the same tally the Judge
+    // page's tabs and the nav badge read — see computeTriage).
+    return delay(computeTriage(), 60);
+  },
+
+  // ── Judge menu — cross-run backlog + bulk disposition (PRD #98 M3) ───────────
+  getJudgeBacklog: async (bucket: JudgeBacklogBucket = "todo", run?: string) => {
+    requireSession();
+    return delay(computeBacklog(bucket, run ?? ""), 80);
+  },
+  bulkSetJudgeDisposition: async (
+    items: JudgeDispositionCoord[],
+    status: "done" | "dismissed",
+    reason?: "wont_do" | "not_an_issue",
+    scope: JudgeDispositionScope = "open",
+  ) => {
+    requireSession();
+    if (items.length === 0) throw new ApiError(400, "items required");
+    if (status === "dismissed") {
+      if (reason !== "wont_do" && reason !== "not_an_issue") {
+        throw new ApiError(400, "invalid status or reason");
+      }
+    } else if (status === "done") {
+      if (reason !== undefined) throw new ApiError(400, "invalid status or reason");
+    } else {
+      throw new ApiError(400, "invalid status or reason");
     }
-    return delay(total, 60);
+    if (scope !== "open" && scope !== "all") throw new ApiError(400, "invalid scope");
+    // Dedup coordinates before the cap check (the cap counts distinct work).
+    const want = new Map<string, JudgeDispositionCoord>();
+    for (const it of items) want.set(coordKey(it.category, it.target), it);
+    if (want.size > 100) throw new ApiError(400, "too many items");
+
+    // Fan out: for every review, upsert a disposition on each member coordinate that the
+    // request names and the scope selects (scope=open → only members the ladder buckets as
+    // todo). `updated` counts distinct (review_id, category, target) TRIPLES actually
+    // written — so it can be LOWER than the recommendations a group spans.
+    //
+    // `settled` collects an undo ADDRESS per written triple, from the same pass that decides
+    // membership — the mock must model this faithfully, because the whole point of the field
+    // is that it can DIFFER from what a client would compute: a member the scope skips must
+    // not appear here (PRD #98 review BLK-UNDO).
+    const writtenTriples = new Set<string>();
+    const settled: JudgeSettledMember[] = [];
+    for (const review of reviews) {
+      for (const rec of review.recommendations) {
+        const key = coordKey(rec.category, rec.target);
+        if (!want.has(key)) continue;
+        if (scope === "open" && bucketOfRec(review, rec.category, rec.target) !== "todo") continue;
+        if (!writtenTriples.has(`${review.id} ${key}`)) {
+          settled.push({ run_id: review.target_run_id, rec_id: rec.id });
+        }
+        // set_via explicitly cleared: a bulk group action is a HUMAN write too, so it must
+        // drop any issue-close provenance rather than inherit it (see the single-coordinate
+        // path above for why Object.assign makes the omission a live bug, not a tidiness nit).
+        const next: Disposition & { set_via?: "issue_close" } = {
+          category: rec.category,
+          target: rec.target,
+          status,
+          reason: status === "dismissed" ? (reason as "wont_do" | "not_an_issue") : "",
+          set_at: new Date().toISOString(),
+          stale: false,
+          set_via: undefined,
+        };
+        const existing = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+        if (existing) Object.assign(existing, next);
+        else review.dispositions.push(next);
+        writtenTriples.add(`${review.id} ${key}`);
+      }
+    }
+
+    // Re-read at bucket=all (so a just-dismissed group still returns with its new rollup),
+    // narrowed to the acted-on coordinates — the shape the page re-renders rows from.
+    const backlog = computeBacklog("all", "");
+    const acted = new Set([...want.keys()]);
+    const groups = backlog.groups.filter((g) => acted.has(coordKey(g.category, g.target)));
+    const result: JudgeDispositionResult = {
+      updated: writtenTriples.size,
+      settled,
+      groups,
+      truncated: false,
+      triage: backlog.triage,
+    };
+    return delay(result, 120);
   },
 
   // ── File a forge issue from a recommendation (PRD #68 M4 preview) ────────────

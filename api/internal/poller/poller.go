@@ -242,6 +242,16 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
 	}
 
+	// Filed→Done judge sync (PRD #98 M6): with the issue cache fresh, move any
+	// recommendation whose filed issue (#68) has just been observed CLOSED to Done —
+	// once, on the open→closed edge, never overwriting a human's own verdict. Reads the
+	// cache the sync above just wrote and makes NO forge call, so it costs nothing on the
+	// wire and, like the MR watcher, is skipped entirely by the early returns when the
+	// forge is unreachable (a stale cache must not manufacture edges).
+	if err := e.svc.SyncFiledIssueCloses(ctx, r.ID); err != nil {
+		slog.Error("poller: sync filed-issue closes", "repo", r.PathWithNamespace, "error", err)
+	}
+
 	// Pipeline-status sync (PRD #6): refresh the CI-badge cache for the repo's
 	// default branch + its watched agent run branches. Rides this tick (no second
 	// loop, no new interval); disabled when SetPipelineWatch was not called or

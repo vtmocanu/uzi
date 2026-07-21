@@ -75,6 +75,206 @@ type TriageDTO struct {
 	FalsePositives int `json:"false_positives"`
 }
 
+// JudgeFiledIssueRefDTO is the forge issue a single occurrence was filed as (PRD #98 M1).
+// It is the lean, coordinate-free cousin of FiledIssueDTO: inside an occurrence the
+// (category, target) coordinate is the enclosing group's, so only the issue itself is
+// carried. Present ONLY on a SETTLED link — an in-flight claim is omitted, matching the
+// run-page panel and the "filed means settled" rung of the #94 ladder.
+type JudgeFiledIssueRefDTO struct {
+	IssueIID int64     `json:"issue_iid"`
+	IssueURL string    `json:"issue_url"`
+	FiledAt  time.Time `json:"filed_at"`
+}
+
+// JudgeOccurrenceDTO is one run's instance of a deduped recommendation (PRD #98
+// Decision 2): the group is a display construct, but triage state stays PER-COORDINATE,
+// so every occurrence carries its own bucket and its own filed link. run_title is the
+// target run's issue_title. Bucket comes from the shared workersvc.BucketOf ladder
+// (#94 Decision 2) — never a SQL CASE, never a second implementation.
+type JudgeOccurrenceDTO struct {
+	RunID      string `json:"run_id"`
+	RunTitle   string `json:"run_title"`
+	ReviewID   string `json:"review_id"`
+	RecID      string `json:"rec_id"`
+	Verdict    string `json:"verdict"`
+	Confidence string `json:"confidence"`
+	Bucket     string `json:"bucket"`
+	// SetVia is the disposition's PROVENANCE (PRD #98 Decision 6): "" (omitted) means a
+	// PERSON set it, "issue_close" means the M6 poller sync did when the filed issue closed.
+	// A client MUST render the two differently — an auto-done reads "done via #IID" — because
+	// "I decided this was done" and "the system inferred it from a closed issue" are
+	// different claims, and only one of them is the user's.
+	//
+	// The entire set_via mechanism exists for this one visible distinction, guarded from both
+	// directions in SQL: the sync writes set_via='issue_close' with set_by_user_id NULL so a
+	// system action is never attributed to a person, and every human write clears set_via
+	// back to a literal NULL so a person's action is never attributed to the system. None of
+	// that reached a client until this field existed, and the chip rendered both identically.
+	//
+	// omitempty because the overwhelmingly common case is a hand-set (or absent) disposition:
+	// the field carries meaning only when present.
+	SetVia string `json:"set_via,omitempty"`
+	// FiledIssue is the settled forge issue for this occurrence's coordinate, nil when
+	// the coordinate was never filed (or the claim is still in flight).
+	FiledIssue *JudgeFiledIssueRefDTO `json:"filed_issue,omitempty"`
+}
+
+// JudgeRecommendationGroupDTO is one (category, target) coordinate deduped across every
+// run it recurs in (PRD #98 Decisions 1/2) — the Judge menu's row. OpenCount is the
+// number of members whose bucket is todo ("open" means todo; a FILED member is not open,
+// it is on the filed rung). RunCount is the DISTINCT run count behind the group — the
+// "seen in N runs" evidence chip, and the frequency signal the backlog ranks by. Bucket
+// is the group rollup: todo whenever OpenCount >= 1, otherwise the HIGHEST member state
+// on the #94 ladder (dismissed > done > filed).
+//
+// RationalePreview is the most-recent occurrence's rationale_md, TRUNCATED to a preview
+// cap (workersvc.RationalePreviewMaxRunes) and shipped as PLAIN TEXT — deliberately NOT
+// server-side HTML-escaped. It is scrubbed at ingest, and the no-raw-render guarantee is
+// CLIENT-side: every consumer must render it as escaped text (React's default, as
+// web/src/pages/RunView.tsx does for the same fields), never as markdown or HTML.
+// Escaping it here would double-escape in the SPA and print HTML entities into the
+// terminal from `uzi review backlog`.
+type JudgeRecommendationGroupDTO struct {
+	Category         string               `json:"category"`
+	Target           string               `json:"target"`
+	Bucket           string               `json:"bucket"`
+	OpenCount        int                  `json:"open_count"`
+	RunCount         int                  `json:"run_count"`
+	RationalePreview string               `json:"rationale_preview"`
+	Occurrences      []JudgeOccurrenceDTO `json:"occurrences"`
+}
+
+// JudgeBacklogDTO is GET /api/me/judge/recommendations (PRD #98 M1): the caller's
+// all-time, owner-scoped recommendation backlog, deduped by (category, target).
+//
+// Bucket echoes the applied ?bucket= filter (default todo) and Run echoes the ?run=
+// anchor ("" when absent). Triage is deliberately NOT tallied from Groups: it is the
+// aggregate GET /me/judge/stats serves, read from the same query through the same shared
+// BucketTriage ladder, so the page's bucket tabs, the nav badge and the strip cannot drift
+// no matter which filter is applied or whether the page was truncated.
+//
+// Truncated says the backlog hit its hard row cap (workersvc.JudgeBacklogMaxRows). Read
+// this carefully before rendering a truncated page, because the cut is NOT simply "the
+// tail of the list is missing":
+//
+// The cap bounds ROWS and it applies BEFORE grouping, so a group that SURVIVES the cut can
+// still have lost occurrences. When Truncated is true, a surviving group's RunCount and
+// OpenCount may be UNDERSTATED and its Bucket rollup may be WRONG — a group whose only
+// open occurrence fell outside the cut rolls up done/dismissed instead of todo, and is
+// then filtered out of the default ?bucket=todo view entirely. So a truncated page must
+// never be presented as authoritative.
+//
+// What is missing is the LEAST-RECENTLY-JUDGED occurrences: the read is ordered by
+// run_reviews.updated_at DESC, so "oldest" means oldest by last judging, and a run
+// re-judged today counts as recent no matter when it first ran.
+//
+// Triage is unaffected — it comes from the #94 stats query over the caller's whole row
+// set, so the canonical counts remain correct even here. That asymmetry is deliberate: the
+// numbers stay right while the list goes partial.
+type JudgeBacklogDTO struct {
+	Bucket    string                        `json:"bucket"`
+	Run       string                        `json:"run"`
+	Groups    []JudgeRecommendationGroupDTO `json:"groups"`
+	Truncated bool                          `json:"truncated"`
+	Triage    TriageDTO                     `json:"triage"`
+}
+
+// JudgeDispositionResultDTO is the response to the bulk group-disposition fan-out
+// (PRD #98 M2, Decision 3).
+//
+// Updated counts member COORDINATES — (review_id, category, target) triples — not
+// recommendation rows. The two differ: a review may carry the same coordinate on two
+// recommendations, and since recommendation_dispositions is keyed on the coordinate, both
+// share ONE verdict and contribute ONE to this count. So Updated can be lower than the
+// number of recommendations a group visibly spans, and that is correct.
+//
+// It is deliberately an aggregate and never a per-item breakdown: a coordinate that does
+// not exist and one that belongs to another user both resolve to zero members, so neither
+// the count nor anything else in this DTO can be used to tell them apart (#94 Decision 5's
+// one-404 rule — no existence oracle). A caller learning "0 written" learns only that none
+// of THEIR rows matched.
+//
+// Groups are the affected coordinates re-read after the writes (all buckets, so a group
+// that just left To triage is still returned with its new rollup), and Triage is the
+// recomputed canonical tally — together enough for the page to update its rows AND its
+// badge from this one round-trip, with no follow-up GET.
+//
+// Truncated carries through from that re-read, which is bounded by the same hard row cap as
+// the backlog (workersvc.JudgeBacklogMaxRows). It matters because of a specific interaction:
+// a user past the cap can settle a coordinate that lies OUTSIDE the read window and get
+// Updated > 0 with NO corresponding entry in Groups. Without this flag a consumer cannot
+// tell that from "the group is gone", and would make the row vanish mid-interaction —
+// exactly what re-reading at bucket=all exists to prevent. When Truncated is true, treat a
+// missing group as UNKNOWN, not settled.
+// Settled names the coordinates this call actually wrote, as addresses a caller can undo
+// through. It exists because the client CANNOT compute that set (PRD #98 review BLK-UNDO):
+// with scope=open, membership is decided SERVER-SIDE at write time, so any member settled
+// between the client's last read and this write is in the client's view of "open" and
+// outside the action. Undoing from that stale view deletes dispositions the action never
+// created — and for an M6 issue-close auto-done that is IRREVERSIBLE, because
+// close_synced_at is already stamped and the poller is edge-triggered, so the auto-done
+// never re-fires and the set_via='issue_close' provenance is gone.
+//
+// Updated cannot stand in for it: it is a bare count, and a count cannot say WHICH.
+type JudgeDispositionResultDTO struct {
+	Updated   int                           `json:"updated"`
+	Settled   []JudgeSettledMemberDTO       `json:"settled"`
+	Groups    []JudgeRecommendationGroupDTO `json:"groups"`
+	Truncated bool                          `json:"truncated"`
+	Triage    TriageDTO                     `json:"triage"`
+}
+
+// JudgeSettledMemberDTO is one coordinate a bulk disposition wrote, addressed as the
+// (run, recommendation) pair the per-recommendation disposition route takes (PRD #98 review
+// BLK-UNDO). It is an ADDRESS, not a grain: dispositions are keyed on the (review_id,
+// category, target) coordinate, so two recommendations sharing a coordinate share ONE
+// disposition row and either one of them names it. Exactly one member per settled
+// coordinate is returned, so len(Settled) is the coordinate count Updated reports — a
+// consumer that finds them disagreeing has found a bug, not a subtlety.
+//
+// A caller undoes by DELETEing each pair's disposition. Doing so is safe even if the
+// coordinate was settled twice, because that route treats "no disposition" as already-undone
+// rather than an error.
+type JudgeSettledMemberDTO struct {
+	RunID string `json:"run_id"`
+	RecID string `json:"rec_id"`
+}
+
+// JudgeDispositionCoordDTO is one (category, target) coordinate in a bulk group-disposition
+// request (PRD #98 M2/M7). It is the DISPLAY grain the Judge menu groups by, deliberately
+// NOT a recommendation id, because one group spans many runs and therefore many ids. It is
+// the caller's REQUEST, never a resolved row: nothing here is written to the database — the
+// values only match against review_recommendations, and the disposition is written from the
+// resolved row's own columns.
+//
+// It lives in apitypes rather than in workersvc so the CLI ENCODES the same struct the
+// handler DECODES: workersvc.JudgeDispositionCoord is a type alias of this, so there is one
+// set of JSON tags and a client/server key mismatch is not expressible. That matters more
+// than usual here — the handler decodes with DisallowUnknownFields, so a client-side key
+// typo would be a 400 rather than a quietly-ignored field. uzicli could not have referenced
+// the workersvc type in any case: importing workersvc drags pgx into the CLI binary and
+// turns cmd/uzi's TestNoServerDeps red.
+type JudgeDispositionCoordDTO struct {
+	Category string `json:"category"`
+	Target   string `json:"target"`
+}
+
+// JudgeBulkDispositionRequest is the PUT /api/me/judge/recommendations/disposition body
+// (PRD #98 M2, Decision 3): one triage verdict fanned out to every member coordinate of the
+// listed groups.
+//
+// Status ∈ {done, dismissed}; Reason ∈ {wont_do, not_an_issue} and is legal only on a
+// dismissal. Scope ∈ {open, all}, and EMPTY IS MEANINGFUL: the handler reads "" as the
+// default open scope (settle what is open, never re-assert a settled member). A client that
+// does not expose a scope choice therefore sends the zero value rather than naming a scope,
+// which is why the CLI spells neither wire value — see uzicli.Client.BulkSetDispositions.
+type JudgeBulkDispositionRequest struct {
+	Items  []JudgeDispositionCoordDTO `json:"items"`
+	Status string                     `json:"status"`
+	Reason string                     `json:"reason"`
+	Scope  string                     `json:"scope"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {

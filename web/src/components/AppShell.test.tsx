@@ -17,6 +17,11 @@ vi.mock("../lib/api", () => ({
     listRepos: vi.fn(),
     listConnections: vi.fn(),
     unreadNotificationCount: vi.fn(),
+    // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
+    // backlog so the badge is absent unless a test overrides it.
+    getJudgeStats: vi
+      .fn()
+      .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     // The status favicon (PRD #70) polls listRuns on mount via useFavicon; stub it
     // so the poll resolves to an empty run set instead of throwing on an undefined
     // mock (the throw is synchronous, so the hook's own .catch never sees it).
@@ -142,6 +147,8 @@ beforeEach(() => {
   mockApi.unreadNotificationCount.mockResolvedValue({ unread: 0 });
 });
 
+const emptyTriage = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 };
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -167,6 +174,27 @@ describe("AppShell navigation", () => {
 
     // Decision 3: Forge is reachable only under Settings, never as its own entry.
     expect(screen.queryByRole("link", { name: "Forge" })).toBeNull();
+
+    // PRD #98: the Judge entry joins the Factory group.
+    expect(screen.getByRole("link", { name: /Judge/ })).toBeTruthy();
+  });
+
+  it("badges the Judge nav item with the canonical /me/judge/stats.todo (PRD #98)", async () => {
+    mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 12, todo: 7 });
+    renderShell("/dashboard");
+
+    // The Judge link's badge shows the to-triage count — the ONE canonical number, read as
+    // .todo and never .total.
+    //
+    // It does NOT follow from this test that the badge agrees with the Judge page's
+    // To-triage tab, and this comment used to say it did (PRD #98 review BLK-BADGE). Reading
+    // the same number is only half of it: this shell is mounted ALONE, so nothing here can
+    // observe the propagation gap that made the two disagree after a dispose. The agreement
+    // is pinned in JudgeNavBadge.test.tsx, which mounts AppShell and Judge together —
+    // the only configuration in which the bug existed.
+    const judge = await screen.findByRole("link", { name: /Judge/ });
+    await waitFor(() => expect(judge.textContent).toContain("7"));
+    expect(judge.textContent).not.toContain("12");
   });
 
   it("shows the server build version (GET /api/version) in the sidebar footer", async () => {

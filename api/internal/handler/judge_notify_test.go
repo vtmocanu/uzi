@@ -47,8 +47,11 @@ func TestBuildReviewNotificationSummaryAndScrub(t *testing.T) {
 		t.Errorf("review anchor = %v, want %v", n.ReviewID, reviewID)
 	}
 	// Deep link is server-built from the operator base + target UUID, trailing slash
-	// trimmed — never any LLM text.
-	wantLink := "https://uzi.example.com/runs/" + target.String()
+	// trimmed — never any LLM text. It points at the Judge workbench anchored to this run
+	// (PRD #98 M5, Decision 4), not at the run page; reviewDeepLink's own test covers the
+	// base-URL edge cases, and this one pins that the notification the worker builds
+	// actually carries that link.
+	wantLink := "https://uzi.example.com/judge?run=" + target.String()
 	if n.Slack == nil || n.Slack.Link != wantLink {
 		t.Errorf("slack link = %v, want %q", n.Slack, wantLink)
 	}

@@ -53,7 +53,7 @@ func (q *Queries) ClaimRecommendationFiledIssue(ctx context.Context, arg ClaimRe
 }
 
 const listFiledIssuesForReview = `-- name: ListFiledIssuesForReview :many
-SELECT id, review_id, category, target, filed_repo_id, filed_issue_iid, filed_issue_url, filed_by_user_id, filed_at, filing_since FROM recommendation_filed_issues
+SELECT id, review_id, category, target, filed_repo_id, filed_issue_iid, filed_issue_url, filed_by_user_id, filed_at, filing_since, close_synced_at FROM recommendation_filed_issues
 WHERE review_id = $1
 ORDER BY filed_at ASC NULLS LAST, id ASC
 `
@@ -83,6 +83,7 @@ func (q *Queries) ListFiledIssuesForReview(ctx context.Context, reviewID uuid.UU
 			&i.FiledByUserID,
 			&i.FiledAt,
 			&i.FilingSince,
+			&i.CloseSyncedAt,
 		); err != nil {
 			return nil, err
 		}

@@ -48,6 +48,20 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// Judge to-triage counts for the runs ON THIS PAGE (PRD #98 M4). Deliberately a
+	// second query bucketed in Go rather than a join: see queries/runtime.sql. Best
+	// effort — the judge badge is decoration, so a failure here logs and leaves every
+	// count at 0 rather than failing the whole run list.
+	runIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		runIDs = append(runIDs, row.Run.ID)
+	}
+	todo, err := h.wsvc.JudgeTodoCountsForRuns(r.Context(), user.ID, runIDs)
+	if err != nil {
+		slog.Error("judge todo counts", "error", err)
+		todo = nil
+	}
+
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
 		item := apitypes.RunListItemDTO{
@@ -55,8 +69,11 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
-		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		item.ForgeType = row.ForgeType     // per-run MR/PR noun (PRD #65 D2)
 		item.Usage = usageFromListRow(row) // nil when the run has no usage rows (PRD #40)
+		// nil stays nil for an unjudged run — absent, not a neutral verdict.
+		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
+		item.JudgeTodoCount = todo[row.Run.ID]
 		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})

@@ -63,8 +63,8 @@ var (
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
-	ErrInvalidState        = errors.New("invalid run state")
-	ErrInvalidMessage      = errors.New("invalid run message")
+	ErrInvalidState     = errors.New("invalid run state")
+	ErrInvalidMessage   = errors.New("invalid run message")
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
@@ -156,6 +156,22 @@ type Store interface {
 	DeleteRecommendationDisposition(ctx context.Context, arg store.DeleteRecommendationDispositionParams) (int64, error)
 	ListDispositionsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.RecommendationDisposition, error)
 	ListJudgeTriageRowsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListJudgeTriageRowsForUserRow, error)
+	// Judge menu grouped read (PRD #98 M1): the wider per-recommendation join the
+	// (category, target) dedup groups. Same spine as the triage row above, plus the
+	// runs join, the verdict/confidence/filed projection, the pushed-down ?run= anchor
+	// and a hard row cap.
+	ListJudgeRecommendationRowsForUser(ctx context.Context, arg store.ListJudgeRecommendationRowsForUserParams) ([]store.ListJudgeRecommendationRowsForUserRow, error)
+	// Judge menu bulk-disposition resolve (PRD #98 M2): the owner-scoped lookup of a set
+	// of (category, target) coordinates' member recommendations. It is the security
+	// boundary of the fan-out — the disposition is written off the rows it returns, never
+	// off the request body.
+	// /runs judge badge (PRD #98 M4): per-recommendation triage facts for the runs on one
+	// page, bucketed in Go by the shared BucketOf — never counted in SQL.
+	ListJudgeTriageRowsForRuns(ctx context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error)
+	ListOwnedRecommendationsForCoords(ctx context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error)
+	// The fan-out write itself: ONE multi-row upsert over the RESOLVED coordinates, so a
+	// bulk call is a single round-trip that cannot half-apply (PRD #98 M2, audit NB-A).
+	UpsertDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
@@ -275,14 +291,14 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
-	RunTimeout           time.Duration
-	RunIdleTimeout       time.Duration
-	RunMaxIterations     int
+	RunTimeout       time.Duration
+	RunIdleTimeout   time.Duration
+	RunMaxIterations int
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
-	PlanMaxRevisions int
-	RunMaxRequeues   int
+	PlanMaxRevisions     int
+	RunMaxRequeues       int
 	WorkerHeartbeatStale time.Duration
 	WorkerAffinityGrace  time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
@@ -2352,6 +2368,22 @@ func pgFloat4Ptr(v *float64) pgtype.Float4 {
 	return pgtype.Float4{Float32: float32(*v), Valid: true}
 }
 
+// pgUUID wraps a uuid you KNOW IS PRESENT as a valid pgtype.UUID. It sets Valid=true
+// unconditionally — including for uuid.Nil, which it turns into the REAL all-zero uuid,
+// not SQL NULL.
+//
+// That is correct for its contract and must not be "fixed" to auto-NULL uuid.Nil: at the
+// ~45 call sites that legitimately assume presence, auto-NULLing would convert a loud FK
+// violation into a silent NULL write.
+//
+// The trap is passing uuid.Nil as an "absent" sentinel to a sqlc.narg parameter. The
+// query's `IS NULL` escape hatch then never fires and the filter matches nothing, so the
+// endpoint SILENTLY RETURNS NOTHING rather than erroring (PRD #98 M1 hit exactly this; it
+// took a live-DB test to surface, since a fake store cannot show it). For a genuinely
+// optional id use the house idiom instead: *uuid.UUID with an explicit nil guard
+// (ListRunsForUser, above), or leave the zero pgtype.UUID (Valid:false → NULL) and call
+// this only on the present branch. workersvc.nullableUUID does the latter for the judge
+// backlog's ?run= anchor.
 func pgUUID(id uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: id, Valid: true}
 }

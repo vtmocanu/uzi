@@ -2019,6 +2019,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
+       rv.verdict                AS judge_verdict,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
@@ -2028,6 +2029,9 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
 LEFT JOIN workers w ON w.id = r.worker_id
+LEFT JOIN run_reviews rv
+       ON rv.target_run_id = r.id      -- UNIQUE target_run_id → at most one row (PRD #98 M4)
+      AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $1
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
@@ -2052,6 +2056,7 @@ type ListRunsForUserRow struct {
 	RepoPath                 string         `json:"repo_path"`
 	WorkerName               pgtype.Text    `json:"worker_name"`
 	ForgeType                string         `json:"forge_type"`
+	JudgeVerdict             pgtype.Text    `json:"judge_verdict"`
 	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
 	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
 	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
@@ -2068,6 +2073,31 @@ type ListRunsForUserRow struct {
 // The usage_* columns are the run's rollup totals (PRD #40 M3), LEFT-joined from
 // run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
 // fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
+// judge_verdict (PRD #98 M4, Decision 7) is a SAFE join: run_reviews.target_run_id is
+// NOT NULL UNIQUE (00059), so this matches at most one review per run — it cannot fan the
+// list out and, being a LEFT JOIN, cannot drop an unjudged run either. NULL means "not
+// judged", which the badge renders as absent rather than as a verdict.
+//
+// The join carries its OWN owner predicate (rv.user_id = r.user_id), which is redundant
+// today and deliberately so. Without it the join would be correct only because TWO separate
+// facts both hold: this query filters r.user_id = @user_id, AND a review's user_id always
+// equals its target run's owner (PostReview binds UserID: target.UserID; CreateJudgeRun
+// preserves it). That is correctness derived from an invariant maintained in another file —
+// the same shape as the correlated rv2.user_id the ?run= semi-join was changed away from,
+// and as EXCLUDED.set_via. It costs nothing (the planner already has both columns) and it
+// means a change to how reviews are owned cannot quietly turn this join into a cross-user
+// read. The companion count query (ListJudgeTriageRowsForRuns) is scoped in its own right
+// already.
+//
+// The companion judge_todo_count is deliberately NOT here. Joining through
+// review_recommendations WOULD fan out (≤50 recs per review → up to 50 duplicate rows per
+// run, breaking this query's one-row-per-run contract), and counting `todo` in SQL would
+// re-implement the ladder's bottom rung, which #94 Decision 2 categorically forbids — one
+// Go BucketOf, no SQL CASE. The handler fetches the per-rec rows for the runs on the page
+// and buckets them in Go (ListJudgeTriageRowsForRuns).
+// NOTE: workersvc.runListPageCap mirrors this 200 to size the judge-badge triage fetch
+// (PRD #98 M4). A SQL literal is not importable, so the two are coupled by comment only —
+// raise this without raising that and the badge counts start truncating silently.
 func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams) ([]ListRunsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForUser, arg.UserID, arg.RepoID, arg.IssueIid)
 	if err != nil {
@@ -2126,6 +2156,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
+			&i.JudgeVerdict,
 			&i.UsageInputTokens,
 			&i.UsageCacheReadTokens,
 			&i.UsageCacheCreationTokens,

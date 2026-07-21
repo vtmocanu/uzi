@@ -1,0 +1,356 @@
+<title>Judge menu — mock (by-target, PRD #98)</title>
+<style>
+  :root {
+    color-scheme: dark;
+    /* uzi "ember" tokens (web/src/index.css), verbatim */
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 122 133 154;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 620px at 50% -12%, rgb(var(--brand) / 0.05), transparent 60%),
+      rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    padding: 40px 20px 72px;
+  }
+
+  .wrap { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+  .lede { display: flex; flex-direction: column; gap: 6px; margin-bottom: 2px; }
+  .lede h1 { margin: 0; font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
+  .lede h1 .glyph { color: rgb(var(--brand)); }
+  .lede p { margin: 0; color: rgb(var(--faint)); font-size: 0.8rem; max-width: 66ch; }
+
+  .card {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+
+  .eyebrow {
+    font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.09em; color: rgb(var(--faint));
+  }
+
+  .new {
+    font-size: 0.56rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    color: rgb(var(--brand)); border: 1px dashed rgb(var(--brand) / 0.55);
+    border-radius: 999px; padding: 1px 7px; line-height: 1.6; white-space: nowrap;
+  }
+
+  /* ── Badges (tinted pills, ember Badge component) ── */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.7rem; font-weight: 600; line-height: 1;
+    padding: 4px 9px; border-radius: 6px; border: 1px solid;
+  }
+  .badge.info    { color: rgb(var(--info));   border-color: rgb(var(--info) / 0.4);   background: rgb(var(--info) / 0.1); }
+  .badge.ok      { color: rgb(var(--ok));     border-color: rgb(var(--ok) / 0.4);     background: rgb(var(--ok) / 0.1); }
+  .badge.warn    { color: rgb(var(--warn));   border-color: rgb(var(--warn) / 0.4);   background: rgb(var(--warn) / 0.1); }
+  .badge.brand   { color: rgb(var(--brand));  border-color: rgb(var(--brand) / 0.4);  background: rgb(var(--brand) / 0.1); }
+  .badge.neutral { color: rgb(var(--muted));  border-color: rgb(var(--edge-strong));  background: rgb(var(--raised)); }
+
+  code {
+    font-family: var(--font-mono); font-size: 0.72rem; color: rgb(var(--fg));
+    background: rgb(var(--raised)); border-radius: 5px; padding: 2px 6px;
+  }
+
+  /* ── Nav item (badged) ── */
+  .navrow { display: flex; align-items: center; gap: 10px; }
+  .navitem {
+    display: inline-flex; align-items: center; gap: 9px; font-size: 0.85rem; font-weight: 500;
+    color: rgb(var(--fg)); background: rgb(var(--raised)); border: 1px solid rgb(var(--edge));
+    border-radius: 8px; padding: 7px 12px;
+  }
+  .navitem .glyph { color: rgb(var(--brand)); }
+  .navbadge {
+    min-width: 20px; text-align: center; font-size: 0.62rem; font-weight: 700;
+    color: rgb(var(--on-brand)); background: rgb(var(--brand)); border-radius: 999px; padding: 2px 6px;
+  }
+
+  /* ── Strip (aggregate, new home) ── */
+  .strip { display: flex; flex-direction: column; gap: 10px; background: rgb(8 10 15 / 0.4); }
+  .strip .meter { height: 8px; border-radius: 999px; overflow: hidden; display: flex; background: rgb(var(--raised)); }
+  .strip .meter span { height: 100%; }
+  .counts { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.72rem; }
+  .counts .c { display: inline-flex; align-items: center; gap: 6px; color: rgb(var(--faint)); }
+  .counts .c b { color: rgb(var(--fg)); font-size: 0.82rem; }
+  .dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
+
+  /* ── Tabs ── */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid rgb(var(--edge)); }
+  .tab { padding: 8px 12px; font-size: 0.8rem; font-weight: 500; color: rgb(var(--faint));
+    border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab .n { color: rgb(var(--faint)); margin-left: 6px; }
+  .tab.active { color: rgb(var(--fg)); border-bottom-color: rgb(var(--brand)); }
+
+  /* ── Group rows (the by-target worklist) ── */
+  .group { border: 1px solid rgb(var(--edge)); border-radius: 8px; background: rgb(var(--raised) / 0.4); }
+  .group + .group { margin-top: 8px; }
+  .grow { display: flex; align-items: flex-start; gap: 10px; padding: 12px; }
+  .grow input { margin-top: 3px; width: 15px; height: 15px; accent-color: rgb(var(--brand)); }
+  .gmain { min-width: 0; flex: 1; }
+  .gtop { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .seen { font-size: 0.72rem; color: rgb(var(--faint)); }
+  .rationale { margin: 6px 0 0; font-size: 0.82rem; color: rgb(var(--muted));
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .gact { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .btn { font-size: 0.74rem; font-weight: 500; padding: 5px 10px; border-radius: 7px;
+    border: 1px solid rgb(var(--edge-strong)); background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  .btn.primary { background: rgb(var(--brand)); color: rgb(var(--on-brand)); border-color: transparent; }
+  .chev { color: rgb(var(--faint)); padding: 4px; }
+
+  /* ── Occurrence expander ── */
+  .occs { border-top: 1px solid rgb(var(--edge)); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .occ { border: 1px solid rgb(var(--edge)); border-radius: 7px; background: rgb(var(--surface) / 0.6); padding: 8px 10px; }
+  .occ .line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .occ a.run { font-size: 0.8rem; font-weight: 500; color: rgb(var(--fg)); text-decoration: none; }
+  .occ a.run:hover { text-decoration: underline; }
+  .occ .filebtn { margin-top: 7px; }
+
+  /* ── Multi-select bar ── */
+  .selbar { display: flex; align-items: center; gap: 12px; background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge-strong)); border-radius: 10px; padding: 10px 14px; }
+  .selbar .grow2 { margin-left: auto; display: flex; gap: 8px; }
+
+  /* ── Undo toast ── */
+  .toast { display: inline-flex; align-items: center; gap: 12px; background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge-strong)); border-radius: 9px; padding: 9px 14px; font-size: 0.82rem;
+    box-shadow: 0 8px 30px rgb(0 0 0 / 0.4); }
+  .toast a { color: rgb(var(--brand)); font-weight: 600; text-decoration: underline; }
+
+  /* ── Inbox-zero ── */
+  .zero { text-align: center; border-color: rgb(var(--ok) / 0.3); background: rgb(var(--ok) / 0.04); }
+  .zero h2 { margin: 0 0 4px; font-size: 1.05rem; }
+  .zero p { margin: 0; color: rgb(var(--muted)); font-size: 0.82rem; }
+  .optin { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    border-color: rgb(var(--brand) / 0.3); background: rgb(var(--brand) / 0.05); }
+  .optin .btn { background: rgb(var(--brand)); color: rgb(var(--on-brand)); border-color: transparent; }
+
+  .foot { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 0.72rem; color: rgb(var(--faint));
+    border-top: 1px solid rgb(var(--edge)); padding-top: 14px; }
+  .foot b { color: rgb(var(--muted)); }
+  .split { border-top: 1px dashed rgb(var(--edge)); margin: 6px 0 0; padding-top: 16px; }
+</style>
+
+<div class="wrap">
+
+  <div class="lede">
+    <h1><span class="glyph">⚖</span> Judge <span class="new">PRD&nbsp;#98</span></h1>
+    <p>The cross-run recommendation workbench. One row per <code>(category, target)</code> deduped across
+      all your runs; frequency ("seen in N runs") is the priority signal, not the judge's self-reported
+      confidence. Triage a whole group in one action.</p>
+  </div>
+
+  <!-- Nav placement -->
+  <div class="navrow">
+    <span class="eyebrow">Factory nav · after Workers</span>
+    <span class="navitem"><span class="glyph">⚖</span> Judge <span class="navbadge">5</span></span>
+    <span class="seen">badge = <code>triage.todo</code>, the ONE canonical number (nav = To-triage tab = notification)</span>
+  </div>
+
+  <!-- Aggregate strip (its new home, moved off /runs) -->
+  <div class="card strip">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <span class="eyebrow">Recommendations · all your runs</span>
+      <span class="seen">all time · <span class="new">moved from /runs</span></span>
+    </div>
+    <div class="meter">
+      <span style="width:45%;background:rgb(var(--edge-strong));"></span>
+      <span style="width:18%;background:rgb(var(--info));"></span>
+      <span style="width:18%;background:rgb(var(--ok));"></span>
+      <span style="width:19%;background:rgb(var(--muted) / 0.6);"></span>
+    </div>
+    <div class="counts">
+      <span class="c"><span class="dot" style="background:rgb(var(--edge-strong));"></span><b>5</b> to do</span>
+      <span class="c"><span class="dot" style="background:rgb(var(--info));"></span><b>2</b> filed</span>
+      <span class="c"><span class="dot" style="background:rgb(var(--ok));"></span><b>2</b> done</span>
+      <span class="c"><span class="dot" style="background:rgb(var(--muted) / 0.6);"></span><b>2</b> dismissed</span>
+      <span class="c">1 of 2 dismissed was a false positive</span>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <span class="tab active">To triage <span class="n">5</span></span>
+    <span class="tab">Filed <span class="n">2</span></span>
+    <span class="tab">Done <span class="n">2</span></span>
+    <span class="tab">Dismissed <span class="n">2</span></span>
+    <span class="tab">All <span class="n">11</span></span>
+  </div>
+  <p class="seen" style="margin:-8px 0 0;">Tab counts are per-<em>recommendation</em> (<code>triage.*</code>), never a
+    tally of the group rows below — the To-triage tab shows <b>5</b> while only <b>3</b> deduped groups render.</p>
+
+  <!-- Worklist: deduped group rows -->
+  <div>
+    <div class="group">
+      <div class="grow">
+        <input type="checkbox">
+        <div class="gmain">
+          <div class="gtop">
+            <span class="badge info">Improve uzi</span>
+            <code>api/internal/poller</code>
+            <span class="seen">seen in 3 runs</span>
+            <span class="seen">3 open</span>
+          </div>
+          <p class="rationale">Queue-to-claim latency again dominated the run's wall time; a webhook path keeps
+            coming up. This is the most-recurring recommendation in your backlog — frequency is why it sits on top.</p>
+        </div>
+        <div class="gact">
+          <span class="btn">Mark done</span>
+          <span class="btn">Dismiss ▾</span>
+          <span class="chev">▾</span>
+        </div>
+      </div>
+      <!-- expanded occurrences -->
+      <div class="occs">
+        <div class="occ">
+          <div class="line">
+            <a class="run" href="#">Run view: fold tool results under their calls</a>
+            <span class="badge warn">Issues found</span>
+            <span class="badge neutral">To do</span>
+          </div>
+          <div class="filebtn"><span class="btn">File issue</span></div>
+        </div>
+        <div class="occ">
+          <div class="line">
+            <a class="run" href="#">Retry the flaky worker heartbeat probe</a>
+            <span class="badge warn">Issues found</span>
+            <span class="badge neutral">To do</span>
+          </div>
+          <div class="filebtn"><span class="btn">File issue</span></div>
+        </div>
+        <div class="occ">
+          <div class="line">
+            <a class="run" href="#">Healthcheck should ping the DB pool</a>
+            <span class="badge ok">OK</span>
+            <span class="badge neutral">To do</span>
+          </div>
+          <div class="filebtn"><span class="btn">File issue</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- A PARTIALLY-SETTLED group: done in one run, open in another → rolls up To triage -->
+    <div class="group">
+      <div class="grow">
+        <input type="checkbox">
+        <div class="gmain">
+          <div class="gtop">
+            <span class="badge info">Install a worker tool</span>
+            <code>shellcheck</code>
+            <span class="seen">seen in 2 runs</span>
+            <span class="seen">1 open</span>
+          </div>
+          <p class="rationale"><code>shellcheck</code> was missing again on this run's worker image — the second run
+            to hit it. (Partially settled: Done in one run, still To&nbsp;do in another — the occurrence expander is the
+            per-run source of truth.)</p>
+        </div>
+        <div class="gact">
+          <span class="btn">Mark done</span>
+          <span class="btn">Dismiss ▾</span>
+          <span class="chev">▸</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="grow">
+        <input type="checkbox">
+        <div class="gmain">
+          <div class="gtop">
+            <span class="badge info">Enable a tool or skill</span>
+            <code>ripgrep</code>
+            <span class="seen">seen in 1 run</span>
+            <span class="seen">1 open</span>
+          </div>
+          <p class="rationale">The agent shelled out to <code>grep -r</code> repeatedly; enabling ripgrep would speed
+            the search phase.</p>
+        </div>
+        <div class="gact">
+          <span class="btn">Mark done</span>
+          <span class="btn">Dismiss ▾</span>
+          <span class="chev">▸</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Multi-select bar -->
+  <div class="selbar">
+    <span style="font-weight:600;font-size:0.85rem;">2 groups selected</span>
+    <span class="seen">Actions apply to open members only (scope=open).</span>
+    <div class="grow2">
+      <span class="btn">Mark done</span>
+      <span class="btn">Dismiss ▾</span>
+      <span class="btn">Clear</span>
+    </div>
+  </div>
+
+  <!-- Undo toast -->
+  <div style="text-align:center;">
+    <span class="toast">4 recommendations dismissed. <a href="#">Undo</a> ✕</span>
+  </div>
+  <p class="seen" style="margin:-8px 0 0;text-align:center;">
+    <code>updated</code> counts <code>(review, category, target)</code> triples — "dismissed a group of 5, said 4"
+    is correct. A dismiss re-renders the row from the response's <code>bucket=all</code> re-read, it never vanishes.</p>
+
+  <!-- ── Inbox-zero (first-class) ── -->
+  <div class="split"></div>
+  <div class="eyebrow">Inbox-zero view · <code>triage.todo == 0</code> is the goal state</div>
+
+  <div class="card zero">
+    <h2>Inbox zero — nothing to triage.</h2>
+    <p>Every recommendation across your runs is handled. New verdicts will show up here as your runs finish.</p>
+  </div>
+
+  <div class="card optin">
+    <div>
+      <div style="font-weight:600;font-size:0.85rem;">The judge is off for your account.</div>
+      <div class="seen">Turn it on and uzi reviews each finished run, surfacing recommendations here.</div>
+    </div>
+    <span class="btn">Enable in Settings</span>
+  </div>
+
+  <div class="card">
+    <div class="eyebrow" style="margin-bottom:8px;">Recent verdicts</div>
+    <div class="counts">
+      <span class="c"><span class="dot" style="background:rgb(var(--ok));"></span><b>1</b> ideal</span>
+      <span class="c"><span class="dot" style="background:rgb(var(--info));"></span><b>1</b> ok</span>
+      <span class="c"><span class="dot" style="background:rgb(var(--warn));"></span><b>1</b> issues</span>
+      <span class="c">across 3 judged runs</span>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span><b>Dedup grain:</b> (category, target), across runs — a display construct, no new table</span>
+    <span><b>One number:</b> nav badge = To-triage tab = notification, all read triage.todo</span>
+    <span><b>Filing:</b> per-recommendation #68 browser draft from the expander; bulk file-as-one-issue is a follow-up</span>
+    <span><b>Free text:</b> rationale/target/run-title render as escaped text, never markdown/HTML</span>
+  </div>
+
+</div>

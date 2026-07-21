@@ -1,10 +1,18 @@
-// Package apitypes holds the JSON wire types (DTOs) the api serializes on the
-// RequireUser routes — the exact set the uzi CLI binary unmarshals (PRD #64 M1).
+// Package apitypes holds the JSON wire types the api and the uzi CLI binary share
+// on the RequireUser routes (PRD #64 M1).
 //
 // It is a LEAF: it imports only the standard library. That is the whole point —
 // the CLI links these types without dragging pgx, chi, or any handler/service
 // dependency into the binary (Success Criterion 8, enforced by a go list -deps
-// assertion). Membership is precisely "types the CLI decodes"; DTOs behind
-// cookie-only routes stay in the handler package. Handlers own the mappers that
-// build these from store rows; this package owns only the shapes.
+// assertion). DTOs behind cookie-only routes stay in the handler package. Handlers
+// own the mappers that build these from store rows; this package owns only the shapes.
+//
+// Membership is BOTH DIRECTIONS of the wire, not only responses: RunInputRequest and
+// JudgeBulkDispositionRequest are bodies the CLI ENCODES and a handler decodes. (This
+// sentence used to read "the exact set the uzi CLI binary unmarshals" / "types the CLI
+// decodes", which RunInputRequest already contradicted; corrected 2026-07-21 while adding
+// the PRD #98 M7 request types.) A shared request type is worth more than a shared
+// response type here, because httpx.DecodeJSON runs with DisallowUnknownFields — one
+// definition means a client/server key mismatch cannot be written, rather than surfacing
+// as a 400 at runtime.
 package apitypes

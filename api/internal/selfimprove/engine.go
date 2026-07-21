@@ -386,4 +386,16 @@ func recIDs(recs []store.ListOpenImproveUziRecommendationsRow) []uuid.UUID {
 // uuid → the not-configured branch), so the error is not separately actionable.
 func mustGet(v string, _ error) string { return v }
 
+// pgUUID wraps a uuid you KNOW IS PRESENT as a valid pgtype.UUID. It sets Valid=true
+// unconditionally — including for uuid.Nil, which becomes the REAL all-zero uuid, not SQL
+// NULL. Do not "fix" that: at call sites that legitimately assume presence, auto-NULLing
+// would turn a loud FK violation into a silent NULL write.
+//
+// The trap is passing uuid.Nil as an "absent" sentinel to a sqlc.narg parameter — the
+// query's `IS NULL` branch never fires, so the filter matches nothing and the caller
+// SILENTLY GETS NOTHING instead of an error. For a genuinely optional id, leave the zero
+// pgtype.UUID (Valid:false → NULL) and call this only on the present branch.
+//
+// Two sibling copies exist (workersvc/service.go, handler/agent_templates.go) with the
+// same contract; keep these comments in step.
 func pgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }

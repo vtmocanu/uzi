@@ -83,6 +83,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     updated_at: "2026-07-05T12:00:00Z",
     repo_path: "vtmocanu/uzi",
     worker_name: "laptop",
+    // PRD #98 M4: unjudged by default, so existing assertions are unchanged.
+    judge_verdict: null,
+    judge_todo_count: 0,
     ...over,
   };
 }

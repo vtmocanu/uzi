@@ -25,10 +25,16 @@ import (
 // runsStore is a minimal workersvc.Store for the run REST + WS authz tests: it
 // owns a single run and answers the viewer/list queries the tested paths reach.
 type runsStore struct {
+	// PRD #98 M4 judge badge: scripted per-rec triage rows for the page's runs, and the
+	// params the handler passed (owner scoping + the bound).
+	judgeTriageRunRows []store.ListJudgeTriageRowsForRunsRow
+	judgeTriageRunArg  *store.ListJudgeTriageRowsForRunsParams
+	judgeTriageRunErr  error
+
 	workersvc.Store
-	ownerID    uuid.UUID
-	run        store.Run
-	msgs       []store.RunMessage
+	ownerID     uuid.UUID
+	run         store.Run
+	msgs        []store.RunMessage
 	userRuns    []store.ListRunsForUserRow
 	lastRunsArg *store.ListRunsForUserParams
 	allWorkers  []store.ListAllWorkersRow
@@ -653,4 +659,12 @@ func TestServeWSRejectsCrossOrigin(t *testing.T) {
 	if err == nil {
 		t.Fatal("cross-origin WS handshake must be rejected (CSWSH defense)")
 	}
+}
+
+// ListJudgeTriageRowsForRuns backs the /runs judge badge count (PRD #98 M4). The default
+// is an empty set — an unjudged page — so every pre-existing run-list test keeps its
+// meaning; judgeTriageRunRows lets a test script real recommendations.
+func (s *runsStore) ListJudgeTriageRowsForRuns(_ context.Context, arg store.ListJudgeTriageRowsForRunsParams) ([]store.ListJudgeTriageRowsForRunsRow, error) {
+	s.judgeTriageRunArg = &arg
+	return s.judgeTriageRunRows, s.judgeTriageRunErr
 }

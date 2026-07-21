@@ -23,9 +23,24 @@ func TestNoServerDeps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("go list -deps -buildvcs=false .: %v\n%s", err, out)
 	}
-	for _, banned := range []string{"github.com/jackc/pgx", "github.com/go-chi/chi"} {
+	// internal/workersvc is banned BY NAME, not merely via pgx. It is the service layer and
+	// the CLI must not link it, but the two pgx/chi entries only catch it TRANSITIVELY —
+	// they happen to be reachable from workersvc today. If workersvc ever became pgx-free, a
+	// direct `import ".../internal/workersvc"` from cmd/uzi would sail past this gate while
+	// violating exactly the layering it exists to protect. Naming it states the invariant
+	// where it is enforced instead of relying on a dependency of a dependency.
+	//
+	// It is a live temptation rather than a hypothetical: workersvc owns the bucket and
+	// scope constants the CLI forwards, and PRD #98 M7 reaches for them from a TEST-ONLY
+	// import for exactly that reason (a test import does not appear in `go list -deps` on
+	// the non-test package, which is what keeps that legal).
+	for _, banned := range []string{
+		"github.com/jackc/pgx",
+		"github.com/go-chi/chi",
+		"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc",
+	} {
 		if strings.Contains(string(out), banned) {
-			t.Errorf("cmd/uzi must not depend on %s — it drags the server stack into the CLI binary (import internal/apitypes for DTOs, never internal/handler)", banned)
+			t.Errorf("cmd/uzi must not depend on %s — it drags the server stack into the CLI binary (import internal/apitypes for DTOs, never internal/handler or internal/workersvc)", banned)
 		}
 	}
 }
