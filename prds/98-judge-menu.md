@@ -1185,14 +1185,39 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       look, not a defect" — was careful, and it was the compression in between that was
       wrong.)*
 
-- [ ] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/`.** Two
-      instances in this PRD were corrected 2026-07-21 (they cited the checkpoint as
-      authoritative for the pre-MR migration gate — the one item with the worst failure mode on
-      this branch — while line 813 of the same document said the directory is gitignored). The
-      same dangling pointer survives at **`prds/58-hosted-k8s-workers.md:1311`,
-      `prds/done/25-slack-integration.md:118`, `prds/done/39-chat-agent.md:101`, and
-      `specs/ai.md:7931`**. Outside this PRD and outside the freeze — recorded, not touched.
-      The grep that finds the whole class is one string: `agent-team-tasks`.
+- [x] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/` — CLASSIFIED
+      AND CLOSED 2026-07-21.** The sweep found **five** hits, not the four dispatched
+      (`prds/done/39` carries two). Each was classified before being touched, per the rule this
+      PRD's own work put in `.claude/agent-team.md`; **three were left alone deliberately**, and
+      that is the result rather than a shortfall.
+      **Fixed — CURRENT CLAIMS a reader would follow today:**
+      `specs/ai.md` (PRD #83's "Design grounding: <dead path>") — the live decision register,
+      present tense, pointing at a file that cannot be fetched; now says the note did not survive
+      and names `prds/done/83-docker-capable-worker.md` as the surviving record.
+      `prds/done/39-chat-agent.md:101` — the one archived hit that makes a present-tense
+      AUTHORITY claim ("Authoritative Phase-3 wire catalog: <dead path>") with no historical
+      label, while the wire details it defers to are enumerated immediately above it. Annotated,
+      not rewritten: the original sentence stands and a dated parenthetical says the file did not
+      survive and that "authoritative" now names the surviving text.
+      **Left alone — HISTORICAL RECORDS that describe their own mortality:**
+      `prds/58-hosted-k8s-workers.md:1311` sits inside a dated 2026-07-16 log entry whose entire
+      subject IS that the directory is gitignored and the notes die with the worktree — it also
+      records a coder correctly declining to `git add -f` over a deliberate ignore. Rewriting it
+      would erase the reasoning. (This is the one the dispatch expected to be a current claim
+      because #58 is active; the file disagreed.)
+      `prds/done/25-slack-integration.md:118` sits under a heading that literally reads "Original
+      session-1 resume note (historical)".
+      `prds/done/39-chat-agent.md:168` is inside a "Team roster to re-spawn tomorrow" paragraph
+      dated to a day in July — self-evidently a record of a session, not an instruction.
+      **The distinguishing test, since it is the reusable part:** *would a reader today follow
+      this and be misled about where truth lives?* A dated log entry that says the file is gone
+      fails that test harmlessly; an undated "Authoritative: <path>" passes it and misleads.
+      **Earlier in this PRD**, two instances of the same class were corrected inside this file —
+      they cited the checkpoint as authoritative for the pre-MR migration gate, the one item with
+      the worst failure mode on the branch, while another line of the same document said the
+      directory is gitignored. The grep that finds the whole class is one string:
+      `agent-team-tasks`. The dispatched line numbers were already one hit short of what it
+      returns, which is the argument for re-running it rather than inheriting the list.
 
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security

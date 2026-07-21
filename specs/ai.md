@@ -7967,7 +7967,10 @@ Serves human Feature #4 (the worker runs the agent) + the user requirement that 
 able to run Docker/Compose projects — uzi's own `./e2e/run-e2e.sh` / `./scripts/smoke.sh`
 need `docker compose up`, so a worker that cannot run containers cannot dogfood uzi. PRD at
 `prds/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
-grounding: `.claude/agent-team-tasks/prd-83-architecture.md`. Trust model (user): trust the
+grounding: the architecture note was written to `.claude/agent-team-tasks/`, which `.gitignore:27`
+deliberately excludes, so it did not survive its worktree — `prds/done/83-docker-capable-worker.md`
+is the surviving design record (corrected 2026-07-21; this line used to cite the dead path as if
+it were fetchable). Trust model (user): trust the
 USER who owns the worker, not the repo code the agent runs (prompt-injectable); the ONE
 agent-facing defense that stays load-bearing is that a container the agent starts cannot reach
 the worker's secrets. Built on #58's hosted-worker machinery (§264–275) and #51's uid split

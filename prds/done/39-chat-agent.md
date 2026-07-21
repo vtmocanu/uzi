@@ -98,7 +98,9 @@ atomically-seeded `run_user_inputs` follow_up row (claim carries no prompt text)
 from runs/board/admin lists; `GET /api/chats` returns `{chats:[chatListDTO], max_turns}`;
 `propose_issue` sends `repo_path` (server resolves user-scoped; internal UUIDs stay off the worker);
 the proposal-card is a worker-emitted `proposal`-kind run_message keyed on `id`. Authoritative
-Phase-3 wire catalog: `.claude/agent-team-tasks/prd39-phase3-wire-catalog.md`.
+Phase-3 wire catalog: `.claude/agent-team-tasks/prd39-phase3-wire-catalog.md` — *(2026-07-21: that
+directory is gitignored and the file did not survive its worktree. The wire details enumerated
+immediately above are the surviving record; "authoritative" now names them, not the dead path.)*
 
 **STOPPED 2026-07-10 EOD. To resume tomorrow — do these in order (see "Resume plan" below the
 milestones):** (1) review + merge P3-web; (2) M5 security validation pass; (3) M6 docs/specs/e2e;
