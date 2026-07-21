@@ -53,7 +53,7 @@ import {
   type UserSettingsPatch,
 } from "../lib/api";
 import { isTheme, resolveTheme } from "../lib/theme";
-import { recommendationLabel, verdictLabel } from "../lib/judge";
+import { coordKey, recommendationLabel, verdictLabel } from "../lib/judge";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
@@ -209,10 +209,6 @@ const reviews: MockReview[] = mockReviews.map((r) => ({
   filed_issues: r.filed_issues.map((x) => ({ ...x })),
   dispositions: r.dispositions.map((x) => ({ ...x })),
 }));
-
-// coordKey mirrors RunView's (category, target) key — the coordinate the disposition
-// and filed-link side-tables share (PRD #94/#68).
-const coordKey = (category: string, target: string) => `${category} ${target}`;
 
 // recomputeTriage buckets a review's recommendations through the SAME precedence
 // ladder as the server (dismissed > done > filed[settled] > todo), so the mock's

@@ -51,3 +51,25 @@ export function recommendationLabel(category: string): string {
     category.replace(/_/g, " ")
   );
 }
+
+// coordKey is the ONE (category, target) key that matches a recommendation to its filed
+// link and its disposition (PRD #68/#94/#98). It MUST be used at both the build and the
+// lookup site: a separator mismatch silently drops a persisted filed link back to the
+// idle "File issue" button (the row then 409s on Create and the stale flag never fires).
+//
+// It lives here, exported, rather than being redefined per consumer. It was defined three
+// times — RunView, the Judge page and mockApi — under a comment in RunView calling itself
+// "the SINGLE source of truth", and the three had already diverged in their separator
+// BYTES: the Judge page used a literal NUL (U+0000) while the other two used a space
+// (PRD #98 review B1/N3, 2026-07-21). Nothing broke, because no map is ever shared across
+// the three, but the invariant the comment asserted was not true of the code — so the fix
+// is one definition, not a fourth restatement of the rule.
+//
+// A single space is a sound separator because `category` is a closed enum with no spaces,
+// so the split point is unambiguous however the arbitrary `target` is spelled. A NUL is
+// not worth its cost: it renders a source file BINARY to git (zero-line diffs, "Binary
+// files differ" in every future review) and invisible to plain grep/rg, which is how a
+// 32 KB page landed with no reviewable diff.
+export function coordKey(category: string, target: string): string {
+  return `${category} ${target}`;
+}
