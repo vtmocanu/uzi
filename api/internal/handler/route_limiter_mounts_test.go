@@ -3,10 +3,15 @@ package handler
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,13 +254,16 @@ var wantRouteMounts = []routeMount{
 // test reddens when a route carries the WRONG limiter, not merely when it carries
 // none.
 //
-// Function identity could not do that, and that is measured rather than assumed:
-// comparing every walked middleware against reflect.ValueOf(ls[0].PerUserMiddleware)
-// .Pointer() tagged all 24 mounts as equal, though those 24 carry SIX different
-// limiter instances. A bound-method value's code pointer is the receiver-independent
-// wrapper, and the receiver itself is not reachable through the reflect API — so a
-// reflect compare can only see THAT some per-user middleware is mounted. Driving the
-// middleware is what turns "some limiter" into a named one.
+// Function identity could not do that, and the precise boundary is measured rather
+// than assumed: a reflect pointer compare sees the METHOD but not the RECEIVER.
+// Measured — PerUserMiddleware's pointer differs from both PerWorkerMiddleware's and
+// the IP-keyed Middleware's, so reflect can tell those three apart; but two limiters
+// with different receivers share one PerUserMiddleware pointer, and comparing every
+// walked middleware against reflect.ValueOf(ls[0].PerUserMiddleware).Pointer() tagged
+// all 24 mounts equal though they carry SIX different instances. A bound-method
+// value's code pointer is the receiver-independent wrapper and the receiver is not
+// reachable through the reflect API. So reflect could have named the method; only
+// driving the middleware names the instance.
 func newProbeLimiters() []*mw.Limiter {
 	ls := make([]*mw.Limiter, len(limiterNames))
 	for i := range ls {
@@ -377,10 +385,19 @@ func describeLimiter(name string) string {
 //   - a route removed or renamed reddens as listed-but-absent.
 //
 // What it does NOT pin: the per-IP authLimiter.Middleware mounts (see the note on
-// wantRouteMounts), the limiters' real production budgets (this test substitutes
-// its own), and the order of the Routes parameters — the limiters go in
-// positionally here exactly as they do in main, so swapping two names in the
-// signature would change behaviour invisibly to this file.
+// wantRouteMounts), and the limiters' real production budgets (this test substitutes
+// its own).
+//
+// On REORDERS, measured rather than reasoned — an earlier version of this comment
+// claimed this test was blind to all of them, and that was wrong:
+//   - reordering Routes' PARAMETERS does redden it (16 routes report the wrong
+//     limiter), because this test binds budget to name positionally while the body
+//     binds name to behaviour, so the two disagree. It reads as sixteen broken
+//     mounts rather than one renamed parameter, which is why
+//     TestRoutesLimiterParametersAreNamedInLimiterNamesOrder also exists.
+//   - reordering main's ARGUMENTS is genuinely invisible here, because this test
+//     builds its own call with its own ordering and never reads main's.
+//     TestRoutesCallSitePassesLimitersInLimiterNamesOrder covers that one.
 func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	limiters := newProbeLimiters()
 	// Hosting on, so the controller routes exist and the table is unconditional.
@@ -485,14 +502,21 @@ func TestLimiterProbeTellsTheMountKindsApart(t *testing.T) {
 }
 
 // TestLimiterNamesCoverEveryRoutesLimiterParameter guards the position-to-name
-// mapping that makes a probed budget readable as an identity. Adding or dropping a
-// limiter parameter shifts every position after it, silently relabelling mounts;
-// this fails instead.
+// mapping that makes a probed budget readable as an identity, at RUNTIME: adding or
+// dropping a limiter parameter shifts every position after it, silently relabelling
+// mounts, and this fails instead.
 //
-// It cannot see a REORDER of two existing parameters — reflect knows their types,
-// not their names — and neither can the walk test, which passes limiters
-// positionally exactly as main does. That gap is real and is stated on the walk
-// test too.
+// reflect cannot see a REORDER of two existing parameters: it knows their types, not
+// their names. A source parse can, so the two order checks live next door
+// (TestRoutesLimiterParametersAreNamedInLimiterNamesOrder for the signature,
+// TestRoutesCallSitePassesLimitersInLimiterNamesOrder for main's arguments) rather
+// than being left as a declared gap.
+//
+// This one is still worth keeping alongside them: it pins count and type as the
+// RUNNING program sees them, where the parses read source text. A disagreement
+// between the two would mean a parse had matched something other than the Routes
+// this package actually calls — which is the failure mode a source-reading test has
+// and a reflect-reading test does not.
 func TestLimiterNamesCoverEveryRoutesLimiterParameter(t *testing.T) {
 	sig := reflect.TypeOf((*Handler).Routes)
 	gotParams := sig.NumIn() - 1 // less the receiver
@@ -504,6 +528,172 @@ func TestLimiterNamesCoverEveryRoutesLimiterParameter(t *testing.T) {
 	for i := 1; i < sig.NumIn(); i++ {
 		if sig.In(i) != limiterType {
 			t.Errorf("Routes parameter %d is %s, want %s", i, sig.In(i), limiterType)
+		}
+	}
+}
+
+// routesLimiterParamNames parses this package's non-test source and returns the
+// names of Routes' *mw.Limiter parameters in declaration order.
+//
+// It scans the directory rather than naming handler.go, so moving Routes to another
+// file in the package does not redden this test for the wrong reason. It fails when
+// it finds no Routes at all: a parse that matched nothing would otherwise return an
+// empty list and compare equal to nothing, which is the shape of a check that cannot
+// fail.
+func routesLimiterParamNames(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".") // go test runs with the package dir as cwd
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var decl *ast.FuncDecl
+	var declIn string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, d := range file.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || fn.Name.Name != "Routes" {
+				continue
+			}
+			if decl != nil {
+				t.Fatalf("found a Routes method in both %s and %s; this test does not know which one runs", declIn, name)
+			}
+			decl, declIn = fn, name
+		}
+	}
+	if decl == nil {
+		t.Fatal("parsed this package's source and found no Routes method — the check matched nothing, which is a failure and not a pass")
+	}
+
+	var names []string
+	for _, field := range decl.Type.Params.List {
+		// Grouped parameters (`a, b, c *mw.Limiter`) are ONE Field carrying several
+		// Names, which is exactly how Routes declares its limiters — so the names must
+		// come from Field.Names, not from one name per Field.
+		star, ok := field.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		sel, ok := star.X.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Limiter" {
+			continue
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "mw" {
+			continue
+		}
+		for _, n := range field.Names {
+			names = append(names, n.Name)
+		}
+	}
+	return names
+}
+
+// TestRoutesLimiterParametersAreNamedInLimiterNamesOrder pins the SIGNATURE half of
+// the position-to-name mapping: Routes' limiter parameters, by name, in order.
+//
+// Swapping two of them COMPILES — both names stay declared and the body still
+// references both — so no build step sees it. The walk test does redden (measured:
+// 16 routes report the wrong limiter), because it binds budget to name positionally
+// while the body binds name to behaviour, and the two then disagree. But it reddens
+// as a spray of route mismatches that reads like sixteen broken mounts. This test
+// names the actual cause in two lines, which is the difference between a failure you
+// can act on and one you have to diagnose.
+//
+// It is one of a PAIR. See TestRoutesCallSitePassesLimitersInLimiterNamesOrder for
+// the half that the walk test genuinely cannot see.
+func TestRoutesLimiterParametersAreNamedInLimiterNamesOrder(t *testing.T) {
+	got := routesLimiterParamNames(t)
+	want := limiterNames[:]
+	if len(got) != len(want) {
+		t.Fatalf("Routes declares %d *mw.Limiter parameters %v, limiterNames has %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Routes parameter %d is named %q but limiterNames[%d] is %q — "+
+				"a probed budget of %d would be reported as %q while the mount actually "+
+				"uses %q. Reorder limiterNames to match the signature, or undo the signature change.",
+				i+1, got[i], i, want[i], i+1, want[i], got[i])
+		}
+	}
+}
+
+// routesCallSiteArgNames parses the server's main package and returns the
+// identifiers passed to h.Routes(...), in argument order.
+//
+// It fails rather than returning nothing when the call cannot be found or when an
+// argument is not a plain identifier: a parse that silently matched nothing would
+// compare equal to nothing and pass.
+func routesCallSiteArgNames(t *testing.T) []string {
+	t.Helper()
+	// Relative to this package's directory, which is go test's cwd. If main moves,
+	// this fails loudly and someone repoints it — the alternative is a check that
+	// quietly stops checking.
+	const mainPath = "../../cmd/server/main.go"
+	file, err := parser.ParseFile(token.NewFileSet(), mainPath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", mainPath, err)
+	}
+
+	var calls []*ast.CallExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Routes" {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	if len(calls) != 1 {
+		t.Fatalf("found %d .Routes(...) calls in %s, want exactly 1 — this test no longer knows which call wires the server", len(calls), mainPath)
+	}
+
+	names := make([]string, 0, len(calls[0].Args))
+	for i, arg := range calls[0].Args {
+		id, ok := arg.(*ast.Ident)
+		if !ok {
+			t.Fatalf("%s: argument %d to Routes is not a plain identifier (%T); this test can only read named variables", mainPath, i+1, arg)
+		}
+		names = append(names, id.Name)
+	}
+	return names
+}
+
+// TestRoutesCallSitePassesLimitersInLimiterNamesOrder pins the half that nothing
+// else reaches: the order main passes its limiter variables in.
+//
+// This is the hole worth having. MEASURED: swapping the first two arguments at
+// main.go's call site, leaving the signature untouched, compiles and leaves the
+// ENTIRE api suite green — exit 0, 41 packages ok, zero failures — while forge
+// routes run on the auth budget and vice versa in production. Every other check here
+// is blind to it by construction: the walk test builds its own call with its own
+// ordering, reflect sees the signature, and the signature parse sees the signature.
+// Only the call site says which real limiter lands in which slot.
+//
+// Note what this pins and what it does not: that the ARGUMENT NAMES are in
+// limiterNames order. It does not verify that the variable called forgeLimiter was
+// constructed with the forge budget — that binding is main's own, a few lines up,
+// and no test here reads it.
+func TestRoutesCallSitePassesLimitersInLimiterNamesOrder(t *testing.T) {
+	got := routesCallSiteArgNames(t)
+	want := limiterNames[:]
+	if len(got) != len(want) {
+		t.Fatalf("main passes %d arguments to Routes %v, limiterNames has %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("main passes %q as Routes argument %d, but limiterNames[%d] is %q — "+
+				"the running server mounts %q where every mount in this package's table says %q.",
+				got[i], i+1, i, want[i], got[i], want[i])
 		}
 	}
 }
