@@ -13,6 +13,41 @@ PRD's own history keeps producing. This sits next to the PRD it serves and archi
 or opened the file at `ad6c63d9`) or INFERRED (reasoned, not executed). The INFERRED ones are
 the ones to attack first.
 
+## Revision log
+
+**v1 (`4c647f84`)** — first pass, both mechanisms.
+
+**v2 (this commit)** — seam 6 revised in place after four follow-ups and four user rulings.
+What changed, and why each change was forced rather than chosen:
+
+- **A10 is new.** A real mock↔server divergence exists *today* in `rationalePreview` (runes vs
+  UTF-16 code units, plus a differing trim set). The user ruled **fix the mock, in two
+  separate changes**. Until that ruling, `expected.json` was unauthorable — with a live
+  divergence there is no single expected output. It is authorable now: **the expected output
+  is the server's.**
+- **A5 gains three mandatory non-ASCII rows.** v1's preview row was ASCII-only, which would
+  have produced a fixture whose green is load-bearing on its own ASCII-ness — certifying a
+  fidelity the code does not have. That is the "snapshot that rots" failure arriving by a
+  route the PRD item did not anticipate, and v1 walked into it.
+- **A6's sort row is no longer a caveat.** v1 said `sort.SliceStable → sort.Slice` "may
+  produce a false green" and left it there. MEASURED since: it produces a false green for
+  *every fixture shape anyone would naturally write*, and diverges only under a specific,
+  unnatural one. The row now specifies that shape exactly. A caveat attached to a green is
+  the thing this branch keeps deleting; this replaces it with a construction rule.
+- **A1 and A10 are AUTHORISED** by the user — the extraction and the mock fix both land.
+- **Part B/B8 is marked DEAD.** The no-token-spend e2e assertion cannot fail. Left in place
+  with its refutation rather than deleted, per the rule that a removed check with no recorded
+  reason gets re-added by the next person who reads the PRD's criteria list.
+- **Part B is otherwise unrevised** and awaits pass 3. Do not build from it yet.
+
+**Correction to v1's reporting, recorded because the error was mine.** I attributed the lead's
+stale status read to the persisted-cwd trap in `.claude/agent-team.md`. That was wrong, and the
+lead disproved it: its check ran in `prd-98-fid` and reported `ad6c63d9` while `prd-98` was at
+`bb4a66ac`, so a wrong-tree read would have shown *those* commits. The real mechanism was
+staleness — the check ran minutes before the commit. **A correct rule applied to the wrong
+incident is worse than no rule**, because it ships with evidence attached and sends the next
+reader to guard a mechanism that was not involved.
+
 ---
 
 ## Part A — Seam 6: the mock↔server fidelity golden fixture
@@ -190,6 +225,9 @@ JSON, touching neither implementation). Failure messages follow the shape alread
 | 5 | sort tie / stability | ≥2 groups tying on `(run_count, open_count)` |
 | 6 | bucket filter | ≥2 cases sharing a row set but differing in `bucket`, with different expected group counts |
 | 7 | rationale preview | some row's `rationale_md` exceeds 280 runes, and some group's preview is drawn from a **non-first** input row's coordinate |
+| 8 | **multibyte cut — REQUIRED, not optional** | some row's `rationale_md` has **rune count ≠ UTF-16 code-unit count** *and* exceeds 280 runes, so the cut lands past the point where the two counts diverge |
+| 9 | **multibyte no-cut** | some row is >280 code units but **≤280 runes** — the case that separates a fixed mock from an unfixed one, since both cut identically once past 280 runes |
+| 10 | **trim-set boundary** | some row's rune 280 is one of NBSP / U+FEFF / U+2028 — the characters JS `\s` trims and Go's `" \t\r\n"` does not |
 
 Row 4 is the gap the PRD measured: the demo fixture "never has to *choose*". The
 `no todo member` clause is the part that is easy to get wrong and would silently make the
@@ -201,6 +239,13 @@ whole ladder untested.
 - case 4: each pair's expected group `bucket` equals the higher rung
 - case 5: the tied groups appear in first-seen input order
 - case 7: the preview ends in `…` and is 281 runes
+- case 8: the preview is **exactly 281 runes** and its rune count **differs** from its UTF-16
+  code-unit count — the second clause is what fails if someone "simplifies" the case to ASCII
+- case 9: the preview is byte-identical to the input `rationale_md` (no `…`), proving the
+  no-cut branch was taken on a string that a code-unit implementation would have cut
+- case 10: the preview's final rune (before `…`) **is** the NBSP/U+FEFF/U+2028 — i.e. Go kept
+  what JS `\s` would have stripped
+- case 11: the 13 groups appear in the fixture's own first-seen order within each `run_count`
 
 **Why the output-side half is the anti-regeneration mechanism, and its honest limit.** If
 someone regenerates `expected.json` from a *regressed* Go grouper — say `RunCount++` escapes
@@ -221,7 +266,9 @@ Five folds, each **compiled before it is believed** (`CLAUDE.md`'s rule; `npm ru
 | Go `bucketRank` `case "done": return 3` (`judge_backlog.go:52`) | Go RED, **vitest GREEN** |
 | Go `g.RunCount++` hoisted out of the `runsSeen` guard (`:238-241`) | case 2 RED |
 | JS drop the `\|\| (b.open_count - a.open_count)` tiebreak (`:374`) | case 5 RED |
-| Go `sort.SliceStable` → `sort.Slice` (`:259`) | **unknown — record what it does** |
+| Go `sort.SliceStable` → `sort.Slice` (`:259`) | **RED only under the case-11 shape below — see A6a** |
+| JS `Array.from(s)` → `s` in `rationalePreview` (post-fix) | case 8/9 RED, Go GREEN |
+| JS trim `/[ \t\r\n]+$/` → `/[\s]+$/` (post-fix) | case 10 RED, Go GREEN |
 
 The last one is flagged deliberately. Go's `sort.Slice` is pdqsort and is frequently stable in
 practice at small N, so this fold may well produce a **false green**. If it does, the honest
@@ -231,6 +278,53 @@ tempting to leave out.
 
 The first two folds are the ones that justify the third artifact: each reddens exactly one
 runtime, which is the property a Go-vs-JS diff cannot deliver.
+
+### A6a. Sort stability — MEASURED, and it is a construction rule, not a caveat
+
+v1 said `sort.SliceStable → sort.Slice` "may produce a false green" and stopped. That was a
+caveat attached to a green, which is the shape this branch keeps deleting. Measured instead
+(Go probe, run at `ad6c63d9` then deleted; `sort.Slice` vs `sort.SliceStable` over the real
+comparator `run_count DESC, open_count DESC`):
+
+| fixture shape | n | `sort.Slice` diverges from `SliceStable`? |
+|---|---|---|
+| **all groups tied** on `(run_count, open_count)` | 2…200 | **NEVER** |
+| **realistic backlog** — 2 groups at `run_count=3`, 3 at `2`, rest at `1`, in that order | 8, 12, 13, 16, 20 | **NEVER** |
+| **interleaved two-key** — `run_count` alternating `1,2,1,2,…` | ≤12 | never |
+| **interleaved two-key** | **13** | **YES** — `[9 1 3 5 7 11 2 4 6 8 0 10 12]` |
+
+**So the mutation produces a false green for every fixture shape anyone would naturally
+write**, and v1's instinct that "many tied groups" would catch it was exactly backwards. Two
+mechanisms, both in Go's pdqsort: below n=12 it uses insertion sort, which is stable; and it
+short-circuits on input it detects as already-ordered — which is what an all-tied run and a
+realistically recency-ordered backlog both are.
+
+**The construction rule, therefore — case 11:** the stability case needs **≥13 groups**, **at
+least two distinct `run_count` values**, **ties within each value**, and an input order that
+is **NOT already sorted by `run_count`** (interleave them). All four clauses are load-bearing;
+drop any one and the mutation goes green.
+
+**Two consequences the coder must carry into the fixture file:**
+
+- The case is **deliberately unrealistic**, and that is the entire point. It needs a
+  do-not-tidy note at the site, in the shape `.claude/agent-team.md` already documents for
+  the shared-coordinate fixtures: *reordering these groups into recency order silently
+  deletes the only thing pinning sort stability.* Someone will otherwise "fix" it to look
+  like a real backlog and never know.
+- It is the **cheapest** case despite being the largest: 13 groups × 1 row each, all
+  `open_count=0`, no occurrence variety needed. ~13 rows in and 13 small groups out.
+
+**What this pins and what it does not.** It pins the **Go** side. The JS side is not at risk
+from the same mutation: `Array.prototype.sort` has been **required** to be stable since ES2019,
+so JS stability is a language guarantee rather than a call-site choice. The JS ordering risk is
+a comparator change, and the case-5 tiebreak-drop fold already covers that. Say this at the
+site so nobody later "balances" the design by adding a JS stability mutation that cannot fail.
+
+**If the lead would rather not pay 13 groups:** the honest alternative is to declare sort
+stability **unpinned**, with the reason (`sort.Slice` is stable at this scale for every natural
+shape, so the property is real but unreachable by a proportionate fixture). An unpinned
+property named honestly is fine. What is not fine is the v1 text — a caveat that reads as
+partial coverage.
 
 ### A7. What seam 6 CANNOT catch — stated, not implied
 
@@ -252,6 +346,78 @@ runtime, which is the property a Go-vs-JS diff cannot deliver.
    look-alike case.
 6. **The demo data.** The fixture is authored, so `mockReviews` can still be unrepresentative
    and nothing here would say so.
+
+### A10. The rune/code-unit divergence — RULED: fix the mock, in TWO changes
+
+This is a **live defect**, not a hypothetical, and it is the reason `expected.json` was
+unauthorable until the user ruled. I re-derived both sides myself rather than relaying.
+
+**MEASURED — Go `rationalePreview` (`judge_backlog.go:77-83`), probe run at `ad6c63d9`:**
+
+| input | cut? | out runes | valid UTF-8 |
+|---|---|---|---|
+| 200× U+1F680 | **false** | 200 | yes |
+| `"a"` + 200× U+1F680 | **false** | 201 | yes |
+| 300× U+1F680 | true | 281 | yes |
+| `"a"` + 300× U+1F680 | true | 281 | yes |
+
+**MEASURED — JS `rationalePreview` (`mockApi.ts:294-296`), same inputs, node:**
+
+| input | cur cut? | cur out runes | cur lone surrogate | fixed cut? | fixed out runes | fixed lone surrogate |
+|---|---|---|---|---|---|---|
+| 200× U+1F680 | **true** | **141** | no | false | 200 | no |
+| `"a"` + 200× | **true** | **142** | **YES** | false | 201 | no |
+| 300× U+1F680 | true | **141** | no | true | 281 | no |
+| `"a"` + 300× | true | **142** | **YES** | true | 281 | no |
+
+Three distinct defects, not one:
+
+1. **Different answer to "was this cut".** At 200 emoji Go returns the string whole and JS
+   truncates. Not rounding — a different boolean.
+2. **Different cut LENGTH even when both cut.** At 300 emoji Go yields 281 runes, JS yields 141.
+3. **A lone surrogate**, exactly the broken glyph `judge_backlog.go:64-65` says the rune count
+   exists to prevent. Confirmed by scanning the **whole** output string. (My first probe checked
+   `o.slice(-3)`, which splits a surrogate pair by itself and reported a false positive on the
+   *fixed* path — an instrument artifact, caught and discarded before it reached this file. Worth
+   recording: the measurement tool manufactured the very defect it was looking for.)
+
+**MEASURED — trim set**, padding rune 280 with each character and asking whether it survives:
+
+| pad | Go trims? | JS current trims? | JS with `/[ \t\r\n]+$/` |
+|---|---|---|---|
+| SPACE, TAB | yes | yes | yes |
+| NBSP U+00A0 | **no** | **yes** | no |
+| BOM U+FEFF | **no** | **yes** | no |
+| U+2028 | **no** | **yes** | no |
+
+**RULING (user, relayed by the lead): fix the mock. It is TWO changes, and that framing is the
+ruling, not a gloss.**
+
+- **Change 1** — `Array.from(s)` / `[...s]` for both the length test and the slice. Fixes
+  defects 1, 2 and 3 together (measured above: all three go away).
+- **Change 2** — replace `/[\s]+$/` with `/[ \t\r\n]+$/`. **Change 1 does not touch this.** A
+  fix that stops at the spread operator leaves the trim divergence live, and a golden fixture
+  authored afterwards would go green with a real divergence still in the tree.
+
+**Consequence for `expected.json`: the expected output is the SERVER's.** No exception is
+encoded, and the fixture is not written against current mock behaviour.
+
+**The trap this creates, and it is the one to state loudest.** Post-fix, both sides cut at the
+same place — so a fixture authored against the OLD behaviour, or authored in ASCII, is
+**indistinguishable from a fixture that pins nothing**. That is why A5 rows 8-10 are marked
+REQUIRED rather than optional, and why row 9 (>280 code units, ≤280 runes) exists at all: it is
+the *only* shape that separates a fixed mock from an unfixed one, because once a string exceeds
+280 runes both implementations cut and the outputs converge.
+
+**Carry the clamp offset into any escaping case.** The cut is at 280 **runes** server-side. A
+hostile multibyte payload therefore lands at a different offset than a naive code-unit count
+predicts, so an escaping fixture that counts characters the wrong way tests a different string
+than it thinks and calls the two one string. Any case combining untrusted text with the preview
+cap must state which count it is using.
+
+**Scope note.** The fix lands in `mockApi.ts`, which this branch owns, so it can ride the same
+wave as the A1 extraction. It is a **behaviour** change to shipped demo code — authorised here,
+recorded so nobody re-litigates it at review.
 
 ### A8. Second finding — truncation is unreachable in demo mode
 
@@ -279,19 +445,40 @@ bulk-disposition re-read at `:1982`.
 
 ### A9. Effort
 
+Revised for v2 — the fixture grew from 9 cases to 11, three of them multibyte and one of them
+13 groups wide.
+
 | | |
 |---|---|
-| JS extraction (A1) | 1-2h |
-| Authoring `cases.json` + `expected.json` (9 cases; the expected DTOs are the bulk) | 3-4h |
+| JS extraction (A1) — authorised | 1-2h |
+| **Mock `rationalePreview` fix (A10) — TWO changes** | 0.5h |
+| Authoring `cases.json` + `expected.json` (11 cases; the expected DTOs are the bulk) | 4-5h |
+| — of which case 11 (13 interleaved groups) | ~1h |
+| — of which cases 8-10 (multibyte; each needs its rune/code-unit counts computed, not eyeballed) | ~1.5h |
 | Two harnesses (A3/A4) | 2h |
-| Self-checks, both runtimes (A5) | 1.5h |
-| Mutation measurement (A6) | 1.5h |
-| **Seam 6 total** | **~1.5 days** |
-| Truncation fix (A8), after the product decision | 2h |
+| Self-checks, both runtimes (A5) | 2h |
+| Mutation measurement (A6/A6a) — now 7 folds | 2h |
+| **Seam 6 total** | **~2 days** |
+| Truncation fix (A8), after the remaining product decision | 2h |
+
+**Authoring note that will otherwise cost the coder an afternoon.** Cases 8-10 must not have
+their expected previews hand-counted. Compute them — the rune index, the code-unit index and
+the trimmed tail — and paste the result. My own probes hit this twice: a heredoc silently
+corrupted a literal U+FEFF into a raw BOM that Go refuses to compile anywhere in a source file
+(the repo's own "read a file back after a shell heredoc" rule, earned again), and the
+`slice(-3)` artifact above. **Build exotic characters by code point** (`string(rune(0xFEFF))`,
+`"\u{FEFF}"`), never by pasting the glyph.
 
 ---
 
 ## Part B — M8b: the e2e leg in `e2e/run-e2e.sh`
+
+> **PART B IS v1 AND AWAITS PASS 3. Do not build from it yet** — the split the lead approved
+> makes it the third pass, after the backstop. Four follow-ups landed against it and only the
+> B8 refutation below has been folded in. The two findings worth keeping regardless, because
+> nothing has challenged them: the `forge-fake` issue-close mutator does not exist and must
+> bump `updated_at`; and both negative windows need a positive control, because a **crashed
+> poller produces a byte-identical green**.
 
 Conventions matched from the file at `ad6c63d9`, not invented: `say`/`pass`/`fail` (`:192-194`),
 `apiget`/`apipost`/`apipost_code` (`:256-308`), `retry_read` (reads only, `:239`), `create_run`
@@ -420,14 +607,48 @@ notification carries `run_id` — which the #46 phase already makes at `:2709`. 
 drop the block and say so**, rather than assert a proxy. Asserting presence where efficacy was
 claimed is the exact failure `.claude/agent-team.md` records for the `title`-attribute pass.
 
-**B8 — no token spend on any disposition.** Follow the steer phase verbatim (`:1690-1701`):
-fake MR count unchanged, no branch pushed, `run.usage` zero on both target runs, and
-`SELECT count(*) FROM runs` unchanged across the whole #98 phase. Cite
-`TestDispositionTouchesStoreOnly` alongside it — a positive store-call allowlist is
-*structurally stronger* than a before/after count, and the e2e block must not be credited with
-more than it proves.
+**~~B8 — no token spend on any disposition.~~ DEAD. DO NOT BUILD IT.**
+
+**v1 text, kept so the refutation has a subject:** *"Follow the steer phase verbatim
+(`:1690-1701`): fake MR count unchanged, no branch pushed, `run.usage` zero on both target
+runs, and `SELECT count(*) FROM runs` unchanged across the whole #98 phase."*
+
+**Why it is dead: the assertion cannot fail.** A disposition creates no run, so a
+`run.usage`/run-count delta sits at zero whether or not the property holds. The one honest
+precedent (`run-e2e.sh:1690-1700`) could attach to `run.usage` only because a run existed to
+attach it to. The harness **already records this in its own words** at `:2832-2836`, describing
+the structural proof as *"strictly stronger than this harness's before/after run count and
+forge-state signature, which could only catch a write that happened to land"*.
+
+**The criterion is met, and by the stronger proof.** `TestDispositionTouchesStoreOnly`
+(`handler/review_disposition_test.go:421`) and `TestBulkDispositionTouchesStoreOnly`
+(`judge_bulk_disposition_test.go:678`) are positive store-call **allowlists**: they prove the
+path calls only the owner-resolve reads plus the single disposition write, never a
+run-create/enqueue or any forge method. That is a statement about what the code *can* do; a
+before/after count is a statement about what it *did once*.
+
+**Recorded rather than deleted, deliberately.** The PRD's Success Criteria say the no-spend
+property is *"proven by the M8 e2e leg"*. A silent removal invites the next reader to re-add it
+from that line. **The PRD sentence is the thing that needs amending** — that file is the lead's,
+so this is a request, not an edit: the criterion is proven by the two structural tests, not by
+e2e.
+
+**Authored by me in v1, and the failure is the one this branch keeps cataloguing** — I shipped
+a decorative assertion as a criterion's proof while quoting, two blocks earlier, the very
+harness comment that refutes it. Proxy substituted for property: a zero delta proxied for "no
+spend can happen".
 
 ### B9. The printed-instruction backstop — the EXECUTING half
+
+> **B9 and B10 are SUPERSEDED and belong to pass 2** (the backstop pass the lead approved).
+> They were written without knowing that `instructionRE` (`instructions_test.go:130`) excludes
+> `%`, `<` and `|`, so a backticked instruction carrying a format verb or a placeholder cannot
+> be lifted at all — which means the file's central claim that "a FOURTH instruction cannot
+> land silently" does not hold for the shape a real instruction takes. Pass 2 owns the
+> static-vs-runtime matcher split, the class widening, the prefix-boundary ruling, the
+> 0-of-8 baseline, and the reachability triage. **What survives from below**: the placement
+> ruling (e2e, not a build-tagged Go test) and the extraction discipline (assert the count,
+> never `head -1`; `eval` guarded by a fixed-shape regex; bind to the emitting command).
 
 **Where it lives: `e2e/run-e2e.sh`. Not a build-tagged Go test.** Reasons from the code, not
 preference:
@@ -558,12 +779,29 @@ precisely what a fake cannot fake.
 
 ## Open questions for the user (product), via the lead
 
+**RESOLVED (user, 2026-07-21):**
+
+- ~~**A1 — the `mockApi.ts` extraction.**~~ **AUTHORISED.**
+- ~~**A10 — fix the divergence or encode it as an expected exception.**~~ **FIX THE MOCK, in
+  TWO changes** (`Array.from` for the count/slice; the trim set separately). Expected output is
+  the server's.
+- ~~**B11 — pay 90s for a second real judged run?**~~ **Drive to 100%; M8b is funded.** Do not
+  trim it for time.
+
+**STILL OPEN:**
+
 1. **A8 — demo-mode truncation.** Permanently-truncated demo, test-only reachability, or a
    deliberate dev toggle? M3's requirement is that the *mock renders every state*, and only the
-   toggle satisfies that for a human. Recommend the toggle.
-2. **A1 — the `mockApi.ts` extraction** is behaviour-preserving but edits shipped demo code;
-   `CLAUDE.md` wants a confirmation. Recommend taking it — seam 6 has no other honest shape.
-3. **B11** — pay 90s of e2e for a second real judged run, or direct-seed it? Recommend paying.
+   toggle satisfies that for a human. Recommend the toggle. This is the **only** unresolved
+   product question in Part A.
+2. **A6a — sort stability.** Not a product question, but a cost one the lead may want to
+   overrule: 13 interleaved groups to pin it, or declare it unpinned with the measured reason.
+   Recommend paying — it is the cheapest case per row despite being the widest.
+3. **A request against `prds/98-judge-menu.md` (the lead's file, not mine):** the Success
+   Criteria say no-token-spend is *"proven by the M8 e2e leg"*. It is not, and cannot be — see
+   the B8 refutation. It is proven by `TestDispositionTouchesStoreOnly` and
+   `TestBulkDispositionTouchesStoreOnly`. Left as a request so the line does not silently
+   re-summon the dead assertion.
 
 ## What this design cannot catch, in one place
 
