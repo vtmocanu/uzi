@@ -1078,6 +1078,16 @@ times in one session from comment edits alone; an assertion *count* drifted the 
 Five items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
 **These are PRD #98 work, not a follow-up PRD** — resume here.
 
+> **⚠️ THE CHECKBOXES BELOW ARE STALE AS OF 2026-07-21 LATE. READ THE `RESUME HERE` BLOCK AT THE
+> TOP OF THIS FILE INSTEAD.** Five of the seven unchecked items **landed today** — the backstop's
+> executing half, seam 6, the query-inventory widening, the anchored deep-link render pin, and N2.
+> They are **deliberately not ticked**: every one is **unreviewed and unaudited**, and a ticked box
+> for unvalidated work is precisely the false completion this PRD has spent itself removing. Tick
+> them when a validator has cleared them, not when a coder has reported them.
+> **Genuinely open: M8b (the e2e leg), and M8a's e2e half which is the same work.**
+> Not duplicating per-item status here on purpose — two places to update is how the entries above
+> went stale in the first place.
+
 - [x] **DONE `0da9186a` (reviewed) — An unscoped assertion in an M6 test — a landmine with a measured detonation.** Fixed by scoping the assertion to the recommendation's row id (the returned row carries no `review_id`, so the id is the only handle), plus a **decoy** row that trips the old assertion. Reviewer measured the discrimination: reverting the fix with the decoy left in place reddens, and the failure names the decoy itself (`RationaleMd:decoy`). Recorded against itself in the commit: the FIRST decoy was never in the backlog at all — `seedCloseSync` always writes a `recommendation_filed_issues` row and #68 Decision 12 makes the row's *existence* the exclusion — and the test's own precondition caught it before any result was claimed.
       `ListOpenImproveUziRecommendations` (selfimprove.sql) selects
       `WHERE rr.category = 'improve_uzi'` across the **whole table** — no user scope, no
