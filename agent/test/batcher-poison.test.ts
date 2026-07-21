@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { MessageBatcher } from "../src/batcher.js";
+import { MessageBatcher, MAX_BATCH_BYTES, MAX_MESSAGE_BYTES, MAX_BACKOFF_MS } from "../src/batcher.js";
 import { RequestError } from "../src/client.js";
 import { recordingLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
@@ -8,20 +8,30 @@ import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 
 /**
- * PRD #108 M1b — reproduce the 2026-07-21 wedge in the batcher, characterising
- * TODAY's behaviour so M3 has something to flip.
- *
- * These are CHARACTERIZATION tests: every assertion here pins the DEFECT, and is
- * named `TODAY (pre-M3)` so nobody mistakes one for a desired invariant. M3
- * inverts each of them in place — unbounded → bounded, growth → capped+split,
- * class-change → split-and-retry — so the flip is visible in one diff rather than
- * hidden in a deletion.
+ * PRD #108 — the 2026-07-21 batcher wedge. Written as M1b characterization tests
+ * pinning the DEFECT, and FLIPPED here by M3 steps 1-3 into the invariants that
+ * replace it. Each `it` keeps its subject and inverts its assertion, so the fix
+ * reads as a flip in one diff rather than a deletion.
  *
  * The incident: run 4d4762cf posted a `tool_result` carrying 84 NUL bytes. The
  * store rejected it (SQLSTATE 22P05), `worker_protocol.go`'s `default:` arm
  * returned 500, the batcher read 500 as retryable, re-buffered the identical
  * batch, and looped at ~2 Hz for 27 minutes with the batch climbing 206 → 239
  * messages. Cancelling logged `dropped: 239`.
+ *
+ * Measured against the UNFIXED batcher, and each number is what the flipped test
+ * below now refutes:
+ *
+ *   1. 62 posts in a 400ms window, 6.49ms apart, flat — no backoff.
+ *   2. batch 1 → 13 messages, body 81 → 843 bytes, monotone — unbounded growth.
+ *   3. crossed the 1 MiB cap at attempt 18 (11 messages, 1,082,141 bytes), status
+ *      500 → 400, peaking at 1,475,645 bytes — the class changed under a batcher
+ *      that could not tell.
+ *
+ * Still M3b's, and deliberately NOT asserted here yet: bisection, the tombstone,
+ * 4xx-as-fatal and the breaker. Retries remain unbounded in COUNT after this
+ * change — what M3 steps 1-3 remove is the hot loop and the growth, which is
+ * precisely the Decision 4 ordering (cap and split BEFORE 4xx is made fatal).
  */
 
 /** The api's real cap: `maxBodyBytes = 1 << 20` in `api/internal/httpx/respond.go`,
@@ -32,6 +42,8 @@ interface Attempt {
   count: number;
   bytes: number;
   status: number;
+  /** Wall clock, so the retry CADENCE is measurable and not merely assumed. */
+  t: number;
 }
 
 /**
@@ -55,7 +67,7 @@ function poisonedApi(): { client: WorkerClient; attempts: Attempt[] } {
       const bytes = Buffer.byteLength(JSON.stringify({ messages }), "utf8");
       const oversize = bytes > MAX_BODY_BYTES;
       const status = oversize ? 400 : 500;
-      attempts.push({ count: messages.length, bytes, status });
+      attempts.push({ count: messages.length, bytes, status, t: Date.now() });
       throw new RequestError(
         "POST",
         `/api/worker/runs/${runId}/messages`,
@@ -73,115 +85,186 @@ function fatMessage(size: number): { kind: "tool_result"; agent: string; payload
   return { kind: "tool_result", agent: "lead", payload: { content: "x".repeat(size) } };
 }
 
-describe("MessageBatcher — the poison-pill wedge (PRD #108 M1b)", () => {
-  it("TODAY (pre-M3): a permanently-failing POST is retried without bound, at a fixed cadence", async () => {
+describe("MessageBatcher — the poison-pill wedge (PRD #108 M1b/M3)", () => {
+  it("M3: a permanently-failing POST backs off exponentially instead of hot-looping", async () => {
     const { logger } = recordingLogger();
     const { client, attempts } = poisonedApi();
     const batchMs = 5;
     const batcher = new MessageBatcher(client, "run-1", 0, batchMs, logger);
 
     batcher.emit({ kind: "text", agent: "lead", payload: { text: "the poisoned message" } });
-    // A bounded observation window — the loop really is unbounded, so the test
-    // must be what stops, not the batcher.
     const windowMs = 400;
     await sleep(windowMs);
 
-    // There is no give-up in the steady state: `doFlush` re-buffers and calls
-    // `scheduleFlush()` again, forever (batcher.ts:113-118). The exact count is
-    // timer scheduling, so assert the ORDER of magnitude, not a number.
+    // The retry COUNT is still unbounded (the breaker is M3b) — what is gone is
+    // the hot loop. The unfixed batcher managed 62 posts in this window; doubling
+    // from 5ms can reach at most ~7 before the window closes.
     assert.ok(
-      attempts.length > 20,
-      `expected an unbounded retry loop in ${windowMs}ms at ${batchMs}ms cadence, saw only ${attempts.length} attempts`,
+      attempts.length > 0 && attempts.length <= 10,
+      `expected a backed-off handful of attempts in ${windowMs}ms, saw ${attempts.length} (unfixed batcher: 62)`,
     );
-    // Every attempt is the identical batch and every one takes the same 500.
-    assert.ok(attempts.every((a) => a.count === 1), "the same single-message batch is re-posted every time");
-    assert.ok(attempts.every((a) => a.status === 500), "a store rejection returns 500, which the batcher reads as retryable");
+    assert.ok(attempts.every((a) => a.status === 500), "a store rejection still returns 500 and is still retried");
 
-    // And the cadence is FIXED, not backed off: the last interval is no longer
-    // than the first. This is the property M3 replaces with exponential backoff.
-    const perAttemptMs = windowMs / attempts.length;
+    // The gaps GROW. Compare the first interval with the last rather than
+    // asserting a schedule: ±20% jitter makes any exact delay a flake.
+    const gaps: number[] = [];
+    for (let i = 1; i < attempts.length; i++) gaps.push(attempts[i]!.t - attempts[i - 1]!.t);
+    assert.ok(gaps.length >= 2, `need at least two intervals to show growth, saw ${gaps.length}`);
     assert.ok(
-      perAttemptMs < batchMs * 4,
-      `no backoff today: ${attempts.length} attempts in ${windowMs}ms is ~${perAttemptMs.toFixed(1)}ms each`,
+      gaps.at(-1)! > gaps[0]! * 2,
+      `the delay must grow: first gap ${gaps[0]}ms, last gap ${gaps.at(-1)}ms (unfixed: flat at 6.49ms)`,
     );
 
-    // close() does its own bounded 3 retries on top and then gives up, dropping
-    // the buffer — the incident's `dropped: 239`.
     await batcher.close();
   });
 
-  it("TODAY (pre-M3): the re-buffered batch GROWS as new messages pile in behind the poison", async () => {
+  it("M3: the backoff delay is capped, so a long outage never stalls delivery forever", async () => {
+    const { logger } = recordingLogger();
+    const { client } = poisonedApi();
+    // A base already above the cap: every computed delay must clamp to it.
+    const batcher = new MessageBatcher(client, "run-1b", 0, MAX_BACKOFF_MS * 4, logger);
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    // Capture what the batcher ASKS for, rather than waiting out real delays.
+    (globalThis as { setTimeout: typeof setTimeout }).setTimeout = ((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return realSetTimeout(fn, 1);
+    }) as typeof setTimeout;
+    try {
+      batcher.emit({ kind: "text", agent: "lead", payload: { text: "x" } });
+      await sleep(120);
+    } finally {
+      (globalThis as { setTimeout: typeof setTimeout }).setTimeout = realSetTimeout;
+    }
+    assert.ok(delays.length > 1, `expected repeated scheduling, saw ${delays.length}`);
+    // The first is the base cadence; every retry after it is clamped (+jitter).
+    for (const d of delays.slice(1)) {
+      assert.ok(d <= MAX_BACKOFF_MS * (1 + 0.2), `delay ${d}ms exceeds the ${MAX_BACKOFF_MS}ms cap plus jitter`);
+    }
+    await batcher.close();
+  });
+
+  it("M3: the re-buffered batch never grows past the byte cap, however long the failure lasts", async () => {
     const { logger } = recordingLogger();
     const { client, attempts } = poisonedApi();
     const batcher = new MessageBatcher(client, "run-2", 0, 5, logger);
 
-    batcher.emit({ kind: "text", agent: "lead", payload: { text: "poison" } });
-    // Keep emitting while the flush loop fails, exactly as a working agent does:
-    // the incident's worker was still creating files at 18:36 and 18:37.
-    for (let i = 0; i < 12; i++) {
-      await sleep(15);
-      batcher.emit({ kind: "text", agent: "lead", payload: { text: `message ${i}` } });
+    // Keep emitting fat messages while the flush loop fails, exactly as a working
+    // agent does: the incident's worker was still creating files at 18:36/18:37.
+    // 64 KiB apiece, so ~24 of them would blow past 1 MiB in one body if the
+    // batcher still posted the whole buffer.
+    batcher.emit(fatMessage(64 * 1024));
+    for (let i = 0; i < 30; i++) {
+      await sleep(4);
+      batcher.emit(fatMessage(64 * 1024));
     }
-    await sleep(30);
+    await sleep(60);
 
-    // `doFlush` puts the WHOLE failed batch back at the head (batcher.ts:114,
-    // `this.buffer = batch.concat(this.buffer)`), so the next post carries the
-    // poison plus everything that arrived since. 206 → 239, in miniature.
-    const first = attempts[0];
-    const last = attempts.at(-1);
-    assert.ok(first && last);
-    assert.strictEqual(first.count, 1);
-    assert.ok(last.count > first.count, `batch must grow: first=${first.count} last=${last.count}`);
-    // Monotone: it never sheds anything, because nothing ever succeeds.
-    for (let i = 1; i < attempts.length; i++) {
-      const prev = attempts[i - 1];
-      const cur = attempts[i];
-      assert.ok(prev && cur);
-      assert.ok(cur.count >= prev.count, `attempt ${i} shrank: ${prev.count} → ${cur.count}`);
-      assert.ok(cur.bytes >= prev.bytes, `attempt ${i} body shrank: ${prev.bytes} → ${cur.bytes}`);
-    }
+    assert.ok(attempts.length > 0, "the batcher must have tried at least once");
+    const largest = Math.max(...attempts.map((a) => a.bytes));
+    assert.ok(
+      largest <= MAX_BATCH_BYTES,
+      `no body may exceed the ${MAX_BATCH_BYTES}-byte grouping cap, saw ${largest}`,
+    );
+    // The buffer behind it still grows — nothing is succeeding — but that growth
+    // no longer reaches the wire. This is the whole point of splitting.
+    assert.ok(
+      attempts.some((a) => a.count > 1),
+      "batches still carry multiple messages; the cap bounds bytes, it does not force one-at-a-time",
+    );
 
     await batcher.close();
   });
 
-  it("TODAY (pre-M3): that growth crosses the api's 1 MiB cap and the failure CHANGES CLASS from 500 to 400", async () => {
+  it("M3: the batch never crosses the api's 1 MiB cap, so the failure cannot change class to 400", async () => {
     const { logger } = recordingLogger();
     const { client, attempts } = poisonedApi();
     const batcher = new MessageBatcher(client, "run-3", 0, 5, logger);
 
-    // 96 KiB apiece: ~11 of them cross 1 MiB. A single oversized tool_result
-    // would do it alone — this is the SECOND poison trigger, and sanitation does
-    // not touch it.
+    // The exact shape that crossed the cap at attempt 18 on the unfixed batcher.
     batcher.emit(fatMessage(96 * 1024));
-    for (let i = 0; i < 14; i++) {
-      await sleep(12);
+    for (let i = 0; i < 20; i++) {
+      await sleep(6);
       batcher.emit(fatMessage(96 * 1024));
     }
-    await sleep(40);
+    await sleep(60);
 
-    const firstOversize = attempts.findIndex((a) => a.bytes > MAX_BODY_BYTES);
-    assert.ok(firstOversize > 0, `the growing batch must cross ${MAX_BODY_BYTES} bytes; largest seen was ${Math.max(...attempts.map((a) => a.bytes))}`);
-
-    // Before the crossing it is a 500 (retryable, per the contract). After it, a
-    // 400 the batcher retries just as blindly — and one that no amount of waiting
-    // can clear, because the body only ever gets bigger.
-    assert.ok(
-      attempts.slice(0, firstOversize).every((a) => a.status === 500),
-      "every under-cap attempt is a 500",
+    assert.ok(attempts.length > 0);
+    const oversize = attempts.filter((a) => a.bytes > MAX_BODY_BYTES);
+    assert.strictEqual(
+      oversize.length,
+      0,
+      `no attempt may exceed the api's ${MAX_BODY_BYTES}-byte cap; ${oversize.length} did, largest ${Math.max(...attempts.map((a) => a.bytes))} (unfixed batcher peaked at 1,475,645)`,
     );
+    // And because nothing is oversized, the stub — which derives its status the
+    // same way the api does — never has cause to answer 400. The failure class
+    // stays honest, which is the precondition for making 4xx fatal in M3b.
     assert.ok(
-      attempts.slice(firstOversize).every((a) => a.status === 400),
-      "every attempt from the crossing on is a 400 — the class changed under a batcher that cannot tell",
+      attempts.every((a) => a.status === 500),
+      "every attempt stays a retryable 500; the class never rotates under the batcher",
     );
-    // Which is exactly why "never retry a 4xx" cannot ship alone (PRD Decision
-    // 4): a healthy run riding out a transient 500 outage grows into this 400 and
-    // would be failed for a payload that was never poisoned.
-    assert.ok(attempts.some((a) => a.status === 500) && attempts.some((a) => a.status === 400));
 
     await batcher.close();
   });
 
-  it("TODAY (pre-M3): close() gives up after 3 retries and DROPS the whole buffer", async () => {
+  it("M3: a message too large to ever be accepted is replaced by a marker under its OWN seq", async () => {
+    const { logger, lines } = recordingLogger();
+    const { client, attempts } = poisonedApi();
+    const batcher = new MessageBatcher(client, "run-5", 0, 5, logger);
+
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "before" } });
+    batcher.emit(fatMessage(MAX_MESSAGE_BYTES + 4096));
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "after" } });
+    await sleep(40);
+
+    const posted = attempts[0];
+    assert.ok(posted, "the batch must have been attempted");
+    assert.ok(posted.bytes < MAX_BATCH_BYTES, `the oversized message must not reach the wire, body was ${posted.bytes}`);
+    // Seq CONTIGUITY is the point: `web/src/lib/runStream.ts` renders nothing past
+    // a gap (`seq > lastSeq + 1` buffers into `pending` and never advances
+    // `lastSeq`), so a dropped seq would freeze the live view for the rest of the
+    // run. All three messages are still there, 1/2/3.
+    assert.strictEqual(posted.count, 3);
+    assert.strictEqual(batcher.currentSeq(), 3);
+
+    const warned = lines.find(
+      (l): l is Record<string, unknown> =>
+        !!l && typeof l === "object" &&
+        (l as { msg?: string }).msg === "run message too large for the api to accept; replaced with a marker",
+    );
+    assert.ok(warned, "the replacement is logged, never silent");
+    assert.strictEqual(warned["seq"], 2, "and it names the seq it replaced");
+
+    await batcher.close();
+  });
+
+  it("M3: a message that is large but ACCEPTABLE is delivered intact, alone if need be", async () => {
+    // The regression guard for the cap: a payload between the grouping cap and the
+    // hard cap is one the api takes today, so the worker must not mangle it.
+    const { logger } = recordingLogger();
+    const sent: OutgoingMessage[][] = [];
+    const client = {
+      async postMessages(_runId: string, messages: OutgoingMessage[]): Promise<void> {
+        sent.push(messages);
+      },
+    } as unknown as WorkerClient;
+    const batcher = new MessageBatcher(client, "run-6", 0, 5, logger);
+
+    const big = 700 * 1024; // > MAX_BATCH_BYTES, < MAX_MESSAGE_BYTES
+    batcher.emit(fatMessage(big));
+    batcher.emit({ kind: "text", agent: "lead", payload: { text: "small" } });
+    await batcher.close();
+
+    const all = sent.flat();
+    assert.strictEqual(all.length, 2, "both messages are delivered");
+    const content = (all[0]?.payload as { content?: string } | undefined)?.content;
+    assert.strictEqual(content?.length, big, "the large payload is delivered byte-for-byte, not truncated");
+    // It exceeds the grouping cap, so it went out in a sub-batch of its own rather
+    // than dragging the next message over the cap with it.
+    assert.strictEqual(sent[0]?.length, 1, "the oversized-for-grouping message goes alone");
+  });
+
+  it("STILL TODAY (M3b's): close() gives up after 3 failed attempts and DROPS the whole buffer", async () => {
     const { logger, lines } = recordingLogger();
     const { client } = poisonedApi();
     const batcher = new MessageBatcher(client, "run-4", 0, 5, logger);
