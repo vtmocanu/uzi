@@ -139,6 +139,16 @@ decides where the next person spends their time. Re-derive those too.
   failure (an empty string where a `0` belongs is visible); the correct-array-wrong-moment
   form is the silent one, and it is exactly the "stale `0` would have shipped" case. Capture
   with `a=("${pipestatus[@]}")` immediately, or do not pipe at all.
+  **WHY that capture line is legal when the sentence above says "the very next command resets
+  it" — and the obvious explanation is wrong.** Measured, zsh 5.9, four cases: a SCALAR
+  assignment (`x=1`, `s="${pipestatus[1]}"`) does **not** reset `$pipestatus`, but an ARRAY
+  assignment (`a=(1 2)`, and `a=("${pipestatus[@]}")` itself) **does** — it leaves
+  `pipestatus=(0)`. So "commands reset it, assignments do not" is FALSE for exactly the form
+  the fix uses. The capture works for a different reason: **the right-hand side is expanded
+  before the assignment takes effect**, so `a` gets `(1 0)` and *then* the array is reset.
+  **Consequence with teeth: you get exactly ONE capture.** A second
+  `b=("${pipestatus[@]}")` reads `(0)` — plausible, passing-looking, wrong. After the capture,
+  read `a`, never `$pipestatus` again.
   **The robust form: do not pipe when you need the exit status.** Redirect to a file, capture
   `$?` on the very next line, then grep the file:
   ```sh
