@@ -24,6 +24,11 @@ vi.mock("../lib/api", async (importActual) => {
       createAnthropicToken: vi.fn(),
       patchAnthropicToken: vi.fn(),
       deleteAnthropicTokenById: vi.fn(),
+      // The token card reads workers so a delete can NAME the ones bound to the
+      // token (PRD #104 D5). Settings renders that card, so its tree calls this —
+      // resolved empty, since these tests are about vault/autopilot/judge/theme and
+      // never open a delete confirmation.
+      listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
       setJudgeEnabled: vi.fn(),
       getMySettings: vi.fn(),

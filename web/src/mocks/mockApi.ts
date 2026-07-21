@@ -876,6 +876,29 @@ export const mockApi = {
       );
     }
     secrets = secrets.filter((s) => s.id !== id);
+    // The real schema CASCADES: migrations 00078/00079 hang composite FKs off
+    // user_secrets (user_id, id) with ON DELETE SET NULL, so deleting a bound token
+    // unbinds its workers and the judge rather than orphaning them. Without this the
+    // mock left workers reading "spends console-key" forever — and with one token
+    // left the picker is hidden, so there was no way to correct it. Two reasons that
+    // matters beyond tidiness: the shipped Dockerfile.mock demo was showing D5's own
+    // promise being broken, and D5's cascade otherwise has schema-level evidence
+    // only. Mirrored here so a browser can prove the behaviour end to end.
+    workers.forEach((w) => {
+      if (w.anthropic_secret_id === id) {
+        w.anthropic_secret_id = null;
+        w.anthropic_secret_label = null;
+      }
+    });
+    // `state.session` is a COPY, not a reference into `users`, so both have to be
+    // swept or the cascade would be invisible to /me — which is the read every
+    // judge surface actually uses.
+    [...users, state.session].forEach((u) => {
+      if (u && u.judge_anthropic_secret_id === id) {
+        u.judge_anthropic_secret_id = null;
+        u.judge_anthropic_secret_label = null;
+      }
+    });
     return delay(null);
   },
 

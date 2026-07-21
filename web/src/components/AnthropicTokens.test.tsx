@@ -6,7 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { AnthropicTokens } from "./AnthropicTokens";
-import { api, type SecretMeta } from "../lib/api";
+import { api, type SecretMeta, type Worker } from "../lib/api";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -16,6 +16,9 @@ vi.mock("../lib/api", async (importActual) => {
       createAnthropicToken: vi.fn(),
       patchAnthropicToken: vi.fn(),
       deleteAnthropicTokenById: vi.fn(),
+      // The card fetches workers itself so a delete can NAME the affected ones
+      // (D5). Defaulted per-test in beforeEach.
+      listWorkers: vi.fn(),
     },
   };
 });
@@ -36,7 +39,23 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
 
 const noop = async () => {};
 
-function renderList(secrets: SecretMeta[], reload = noop) {
+function worker(over: Partial<Worker> = {}): Worker {
+  return {
+    ...(baseWorker as Worker),
+    ...over,
+  };
+}
+
+// Only the three fields this component reads; the rest of Worker is irrelevant
+// here and casting once keeps the fixtures legible.
+const baseWorker = {
+  id: "wrk-1",
+  name: "alpha",
+  anthropic_secret_id: null,
+  anthropic_secret_label: null,
+} as unknown as Worker;
+
+function renderList(secrets: SecretMeta[], reload = noop, judgeSecretId: string | null = null) {
   return render(
     <AnthropicTokens
       secrets={secrets}
@@ -45,13 +64,14 @@ function renderList(secrets: SecretMeta[], reload = noop) {
       reload={reload}
       onError={() => {}}
       onNotice={() => {}}
-      error=""
+      judgeSecretId={judgeSecretId}
     />,
   );
 }
 
 beforeEach(() => {
   vi.spyOn(window, "confirm").mockReturnValue(true);
+  mockApi.listWorkers.mockResolvedValue({ workers: [] });
 });
 
 afterEach(() => {
@@ -84,32 +104,88 @@ describe("AnthropicTokens", () => {
   // D6: the default cannot be deleted while other tokens exist. The UI disables it
   // rather than letting the server 409 — and says why, so the user knows the fix is
   // "promote another", not "try again".
-  it("disables deleting the default while another token exists, and explains why", () => {
+  it("refuses deleting the default while another token exists, and explains why", () => {
     renderList([secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]);
     const defaultRow = screen.getByTestId("token-sec-1");
     const del = within(defaultRow).getByRole("button", { name: "Delete" });
-    expect((del as HTMLButtonElement).disabled).toBe(true);
+    // aria-disabled, NOT `disabled`: a `disabled` button leaves the tab order, so
+    // the reason was reachable only by hovering a control you could not focus.
+    expect(del.getAttribute("aria-disabled")).toBe("true");
+    expect((del as HTMLButtonElement).disabled).toBe(false);
     expect(del.getAttribute("title")).toMatch(/another token the default first/i);
+  });
+
+  // The half that was missing (web-ux D3): keyboard and screen-reader users got a
+  // button they could not reach and a reason that existed only in a tooltip.
+  it("gives the refusal a screen-reader description, not just a tooltip", () => {
+    renderList([secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]);
+    const del = within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Delete" });
+    const describedBy = del.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toMatch(
+      /another token the default first/i,
+    );
+  });
+
+  it("does not delete when the D6 rule blocks it, even if the click lands", () => {
+    mockApi.deleteAnthropicTokenById.mockResolvedValue(null);
+    renderList([secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]);
+    fireEvent.click(within(screen.getByTestId("token-sec-1")).getByRole("button", { name: "Delete" }));
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(mockApi.deleteAnthropicTokenById).not.toHaveBeenCalled();
   });
 
   it("allows deleting the default when it is the LAST token", () => {
     renderList([secret()]);
     const del = screen.getByRole("button", { name: "Delete" });
     expect((del as HTMLButtonElement).disabled).toBe(false);
+    expect(del.getAttribute("aria-disabled")).toBeNull();
   });
 
-  // D5: deleting a bound token silently returns its workers to the default. The
-  // confirmation must SAY so — a quiet fallback is acceptable behavior but not
-  // acceptable UX.
-  it("warns that bound workers fall back to the default before deleting a non-default token", async () => {
+  // D5: deleting a bound token silently returns its workers to the default, and
+  // the confirmation must NAME them. The generic "any worker bound to it" wording
+  // is precisely what D5 rejects — it tells a user something MIGHT move, not what
+  // did — so these assert the names, not the sentence shape.
+  it("NAMES the workers bound to a token before deleting it", async () => {
+    mockApi.deleteAnthropicTokenById.mockResolvedValue(null);
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        worker({ id: "w1", name: "alpha", anthropic_secret_id: "sec-2" }),
+        worker({ id: "w2", name: "beta", anthropic_secret_id: "sec-2" }),
+        worker({ id: "w3", name: "gamma", anthropic_secret_id: null }),
+      ],
+    });
+    renderList([secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]);
+    await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Delete" }));
+    const msg = vi.mocked(window.confirm).mock.calls[0][0] as string;
+    expect(msg).toMatch(/alpha/);
+    expect(msg).toMatch(/beta/);
+    // An UNBOUND worker must not be named — a warning that over-claims is as
+    // useless as one that under-claims.
+    expect(msg).not.toMatch(/gamma/);
+    expect(msg).toMatch(/fall back to your default token/i);
+    await waitFor(() => expect(mockApi.deleteAnthropicTokenById).toHaveBeenCalledWith("sec-2"));
+  });
+
+  it("names the run judge too when the judge lane is bound to the token", async () => {
+    mockApi.deleteAnthropicTokenById.mockResolvedValue(null);
+    renderList(
+      [secret(), secret({ id: "sec-2", label: "console-key", is_default: false })],
+      noop,
+      "sec-2",
+    );
+    await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Delete" }));
+    expect(vi.mocked(window.confirm).mock.calls[0][0]).toMatch(/your run judge falls back/i);
+  });
+
+  it("says plainly when nothing is bound, rather than implying something might move", async () => {
     mockApi.deleteAnthropicTokenById.mockResolvedValue(null);
     renderList([secret(), secret({ id: "sec-2", label: "console-key", is_default: false })]);
-    const row = screen.getByTestId("token-sec-2");
-    fireEvent.click(within(row).getByRole("button", { name: "Delete" }));
-    expect(window.confirm).toHaveBeenCalledWith(
-      expect.stringMatching(/falls back to your default token/i),
-    );
-    await waitFor(() => expect(mockApi.deleteAnthropicTokenById).toHaveBeenCalledWith("sec-2"));
+    await waitFor(() => expect(mockApi.listWorkers).toHaveBeenCalled());
+    fireEvent.click(within(screen.getByTestId("token-sec-2")).getByRole("button", { name: "Delete" }));
+    expect(vi.mocked(window.confirm).mock.calls[0][0]).toMatch(/nothing is bound to it/i);
   });
 
   it("warns that deleting the LAST token disconnects the account", () => {
@@ -169,5 +245,87 @@ describe("AnthropicTokens", () => {
     await waitFor(() =>
       expect(mockApi.createAnthropicToken).toHaveBeenCalledWith("sk-ant-new-value", "console-key", false),
     );
+  });
+
+  // web-ux D1, and the reason this is a bug and not a nit: the Name input UNMOUNTS
+  // when the card collapses to first-token mode, so a label typed and never
+  // submitted would name the next token through a field that is not on screen.
+  // Deterministic repro was: type a name, delete every token, paste, Save.
+  it("never names the first token from a field the user cannot see", async () => {
+    mockApi.createAnthropicToken.mockResolvedValue({ secret: secret() });
+    const { rerender } = render(
+      <AnthropicTokens
+        secrets={[secret()]}
+        loading={false}
+        busy={false}
+        reload={noop}
+        onError={() => {}}
+        onNotice={() => {}}
+        judgeSecretId={null}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Token name"), { target: { value: "staging-key" } });
+    // Every token goes away — the card collapses and the Name field unmounts.
+    rerender(
+      <AnthropicTokens
+        secrets={[]}
+        loading={false}
+        busy={false}
+        reload={noop}
+        onError={() => {}}
+        onNotice={() => {}}
+        judgeSecretId={null}
+      />,
+    );
+    expect(screen.queryByLabelText("Token name")).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), {
+      target: { value: "sk-ant-first" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save token" }));
+    await waitFor(() =>
+      expect(mockApi.createAnthropicToken).toHaveBeenCalledWith("sk-ant-first", "default", false),
+    );
+  });
+
+  // web-ux D1's other half: the pasted VALUE must not survive the collapse either.
+  it("clears a half-typed token value when the card changes mode", () => {
+    const { rerender } = render(
+      <AnthropicTokens
+        secrets={[secret()]}
+        loading={false}
+        busy={false}
+        reload={noop}
+        onError={() => {}}
+        onNotice={() => {}}
+        judgeSecretId={null}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Paste your Anthropic token"), {
+      target: { value: "sk-ant-half-typed" },
+    });
+    rerender(
+      <AnthropicTokens
+        secrets={[]}
+        loading={false}
+        busy={false}
+        reload={noop}
+        onError={() => {}}
+        onNotice={() => {}}
+        judgeSecretId={null}
+      />,
+    );
+    expect(
+      (screen.getByPlaceholderText("Paste your Anthropic token") as HTMLInputElement).value,
+    ).toBe("");
+  });
+
+  // web-ux D4: the card used to keep its own sr-only copy of the parent's error, so
+  // a duplicate-label failure sat in the DOM twice and was announced twice. The
+  // `error` prop is gone entirely now (TypeScript enforces that half); this asserts
+  // the runtime half. Single-token on purpose — that is the one shape where D6's
+  // own sr-only hint cannot render, so any sr-only node here would be a new echo.
+  it("keeps no second copy of an error for screen readers", () => {
+    const { container } = renderList([secret()]);
+    expect(container.querySelectorAll(".sr-only").length).toBe(0);
   });
 });

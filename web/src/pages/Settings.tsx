@@ -179,7 +179,7 @@ export function Settings() {
         reload={load}
         onError={setError}
         onNotice={setNotice}
-        error={error}
+        judgeSecretId={user?.judge_anthropic_secret_id ?? null}
       />
 
       {/* The rotate-your-legacy-token reminder (PRD #32): password protection

@@ -2,16 +2,21 @@
 // "does this user have a token?" checks in the SPA (Dashboard, Board, IssueView)
 // keep any-row semantics after a user can hold several tokens.
 //
-// All three are the same expression — `secrets.some((s) => s.kind ===
-// "anthropic_token")` — over the GET /api/me/secrets payload. This pins that
-// expression's behaviour across the shapes that payload can now take, so a future
-// change to it (say, filtering on is_default) trips here instead of silently
-// gating the board on the wrong thing.
+// This file used to declare its OWN copy of the predicate while the real
+// expression stayed inlined at all three call sites — so it asserted a copy, and
+// narrowing any of those three to `is_default` would have left it green while the
+// board silently gated on the wrong thing. Exactly the shape of "a test that
+// passes both before and after is not testing the bug". The predicate now lives in
+// `lib/hasToken.ts` and is imported by the three pages AND by this file, so the
+// line below holds the shipping code.
+//
+// Verified by removal (2026-07-21): changing `hasAnthropicToken` to
+// `s.kind === "anthropic_token" && s.is_default` turns the "NO token is flagged
+// default" case red. Against the old local copy the same edit changed nothing.
 
 import { describe, expect, it } from "vitest";
 import type { SecretMeta } from "./api";
-
-const hasToken = (secrets: SecretMeta[]) => secrets.some((s) => s.kind === "anthropic_token");
+import { hasAnthropicToken as hasToken } from "./hasToken";
 
 function secret(over: Partial<SecretMeta> = {}): SecretMeta {
   return {

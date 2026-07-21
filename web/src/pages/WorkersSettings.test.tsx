@@ -548,6 +548,22 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     expect(screen.getByText(/your default token/i)).toBeTruthy();
   });
 
+  // The MIRROR of the case above, and the reason "always state it" needs three
+  // branches rather than two (web-ux D2): on an account holding NO tokens, "spends
+  // your default token" over-claims a credential that does not exist, on an account
+  // where every run will fail, with nowhere to go. Blank was wrong in one
+  // direction; this was wrong in the other.
+  it("does not claim a default token on an account that has none", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.queryByText(/your default token/i)).toBeNull();
+    expect(screen.getByText(/no Anthropic token/i)).toBeTruthy();
+    // And it points somewhere actionable rather than just reporting the problem.
+    expect(screen.getByRole("link", { name: /add one in Settings/i })).toBeTruthy();
+  });
+
   it("names the bound credential on a bound worker", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" })],

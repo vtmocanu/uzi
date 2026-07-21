@@ -6,8 +6,8 @@
 // after saving — rotation is a re-paste, which is why "Replace value" is a form
 // and not an edit-in-place field.
 
-import { useState, type FormEvent } from "react";
-import { api, ApiError, type SecretMeta } from "../lib/api";
+import { useEffect, useState, type FormEvent } from "react";
+import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
 import { isVaultLocked } from "../lib/api";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 
@@ -18,9 +18,58 @@ const DOC_URL =
 // has already refreshed the session, so the unlock banner is showing above.
 const VAULT_LOCKED = "Your vault is locked — unlock it with the banner above, then save again.";
 
+// D6's reason, in one place: it is rendered as a tooltip AND as the screen-reader
+// description the disabled-looking Delete points at, and those two must not drift.
+const D6_HINT =
+  "Make another token the default first — every account needs one default while any token exists.";
+
 function errText(err: unknown, fallback: string): string {
   if (isVaultLocked(err)) return VAULT_LOCKED;
   return err instanceof ApiError ? err.message : fallback;
+}
+
+// D5 says the delete confirmation must NAME the affected workers, and it says so
+// because the generic warning is precisely what it rejects: a silent fallback to
+// the default is acceptable behavior and unacceptable surprise. "Any worker bound
+// to it" tells a user that something might move; "alpha and beta" tells them what
+// did. Bounded at four names so a fleet-sized list stays a sentence.
+const MAX_NAMED = 4;
+function nameList(names: string[]): string {
+  const shown = names.slice(0, MAX_NAMED);
+  const rest = names.length - shown.length;
+  const joined =
+    shown.length === 1
+      ? shown[0]
+      : `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`;
+  return rest > 0 ? `${joined} (and ${rest} more)` : joined;
+}
+
+// deleteWarning is the confirmation copy, split out so the naming rules are
+// readable and testable in one place rather than nested three ternaries deep.
+export function deleteWarning(
+  label: string,
+  isDefault: boolean,
+  boundWorkers: string[],
+  judgeBound: boolean,
+): string {
+  if (isDefault) {
+    // Reachable only as the LAST token (D6 blocks deleting a default while others
+    // exist), so this is the disconnect-my-account case, not a fallback case.
+    return `Delete “${label}”? This is your last token — uzi will no longer be connected to your Anthropic account.`;
+  }
+  const affected: string[] = [];
+  if (boundWorkers.length > 0) {
+    affected.push(
+      `${boundWorkers.length === 1 ? "Worker" : "Workers"} ${nameList(boundWorkers)}`,
+    );
+  }
+  if (judgeBound) affected.push("your run judge");
+  if (affected.length === 0) {
+    return `Delete “${label}”? Nothing is bound to it, so no worker or judge setting changes.`;
+  }
+  const subject = affected.join(" and ");
+  const verb = boundWorkers.length + (judgeBound ? 1 : 0) === 1 ? "falls" : "fall";
+  return `Delete “${label}”? ${subject} ${verb} back to your default token.`;
 }
 
 // TokenRow is one stored credential: its label, the default badge, when it was
@@ -30,6 +79,8 @@ function TokenRow({
   secret,
   busy,
   soleToken,
+  boundWorkers,
+  judgeBound,
   onChanged,
   onError,
   onNotice,
@@ -37,6 +88,8 @@ function TokenRow({
   secret: SecretMeta;
   busy: boolean;
   soleToken: boolean;
+  boundWorkers: string[];
+  judgeBound: boolean;
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -45,6 +98,8 @@ function TokenRow({
   const [label, setLabel] = useState(secret.label);
   const [rowBusy, setRowBusy] = useState(false);
   const disabled = busy || rowBusy;
+  const blockedByD6 = secret.is_default && !soleToken;
+  const d6HintId = `d6-${secret.id}`;
 
   const run = async (fn: () => Promise<unknown>, ok: string, fallback: string) => {
     onError("");
@@ -133,22 +188,28 @@ function TokenRow({
             <Button
               variant="danger"
               size="sm"
-              // The default cannot be deleted while other tokens exist (D6) —
-              // disable rather than let the server 409, and say why on hover.
-              disabled={disabled || (secret.is_default && !soleToken)}
-              title={
-                secret.is_default && !soleToken
-                  ? "Make another token the default first — every account needs one default while any token exists."
-                  : undefined
-              }
+              // The default cannot be deleted while other tokens exist (D6). It is
+              // aria-disabled rather than `disabled` DELIBERATELY: a `disabled`
+              // button leaves the tab order entirely, so a keyboard or screen-reader
+              // user met a control they could not reach and a reason that existed
+              // only in a hover tooltip (web-ux D3). aria-disabled keeps it
+              // focusable, aria-describedby carries the reason to a screen reader,
+              // and the click is refused here instead of by the server's 409 — a
+              // 409 tells a user it failed, not what to do instead.
+              // `busy` still uses real `disabled`: that one is transient and has
+              // nothing to explain.
+              disabled={disabled}
+              aria-disabled={blockedByD6 || undefined}
+              aria-describedby={blockedByD6 ? d6HintId : undefined}
+              title={blockedByD6 ? D6_HINT : undefined}
+              className={blockedByD6 ? "cursor-not-allowed opacity-50" : undefined}
               onClick={() => {
+                if (blockedByD6) return;
                 // Deleting a bound token silently returns its workers to the
-                // default (D5), so the confirmation must SAY so rather than let a
-                // user discover it from a meter.
-                const warning = secret.is_default
-                  ? `Delete “${secret.label}”? This is your last token — uzi will no longer be connected to your Anthropic account.`
-                  : `Delete “${secret.label}”? Any worker or judge setting bound to it falls back to your default token.`;
-                if (!window.confirm(warning)) return;
+                // default (D5), so the confirmation must NAME them rather than let a
+                // user discover the move from a meter.
+                if (!window.confirm(deleteWarning(secret.label, secret.is_default, boundWorkers, judgeBound)))
+                  return;
                 void run(
                   () => api.deleteAnthropicTokenById(secret.id),
                   `Deleted “${secret.label}”.`,
@@ -158,6 +219,11 @@ function TokenRow({
             >
               Delete
             </Button>
+            {blockedByD6 && (
+              <span id={d6HintId} className="sr-only">
+                {D6_HINT}
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -178,7 +244,7 @@ export function AnthropicTokens({
   reload,
   onError,
   onNotice,
-  error,
+  judgeSecretId,
 }: {
   secrets: SecretMeta[];
   loading: boolean;
@@ -186,15 +252,49 @@ export function AnthropicTokens({
   reload: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
-  error: string;
+  // The owner's judge-lane binding, so a delete can say the judge moves too (D5
+  // covers "workers AND the judge"). From Settings, which already holds the user.
+  judgeSecretId: string | null;
 }) {
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [rotateFor, setRotateFor] = useState("");
   const [rotateValue, setRotateValue] = useState("");
+  // The card fetches workers itself, because naming the affected ones is the whole
+  // of D5 and no caller has that data. Re-fetched whenever `secrets` changes, which
+  // is what keeps it honest after a delete unbinds rows server-side. Failure is
+  // silent by design: a delete confirmation that cannot enumerate is still a
+  // correct (if less helpful) warning, and an error banner over an unrelated fetch
+  // would be worse than the missing names.
+  const [workers, setWorkers] = useState<Worker[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listWorkers()
+      .then(({ workers }) => {
+        if (!cancelled) setWorkers(workers);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [secrets]);
 
   const first = secrets.length === 0;
+
+  // The add form collapses to first-token mode when the last token goes away, and
+  // the Name input UNMOUNTS while keeping its state — so a label typed and never
+  // submitted would silently become the next token's name, chosen through a field
+  // the user cannot see (web-ux D1, reproduced deterministically). Clearing both
+  // fields on the transition is the fix; `first` is the only thing that changes
+  // which fields exist, so it is the only trigger needed.
+  useEffect(() => {
+    setToken("");
+    setLabel("");
+  }, [first]);
 
   const add = async (e: FormEvent) => {
     e.preventDefault();
@@ -202,10 +302,11 @@ export function AnthropicTokens({
     onNotice("");
     setAddBusy(true);
     try {
-      // A user's FIRST token is forced default server-side whatever we send, so
-      // the form does not offer the choice until there is something to choose
-      // between.
-      await api.createAnthropicToken(token, label.trim() || "default", false);
+      // A user's FIRST token is forced default server-side whatever we send, and
+      // the Name field does not exist in that mode, so send the literal `default`
+      // rather than `label || "default"` — the latter would read a field that is
+      // not on screen.
+      await api.createAnthropicToken(token, first ? "default" : label.trim(), false);
       setToken("");
       setLabel("");
       onNotice("Token saved. It is sealed with your login password and validated on the first agent run.");
@@ -267,6 +368,10 @@ export function AnthropicTokens({
               secret={s}
               busy={anyBusy}
               soleToken={secrets.length === 1}
+              boundWorkers={workers
+                .filter((w) => w.anthropic_secret_id === s.id)
+                .map((w) => w.name)}
+              judgeBound={judgeSecretId === s.id}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}
@@ -341,7 +446,11 @@ export function AnthropicTokens({
         <Button type="submit" disabled={anyBusy || token.trim() === "" || (!first && label.trim() === "")}>
           {first ? "Save token" : "Add token"}
         </Button>
-        {error !== "" && <span className="sr-only">{error}</span>}
+        {/* No sr-only echo of the error here, and no `error` prop any more. There
+            used to be both, from before this card's parent grew its own
+            `role=alert` banner — so a duplicate-label failure sat in the DOM twice
+            and was announced twice (web-ux D4). The parent's Alert is now the single
+            announcement, and this card reports into it via onError. */}
       </form>
     </Card>
   );

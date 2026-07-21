@@ -154,3 +154,55 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });
   });
 });
+
+// PRD #104: the mock must CASCADE a token delete the way the schema does.
+// Migrations 00078/00079 hang composite FKs off user_secrets (user_id, id) with
+// ON DELETE SET NULL, so deleting a bound token unbinds its workers and the judge.
+// The mock previously only dropped the secret row, which left the shipped
+// Dockerfile.mock demo showing D5's own promise being broken — and with one token
+// left the picker hides, so there was no way to correct it in the UI. This is the
+// only place D5's cascade is provable above the schema layer inside the SPA.
+describe("mockApi token delete cascades like ON DELETE SET NULL (PRD #104 D5)", () => {
+  it("unbinds every worker bound to the deleted token, and leaves the others alone", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+
+    const { secret } = await api.createAnthropicToken("sk-ant-mock-second", "cascade-key", false);
+    const { workers } = await api.listWorkers();
+    const target = workers[0];
+    const other = workers[1];
+    await api.setWorkerToken(target.id, "cascade-key");
+
+    const beforeList = (await api.listWorkers()).workers;
+    const beforeOther = beforeList.find((w) => w.id === other?.id);
+    expect(beforeList.find((w) => w.id === target.id)?.anthropic_secret_label).toBe("cascade-key");
+
+    await api.deleteAnthropicTokenById(secret.id);
+
+    const after = (await api.listWorkers()).workers.find((w) => w.id === target.id)!;
+    expect(after.anthropic_secret_id).toBeNull();
+    expect(after.anthropic_secret_label).toBeNull();
+    // Deleting a token must not disturb a worker that was never bound to it.
+    if (beforeOther) {
+      const afterOther = (await api.listWorkers()).workers.find((w) => w.id === other.id)!;
+      expect(afterOther.anthropic_secret_id).toBe(beforeOther.anthropic_secret_id);
+    }
+  });
+
+  it("clears the judge binding when the judge's token is deleted", async () => {
+    installStorage();
+    const api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+
+    const { secret } = await api.createAnthropicToken("sk-ant-mock-judge", "judge-only-key", false);
+    const { user } = await api.setJudgeEnabled(true, "judge-only-key");
+    expect(user.judge_anthropic_secret_label).toBe("judge-only-key");
+
+    await api.deleteAnthropicTokenById(secret.id);
+
+    const me = await api.me();
+    expect(me.user.judge_anthropic_secret_id).toBeNull();
+    expect(me.user.judge_anthropic_secret_label).toBeNull();
+  });
+});

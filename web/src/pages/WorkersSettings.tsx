@@ -2,6 +2,7 @@
 // the fleet with live status. Inside SettingsShell.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
@@ -341,20 +342,34 @@ export function WorkersSettings() {
                         <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                       )}
                     </div>
-                    {/* The EFFECTIVE token, always stated (PRD #104 M6): an unbound
-                        worker says "your default token" rather than nothing, because
-                        "nothing" reads as "no token" when the truth is "the default".
+                    {/* The EFFECTIVE token, always stated (PRD #104 M6), and it has
+                        to be right in BOTH directions. Rendering blank for an unbound
+                        worker reads as "no token" when the truth is "the default" —
+                        but saying "your default token" on an account holding NO tokens
+                        is the same failure mirrored: it over-claims a credential that
+                        does not exist, on an account where every run will fail, and
+                        offers nowhere to go. Three states, not two (web-ux D2).
                         A bound worker is rendered from the LIST payload, which always
                         carries the label alongside the id — never from a source that
                         could supply an id with a null label. */}
                     <div className="mt-1 text-xs text-muted">
-                      spends{" "}
                       {w.anthropic_secret_id ? (
-                        <strong className="font-medium text-fg">
-                          {w.anthropic_secret_label ?? "a named token"}
-                        </strong>
+                        <>
+                          spends{" "}
+                          <strong className="font-medium text-fg">
+                            {w.anthropic_secret_label ?? "a named token"}
+                          </strong>
+                        </>
+                      ) : tokens.length === 0 ? (
+                        <span className="text-warn">
+                          no Anthropic token —{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            add one in Settings
+                          </Link>{" "}
+                          or its runs will fail
+                        </span>
                       ) : (
-                        <span>your default token</span>
+                        <span>spends your default token</span>
                       )}
                     </div>
                   </div>

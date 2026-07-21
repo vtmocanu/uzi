@@ -8,6 +8,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
+import { hasAnthropicToken } from "../lib/hasToken";
 import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { mrAbbrev } from "../lib/forgeNoun";
@@ -112,7 +113,7 @@ export function Dashboard() {
           workersTotal: workers.length,
           reposEnabled: repos.filter((r) => r.enabled).length,
           templates: templates.length,
-          hasToken: secrets.some((s) => s.kind === "anthropic_token"),
+          hasToken: hasAnthropicToken(secrets),
           hasForge: connections.length > 0,
           selfUsage,
           adminUsage,

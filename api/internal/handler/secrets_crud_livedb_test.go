@@ -427,6 +427,25 @@ func countTokens(t *testing.T, pool *pgxpool.Pool, user uuid.UUID) int {
 //     before it commits, so the alias's blast radius on this invariant is smaller
 //     than its unlocked status suggests. The index is doing more of the work here
 //     than the atomicity argument is.
+//
+// TWO mechanisms keep the unlocked alias safe, not one, and only the first is the
+// index. This matters because the second one's failure mode is the one this test
+// would mostly MISS:
+//
+//   - The index rejects the only shape that could ADD a default. The alias always
+//     inserts is_default = true with an `ON CONFLICT ... WHERE is_default` arbiter,
+//     so the sole path to a second default is the arbiter missing the existing row
+//     — which user_secrets_one_default_key refuses before commit.
+//   - The statement shape means it can never SUBTRACT one. The alias writes
+//     is_default = false nowhere. NO INDEX ENFORCES THIS HALF — it is a property of
+//     the SQL text alone. (Verified 2026-07-21: ClearDefaultUserSecret is the only
+//     query in the schema that writes false, and it runs under the advisory lock.)
+//
+// So a future edit that gives the alias ANY is_default = false path breaks the
+// no-default half without the index noticing, and this test only catches it in the
+// narrow case where the user happens to end a round at zero tokens with a default
+// outstanding. If you are making that change, write the test that targets it
+// directly — do not assume this one covers its name.
 func TestAliasVsLockedMutationsInvariantLiveDB(t *testing.T) {
 	h, pool := secretsCRUDHandler(t)
 

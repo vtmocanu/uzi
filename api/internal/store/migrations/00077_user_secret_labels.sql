@@ -70,6 +70,14 @@ ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_user_id_kind_key;
 CREATE UNIQUE INDEX user_secrets_user_kind_label_key
     ON user_secrets (user_id, kind, lower(label));
 
+-- NOT ONLY D2's "at most one default". This index is also the control standing
+-- between the UNLOCKED D14 compatibility alias (UpsertDefaultUserSecret, which takes
+-- no advisory lock) and a two-default state: the alias's sole path to a second
+-- default is its ON CONFLICT arbiter missing an existing row, and this refuses that
+-- before commit. Read as a data-integrity constraint alone it looks droppable in
+-- favour of an application check; it is not. PRD #104 D2 records both mechanisms
+-- (this index, plus the alias's write-no-false statement shape, which NO index
+-- enforces) and the verification behind them.
 CREATE UNIQUE INDEX user_secrets_one_default_key
     ON user_secrets (user_id, kind) WHERE is_default;
 

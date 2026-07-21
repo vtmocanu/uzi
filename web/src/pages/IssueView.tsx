@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem } from "../lib/api";
+import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
@@ -53,7 +54,7 @@ export function IssueView() {
       setIssue(issue);
       setRuns(runs);
       setHasWorker(workers.length > 0);
-      setHasToken(secrets.some((s) => s.kind === "anthropic_token"));
+      setHasToken(hasAnthropicToken(secrets));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load the issue");
     } finally {
