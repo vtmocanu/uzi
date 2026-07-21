@@ -115,6 +115,17 @@ function groupByInstance(messages: RunMessage[]): AgentLane[] {
 // `.claude/agents/lead.md`, which registers as an ordinary invocable subagent (no lead
 // filter in subagentsFromTemplates), so an all-"lead" lane can be a real invocation with
 // a real instance id. That is why this cannot be "the first non-lead role, or bust".
+//
+// NOTE for anyone mutation-testing this: the final fallback is PROVABLY EQUIVALENT to
+// a bare `return LEAD`, so that mutant cannot be killed and its survival is not a gap
+// in the suite. If control reaches it, every message satisfied `!m.agent || m.agent
+// === LEAD`, so `messages[0].agent` is null or "lead"; it could only differ on "",
+// and "" cannot arrive — `hub.PublishMessage` OMITS an empty agent from the WS frame
+// (`if agent != ""`), and the REST path stores "" as SQL NULL, so `RunMessage.agent`
+// is null or non-empty, never "". What IS pinned is the fallback's VALUE: replacing
+// it with "unknown" or "" fails 14 tests. Keep the expression anyway — it states the
+// Decision 8 intent ("else the lane's first role, which may legitimately BE lead")
+// and stays correct if the wire ever carries a third case.
 function laneRole(messages: RunMessage[]): string {
   for (const m of messages) {
     if (m.agent && m.agent !== LEAD) return m.agent;
@@ -134,8 +145,21 @@ function laneLabel(messages: RunMessage[]): string | null {
 }
 
 // The label is model-authored text: it is rendered PLAIN and clamped to a single
-// truncated line, never through <Markdown> (Decision 7). The API's 80-rune cap is a
-// STORAGE bound (Decision 7a); this is the layout one, and both must exist.
+// truncated line, never through <Markdown> (Decision 7). The API's cap is a STORAGE
+// bound (Decision 7a); this is the layout one, and both must exist.
+//
+// UNITS DIFFER, deliberately stated rather than glossed: the server cap is 80 RUNES
+// (Go `truncateRunes`, code points), but this one is 48 UTF-16 CODE UNITS, because
+// `truncate` is `s.length`/`s.slice` and JS strings are UTF-16. For BMP text the two
+// coincide, which is why every fixture here reads the same either way; for astral
+// text they do not. MEASURED: 30 rocket emoji are 30 code points but 60 code units,
+// so this clamp keeps 24 of them and leaves an UNPAIRED HIGH SURROGATE at the cut,
+// which renders as the replacement glyph.
+//
+// Cosmetic, pre-existing, and shared with all 8 `truncate` call sites, so it is NOT
+// fixed here — a surrogate-aware clamp is a behaviour change to shared code and
+// belongs in its own commit. The comment says "code units" so the next reader is not
+// misled into thinking this matches the server's rune cap. It does not.
 const LABEL_MAX = 48;
 
 // Whitespace is FLATTENED, not cut at the first newline. Taking `split("\n")[0]`
@@ -145,7 +169,8 @@ const LABEL_MAX = 48;
 // missing (MEASURED). Collapsing runs of whitespace keeps the single-line
 // requirement while leaving truncate as the only thing that removes text — and
 // truncate always leaves the "…" that says so. The server's 80-rune cap bounds
-// what can arrive, so flattening cannot blow the string up.
+// what can arrive, so flattening cannot blow the string up. (That cap is in runes;
+// LABEL_MAX above is in UTF-16 code units — see the note there.)
 //
 // firstLine is right for toolSummary, where line 1 of a tool input IS the summary.
 // It is wrong here: `task_description` is an Agent-tool description argument that

@@ -813,9 +813,11 @@ describe("ActivityFeed lane label is untrusted-ish text (PRD #99 Decision 7)", (
   // so an angle-bracket-only check would pass against the very sink Decision 7 exists
   // to forbid. The `strong` and `a` assertions are the load-bearing ones.
   //
-  // The payload is 43 runes, under the 48-rune layout clamp, so all three vectors reach
-  // the DOM intact. (The lead's longer draft clamped mid-link, which would have made the
-  // `a` assertion vacuous — MEASURED, hence the shortened link.)
+  // The payload is 43 UTF-16 code units, under the 48-code-unit layout clamp (LABEL_MAX
+  // is `s.length`-based, NOT runes — see the note at its declaration; identical here
+  // because this payload is pure ASCII). All three vectors therefore reach the DOM
+  // intact. The lead's longer draft clamped mid-link, which would have made the `a`
+  // assertion vacuous against the very sink it targets — MEASURED, hence the shortening.
   const HOSTILE = '<img src=x onerror=alert(1)> **b** [l](j:1)';
 
   // Rendered through the REAL By-agent view, not the block in isolation: isolation can
@@ -852,9 +854,9 @@ describe("ActivityFeed lane label is untrusted-ish text (PRD #99 Decision 7)", (
   });
 
   it("puts the CLAMPED label — not the raw one — in the title and aria-label", () => {
-    // A 65-rune label with a distinctive tail. The layout clamp (48) must apply to the
-    // accessible name and the tooltip too, or the a11y surface leaks the unclamped
-    // model text that the visible one refuses to show.
+    // A 65-code-unit label with a distinctive tail. The layout clamp (48 UTF-16 code
+    // units) must apply to the accessible name and the tooltip too, or the a11y surface
+    // leaks the unclamped model text that the visible one refuses to show.
     const LONG = "lane grouping and the conditional role rollup for PRD ninety-nine";
     const { container, getByRole } = renderFeed(
       [mi(1, "coder", "toolu_A", LONG), mi(2, "reviewer", "toolu_R", "safe")],
@@ -874,7 +876,13 @@ describe("ActivityFeed lane label is untrusted-ish text (PRD #99 Decision 7)", (
 
     // The visible label and the accessible name must agree — a disagreement between
     // them is the signal, so assert both carry the SAME clamped string.
-    const visible = container.querySelector(".font-mono")?.textContent ?? "";
+    //
+    // Scoped to the coder lane's own header rather than `querySelector(".font-mono")`:
+    // that takes the FIRST match in the document and silently depends on the coder lane
+    // sorting before the reviewer lane, so a lane-ordering change would make it assert
+    // against the wrong element instead of failing.
+    const header = getByRole("button", { name: /coder · lane grouping/ }).parentElement;
+    const visible = header?.querySelector(".font-mono")?.textContent ?? "";
     expect(visible.endsWith("…")).toBe(true);
     expect(aria).toContain(visible);
   });
