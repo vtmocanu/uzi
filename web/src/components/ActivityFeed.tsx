@@ -138,9 +138,22 @@ function laneLabel(messages: RunMessage[]): string | null {
 // STORAGE bound (Decision 7a); this is the layout one, and both must exist.
 const LABEL_MAX = 48;
 
+// Whitespace is FLATTENED, not cut at the first newline. Taking `split("\n")[0]`
+// matches toolSummary's firstLine idiom, but it drops the remainder SILENTLY when
+// the first line is short: "short first line\nSECOND LINE" rendered as
+// "short first line" with no ellipsis, so nothing on screen said content was
+// missing (MEASURED). Collapsing runs of whitespace keeps the single-line
+// requirement while leaving truncate as the only thing that removes text — and
+// truncate always leaves the "…" that says so. The server's 80-rune cap bounds
+// what can arrive, so flattening cannot blow the string up.
+//
+// firstLine is right for toolSummary, where line 1 of a tool input IS the summary.
+// It is wrong here: `task_description` is an Agent-tool description argument that
+// is single-line by expectation, so a multi-line value is anomalous and hiding
+// half of it hides the anomaly too.
 function laneLabelText(label: string | null): string {
   if (!label) return "";
-  return truncate((label.split("\n")[0] ?? "").trim(), LABEL_MAX);
+  return truncate(label.replace(/\s+/g, " ").trim(), LABEL_MAX);
 }
 
 // ── View toggle (Decision 2) ──────────────────────────────────────────────────
@@ -441,6 +454,13 @@ export function ActivityFeed({
     setBulk("collapsed");
     setOverrides(new Map());
   };
+  // Both jump sites use getElementById, which takes a LITERAL id — so an actor key
+  // is safe here however it is shaped. querySelector would parse the same string as
+  // a CSS SELECTOR, and both key spaces are worker-supplied: a lane key is an SDK
+  // `parent_tool_use_id` and a Timeline key is a `subagent_type` role name. A
+  // metacharacter in either would make querySelector throw inside a click handler.
+  // Safe by construction today, silently unsafe after a plausible "modernise this to
+  // querySelector" refactor — hence the note rather than a runtime guard.
   const jumpTo = (key: string) => {
     setOverrides((prev) => new Map(prev).set(key, true));
     document.getElementById(`agent-anchor-${key}`)?.scrollIntoView?.({ block: "start" });
@@ -499,6 +519,7 @@ export function ActivityFeed({
       for (const l of hits) next.set(l.key, true);
       return next;
     });
+    // Literal id, not a selector — see the note on jumpTo above.
     document.getElementById(`agent-anchor-${hits[0].key}`)?.scrollIntoView?.({ block: "start" });
   };
 

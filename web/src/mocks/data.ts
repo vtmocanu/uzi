@@ -1648,6 +1648,123 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
   };
 }
 
+// ── PRD #99: per-instance lane demo runs ─────────────────────────────────────
+// Every other fixture in this file hardcodes both attribution columns to null, so
+// before these existed `VITE_UZI_MOCK=1 npm run dev` showed NONE of PRD #99: every
+// run coalesced to legacy role lanes and the feature had no demoable state. That is
+// the same blind spot that let both code suites stay green while the lane grouping
+// was removable (see the M5 mutation record) — a fixture that cannot express a
+// feature cannot demo it OR guard it.
+let laneSeq = 0;
+const nm = (
+  kind: string,
+  agent: string | null,
+  instance: string | null,
+  label: string | null,
+  payload: unknown,
+  minAgo: number,
+): RunMessage => ({
+  seq: ++laneSeq,
+  kind,
+  agent,
+  agent_instance: instance,
+  agent_label: label,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+// run-lanes — the PRD headline. Two `coder` invocations running in parallel, with
+// DISTINCT instance ids and their own task labels, interleaved NON-adjacently (a
+// reviewer frame sits between them). Non-adjacency is the load-bearing part: two
+// contiguous coder frames render correctly even under the pre-#99 consecutive-author
+// grouping, so they would not show the fix. The lead's own turns carry neither
+// column, so its lane is the role-keyed fallback beside the two instance-keyed ones.
+export const mockLaneMessages: RunMessage[] = [
+  nm("status", null, null, null, { event: "init", model: "claude-opus-4-8" }, 18),
+  nm("text", "lead", null, null, { text: "Dispatching two coders in parallel: API wiring and the web gate." }, 17),
+  nm("tool_use", "lead", null, null, { id: "ln-1", name: "Agent", input: { description: "API wiring", subagent_type: "coder" } }, 17),
+  nm("tool_use", "lead", null, null, { id: "ln-2", name: "Agent", input: { description: "web gate UX", subagent_type: "coder" } }, 17),
+  nm("tool_use", "coder", "toolu_01coderA", "API wiring", { id: "ln-3", name: "Read", input: { file_path: "api/internal/store/queries/runtime.sql" } }, 12),
+  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-3", content: "-- name: InsertRunMessage :execrows" }, 12),
+  nm("tool_use", "reviewer", "toolu_01review", "audit the wire threading", { id: "ln-4", name: "Grep", input: { pattern: "agent_instance", path: "api" } }, 9),
+  nm("tool_use", "coder", "toolu_01coderB", "web gate UX", { id: "ln-5", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 7),
+  nm("tool_result", "coder", "toolu_01coderB", "web gate UX", { tool_use_id: "ln-5", content: "1 change applied" }, 7),
+  // The same instance speaking again, several frames later: it folds back into its
+  // OWN lane instead of opening a fresh near-empty bar (Problem 1's fix).
+  nm("tool_use", "coder", "toolu_01coderA", "API wiring", { id: "ln-6", name: "Bash", input: { command: "cd api && go test ./internal/store/..." } }, 3),
+  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-6", content: "ok  gitlab.example.com/vtmocanu/uzi/api/internal/store  0.42s" }, 2),
+  nm("tool_use", "coder", "toolu_01coderB", "web gate UX", { id: "ln-7", name: "Bash", input: { command: "cd web && npx vitest run src/components/ActivityFeed.test.tsx" } }, 0.3),
+];
+
+// run-busy — the conditional role rollup, and specifically the ONE state pairing
+// nobody had seen on screen: a doubled role whose worst state is `waiting` while one
+// of its own lanes is visibly pulsing `working`. worstStateFor takes the MIN of
+// STATE_PRIORITY and `waiting`(1) outranks `working`(2), so the chip reads `waiting`
+// and does not pulse while the lane below it does. That is by design (the chip is a
+// worst-state summary, not a most-active one) but nothing on screen says so, and the
+// no-legend decision removed the obvious place to say it. This fixture exists so the
+// pairing is browsable rather than theoretical — see the open question in PRD #99.
+//
+// Shape: `tester` is doubled — toolu_01testX is the newest speaker (active → working)
+// and toolu_01testY spoke 0.4 min ago, inside the 45s recency window (→ waiting).
+let busySeq = 0;
+const bm = (
+  kind: string,
+  agent: string | null,
+  instance: string | null,
+  label: string | null,
+  payload: unknown,
+  minAgo: number,
+): RunMessage => ({
+  seq: ++busySeq,
+  kind,
+  agent,
+  agent_instance: instance,
+  agent_label: label,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+export const mockBusyMessages: RunMessage[] = [
+  bm("status", null, null, null, { event: "init", model: "claude-opus-4-8" }, 22),
+  bm("text", "lead", null, null, { text: "Six subagents across the migration and the web rebuild." }, 21),
+  bm("tool_use", "researcher", "toolu_01resrch", "survey prior art in inspiration/", { id: "b-1", name: "Read", input: { file_path: "inspiration/bottega/README.md" } }, 20),
+  // A long label, over the 48-rune layout clamp: it renders truncated with an
+  // ellipsis, which is the only on-screen signal that text was dropped.
+  bm("tool_use", "coder", "toolu_01coder1", "thread agent_instance and agent_label through the entire message wire, end to end", { id: "b-2", name: "Bash", input: { command: "cd api && go build ./... && go test ./..." } }, 12),
+  bm("tool_use", "coder", "toolu_01coder2", "rebuild the activity pane around per-instance lanes", { id: "b-3", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 10),
+  // A subagent frame with an instance but NO label: its lane titles as the bare role,
+  // no `·` suffix and no placeholder (the label-absent degradation).
+  bm("tool_use", "auditor", "toolu_01audit1", null, { id: "b-4", name: "Grep", input: { pattern: "CLAUDE_CODE_OAUTH_TOKEN", path: "agent/src" } }, 8),
+  bm("tool_use", "documenter", "toolu_01docs01", "docs: run activity page", { id: "b-5", name: "Edit", input: { file_path: "docs/run-activity.md" } }, 7),
+  bm("tool_use", "reviewer", "toolu_01review", "review the migration + wire threading", { id: "b-6", name: "Read", input: { file_path: "api/internal/store/migrations/00076_run_message_instance.sql" } }, 6),
+  // The doubled role. Y spoke recently (waiting), X is the newest speaker (working) —
+  // so the `tester ×2` chip rolls up as `waiting` while X's lane pulses.
+  bm("tool_use", "tester", "toolu_01testY", "unit: RunEvent", { id: "b-7", name: "Bash", input: { command: "npx vitest run src/components/RunEvent.test.tsx" } }, 0.4),
+  bm("tool_use", "tester", "toolu_01testX", "e2e: approval gate", { id: "b-8", name: "Bash", input: { command: "./e2e/run-e2e.sh" } }, 0.1),
+];
+
+export const mockLaneRuns: Run[] = [
+  demoIssueRun({
+    id: "run-lanes",
+    issue_iid: 99,
+    issue_title: "Two parallel coders (PRD #99 headline case)",
+    issue_description: "Demo run: two same-role subagent invocations that must not merge into one lane.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "ok",
+  }),
+  demoIssueRun({
+    id: "run-busy",
+    issue_iid: 99,
+    issue_title: "Busy crew: role rollup, doubled tester, clamped label",
+    issue_description: "Demo run: enough lanes and doubled roles to trigger the conditional role rollup.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "ok",
+  }),
+];
+
 export const mockCrewRuns: Run[] = [
   demoIssueRun({
     id: "run-crew",

@@ -9382,3 +9382,81 @@ Migration is draft `00070` — renumber above the merged head at landing (live h
   `plan_md` only — all other content minimization stands. `docs/slack.md` and
   ARCHITECTURE.md's trust model MUST say plan content now goes to Slack's cloud and
   non-pattern secrets in plans are unscrubbed.
+
+## 347. Per-instance activity lanes — identity is `parent_tool_use_id`, label is `task_description`, both stateless per-frame columns (PRD #99)
+
+The activity feed groups by **invocation**, not by role and not by consecutive author.
+Two `coder` subagents running in parallel are two lanes, not one merged block.
+
+- **Two nullable `run_messages` columns, `agent_instance` and `agent_label`**, appended
+  by `00076` with no backfill. `agent_instance` is the SDK's per-frame
+  `parent_tool_use_id` (the INVOCATION id); `agent_label` is its `task_description`.
+  Both are read exactly as `agentOf` already reads its sibling `subagent_type`: pure,
+  per-frame, **no worker-side correlation state and no client-side join**, so they are
+  correct across resume and independent of whether the spawning turn is still in the
+  window. The rejected alternative — persist only the instance and derive the label
+  client-side from the lead's spawn `tool_use` — cost one column but broke when the
+  spawn frame aged out of the 500-message cap, depended on the pane's spawn-tool
+  parsing, and leaned on the unverified `parent_tool_use_id == spawn tool_use id`
+  equality (that forwarding lives in the native CLI binary). A second nullable column
+  denormalized exactly as `agent` already is buys all three problems away.
+- **NULL is not "the lead".** Both columns are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a repo
+  may legitimately ship `.claude/agents/lead.md`, which registers as an ordinary
+  invocable subagent and DOES carry an instance id. `agentOf` is
+  `asString(subagent_type) ?? "lead"`, so the field being ABSENT and the field having
+  the VALUE `"lead"` collapse to the same string — any logic keying off "is this the
+  lead?" must say which it means. A write-side guard that dropped the instance for
+  lead-looking frames was proposed twice and declined twice: keyed on the output it
+  merged two parallel invocations of a repo-authored `lead` (this PRD's own Problem 2,
+  reintroduced by the guard); keyed on presence it was immune to that but still
+  removed one producer of the combination rather than the combination, and lost
+  information on two surfaces. The diagnostic half shipped instead, as a detector that
+  logs rather than a mutator that rewrites.
+- **Read-side derivation, never write-side repair.** A lane takes its role from the
+  first frame naming a **non-lead** role (else the lane's first role, which may
+  legitimately BE `lead`), and its label — independently — from the first frame
+  carrying a non-null one. This exists because `SDKUserMessageReplay` carries
+  `parent_tool_use_id` but neither `subagent_type` nor `task_description`, so a resumed
+  subagent's lane can OPEN with a lead-looking frame. Deriving on read is recomputed
+  every render and repairs already-stored rows for free; `run_messages.agent` is
+  denormalized with no backfill, so anything guessed at write time is permanent.
+- **The roster is conditional, and is a different altitude from the lanes.** With every
+  lane carrying its own `crewStateFor` dot, an always-on crew strip would re-render the
+  lane list. So under By-agent there is **no strip** for a small crew; a **role rollup**
+  appears only when a role is doubled (counted by instances, regardless of liveness) or
+  lanes exceed the glance threshold of 6. A rollup chip's dot is the **worst** state
+  among that role's instances (`stalled > waiting > working > idle > done`), which is a
+  summary the per-instance lanes cannot provide — so it is a tier, not a duplicate.
+  Consequence, accepted: a chip can read `waiting` while one of its own lanes pulses
+  `working`, because `waiting` outranks `working` in attention priority. Timeline view
+  keeps the pre-#99 per-role jump strip.
+- **No standing legend.** The state word renders beside every dot ("● working"), plus a
+  `title` tooltip, so a five-swatch key would only repeat what is already in situ. This
+  is a deliberate removal of chrome, not an omission.
+- **The label is model-authored text and is treated as such at every layer**:
+  secret-redacted worker-side (it rides OUTSIDE the payload object, so the batcher's
+  payload redactor never walked it), rune-capped server-side on the untrusted insert
+  path (80 runes, truncate-never-reject, applied through the slice index so the stored
+  row, the WS broadcast and the usage fold cannot disagree), rendered PLAIN and
+  single-line in the browser — **never through `<Markdown>`** — and sanitize-and-folded
+  on the CLI's human path while `--json` stays byte-exact.
+
+## 348. Additive `OutgoingMessage` fields are a DEPLOY-ORDER constraint: the api image must roll before the agent image
+
+`/api/worker/messages` decodes with `DisallowUnknownFields` (`httpx/respond.go:35`), so
+an api that predates a field the worker has started sending **400s the whole batch, and
+keeps 400ing**. The symptom is not a crash and not a partial write: the worker's batches
+fail forever and its messages never land, so a run looks alive on the worker and silent
+in the UI.
+
+This is **systemic to the strict decoder, not specific to PRD #99** — it applies to any
+additive `OutgoingMessage` field. The rule (**deploy the api image first, always**) is
+already stated in code as the "compat rule" at
+`api/internal/handler/worker_protocol.go:91`, where a field is declared purely so the
+decoder tolerates it in the same release the worker starts sending it; this section
+records the deploy-order half rather than restating the mechanism.
+
+Relaxing `DisallowUnknownFields` on the worker-message route is the real fix and is
+tracked separately — it trades a strict-schema guarantee for forward compatibility, and
+that is a deliberate decision rather than a cleanup.

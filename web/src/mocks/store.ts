@@ -9,6 +9,7 @@ import {
   mockAdmin,
   mockAwaitingMessages,
   mockBoards,
+  mockBusyMessages,
   mockChatMessages,
   mockChatRuns,
   mockCrewMessages,
@@ -16,6 +17,8 @@ import {
   mockDegradedMessages,
   mockDoneMessages,
   mockFailedMessages,
+  mockLaneMessages,
+  mockLaneRuns,
   mockProposals,
   mockRuns,
 } from "./data";
@@ -42,8 +45,14 @@ function seed(): MockState {
   for (const r of mockChatRuns) runs.set(r.id, { ...r });
   // Crew-roster demo runs (PRD #95 M2): health-varied so every crew state renders.
   for (const r of mockCrewRuns) runs.set(r.id, { ...r });
+  // PRD #99 instance-lane demo runs: the only fixtures carrying a non-null
+  // agent_instance, so they are the only ones that render the By-agent lane view as
+  // anything other than legacy role lanes.
+  for (const r of mockLaneRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
+  messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
+  messages.set("run-busy", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));
   messages.set("run-done", [...mockDoneMessages]);
   // run-closed is a completed run (its MR was later closed unmerged); reuse the
@@ -96,14 +105,20 @@ export function appendMessage(
   kind: string,
   agent: string | null,
   payload: unknown,
+  // PRD #99: optional so every existing caller keeps its NULL-instance behaviour,
+  // but present so a mock broadcast CAN carry a lane identity. Without it the mock
+  // socket could only ever append role-keyed frames, and the live path this PRD
+  // cares about most — a new agent_instance opening a new lane mid-run — had no way
+  // to be exercised in mock mode.
+  attribution: { instance?: string | null; label?: string | null } = {},
 ): RunMessage {
   const log = state.messages.get(runId) ?? [];
   const msg: RunMessage = {
     seq: (log[log.length - 1]?.seq ?? 0) + 1,
     kind,
     agent,
-    agent_instance: null,
-    agent_label: null,
+    agent_instance: attribution.instance ?? null,
+    agent_label: attribution.label ?? null,
     payload,
     created_at: new Date().toISOString(),
   };

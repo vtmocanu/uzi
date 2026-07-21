@@ -666,6 +666,29 @@ describe("ActivityFeed instance lanes (PRD #99)", () => {
     expect(laneTitles(r)).toEqual(["coder · web gate UX"]);
   });
 
+  it("flattens a multi-line label instead of silently dropping everything after line 1", () => {
+    // The old rule was `label.split("\n")[0]`, which matches toolSummary's firstLine
+    // idiom but drops the remainder with NO ellipsis when line 1 is short — nothing
+    // on screen said text was missing. Truncation must be the only thing that removes
+    // text, because truncation is the only thing that leaves a "…" saying so.
+    const r = renderFeed(
+      [mi(1, "coder", "toolu_A", "short first line\nSECOND LINE")],
+      { status: "running", health: "ok" },
+    );
+    expect(laneTitles(r)).toEqual(["coder · short first line SECOND LINE"]);
+  });
+
+  it("collapses whitespace runs but keeps the ellipsis when a flattened label overflows", () => {
+    const long = "first line of the label\nsecond line that pushes it past the clamp";
+    const r = renderFeed([mi(1, "coder", "toolu_A", long)], { status: "running", health: "ok" });
+    const title = laneTitles(r)[0];
+    // Single line, clamped, and the clamp is visible.
+    expect(title).not.toContain("\n");
+    expect(title.endsWith("…")).toBe(true);
+    // The dropped tail is genuinely gone, not merely off-screen.
+    expect(title).not.toContain("past the clamp");
+  });
+
   it("renders a labelless lane as the bare role — no `·` suffix, no placeholder", () => {
     const r = renderFeed([mi(1, "reviewer", "toolu_R", null)], { status: "running", health: "ok" });
     expect(laneTitles(r)).toEqual(["reviewer"]);
@@ -739,6 +762,36 @@ describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
     expect(getByTitle("coder ×3: stalled")).toBeTruthy();
     expect(queryByTitle("coder ×3: idle")).toBeNull();
     expect(queryByTitle("coder ×3: done")).toBeNull();
+  });
+
+  it("rolls a doubled role up as `waiting` while one of its own lanes pulses `working`", () => {
+    // The pairing nobody had on screen before the M6 fixtures. worstStateFor takes the
+    // MIN of STATE_PRIORITY and `waiting`(1) outranks `working`(2), so a role with one
+    // ACTIVE lane and one recently-spoken sibling summarises as `waiting` and its chip
+    // does NOT pulse — while the active lane below it does. That is deliberate (the
+    // chip is a worst-state summary, not a most-active one), but nothing on screen
+    // says so and the no-legend decision removed the obvious place to say it.
+    //
+    // Pinned here so the behaviour is explicit rather than incidental: if the product
+    // answer changes, this test is the thing that has to change with it.
+    const now = Date.now();
+    const recent = new Date(now - 24_000).toISOString(); // <45s -> waiting
+    const fresh = new Date(now - 1_000).toISOString();
+    const { container, getByTitle } = renderFeed(
+      [
+        mi(1, "tester", "toolu_Y", "unit", { created_at: recent }),
+        mi(2, "tester", "toolu_X", "e2e", { created_at: fresh }), // newest -> active
+      ],
+      { status: "running", health: "ok" },
+    );
+    expect(getByTitle("tester ×2: waiting")).toBeTruthy();
+    // The lane, meanwhile, reads working and pulses — exactly one, inside role="log".
+    expect(getByTitle("tester · e2e: working")).toBeTruthy();
+    expect(container.querySelector('[role="log"]')?.querySelectorAll(".animate-pulse").length).toBe(1);
+    // And the rollup chip itself does not pulse, so "one pulse" is never a whole-pane
+    // claim — it is scoped to the lane list.
+    const crew = container.querySelector('[aria-label="Crew"]');
+    expect(crew?.querySelectorAll(".animate-pulse").length).toBe(0);
   });
 
   it("keeps the Timeline jump strip, which groups by ROLE and never mentions instances", () => {
