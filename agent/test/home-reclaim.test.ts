@@ -154,6 +154,93 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
     assert.strictEqual(asked, 2);
     assert.strictEqual(summary.removed, 2);
     assert.strictEqual(fs.readdirSync(root).length, 1, "the third is left for the next boot");
+    // Audit N1: the remainder must be REPORTED, not silently absent from every
+    // counter. Without this an operator reading `examined: 500, removed: 3` cannot
+    // tell a volume of 503 from one of 50,000 — exactly when they need to know.
+    assert.strictEqual(summary.unexamined, 1);
+    assert.strictEqual(summary.stoppedEarly, "budget");
+  });
+
+  it("accounts for EVERY candidate — the buckets sum to examined, and unexamined covers the rest", async () => {
+    // One of each outcome plus a budget cut, so the arithmetic is exercised rather
+    // than asserted on a trivial case.
+    makeHome(RUN_A); // terminal -> removed
+    makeHome(RUN_B); // running  -> skippedNotTerminal
+    makeHome(RUN_C, new Date()); // fresh -> skippedTooRecent
+    const status: Record<string, string> = { [RUN_A]: "completed", [RUN_B]: "running", [RUN_C]: "completed" };
+    const summary = await reclaimStrandedRunHomes(root, async (id) => status[id], nullLogger());
+
+    const bucketed =
+      summary.removed +
+      summary.skippedTooRecent +
+      summary.skippedStatusUnknown +
+      summary.skippedNotTerminal +
+      summary.failed;
+    assert.strictEqual(bucketed, summary.examined, "every examined directory lands in exactly one bucket");
+    assert.strictEqual(summary.unexamined, 0, "nothing was left over");
+    assert.strictEqual(summary.stoppedEarly, undefined);
+  });
+
+  it("BAILS OUT after consecutive status failures instead of blocking startup on a dead api", async () => {
+    // The blocking audit finding. With the api unreachable NOTHING can be
+    // reclaimed — every candidate resolves to unknown and skips — so continuing
+    // only spends time the worker needs for registration and orphan recovery.
+    // Against a HANGING api each lookup costs a full HTTP timeout.
+    for (let i = 0; i < 20; i++) {
+      makeHome(`4d4762cf-0000-4000-8000-${String(i).padStart(12, "0")}`);
+    }
+    let asked = 0;
+    const summary = await reclaimStrandedRunHomes(
+      root,
+      async () => {
+        asked += 1;
+        throw new Error("connect ETIMEDOUT 10.0.0.1:8080");
+      },
+      nullLogger(),
+      { maxConsecutiveFailures: 3 },
+    );
+
+    assert.strictEqual(asked, 3, `must stop after 3 failures, made ${asked} round-trips against 20 candidates`);
+    assert.strictEqual(summary.stoppedEarly, "api_unreachable");
+    assert.strictEqual(summary.unexamined, 17, "and it reports how much it did not get to");
+    assert.strictEqual(summary.removed, 0);
+    assert.strictEqual(fs.readdirSync(root).length, 20, "nothing is deleted when the api cannot be reached");
+  });
+
+  it("does not bail on ISOLATED failures — the streak has to be consecutive", async () => {
+    const ids = [RUN_A, RUN_B, RUN_C];
+    for (const id of ids) makeHome(id);
+    let n = 0;
+    const summary = await reclaimStrandedRunHomes(
+      root,
+      async () => {
+        n += 1;
+        if (n === 1) throw new Error("one unlucky request");
+        return "completed";
+      },
+      nullLogger(),
+      { maxConsecutiveFailures: 3 },
+    );
+    assert.strictEqual(summary.stoppedEarly, undefined, "a single failure must not abandon the sweep");
+    assert.strictEqual(summary.examined, 3);
+    assert.strictEqual(summary.removed, 2);
+    assert.strictEqual(summary.skippedStatusUnknown, 1);
+  });
+
+  it("holds a wall-clock deadline even when the api answers slowly but successfully", async () => {
+    for (const id of [RUN_A, RUN_B, RUN_C]) makeHome(id);
+    // A fake clock: every read advances 40ms, so the deadline is crossed after the
+    // first candidate without the test sleeping for real.
+    let clock = 1_000_000;
+    const summary = await reclaimStrandedRunHomes(root, async () => "completed", nullLogger(), {
+      deadlineMs: 100,
+      now: () => {
+        clock += 40;
+        return clock;
+      },
+    });
+    assert.strictEqual(summary.stoppedEarly, "deadline");
+    assert.ok(summary.unexamined > 0, "the deadline must leave work for the next boot rather than blocking startup");
   });
 
   it("is a quiet no-op when the HOME root does not exist yet (fresh volume)", async () => {
@@ -167,6 +254,7 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
       skippedStatusUnknown: 0,
       skippedNotTerminal: 0,
       failed: 0,
+      unexamined: 0,
     });
   });
 

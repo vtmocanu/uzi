@@ -20,7 +20,7 @@ import { RUN_ID_RE } from "./util.js";
  *  - not a directory, or a name that is not a run UUID → not ours, skip
  *    (symlinks included: `readdir` types entries from `lstat`, so a symlink never
  *    reports `isDirectory()` and can never be followed out of the data volume);
- *  - modified within `minAgeMs` → skip, a cheap belt beside the API check;
+ *  - modified within `minAgeMs` → skip;
  *  - the status lookup THREW (api down, 5xx, timeout) → unknown, skip;
  *  - the status lookup 404'd → also unknown, skip. A 404 is *probably* a deleted
  *    run whose HOME is genuinely garbage, but "probably" is not the standard
@@ -42,13 +42,43 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", 
 /**
  * How stale a directory must be before it is even a candidate.
  *
- * Sized against `RUN_TIMEOUT` (2h by default, `api/internal/config/config.go:537`) plus an
- * hour of margin: no run can legitimately outlive its own timeout, so a HOME
- * untouched for longer than that cannot belong to a run still doing work. This is
- * belt only — the API's terminal-status check is the actual oracle — but it is the
- * belt that holds if the status lookup is ever made cheaper or cached.
+ * Sized against `RUN_TIMEOUT` (2h by default, `api/internal/config/config.go:537`)
+ * plus an hour of margin.
+ *
+ * **This filter is much weaker than it looks, and it is NOT a second line of
+ * defence for a live run.** A directory's mtime tracks only its own DIRECT
+ * entries, so the writes a live run actually performs — appending to
+ * `.claude/projects/<x>.jsonl`, several levels down — do not refresh the HOME's
+ * own mtime at all. Measured 2026-07-21: a deep write left the top-level mtime
+ * byte-identical, while touching a direct child refreshed it. So any run older
+ * than `minAgeMs` sails straight past this check, and with `RUN_TIMEOUT` at 2h
+ * runs routinely live in that gap.
+ *
+ * **Past `minAgeMs`, the API's terminal-status check is the ONLY thing standing
+ * between a live run and a deleted HOME.** That check is sufficient — a live run
+ * reads `running`/`claimed`/`queued` and is skipped — but it is load-bearing
+ * alone, so do not weaken it on the theory that the age filter backs it up.
  */
 export const DEFAULT_RECLAIM_MIN_AGE_MS = 3 * 60 * 60_000;
+
+/**
+ * Consecutive status-lookup failures after which the sweep gives up for this boot.
+ *
+ * When the api is unreachable NOTHING can be reclaimed — every candidate resolves
+ * to "unknown" and skips — so each further round-trip is pure cost paid before the
+ * worker can register. Against a HANGING api (NetworkPolicy drop, dead Service
+ * endpoints) each lookup costs the full `WORKER_HTTP_TIMEOUT`, so at the 500-entry
+ * budget an un-bailed sweep can block startup for hours. Three failures is enough
+ * to distinguish "the api is down" from one unlucky request.
+ */
+export const DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES = 3;
+
+/**
+ * Wall-clock ceiling for the whole sweep. The consecutive-failure bail handles the
+ * common outage; this bounds every other slow shape (a very large volume, an api
+ * that is slow but not failing) so startup can never be held hostage by cleanup.
+ */
+export const DEFAULT_RECLAIM_DEADLINE_MS = 60_000;
 
 /** Cap on directories examined per boot, so a pathological volume cannot turn
  *  startup into an unbounded sequence of API round-trips. The next boot picks up
@@ -64,12 +94,24 @@ export type RunStatusLookup = (runId: string) => Promise<string | undefined>;
 export interface ReclaimOptions {
   minAgeMs?: number;
   maxEntries?: number;
+  maxConsecutiveFailures?: number;
+  deadlineMs?: number;
   /** Injected for tests. */
   now?: () => number;
 }
 
-/** Every directory is accounted for in exactly one bucket, so the log line can be
- *  read as "why was nothing reclaimed?" rather than leaving it to inference. */
+/**
+ * Every EXAMINED directory lands in exactly one bucket
+ * (`removed + skippedTooRecent + skippedStatusUnknown + skippedNotTerminal +
+ * failed === examined`), and `unexamined` carries everything the sweep stopped
+ * short of.
+ *
+ * That last field exists because the earlier version claimed full accounting and
+ * did not have it: when the budget cut the loop short, the remainder fell into no
+ * counter and no log field, so `examined: 500, removed: 3` could not distinguish a
+ * volume holding 503 directories from one holding 50,000 — precisely the case
+ * where an operator needs to know. A comment is an assertion; this one now holds.
+ */
 export interface ReclaimSummary {
   /** Candidate run-id directories examined (after the name filter). */
   examined: number;
@@ -80,6 +122,10 @@ export interface ReclaimSummary {
   skippedNotTerminal: number;
   /** Positively terminal, but the removal itself failed. */
   failed: number;
+  /** Candidates the sweep never looked at, because it stopped early. */
+  unexamined: number;
+  /** Why it stopped, or undefined if it ran the whole directory. */
+  stoppedEarly?: "budget" | "api_unreachable" | "deadline";
 }
 
 export async function reclaimStrandedRunHomes(
@@ -90,7 +136,11 @@ export async function reclaimStrandedRunHomes(
 ): Promise<ReclaimSummary> {
   const minAgeMs = opts.minAgeMs ?? DEFAULT_RECLAIM_MIN_AGE_MS;
   const maxEntries = opts.maxEntries ?? DEFAULT_RECLAIM_MAX_ENTRIES;
+  const maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
+  const deadlineMs = opts.deadlineMs ?? DEFAULT_RECLAIM_DEADLINE_MS;
   const now = opts.now ?? Date.now;
+  const startedAt = now();
+  let consecutiveFailures = 0;
   const summary: ReclaimSummary = {
     examined: 0,
     removed: 0,
@@ -99,6 +149,7 @@ export async function reclaimStrandedRunHomes(
     skippedStatusUnknown: 0,
     skippedNotTerminal: 0,
     failed: 0,
+    unexamined: 0,
   };
 
   let entries;
@@ -113,14 +164,20 @@ export async function reclaimStrandedRunHomes(
     return summary;
   }
 
-  for (const entry of entries) {
-    // Not a directory (a stray file), a symlink, or a name that is not a run
-    // UUID: not something this worker created as a run HOME.
-    if (!entry.isDirectory() || !RUN_ID_RE.test(entry.name)) {
-      summary.skippedNotRunDir += 1;
-      continue;
+  // Candidates first, so "how many did we not get to" is a subtraction from a list
+  // that exists rather than a number nobody counted.
+  const candidates = entries.filter((e) => e.isDirectory() && RUN_ID_RE.test(e.name));
+  summary.skippedNotRunDir = entries.length - candidates.length;
+
+  for (const entry of candidates) {
+    if (summary.examined >= maxEntries) {
+      summary.stoppedEarly = "budget";
+      break;
     }
-    if (summary.examined >= maxEntries) break;
+    if (now() - startedAt >= deadlineMs) {
+      summary.stoppedEarly = "deadline";
+      break;
+    }
     summary.examined += 1;
     const dir = path.join(homeRoot, entry.name);
 
@@ -128,8 +185,9 @@ export async function reclaimStrandedRunHomes(
     try {
       st = await fs.lstat(dir);
     } catch {
-      // Vanished between readdir and now — someone else cleaned it up.
-      summary.skippedNotRunDir += 1;
+      // Vanished between readdir and now — someone else cleaned it up. Counted as
+      // "too recent to touch" rather than leaking out of the accounting.
+      summary.skippedTooRecent += 1;
       continue;
     }
     if (now() - st.mtimeMs < minAgeMs) {
@@ -145,8 +203,19 @@ export async function reclaimStrandedRunHomes(
     }
     if (status === undefined) {
       summary.skippedStatusUnknown += 1;
+      consecutiveFailures += 1;
+      // BAIL OUT. With the api unreachable every remaining candidate resolves to
+      // "unknown" and skips, so the rest of the sweep can reclaim nothing and only
+      // spends time the worker needs to register, recover its orphaned runs and
+      // start heartbeating. Against a HANGING api each of those costs a full HTTP
+      // timeout, which is how a cleanup pass turns into hours of blocked startup.
+      if (consecutiveFailures >= maxConsecutiveFailures) {
+        summary.stoppedEarly = "api_unreachable";
+        break;
+      }
       continue;
     }
+    consecutiveFailures = 0;
     if (!TERMINAL_RUN_STATUSES.has(status)) {
       summary.skippedNotTerminal += 1;
       continue;
@@ -162,6 +231,8 @@ export async function reclaimStrandedRunHomes(
     }
   }
 
+  summary.unexamined = candidates.length - summary.examined;
+
   // Always log, including the all-zero case: "the sweep ran and reclaimed
   // nothing" and "the sweep never ran" must not look the same in the log.
   log.info("run HOME reclaim complete", {
@@ -173,6 +244,9 @@ export async function reclaimStrandedRunHomes(
     skipped_status_unknown: summary.skippedStatusUnknown,
     skipped_not_terminal: summary.skippedNotTerminal,
     failed: summary.failed,
+    unexamined: summary.unexamined,
+    stopped_early: summary.stoppedEarly,
+    took_ms: now() - startedAt,
   });
   return summary;
 }

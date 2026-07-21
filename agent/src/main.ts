@@ -184,27 +184,39 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
-  // PRD #108 M6: one-off reclaim of HOMEs stranded by the pre-fix cleanup, which
-  // could not remove the Go module cache's 0555 directories (167.3 MB measured for
-  // one run). Deliberately BEFORE worker.run(): this process holds no run yet, so
-  // the sweep cannot race a run of its own, and the API's terminal-status check
-  // covers a run live on another worker sharing the volume. It never throws and it
-  // deletes only run ids the API positively reports terminal — every kind of
-  // not-knowing skips (home-reclaim.ts).
-  if (config.homeReclaimEnabled) {
-    await reclaimStrandedRunHomes(sdkHomeRoot, async (runId) => (await client.getChatRun(runId)).status, log).catch(
-      (err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }),
-    );
-  }
-
   const worker = new Worker(config, client, runner, chatRunner, judgeRunner, log);
 
+  // Signal handlers FIRST, before anything that can take real time. Until these
+  // are installed a SIGTERM hits Node's default disposition and terminates the
+  // process immediately, so a container stopped during startup dies rather than
+  // shutting down — and the HOME reclaim below is exactly the kind of startup work
+  // that can be in flight when a rollout sends SIGTERM.
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
     process.on(sig, () => {
       log.info("shutting down", { signal: sig });
       controller.abort();
     });
+  }
+
+  // PRD #108 M6: one-off reclaim of HOMEs stranded by the pre-fix cleanup, which
+  // could not remove the Go module cache's 0555 directories (167.3 MB measured for
+  // one run). It never throws, and it deletes only run ids the API positively
+  // reports terminal — every kind of not-knowing skips (home-reclaim.ts).
+  //
+  // It runs before worker.run() for defence in depth, NOT because it has to: a run
+  // this worker later claims reads `claimed`/`running` (non-terminal, skipped) and
+  // has a fresh mtime, so the ordering is not what makes the sweep safe. What the
+  // ordering DOES cost is startup latency, since worker.run() is where the
+  // toolchain preflight, registration, orphan recovery and both claim loops live.
+  // The sweep therefore bails out after a few consecutive status-lookup failures
+  // and holds a wall-clock deadline: when the api is unreachable nothing can be
+  // reclaimed anyway, and a worker restarting while the api is unhealthy is a
+  // CORRELATED failure, not an exotic one — they roll together.
+  if (config.homeReclaimEnabled) {
+    await reclaimStrandedRunHomes(sdkHomeRoot, async (runId) => (await client.getChatRun(runId)).status, log).catch(
+      (err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }),
+    );
   }
 
   await worker.run(controller.signal);

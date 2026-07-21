@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 
 /**
@@ -56,29 +57,45 @@ function isPermissionError(err: unknown): boolean {
  * needs `x`, listing needs `r`), so the chmod happens on the way DOWN, never on
  * the way back up.
  *
- * Symlinks are never followed. `readdir(withFileTypes)` types entries from
- * `lstat`, so a symlink to a directory reports `isSymbolicLink()`, not
- * `isDirectory()`, and we never descend through it — a symlinked-away escape
- * from the HOME can therefore not have its permissions rewritten.
+ * **The chmod cannot be redirected onto a symlink's target.** It is an `fchmod`
+ * against a handle opened `O_DIRECTORY | O_NOFOLLOW`, so a symlink is refused by
+ * the kernel at open time (measured: `ENOTDIR` on macOS, `ELOOP` on Linux — the
+ * code differs, which is why nothing here matches on it) and the mode change
+ * applies to the inode the descriptor already names. An earlier version did
+ * `lstat` then a path-based `fs.chmod`, which a same-uid writer could redirect
+ * between the two calls.
+ *
+ * **What this does NOT guarantee**, stated because the previous comment claimed
+ * more than it held: the walk still resolves each level's path from the root, and
+ * `O_NOFOLLOW` only constrains the FINAL component. A same-uid attacker who can
+ * swap an INTERMEDIATE directory for a symlink mid-walk can still redirect where
+ * we descend. Node exposes no `openat`, so a fully race-free walk is not
+ * available here. The residual severity is very low: chmod requires ownership, so
+ * the target is already same-uid; the change only ADDS owner `rwx`; and anyone
+ * who can win that race can delete the tree outright without it.
  *
  * Best-effort per entry: one unreadable subtree must not abort the restoration
  * of its siblings. The subsequent `rm` is the thing that reports real failure.
  */
 export async function restoreTreeWritability(target: string): Promise<void> {
-  let st;
+  let handle;
   try {
-    st = await fs.lstat(target);
+    handle = await fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   } catch {
-    return; // already gone, or not ours to see
+    // Not a directory, a symlink, already gone, or not ours to open. Nothing to
+    // widen, and nothing here should be widened.
+    return;
   }
-  if (!st.isDirectory()) return;
-  // OR the bits in rather than assigning 0o700: the tree is about to be deleted
-  // so the exact mode hardly matters, but widening-only cannot surprise anyone
-  // reading a half-swept tree after a crash.
   try {
-    await fs.chmod(target, st.mode | 0o700);
+    // OR the bits in rather than assigning 0o700: the tree is about to be deleted
+    // so the exact mode hardly matters, but widening-only cannot surprise anyone
+    // reading a half-swept tree after a crash.
+    const st = await handle.stat();
+    await handle.chmod(st.mode | 0o700);
   } catch {
-    // Not the owner (or a read-only mount) — the rm below will report it.
+    // Not the owner (or a read-only mount) — the rm will report it.
+  } finally {
+    await handle.close().catch(() => undefined);
   }
   let entries;
   try {
@@ -87,6 +104,9 @@ export async function restoreTreeWritability(target: string): Promise<void> {
     return;
   }
   for (const entry of entries) {
+    // `readdir(withFileTypes)` types entries from `lstat`, so a symlink to a
+    // directory reports `isSymbolicLink()`, not `isDirectory()`, and is skipped
+    // here as well as refused by the O_NOFOLLOW open above.
     if (!entry.isDirectory()) continue;
     await restoreTreeWritability(path.join(target, entry.name));
   }

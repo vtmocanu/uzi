@@ -215,7 +215,16 @@ export class JudgeRunner {
       return await Promise.race([this.consumeModel(token, model, prompt, homeDir, abort), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
-      await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
+      // PRD #108 M6 (N4): still `fs.rm`, not `rmTreeForce` — a judge run fetches a
+      // trace and calls the model, so it populates no Go module cache and has no
+      // observed EACCES exposure. But the swallow used to be TOTAL, and the M6
+      // reclaim sweep will never collect this directory either: it is named
+      // `uzi-judge-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips it by
+      // design. If one ever does strand, this warn is the only thing that will say
+      // so. Still best-effort — a cleanup must not fail a judge run.
+      await fs
+        .rm(homeDir, { recursive: true, force: true })
+        .catch((e) => this.log.warn("judge HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }));
     }
   }
 
