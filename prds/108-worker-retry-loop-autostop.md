@@ -178,6 +178,12 @@ This falsifies Success Criterion 2 ("returns 400, is not retried, and costs one 
 
 It also makes `e1935d78`'s tripwire comment wrong in the way that matters most: its column enumeration is complete, but its *argument* reasons only about character validity and never about length, and its `session_id` claim ("comes from the runs row, so Postgres already accepted it") does not transfer — acceptance into an unindexed `text` column says nothing about indexability inside a composite primary key. A reader trusting that comment, which is what it was designed for, would believe both columns are handled. Fix the comment with the cap.
 
+**Smaller open items, all recorded rather than fixed at the checkpoint:**
+
+- **`kind` is sanitized but not capped.** `f2ddb5ce` added `stripNUL(m.Kind)` and a post-strip empty check, but no rune cap — so `kind` is now the *only* uncapped worker-controlled text column, on the same untrusted route and with the same per-frame repetition that justified capping `agent` in `c88cfea8`. It also rides two log lines per message, so an unbounded `kind` is an unbounded log write. One line: `truncateRunes(m.Kind, …)`.
+- **A legal-but-unstorable JSON number costs a message, by design.** `{"n":1e1000000}` survives sanitation untouched — correctly, since silently rewriting a number would be worse corruption than dropping the message — takes a 400, and under M3 is bisected out. That is the right trade, but it is a **new class of one-message data loss** that the Success Criteria above do not mention. Docs, not code.
+- Both validators had **Track B passes in flight** when the session stopped; those findings are not captured here.
+
 **Six of this document's claims were falsified by implementing it.** Corrections are drafted and queued across eight edit sites: the three-SQLSTATE enumeration (Decision 3, Solution §2); "drop only that one" (Solution §3); "Decisions 1-4" (M9a — Phase 1 also ships M6); the breaker's N-consecutive-same-batch rule (Solution §3, M3); Solution §1's account of the text columns, wrong twice in one bullet (`agent` was uncapped entirely, not merely unstripped; and `kind` is a fourth column) — the latter also in M2's checkbox.
 
 *(Two things deliberately **not** corrected: M0's account of the pre-fix failure is history and stays as written — fixing what a passage describes does not falsify the passage; and Risk §2's "~8 extra round-trips" is correct for the one-sided bisection that shipped, and only looked wrong against a two-sided variant costing 16.)*
