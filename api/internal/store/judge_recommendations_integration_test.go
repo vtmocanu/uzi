@@ -709,14 +709,25 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 // The pairs are deliberately NOT uniform. A fixture whose rows all look alike is what made
 // both of the holes this branch just closed invisible, twice, one level down each time.
 //
-// 🔴 VERIFICATION STATUS: WRITTEN, NOT YET FOLDED. The four "fold it is BUILT to catch"
-// entries above are DESIGN INTENT, not measurements — this test was authored without a
-// database slot (the validators held it), so no fold has been executed against it. Only the
-// pre-existing GREENs in the paragraph above were measured. "Fix written" is not "closed",
-// and a table that reads like results is exactly the proxy this branch keeps correcting.
+// A FIFTH fold is owed alongside those four, on the same query: `d.status` ->
+// `'anything'::text`, which assertion 6 exists to catch. It is not a coordinate half but it
+// is the one value fold here that is NOT fail-safe (see that assertion).
+//
+// 🔴 VERIFICATION STATUS: WRITTEN, NOT YET FOLDED. The "fold it is BUILT to catch" entries
+// above are DESIGN INTENT, not measurements — this test was authored without a database slot
+// (the validators held it), so no fold has been executed against it. Only the pre-existing
+// GREENs in the paragraph above were measured. "Fix written" is not "closed", and a table
+// that reads like results is exactly the proxy this branch keeps correcting.
+//
 // Replace this block with the measured per-fold results — one mutation per run, fresh
 // database, mutation asserted present in both the .sql and the regenerated .sql.go before
 // and gone from both after — and do not record this query as pinned until that is done.
+// When you write those results, state what was executed: the fold reddened THIS named
+// assertion, and the mutation was confirmed present before the run and gone after. Do not
+// lean on "a contended run cannot produce a false green" — a run that prints no result, a
+// mutation that silently fails to apply, and a suite that skips all yield "no failures", and
+// "no failures observed" is not "the assertion passed". Two of those three have already
+// happened on this branch.
 func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -794,6 +805,27 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 			 VALUES ($1, $2, $3, 'dismissed', 'not_an_issue', 'h', $4)`, reviewID, category, target, owner)
 	}
 
+	// WHAT THESE PAIRS SHARE — asked and answered deliberately, because the sibling fixture
+	// next door got exactly this wrong twice, one level down each time. Derived by READING
+	// the fixture against the query, not measured.
+	//
+	// Shared ON PURPOSE, and load-bearing: within a run the two coordinates share the review
+	// (so `f.review_id = rv.id` cannot be what separates them — the whole point) and exactly
+	// ONE coordinate half. Across runs everything shares one owner and one repo, which is
+	// what keeps the read owner-scoped.
+	//
+	// Shared BY ACCIDENT, and NOT currently observable — flagged so the next author does not
+	// inherit an inert fixture the way this branch already has:
+	//   - every review carries verdict 'issues';
+	//   - every recommendation carries confidence 'high';
+	//   - every run carries status 'completed'.
+	// None of those three is projected by THIS query, so nothing here is weakened today. But
+	// the moment a column is added to the SELECT, a fold of it would be invisible on this
+	// fixture. Vary the value before you pin a new column, not after.
+	//
+	// Deliberately NOT uniform, because these ARE projected: the two dispositions differ
+	// ('done' vs 'dismissed', pinned in assertion 6), the filed and disposed coordinates sit
+	// in different runs, and each recommendation carries its own rationale text.
 	runFT, revFT := newRun()
 	rec(revFT, catA, tgt1)
 	rec(revFT, catA, tgt2)
@@ -823,7 +855,10 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 		t.Fatalf("list triage rows: %v", err)
 	}
 
-	type tally struct{ rows, filed, disposed int }
+	type tally struct {
+		rows, filed, disposed int
+		status                string // the one non-NULL disposition_status seen in this run
+	}
 	got := map[uuid.UUID]*tally{}
 	for _, r := range rows {
 		tl := got[r.RunID]
@@ -837,6 +872,7 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 		}
 		if r.DispositionStatus.Valid {
 			tl.disposed++
+			tl.status = r.DispositionStatus.String
 		}
 	}
 	at := func(name string, runID uuid.UUID) *tally {
@@ -904,5 +940,32 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 	if n := at("DT", runDT).filed + at("DC", runDC).filed; n != 0 {
 		t.Errorf("the two disposition-only runs report %d settled filed links, want 0 — "+
 			"filed_settled is not reading the filed table for this coordinate", n)
+	}
+
+	// 6. disposition_status's VALUE, not just its nullness. Found by asking the auditor's
+	// question of this fixture — "do the pairs share anything you did not intend?" — and the
+	// answer was yes, in my own assertions: everything above counts `.Valid`, so folding
+	// `d.status` to a non-NULL constant would have left all five green.
+	//
+	// It is not inert. BucketOf switches on the STRING: an unrecognised value falls through
+	// both cases, filed_settled is false for these runs, and the coordinate comes back
+	// "todo" — so a settled recommendation is COUNTED as outstanding and the /runs badge
+	// OVER-counts. That is the set_via class again: a value fold that is not fail-safe.
+	//
+	// DT is marked done and DC dismissed, so this is a pairwise check — it fails under a fold
+	// to ANY single constant, whichever one is chosen, rather than only to a value the
+	// fixture does not contain.
+	dt, dc := at("DT", runDT), at("DC", runDC)
+	if dt.status == dc.status {
+		t.Errorf("both disposed runs report disposition_status %q — the column is folded to a "+
+			"constant, and BucketOf reads the string, so an unrecognised one buckets a SETTLED "+
+			"coordinate as todo and the badge over-counts", dt.status)
+	}
+	if dt.status != "done" {
+		t.Errorf("runDT disposition_status = %q, want done — the value written by the fixture",
+			dt.status)
+	}
+	if dc.status != "dismissed" {
+		t.Errorf("runDC disposition_status = %q, want dismissed", dc.status)
 	}
 }
