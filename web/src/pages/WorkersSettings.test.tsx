@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
-import { api, type Worker } from "../lib/api";
+import { api, type SecretMeta, type Worker } from "../lib/api";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -11,6 +11,10 @@ vi.mock("../lib/api", async (importActual) => {
     ...actual,
     api: {
       listWorkers: vi.fn(),
+      // The page reads the user's tokens alongside the workers (PRD #104 M6) to
+      // populate the per-row token picker.
+      listSecrets: vi.fn(),
+      setWorkerToken: vi.fn(),
       createWorker: vi.fn(),
       deleteWorker: vi.fn(),
       hostedConfig: vi.fn(),
@@ -26,6 +30,9 @@ const mockApi = vi.mocked(api);
 // the page they always rendered.
 beforeEach(() => {
   mockApi.hostedConfig.mockResolvedValue({ enabled: false, quota: 0 });
+  // One token by default: the picker only renders with more than one, so the
+  // pre-#104 tests below see exactly the page they always saw.
+  mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret()] });
 });
 
 afterEach(() => {
@@ -34,8 +41,24 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+function aSecret(over: Partial<SecretMeta> = {}): SecretMeta {
+  return {
+    id: "sec-default",
+    kind: "anthropic_token",
+    label: "default",
+    is_default: true,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
+    // Unbound by default (PRD #104): every worker spends its owner's default token
+    // until someone binds one, which is the state these pre-#104 tests assume.
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
     id: "w1",
     name: "laptop",
     status: "online",
@@ -504,5 +527,77 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
 
     const msg = await screen.findByText("Deleted base (S).");
     await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
+  });
+});
+
+// ── Worker → token binding (PRD #104 M3/M6) ─────────────────────────────────
+
+describe("WorkersSettings token binding (PRD #104)", () => {
+  const twoTokens = [
+    aSecret(),
+    aSecret({ id: "sec-console", label: "console-key", is_default: false }),
+  ];
+
+  // The EFFECTIVE token is always stated. An unbound worker says "your default
+  // token" rather than nothing, because nothing reads as "no token" when the truth
+  // is "the default".
+  it("states the effective token for an unbound worker", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.getByText(/your default token/i)).toBeTruthy();
+  });
+
+  it("names the bound credential on a bound worker", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" })],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    renderPage();
+    await screen.findByText("laptop");
+    // The row states it on its effective-token line ("spends console-key"). The
+    // picker also lists it as an <option>, so scope the assertion to that line
+    // rather than asserting the label appears somewhere on the page.
+    const spendsLine = screen.getByText(/^spends/i);
+    expect(spendsLine.textContent).toMatch(/console-key/);
+  });
+
+  // With ONE token there is nothing to choose between, so no picker is offered —
+  // an always-visible picker would imply a choice the user does not have.
+  it("offers no picker when the user holds a single token", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.queryByLabelText("Anthropic token for laptop")).toBeNull();
+  });
+
+  it("rebinds a worker to a named token by label", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setWorkerToken.mockResolvedValue({
+      worker: aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" }),
+    });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    fireEvent.change(picker, { target: { value: "console-key" } });
+    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", "console-key"));
+    // The announcement says WHEN it takes effect — a user who expects to restart
+    // something will otherwise go looking for the control to do it.
+    expect(await screen.findByText(/from its next claim/i)).toBeTruthy();
+  });
+
+  // Selecting "default token" CLEARS the binding — sent as null, not as a label.
+  it("clears the binding when the picker returns to the default", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" })],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setWorkerToken.mockResolvedValue({ worker: aWorker() });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    fireEvent.change(picker, { target: { value: "" } });
+    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", null));
   });
 });

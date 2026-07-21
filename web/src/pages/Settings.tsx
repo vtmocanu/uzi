@@ -1,11 +1,14 @@
-// Settings → Account & token: the account card (moved here from the old
+// Settings → Account & tokens: the account card (moved here from the old
 // dashboard) plus the Anthropic token lifecycle. Lives inside SettingsShell so
-// token/forge/workers are one discoverable area.
+// tokens/forge/workers are one discoverable area. The token LIST itself is
+// AnthropicTokens (PRD #104 M6) — this page owns the fetch so the list and the
+// rate-limit meters refresh together.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, isVaultLocked, type SecretMeta } from "../lib/api";
-import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
+import { api, ApiError, type SecretMeta } from "../lib/api";
+import { Alert, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
+import { AnthropicTokens } from "../components/AnthropicTokens";
 import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
@@ -17,9 +20,6 @@ import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/
 
 // One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
 const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
-
-const DOC_URL =
-  "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/anthropic-token.md";
 
 export function Settings() {
   const { user, refresh, themeOverride, defaultTheme, vaultUnlocked } = useAuth();
@@ -34,10 +34,11 @@ export function Settings() {
     prefs.set(ROTATE_NOTICE_KEY, true);
     setRotateDismissed(true);
   };
-  const [meta, setMeta] = useState<SecretMeta | null>(null);
+  const [secrets, setSecrets] = useState<SecretMeta[]>([]);
   const [loading, setLoading] = useState(true);
-  const [token, setToken] = useState("");
-  const [busy, setBusy] = useState(false);
+  // busy is the page-level guard the token card also respects, so a model save and
+  // a token mutation cannot race each other's reloads.
+  const [busy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [autopilotBusy, setAutopilotBusy] = useState(false);
@@ -64,10 +65,29 @@ export function Settings() {
     setJudgeError("");
     setJudgeBusy(true);
     try {
+      // The token field is OMITTED, not sent as null: omitted leaves the judge
+      // binding alone, and toggling the opt-in must never silently unbind the
+      // credential the user chose (PRD #104 M4).
       await api.setJudgeEnabled(enabled);
       await refresh();
     } catch (err) {
       setJudgeError(err instanceof ApiError ? err.message : "Failed to update run judge");
+    } finally {
+      setJudgeBusy(false);
+    }
+  };
+
+  // setJudgeToken points the JUDGE lane at one of the user's tokens, or clears it
+  // back to the default. Separate from the opt-in above so each sends only what it
+  // changes — the whole point of the three-way token field.
+  const setJudgeToken = async (label: string) => {
+    setJudgeError("");
+    setJudgeBusy(true);
+    try {
+      await api.setJudgeEnabled(user?.judge_enabled ?? false, label === "" ? null : label);
+      await refresh();
+    } catch (err) {
+      setJudgeError(err instanceof ApiError ? err.message : "Failed to change the judge's token");
     } finally {
       setJudgeBusy(false);
     }
@@ -81,8 +101,11 @@ export function Settings() {
 
   const load = useCallback(async () => {
     try {
-      const [{ secrets }, { settings }] = await Promise.all([api.listSecrets(), api.getMySettings()]);
-      setMeta(secrets.find((s) => s.kind === "anthropic_token") ?? null);
+      const [{ secrets: rows }, { settings }] = await Promise.all([
+        api.listSecrets(),
+        api.getMySettings(),
+      ]);
+      setSecrets(rows.filter((s) => s.kind === "anthropic_token"));
       const model = settings.default_model ?? "";
       setDefaultModel(model);
       setSavedModel(model);
@@ -96,48 +119,6 @@ export function Settings() {
   useEffect(() => {
     load();
   }, [load]);
-
-  const save = async (e: FormEvent) => {
-    e.preventDefault();
-    setError("");
-    setNotice("");
-    setBusy(true);
-    try {
-      await api.putAnthropicToken(token);
-      setToken("");
-      setNotice(
-        "Token saved. It is sealed with your login password and validated on the first agent run.",
-      );
-      await load();
-    } catch (err) {
-      // A mid-session pod restart locks the vault; the global handler already
-      // refreshed the session (the unlock banner is now showing), so point there.
-      setError(
-        isVaultLocked(err)
-          ? "Your vault is locked — unlock it with the banner above, then save again."
-          : err instanceof ApiError
-            ? err.message
-            : "Failed to save token",
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const remove = async () => {
-    setError("");
-    setNotice("");
-    setBusy(true);
-    try {
-      await api.deleteAnthropicToken();
-      setNotice("Token removed. uzi is no longer connected to your Anthropic account.");
-      await load();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to remove token");
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const modelWarning = modelFieldWarning(defaultModel);
   const modelDirty = defaultModel.trim() !== savedModel;
@@ -191,82 +172,35 @@ export function Settings() {
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Anthropic token</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            uzi runs your agents with your own Anthropic credentials. Paste an OAuth token from{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">claude setup-token</code> or a
-            Console API key. It is stored encrypted and validated on the first agent run.{" "}
-            <a
-              href={DOC_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="text-brand hover:text-brand-hover"
-            >
-              How to obtain a token
-            </a>
-            .
+      <AnthropicTokens
+        secrets={secrets}
+        loading={loading}
+        busy={busy}
+        reload={load}
+        onError={setError}
+        onNotice={setNotice}
+        error={error}
+      />
+
+      {/* The rotate-your-legacy-token reminder (PRD #32): password protection
+          applies from the save forward, never retroactively. */}
+      {secrets.length > 0 && !rotateDismissed && (
+        <div className="rounded-lg border border-info/40 bg-info/10 px-4 py-3 text-sm text-info">
+          <p className="text-fg">
+            <strong className="font-semibold">Protecting an older token?</strong> If you first saved
+            a token before password-protection was enabled, an operator could have read it. The
+            protection applies from the moment you save, not retroactively — for full protection,
+            rotate the token in the Anthropic console and replace its value above.
           </p>
+          <button
+            type="button"
+            onClick={dismissRotate}
+            className="mt-2 text-xs font-medium text-brand hover:text-brand-hover"
+          >
+            Got it, dismiss
+          </button>
         </div>
-
-        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3 text-sm">
-          {loading ? (
-            <Skeleton className="h-5 w-40" />
-          ) : meta ? (
-            <div className="flex items-center gap-2">
-              <Badge tone="ok" dot>
-                Set
-              </Badge>
-              <span className="text-faint">updated {new Date(meta.updated_at).toLocaleString()}</span>
-            </div>
-          ) : (
-            <Badge tone="neutral">Not set</Badge>
-          )}
-          {meta && !loading && (
-            <Button variant="danger" size="sm" disabled={busy} onClick={remove}>
-              Delete
-            </Button>
-          )}
-        </div>
-
-        <form onSubmit={save} className="space-y-3">
-          <Field label={meta ? "Replace token" : "Token"}>
-            <Input
-              type="password"
-              autoComplete="off"
-              placeholder="Paste your Anthropic token"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-            />
-          </Field>
-          <p className="text-xs text-faint">
-            Encrypted with your login password. If you forget your password this token cannot be
-            recovered and must be re-entered.
-          </p>
-          <Button type="submit" disabled={busy || token.trim() === ""}>
-            {meta ? "Save new token" : "Save token"}
-          </Button>
-        </form>
-
-        {meta && !rotateDismissed && (
-          <div className="rounded-lg border border-info/40 bg-info/10 px-4 py-3 text-sm text-info">
-            <p className="text-fg">
-              <strong className="font-semibold">Protecting an older token?</strong> If you first saved
-              this token before password-protection was enabled, an operator could have read it. The
-              protection applies from the moment you save, not retroactively — for full protection,
-              rotate the token in the Anthropic console and re-save it above.
-            </p>
-            <button
-              type="button"
-              onClick={dismissRotate}
-              className="mt-2 text-xs font-medium text-brand hover:text-brand-hover"
-            >
-              Got it, dismiss
-            </button>
-          </div>
-        )}
-      </Card>
+      )}
 
       {/* Claude rate-limit meters (PRD #53). Self-gates: hidden when no token is
           set, greyed on "unavailable", live meters once a reading lands. */}
@@ -353,6 +287,33 @@ export function Settings() {
           />
           <span className="text-fg">Judge my finished runs</span>
         </label>
+
+        {/* The judge token picker (PRD #104 M4/M6). Without it "the judge lane can
+            burn a different token, set from the web UI" is unreachable, which is
+            why it is required and not a nicety. Shown only with more than one
+            token — with a single credential there is nothing to choose. */}
+        {secrets.length > 1 && (
+          <Field label="Token the judge spends">
+            <Select
+              aria-label="Token the judge spends"
+              value={user?.judge_anthropic_secret_label ?? ""}
+              disabled={judgeBusy}
+              onChange={(e) => setJudgeToken(e.target.value)}
+            >
+              <option value="">your default token</option>
+              {secrets.map((s) => (
+                <option key={s.id} value={s.label}>
+                  {s.label}
+                  {s.is_default ? " (default)" : ""}
+                </option>
+              ))}
+            </Select>
+            <p className="mt-1.5 text-xs text-faint">
+              Retrospectives can bill a different account from the runs they review — point them at
+              a cheaper console key while your runs stay on a subscription.
+            </p>
+          </Field>
+        )}
       </Card>
 
       <Card className="space-y-5">

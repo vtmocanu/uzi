@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from "react";
 import { toneFor } from "../components/Meter";
-import type { AdminRateLimitUser, MyRateLimits } from "./api";
+import type { AdminRateLimitUser, MyRateLimits, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
 
 // formatCountdown renders "resets in <this>" (Decision 7): "2d 4h", "1h 23m",
@@ -81,6 +81,29 @@ export function rowState(limits: MyRateLimits): RowState {
   return tone === "danger" ? "live_danger" : tone === "warn" ? "live_warn" : "live_ok";
 }
 
+// worstTokenState reduces a user's N token meters to the single most urgent state
+// (PRD #104 M5), which is what the admin table sorts and badges a USER by: a user
+// with one exhausted credential and two healthy ones is still worth surfacing. An
+// EMPTY token list is "no_token" — since M5 that is how the API says a user holds
+// no credential at all (there is no per-token status to report when there is none).
+export function worstTokenState(tokens: TokenRateLimits[]): RowState {
+  if (tokens.length === 0) return "no_token";
+  return tokens.map((t) => rowState(t.limits)).reduce((a, b) => (RANK[a] <= RANK[b] ? a : b));
+}
+
+// worstTokenReading returns the token whose reading is most urgent, so a caller
+// that needs a representative reading (the admin 5h% tie-break, the announcer)
+// picks the same one the state came from. undefined when the user holds none.
+export function worstTokenReading(tokens: TokenRateLimits[]): TokenRateLimits | undefined {
+  if (tokens.length === 0) return undefined;
+  return [...tokens].sort((a, b) => {
+    const ra = RANK[rowState(a.limits)];
+    const rb = RANK[rowState(b.limits)];
+    if (ra !== rb) return ra - rb;
+    return fiveHourPct(b.limits) - fiveHourPct(a.limits);
+  })[0];
+}
+
 // Sort rank: the most urgent rows rise (Decision: admin sorts danger, then warn,
 // then by 5h% desc). Non-actionable states (stale / unavailable / no_token) sink
 // below every live reading so the capacity view leads with who is near a wall.
@@ -98,14 +121,17 @@ function fiveHourPct(limits: MyRateLimits): number {
 }
 
 // sortAdminRows returns a new array ordered danger → warn → ok → stale →
-// unavailable → no_token, tie-broken by 5h% desc then name.
+// unavailable → no_token, tie-broken by 5h% desc then name. Since PRD #104 a user
+// holds N tokens, so a USER is ranked by their most urgent one (worstTokenState):
+// the capacity view must still lead with whoever is nearest a wall, and one
+// exhausted credential among three is exactly that.
 export function sortAdminRows(users: AdminRateLimitUser[]): AdminRateLimitUser[] {
   return [...users].sort((a, b) => {
-    const ra = RANK[rowState(a.limits)];
-    const rb = RANK[rowState(b.limits)];
+    const ra = RANK[worstTokenState(a.tokens)];
+    const rb = RANK[worstTokenState(b.tokens)];
     if (ra !== rb) return ra - rb;
-    const pa = fiveHourPct(a.limits);
-    const pb = fiveHourPct(b.limits);
+    const pa = fiveHourPct(worstTokenReading(a.tokens)?.limits ?? { status: "unavailable" });
+    const pb = fiveHourPct(worstTokenReading(b.tokens)?.limits ?? { status: "unavailable" });
     if (pa !== pb) return pb - pa;
     return a.name.localeCompare(b.name);
   });

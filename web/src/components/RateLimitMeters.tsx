@@ -4,25 +4,40 @@
 // shared MeterTrack + toneFor thresholds. The admin table is a separate page.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type MyRateLimits, type RateLimitWindow } from "../lib/api";
+import { api, type RateLimitWindow, type TokenRateLimits } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { formatAgo, formatCountdown, statusBadge, useNow, worstWindow } from "../lib/rateLimits";
+import {
+  formatAgo,
+  formatCountdown,
+  statusBadge,
+  useNow,
+  worstTokenReading,
+  worstWindow,
+} from "../lib/rateLimits";
 import { Badge, Card, SectionTitle } from "./ui";
 import { MeterTrack, toneFor, type MeterTone } from "./Meter";
 
 // useMyRateLimits polls GET /me/rate-limits while the tab is visible. A failed
 // fetch keeps the last reading (never blanks the meters); the surfaces decide what
-// to render per status. intervalMs differs per surface — the data changes at most
+// to render per token. intervalMs differs per surface — the data changes at most
 // once per server poll interval, so a page's usual 10s cadence would be pure
 // amplification.
-export function useMyRateLimits(intervalMs: number): { data: MyRateLimits | null; loading: boolean } {
-  const [data, setData] = useState<MyRateLimits | null>(null);
+//
+// Since PRD #104 M5 the endpoint returns ONE READING PER TOKEN, so `tokens` is an
+// array. An empty array means the user holds no credential at all — the surfaces
+// render nothing rather than a "no token" meter, which is what they already did
+// for the old no_token status.
+export function useMyRateLimits(intervalMs: number): {
+  tokens: TokenRateLimits[] | null;
+  loading: boolean;
+} {
+  const [tokens, setTokens] = useState<TokenRateLimits[] | null>(null);
   const [loading, setLoading] = useState(true);
   const load = useCallback(() => {
     api
       .getMyRateLimits()
       .then((d) => {
-        setData(d);
+        setTokens(d.tokens);
         setLoading(false);
       })
       .catch(() => setLoading(false));
@@ -31,11 +46,11 @@ export function useMyRateLimits(intervalMs: number): { data: MyRateLimits | null
     load();
   }, [load]);
   usePollWhileVisible(load, intervalMs);
-  return { data, loading };
+  return { tokens, loading };
 }
 
 const CARD_BLURB =
-  "Live utilization of your Anthropic account's two rate-limit windows. Runs queue when a window is exhausted and resume after it resets.";
+  "Live utilization of each token's two rate-limit windows. Anthropic meters these per credential, so every token has its own pair. Runs queue when a window is exhausted and resume after it resets.";
 
 function SettingsWindowRow({
   label,
@@ -83,59 +98,80 @@ function UnavailableWindowRow({ label }: { label: string }) {
   );
 }
 
-// RateLimitCard is the Settings → Account & token card (mockup frame A). Hidden
-// entirely when the user has no token stored (and while the first read is in
-// flight, to avoid a flash under the token card). On "unavailable" it shows the
-// two windows greyed with a neutral badge; on "ok" it renders the live meters.
-export function RateLimitCard() {
-  const { data, loading } = useMyRateLimits(60_000);
-  const now = useNow();
+// TokenMeters renders ONE token's meter pair plus its status line. `showLabel`
+// names the credential — omitted when the user holds a single token, because
+// "default" above a lone meter pair is noise; with several it is the only thing
+// telling the pairs apart.
+function TokenMeters({ token, now, showLabel }: { token: TokenRateLimits; now: number; showLabel: boolean }) {
+  const { limits } = token;
+  const heading = showLabel ? (
+    <div className="flex items-center gap-2">
+      <span className="text-sm font-medium text-fg">{token.label}</span>
+      {token.is_default && <Badge tone="neutral">default</Badge>}
+    </div>
+  ) : null;
 
-  if (loading || !data || data.status === "no_token") return null;
-
-  if (data.status === "unavailable") {
+  if (limits.status !== "ok") {
+    // A token with no reading yet (fresh save, polling off, refused credential).
     return (
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Claude limits</SectionTitle>
-          <p className="mt-2 text-sm text-muted">{CARD_BLURB}</p>
-        </div>
-        <div>
+      <div className="border-t border-line pt-4 first:border-t-0 first:pt-0">
+        {heading}
+        <div className={showLabel ? "mt-2" : ""}>
           <UnavailableWindowRow label="5-hour window" />
           <UnavailableWindowRow label="7-day window" />
         </div>
-        <div className="flex items-center gap-2 text-xs text-faint">
+        <div className="mt-3 flex items-center gap-2 text-xs text-faint">
           <Badge tone="neutral">No reading yet</Badge>
           <span>a reading appears within a few minutes of saving your token</span>
         </div>
-      </Card>
+      </div>
     );
   }
 
-  // The badge reuses the shared statusBadge helper (PRD #54, Decision 2) so a
-  // ≥95% window escalates to the danger pill ("5h nearly out") matching the admin
-  // table, instead of the old flat "Stale"/"Live". /me/rate-limits has no
-  // vault_locked field, so vaultLocked is false — a stale self reading reads
-  // "stale" (the single-source-of-truth wording).
-  const badge = statusBadge(data, false);
+  // /me/rate-limits carries no vault_locked field, so vaultLocked is false — a
+  // stale self reading reads "stale" (the single-source-of-truth wording).
+  const badge = statusBadge(limits, false);
+  return (
+    <div className="border-t border-line pt-4 first:border-t-0 first:pt-0">
+      {heading}
+      <div className={showLabel ? "mt-2" : ""}>
+        <SettingsWindowRow label="5-hour window" win={limits.five_hour} now={now} dim={limits.stale} />
+        <SettingsWindowRow label="7-day window" win={limits.seven_day} now={now} dim={limits.stale} />
+      </div>
+      {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
+          this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
+      <div className="mt-3 flex items-center gap-2 text-xs text-muted">
+        <Badge tone={badge.tone} dot={badge.dot}>{badge.label}</Badge>
+        <span>
+          updated {formatAgo(limits.synced_at, now)}
+          {limits.stale ? " · reading is stale (vault locked or polling off)" : " · refreshes every few minutes"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// RateLimitCard is the Settings → Claude limits card. Hidden entirely when the
+// user holds no token (and while the first read is in flight, to avoid a flash
+// under the token card). Since PRD #104 it renders ONE METER PAIR PER TOKEN,
+// default first (the server orders them), each named by its label.
+export function RateLimitCard() {
+  const { tokens, loading } = useMyRateLimits(60_000);
+  const now = useNow();
+
+  if (loading || !tokens || tokens.length === 0) return null;
+  const showLabels = tokens.length > 1;
+
   return (
     <Card className="space-y-5">
       <div>
         <SectionTitle>Claude limits</SectionTitle>
         <p className="mt-2 text-sm text-muted">{CARD_BLURB}</p>
       </div>
-      <div>
-        <SettingsWindowRow label="5-hour window" win={data.five_hour} now={now} dim={data.stale} />
-        <SettingsWindowRow label="7-day window" win={data.seven_day} now={now} dim={data.stale} />
-      </div>
-      {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
-          this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
-      <div className="flex items-center gap-2 text-xs text-muted">
-        <Badge tone={badge.tone} dot={badge.dot}>{badge.label}</Badge>
-        <span>
-          updated {formatAgo(data.synced_at, now)}
-          {data.stale ? " · reading is stale (vault locked or polling off)" : " · refreshes every few minutes"}
-        </span>
+      <div className="space-y-4">
+        {tokens.map((t) => (
+          <TokenMeters key={t.secret_id} token={t} now={now} showLabel={showLabels} />
+        ))}
       </div>
     </Card>
   );
@@ -155,15 +191,22 @@ const TONE_RANK: Record<MeterTone, number> = { ok: 0, warn: 1, danger: 2 };
 // screen. useNow keeps it re-rendering on the 30s clock like the card; the
 // effect keys off the reading, so a bare clock tick never re-announces.
 export function RateLimitAnnouncer() {
-  const { data } = useMyRateLimits(60_000);
+  const { tokens } = useMyRateLimits(60_000);
   useNow();
   const lastTone = useRef<MeterTone | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
+    if (!tokens || tokens.length === 0) return;
+    // Announce the user's MOST URGENT token (PRD #104): with several credentials
+    // the one nearest a wall is the one worth interrupting for, and naming it is
+    // what makes the announcement actionable — "at 96%" is useless when the user
+    // holds three tokens and cannot tell which is throttling.
+    const worstToken = worstTokenReading(tokens);
+    const limits = worstToken?.limits;
     // Only a live, non-stale reading transitions the ref (Decision 3).
-    if (!data || data.status !== "ok" || data.stale) return;
-    const worst = worstWindow(data);
+    if (!limits || limits.status !== "ok" || limits.stale) return;
+    const worst = worstWindow(limits);
     const tone = toneFor(worst.pct);
     const prev = lastTone.current;
     lastTone.current = tone;
@@ -171,10 +214,13 @@ export function RateLimitAnnouncer() {
     // when the tone rose above the last seen one.
     if (prev === null || TONE_RANK[tone] <= TONE_RANK[prev]) return;
     const countdown = formatCountdown(worst.resets_at);
+    // The label is named only when the user holds more than one token, so a
+    // single-token user hears exactly what they heard before this feature.
+    const which = tokens.length > 1 && worstToken ? `${worstToken.label} ` : "";
     setMessage(
-      `${worst.label} window at ${worst.pct}%` + (countdown ? `, resets in ${countdown}` : ""),
+      `${which}${worst.label} window at ${worst.pct}%` + (countdown ? `, resets in ${countdown}` : ""),
     );
-  }, [data]);
+  }, [tokens]);
 
   return (
     <div className="sr-only" aria-live="polite" role="status">
@@ -193,20 +239,48 @@ function MicroRow({ label, win, dim }: { label: string; win: RateLimitWindow; di
   );
 }
 
-// SidebarRateLimits is the two 5px micro-bars under the signed-in user block
-// (mockup frame B). Hidden for no_token / unavailable (no dead chrome) and while
-// loading; a stale reading is shown dimmed. Hover title carries the reset
-// countdowns.
-export function SidebarRateLimits() {
-  const { data } = useMyRateLimits(60_000);
-  if (!data || data.status !== "ok") return null;
-  const c5 = formatCountdown(data.five_hour.resets_at);
-  const c7 = formatCountdown(data.seven_day.resets_at);
-  const title = [c5 && `5h resets in ${c5}`, c7 && `7d resets in ${c7}`].filter(Boolean).join(" · ");
+// TokenMicroMeters is one token's pair of 5px bars, with the credential named
+// above them only when the user holds several.
+function TokenMicroMeters({ token, showLabel }: { token: TokenRateLimits; showLabel: boolean }) {
+  const { limits } = token;
+  if (limits.status !== "ok") return null;
+  const c5 = formatCountdown(limits.five_hour.resets_at);
+  const c7 = formatCountdown(limits.seven_day.resets_at);
+  const title = [
+    showLabel && token.label,
+    c5 && `5h resets in ${c5}`,
+    c7 && `7d resets in ${c7}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
-    <div className="mt-2 space-y-1.5" title={title || undefined} aria-label="Claude rate limits">
-      <MicroRow label="5h" win={data.five_hour} dim={data.stale} />
-      <MicroRow label="7d" win={data.seven_day} dim={data.stale} />
+    <div className="space-y-1.5" title={title || undefined}>
+      {showLabel && (
+        <div className="truncate text-[10px] font-medium uppercase tracking-wide text-faint">
+          {token.label}
+        </div>
+      )}
+      <MicroRow label="5h" win={limits.five_hour} dim={limits.stale} />
+      <MicroRow label="7d" win={limits.seven_day} dim={limits.stale} />
+    </div>
+  );
+}
+
+// SidebarRateLimits is the micro-bars under the signed-in user block (mockup frame
+// B) — one PAIR PER TOKEN since PRD #104, each named when the user holds several.
+// Hidden while loading and for a token-less user (no dead chrome); a token with no
+// reading renders nothing rather than an empty bar, and a stale one is dimmed.
+export function SidebarRateLimits() {
+  const { tokens } = useMyRateLimits(60_000);
+  if (!tokens || tokens.length === 0) return null;
+  const readable = tokens.filter((t) => t.limits.status === "ok");
+  if (readable.length === 0) return null;
+  const showLabels = readable.length > 1;
+  return (
+    <div className="mt-2 space-y-2.5" aria-label="Claude rate limits">
+      {readable.map((t) => (
+        <TokenMicroMeters key={t.secret_id} token={t} showLabel={showLabels} />
+      ))}
     </div>
   );
 }

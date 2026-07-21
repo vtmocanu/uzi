@@ -287,12 +287,30 @@ Proven, not asserted: with the lock removed,
 state` — precisely the state the kind-path alias 500s on. With the lock, 25
 interleavings pass.
 
-**Which test proves what** (recorded because the two are not equivalent):
-`TestConcurrentFirstTokenCreatesLiveDB` passes *without* the lock too — the
-partial unique index already prevents two defaults there, so the lock only
-upgrades a loser's outcome from a 409 to a clean non-default create. Only the
-delete-vs-create test demonstrates the lock is load-bearing. Do not cite the
-first as evidence the lock is necessary.
+**Which test proves what** (recorded because the two are not equivalent — and
+this paragraph was itself wrong once, see below):
+
+Both tests fail without the lock, for *different* reasons, and both are earning
+their place:
+
+| test | lock removed | what breaks |
+|---|---|---|
+| `TestConcurrentDeleteDefaultVsCreateLiveDB` | FAIL — `1 tokens but 0 defaults` | **state corrupts** |
+| `TestConcurrentFirstTokenCreatesLiveDB` | FAIL — 7× `concurrent create returned 500` | **contract breaks** |
+
+The distinction: **the partial unique index protects the data; the lock protects
+the user-visible outcome.** Without the lock, concurrent first-token creates are
+*safe but ugly* — the index still prevents a second default, so the invariant
+holds, but the losing goroutines hit `duplicate key … user_secrets_one_default_key`
+which the handler maps to a **500** instead of a clean 201/409. Only the
+delete-vs-create test shows absence of the lock corrupting *state*.
+
+*Corrected 2026-07-21.* This paragraph originally claimed
+`TestConcurrentFirstTokenCreatesLiveDB` **passes** without the lock, on the
+implementer's report. The reviewer removed the lock and ran both tests: it fails.
+The wrong version was the dangerous one — "test B passes without the lock" reads
+as "test B is decorative" and invites deleting a test that genuinely guards the
+response contract.
 
 *Original text, retained for provenance:*
 

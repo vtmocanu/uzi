@@ -20,14 +20,19 @@ vi.mock("../lib/api", async (importActual) => {
       listSecrets: vi.fn(),
       putAnthropicToken: vi.fn(),
       deleteAnthropicToken: vi.fn(),
+      // PRD #104 M2 token CRUD, driven by the AnthropicTokens card.
+      createAnthropicToken: vi.fn(),
+      patchAnthropicToken: vi.fn(),
+      deleteAnthropicTokenById: vi.fn(),
       setAutopilotEnabled: vi.fn(),
       setJudgeEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
       vaultLock: vi.fn(),
-      // The Claude limits card (PRD #53) self-gates: default to no_token so it
-      // renders nothing and stays out of these token/vault/theme assertions.
-      getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+      // The Claude limits card (PRD #53/#104) self-gates: an EMPTY token list is
+      // how the API reports a token-less user since M5, so the card renders nothing
+      // and stays out of these token/vault/theme assertions.
+      getMyRateLimits: vi.fn().mockResolvedValue({ tokens: [] }),
       // The Notifications section (a child of Settings) loads its own state.
       getMySlack: vi.fn(),
       setMySlackNotify: vi.fn(),
@@ -49,6 +54,8 @@ const baseUser: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -281,5 +288,89 @@ describe("Settings — Appearance theme picker (PRD #21)", () => {
     expect(await screen.findByText("unknown theme")).toBeTruthy();
     // refresh is the revert mechanism: re-fetch me() and re-apply the server truth.
     await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+});
+
+// ── Judge → token binding (PRD #104 M4/M6) ──────────────────────────────────
+// Without this control the success criterion "the judge lane can burn a different
+// token, set from the web UI" is unreachable, which is why it is required.
+
+describe("Settings judge token picker (PRD #104)", () => {
+  const twoTokens = [
+    {
+      id: "sec-default",
+      kind: "anthropic_token",
+      label: "default",
+      is_default: true,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    },
+    {
+      id: "sec-cheap",
+      kind: "anthropic_token",
+      label: "cheap-console",
+      is_default: false,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    },
+  ];
+
+  it("offers no judge picker when the user holds a single token", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [twoTokens[0]] });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await screen.findByText("Run judge");
+    expect(screen.queryByLabelText("Token the judge spends")).toBeNull();
+  });
+
+  it("points the judge lane at a named token, sending the label", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const picker = await screen.findByLabelText("Token the judge spends");
+    fireEvent.change(picker, { target: { value: "cheap-console" } });
+    await waitFor(() =>
+      // enabled rides along unchanged; the token is the label, not an id.
+      expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, "cheap-console"),
+    );
+  });
+
+  it("clears the judge binding back to the default by sending null", async () => {
+    mockAuth({ ...baseUser, judge_anthropic_secret_id: "sec-cheap", judge_anthropic_secret_label: "cheap-console" });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const picker = await screen.findByLabelText("Token the judge spends");
+    fireEvent.change(picker, { target: { value: "" } });
+    await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(false, null));
+  });
+
+  // Toggling the opt-in must NOT touch the binding: the token field is omitted,
+  // not sent as null, or enabling the judge would silently unbind the credential.
+  it("omits the token field when only the opt-in is toggled", async () => {
+    mockAuth({ ...baseUser, judge_anthropic_secret_id: "sec-cheap", judge_anthropic_secret_label: "cheap-console" });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setJudgeEnabled.mockResolvedValue({ user: baseUser });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const toggle = await screen.findByLabelText("Judge my finished runs");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(true));
   });
 });
