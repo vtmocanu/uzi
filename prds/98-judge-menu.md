@@ -982,6 +982,53 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       (`sqlc generate` + `go vet`) before being believed; `false::bool` is type-preserving here
       because the projection is already NOT NULL via the cast — the nullability trap in
       `CLAUDE.md` applies to folding a nullable LEFT-JOIN column, which this is not.
+- [ ] **`ListRunInputsForRun` has NO live exercise — found by the query inventory, 2026-07-21.**
+      `judge.sql`'s `ListRunInputsForRun` is called from exactly one place in production
+      (`workersvc/judge_trace.go:89`) and from **no test that touches a database**. Every test
+      reaching `JudgeTrace` runs against workersvc's `fakeStore`
+      (`workersvc/service_test.go:393`), which returns a canned slice, so the SQL text has
+      never executed under test. The judge's oldest-first input cap rides this query
+      (`follow_up_inputs_integration_test.go:21` describes the shape). Recorded rather than
+      fixed because scope is frozen; it is declared `UNPINNED` with this reason in
+      `api/internal/store/judge_query_inventory_test.go`, which is the only reason it is
+      visible at all.
+
+- [ ] **Widen the query inventory beyond the judge family.** The declaration test landed for
+      the five judge-family `.sql` files (**17 queries**). Repo-wide is **276 queries across
+      28 files**, and a repo-wide table written in one sitting would be mostly `UNPINNED` rows
+      authored by someone who had not investigated any of them — which is a worse artifact
+      than none, because it reads as an audit. Widen one file at a time, with the call sites
+      opened.
+      **What the mechanism is and is not, so a later reader does not over-credit it:** it
+      proves only that someone has DECLARED where a query is pinned, **not that the pin is
+      good**. Nothing in it executes a query or folds a predicate; a row naming a test that
+      merely touches the query is exactly as green as a row naming a test that reddens under
+      mutation. What it does catch is the case that currently produces silence — a query
+      **arriving or being renamed with nobody having thought about coverage** — and it fails
+      the build until a human writes a row.
+      **`UNPINNED` is a legal, green, permanent state, and that is a design constraint rather
+      than a concession:** a mechanism that fails the build for an honestly-declared gap gets
+      deleted the first time someone is in a hurry, taking the arriving-query check with it.
+      **Declared, not inferred, and the inference was measured wrong in BOTH directions on
+      these same 17 queries** (the auditor's prototype, `Test*LiveDB` body scan): (a) the two
+      `judge_bulk_disposition.sql` queries appear in **no test source at all** — reached only
+      through workersvc from a handler test — which is the mechanism behind the 48 repo-wide
+      queries it classified as "named in tests but no LiveDB caller"; (b) **a second, distinct
+      false-negative mechanism found while writing the table**: `ListDispositionsForReview` is
+      called at `recommendation_dispositions_integration_test.go:262`, inside the
+      package-level helper `listDispositions` (`:260`) that the test calls at `:225` — in the
+      file, but in no test function's body, so a body scan misses it and a whole-file scan
+      would instead credit every test in the file; (c) false positive: `CreateJudgeRun`'s
+      first inferred pinner is `TestClaimRunDockerRepoAllowlistLiveDB`, which uses it as
+      fixture setup for an unrelated property.
+      **Negative controls run at the tip, all four RED then restored green:** an undeclared
+      new query in `judge.sql`; a pin renamed to a test that does not exist; a row renamed so
+      it names no query (fires BOTH the missing and the stale check); an `UNPINNED` row whose
+      reason is blank. Plus two self-checks against a vacuous green — a per-file "0 query
+      names parsed" abort and a whole-scan "0 queries total" abort — because the two ways this
+      test passes for any tree are "the glob found nothing" and "the regex matched nothing",
+      and each check catches only its own.
+
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,
