@@ -3,7 +3,16 @@
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
-**Progress (2026-07-20, end of day)** — 5 of 8 milestones landed on `feature/prd-98-judge-menu`, no MR yet:
+**Progress (2026-07-21)** — 6 of 8 milestones landed, **MR opened with the PRD still open**. Work resumes in THIS PRD, not a follow-up.
+
+- **Done, reviewed + audited**: M1 (`0874d3f6`), M2 (`30204a61`, later collapsed to one atomic statement), M6 (`d6a8545c`), M4 (`1da5ac32`), M3 (`c629ce28`), M7 (`de2d8de3`). Plus a merge of `origin/main` (`ad5abca1`, 38 commits — PRD #97 landed, which unblocked M8b).
+- **In this MR**: M5, M8a docs, and the last open Blocking (a measured-false CLI instruction).
+- **Still open IN THIS PRD after the MR** — see "Remaining work" below. Four items, all with recorded evidence.
+- **Handoff notes**: `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` is the resume document — branch state, standing rules with the incident behind each, the docker safety rule, and the pre-MR migration gate.
+
+**What the review loop cost and bought** (recorded because it shaped the design): 3 Blocking in M3's first wave, then **every Blocking after M3 was about evidence rather than behaviour** — seven SQL projections no test executed, tests asserting properties of `encoding/json` rather than of the service, assertions credited for gates they sit behind, comments crediting guards in other files, and two printed CLI instructions that had never been run and were false. The implementation was sound throughout; the layer certifying it was not.
+
+**Superseded progress note (2026-07-20, end of day)** — 5 of 8 milestones landed on `feature/prd-98-judge-menu`, no MR yet:
 - **Done + reviewed + audited**: M1 (`0874d3f6`), M2 (`30204a61`, rewritten to one atomic statement in `082d8651`/`c962435d`), M6 (`d6a8545c`), M4 (`1da5ac32`). Full Go + web + live-DB gates pass at the tip.
 - **Done, review PENDING**: M3 (Judge page + nav, `c629ce28`) — the largest milestone, first substantial `web/` surface. Gates green (web typecheck + 837 tests + build; api build/vet/test), the four validator pre-flags built in and test-pinned, but it has **not yet had a review/audit wave** — that is the first task next session. Six implementation decisions are flagged for confirmation in the M3 checkpoint; one (anchored deep-link defaulting to `bucket=all`, not `todo`) is a product-behaviour call touching M5.
 - **Not started**: M7 (CLI), M5 (notification retarget — its `/judge` + `?run=` route dependency is now satisfied), M8a (vitest + docs + specs). **M8b (e2e) stays blocked** on #97.
@@ -700,7 +709,105 @@ exactly as #68 already does.
       `TestReviewGroupZeroUpdatedIsNotReportedAsSuccess` pins that instead — and the
       genuine 404 refusal stays covered where it genuinely exists, on the per-run route
       (`TestReviewMutationRefusedForReadOnlyToken`). Depends on M1 + M2.
-- [ ] **M8 — Tests + Docs**: e2e leg (dedup grouping; a group **Dismiss** fans out
+## Remaining work — OPEN IN THIS PRD after the first MR (2026-07-21)
+
+Four items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
+**These are PRD #98 work, not a follow-up PRD** — resume here.
+
+- [ ] **M8b — the e2e leg.** Unblocked since PRD #97 merged and this branch merged `main`
+      (`create_run`, `retry_read`, positive controls are all in the tree). Its value is
+      **entirely in assertions fakes structurally cannot make** — a happy-path walkthrough
+      would duplicate coverage that already exists three times over. It is the natural home
+      for the two mechanisms below.
+- [ ] **The printed-instruction backstop.** Three instructions existed in the CLI, **none had
+      ever been executed, and two were false** (the revert hint, fixed; the truncation
+      remedy, fixed). A string that tells a user what to do is an assertion nothing
+      typechecks. The mechanism: a table of `arrange → produce → extract → assert` rows that
+      **executes the printed text verbatim** (never a hand-written copy — both false
+      instructions parsed perfectly), asserts an **outcome** rather than an exit code, and
+      **asserts its own precondition** or is vacuous. **The piece that makes it a class
+      mechanism and not three patches**: a backstop scanning `api/cmd/uzi/` for printed
+      backticked `uzi …` commands that **fails if any has no row in the table** — so the
+      *fourth* instruction, the one nobody has written yet, fails the build until someone
+      runs it. That half needs **no stack** (a grep and a set difference) and can land
+      independently. Constraint: each row must bind to the command that **emits** it —
+      running an instruction against the wrong command manufactures a false finding exactly
+      as reading it manufactures a false pass.
+- [ ] **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
+      demo fixture cannot reach the two riskiest behaviours.** A differential harness dumped
+      the shipped `mockReviews`, ran the real `GroupJudgeRecommendations` over rows built in
+      `rv.updated_at DESC` order, and structurally diffed against `mockApi.getJudgeBacklog`:
+      **7 groups, 0 field diffs, identical ordering.** Detection power proven (swapping the JS
+      `BUCKET_RANK` produced 4 immediate divergences), and **sort stability is genuinely
+      exercised** — the fixture contains a four-way tie at `(run_count=1, open_count=0)` and
+      both sides order it identically, so `sort.SliceStable` vs JS `.sort()` is covered by
+      data rather than by reading.
+      **The gap: the demo fixture contains ZERO instances of `occurrences > run_count`** (the
+      same coordinate twice in one review — the Go grouper's own comment calls it out, and it
+      is the shape that crashed the endpoint with SQLSTATE 21000) **and ZERO fully-settled
+      groups with disagreeing members** — so `topRung` never has to *choose*, and the
+      `dismissed > done > filed` precedence ladder, the single most-duplicated logic across
+      the two implementations, is **never exercised**. Extending the fixture with both showed
+      the implementations agree (9 groups, 0 diffs), so this is a **coverage gap, not a
+      defect** — but the fixture *is* the demo, so the blind spot is shared by the demo and by
+      every mock-backed vitest.
+      **Second finding: truncation is unreachable in demo mode.** `mockApi.ts:381` and `:1812`
+      hardcode `truncated: false`, so the banner cannot render. M3 requires `mockApi.ts` +
+      `data.ts` to "render every state"; truncation is a state, it is subtle, and seam 5
+      showed its CLI remedy was outright false — making it the state you would most want
+      demoable.
+      **Boundary of what was measured, stated not implied:** the harness compares the Go
+      **grouper**, a pure function over rows. The `?run=` anchor and the row cap live in
+      **SQL** and were *not* executed — they read as equivalent (SQL's coordinate-level
+      `EXISTS` filtering rows pre-grouping vs the mock's `occurrences.some(...)` filtering
+      groups post-grouping, both retaining other-run occurrences) but that comparison needs a
+      live DB and belongs in M8b.
+      **Constraint on the golden-fixture mechanism, demonstrated by this run:** the fixture
+      must be **authored to discriminate, not snapshotted from the demo** — a golden file
+      derived from `mockReviews` would lock in exactly the blind spot above, agree on
+      everything it covers, and *read as full coverage*. One case per reimplemented behaviour
+      (dedup; occurrences>runs; partial settle; each rollup precedence pair; anchor;
+      scope=open; truncation) **plus an assertion that the fixture actually exercises each**,
+      in the shape of the Go grouper test's own "fixture broken … otherwise this test proves
+      nothing" guard. Without that self-check the golden file rots into a snapshot the moment
+      someone regenerates it.
+      *Original framing:* `mockApi` is no longer a stub: it reimplements
+      dedup, the rollup ranks, `run_count`, the `?run=` semi-join, the `scope=open` fan-out,
+      `updated` triples, truncation and `set_via` provenance. Its agreement with Go was
+      verified **only by reading** — the mode that failed repeatedly on this branch. If it
+      drifts, **the demo lies AND ~860 mock-backed vitests pass while asserting a fiction**:
+      two failures, one cause, nothing announces either. Settling execution: a golden fixture
+      — one input through Go's `GroupJudgeRecommendations` and through `mockApi`, asserting
+      identical output. Attack the cases the mock had to *reimplement* (cross-run recurrence,
+      a partially-settled group, the `dismissed > done > filed > todo` rollup, the anchor
+      keeping other-run occurrences, truncation cutting **before** grouping), and check
+      ordering explicitly — Go uses `sort.SliceStable(run_count DESC, open_count DESC)` and a
+      JS `.sort()` is not stable the same way for equal keys.
+- [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
+      forge-writing web path**; no test ever opens the occurrence expander. Its security
+      controls were verified by line-by-line diff against RunView's filer (same CSRF path,
+      `forgeLimiter`, draft gate, provenance box, `isHttpsUrl`) — but that duplication also
+      duplicated away its coverage. A test on the duplicate is wanted, **not** a refactor.
+      Also still open: its stale-filed-link warning is absent because `JudgeOccurrenceDTO`
+      carries no review `updated_at`; the comment now says so plainly rather than implying
+      there is nothing to guard.
+
+**Known limitation, accepted deliberately (2026-07-21):** the `⚖ issues` badge is
+**byte-identical on `/runs` and on Judge occurrence rows**, but means different things. On
+`/runs` the count is always rendered when > 0, so a bare `⚖ issues` there means *"nothing
+left to triage"* (M4 behaviour (c)); on the Judge page an occurrence carries no count at all
+— and those rows are by construction still open. **Only the tooltip distinguishes them**; a
+user who does not hover reads the `/runs` meaning. Splitting the *label* was rejected because
+it reintroduces the two-grammar problem the fable review removed and N8 closed, so the title
+carries the distinction alone. Revisit only with a design that keeps one visual grammar.
+
+**Also unresolved, lower priority:** the live-DB harness's intermittent *"postgres never became
+ready"* — **mechanism unknown**, with two confident explanations already disproved (a "fixed
+container name" that does not exist, and load contention measured at 3-6× headroom for one
+concurrent suite). Recorded in the checkpoint as unknown. Sequencing is the mitigation and it
+costs nothing; do not attribute it.
+
+- [ ] **M8a — Tests + Docs (docs half in the first MR)**: e2e leg (dedup grouping; a group **Dismiss** fans out
       across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
       Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
       deep-links to `/judge?run=`; **no token spend** on any disposition); vitest for
