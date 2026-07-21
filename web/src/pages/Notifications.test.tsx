@@ -167,9 +167,17 @@ describe("Notifications inbox (PRD #46 M2)", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
-    // The markup never became a real element (no dangerouslySetInnerHTML / markdown).
+    // Wait on the TITLE, not on the text under test: the row must be rendered before either
+    // assertion means anything, and awaiting the escaped body would put the text query first
+    // again. A bare `expect(container.querySelector("img")).toBeNull()` with no await ahead of
+    // it passes VACUOUSLY — nothing has rendered yet, so of course there is no <img>.
+    await screen.findByText("Run review ready");
+    // THE SECURITY PROPERTY, ASSERTED FIRST so it is the first red. The markup never became a
+    // real element (no dangerouslySetInnerHTML / markdown parsing on judge output).
     expect(container.querySelector("img")).toBeNull();
+    // ...and it is present as literal characters. Both halves of the payload are required:
+    // raw HTML breaks the first, a markdown renderer breaks the second.
+    expect(screen.getByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
   });
 
   // The GROUPED path renders the same NotificationRow, but M5 is what put judge text behind
@@ -195,8 +203,10 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     await waitFor(() => expect(screen.getByText("2 reviews ready")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { expanded: false }));
 
-    expect((await screen.findAllByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).length).toBe(2);
+    // Same ordering rule as above, and the same reason for awaiting the title instead.
+    expect((await screen.findAllByText("Run review ready")).length).toBe(2);
     expect(container.querySelector("img")).toBeNull();
+    expect(screen.getAllByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/).length).toBe(2);
   });
 
   it("deep-links a judge review into the Judge workbench, anchored to its run", async () => {
