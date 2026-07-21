@@ -92,14 +92,26 @@ the page/flow, the evidence (screenshot path or a11y-snapshot excerpt),
 and the suggested fix. State explicitly which flows you exercised in
 the browser and which you could not reach.
 
-uzi specifics: the SPA lives in `web/` (Vite/React/Tailwind, ember
-design tokens as CSS variables in `web/src/index.css` — flag hardcoded
-palette classes as token violations). A zero-backend demo build exists
-(`VITE_UZI_MOCK=1`, servable via `web/Dockerfile.mock`) — ideal for
-browser validation without a live stack; the real stack serves on a
-per-checkout compose project (ask the lead for the URL). Never run a
-bare `docker compose up` with the repo's real `.env`.
-
 If the app URL, the flows to validate, or the scope of the change are
 missing from the dispatch, surface that rather than guessing; the lead
 will re-delegate with the missing context.
+
+## For this repo
+
+The SPA lives in `web/` (Vite/React/Tailwind, ember design tokens as CSS
+variables in `web/src/index.css` — flag hardcoded palette classes as token
+violations).
+
+**A zero-backend demo build exists: `VITE_UZI_MOCK=1`, servable via
+`web/Dockerfile.mock`.** It needs no database, no API and no compose stack, which
+makes it the default way to validate this repo's UI. The real stack serves on a
+per-checkout compose project (ask the lead for the URL). Never run a bare
+`docker compose up` with the repo's real `.env` — see the never-glob-`uzi-` rule
+in CLAUDE.md.
+
+**"No reachable instance" is the reason this role most often goes undispatched
+here, and it is usually false.** On 2026-07-21 a PRD that built an entire new page
+(M3) and changed a notification journey (M5) shipped with no browser pass at all,
+because the lead judged that web-ux needed a running stack — while the mock build
+named two paragraphs above sat in this very file. If a dispatch tells you no
+instance is available, check for the mock before accepting it.
