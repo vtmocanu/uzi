@@ -521,10 +521,17 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//
 	// BE PRECISE ABOUT WHAT THIS CATCHES. `hand` lives in a DIFFERENT review that owns no
 	// filed row at all, so `f.review_id = rv.id` alone already separates it: this fires on a
-	// wrong VALUE (a fold to a constant, or a join loose enough to cross reviews), NOT on the
-	// join's coordinate halves. Dropping `AND f.target = rr.target` leaves this green —
-	// measured. The coordinate halves are pinned by the same-review sibling below, and this
-	// message said "not row-scoped" while that hole was open.
+	// wrong VALUE, NOT on the join's coordinate halves. The coordinate halves are pinned by
+	// the same-review sibling below, and this message said "not row-scoped" while that hole
+	// was open.
+	//
+	// PROVENANCE OF THE TWO CLAIMS IN THAT PARAGRAPH, since they are not equally strong:
+	//   - "dropping `AND f.target = rr.target` leaves this green" — MEASURED here, fresh
+	//     database. That fold reddened only the sibling's assertion; this one stayed silent.
+	//   - "a fold to a constant would fire this" — INHERITED, not re-run: the checkpoint
+	//     records `filed_issue_iid -> 4242` on fc8763f9 being caught by exactly this
+	//     unfiled-row absence check, after satisfying every positive assertion. No fold of
+	//     filed_issue_iid or filed_issue_url was executed in the 2026-07-21 sweep.
 	if hand.FiledIssueIid.Valid || hand.FiledIssueUrl.Valid {
 		t.Errorf("a coordinate with NO filed row anywhere carries a filed link (iid=%v url=%q) — "+
 			"the projection is not reading the joined filed row (a constant fold, or a join that "+
@@ -629,11 +636,23 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 		t.Error("the filed+settled row carries a NULL filed_at")
 	}
 	// Same correction as the filed-link pair above: `hand` is in a review with no filed row,
-	// so this fires when filed_at is a VALUE the projection invented (`f.filed_at -> now()`
-	// reddens here — measured) rather than one read off the joined row. It is NOT a
-	// row-scoping check: the coordinate halves of the filed join are pinned by the
-	// same-review unfiled sibling above, and this assertion stays green when
-	// `AND f.target = rr.target` is dropped.
+	// so this fires when filed_at is a VALUE the projection invented, rather than one read off
+	// the joined row. It is NOT a row-scoping check: the coordinate halves of the filed join
+	// are pinned by the same-review unfiled sibling above.
+	//
+	// MEASURED (fresh database, one fold per run): folding `f.filed_at` to `d.set_at` reddens
+	// THIS assertion. And dropping `AND f.target = rr.target` leaves it green while reddening
+	// the sibling's — the two ran in the same sweep and only the sibling's message appeared,
+	// which is the evidence that this assertion is a value check and not a scoping one.
+	//
+	// DO NOT REACH FOR `f.filed_at -> now()`, the obvious fold. It does not work here and its
+	// failure is not this assertion firing: sqlc types the folded column as NOT NULL, the
+	// generated struct field becomes `FiledAt interface{}`, and the package no longer
+	// COMPILES (`sibling.FiledAt.Valid undefined`). That is loud, but a build error is not a
+	// red assertion — the line below never executes. `d.set_at` is the fold that works,
+	// because a nullable timestamptz off the other LEFT JOIN preserves the type AND looks
+	// like data. (An earlier version of this comment credited the `now()` fold with the
+	// result `d.set_at` actually produced; it could not have run.)
 	if hand.FiledAt.Valid {
 		t.Errorf("a coordinate with NO filed row anywhere carries filed_at %v — the projection is "+
 			"not reading the joined filed row", hand.FiledAt.Time)

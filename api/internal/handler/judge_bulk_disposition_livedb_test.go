@@ -657,9 +657,14 @@ func TestBulkDispositionSettledAddressesAreDistinctPerRunLiveDB(t *testing.T) {
 // So the two things that carry this test are, in order: (1) bulkFixture giving every ROW a
 // distinct rationale, and (2) the pairwise assertion below — two coordinates with different
 // texts must stamp DIFFERENT hashes, which fails under a fold to ANY constant whichever
-// constant is chosen. Measured (PRD #98, 2026-07-21, fresh database): folding
-// `rr.rationale_md` to `'because'::text` in internal/store/queries/judge_bulk_disposition.sql
-// was GREEN before those two changes and is RED after, at both assertions below.
+// constant is chosen.
+//
+// The fold is `rr.rationale_md` -> `'because'::text` at
+// internal/store/queries/judge_bulk_disposition.sql:111 — the BULK query, not the backlog
+// one, which projects a column of the same name. Two results, and they are not equally
+// strong: RED after those two changes, at both assertions below, MEASURED 2026-07-21 on a
+// fresh database. GREEN before them, INHERITED from the M3 checkpoint's earlier sweep and
+// never re-run against the pre-fix tree.
 //
 // SCOPE OF THAT SWEEP, stated so it is not read as broader than it is: this fixed the
 // LIVE-DB half only. memberRowIn in judge_bulk_disposition_test.go still writes
