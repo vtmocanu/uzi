@@ -25,9 +25,24 @@ import (
 //	(b) the status/reason CHECK: dismissed REQUIRES a reason and done FORBIDS one;
 //	(c) ListJudgeTriageRowsForUser returns the right (disposition_status, filed_settled)
 //	    per recommendation — an UNSETTLED filed claim (filed_at NULL) is NOT "filed"
-//	    (Decision 2/8);
+//	    (Decision 2/8). 🔴 IT DOES NOT PIN THAT QUERY'S COORDINATE JOINS — see below;
 //	(d) a disposed improve_uzi LEAVES the self-improve backlog and Undo (delete) re-includes
 //	    it (Decision 9).
+//
+// 🔴 WHAT THIS TEST DOES NOT COVER, stated HERE because a reader who finds it first would
+// otherwise reasonably conclude it does. Its (c) leg exercises ListJudgeTriageRowsForUser but
+// CANNOT observe either LEFT JOIN's coordinate predicates: the three coordinates below differ
+// in BOTH halves at once (improve_uzi with an empty target, install_worker_tool/shellcheck,
+// improve_agent/coder), so no two share a category or a target and every half has nothing to
+// discriminate. MEASURED 2026-07-21, four fresh-database runs with a positive control:
+// dropping `d.target`, `d.category`, `f.target` or `f.category` in isolation left the ENTIRE
+// live-DB suite green, 126 pass / 0 fail each time. Only dropping BOTH halves of a join went
+// red — the weaker mutation passing while the stronger one fails, which is what makes this
+// worth stating rather than assuming.
+//
+// TestJudgeTriageRowsForUserAreCoordinateScopedLiveDB (below) covers those four halves. Do not
+// delete it as redundant with this one: the properties do not overlap, and this fixture cannot
+// be extended to cover them without rewriting the assertions it was reviewed for.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (e2e/run-store-it.sh).
 func TestRecommendationDispositionsLiveDB(t *testing.T) {

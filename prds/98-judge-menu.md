@@ -758,6 +758,27 @@ reads as coverage.
 | `ListOwnedRecommendationsForCoords` (bulk resolve) | review half pinned; coordinate halves inert; the `f` join never exercised |
 | `ListJudgeTriageRowsForUser` (#94 stats) | every half individually inert; only the both-halves fold caught anything |
 
+**All four are now pinned**, each half reddening its own named assertion, every fold run on a
+fresh database with a positive control asserted. The `/runs` badge query and the #94 stats
+query needed new tests; the backlog query needed new fixture rows (a cross-review coordinate,
+a cross-category one, a claimed-but-not-filed one, a second tenant, and a run the caller owns
+but does not request).
+
+**THE POSITIVE CONTROL HAS THREE CLAUSES BECAUSE THREE DIFFERENT MECHANISMS PRODUCE "no
+failures observed" WITH NOTHING EXECUTED**, and no single weaker check catches all three:
+
+| mechanism | what it looks like | what misses it |
+|---|---|---|
+| the suite skipped (no DSN) | `rc=0`, both packages `ok`, `RUN=108 PASS=0 SKIP=108` | exit code, "no FAIL lines" |
+| the mutation silently did not apply | a real, fully green run of **unmutated** code | everything except diffing the file |
+| the run never happened | `run-store-it.sh` exits 1, log holds only "postgres never became ready", `PASS=0 SKIP=0 FAIL=0` | "no FAIL lines" |
+
+The third was observed twice on 2026-07-21 by two agents on two different commands. Only
+`PASS > 0` **and** `SKIP == 0` **and** the named test appearing as `--- PASS`/`--- FAIL`
+catches all three — which is why the rule is not "check the exit code". Note also that the
+rule was written before the third mechanism was seen and caught it anyway: that is the
+argument for a mechanism over an enumeration of known failure modes.
+
 **The tenant boundary, and the precise claim.** Neither `recommendation_filed_issues`
 (00071) nor `recommendation_dispositions` (00073) has an owner column. `filed_by_user_id`
 and `set_by_user_id` are `ON DELETE SET NULL` **attribution** pointers — nullable, and NULL
