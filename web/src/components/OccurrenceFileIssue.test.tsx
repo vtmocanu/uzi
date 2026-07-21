@@ -367,16 +367,31 @@ describe("OccurrenceFileIssue — a created-with-warning is a success, not a ret
   });
 });
 
-describe("OccurrenceFileIssue — the write travels the app's cookie+CSRF client", () => {
-  // The other tests here stub `api.fileIssue`, so they can only show WHICH call is made,
-  // never how it goes out. This one runs the REAL client (api.ts's request()) over a stubbed
-  // fetch, which is the only way to see the parts that make this a safe forge write: the
-  // POST route, the session cookie, and the X-CSRF-Token echo of the readable CSRF cookie.
+describe("OccurrenceFileIssue — the write is issued through the app's API client", () => {
+  // READ THE BOUND BEFORE CITING THIS TEST. It asserts the BROWSER half of the write and
+  // nothing else. The other tests here stub `api.fileIssue`, so they can only show WHICH
+  // call is made, never how it goes out; this one runs the REAL client (api.ts's request())
+  // over a stubbed fetch, so the POST route, the same-origin credentials and the
+  // X-CSRF-Token echo of the readable cookie are observed rather than assumed. A
+  // hand-rolled `fetch()` added to this component later is what it would catch.
   //
-  // What it does NOT prove: anything about the server. The forge limiter, the owner check
-  // and the sanitizer all live in Go and are asserted there — this pins that the component's
-  // write is issued through the client that carries the browser half of that contract, which
-  // is what a hand-rolled fetch() in this component would silently break.
+  // IT PROVES NOTHING ABOUT ENFORCEMENT, WHICH IS ENTIRELY SERVER-SIDE. Re-derived from
+  // api/internal/handler/handler.go: the draft GET
+  // (`/{id}/review/recommendations/{recID}/issue-draft`) sits in the RequireUser group and
+  // is NOT forge-limited, while the POST (`…/issue`) is mounted inside the RequireAuth
+  // cookie+CSRF group `.With(forgeLimiter.PerUserMiddleware)`. No test that mocks or stubs
+  // the transport can observe a middleware chain — it can only see that a function was
+  // called. So this must never be cited as covering "the CSRF path" or "the forge limiter".
+  //
+  // Where those controls ARE covered, measured rather than assumed
+  // (api/internal/handler/review_issue_livedb_test.go):
+  //   - owner/admin scoping: covered (NonOwnerNotFound, AdminNonOwnedRepoNotFound, …)
+  //   - the write-boundary sanitizer: covered (WriteBoundarySanitizesClientBody,
+  //     TitleSanitizedAtPost, EmptyTitleRejected)
+  //   - the forge limiter ON THIS ROUTE: NOT covered anywhere I could find. The only
+  //     PerUserMiddleware assertions in the api suite are chat_test.go's and slack_test.go's,
+  //     each for its own route. That is a real gap, named here rather than papered over by a
+  //     web test that appears to cover it.
   it("POSTs to the recommendation's issue route with the CSRF header and the session cookie", async () => {
     const real = (await vi.importActual<typeof import("../lib/api")>("../lib/api")).api;
     mockApi.fileIssue.mockImplementation(real.fileIssue);
