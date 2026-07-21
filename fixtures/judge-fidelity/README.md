@@ -117,6 +117,51 @@ four-branch copy of the ladder rather than calling `BucketOf`. That is what make
 to a mutated ladder, and the cost is that it cannot notice a ladder change -- catching that
 is the golden comparison's job, not the self-check's.
 
+## Detection power, MEASURED at landing
+
+Recorded because a fixture's own claim to discriminate is worth nothing unless someone ran
+the experiment. Ten folds, all against tree `5429ebe9`, each applied by script, each **proved
+applied by diffing the tree** before its result was believed, each restored by copy-aside.
+Results are recorded by the assertion MESSAGE that reddened, not by red/green: a fold can go
+red at the wrong assertion and certify nothing.
+
+| fold | Go | vitest | what reddened |
+|---|---|---|---|
+| JS `BUCKET_RANK` done/dismissed swapped | GREEN | RED, 5 cases | `mock grouper disagrees ... for rollup-precedence-pairs` (+ sort-tie, both bucket-filter cases, sort-stability) |
+| Go `bucketRank` `case "done": return 3` | RED, 5 cases | GREEN | `case "rollup-precedence-pairs": the GO grouper disagrees ...` |
+| Go `g.RunCount++` hoisted out of the `runsSeen` guard | RED, 1 | GREEN | `case "occurrences-exceed-run-count": the GO grouper disagrees ...` |
+| JS drop the `open_count` half of the comparator | GREEN | RED, 3 | `... for sort-tie-first-seen-order` (+ rollup-precedence-pairs, bucket-filter-all) |
+| Go `sort.SliceStable` -> `sort.Slice` | RED, 1 | GREEN | `case "sort-stability-13-groups": the GO grouper disagrees ...` |
+| JS `Array.from` -> code units | GREEN | RED, 2 | `... for preview-multibyte-cut`, `... for preview-multibyte-no-cut` |
+| JS trim set -> `/[\s]+$/` | GREEN | RED, 1 | `... for preview-trim-boundary` |
+| **regeneration**: the `RunCount` fold PLUS rewriting the golden's `run_count` to match | golden **PASS**, self-check RED | same | `fixture broken: no expected group has more occurrences than run_count -- this case no longer describes the shape it is named for ...` |
+| delete a case from `cases.json` | RED x3 | RED x3 | `fixture broken: cases.json has no case "..."` AND `fixture broken: expected.json carries golden output for "..." but cases.json no longer defines it` |
+| **tidy** the stability case into recency order | golden **PASS**, self-check RED | same | `fixture broken: the groups are already in run_count DESC order before the sort runs ...` |
+
+The first two are what justify the third artifact: each reddens exactly ONE runtime, which a
+direct Go-against-JS diff cannot do. The rune fold and the trim fold redden **disjoint** case
+sets, which is why the mock fix was two changes and not one.
+
+**The last three are the ones to read.** In each, `TestJudgeGrouperMatchesFidelityGolden`
+printed `--- PASS` while the fixture had been neutered, so the golden comparison alone
+certified nothing and only the self-check caught it. The tidy fold left `expected.json`
+**byte-identical**.
+
+`sort.Slice` reddened `sort-stability-13-groups` and **nothing else in the fixture** -- the
+6-group precedence case and the 5-group tie case both stayed green. That is the measured
+confirmation, from the other direction, that no naturally-shaped case catches an unstable
+sort.
+
+### A case that shipped green and asserted nothing
+
+`sort-tie-first-seen-order` first landed claiming, in its own `proves` field, that dropping
+the `open_count` tiebreak would reorder it. **It did not.** Epsilon (the `open_count 0` group)
+was authored LAST in the input rows, where first-seen order and the sorted order coincide, so
+the fold went green against the case named for it. The fix was to move one row; `expected.json`
+did not change, because the correct OUTPUT was never wrong. Recorded because that is the whole
+argument for measuring detection power rather than reasoning about it: a case can be entirely
+correct about its output and still pin nothing, and only running the fold says which.
+
 ## What this fixture CANNOT catch
 
 Stated here rather than implied, because a fixture that reads as covering more than it does
@@ -126,7 +171,12 @@ is worse than a smaller one.
    `EXISTS`; the mock filters GROUPS post-grouping. Different algorithms at different
    layers, and the Go half is not in the grouper at all.
 2. **The row cap and `truncated`.** `JudgeBacklogMaxRows` cuts rows BEFORE grouping, in
-   `JudgeRecommendationBacklog`. The grouper never sees it.
+   `JudgeRecommendationBacklog`. The grouper never sees it, and there is no exported pure
+   helper for a case to call -- so a fixture case here would have to invent a cap value
+   neither production path uses, while the `Lim: max + 1` interaction that distinguishes a
+   full page from an exactly-full one stayed out of reach. That is a proxy reading as a pin.
+   The MOCK side of the cut is pinned instead by `web/src/mocks/judgeBacklogTruncation.test.ts`;
+   the cross-implementation pin belongs to M8b/B4.
 3. **The SQL join.** `disposition_status`, `set_via` and `filed_settled` are join *outputs*
    in Go and array lookups in the mock. The fixture supplies both as *input*, so the
    filed-issues join's coordinate predicate is invisible here.
