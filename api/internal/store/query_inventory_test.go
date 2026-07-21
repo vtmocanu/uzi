@@ -87,7 +87,7 @@ import (
 // inventoryQueryFiles and nothing else. Re-derive the coverage arithmetic rather than
 // trusting a sentence — `grep -c '^-- name: ' queries/*.sql` gives the per-file counts and
 // `ls queries/*.sql | wc -l` the denominator. Measured at `ad6c63d9`: 290 queries across 28
-// files repo-wide; this file declares 46 of them across ten files. (The number this paragraph
+// files repo-wide; this file declares 52 of them across twelve files. (The number this paragraph
 // carried before was 276, written weeks of merges earlier and never re-derived; it is quoted
 // here only to make the point that the figure drifts and the command does not.)
 //
@@ -104,12 +104,30 @@ import (
 //	  -e POSTGRES_PASSWORD=... -p 127.0.0.1:<port>:5432 postgres:17 -c log_statement=all
 //	UZI_TEST_DATABASE_URL=... go test -count=1 -p 1 -run 'LiveDB$' ./internal/store/... ./internal/handler/...
 //	docker logs cdr-<yours>-pg > pg.log 2>&1        # ORDER MATTERS, see below
-//	grep -c -- '-- name: <QueryName> :' pg.log
+//	grep -- '-- name: <QueryName> :' pg.log | grep -vc 'STATEMENT:'
 //
-// It is exact rather than approximate: sqlc emits each query's `-- name: X :kind` header as the
-// FIRST LINE of the SQL it sends, so that string appears in the log once per execution and
-// belongs to exactly one query. No fuzzy matching, no false hits from a neighbouring statement —
-// which matters, since a generic `INSERT INTO runs` grep hits from 145 unrelated fixtures.
+// Anchor on the `-- name:` header, never on the query's body text: sqlc emits each query's
+// `-- name: X :kind` header as the FIRST LINE of the SQL it sends, so it belongs to exactly one
+// query. Body text does not — a partial index whose predicate is textually identical to the
+// query it serves gets emitted as DDL by store.Migrate on every fresh database, and a grep on
+// that WHERE clause counts the DDL as an execution. Keep the trailing ` :` too: without it,
+// `ListAppSettings` also matches `ListAppSettingsForUpdate`.
+//
+// 🔴 AND EXCLUDE `STATEMENT:` LINES, which is the correction this note needed after it was
+// first written. Postgres echoes the offending statement on a `STATEMENT:` line beside every
+// ERROR, so any query a test makes fail — an expected unique violation, a deliberate conflict —
+// is logged TWICE and counted twice. Measured here: 17 such lines across one sweep, inflating 10
+// queries (CreateUserOIDC 32->27, InsertUserSecret 129->126, UpsertRecommendationDisposition
+// 7->5). None of the figures already published in this file moved, because the affected queries
+// were inside a stated range rather than quoted individually — luck, not method.
+//
+// THE THREE WAYS THIS MEASUREMENT LIES, ALL FOUND BY USING IT, and they do not point the same
+// way — which is why each needs its own guard rather than general care:
+//   - a broken capture UNDER-counts to zero (see the stderr note below);
+//   - a body-text anchor OVER-counts by catching DDL;
+//   - a `STATEMENT:` echo OVER-counts by double-counting errors.
+// A zero is the only reading that no over-count can fake, and it is also the reading this file
+// leans on hardest — so verify the capture before trusting one.
 //
 // 🔴 `docker logs X > f 2>&1` AND `docker logs X 2>&1 > f` ARE NOT THE SAME COMMAND, and
 // Postgres logs to STDERR. The second sends stderr to the terminal and only stdout to the file,
@@ -127,11 +145,13 @@ import (
 //	0  ListCLITokens                                                 (cli_tokens.sql)
 //	0  ListNotificationsForUser, CountUnreadNotificationsForUser,
 //	   MarkNotificationRead, ListAllNotifications, CountAllNotifications (notifications.sql)
+//	0  GetUserVault, CreateUserVaultIfAbsent, DeleteUserVault      (user_vaults.sql — ALL of it)
+//	0  ListAppSettingsForUpdate                                    (settings.sql)
 //	1  CountActiveSelfImproveRuns  — the row that was wrong
 //	35 TouchCLIToken               — runs constantly, asserted nowhere
 //	1..39 everything else
 //
-// Those eight zeroes are exactly the eight UNPINNED rows below, and the two non-zero sentinels
+// Those twelve zeroes are exactly the twelve UNPINNED rows below, and the two non-zero sentinels
 // are exactly the two EXERCISED-UNASSERTED rows. That correspondence is the check: if a row's
 // state and its execution count ever disagree, the ROW is wrong.
 //
@@ -322,6 +342,8 @@ var inventoryQueryFiles = []string{
 	"cli_tokens.sql",
 	"notifications.sql",
 	"agent_memory.sql",
+	"user_vaults.sql",
+	"settings.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -562,6 +584,63 @@ var queryInventory = []queryPin{
 		"direct call, :147 and :154 — owner scoping in BOTH directions: a foreign user's delete " +
 			"affects 0 rows, then the owner's delete of that SAME id affects 1, which proves the 0 " +
 			"was the predicate and not a missing row"},
+
+	// ── user_vaults.sql — ALL THREE UNPINNED, and this is the convergence worth naming ──
+	// The per-user vault (Argon2 KEK + wrapped DEK) is the mechanism protecting every
+	// sealed_with='dek' secret, and NOT ONE of its queries has executed against a database.
+	// Measured, 0/0/0. It is not that nobody wrote a live test near it — four live-DB files
+	// mention "vault", which is exactly the false positive a name-based scan would report.
+	// They do not reach these queries: secrets_crud_livedb_test.go:24 states it passes a NIL
+	// vault on purpose ("real box (nil vault → the master-box seal path, which is all these
+	// tests need)"), a deliberate and locally reasonable choice that leaves the vault path
+	// with no live exercise anywhere.
+	//
+	// 🔴 THIS MEETS THE WAVE'S OTHER VAULT FINDING. The same surface has /vault/unlock and
+	// /vault/passphrase sitting unguarded by any limiter-mount assertion. So the vault is
+	// simultaneously the place where a brute-force guard is unasserted and the place where no
+	// SQL has been executed under test. Recorded here rather than left implicit in three rows,
+	// because the two gaps are individually minor and jointly the weakest surface in the tree.
+	{"GetUserVault", "user_vaults.sql", unpinnedPin,
+		"0 executions. Production callers are vault.go:117, :200 and :265; every test in its path " +
+			"is a fake (vault/vault_test.go:76, workersvc/vault_gate_test.go:27, " +
+			"handler/vault_test.go:31), each returning a canned store.UserVault. So the SELECT that " +
+			"fetches the KEK salt and wrapped DEK has never run against the real table"},
+	{"CreateUserVaultIfAbsent", "user_vaults.sql", unpinnedPin,
+		"0 executions — and it is the query in this file whose whole point a fake CANNOT stand in " +
+			"for. Its `ON CONFLICT (user_id) DO NOTHING` exists to make two concurrent first-unlocks " +
+			"safe: one insert wins, the loser gets pgx.ErrNoRows and re-reads the winner's row, so " +
+			"the cached DEK always equals the persisted one. That is a race fixed by database " +
+			"semantics, and a fake has no unique index to conflict on. The comment states the " +
+			"consequence of getting it wrong (each request caching a different DEK than the DB " +
+			"holds); nothing has ever made Postgres produce the conflict"},
+	{"DeleteUserVault", "user_vaults.sql", unpinnedPin,
+		"0 executions, and it has NO CALLER AT ALL — not a test, not production. `rg` over " +
+			"internal/ and cmd/ finds only the generated method. It is a deliberate primitive for " +
+			"PRD #32's password reset (its own comment says reset is out of scope and this is what " +
+			"that flow will build on), so it is dead-but-intended rather than dead-by-accident. " +
+			"Worth a row precisely because 'unused' and 'untested' are indistinguishable from a " +
+			"coverage report, and only one of them is fine"},
+
+	// ── settings.sql — the write path and the plain read are pinned; the LOCK is not ──
+	{"UpsertAppSetting", "settings.sql", "TestSlackBotTokenSealedAtRestLiveDB",
+		"direct call, slack_integration_test.go:191 (1 execution). Discriminating rather than " +
+			"incidental: the test writes a sealed Slack bot token through it, then reads the row " +
+			"back with raw SQL and asserts the stored value neither equals nor contains the token, " +
+			"decodes as base64, and has no plaintext in the ciphertext"},
+	{"ListAppSettings", "settings.sql", "TestSlackBotTokenSealedAtRestLiveDB",
+		"2 executions in that test, reached through settings.New(q,0).AdminView() at :215 — NOT a " +
+			"direct call, so a body scan sees the constructor and not the query. The AdminView it " +
+			"builds is then asserted three ways (secret reported configured, the secret key absent " +
+			"from Values, and no token or ciphertext bytes anywhere in the rendered struct), so the " +
+			"rows this query returns are what those assertions are about"},
+	{"ListAppSettingsForUpdate", "settings.sql", unpinnedPin,
+		"0 executions. Its only caller is handler/settings.go:203, inside the settings PUT " +
+			"transaction, and no live test drives that route. The `FOR UPDATE` is the entire " +
+			"difference from ListAppSettings above: it row-locks so a concurrent PUT blocks and " +
+			"reads this writer's committed values, which is what closes PRD #19 M2's cross-key " +
+			"prd_label != autopilot_label TOCTOU. A lock that is never taken under contention is a " +
+			"lock nothing has tested — and like the vault's ON CONFLICT, it is a property no fake " +
+			"can exhibit, because a fake has no transactions"},
 
 	{"TouchCLIToken", "cli_tokens.sql", unassertedPin,
 		"EXECUTES on every accepted Bearer request in the CLI live-DB suite " +
