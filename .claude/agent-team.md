@@ -125,7 +125,10 @@ decides where the next person spends their time. Re-derive those too.
   just passed. `test:api-store-it` now fails on zero-passed or any-skipped for
   exactly this reason. **Re-measured on PRD #98 (2026-07-21) because three agents
   had each leaned on weaker evidence anyway:** with the var unset the sweep exits
-  `0`, both packages print `ok`, and the tally is `RUN=108 PASS=0 SKIP=108`.
+  `0`, both packages print `ok`, and the tally is `RUN=n PASS=0 SKIP=n` — every
+  test in the suite ran nothing. (It was `108` that day and `128` within hours.
+  **The run count is whatever the suite holds when you read this; `PASS=0` is the
+  finding.**)
   Exit code and "no failures printed" are *both* satisfiable by a run in which
   not one assertion executed. Require a **positive control** — the named test
   appears as `--- PASS`/`--- FAIL`, zero `--- SKIP`, `RUN > 0` — and treat any
@@ -210,6 +213,22 @@ was comment-only: no SQL, no fixture row, no assertion changed.
 **The point of the entry is the cost.** Without the split, the honest response to
 "your tree was stale" is to re-run eleven folds that nothing invalidated — and a
 rule expensive enough to get abandoned protects nothing.
+
+**1b-i. DATING A NUMBER IS NOT THE SAME AS BOUNDING IT.** *"Measured 2026-07-21:
+`RUN=108`"* is honest and still misleads, because the reader's question is not
+"was this true then" but *"is what I am seeing now consistent with it"*. State
+which part is durable and which is incidental — `PASS=0` is the finding, `108`
+is that day's inventory; **"the ENTIRE suite went green"** is the finding, `126`
+is the receipt. Bind the incidental half to a **SHA**, not a date: a date names
+when someone typed, a SHA names the tree the number describes.
+
+Evidence, and it is the strongest form the rule has: **this exact figure drifted
+`108 → 128` inside one day, across three sites, written by two authors who had
+both just adopted the rule about drifting counts** — and a third author then
+corrected two of the three and left the fourth, in a file it had open. Four
+rule-holders, one number. Corollary worth keeping: when you fix an instance of
+this, **grep for the DEFECT (`RUN=`, `PASS=`, a bare tally), not for the string
+you just changed** — grepping the string is what leaves the fourth site.
 
 **1c. WHEN AN INSTRUCTION SAYS "VERBATIM", IT BINDS THE CLAIM AND NOT THE
 EXAMPLES.** A claim generalises; an example is a measurement with a shelf life,

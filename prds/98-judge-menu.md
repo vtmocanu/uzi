@@ -41,7 +41,7 @@ for. See the milestone entries for what was measured.
 
 **Superseded progress note (2026-07-20, end of day)** — 5 of 8 milestones landed on `feature/prd-98-judge-menu`, no MR yet:
 - **Done + reviewed + audited**: M1 (`0874d3f6`), M2 (`30204a61`, rewritten to one atomic statement in `082d8651`/`c962435d`), M6 (`d6a8545c`), M4 (`1da5ac32`). Full Go + web + live-DB gates pass at the tip.
-- **Done, review PENDING**: M3 (Judge page + nav, `c629ce28`) — the largest milestone, first substantial `web/` surface. Gates green (web typecheck + 837 tests + build; api build/vet/test), the four validator pre-flags built in and test-pinned, but it has **not yet had a review/audit wave** — that is the first task next session. Six implementation decisions are flagged for confirmation in the M3 checkpoint; one (anchored deep-link defaulting to `bucket=all`, not `todo`) is a product-behaviour call touching M5.
+- **Done, review PENDING**: M3 (Judge page + nav, `c629ce28`) — the largest milestone, first substantial `web/` surface. Gates green (web typecheck + 837 tests + build; api build/vet/test) — 837 is the vitest count **at `c629ce28`**, not a current figure, the four validator pre-flags built in and test-pinned, but it has **not yet had a review/audit wave** — that is the first task next session. Six implementation decisions are flagged for confirmation in the M3 checkpoint; one (anchored deep-link defaulting to `bucket=all`, not `todo`) is a product-behaviour call touching M5.
 - **Not started**: M7 (CLI), M5 (notification retarget — its `/judge` + `?run=` route dependency is now satisfied), M8a (vitest + docs + specs). **M8b (e2e) stays blocked** on #97.
 - **One Blocking bug** found and fixed before merge: a duplicate-coordinate `SQLSTATE 21000` crash on legal judge output, invisible to fakes (the M2 fan-out collapse; fixed with `DISTINCT ON` on the resolved member set, `c962435d`).
 - **Open follow-ups**: **AK** — a bucket-literal→constant sweep is partial; the producer side (`BucketOf` in `triage.go`, #94's shared helper) is deliberately left as a cross-PRD change, with `TestBucketConstantsMatchTheLadder` pinning the coupling meanwhile. **AL** — a comment-precision split in `judge_bulk_disposition.go`. Both tracked in the M3 checkpoint.
@@ -662,7 +662,8 @@ exactly as #68 already does.
       with coordinates there is no id to 404 on, so a status-only assertion is
       vacuous.
 - [x] **M3 — Judge page + nav (web)** — DONE `c629ce28`; reviewed + audited. Web gates green
-      (`typecheck` + 837 vitest). **One interpretation to confirm:** an anchored
+      (`typecheck` + 837 vitest **at `c629ce28`**; the suite has grown since — cite the SHA,
+      not the tally). **One interpretation to confirm:** an anchored
       deep-link (`/judge?run={id}`) with no explicit `?bucket=` defaults to the `all`
       bucket, not `todo`, so a notification reliably shows that run's recs even when its
       coordinates rolled up settled elsewhere (dedup); un-anchored still defaults `todo`.
@@ -842,7 +843,7 @@ failures observed" WITH NOTHING EXECUTED**, and no single weaker check catches a
 
 | mechanism | what it looks like | what misses it |
 |---|---|---|
-| the suite skipped (no DSN) | `rc=0`, both packages `ok`, `RUN=108 PASS=0 SKIP=108` | exit code, "no FAIL lines" |
+| the suite skipped (no DSN) | `rc=0`, both packages `ok`, `RUN=n PASS=0 SKIP=n` (`n` was 108 that day, 128 within hours — `PASS=0` is the finding) | exit code, "no FAIL lines" |
 | the mutation silently did not apply | a real, fully green run of **unmutated** code | everything except diffing the file |
 | the run never happened | `run-store-it.sh` exits 1, log holds only "postgres never became ready", `PASS=0 SKIP=0 FAIL=0` | "no FAIL lines" |
 
@@ -1045,7 +1046,9 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       both directions. Measured, each fold on a fresh throwaway Postgres with the positive
       control passing (control RUN/PASS lines = 2, `SKIP == 0`) and the restore verified by
       `sqlc generate` giving a zero diff:
-      **baseline GREEN** (129 PASS / 0 FAIL / 0 SKIP);
+      **baseline GREEN** (129 PASS / 0 FAIL / 0 SKIP **at `31080a40`** — the tally is the
+      receipt for "0 FAIL across the whole suite", and it is bound to a SHA because it was 126
+      at `8c6be2b8` and 128 at `c1fcdfce`; the count is that tree's inventory, not a constant);
       **`ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target` →
       `ON f.review_id = rv.id`** ⇒ **RED**, `updated = 0` (the one filed row cross-matches its
       sibling coordinate, so BOTH members bucket `filed` and neither is open);

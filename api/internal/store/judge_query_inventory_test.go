@@ -30,8 +30,8 @@ import (
 // Neither was fixed by this mechanism, and neither would have been.
 //
 // (The suite tally from that measurement — 126 pass / 0 fail — is bound to `8c6be2b8`,
-// where it ran, and is not repeated as a live figure: 128 by `c1fcdfce`, 129 at this
-// commit. Corroborated independently rather than taken on trust: the count of top-level
+// where it ran, and is not repeated as a live figure: 128 by `c1fcdfce`, 129 by
+// `31080a40`. Corroborated independently rather than taken on trust: the count of top-level
 // Test*LiveDB functions across internal/store + internal/handler is 108 / 110 / 111 at
 // those three SHAs, and the +2 / +1 deltas match. A tally drifts exactly like a line
 // number, so the mechanism is the claim and the number is only its receipt.)
