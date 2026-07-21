@@ -31,6 +31,12 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    `run_message_instance_integration_test.go`, `specs/ai.md` ×2, `mocks/data.ts` — every one
    of them naming **main's** `00075`, plus four `prds/done/` + `adr/` hits that are other
    PRDs' historical drafts. A tree-wide `sed 00075→00081` would have corrupted all ten.
+   **Provenance, stated precisely because the timing decides what this is evidence OF:** the
+   auditor sent the same seven-file list as a mid-merge warning, and it arrived **after** the
+   merge was committed. So this is **two derivations reaching the same answer without reading
+   each other**, not "the auditor warned and the coder complied" — a message that arrives too
+   late to have caused anything cannot be credited with having done so. The independence is
+   the finding; a warning would have been worth less.
 3. **Merge `origin/main`**, then re-run the three gates (api, web, `./e2e/run-store-it.sh`)
    before the MR. The live sweep needs its positive control checked, not just its exit code.
 4. **Then the MR**, after a review pass.

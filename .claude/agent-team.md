@@ -215,6 +215,14 @@ whose shell has a persisted working directory, which is everyone running verific
 lists and mechanisms survive from a mid-merge tree; counts do not. Cite the former, re-derive
 the latter on the committed merge.
 
+**A FAILED GREP IS NOT EVIDENCE THE TEXT IS ABSENT.** A quoted anchor can be present and
+unmatchable — wrapped across a line break, reflowed, or differing in whitespace. Read the
+section before reporting "not found". Same family as *a measurement is bound to a working
+tree*: in both, the tool's SILENCE reads as a finding when it is only a limit of the query.
+Evidence: the lead quoted an anchor for this very amendment that did not match the coder's
+grep because the sentence wrapped; the coder read the section and landed it correctly instead
+of replying "anchor not found".
+
 Worked example, both halves from one day: the auditor reported a comment gap at
 `c1fcdfce` that `a2b554a6` had already closed — genuinely stale. Its **fold**
 results from the same run still stood, because
