@@ -167,8 +167,11 @@ var judgeQueryInventory = []queryPin{
 		"WAS the one UNPINNED row, and this mechanism is how it was found — it named a query " +
 			"nobody was looking at, outside the work that motivated the inventory. Now pinned by " +
 			"judge_trace_inputs_integration_test.go: run scoping, every kind (not just follow_up), " +
-			"oldest-first, and the cap taking the OLDEST n. Three folds, each RED — ORDER BY id DESC, " +
-			"a neutered run predicate, and a follow_up-only filter."},
+			"oldest-first, and the cap taking the OLDEST n. FOUR folds, each RED, hitting THREE " +
+			"distinct assertions: ORDER BY id DESC and a cap-from-the-wrong-end subquery isolate " +
+			"the order and the cap; a neutered run predicate and a follow_up-only filter both land " +
+			"on the same row-count check. NOT covered, and the fixture cannot cover it: " +
+			"consumed_at and created_at (see the note at the fixture)."},
 	{"UpsertRunReviewWithRecommendations", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:103"},
 	{"GetRunReviewForTarget", "judge.sql", "TestJudgeQueriesLiveDB",

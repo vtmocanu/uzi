@@ -62,6 +62,14 @@ func TestListRunInputsForRunLiveDB(t *testing.T) {
 	// the same value cannot tell "the right rows in the right order" from "some rows" — the
 	// memberRow lesson this branch keeps relearning. The kinds are mixed deliberately: this
 	// query must return ALL of them.
+	//
+	// 🔴 WHAT THIS FIXTURE CANNOT PIN, stated so the inventory entry is not read as covering
+	// it: `consumed_at` and `created_at` are projected by the query and asserted by NOTHING
+	// here — and the fixture could not assert them even if it tried, because the insert
+	// supplies only (run_id, kind, body), so every row takes `consumed_at = NULL` and a
+	// `created_at` of now() within the same second (00020_workers_runs.sql). A fold of either
+	// column is invisible for two independent reasons, and either one alone would be enough.
+	// Closing it needs varied values per row, not another assertion.
 	insert := func(kind, body string) {
 		mustExec(ctx, t, pool,
 			`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, $2, $3)`, runID, kind, body)
@@ -129,10 +137,21 @@ func TestListRunInputsForRunLiveDB(t *testing.T) {
 		}
 	}
 
-	// (4) THE CAP TAKES THE OLDEST N — the property with real consequences, and the one a
-	// direction flip cannot hide from. Reversing ORDER BY would still return two rows in a
-	// self-consistent order; it would return the WRONG TWO. This is Decision 4's stated
-	// behaviour: under a cap the judge keeps the longest-waiting inputs, not the latest.
+	// (4) THE CAP TAKES THE OLDEST N — Decision 4's stated behaviour: under a cap the judge
+	// keeps the longest-waiting inputs, not the latest.
+	//
+	// MEASURED REACHABLE, because "strongest property" was asserted here before it was shown.
+	// None of the first three folds executes this line — `:102` and `:96` are t.Fatalf and one
+	// of them dies first every time — so it was credited from behind an earlier failure, the
+	// mistake this file's own note about the by-kind loop already calls out. A fourth fold
+	// isolates it: keep the presentation order correct and cut from the wrong END, i.e.
+	// `(SELECT … ORDER BY id DESC LIMIT @lim) t ORDER BY t.id ASC`. That leaves the uncapped
+	// read entirely correct — `:96` and `:102` pass — and reddens ONLY this assertion, with
+	// `capped read = [3-third 4-newest]`.
+	//
+	// The obvious fold does NOT work, which is why the shape above is specific: applying
+	// `LIMIT` before any `ORDER BY` returns heap order, and on a table this small that is
+	// insertion order, so it would return the right two BY LUCK and prove nothing.
 	capped, err := q.ListRunInputsForRun(ctx, store.ListRunInputsForRunParams{RunID: runID, Lim: 2})
 	if err != nil {
 		t.Fatalf("ListRunInputsForRun capped: %v", err)
@@ -140,6 +159,7 @@ func TestListRunInputsForRunLiveDB(t *testing.T) {
 	if got, wantCap := bodies(capped), []string{"1-oldest", "2-second"}; len(got) != 2 ||
 		got[0] != wantCap[0] || got[1] != wantCap[1] {
 		t.Fatalf("capped read = %v, want %v — @lim must cut from the NEWEST end, keeping the "+
-			"oldest inputs (Decision 4). Getting the newest two means ORDER BY is descending", got, wantCap)
+			"oldest inputs (Decision 4). Getting the newest two means the cap was applied to a "+
+			"descending scan, whether or not the rows are PRESENTED in ascending order", got, wantCap)
 	}
 }
