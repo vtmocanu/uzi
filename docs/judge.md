@@ -23,12 +23,17 @@ judge for any individual user from **Admin → Users**.
 ## What you get
 
 When a judged run finishes (completed or failed — a cancelled run is never
-judged), a review lands in four places:
+judged), a review lands in five places:
 
 - **The run page**: a verdict chip (Ideal / OK / Issues found) plus a list of
   recommendations, each with a category, a target (the tool/agent/repo it's
   about), a rationale, and a confidence level.
-- **Your [inbox](#the-inbox)**: a "Run review ready" notification.
+- **The [Judge menu](./judge-menu.md)**: the cross-run backlog, where the same
+  recommendation raised by many runs is **one row** to triage once. This is
+  where you work the list; the run page is where you see one run's verdict.
+- **The runs list**: each judged run's row carries a `⚖ verdict · N` badge.
+- **Your [inbox](#the-inbox)**: a "Run review ready" notification, which opens
+  the Judge menu anchored to that run.
 - **Slack** (if you've linked your account): the same summary as a DM.
 - **The [uzi CLI](./cli.md)**: `uzi review show <run-id>` prints the same
   verdict, recommendations, and your triage state from the terminal — see
@@ -156,10 +161,12 @@ happened.
 
 Two places tally the same four buckets from the same server-computed counts,
 so they can never disagree: a **triage bar** at the top of each judged run's
-recommendations, and a **"Judge recommendations · all your runs"** strip
-above your runs list (it appears once you have at least one triaged
-recommendation). Both break out **false positives** — how many "Not an
-issue" dismissals you've made — as a sub-count of Dismissed.
+recommendations, and the header of the **[Judge menu](./judge-menu.md)**,
+which counts all your runs at once. Both break out **false positives** — how
+many "Not an issue" dismissals you've made — as a sub-count of Dismissed.
+(The all-runs tally used to sit as a strip above the runs list; it moved to
+the Judge menu, and each run's row on that list gained its own
+`⚖ verdict · N` badge instead.)
 
 **No token spent, nothing written to GitLab.** Setting or undoing a
 disposition is a local, instant action: it never calls the judge model and
@@ -169,6 +176,16 @@ never touches the forge.
 recommendation you mark **Done** or **Dismiss** drops out of that job's
 backlog, the same way filing an issue for it already does; **Undo** puts it
 back next cycle.
+
+**Closing the filed issue marks it done for you.** Once the issue you filed
+is closed on the forge, uzi moves that recommendation to Done by itself,
+labelled "done via #IID" — once, and never over a verdict you set yourself.
+See [Closing a filed issue marks it done](./judge-menu.md#5-closing-a-filed-issue-marks-it-done)
+for the two preconditions.
+
+**Triage one idea once, across every run.** The same recommendation recurring
+in ten runs is ten coordinates here, but a single row on the
+**[Judge menu](./judge-menu.md)**, where one action settles all of them.
 
 **If a re-judge stops raising a recommendation you'd triaged** (its next run
 just doesn't surface that finding again), your disposition is kept but goes
@@ -191,6 +208,12 @@ own; an admin can switch to **All users** to see everyone's (each row shows
 its owner). Unread rows are highlighted; **Mark read** clears them from your
 unread count. Marking read is scoped to your own rows even in the admin
 all-view.
+
+A run of consecutive review notifications collapses into one "N reviews
+ready" header you can expand — the rows underneath keep their own read state
+and **Mark read**. A review row opens the
+**[Judge menu](./judge-menu.md)** anchored to its run; every other kind of
+notification still opens its run.
 
 That same unread count, together with your own runs' state, also drives a
 small dot on the browser tab icon: rose if one of your runs has failed,

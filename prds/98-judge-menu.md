@@ -30,12 +30,12 @@ rationales per row and the folds were run; the bulk query's own filed-issues joi
 at `31080a40`. M5 (item 2) landed at `a48c5afe` with the together-mount test the item asked
 for. See the milestone entries for what was measured.
 
-**Handoff document:** `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` — branch state, standing rules with the incident behind each, the docker safety rule about the user's real stack, the projection-pin criterion, and the pre-MR gate.
+**Working rules:** `.claude/agent-team.md` (tracked) — the citing-across-a-moving-tree rules and the repo's measured traps; `CLAUDE.md` for the live-DB green rule, the sqlc fold-shape rule and the never-glob-`uzi-` docker rule. **The pre-MR migration gate is at the top of this file (see "RESUME HERE"), not in a handoff doc** — it must be re-derived, never inherited. *(Corrected 2026-07-21: this line used to point at `.claude/agent-team-tasks/prd-98-m3-checkpoint.md`, which `.gitignore:27` excludes, so after the merge the pointer resolves to nothing — and what it sent readers to fetch was the migration gate. The durable sections were migrated to `.claude/agent-team.md` in `234236c2`.)*
 
 - **Done, reviewed + audited**: M1 (`0874d3f6`), M2 (`30204a61`, later collapsed to one atomic statement), M6 (`d6a8545c`), M4 (`1da5ac32`), M3 (`c629ce28`), M7 (`de2d8de3`). Plus a merge of `origin/main` (`ad5abca1`, 38 commits — PRD #97 landed, which unblocked M8b).
 - **In this MR**: M5, M8a docs, and the last open Blocking (a measured-false CLI instruction).
 - **Still open IN THIS PRD after the MR** — see "Remaining work" below. Four items, all with recorded evidence.
-- **Handoff notes**: `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` is the resume document — branch state, standing rules with the incident behind each, the docker safety rule, and the pre-MR migration gate.
+- **Handoff notes**: the durable rules live in `.claude/agent-team.md` and `CLAUDE.md`, both tracked. The pre-MR migration gate is in the RESUME block at the top of this file. *(The former `.claude/agent-team-tasks/` checkpoint is gitignored and does not survive the merge — see line 813, which says so.)*
 
 **What the review loop cost and bought** (recorded because it shaped the design): 3 Blocking in M3's first wave, then **every Blocking after M3 was about evidence rather than behaviour** — seven SQL projections no test executed, tests asserting properties of `encoding/json` rather than of the service, assertions credited for gates they sit behind, comments crediting guards in other files, and two printed CLI instructions that had never been run and were false. The implementation was sound throughout; the layer certifying it was not.
 

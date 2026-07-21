@@ -141,7 +141,8 @@ uzi review stats [--json]                                    # your triage tally
 
 `show` is one run. `backlog` is every recommendation across **all** your runs,
 deduped by `(category, target)`, so one that recurs in five runs is a single
-row reading `seen in 5 runs`:
+row reading `seen in 5 runs` — the terminal form of the
+[Judge menu](./judge-menu.md):
 
 ```sh
 uzi review backlog                                           # what still needs triage
