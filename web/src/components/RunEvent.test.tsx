@@ -114,6 +114,39 @@ describe("describeStatus", () => {
       "status: result/error_max_turns",
     );
   });
+
+  // PRD #108 M3: the worker replaces a permanently-rejected message with a
+  // tombstone under the SAME seq, because runStream.ts renders nothing past a seq
+  // gap — a true drop would freeze the live run view for the rest of the run. That
+  // only helps if the tombstone is VISIBLE, so this asserts the render rather than
+  // the shape: a tombstone nobody sees is a silent hole by another mechanism.
+  //
+  // The payload is copied from what `tombstone()` in agent/src/batcher.ts actually
+  // mints (kind "status", `text` first, original kind + bytes as data).
+  it("renders a PRD #108 message tombstone visibly, verbatim and in the DOM", () => {
+    const payload = {
+      text: "message dropped: payload rejected by the api (kind tool_result, 25418 bytes)",
+      event: "message_dropped",
+      reason: "payload rejected by the api",
+      kind: "tool_result",
+      bytes: 25418,
+    };
+    expect(describeStatus(payload)).toBe(
+      "message dropped: payload rejected by the api (kind tool_result, 25418 bytes)",
+    );
+    // And it survives all the way to the screen, not just out of the pure helper.
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 273, kind: "status", payload })} live={false} />,
+    );
+    expect(container.textContent).toContain("message dropped: payload rejected by the api");
+    // The size marker (a 413 at size 1) takes the same path.
+    expect(
+      describeStatus({ text: "message too large to deliver: the api cannot accept a message this large (kind tool_result, 1048577 bytes)" }),
+    ).toContain("message too large to deliver");
+    // Belt: even if a future worker mints the marker WITHOUT a text field, the
+    // unknown-event fallback still renders something rather than nothing.
+    expect(describeStatus({ event: "message_dropped" })).toBe("status: message_dropped");
+  });
 });
 
 describe("describeError", () => {

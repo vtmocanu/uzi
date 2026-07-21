@@ -23,6 +23,7 @@ import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
 import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
+import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
 import type {
   ClaimResponse,
@@ -215,16 +216,22 @@ export class JudgeRunner {
       return await Promise.race([this.consumeModel(token, model, prompt, homeDir, abort), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
-      // PRD #108 M6 (N4): still `fs.rm`, not `rmTreeForce` — a judge run fetches a
-      // trace and calls the model, so it populates no Go module cache and has no
-      // observed EACCES exposure. But the swallow used to be TOTAL, and the M6
-      // reclaim sweep will never collect this directory either: it is named
-      // `uzi-judge-*`, not a run UUID, so the sweep's RUN_ID_RE filter skips it by
-      // design. If one ever does strand, this warn is the only thing that will say
-      // so. Still best-effort — a cleanup must not fail a judge run.
-      await fs
-        .rm(homeDir, { recursive: true, force: true })
-        .catch((e) => this.log.warn("judge HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }));
+      // PRD #108 M6: the same permission-restoring removal the run lane uses.
+      //
+      // The EXPOSURE differs from a run's HOME — a judge run fetches a trace and
+      // calls the model, so it populates no Go module cache and no EACCES leak has
+      // been observed here — but the MECHANISM is identical, and shipping the fix
+      // at one of two identical call sites reads as an oversight six months out.
+      //
+      // The warn matters more than the helper swap. This used to be a total
+      // swallow (`.catch(() => {})`), and the M6 reclaim sweep will never collect
+      // this directory either: it is named `uzi-judge-*`, not a run UUID, so the
+      // sweep's RUN_ID_RE filter skips it BY DESIGN. If one ever strands, this line
+      // is the only thing anywhere that will say so. Still best-effort — a cleanup
+      // must never fail a judge run.
+      await rmTreeForce(homeDir).catch((e) =>
+        this.log.warn("judge HOME cleanup failed", { home_dir: homeDir, error: errMessage(e) }),
+      );
     }
   }
 
