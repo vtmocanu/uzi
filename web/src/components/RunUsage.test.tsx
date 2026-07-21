@@ -9,7 +9,7 @@ afterEach(cleanup);
 
 let seq = 0;
 function m(kind: string, agent: string | null, payload: unknown): RunMessage {
-  return { seq: ++seq, kind, agent, payload, created_at: "2026-07-12T00:00:00Z" };
+  return { seq: ++seq, kind, agent, agent_instance: null, agent_label: null, payload, created_at: "2026-07-12T00:00:00Z" };
 }
 
 // A two-phase run: plan + one implement iteration, with per-agent assistant usage.

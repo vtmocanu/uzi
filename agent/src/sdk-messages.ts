@@ -10,6 +10,36 @@
 // Partial/streaming events (`type: 'stream_event'`) are intentionally NOT
 // mapped: they are token deltas, and persisting them would flood the gapless
 // seq stream. M3 persists discrete blocks; the live-UI partial channel is M5.
+//
+// ── Replay frames and the missing role (PRD #99 M2 decision, 2026-07-20) ──────
+// `SDKUserMessageReplay` (sdk.d.ts:4334) is the transcript re-delivery variant.
+// It carries `parent_tool_use_id` but has NEITHER `subagent_type` NOR
+// `task_description`, and its `type` is `'user'` exactly like `SDKUserMessage`,
+// so it maps through `mapUser`. A replayed subagent tool_result therefore emits
+// `agentInstance` SET while `agent` falls back to "lead" and `agentLabel` is
+// absent — a message attributed to the lead but keyed to a subagent's lane.
+//
+// This is left UNCORRECTED in the worker, for two reasons:
+//
+//  1. It is not reliably detectable here. The two variants are structurally
+//     identical apart from `uuid`/`session_id` being REQUIRED on the replay and
+//     OPTIONAL on the normal frame (verified against the pinned 0.3.201
+//     typings). That distinction does not exist at runtime — ordinary user
+//     frames do carry both fields in practice (`sessionIdOf` reads `session_id`
+//     off any message) — so there is no honest `isReplay` predicate to write.
+//     A guess would be a silent mis-tag, which is worse than the gap.
+//  2. Even given perfect detection, the worker has nothing better to put in
+//     `agent`: the replay frame genuinely does not carry the role. Inventing one
+//     (a "subagent" sentinel, or reusing the previous frame's role) would need
+//     the correlation state this design exists to avoid, and would PERSIST the
+//     guess — `run_messages.agent` is denormalized with no backfill, so a wrong
+//     value is permanent.
+//
+// The fix therefore belongs on the read side, where it is free and self-
+// correcting: the pane derives a lane's role and label from the first message in
+// the lane with a NON-NULL value rather than from the lane's first message, so
+// the lane heals as soon as any frame in it carries the role. Recorded as
+// Decision 8's fourth degradation case in prds/99-activity-instance-lanes.md.
 
 import type { EmittedMessage } from "./executor.js";
 
@@ -29,6 +59,45 @@ function agentOf(msg: Record<string, unknown>): string {
   return asString(msg["subagent_type"]) ?? LEAD;
 }
 
+/**
+ * Per-frame attribution (PRD #99): WHO produced the frame, WHICH invocation of
+ * them, and WHAT that invocation was asked to do.
+ *
+ * All three are plain top-level fields on the SDK's complete assistant/user
+ * frames — `subagent_type` (sdk.d.ts:2777), `parent_tool_use_id` (:2765 /
+ * :4295), `task_description` (:2781) — read through the same narrow `asString`
+ * probe, so an SDK reshape degrades each to `undefined` (→ SQL NULL → the web's
+ * role-name fallback) rather than throwing. There is deliberately NO correlation
+ * state here: nothing is remembered between frames, which is what makes this
+ * correct across resume and across two subagents running at once.
+ *
+ * `parent_tool_use_id` is `string | null` and is null on the ORCHESTRATOR's own
+ * turns, so `asString` collapses null and absent to the same `undefined`. Read
+ * that as "this frame has no parent invocation", NOT as `agent === "lead"`: a
+ * repo roster may ship an agent NAMED `lead`, which is a real subagent and does
+ * carry a `parent_tool_use_id` (see `orphanInstanceKind` below for why the two
+ * must never be conflated).
+ */
+interface FrameAttribution {
+  agent: string;
+  agentInstance?: string;
+  agentLabel?: string;
+}
+
+function attributionOf(msg: Record<string, unknown>): FrameAttribution {
+  const at: FrameAttribution = { agent: agentOf(msg) };
+  // Assigned conditionally, never as an explicit `undefined`: the batcher copies
+  // a field onto the wire only when it is `!== undefined`, and the API maps an
+  // absent field to SQL NULL. Writing `agentInstance: undefined` would still be
+  // absent on the JSON wire, but the conditional keeps the emitted object's shape
+  // honest for the node --test assertions that check key presence.
+  const instance = asString(msg["parent_tool_use_id"]);
+  if (instance !== undefined) at.agentInstance = instance;
+  const label = asString(msg["task_description"]);
+  if (label !== undefined) at.agentLabel = label;
+  return at;
+}
+
 /** Content blocks of an assistant/user message (or [] if not an array). */
 function contentBlocks(message: unknown): Record<string, unknown>[] {
   const rec = asRecord(message);
@@ -39,24 +108,24 @@ function contentBlocks(message: unknown): Record<string, unknown>[] {
 
 /** Map an assistant frame's content blocks (text / thinking / tool_use). */
 function mapAssistant(msg: Record<string, unknown>): EmittedMessage[] {
-  const agent = agentOf(msg);
+  const at = attributionOf(msg);
   const out: EmittedMessage[] = [];
   for (const block of contentBlocks(msg["message"])) {
     switch (block["type"]) {
       case "text": {
         const text = asString(block["text"]);
-        if (text) out.push({ kind: "text", agent, payload: { text } });
+        if (text) out.push({ kind: "text", ...at, payload: { text } });
         break;
       }
       case "thinking": {
         const thinking = asString(block["thinking"]);
-        if (thinking) out.push({ kind: "thinking", agent, payload: { text: thinking } });
+        if (thinking) out.push({ kind: "thinking", ...at, payload: { text: thinking } });
         break;
       }
       case "tool_use": {
         out.push({
           kind: "tool_use",
-          agent,
+          ...at,
           payload: {
             id: asString(block["id"]),
             name: asString(block["name"]),
@@ -78,13 +147,13 @@ function mapAssistant(msg: Record<string, unknown>): EmittedMessage[] {
  * tool_result may carry structured content; it is passed through as-is.
  */
 function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
-  const agent = agentOf(msg);
+  const at = attributionOf(msg);
   const out: EmittedMessage[] = [];
   for (const block of contentBlocks(msg["message"])) {
     if (block["type"] !== "tool_result") continue;
     out.push({
       kind: "tool_result",
-      agent,
+      ...at,
       payload: {
         tool_use_id: asString(block["tool_use_id"]),
         content: block["content"],
@@ -156,6 +225,12 @@ export function mapSdkMessage(message: unknown): EmittedMessage[] {
     case "assistant":
       return mapAssistant(msg);
     case "user":
+      // NOTE (PRD #99): `SDKUserMessageReplay` (sdk.d.ts:4334) also has
+      // `type: 'user'` and lands here. It carries `parent_tool_use_id` but has
+      // NEITHER `subagent_type` NOR `task_description`, so such a frame emits
+      // agentInstance SET while `agent` falls back to "lead" and agentLabel is
+      // absent. That is DELIBERATELY not corrected here — see the decision note
+      // in this file's header. Do not add a replay guard without reading it.
       return mapUser(msg);
     case "result":
       return mapResult(msg);
@@ -185,6 +260,43 @@ export function isErrorResult(message: unknown): boolean {
   const msg = asRecord(message);
   if (!msg || msg["type"] !== "result") return false;
   return msg["subtype"] !== "success" || msg["is_error"] === true;
+}
+
+/**
+ * The frame type when a frame carries a `parent_tool_use_id` but NO
+ * `subagent_type` field — otherwise undefined. This is the `SDKUserMessageReplay`
+ * signature (sdk.d.ts:4334) and it should be IMPOSSIBLE on a well-formed frame,
+ * which is why it is worth an alarm rather than a silent normalization.
+ *
+ * The test is on the field's PRESENCE, never on `agentOf`'s output. That
+ * distinction is the whole point and it is easy to get wrong: `agentOf`'s
+ * `subagent_type ?? LEAD` collapses two genuinely different states into the same
+ * string `"lead"` —
+ *   - field ABSENT            → "lead"   (the replay case: actually anomalous)
+ *   - field PRESENT == "lead" → "lead"   (a repo-authored `lead` subagent, which
+ *                                         this repo explicitly supports:
+ *                                         repoagents.ts:46, and
+ *                                         `selectSubagents(source="repo")` applies
+ *                                         only an `exclude` check, so a repo
+ *                                         `lead` IS registered as a subagent)
+ * Anything keying off "is this the lead?" must decide which of the two it means.
+ * A value test here would fire on every frame of a healthy repo-`lead` subagent,
+ * making the signal mean "working as intended" and "replay artifact" at once.
+ *
+ * This is a DETECTOR, not a mutator: nothing is dropped or rewritten on the back
+ * of it. Its purpose is to keep the question observable — the decision to leave
+ * replay frames uncorrected (see this file's header) rests on the absence of
+ * these frames in practice, and without this line that absence could never be
+ * confirmed, only assumed. If it never fires, that reasoning stands on evidence;
+ * if it starts firing, the analysis is already waiting in the PRD's Decision 8.
+ * Do not delete it as defensive noise.
+ */
+export function orphanInstanceKind(message: unknown): string | undefined {
+  const msg = asRecord(message);
+  if (!msg) return undefined;
+  if (asString(msg["subagent_type"]) !== undefined) return undefined;
+  if (asString(msg["parent_tool_use_id"]) === undefined) return undefined;
+  return asString(msg["type"]) ?? "unknown";
 }
 
 /** Whether an SDK message is the terminal `result` frame. */

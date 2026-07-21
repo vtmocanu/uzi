@@ -59,9 +59,9 @@ function compactValue(v: unknown): string {
 // ── tool summaries ──────────────────────────────────────────────────────────
 
 // toolSummary derives a one-line argument gist for a tool call. Sub-agent spawns
-// (Task) surface their subagent_type so they are recognizable. Unknown tools
-// degrade to compact key: value pairs. The result is NOT truncated — callers
-// truncate for display and offer expansion.
+// surface their subagent_type so they are recognizable. Unknown tools degrade to
+// compact key: value pairs. The result is NOT truncated — callers truncate for
+// display and offer expansion.
 export function toolSummary(name: string | undefined, input: unknown): string {
   const rec = asRecord(input) ?? {};
   const s = (k: string): string => asString(rec[k]) ?? "";
@@ -84,6 +84,11 @@ export function toolSummary(name: string | undefined, input: unknown): string {
       const where = s("path");
       return where ? `${pat} in ${where}` : pat;
     }
+    // "Agent" is the tool a LIVE run actually spawns subagents with (the name the
+    // guardrails deny for nested spawns, guardrails.ts NESTED_AGENT_TOOL); "Task" is
+    // its legacy name, kept because historical runs persisted frames under it. Matching
+    // only "Task" left every live spawn falling through to the default key:value branch.
+    case "Agent":
     case "Task": {
       const kind = s("subagent_type");
       const gist = firstLine(s("description") || s("prompt"));
@@ -489,6 +494,9 @@ function toolIcon(name: string): ReactNode {
     case "Grep":
     case "Glob":
       return <SearchIcon />;
+    // Both spawn names get the bot icon — see toolSummary for why "Agent" is the live
+    // one and "Task" the legacy one.
+    case "Agent":
     case "Task":
       return <BotIcon />;
     case "WebFetch":

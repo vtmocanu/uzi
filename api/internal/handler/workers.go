@@ -257,11 +257,13 @@ func failureSnapshotWebURL(raw []byte) string {
 
 func messageToDTO(m store.RunMessage) apitypes.MessageDTO {
 	return apitypes.MessageDTO{
-		Seq:       m.Seq,
-		Kind:      m.Kind,
-		Agent:     textPtrValue(m.Agent.Valid, m.Agent.String),
-		Payload:   json.RawMessage(m.Payload),
-		CreatedAt: m.CreatedAt.Time,
+		Seq:           m.Seq,
+		Kind:          m.Kind,
+		Agent:         textPtrValue(m.Agent.Valid, m.Agent.String),
+		AgentInstance: textPtrValue(m.AgentInstance.Valid, m.AgentInstance.String),
+		AgentLabel:    textPtrValue(m.AgentLabel.Valid, m.AgentLabel.String),
+		Payload:       json.RawMessage(m.Payload),
+		CreatedAt:     m.CreatedAt.Time,
 	}
 }
 

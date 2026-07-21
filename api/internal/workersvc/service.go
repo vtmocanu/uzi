@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -315,8 +316,11 @@ type Params struct {
 // serves no live channel. Every method is best-effort and must never block or
 // error the persistence path (the DB write is authoritative).
 type Broadcaster interface {
-	// PublishMessage forwards one newly-persisted run message.
-	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
+	// PublishMessage forwards one newly-persisted run message. agentInstance and
+	// agentLabel are the PRD #99 per-frame subagent invocation id + task label,
+	// empty when the frame carried no parent_tool_use_id (not the same as
+	// agent == "lead": a repo-authored agent may legitimately be NAMED lead).
+	PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
 	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
@@ -341,9 +345,9 @@ type Broadcaster interface {
 // valid no-op broadcaster.
 type MultiBroadcaster []Broadcaster
 
-func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time) {
+func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time) {
 	for _, b := range m {
-		b.PublishMessage(runID, seq, kind, agent, payload, createdAt)
+		b.PublishMessage(runID, seq, kind, agent, agentInstance, agentLabel, payload, createdAt)
 	}
 }
 
@@ -965,12 +969,65 @@ func decodePackageList(raw []byte) []string {
 	return out
 }
 
+// Caps for the two PRD #99 attribution fields on the UNTRUSTED worker insert
+// path. `agent_label` is free, model-authored prose stored in a bare `text`
+// column, and Decision 1 repeats it on EVERY frame of an invocation — so one
+// label is stored N times, where N is that subagent's whole frame count. The
+// only other ceiling in the path is httpx.DecodeJSON's 1 MiB LimitReader, which
+// is PER BATCH, so a single message could otherwise carry a ~1 MiB label.
+//
+// This belongs here rather than in the pane: web-side truncation is a render
+// concern that does nothing for storage and nothing for `api/cmd/uzi`, a second
+// consumer that would print the full string to a terminal.
+//
+// 80 runes matches maxChatTitleRunes (workersvc/chat.go) — the closest analogue,
+// a one-line title derived from untrusted text — and the field is exactly that:
+// a lane title. The SDK's `task_description` mirrors the Agent tool's short
+// `description` argument (RunEvent.tsx already renders it through `firstLine`,
+// i.e. one line by construction), and the stub fixture's real labels are ~11
+// runes, so 80 is generous for the intended content while bounding the
+// amplification. NOT measured against a live SDK run — no live session is
+// available here; revisit if real labels are seen to clip.
+//
+// Truncate, never reject: a rejected batch is a lost message, and the label is
+// cosmetic. Rune-based, not byte-based, per the house idiom — byte-slicing can
+// split a multibyte rune into invalid UTF-8, which the INSERT then rejects
+// (spelled out at handler/cli_auth_flow.go:148).
+const (
+	maxAgentLabelRunes    = 80
+	maxAgentInstanceRunes = 128 // an SDK `toolu_*` id is ~30; this is headroom, not a fit
+)
+
+// truncateRunes caps s at n runes, cutting on a rune boundary so the result is
+// always valid UTF-8. No ellipsis: unlike a chat title this value is also a
+// grouping key on the read side, and appending a character would make a
+// truncated label collide differently than the raw one.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
+
 // IncomingMessage is one seq-numbered message a worker appends.
+//
+// Compat note: DecodeJSON sets DisallowUnknownFields, so a field a NEW worker
+// sends must already be DECLARED here in the release BEFORE that worker ships, or
+// the whole batch 400s and the batcher retries it forever. That rule is stated in
+// full on the register path (handler/worker_protocol.go, the Capabilities field);
+// it is repeated here because a reader of the messages path would not find it
+// there. The PRD #99 fields satisfy it: they were declared in M1, which lands
+// strictly before M2 starts emitting them.
 type IncomingMessage struct {
-	Seq     int32           `json:"seq"`
-	Kind    string          `json:"kind"`
-	Agent   string          `json:"agent"`
-	Payload json.RawMessage `json:"payload"`
+	Seq   int32  `json:"seq"`
+	Kind  string `json:"kind"`
+	Agent string `json:"agent"`
+	// AgentInstance/AgentLabel are the PRD #99 per-frame subagent invocation id
+	// (the SDK's parent_tool_use_id) and its task description. Both are absent
+	// when the frame carried no parent_tool_use_id; empty string persists as NULL.
+	AgentInstance string          `json:"agent_instance,omitempty"`
+	AgentLabel    string          `json:"agent_label,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
 }
 
 // AppendMessages persists a worker's batched messages (idempotent on
@@ -984,11 +1041,19 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written (all-or-nothing), so a
 	// [valid, valid, invalid] batch never leaves the first two half-persisted.
+	//
+	// The same pass CAPS the two PRD #99 attribution fields. It writes through the
+	// index (not a range copy) on purpose, so the capped value is what the insert,
+	// the WS broadcast and the usage fold all see — otherwise the stored row and
+	// the live frame would disagree.
 	var maxSeq int32
-	for _, m := range msgs {
+	for i := range msgs {
+		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
+		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
+		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
 		if m.Seq > maxSeq {
 			maxSeq = m.Seq
 		}
@@ -996,11 +1061,13 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
 		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
-			RunID:   runID,
-			Seq:     m.Seq,
-			Kind:    m.Kind,
-			Agent:   pgText(m.Agent),
-			Payload: []byte(m.Payload),
+			RunID:         runID,
+			Seq:           m.Seq,
+			Kind:          m.Kind,
+			Agent:         pgText(m.Agent),
+			AgentInstance: pgText(m.AgentInstance),
+			AgentLabel:    pgText(m.AgentLabel),
+			Payload:       []byte(m.Payload),
 		})
 		if err != nil {
 			return err
@@ -1032,7 +1099,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if s.bcast != nil {
 		now := s.now()
 		for _, m := range inserted {
-			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, []byte(m.Payload), now)
+			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, m.AgentInstance, m.AgentLabel, []byte(m.Payload), now)
 		}
 	}
 	return nil

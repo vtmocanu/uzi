@@ -117,6 +117,41 @@ A few worth knowing:
   row, so `run inputs` against a chat run lists the whole conversation, not
   just steering messages; an issue or CI-fix run's queue starts empty and
   only ever holds what you actually sent mid-run.
+- **`run logs <id>` names the invocation, not just the role.** The actor
+  column reads `role[/<short id>][ · <task label>]`, so two `coder`
+  subagents running in parallel are distinguishable instead of being two
+  identical `coder` rows:
+
+  ```
+  #12   tool_use         coder/3v6ptu · API wiring          {"name":"Edit"}
+  #13   tool_use         coder/2k9xqf · web gate UX         {"name":"Write"}
+  #14   text             lead                               {"text":"delegating"}
+  ```
+
+  The short id is the **last** 6 characters of the invocation id, not the
+  first — these ids share a constant prefix, so a leading slice would render
+  every instance identically. A message with no invocation (the lead's own
+  turns, infra frames, and anything from before this shipped) prints the bare
+  role, with no `/id` and no `· label` — note the actor column itself is
+  wider than it used to be, so the payload column of *every* line has moved.
+  The cell is capped and the label truncated so the payload column stays
+  aligned (single-width characters — a CJK label still occupies two terminal
+  columns per rune, which this tool does not model).
+
+  `--json` carries the stored invocation id and label in full, with no
+  CLI-side truncation — but note the **server caps the label at 80 runes on
+  write, and appends no ellipsis**, so a longer label was already shortened
+  before the CLI ever saw it, with nothing in the value marking the cut. Both
+  fields are always present in `--json`, `null` when absent:
+
+  ```jsonc
+  {"seq":12,"kind":"tool_use","agent":"coder",
+   "agent_instance":"toolu_01AAAAAAAAAAAAAAAA3v6ptu","agent_label":"API wiring", ...}
+  ```
+
+  These two keys are the same per-invocation attribution the web pane draws
+  its lanes from — see
+  [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn).
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports

@@ -735,7 +735,17 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   bottega's check-then-insert TOCTOU race with a DB constraint. Terminal runs are
   excluded so an issue can be re-run once its prior run finishes.
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
-  kind, agent, payload jsonb, created_at`, **UNIQUE(run_id, seq)**. Per-run gapless
+  kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
+  **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution
+  (both nullable, appended by `00075`, no backfill): `agent_instance` is the SDK's
+  per-frame `parent_tool_use_id` — the subagent INVOCATION id, which is what keeps
+  two parallel same-role subagents distinguishable — and `agent_label` its
+  `task_description`. Both are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a
+  repo may legitimately ship an agent NAMED `lead`, which is a real subagent and
+  does carry an instance id. `agent_label` is model-authored text, so it is
+  secret-redacted worker-side and rune-capped server-side on the untrusted insert
+  path rather than trusted at either end. Per-run gapless
   seq makes the worker's batched append idempotent and the browser stream replayable
   (fixes multica's lossy buffer). `kind ∈ {text, thinking, tool_use, tool_result,
   status, error, user_message, plan}`.
@@ -9402,6 +9412,84 @@ Migration is draft `00070` — renumber above the merged head at landing (live h
   ARCHITECTURE.md's trust model MUST say plan content now goes to Slack's cloud and
   non-pattern secrets in plans are unscrubbed.
 
+## 347. Per-instance activity lanes — identity is `parent_tool_use_id`, label is `task_description`, both stateless per-frame columns (PRD #99)
+
+The activity feed groups by **invocation**, not by role and not by consecutive author.
+Two `coder` subagents running in parallel are two lanes, not one merged block.
+
+- **Two nullable `run_messages` columns, `agent_instance` and `agent_label`**, appended
+  by `00075` with no backfill. `agent_instance` is the SDK's per-frame
+  `parent_tool_use_id` (the INVOCATION id); `agent_label` is its `task_description`.
+  Both are read exactly as `agentOf` already reads its sibling `subagent_type`: pure,
+  per-frame, **no worker-side correlation state and no client-side join**, so they are
+  correct across resume and independent of whether the spawning turn is still in the
+  window. The rejected alternative — persist only the instance and derive the label
+  client-side from the lead's spawn `tool_use` — cost one column but broke when the
+  spawn frame aged out of the 500-message cap, depended on the pane's spawn-tool
+  parsing, and leaned on the unverified `parent_tool_use_id == spawn tool_use id`
+  equality (that forwarding lives in the native CLI binary). A second nullable column
+  denormalized exactly as `agent` already is buys all three problems away.
+- **NULL is not "the lead".** Both columns are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a repo
+  may legitimately ship `.claude/agents/lead.md`, which registers as an ordinary
+  invocable subagent and DOES carry an instance id. `agentOf` is
+  `asString(subagent_type) ?? "lead"`, so the field being ABSENT and the field having
+  the VALUE `"lead"` collapse to the same string — any logic keying off "is this the
+  lead?" must say which it means. A write-side guard that dropped the instance for
+  lead-looking frames was proposed twice and declined twice: keyed on the output it
+  merged two parallel invocations of a repo-authored `lead` (this PRD's own Problem 2,
+  reintroduced by the guard); keyed on presence it was immune to that but still
+  removed one producer of the combination rather than the combination, and lost
+  information on two surfaces. The diagnostic half shipped instead, as a detector that
+  logs rather than a mutator that rewrites.
+- **Read-side derivation, never write-side repair.** A lane takes its role from the
+  first frame naming a **non-lead** role (else the lane's first role, which may
+  legitimately BE `lead`), and its label — independently — from the first frame
+  carrying a non-null one. This exists because `SDKUserMessageReplay` carries
+  `parent_tool_use_id` but neither `subagent_type` nor `task_description`, so a resumed
+  subagent's lane can OPEN with a lead-looking frame. Deriving on read is recomputed
+  every render and repairs already-stored rows for free; `run_messages.agent` is
+  denormalized with no backfill, so anything guessed at write time is permanent.
+- **The roster is conditional, and is a different altitude from the lanes.** With every
+  lane carrying its own `crewStateFor` dot, an always-on crew strip would re-render the
+  lane list. So under By-agent there is **no strip** for a small crew; a **role rollup**
+  appears only when a role is doubled (counted by instances, regardless of liveness) or
+  lanes exceed the glance threshold of 6. A rollup chip's dot is the **worst** state
+  among that role's instances (`stalled > waiting > working > idle > done`), which is a
+  summary the per-instance lanes cannot provide — so it is a tier, not a duplicate.
+  Consequence, accepted: a chip can read `waiting` while one of its own lanes pulses
+  `working`, because `waiting` outranks `working` in attention priority. Timeline view
+  keeps the pre-#99 per-role jump strip.
+- **No standing legend.** The state word renders beside every dot ("● working"), plus a
+  `title` tooltip, so a five-swatch key would only repeat what is already in situ. This
+  is a deliberate removal of chrome, not an omission.
+- **The label is model-authored text and is treated as such at every layer**:
+  secret-redacted worker-side (it rides OUTSIDE the payload object, so the batcher's
+  payload redactor never walked it), rune-capped server-side on the untrusted insert
+  path (80 runes, truncate-never-reject, applied through the slice index so the stored
+  row, the WS broadcast and the usage fold cannot disagree), rendered PLAIN and
+  single-line in the browser — **never through `<Markdown>`** — and sanitize-and-folded
+  on the CLI's human path while `--json` stays byte-exact.
+
+## 348. Additive `OutgoingMessage` fields are a DEPLOY-ORDER constraint: the api image must roll before the agent image
+
+`/api/worker/messages` decodes with `DisallowUnknownFields` (`httpx/respond.go:35`), so
+an api that predates a field the worker has started sending **400s the whole batch, and
+keeps 400ing**. The symptom is not a crash and not a partial write: the worker's batches
+fail forever and its messages never land, so a run looks alive on the worker and silent
+in the UI.
+
+This is **systemic to the strict decoder, not specific to PRD #99** — it applies to any
+additive `OutgoingMessage` field. The rule (**deploy the api image first, always**) is
+already stated in code as the "compat rule" at
+`api/internal/handler/worker_protocol.go:91`, where a field is declared purely so the
+decoder tolerates it in the same release the worker starts sending it; this section
+records the deploy-order half rather than restating the mechanism.
+
+Relaxing `DisallowUnknownFields` on the worker-message route is the real fix and is
+tracked separately — it trades a strict-schema guarantee for forward compatibility, and
+that is a deliberate decision rather than a cleanup.
+
 # PRD #104 — Named Anthropic tokens (multiple credentials per user, bound to workers and the judge lane)
 
 Serves human Feature #104: a user may hold several Anthropic credentials, name them,
@@ -9413,12 +9501,12 @@ PRD #53/#54 (rate-limit meters), PRD #46 (judge lane + self-improve), and PRD #6
 `prds/done/104-named-anthropic-tokens.md`.
 
 Two things in this PRD are corrections to already-shipped code rather than new
-feature, and they had to land FIRST: §347 (the write paths were keyed on a pair that
+feature, and they had to land FIRST: §349 (the write paths were keyed on a pair that
 was about to stop being unique) and the AAD narrowing recorded in §136. Neither was
-optional groundwork — shipping the schema half without §347 would have silently
+optional groundwork — shipping the schema half without §349 would have silently
 destroyed credentials.
 
-## 347. The secret write paths are re-keyed on `user_secrets.id` — a correctness fix that must precede the schema (D10)
+## 349. The secret write paths are re-keyed on `user_secrets.id` — a correctness fix that must precede the schema (D10)
 
 Three write paths assumed `(user_id, kind)` named at most one row, and all three
 corrupt data the moment it names two. This is a fix to PRD #3/#32 code, not new work,
@@ -9434,11 +9522,11 @@ and it lands before the migration that makes the assumption false:
   callers resolve the user's default id first.
 - **`secretopen.OpenByID`** joins `Open` with the same three sentinels and the same
   vault dispatch, and re-checks ownership in Go **as well as** in SQL. Belt and
-  braces behind the composite FK (§349): the SQL predicate is `WHERE id = $1 AND
+  braces behind the composite FK (§351): the SQL predicate is `WHERE id = $1 AND
   user_id = $2`, and the Go check caught a real fixture bug during M3 rather than
   staying decorative.
 
-## 348. One resolver, three rules, resolved per claim (D1, R4)
+## 350. One resolver, three rules, resolved per claim (D1, R4)
 
 - **`openAnthropic(ctx, userID, secretID *uuid.UUID)`** is the single seam: `nil`
   resolves the user's default via `Open`, non-nil routes to `OpenByID`. All three
@@ -9465,7 +9553,7 @@ and it lands before the migration that makes the assumption false:
   resolution matrix, and per-run pinning would have to survive requeue-to-another-
   worker, which fights the affinity rule in `runs.worker_id`.
 
-## 349. Cross-user binding is schema-impossible, via a composite FK — and the PG15 column list is load-bearing (D11)
+## 351. Cross-user binding is schema-impossible, via a composite FK — and the PG15 column list is load-bearing (D11)
 
 - `user_secrets` gains `UNIQUE (user_id, id)` (a real constraint, not just an index,
   so a FK can reference it). `workers.anthropic_secret_id` and
@@ -9482,7 +9570,7 @@ and it lands before the migration that makes the assumption false:
   never cascade-deletes a worker. The UI names the affected workers in the
   confirmation, because a quiet fallback is acceptable behavior and unacceptable UX.
 
-## 350. "At most one default" is an index; "exactly one while any token exists" is an advisory lock (D2, D12)
+## 352. "At most one default" is an index; "exactly one while any token exists" is an advisory lock (D2, D12)
 
 - **The partial unique index** `user_secrets_one_default_key ON (user_id, kind) WHERE
   is_default` enforces *at most* one. It cannot enforce *at least* one — no index can
@@ -9507,7 +9595,7 @@ and it lands before the migration that makes the assumption false:
   the SQL text alone, enforced by no index — any future change giving the alias an
   `is_default = false` path breaks it **without the index noticing**.
 
-## 351. Labels: user-scoped, case-insensitively unique, never secret (D7)
+## 353. Labels: user-scoped, case-insensitively unique, never secret (D7)
 
 `CREATE UNIQUE INDEX … ON user_secrets (user_id, kind, lower(label))` — an
 expression, so it must be an index, not a UNIQUE constraint. Validation mirrors
@@ -9523,7 +9611,7 @@ WHERE user_id = @user_id AND kind = @kind)`, kind-scoped, inside the same statem
 A create that a caller forgot to flag cannot produce a token-holding user with no
 default even if the lock above were ever bypassed.
 
-## 352. Rate limits key on the token, not the user (D4)
+## 354. Rate limits key on the token, not the user (D4)
 
 `anthropic_rate_limits` is repointed to `user_secret_id PRIMARY KEY`, keeping a
 `user_id` column for the admin cross-user view and the cascade, with `FOREIGN KEY
@@ -9543,7 +9631,7 @@ waits one interval for its first reading. Auto-failover on exhaustion is explici
 out of scope (D3) — it needs its own policy design for which token, chosen when, and
 how `run_usage` attributes a mid-run switch.
 
-## 353. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
+## 355. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
 
 - `POST`/`PATCH`/`DELETE` on `/api/me/secrets/anthropic_token*` keep `RequireAuth`
   (cookie + CSRF). A Bearer-reachable mint would let a stolen `uzc_` **replace** a
@@ -9562,7 +9650,7 @@ how `run_usage` attributes a mid-run switch.
   it mints nothing and returns no credential, it re-points a worker between tokens
   the caller already owns.
 
-## 354. Absent vs explicit-null in the binding PATCH — `json.RawMessage`, not `*string`
+## 356. Absent vs explicit-null in the binding PATCH — `json.RawMessage`, not `*string`
 
 Both binding endpoints take `anthropic_token` as `json.RawMessage` and decode it in
 one place (`parseTokenField`): **omitted** = leave the binding alone, **`null` or
@@ -9575,7 +9663,7 @@ key is answered **400** rather than a 200 no-op: naming the client bug is better
 inventing a read path to echo an unchanged worker back, and the rule is what matters
 the day this body grows a second field.
 
-## 355. The kind-path routes survive as deprecated aliases over the default (D14)
+## 357. The kind-path routes survive as deprecated aliases over the default (D14)
 
 `PUT /api/me/secrets/anthropic_token` rotates-or-creates the default;
 `DELETE /api/me/secrets/anthropic_token` deletes it — but now answers **409** once

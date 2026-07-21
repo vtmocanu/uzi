@@ -91,7 +91,7 @@ function fakeRun(): Run {
 }
 
 function msg(seq: number): RunMessage {
-  return { seq, kind: "text", agent: null, payload: `m${seq}`, created_at: "" };
+  return { seq, kind: "text", agent: null, agent_instance: null, agent_label: null, payload: `m${seq}`, created_at: "" };
 }
 
 describe("useRunStream mount load", () => {

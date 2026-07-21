@@ -125,10 +125,10 @@ describe("queuedBehindActive (one live conversation, Decision 4)", () => {
 describe("countUserTurns", () => {
   it("counts only user_message rows", () => {
     const msgs: RunMessage[] = [
-      { seq: 1, kind: "user_message", agent: null, payload: {}, created_at: "" },
-      { seq: 2, kind: "text", agent: "chat", payload: {}, created_at: "" },
-      { seq: 3, kind: "tool_use", agent: "chat", payload: {}, created_at: "" },
-      { seq: 4, kind: "user_message", agent: null, payload: {}, created_at: "" },
+      { seq: 1, kind: "user_message", agent: null, agent_instance: null, agent_label: null, payload: {}, created_at: "" },
+      { seq: 2, kind: "text", agent: "chat", agent_instance: null, agent_label: null, payload: {}, created_at: "" },
+      { seq: 3, kind: "tool_use", agent: "chat", agent_instance: null, agent_label: null, payload: {}, created_at: "" },
+      { seq: 4, kind: "user_message", agent: null, agent_instance: null, agent_label: null, payload: {}, created_at: "" },
     ];
     expect(countUserTurns(msgs)).toBe(2);
   });

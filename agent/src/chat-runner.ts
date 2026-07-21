@@ -121,7 +121,11 @@ export class ChatRunner {
     const secrets = [claim.secrets.anthropic_oauth_token, this.joinToken];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
+    // redactText also covers the PRD #99 top-level agent_label/agent_instance the
+    // batcher carries beside the payload. A chat run never spawns a subagent
+    // (NESTED_AGENT_TOOL is disallowed), so those fields stay absent here — the
+    // redactor is wired anyway so the two runner paths cannot drift.
+    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText);
 
     // A `cancel` (End chat) input, or worker shutdown, aborts the whole conversation.
     // This SAME controller is the steering channel's cancel AND the executor's
