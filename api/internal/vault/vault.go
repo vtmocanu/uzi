@@ -231,9 +231,12 @@ func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
 			slog.Error("vault: rewrap seal (dek)", "user", userID, "kind", row.Kind, "error", serr)
 			continue
 		}
+		// Keyed on the row's id, never on (user_id, kind): a user may hold several
+		// secrets of one kind (PRD #104), and a by-kind UPDATE here would write this
+		// row's resealed bytes over every sibling (PRD #104 D10).
 		if _, rerr := v.q.RewrapUserSecret(ctx, store.RewrapUserSecretParams{
+			ID:         row.ID,
 			UserID:     userID,
-			Kind:       row.Kind,
 			Ciphertext: sealed,
 		}); rerr != nil {
 			slog.Error("vault: rewrap persist", "user", userID, "kind", row.Kind, "error", rerr)
@@ -280,8 +283,10 @@ func (v *Vault) Unlocked(userID uuid.UUID) bool {
 }
 
 // Seal encrypts a user secret under the user's DEK, binding user_id||kind as AAD
-// so the ciphertext cannot be authenticated onto a different owner or kind. The
-// caller records sealed_with='dek'. ErrLocked if the vault is not unlocked.
+// so the ciphertext cannot be authenticated onto a different owner or kind — but
+// see secretAAD: it does NOT pin the ciphertext to a particular row once a user
+// holds several secrets of one kind. The caller records sealed_with='dek'.
+// ErrLocked if the vault is not unlocked.
 func (v *Vault) Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, error) {
 	box, ok, err := v.dekBox(userID)
 	if err != nil {
@@ -362,6 +367,16 @@ func wrapAAD(userID uuid.UUID) []byte {
 }
 
 // secretAAD binds a DEK-sealed user secret to user_id||kind.
+//
+// Since PRD #104 that is NOT a per-row binding. While UNIQUE (user_id, kind) held,
+// kind identified the row, so the AAD happened to pin a ciphertext to one
+// credential; with several named tokens of one kind the AAD is identical across all
+// of them, and a DB-write operator can move token A's ciphertext onto the row
+// labelled `console-key` and have it authenticate cleanly (the label then lies
+// about which account a bound worker spends). Accepted, not fixed: the adversary is
+// DB-write — strictly stronger than the passive-read adversary the vault exists to
+// stop — and adding id to the AAD needs a versioned AAD scheme plus a rewrap of
+// every stored ciphertext. See PRD #104 R10 and migration 00077.
 func secretAAD(userID uuid.UUID, kind string) []byte {
 	aad := make([]byte, 0, 16+1+len(kind))
 	aad = append(aad, userID[:]...)

@@ -37,6 +37,8 @@ const user = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -104,6 +106,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
     ...over,
   };
 }

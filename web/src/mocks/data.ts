@@ -27,6 +27,7 @@ import type {
   RunMessage,
   RunUsage,
   SecretMeta,
+  TokenRateLimits,
   SteerInput,
   Skill,
   ToolAllowlistEntry,
@@ -48,6 +49,8 @@ export const mockAdmin: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
   created_at: daysAgo(41),
   last_login: minsAgo(7),
 };
@@ -62,6 +65,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: true,
     judge_enabled: true,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(33),
     last_login: minsAgo(95),
   },
@@ -73,6 +78,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(20),
     last_login: daysAgo(1),
   },
@@ -84,6 +91,8 @@ export const mockUsers: User[] = [
     is_active: false,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(18),
     last_login: daysAgo(12),
   },
@@ -97,6 +106,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(15),
     last_login: minsAgo(20),
   },
@@ -108,6 +119,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(25),
     last_login: daysAgo(1),
   },
@@ -139,42 +152,63 @@ function okReading(
   };
 }
 
-// The signed-in demo user's own reading (Settings card + sidebar), matching mockup
-// frame A: 8% / 47%, both green, "Live".
+// The signed-in demo user's own readings (Settings card + sidebar). Since PRD #104
+// this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 47%,
+// both green, "Live"), and the console key is busier so the two meter pairs are
+// visibly different rather than duplicates.
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 47, 2 * D + 4 * H);
+
+export const mockMyTokenRateLimits: TokenRateLimits[] = [
+  { secret_id: "sec-default", label: "default", is_default: true, limits: mockMyRateLimits },
+  {
+    secret_id: "sec-console",
+    label: "console-key",
+    is_default: false,
+    limits: okReading(64, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
+  },
+];
+
+// tokenised wraps a single reading as a one-token list, for the personas whose
+// fixture is a single credential.
+function tokenised(limits: MyRateLimits, label = "default"): TokenRateLimits[] {
+  return limits.status === "no_token"
+    ? [] // token-less is an EMPTY list since M5, not a status
+    : [{ secret_id: `sec-${label}`, label, is_default: true, limits }];
+}
 
 // Per-persona readings so a demo login as a seeded non-admin reaches every own-
 // reading state; anyone else gets the live-ok default (u-admin). warn (radu) and
 // stale (mihai) are here so the sidebar-dim + Settings "Stale" badge and a warn-
 // tone bar are browsable, not just visible in the admin table.
-export const mockMyRateLimitsByUser: Record<string, MyRateLimits> = {
-  "u-admin": mockMyRateLimits, // live ok
-  "u-radu": okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3), // warn (7d 83%)
-  "u-mira": okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1), // danger (5h 97%)
+export const mockMyRateLimitsByUser: Record<string, TokenRateLimits[]> = {
+  "u-admin": mockMyTokenRateLimits, // live ok, TWO tokens
+  "u-radu": tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)), // warn (7d 83%)
+  "u-mira": tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)), // danger (5h 97%)
   // stale own-reading: no live countdown (resets null), aged synced_at, stale flag.
-  "u-mihai": {
+  "u-mihai": tokenised({
     status: "ok",
     five_hour: { pct: 31, resets_at: null },
     seven_day: { pct: 12, resets_at: null },
     source: "header_probe",
     synced_at: minsAgo(180),
     stale: true,
-  },
-  "u-andrei": { status: "unavailable" },
-  "u-dan": { status: "no_token" },
+  }),
+  "u-andrei": tokenised({ status: "unavailable" }),
+  "u-dan": [], // token-less: an EMPTY list, not a no_token status (PRD #104 M5)
 };
 
 // The admin all-users table (mockup frame C) plus a warn row and an unavailable
 // row, so every row state is demonstrable: live-ok, live-warn, live-danger,
 // stale+vault-locked, unavailable, no_token.
 export const mockAdminRateLimits: AdminRateLimitUser[] = [
-  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, limits: mockMyRateLimits },
-  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, limits: okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3) },
-  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, limits: okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1) },
-  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, limits: okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4) },
-  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, limits: okReading(31, 0, 12, 0, 180, "header_probe", true) },
-  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, limits: { status: "unavailable" } },
-  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, limits: { status: "no_token" } },
+  // vlad holds TWO tokens, so the admin table's per-user grouping is demonstrable.
+  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, tokens: mockMyTokenRateLimits },
+  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
+  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
+  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
+  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
+  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
+  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, tokens: [] },
 ];
 
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
@@ -388,8 +422,26 @@ export const mockReviews: MockReview[] = [
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
 
+// Two tokens for the demo user (PRD #104): the multi-token list, the default
+// badge, the per-token meters and the worker/judge pickers are only browsable in
+// the mock if the fixture actually has more than one.
 export const mockSecrets: SecretMeta[] = [
-  { kind: "anthropic_token", created_at: daysAgo(30), updated_at: daysAgo(4) },
+  {
+    id: "sec-default",
+    kind: "anthropic_token",
+    label: "default",
+    is_default: true,
+    created_at: daysAgo(30),
+    updated_at: daysAgo(4),
+  },
+  {
+    id: "sec-console",
+    kind: "anthropic_token",
+    label: "console-key",
+    is_default: false,
+    created_at: daysAgo(9),
+    updated_at: daysAgo(9),
+  },
 ];
 
 // ── Forge ────────────────────────────────────────────────────────────────────
@@ -863,6 +915,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 2254857830, // 2.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~52%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -884,6 +938,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1610612736, // 1.5 GiB
     stats_mem_limit_bytes: 2147483648, // 2 GiB → 75%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -905,6 +961,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 503316480, // 480 MiB
     stats_mem_limit_bytes: null, // unlimited/unknown → no bar
     stats_source: "process",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -930,6 +988,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1181116006, // 1.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
 ];
 
@@ -958,6 +1018,8 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_mem_bytes: 8160437862, // 7.6 GiB
     stats_mem_limit_bytes: 8589934592, // 8 GiB → 95%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
     owner_email: "mira@uzi.local",
   },
 ];

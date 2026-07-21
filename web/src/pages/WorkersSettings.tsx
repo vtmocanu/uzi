@@ -2,7 +2,8 @@
 // the fleet with live status. Inside SettingsShell.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { api, ApiError, type Worker } from "../lib/api";
+import { Link } from "react-router-dom";
+import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
@@ -19,6 +20,11 @@ const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
+  // The user's named tokens, for the per-worker picker (PRD #104 M3/M6). Read
+  // alongside the workers so a rebind can offer labels without a second round trip.
+  const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  // Which worker's rebind is in flight, so only that row's picker disables.
+  const [tokenBusy, setTokenBusy] = useState("");
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
   // The declared worker template (PRD #18): what image the user says this worker
@@ -59,14 +65,42 @@ export function WorkersSettings() {
 
   const load = useCallback(async () => {
     try {
-      const { workers } = await api.listWorkers();
+      const [{ workers }, { secrets }] = await Promise.all([api.listWorkers(), api.listSecrets()]);
       setWorkers(workers);
+      setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load workers");
     } finally {
       setLoading(false);
     }
   }, []);
+
+  // rebind points one worker at a named token, or clears the binding when the
+  // picker returns to "default token". The change lands on the worker's NEXT
+  // claim — no restart — which the announcement says, because a user who expects
+  // to restart something will otherwise go looking for the control to do it.
+  const rebind = useCallback(
+    async (workerId: string, label: string) => {
+      setError("");
+      setTokenBusy(workerId);
+      try {
+        const { worker } = await api.setWorkerToken(workerId, label === "" ? null : label);
+        setWorkers((prev) => prev.map((w) => (w.id === worker.id ? worker : w)));
+        announce(
+          label === ""
+            ? `${worker.name} now spends your default token, from its next claim.`
+            : `${worker.name} now spends ${label}, from its next claim.`,
+        );
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Failed to change the worker's token");
+      } finally {
+        setTokenBusy("");
+      }
+    },
+    // announce is stable (a setState wrapper); listing it keeps the lint rule happy
+    // without re-creating rebind on every render.
+    [],
+  );
 
   useEffect(() => {
     load();
@@ -308,6 +342,36 @@ export function WorkersSettings() {
                         <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                       )}
                     </div>
+                    {/* The EFFECTIVE token, always stated (PRD #104 M6), and it has
+                        to be right in BOTH directions. Rendering blank for an unbound
+                        worker reads as "no token" when the truth is "the default" —
+                        but saying "your default token" on an account holding NO tokens
+                        is the same failure mirrored: it over-claims a credential that
+                        does not exist, on an account where every run will fail, and
+                        offers nowhere to go. Three states, not two (web-ux D2).
+                        A bound worker is rendered from the LIST payload, which always
+                        carries the label alongside the id — never from a source that
+                        could supply an id with a null label. */}
+                    <div className="mt-1 text-xs text-muted">
+                      {w.anthropic_secret_id ? (
+                        <>
+                          spends{" "}
+                          <strong className="font-medium text-fg">
+                            {w.anthropic_secret_label ?? "a named token"}
+                          </strong>
+                        </>
+                      ) : tokens.length === 0 ? (
+                        <span className="text-warn">
+                          no Anthropic token —{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            add one in Settings
+                          </Link>{" "}
+                          or its runs will fail
+                        </span>
+                      ) : (
+                        <span>spends your default token</span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center gap-1.5">
                     {/* Marked by the row's own data, not by the hosting config: if an
@@ -352,6 +416,28 @@ export function WorkersSettings() {
                         with it (PRD: "PVCs accrue cost — deleted with the worker"),
                         which nothing undoes. Same button, wildly different blast
                         radius, so only the expensive one asks. */}
+                    {/* Token picker (PRD #104 M3/M6). Rendered only when the user
+                        holds more than one token — with one credential there is
+                        nothing to choose between, and an always-visible picker would
+                        imply otherwise. Takes effect on the worker's NEXT claim: no
+                        restart, no re-minted join token. */}
+                    {tokens.length > 1 && confirmingDelete !== w.id && (
+                      <Select
+                        aria-label={`Anthropic token for ${w.name}`}
+                        className="h-8 max-w-[11rem] text-xs"
+                        value={w.anthropic_secret_label ?? ""}
+                        disabled={tokenBusy === w.id}
+                        onChange={(e) => void rebind(w.id, e.target.value)}
+                      >
+                        <option value="">default token</option>
+                        {tokens.map((t) => (
+                          <option key={t.id} value={t.label}>
+                            {t.label}
+                            {t.is_default ? " (default)" : ""}
+                          </option>
+                        ))}
+                      </Select>
+                    )}
                     {confirmingDelete !== w.id && (
                       <Button
                         id={deleteButtonId(w.id)}

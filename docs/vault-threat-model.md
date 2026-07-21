@@ -89,6 +89,20 @@ this fits into the OIDC login flow.
    multi-replica API is ever deployed, **pin the API to `replicas: 1`** or accept
    that each pod must be unlocked independently. Do **not** replicate DEKs across
    pods.
+8. **The AAD no longer pins a ciphertext to a *row*, only to `(user, kind)`
+   (PRD #104).** Each sealed secret is bound to `user_id || 0x00 || kind` as
+   additional authenticated data, so a DB-write operator who moves a ciphertext
+   between users or between kinds gets a GCM authentication failure rather than a
+   working key. That guarantee is intact. What changed is that a user may now hold
+   several `anthropic_token` rows, and all of them share one AAD — so swapping two
+   of the *same user's own* tokens between rows authenticates cleanly. The
+   consequence is a mislabeled credential, not disclosure: nothing is decrypted
+   that the operator could not already decrypt, and the swap is confined to one
+   account. Accepted deliberately: widening the AAD to include `user_secrets.id`
+   would be strictly better, but it is not backward compatible — every existing
+   ciphertext was sealed without the id and would stop opening — so it needs a
+   re-seal migration of its own. This residual sits inside the DB-write threat
+   model, which is already outside the passive-read model the vault was built for.
 
 ## Hosted worker join tokens (PRD #58)
 

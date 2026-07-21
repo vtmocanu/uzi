@@ -49,6 +49,17 @@ type WorkerDTO struct {
 	StatsMemBytes      *int64   `json:"stats_mem_bytes"`
 	StatsMemLimitBytes *int64   `json:"stats_mem_limit_bytes"`
 	StatsSource        *string  `json:"stats_source"`
+	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
+	// Both null means "unbound": the worker spends its owner's default token, which
+	// is every worker's state until someone binds one. The label rides alongside the
+	// id so a client can render "spends: console-key" without a second lookup — it
+	// is a name, never the credential, and the token value continues to appear in no
+	// response at all.
+	//
+	// Chat runs on a bound worker still spend the DEFAULT (D1): the binding is a
+	// property of the run lane, not of the worker's every activity.
+	AnthropicSecretID    *string `json:"anthropic_secret_id"`
+	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
 }
 
 // AdminWorkerDTO is a worker plus its owner email for the admin Agents-status

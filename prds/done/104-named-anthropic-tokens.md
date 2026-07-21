@@ -1,7 +1,7 @@
 # PRD #104: Named Anthropic tokens — multiple credentials per user, bound to workers and the judge lane
 
 **GitLab Issue**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104)
-**Status**: Draft (created 2026-07-21; revised 2026-07-21 after a citation-verification review)
+**Status**: **COMPLETE** (created 2026-07-21; completed 2026-07-21) — MR [!89](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/89), 21 commits from `b94c45b4`. All seven milestones landed; every code milestone reviewed **and** security-audited; full `run-e2e.sh` green including the new binding phase. Also folds in [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105).
 **Priority**: Medium
 **Related**: [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — this PRD repoints its table), [#32](https://gitlab.example.com/vtmocanu/uzi/-/issues/32) (user vault — whose rewrap path this PRD must fix before it can store a second token), [#50](https://gitlab.example.com/vtmocanu/uzi/-/issues/50) (LLM egress proxy — must learn which token to inject), [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69) (judge mode + per-user model — draft; overlapping settings surface)
 
@@ -154,12 +154,47 @@ milestone that can create a second row.
 **D1 — Binding reaches workers and the judge lane, not repos or runs.**
 A worker names a token; the judge lane names a token; everything else (chat,
 autopilot, CI-fix, which rides the run lane) resolves the user's default.
+
+*Amended during M4: there are **three** resolution rules, not two.* A
+`self_improve` run is repo-ful and therefore rides the **ordinary run lane**
+(`assembleClaim`, not `assembleJudgeClaim`, which forks only on
+`run.Kind == RunKindJudge`), so "self-improve follows the judge binding" — stated
+in M4 below as though it were free — required an explicit branch. Without it a
+self-improve run would have followed the *claiming worker's* binding while
+appearing handled, and no test would have asked. All three rules live in
+`claimSecretID` so R4's "resolution lives in one place" still holds. The original
+two-item phrasing named neither self-improve nor CI-fix explicitly; a future rule
+must be added there and nowhere else.
 Per-repo and per-run pinning are deliberately excluded: they multiply the
 resolution matrix without a demonstrated need, and per-run pinning in particular
 would have to survive requeue-to-another-worker, which conflicts with the
 worker-affinity rule in `runs.worker_id` (`AffinityCutoff` in the claim queries).
 
 **D2 — An explicit `is_default` flag, not "oldest wins".**
+
+> **`user_secrets_one_default_key` is a security-relevant control, not just a
+> data-integrity nicety.** Recorded after M2, because what leans on it changed.
+> It was introduced here as "at most one default" — a schema property. It is now
+> also the thing standing between the **unlocked** compat alias
+> (`UpsertDefaultUserSecret`, D14) and a two-default state. Two distinct
+> mechanisms keep that alias safe, and only one of them is the index:
+>
+> - **The index rejects the only shape that could ADD a default.** The alias
+>   always inserts `is_default = true` with an `ON CONFLICT … WHERE is_default`
+>   arbiter, so the sole path to a second default is the arbiter missing the
+>   existing one — which the partial unique index refuses before commit.
+> - **The statement shape means it can never SUBTRACT one.** The alias writes
+>   `is_default = false` nowhere. *Verified 2026-07-21:* `ClearDefaultUserSecret`
+>   is the only query in the schema that writes `false`, and it runs under the
+>   D12 advisory lock. **No index enforces this half** — it is a property of the
+>   SQL text alone.
+>
+> Consequences: any future change to this index, to the alias's arbiter, or one
+> that gives the alias any `is_default = false` path must be treated as touching
+> a control. The last of those would break the second half **without the index
+> noticing**, and `TestAliasVsLockedMutationsInvariantLiveDB` would only catch it
+> in the narrow case where the user ends at zero tokens with a default
+> outstanding.
 Exactly one row per `(user_id, kind)` carries `is_default = true`, enforced by a
 partial unique index. The existing token migrates to `label = 'default'`,
 `is_default = true`. Rationale: "oldest wins" changes silently when you delete a
@@ -207,6 +242,24 @@ Validation mirrors `maxTokenBytes`'s spirit in `handler/secrets.go:37`: bounded
 length (64), no control characters, no leading/trailing whitespace.
 
 **D8 — The token-CRUD routes stay cookie-only; worker rebinding is `RequireUser`.**
+
+*Amended during M2: this decision and M2's stated CLI scope contradicted each
+other, and D8 wins.* M2's milestone text listed
+`uzi token list|add|rename|set-default|rm` while the same sentence kept write
+paths cookie-only. Those are incompatible — the CLI authenticates only with
+`Authorization: Bearer <uzc_>`, which a `RequireAuth` route rejects, so every
+write command would 401. **Only `uzi token list` exists**, mirroring the `uzi
+worker` precedent (no `worker create`, for exactly this reason), and
+`TestTokenHasOnlyList` pins the absence so nobody adds one by reflex. The
+command's help says the writes are web-only and why.
+
+`GET /api/me/secrets` moved from `RequireAuth` to `RequireUser` to make `token
+list` reachable — safe, since it returns labels, ids and flags, never a value.
+
+Relaxing D8 to allow CLI writes would make token create/rotate/delete
+Bearer-reachable, so a stolen `uzc_` could replace a user's credentials rather
+than merely read metadata. That is the precise escalation D8 exists to prevent,
+and it is not taken.
 `/api/me/secrets/*` is `RequireAuth` today (`handler/handler.go:320`) and stays
 that way: minting and replacing credentials is the CLI's exclusion zone,
 consistent with `POST /workers` being cookie-only because its join token yields a
@@ -241,6 +294,50 @@ constraint violation), and `OpenByID` re-checks `(user_id, kind)` — defense in
 depth, with the schema as the backstop. Same treatment for
 `users.judge_anthropic_secret_id`.
 
+**D12 — The default invariant is serialized by an ADVISORY LOCK, not `FOR UPDATE`.**
+
+*Corrected during M2. The original text below specified `SELECT ... FOR UPDATE`,
+which is the wrong primitive and would not have closed the races this decision
+names.* `FOR UPDATE` locks **existing rows**: it cannot block a concurrent
+`INSERT` of a new row, and it locks nothing at all when the set is empty — which
+are exactly races (a) and (b). Every mutation instead takes
+`pg_advisory_xact_lock(SecretMutationLockClass, objid(user_id))` as its
+transaction's first statement, matching the hosted-provision quota lock already
+in this codebase (`store/migrate.go`).
+
+Proven, not asserted: with the lock removed,
+`TestConcurrentDeleteDefaultVsCreateLiveDB` fails with
+`user has 1 tokens but 0 defaults — the delete-vs-create race left a no-default
+state` — precisely the state the kind-path alias 500s on. With the lock, 25
+interleavings pass.
+
+**Which test proves what** (recorded because the two are not equivalent — and
+this paragraph was itself wrong once, see below):
+
+Both tests fail without the lock, for *different* reasons, and both are earning
+their place:
+
+| test | lock removed | what breaks |
+|---|---|---|
+| `TestConcurrentDeleteDefaultVsCreateLiveDB` | FAIL — `1 tokens but 0 defaults` | **state corrupts** |
+| `TestConcurrentFirstTokenCreatesLiveDB` | FAIL — 7× `concurrent create returned 500` | **contract breaks** |
+
+The distinction: **the partial unique index protects the data; the lock protects
+the user-visible outcome.** Without the lock, concurrent first-token creates are
+*safe but ugly* — the index still prevents a second default, so the invariant
+holds, but the losing goroutines hit `duplicate key … user_secrets_one_default_key`
+which the handler maps to a **500** instead of a clean 201/409. Only the
+delete-vs-create test shows absence of the lock corrupting *state*.
+
+*Corrected 2026-07-21.* This paragraph originally claimed
+`TestConcurrentFirstTokenCreatesLiveDB` **passes** without the lock, on the
+implementer's report. The reviewer removed the lock and ran both tests: it fails.
+The wrong version was the dangerous one — "test B passes without the lock" reads
+as "test B is decorative" and invites deleting a test that genuinely guards the
+response contract.
+
+*Original text, retained for provenance:*
+
 **D12 — The default invariant is transactional; the index alone is not enough.**
 The partial unique index enforces **at most** one default. "Exactly one while any
 token exists" is not schema-enforceable, and three races exist: two concurrent
@@ -252,15 +349,22 @@ in one transaction that first takes `SELECT ... FROM user_secrets WHERE user_id
 = $1 AND kind = $2 FOR UPDATE`. M2 owns this; its tests must include the
 concurrent-create and concurrent-delete cases.
 
-**D13 — This PRD reserves goose numbers `00104`–`00106`.**
-Head at drafting is `00074_plan_revision.sql`. M3, M4, and M5 each add one
-migration and take one reserved number in that order; M1's columns ride `00104`
-alongside M3 only if M3 lands first, otherwise M1 takes `00104` and the rest
-shift. All are renumbered to the next free number above the live head at merge,
-per the convention recorded in `00065_anthropic_rate_limits.sql`. Known
-outstanding drafts held elsewhere: #50 → `00085`, #35 → `00095`, #99 → `00074`
-(already collides with the live head — that PRD's problem, flagged here so the
-next reader does not inherit it silently).
+**D13 — This PRD takes goose numbers `00077`–`00080`.**
+Live head is `00074_plan_revision.sql`. `00075` is held by the unmerged prd-98
+branch and `00076` by prd-99, so this PRD starts above both: **M1 = `00077`**
+(landed), M3 = `00078`, M4 = `00079`, M5 = `00080`. M2 adds no migration — its
+columns landed in M1.
+
+*Superseded:* this decision originally reserved `00104`–`00106` "to match the PRD
+number". That was a drafting error with no basis in the repo's convention, which
+is to renumber to the next free number above the live head at merge (recorded in
+`00065_anthropic_rate_limits.sql`). Reserving a block three tens above the head
+would have collided with nothing but signalled a numbering scheme that does not
+exist. Corrected 2026-07-21 during M1.
+
+Other outstanding drafts held elsewhere, for whoever merges next: #50 → `00085`,
+#35 → `00095`, #99 → `00074` (already collides with the live head — that PRD's
+problem, noted here so the next reader does not inherit it silently).
 
 **D14 — The kind-path routes stay as compatibility aliases over the default.**
 `PUT /api/me/secrets/anthropic_token` rotates the default (or creates the first
@@ -280,6 +384,16 @@ implies presence-of-a-default, so presence-of-any ≡ presence-of-resolvable —
 these gates keep working with no change. **This is a load-bearing consequence of
 D6**: relax D6 and all four gates become wrong (they would green-light a run whose
 resolution then fails), so any future PRD that revisits D6 must revisit them.
+
+Two of the four are load-bearing on D6 in a stronger sense than the others, and
+M1 is what makes them so. `judge_enqueue.go` and `judge_read.go` reach the row
+through `GetUserSecretCiphertext`, which M1 narrows to "the default" (it must, so
+the single-token read paths keep resolving exactly one row once the unique
+constraint is gone). Their question therefore changes from *"any row exists"* to
+*"a default exists"* — still equivalent under D6, but resting on D6 rather than on
+any-row semantics. `autopilot.sql:30-31` and `UserHasAnthropicToken` are
+independent `EXISTS` queries and keep true any-row semantics. If a future change
+relaxes D6, the judge pair breaks first and silently.
 
 ### Open question (not blocking M1)
 
@@ -323,7 +437,19 @@ Phase 2 (parallel, all depend only on M1):
       value), `DELETE .../{id}` (D5/D6 rules). D14's aliases kept and deprecated.
       **D12's transaction + `FOR UPDATE` is this milestone's core risk** —
       concurrent-create and concurrent-delete-default tests are acceptance
-      criteria, not extras. `uzi token list|add|rename|set-default|rm`, read
+      criteria, not extras.
+      **Three defects M1 deliberately left live for M2 to close** (found by the
+      M1 audit, verified against Postgres 17; they are unreachable in M1 because
+      no second token can exist yet, and become reachable the instant this
+      milestone ships): (i) a user in the "tokens exist, none is default" state
+      gets a raw **500** from `PutAnthropicToken` — the alias INSERT finds no
+      arbiter conflict and collides on the label index instead
+      (`user_secrets_user_kind_label_key`); D12's `FOR UPDATE` transaction is
+      what makes that state unreachable, so no handler branch is wanted, only the
+      transaction. (ii) `DELETE /api/me/secrets/anthropic_token` deletes the
+      default unconditionally instead of D14's 409 for a multi-token user.
+      (iii) `RotateUserSecret` exists with no caller until this milestone wires
+      the id-keyed rotate route — it is not dead code. `uzi token list|add|rename|set-default|rm`, read
       paths `RequireUser`, write paths per D8. Every create/rotate pokes the
       usage poller (`handler/secrets.go:128-132` today pokes by user id;
       coordinate the new poke identity with M5 — whichever lands first defines
@@ -361,6 +487,14 @@ Phase 2 (parallel, all depend only on M1):
 
 Phase 3 (needs M2/M3/M4/M5 API shapes):
 
+> **Carry-forward from the M3/M4 audit (LOW):** `workerDTOFromWorker` renders a
+> bound worker with an id and a *null* label unless the caller passes the
+> just-resolved label. Every current caller does, so it is a sharp edge, not a
+> defect — but M6's picker must render from a source that always carries the
+> label (the list path's joined `workerDTOFromRow` does; the create/rebind
+> response needs the label threaded, or the UI must re-fetch). Do not render a
+> binding as "spends: (none)" when it is actually bound.
+
 - [ ] **M6 — Web UI.** Settings → Anthropic token becomes a token **list**
       (label, set date, default badge, per-token meters, add/rename/set-default/
       delete with the D5 affected-workers warning); `WorkersSettings.tsx` grows a
@@ -375,6 +509,14 @@ Phase 3 (needs M2/M3/M4/M5 API shapes):
       unaffected (any-row semantics) — no change expected, assert it.
 
 Phase 4 (last):
+
+> **Carry-forward from the M3/M4 audit (LOW):** the judge lane's two writes — the
+> `enabled` flag and the token binding — are deliberately non-transactional
+> (independent settings, both user-visible and re-doable). It is the one place in
+> the M3/M4 diff where a half-applied pair is observable if a request fails
+> between the two statements. M7's `docs/judge.md` should state that enabling the
+> judge and choosing its token are separate saves, so a partial failure leaves a
+> visible, correctable state rather than a silent one.
 
 - [ ] **M7 — Docs and specs.** `docs/anthropic-token.md` rewritten around
       multiple named tokens (its line 45, "it overwrites the old one", is *made
@@ -429,17 +571,66 @@ Phase 4 (last):
   per user per tick; per-token makes it N. Keep the fail-closed and locked-vault
   skips, and measure before M5 is done.
 - **R4 — Resolution-order bugs are silent and expensive.** A wrong fallback
-  spends the wrong account and nothing errors. Mitigation: resolution lives in
-  the one M1 helper (not three copies — today all three lanes already share
-  `openAnthropic`, and that property must be preserved, not broken by M3/M4),
-  table-driven tests over the (worker bound? judge bound? default exists?)
-  matrix, and the resolved label logged (label, never value) on every claim.
+  spends the wrong account and nothing errors. Mitigation, as *built* through M4
+  (refined from the original "one function" wording, which the M3/M4 review
+  showed was imprecise): the credential **open** is genuinely one function
+  (`openAnthropic`, three call sites — run `service.go:802`, judge `judge.go:172`,
+  chat `chat.go:177` with explicit nil). The binding **selection** is not one
+  function — it is `claimSecretID` (worker rule + self_improve→judge rule) plus
+  `assembleJudgeClaim`'s direct `judgeSecretID` call plus chat's nil — but the
+  guarantee that matters holds: **each of the three selection rules is expressed
+  exactly once, and self_improve and judge share `judgeSecretID` so they cannot
+  drift apart.** That is R4's real property (no divergent copies of a rule), not
+  "resolution in a single function". Backed by table-driven tests over the
+  (worker bound? judge bound? default exists?) matrix and the resolved label
+  logged (label, never value) on every claim.
+
+  *Note on symmetry, from the review:* "a failed read of the binding fails the
+  claim" is strictly true only for the **judge** lane (`judgeSecretID` at
+  `judge.go:140` propagates a lookup error, pinned by
+  `TestJudgeBindingLookupErrorFailsClaim`). The **worker** lane has no such read
+  to fail — `workerSecretID` reads `AnthropicSecretID` off the already-claimed
+  worker row, so there is no separate lookup. Not a gap; the two lanes are
+  asymmetric by construction, and a future reader should not expect an M3
+  read-failure path that cannot exist.
 - **R5 — D14's alias behavior change.** `DELETE /api/me/secrets/anthropic_token`
   starts returning 409 for multi-token users. Low blast radius (the web UI moves
   to the id routes in M6) but it is a contract change and belongs in the docs
   diff, not just the code.
-- **R6 — Requeue is an unacknowledged mid-run rebind, and SDK resume across
-  accounts is unverified.** The token is delivered only at claim (no later
+- **R6 — Requeue is an unacknowledged mid-run rebind. RESOLVED during M3: resume
+  is NOT at risk; attribution is, and rides as a documented limitation.**
+
+  *Investigated 2026-07-21.* The original premise — that resuming an SDK session
+  under a different account's token might fail — is **wrong**. Session state is a
+  local JSONL transcript under `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`,
+  not server-side account-bound state; `agent/src/sdk-env.ts:19-21` says so
+  explicitly ("HOME is pinned onto the persistent data volume … so the SDK's
+  session transcripts … survive a container restart (resume)"). Resume replays
+  that local file and re-sends the history; the OAuth token is the credential on
+  the next API call, not part of session identity. **So pinning the resolved
+  secret id on the run row would protect nothing, and is not done.**
+
+  What remains is the attribution half: `run_usage` cannot say which credential
+  paid across a requeue that changed the binding. That is real but small, and
+  pinning is deliberately still rejected — it would introduce a second source of
+  truth for "which token" that must agree with the binding forever after, on a
+  PRD whose top risk (R4) is precisely resolution-order divergence. M7 documents
+  it as a limitation.
+
+  *Unverified residual, flagged not designed around:* the chat lane uses a shared
+  `sdkHomeRoot` (`agent/src/main.ts:146`, deliberate — a Continue is a new run id
+  resuming the same session), so one `$HOME/.claude` can see token A then token B.
+  If the SDK caches account-scoped metadata there, behavior is unknown. Chat is
+  unbindable under D1, so this is reachable only via a default flip, never a
+  worker rebind.
+
+  *Separate pre-existing bug found while investigating, filed as its own issue:*
+  the run lane's `agent-home/<runId>` (`main.ts:103`) lives on the **claiming
+  worker's** data volume, so a requeued run re-claimed by a different worker once
+  the affinity grace lapses has no transcript to resume — today, with one token
+  per user, unrelated to this PRD.
+
+  *Original text, retained for provenance:* The token is delivered only at claim (no later
   re-delivery in `chat.go`, `judge.go`, or the steering path), but the stale-run
   sweeper requeues and the affinity grace re-claims — so a rebind or default flip
   between claims switches credentials mid-run. Two consequences: Problem-4's
@@ -456,6 +647,30 @@ Phase 4 (last):
   it from a meter.
 - **R8 — PRD #50 collision.** See the open question; the two PRDs must not both
   invent a token-resolution path.
+- **R9 — M2-before-M5 opens a gauge race, if this PRD is ever split across MRs.**
+  `ListUsersWithAnthropicToken` (`anthropic_rate_limits.sql:8`) selects every
+  `anthropic_token` row with no `is_default` filter and no id, and
+  `UpsertRateLimits` is `ON CONFLICT (user_id)`. M2 is what first creates a second
+  row; M5 is what repoints the gauge to `user_secret_id`. In a deployment where M2
+  has landed and M5 has not, a multi-token user's tokens race for one gauge row
+  every tick and the meters flip between accounts with no indication. **This PRD
+  is being delivered as one branch and one PR, so all seven milestones land
+  together and the window never opens.** The risk is recorded for whoever later
+  splits it: if you do, either merge M5 before M2 or gate M2's create path on M5.
+- **R10 — multi-token narrows the DEK AAD's integrity guarantee.**
+  `vault.secretAAD` (`vault.go:364-370`) binds a sealed secret to `user_id||kind`,
+  which `secretbox.go` and `docs/vault-threat-model.md` sell as "a DB-write
+  operator cannot swap a ciphertext onto a different owner/kind". That was a
+  per-ROW binding only because `UNIQUE (user_id, kind)` made kind identify the
+  row. With N named tokens the AAD is identical across all of them, so a DB-write
+  operator can move token A's ciphertext onto the row labelled `console-key` and
+  it authenticates cleanly — the bound worker then spends account A while the
+  label UI says otherwise. **Decision: document, do not fix.** The adversary
+  required is DB-write, strictly stronger than the passive-read adversary the
+  vault targets, and putting the row id in the AAD would need a versioned AAD
+  scheme or a rewrap migration of every existing ciphertext. M1 states the
+  narrowing in its migration comment and corrects the stale `secretAAD` comment;
+  M7 carries it into `docs/vault-threat-model.md` as a residual risk.
 
 ## Parallel execution plan
 

@@ -32,7 +32,10 @@ else's exact username first blocks their own later save with that value.
 
 Open **Settings → Autopilot** and check **Enable autopilot for my
 account**. Off by default; attribution only ever spends your own Anthropic
-token, and only for issues that trace back to you.
+token, and only for issues that trace back to you. An autopilot run is an
+ordinary run, so it spends whatever the worker that claims it is bound to —
+your default unless you pointed that worker somewhere else (see
+[Anthropic tokens](./anthropic-token.md)).
 
 ## 3. Add the label in GitLab
 

@@ -48,7 +48,7 @@ func TestCommandTree(t *testing.T) {
 
 	topWant := []string{
 		"login", "logout", "auth", "whoami", "run", "review",
-		"worker", "repo", "admin", "skill", "version",
+		"worker", "token", "repo", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
 		if findCmd(root, name) == nil {
@@ -59,7 +59,8 @@ func TestCommandTree(t *testing.T) {
 	subWant := map[string][]string{
 		"run":    {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "inputs"},
 		"review": {"show", "resolve", "dismiss", "undo", "stats"},
-		"worker": {"list", "rm"},
+		"worker": {"list", "rm", "set-token"},
+		"token":  {"list"},
 		"repo":   {"list"},
 		"admin":  {"users", "runs", "workers", "usage", "rate-limits"},
 		"skill":  {"status", "install"},

@@ -53,6 +53,16 @@ type FakeClient struct {
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
+	// Secrets drives ListSecrets (PRD #104 M2).
+	Secrets []apitypes.SecretDTO
+
+	// SetWorkerToken capture (PRD #104 M3): the worker id and the label it was asked
+	// to bind. LastSetTokenLabel is "" for the clear-the-binding form, which is the
+	// same value the command passes for --default, so the tests assert on both.
+	LastSetTokenWorkerID string
+	LastSetTokenLabel    string
+	SetTokenWorker       apitypes.WorkerDTO
+
 	// Agent memory (PRD #90): ListMemory returns Memories; DeleteMemory records the
 	// id it was asked to purge.
 	Memories            []apitypes.AgentMemoryDTO
@@ -149,9 +159,25 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 	return f.Workers, nil
 }
 
+func (f *FakeClient) ListSecrets(context.Context) ([]apitypes.SecretDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.Secrets, nil
+}
+
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.LastDeletedWorkerID = id
 	return f.Err
+}
+
+func (f *FakeClient) SetWorkerToken(_ context.Context, id, label string) (apitypes.WorkerDTO, error) {
+	f.LastSetTokenWorkerID = id
+	f.LastSetTokenLabel = label
+	if f.Err != nil {
+		return apitypes.WorkerDTO{}, f.Err
+	}
+	return f.SetTokenWorker, nil
 }
 
 func (f *FakeClient) ListMemory(context.Context) ([]apitypes.AgentMemoryDTO, error) {

@@ -26,8 +26,20 @@ function ok(pct5: number, pct7: number, over: Partial<Extract<MyRateLimits, { st
   };
 }
 
+// A user row carries ONE READING PER TOKEN since PRD #104 M5; these sort tests are
+// about a user's single credential, so row() wraps it as their default. A
+// "no_token" reading becomes the EMPTY list the API actually sends.
 function row(id: string, name: string, limits: MyRateLimits, vault_locked = false): AdminRateLimitUser {
-  return { id, name, email: `${name}@x`, vault_locked, limits };
+  return {
+    id,
+    name,
+    email: `${name}@x`,
+    vault_locked,
+    tokens:
+      limits.status === "no_token"
+        ? []
+        : [{ secret_id: `sec-${id}`, label: "default", is_default: true, limits }],
+  };
 }
 
 describe("formatCountdown (Decision 7)", () => {

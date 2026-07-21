@@ -27,7 +27,7 @@ func TestWorkerDTODockerMapping(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dto := workerDTOFromWorker(store.Worker{DockerEnabled: tc.col}, 0, false)
+			dto := workerDTOFromWorker(store.Worker{DockerEnabled: tc.col}, 0, false, "")
 			if tc.wantNil {
 				if dto.Docker != nil {
 					t.Fatalf("Docker = %v, want nil for a NULL docker_enabled column", *dto.Docker)

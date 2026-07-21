@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/anthropic"
@@ -43,11 +44,13 @@ const backoffDuration = 15 * time.Minute
 const pokeBuffer = 64
 
 // Store is the query surface the engine needs. *store.Queries satisfies it.
-// ListUsersWithAnthropicToken returns each token's ciphertext + sealed_with so the
-// tick opens them in one pass (no per-user re-fetch); GetUserSecretCiphertext backs
-// the single-user poke path.
+// ListAnthropicTokensToPoll returns each TOKEN's id, owner, ciphertext +
+// sealed_with so the tick opens them in one pass (no per-row re-fetch);
+// GetDefaultUserSecretID backs the single-user poke path, which polls the token a
+// save just touched.
 type Store interface {
-	ListUsersWithAnthropicToken(ctx context.Context) ([]store.ListUsersWithAnthropicTokenRow, error)
+	ListAnthropicTokensToPoll(ctx context.Context) ([]store.ListAnthropicTokensToPollRow, error)
+	GetDefaultUserSecretID(ctx context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) error
 }
@@ -80,7 +83,8 @@ type Engine struct {
 	now      func() time.Time
 	logger   *slog.Logger
 
-	// mu guards backoff (written by concurrent per-user goroutines within a tick).
+	// mu guards backoff (written by concurrent per-token goroutines within a tick).
+	// Keyed by SECRET id since M5, so a refusing credential backs off only itself.
 	mu      sync.Mutex
 	backoff map[uuid.UUID]time.Time
 
@@ -136,12 +140,15 @@ func (e *Engine) Run(ctx context.Context) {
 			return
 		case userID := <-e.poke:
 			// A freshly saved token: ignore any prior backoff (the new credential may
-			// work where the old refused) and poll just this user via a single-user
-			// lookup-open (the row wasn't part of a bulk list here).
-			uid := userID
-			e.pollUser(ctx, uid, true, func() ([]byte, error) {
-				return e.opener.Open(ctx, uid, store.KindAnthropicToken)
-			})
+			// work where the old refused) and poll just that user's DEFAULT token via a
+			// single-user lookup-open (the row wasn't part of a bulk list here).
+			//
+			// The poke identity stays the USER, not the token, because the only poker is
+			// the kind-path save (handler/secrets.go), which rotates the default and has
+			// no token id to offer. A poke therefore refreshes one meter, not all of the
+			// user's — the rest are covered by the next tick, which is the same latency
+			// they had before this feature existed.
+			e.pokeUser(ctx, userID)
 		case <-ticker.C:
 			e.tickAll(ctx)
 		}
@@ -155,9 +162,9 @@ func (e *Engine) tickAll(ctx context.Context) {
 	tickCtx, cancel := context.WithTimeout(ctx, e.interval)
 	defer cancel()
 
-	rows, err := e.store.ListUsersWithAnthropicToken(tickCtx)
+	rows, err := e.store.ListAnthropicTokensToPoll(tickCtx)
 	if err != nil {
-		e.logger.Error("usage poller: list users", "error", err)
+		e.logger.Error("usage poller: list tokens", "error", err)
 		return
 	}
 
@@ -166,12 +173,12 @@ func (e *Engine) tickAll(ctx context.Context) {
 	for _, row := range rows {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(row store.ListUsersWithAnthropicTokenRow) {
+		go func(row store.ListAnthropicTokensToPollRow) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// Open from the already-fetched row (no per-user re-fetch, no N+1). The
+			// Open from the already-fetched row (no per-row re-fetch, no N+1). The
 			// ciphertext stays in this goroutine and is never logged.
-			e.pollUser(tickCtx, row.UserID, false, func() ([]byte, error) {
+			e.pollToken(tickCtx, row.UserID, row.ID, false, func() ([]byte, error) {
 				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 			})
 		}(row)
@@ -179,15 +186,44 @@ func (e *Engine) tickAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// pollUser polls one user, applying the D2 (usage-first, probe fallback) and D5
-// (fail-closed / backoff) rules. open resolves the user's token via the vault path
-// (bulk OpenSealed on the tick, single-user Open on the poke); ignoreBackoff is set
-// on the poke path so a just-saved token is polled even if a prior credential was
+// pokeUser polls the token a just-saved credential landed on: the user's DEFAULT,
+// which is what the kind-path save rotates or creates. Resolving the id first is
+// what lets the reading be written against the right gauge row now that the gauge
+// is per-token — writing it against "the user" is no longer expressible.
+//
+// A user with no default (no token at all, or the transient no-default state D12
+// describes) has nothing to poll, which is not an error worth logging on a path
+// triggered by a delete-then-poke race.
+func (e *Engine) pokeUser(ctx context.Context, userID uuid.UUID) {
+	secretID, err := e.store.GetDefaultUserSecretID(ctx, store.GetDefaultUserSecretIDParams{
+		UserID: userID,
+		Kind:   store.KindAnthropicToken,
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			e.logger.Error("usage poller: resolve default token for poke", "user", userID.String(), "error", err)
+		}
+		return
+	}
+	e.pollToken(ctx, userID, secretID, true, func() ([]byte, error) {
+		return e.opener.Open(ctx, userID, store.KindAnthropicToken)
+	})
+}
+
+// pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
+// (fail-closed / backoff) rules. open resolves that token via the vault path (bulk
+// OpenSealed on the tick, single-user Open on the poke); ignoreBackoff is set on the
+// poke path so a just-saved credential is polled even if the one it replaced was
 // backed off.
-func (e *Engine) pollUser(ctx context.Context, userID uuid.UUID, ignoreBackoff bool, open func() ([]byte, error)) {
+//
+// Backoff is keyed on the TOKEN since M5, not the user: one refusing credential
+// must not silence its owner's other meters, which is precisely the case this
+// feature exists to support (a throttled subscription alongside a working console
+// key).
+func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, ignoreBackoff bool, open func() ([]byte, error)) {
 	if ignoreBackoff {
-		e.clearBackoff(userID)
-	} else if e.inBackoff(userID) {
+		e.clearBackoff(secretID)
+	} else if e.inBackoff(secretID) {
 		return
 	}
 
@@ -210,8 +246,8 @@ func (e *Engine) pollUser(ctx context.Context, userID uuid.UUID, ignoreBackoff b
 
 	reading, err := e.client.Usage(ctx, token)
 	if err == nil {
-		e.upsert(ctx, userID, reading)
-		e.clearBackoff(userID)
+		e.upsert(ctx, userID, secretID, reading)
+		e.clearBackoff(secretID)
 		return
 	}
 
@@ -228,23 +264,25 @@ func (e *Engine) pollUser(ctx context.Context, userID uuid.UUID, ignoreBackoff b
 	// KindHTTP: the usage endpoint definitively refused this credential (observed:
 	// 429 for setup-tokens). Fall back to the ~1-token header probe (D2).
 	if !e.probe {
-		e.setBackoff(userID) // no usable fallback → back off (D5)
+		e.setBackoff(secretID) // no usable fallback → back off (D5)
 		return
 	}
 	preading, perr := e.client.ProbeHeaders(ctx, token)
 	if perr == nil {
-		e.upsert(ctx, userID, preading)
-		e.clearBackoff(userID)
+		e.upsert(ctx, userID, secretID, preading)
+		e.clearBackoff(secretID)
 		return
 	}
 	// The probe also failed (refused, transport, or malformed) — no usable fallback,
 	// so back off to avoid hammering a persistently refusing credential (D5).
-	e.setBackoff(userID)
+	e.setBackoff(secretID)
 }
 
-// upsert overwrites the user's single gauge row (D4). synced_at is stamped now.
-func (e *Engine) upsert(ctx context.Context, userID uuid.UUID, r anthropic.Reading) {
+// upsert overwrites ONE TOKEN's gauge row (PRD #53 D4, repointed by #104 M5).
+// synced_at is stamped now.
+func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, r anthropic.Reading) {
 	if err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		UserSecretID:     secretID,
 		UserID:           userID,
 		FiveHourPct:      pgInt2(r.FiveHour.Pct),
 		FiveHourResetsAt: pgTimePtr(r.FiveHour.ResetsAt),
@@ -253,27 +291,31 @@ func (e *Engine) upsert(ctx context.Context, userID uuid.UUID, r anthropic.Readi
 		Source:           pgText(r.Source),
 		SyncedAt:         pgTime(e.now().UTC()),
 	}); err != nil {
-		e.logger.Error("usage poller: upsert", "user", userID.String(), "error", err)
+		// The token id is safe to log — it is a row identifier, never the credential.
+		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
 	}
 }
 
-func (e *Engine) inBackoff(userID uuid.UUID) bool {
+// The backoff map is keyed by SECRET id since M5 (it was user id under PRD #53's
+// per-user gauge): one refusing credential must not silence its owner's other
+// meters. secretID names the token being backed off, not its owner.
+func (e *Engine) inBackoff(secretID uuid.UUID) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	until, ok := e.backoff[userID]
+	until, ok := e.backoff[secretID]
 	return ok && e.now().Before(until)
 }
 
-func (e *Engine) setBackoff(userID uuid.UUID) {
+func (e *Engine) setBackoff(secretID uuid.UUID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.backoff[userID] = e.now().Add(backoffDuration)
+	e.backoff[secretID] = e.now().Add(backoffDuration)
 }
 
-func (e *Engine) clearBackoff(userID uuid.UUID) {
+func (e *Engine) clearBackoff(secretID uuid.UUID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.backoff, userID)
+	delete(e.backoff, secretID)
 }
 
 func pgInt2(v int) pgtype.Int2              { return pgtype.Int2{Int16: int16(v), Valid: true} }

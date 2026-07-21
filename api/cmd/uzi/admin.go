@@ -132,17 +132,30 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(rls)
 			}
+			// One table row per (user, token) since #104 M5: the table gains a TOKEN
+			// column, and a token-less user is a single row with an empty token cell and
+			// a no_token status — so every user still appears exactly once when they hold
+			// no token, and once per token when they hold several.
 			rows := make([][]string, 0, len(rls))
 			for _, rl := range rls {
-				rows = append(rows, []string{
-					rl.Email,
-					vaultCell(rl.VaultLocked),
-					rl.Limits.Status,
-					windowPct(rl.Limits.FiveHour),
-					windowPct(rl.Limits.SevenDay),
-				})
+				if len(rl.Tokens) == 0 {
+					rows = append(rows, []string{
+						rl.Email, vaultCell(rl.VaultLocked), "-", "no_token", "-", "-",
+					})
+					continue
+				}
+				for _, tk := range rl.Tokens {
+					rows = append(rows, []string{
+						rl.Email,
+						vaultCell(rl.VaultLocked),
+						tokenCell(tk.Label, tk.IsDefault),
+						tk.Limits.Status,
+						windowPct(tk.Limits.FiveHour),
+						windowPct(tk.Limits.SevenDay),
+					})
+				}
 			}
-			return p.Table([]string{"EMAIL", "VAULT", "STATUS", "5H%", "7D%"}, rows)
+			return p.Table([]string{"EMAIL", "VAULT", "TOKEN", "STATUS", "5H%", "7D%"}, rows)
 		},
 	}
 
@@ -177,6 +190,16 @@ func vaultCell(locked bool) string {
 		return "locked"
 	}
 	return "unlocked"
+}
+
+// tokenCell renders a token's label for the admin table, marking the default so an
+// operator can see at a glance which credential a user's unbound workers spend
+// against (#104 M5). The label is a name, never the credential.
+func tokenCell(label string, isDefault bool) string {
+	if isDefault {
+		return label + " (default)"
+	}
+	return label
 }
 
 // windowPct renders a rate-limit window's percentage, or "-" when the window is

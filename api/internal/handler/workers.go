@@ -33,6 +33,17 @@ func textPtrValue(valid bool, s string) *string {
 	return &s
 }
 
+// uuidPtrValue renders a nullable uuid column as its string form, or nil. Used for
+// the worker's Anthropic binding (PRD #104 M3), where NULL is the meaningful
+// "unbound, spends the owner's default" state and must serialize as JSON null.
+func uuidPtrValue(u pgtype.UUID) *string {
+	if !u.Valid {
+		return nil
+	}
+	s := uuid.UUID(u.Bytes).String()
+	return &s
+}
+
 // timePtr returns a pointer to t when valid, else nil.
 func timePtr(valid bool, t time.Time) *time.Time {
 	if !valid {
@@ -102,49 +113,58 @@ var runInputKinds = map[string]bool{
 // derivable from a bare Worker row. The register/heartbeat/create paths hold neither
 // (a just-registered worker has requeued its orphans and holds nothing), so they pass
 // 0/false, exactly as they previously passed busy=false.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) apitypes.WorkerDTO {
+// secretLabel is the bound credential's name when the caller knows it (the mint
+// and rebind paths do — they just resolved it) and "" otherwise. The bare-row
+// callers that pass "" render a bound worker with an id and no label, which is
+// honest: this row carries no join to look it up. The list path uses
+// workerDTOFromRow, which does have the join.
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel string) apitypes.WorkerDTO {
 	return apitypes.WorkerDTO{
-		ID:                 w.ID.String(),
-		Name:               w.Name,
-		Status:             w.Status,
-		Kind:               w.Kind,
-		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
-		Docker:             boolPtrValue(w.DockerEnabled),
-		Busy:               busy,
-		ActiveRuns:         activeRuns,
-		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:            textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:    timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:          w.CreatedAt.Time,
-		StatsCPUPct:        float4PtrValue(w.StatsCpuPct),
-		StatsMemBytes:      int8PtrValue(w.StatsMemBytes),
-		StatsMemLimitBytes: int8PtrValue(w.StatsMemLimitBytes),
-		StatsSource:        textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
+		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
+		AnthropicSecretLabel: textPtrValue(secretLabel != "", secretLabel),
+		ID:                   w.ID.String(),
+		Name:                 w.Name,
+		Status:               w.Status,
+		Kind:                 w.Kind,
+		HostedSize:           textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:               boolPtrValue(w.DockerEnabled),
+		Busy:                 busy,
+		ActiveRuns:           activeRuns,
+		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:     textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:     textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:              textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:      timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:            w.CreatedAt.Time,
+		StatsCPUPct:          float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:        int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes:   int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:          textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow) apitypes.WorkerDTO {
 	return apitypes.WorkerDTO{
-		ID:                 w.ID.String(),
-		Name:               w.Name,
-		Status:             w.Status,
-		Kind:               w.Kind,
-		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
-		Docker:             boolPtrValue(w.DockerEnabled),
-		Busy:               w.Busy,
-		ActiveRuns:         int(w.ActiveRuns),
-		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:            textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:    timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:          w.CreatedAt.Time,
-		StatsCPUPct:        float4PtrValue(w.StatsCpuPct),
-		StatsMemBytes:      int8PtrValue(w.StatsMemBytes),
-		StatsMemLimitBytes: int8PtrValue(w.StatsMemLimitBytes),
-		StatsSource:        textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
+		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
+		AnthropicSecretLabel: textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
+		ID:                   w.ID.String(),
+		Name:                 w.Name,
+		Status:               w.Status,
+		Kind:                 w.Kind,
+		HostedSize:           textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:               boolPtrValue(w.DockerEnabled),
+		Busy:                 w.Busy,
+		ActiveRuns:           int(w.ActiveRuns),
+		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:     textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:     textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:              textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:      timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:            w.CreatedAt.Time,
+		StatsCPUPct:          float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:        int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes:   int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:          textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
 }
 
@@ -267,6 +287,12 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		// be a known curated template — validated against the registry so an
 		// arbitrary string can't land in the declared column.
 		Template string `json:"template"`
+		// AnthropicToken is the LABEL of the credential this worker should spend
+		// (PRD #104 M3), optional: empty ⇒ unbound ⇒ the owner's default. A label,
+		// not an id, because this is the surface a human types into. An unknown
+		// label is a 400 rather than a worker minted against a token that does not
+		// exist and would only fail at its first claim.
+		AnthropicToken string `json:"anthropic_token"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -283,14 +309,19 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wkr, token, err := h.wsvc.CreateWorker(r.Context(), user.ID, name, template)
+	tokenLabel := strings.TrimSpace(req.AnthropicToken)
+	wkr, token, err := h.wsvc.CreateWorker(r.Context(), user.ID, name, template, tokenLabel)
 	if err != nil {
+		if errors.Is(err, workersvc.ErrUnknownSecretLabel) {
+			httpx.Error(w, http.StatusBadRequest, "no Anthropic token with that label")
+			return
+		}
 		slog.Error("create worker", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false),
+		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel),
 		"token":  token,
 	})
 }
@@ -340,6 +371,86 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// PatchWorker rebinds a worker to one of its owner's Anthropic credentials, or
+// clears the binding back to the owner's default (PRD #104 M3, D1).
+//
+// RequireUser rather than cookie-only (D8): unlike POST /workers, which MINTS a
+// join token whose claim yields a decrypted credential, this only re-points a
+// worker between two credentials the caller ALREADY owns. It grants the caller no
+// access they did not have — but that argument holds only while the ownership
+// check does, which is why the composite FK backs it independently of this handler.
+//
+// The body names a token by LABEL, the thing a human knows. `null` (or "") clears
+// the binding; an OMITTED key leaves it alone. Distinguishing those two is why the
+// field is a json.RawMessage rather than a *string — see parseTokenField, where a
+// nil *string would have collapsed "clear" and "don't touch" into one request.
+//
+// The rebind lands on the worker's NEXT claim. No restart, no re-minted join token.
+func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid worker id")
+		return
+	}
+	var req struct {
+		AnthropicToken json.RawMessage `json:"anthropic_token"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	token, ok := parseTokenField(req.AnthropicToken)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
+		return
+	}
+	// An omitted key is NOT a clear. Today this route carries only the binding, so a
+	// body without it asks for nothing and is a client bug worth naming — but the
+	// rule is the load-bearing part: PATCH means "change what I named", and the day
+	// this body grows a second field, absent-means-clear would wipe a user's binding
+	// every time someone renamed a worker. Answering 400 rather than 200-with-no-op
+	// avoids inventing a read path just to echo an unchanged worker back.
+	if !token.present {
+		httpx.Error(w, http.StatusBadRequest, "anthropic_token is required; pass null to use your default token")
+		return
+	}
+
+	var secretID *uuid.UUID
+	if token.label != "" {
+		resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, token.label)
+		if rerr != nil {
+			if errors.Is(rerr, workersvc.ErrUnknownSecretLabel) {
+				httpx.Error(w, http.StatusBadRequest, "no Anthropic token with that label")
+				return
+			}
+			slog.Error("resolve anthropic token label", "error", rerr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		secretID = &resolved
+	}
+
+	wkr, err := h.wsvc.SetWorkerAnthropicToken(r.Context(), user.ID, id, secretID)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrWorkerNotFound), errors.Is(err, workersvc.ErrSecretNotOwned):
+			// Both are 404, and deliberately the same 404: distinguishing them would
+			// tell a caller which of the two ids they guessed happens to exist.
+			httpx.Error(w, http.StatusNotFound, "worker not found")
+		default:
+			slog.Error("set worker anthropic token", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label)})
 }
 
 // -------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import {
   type Card as CardData,
   type RunListItem,
 } from "../lib/api";
+import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate, type StartRunGate } from "../lib/runStream";
 import {
   canOpenRunView,
@@ -157,7 +158,7 @@ export function Board() {
         api.listRuns({ repoId }),
       ]);
       setHasWorker(workers.length > 0);
-      setHasToken(secrets.some((s) => s.kind === "anthropic_token"));
+      setHasToken(hasAnthropicToken(secrets));
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
       setStuckRuns(
         runs.filter((r) => r.health !== "ok" && r.health !== "approval_idle" && r.issue_iid != null),

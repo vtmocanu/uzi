@@ -63,6 +63,60 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, rm)
+	// set-token points a worker at one of the caller's named Anthropic tokens
+	// (PRD #104 M3). Unlike `create`, this mints nothing and hands back no
+	// credential — it re-points a worker between tokens the caller already owns —
+	// so it is reachable from a CLI token (D8).
+	//
+	// `--default` and a label are mutually exclusive, and one of them is required:
+	// `uzi worker set-token <id>` with neither would be ambiguous between "clear the
+	// binding" and "show me the binding", and silently picking either is worse than
+	// asking.
+	var toDefault bool
+	setToken := &cobra.Command{
+		Use:   "set-token <worker-id> [label]",
+		Short: "Point a worker at one of your Anthropic tokens (or --default)",
+		Long: "Bind a worker to a named Anthropic token, so its runs spend that\n" +
+			"credential instead of your default one. Pass --default to clear the\n" +
+			"binding and fall back to your default token.\n\n" +
+			"Takes effect on the worker's next claim: no restart, no new join token.\n" +
+			"Chat runs on a bound worker still spend your default token.",
+		Args: cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			label := ""
+			if len(args) == 2 {
+				label = args[1]
+			}
+			switch {
+			case toDefault && label != "":
+				return uzicli.Exitf(uzicli.ExitUsage, "pass either a token label or --default, not both")
+			case !toDefault && label == "":
+				return uzicli.Exitf(uzicli.ExitUsage, "pass a token label, or --default to clear the binding")
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			wkr, err := c.SetWorkerToken(cmd.Context(), args[0], label)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(wkr)
+			}
+			if !gf.quiet {
+				if label == "" {
+					p.Printf("worker %s now uses your default Anthropic token\n", args[0])
+				} else {
+					p.Printf("worker %s now uses Anthropic token %q\n", args[0], label)
+				}
+			}
+			return nil
+		},
+	}
+	setToken.Flags().BoolVar(&toDefault, "default", false, "clear the binding; use the account default token")
+
+	cmd.AddCommand(list, rm, setToken)
 	return cmd
 }

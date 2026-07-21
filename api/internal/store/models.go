@@ -51,6 +51,7 @@ type AgentTemplateAllocation struct {
 }
 
 type AnthropicRateLimit struct {
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	UserID           uuid.UUID          `json:"user_id"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
@@ -377,25 +378,26 @@ type ToolAllowlist struct {
 }
 
 type User struct {
-	ID                   uuid.UUID          `json:"id"`
-	Email                string             `json:"email"`
-	PasswordHash         pgtype.Text        `json:"password_hash"`
-	DisplayName          pgtype.Text        `json:"display_name"`
-	IsAdmin              bool               `json:"is_admin"`
-	IsActive             bool               `json:"is_active"`
-	TokenVersion         int32              `json:"token_version"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	LastLogin            pgtype.Timestamptz `json:"last_login"`
-	DefaultModel         pgtype.Text        `json:"default_model"`
-	AutopilotEnabled     bool               `json:"autopilot_enabled"`
-	Theme                pgtype.Text        `json:"theme"`
-	SlackMemberID        pgtype.Text        `json:"slack_member_id"`
-	SlackNotify          bool               `json:"slack_notify"`
-	SlackResolvedID      pgtype.Text        `json:"slack_resolved_id"`
-	SlackLinkConfirmedAt pgtype.Timestamptz `json:"slack_link_confirmed_at"`
-	OidcIssuer           pgtype.Text        `json:"oidc_issuer"`
-	OidcSubject          pgtype.Text        `json:"oidc_subject"`
-	JudgeEnabled         bool               `json:"judge_enabled"`
+	ID                     uuid.UUID          `json:"id"`
+	Email                  string             `json:"email"`
+	PasswordHash           pgtype.Text        `json:"password_hash"`
+	DisplayName            pgtype.Text        `json:"display_name"`
+	IsAdmin                bool               `json:"is_admin"`
+	IsActive               bool               `json:"is_active"`
+	TokenVersion           int32              `json:"token_version"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	LastLogin              pgtype.Timestamptz `json:"last_login"`
+	DefaultModel           pgtype.Text        `json:"default_model"`
+	AutopilotEnabled       bool               `json:"autopilot_enabled"`
+	Theme                  pgtype.Text        `json:"theme"`
+	SlackMemberID          pgtype.Text        `json:"slack_member_id"`
+	SlackNotify            bool               `json:"slack_notify"`
+	SlackResolvedID        pgtype.Text        `json:"slack_resolved_id"`
+	SlackLinkConfirmedAt   pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	OidcIssuer             pgtype.Text        `json:"oidc_issuer"`
+	OidcSubject            pgtype.Text        `json:"oidc_subject"`
+	JudgeEnabled           bool               `json:"judge_enabled"`
+	JudgeAnthropicSecretID pgtype.UUID        `json:"judge_anthropic_secret_id"`
 }
 
 type UserSecret struct {
@@ -406,6 +408,8 @@ type UserSecret struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 	SealedWith string             `json:"sealed_with"`
+	Label      string             `json:"label"`
+	IsDefault  bool               `json:"is_default"`
 }
 
 type UserVault struct {
@@ -437,4 +441,5 @@ type Worker struct {
 	HostedSize         pgtype.Text        `json:"hosted_size"`
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
 }

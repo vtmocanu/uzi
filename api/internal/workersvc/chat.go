@@ -172,7 +172,9 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, fmt.Errorf("chat claim context: %w", err)
 	}
 
-	anthropic, err := s.openAnthropic(ctx, run.UserID)
+	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a
+	// bound worker's chat runs still spend the owner's default token.
+	anthropic, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		return nil, err
 	}

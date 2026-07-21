@@ -74,6 +74,16 @@ var (
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
 	ErrWorkerHasActiveRuns = errors.New("worker has active runs")
+	// ErrUnknownSecretLabel is a token label that names none of the user's
+	// credentials (PRD #104 M3) → 400. Case-insensitive, matching the unique index
+	// on lower(label), so it means "you have no token by that name" and never "you
+	// spelled it with the wrong capitalization".
+	ErrUnknownSecretLabel = errors.New("unknown anthropic token label")
+	// ErrSecretNotOwned is a secret id that is not the caller's (PRD #104 D11) → 404,
+	// never 403: a 403 would confirm the id names a real credential belonging to
+	// someone else. The composite FK refuses the same binding independently, so this
+	// exists to produce the right status code, not to be the security control.
+	ErrSecretNotOwned = errors.New("anthropic secret not found for this user")
 
 	// Agent-memory sentinels (PRD #90), mapped to HTTP by the worker handlers.
 	// ErrMemoryNoRepo rejects a save/read on a repo-less run (runs.repo_id is
@@ -242,6 +252,15 @@ type Store interface {
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
+	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
+	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
+	// CLI-facing forms, and the id-keyed rebind itself.
+	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
+	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
+	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
+	// PUT /api/me/judge.
+	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
+	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
@@ -616,7 +635,7 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, err
 	}
 
-	payload, err := s.assembleClaim(ctx, run)
+	payload, err := s.assembleClaim(ctx, wkr, run)
 	if err != nil {
 		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
@@ -675,16 +694,31 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
-// openAnthropic opens the owner's decrypted Anthropic token — the one secret both
-// the run lane and the chat lane deliver. The vault-dispatch logic (dek needs
-// unlock, legacy master opens regardless, nil vault → master box) lives in
-// secretopen, shared with the rate-limit poller (PRD #53); this method maps its
-// sentinels back to workersvc's domain errors, preserving the exact prior
-// behavior: a lock surfaces as errVaultLocked (requeue, never fail), and a
-// missing/undecryptable token as errCredentialUnavailable with its original
-// failure-reason text (which never includes secret bytes).
-func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, error) {
-	tok, err := secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+// openAnthropic opens the decrypted Anthropic token for one run — the one secret
+// the run lane, the judge lane and the chat lane all deliver, and the ONE place
+// credential resolution happens. The vault-dispatch logic (dek needs unlock,
+// legacy master opens regardless, nil vault → master box) lives in secretopen,
+// shared with the rate-limit poller (PRD #53); this method maps its sentinels back
+// to workersvc's domain errors, preserving the exact prior behavior: a lock
+// surfaces as errVaultLocked (requeue, never fail), and a missing/undecryptable
+// token as errCredentialUnavailable with its original failure-reason text (which
+// never includes secret bytes).
+//
+// secretID is the binding-else-default seam (PRD #104 M1): nil resolves the user's
+// default token, non-nil resolves that specific credential. All three lanes pass
+// nil today; M3 threads a worker's anthropic_secret_id through it and M4 the
+// judge lane's, so neither has to restructure this function — which is what keeps
+// them file-disjoint, and what keeps resolution in one place instead of three
+// copies drifting apart (R4). A bound id that is not the caller's is ErrNoSecret,
+// i.e. errCredentialUnavailable, never another user's credential (D11).
+func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) ([]byte, error) {
+	var tok []byte
+	var err error
+	if secretID != nil {
+		tok, err = secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, *secretID)
+	} else {
+		tok, err = secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+	}
 	switch {
 	case err == nil:
 		return tok, nil
@@ -700,8 +734,44 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, 
 	}
 }
 
-// assembleClaim builds the claim payload for an already-claimed run.
-func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
+// claimSecretID resolves WHICH credential a run-lane claim spends, and is the one
+// place that decision is made (R4: three copies of resolution drift, and a wrong
+// fallback spends the wrong account silently).
+//
+//   - self_improve → the owner's JUDGE binding (PRD #104 M4). This branch is not
+//     cosmetic and it is not automatic: a self_improve run is repo-ful and rides
+//     the ordinary run lane, NOT assembleJudgeClaim, so without it "self-improve
+//     follows the judge binding" would simply be false while appearing to be
+//     handled. It belongs with the judge because it is uzi reviewing and improving
+//     itself — the same activity the judge binding exists to bill separately —
+//     not work the user asked a particular worker to do.
+//   - everything else on this lane (issue, ci_fix) → the CLAIMING worker's binding,
+//     else the owner's default.
+//
+// Judge runs never reach here; they fork to assembleJudgeClaim earlier.
+func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (*uuid.UUID, error) {
+	if run.Kind == RunKindSelfImprove {
+		return s.judgeSecretID(ctx, run.UserID)
+	}
+	return workerSecretID(wkr), nil
+}
+
+// workerSecretID is a worker's Anthropic binding as openAnthropic's override:
+// nil when the worker names no credential, which resolves the owner's default
+// (PRD #104 M3). An invalid/unset pgtype.UUID and a NULL column are the same
+// thing here — "no binding" — so this is the one place that translation lives.
+func workerSecretID(wkr store.Worker) *uuid.UUID {
+	if !wkr.AnthropicSecretID.Valid {
+		return nil
+	}
+	id := uuid.UUID(wkr.AnthropicSecretID.Bytes)
+	return &id
+}
+
+// assembleClaim builds the claim payload for an already-claimed run. It takes the
+// CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
+// run spends can depend on which worker picked it up.
+func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
@@ -724,7 +794,16 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	anthropic, err := s.openAnthropic(ctx, run.UserID)
+	// Which credential this claim spends: the claiming worker's binding for ordinary
+	// runs, the owner's judge binding for self_improve, the owner's default when
+	// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
+	// rebind take effect on the worker's next claim with no restart and no re-minted
+	// join token — the token has never ridden the worker, only each claim response.
+	secretID, err := s.claimSecretID(ctx, wkr, run)
+	if err != nil {
+		return nil, err
+	}
+	anthropic, err := s.openAnthropic(ctx, run.UserID, secretID)
 	if err != nil {
 		return nil, err
 	}
@@ -1506,7 +1585,16 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 
 // CreateWorker issues a worker for the user and returns the plaintext join token
 // exactly once (only its hash is stored).
-func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, templateDeclared string) (store.Worker, string, error) {
+// tokenLabel is the optional mint-time Anthropic token binding (PRD #104 M3):
+// empty means "no binding", i.e. the worker spends its owner's default. A label
+// that names none of the user's tokens is ErrUnknownSecretLabel — minting a worker
+// pointed at a credential that does not exist would produce a worker that only
+// fails at its first claim.
+func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, templateDeclared, tokenLabel string) (store.Worker, string, error) {
+	secretID, err := s.resolveSecretLabel(ctx, userID, tokenLabel)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
 	token, hash, err := jointoken.Generate()
 	if err != nil {
 		return store.Worker{}, "", err
@@ -1514,15 +1602,120 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	// templateDeclared is the UI-chosen worker template (PRD #18), validated
 	// against the registry by the caller; empty → NULL (no choice made).
 	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID:           userID,
-		Name:             name,
-		TokenHash:        hash,
-		TemplateDeclared: pgText(templateDeclared),
+		UserID:            userID,
+		Name:              name,
+		TokenHash:         hash,
+		TemplateDeclared:  pgText(templateDeclared),
+		AnthropicSecretID: secretID,
 	})
 	if err != nil {
 		return store.Worker{}, "", err
 	}
 	return wkr, token, nil
+}
+
+// resolveSecretLabel maps an optional token label to the secret id to store.
+// Empty label ⇒ an invalid pgtype.UUID, i.e. NULL, i.e. "use my default".
+func (s *Service) resolveSecretLabel(ctx context.Context, userID uuid.UUID, label string) (pgtype.UUID, error) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return pgtype.UUID{}, nil
+	}
+	id, err := s.q.GetUserSecretIDByLabel(ctx, store.GetUserSecretIDByLabelParams{
+		UserID: userID,
+		Kind:   store.KindAnthropicToken,
+		Label:  label,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return pgtype.UUID{}, ErrUnknownSecretLabel
+		}
+		return pgtype.UUID{}, err
+	}
+	return pgUUID(id), nil
+}
+
+// SetWorkerAnthropicToken points a worker at one of its owner's Anthropic
+// credentials, or clears the binding back to the owner's default (PRD #104 M3).
+// secretID nil clears it. Takes effect on the worker's NEXT claim: no restart, no
+// re-minted join token, because the credential rides each claim response and has
+// never been held by the worker.
+//
+// Ownership is checked THREE times over, deliberately (D11). Here, so an id that
+// is not the caller's produces a 404 rather than a constraint violation. In the
+// UPDATE's own WHERE, which is scoped to user_id. And in the composite FK, which
+// is the layer that still refuses a cross-user binding when this check is bypassed
+// — the one the acceptance test exercises with the handler check stubbed out.
+func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID uuid.UUID, secretID *uuid.UUID) (store.Worker, error) {
+	var bind pgtype.UUID
+	if secretID != nil {
+		// Confirm the secret is this user's before writing, so the caller gets a 404
+		// naming what was wrong instead of a 500 from the FK.
+		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+			ID:     *secretID,
+			UserID: userID,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.Worker{}, ErrSecretNotOwned
+			}
+			return store.Worker{}, err
+		}
+		bind = pgUUID(*secretID)
+	}
+	wkr, err := s.q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
+		ID:                workerID,
+		UserID:            userID,
+		AnthropicSecretID: bind,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Worker{}, ErrWorkerNotFound
+		}
+		return store.Worker{}, err
+	}
+	return wkr, nil
+}
+
+// SetUserJudgeToken points the user's JUDGE lane at one of their own Anthropic
+// credentials, or clears it back to their default when secretID is nil (PRD #104
+// M4). Per-user, not per-worker: which credential reviews your work is a property
+// of you, not of whichever worker claims the retrospective.
+//
+// Ownership is checked here so the caller gets a 404 rather than a constraint
+// violation; 00079's composite FK refuses the same binding independently, and is
+// the layer that holds if this check is ever bypassed (D11).
+func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (store.User, error) {
+	var bind pgtype.UUID
+	if secretID != nil {
+		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+			ID:     *secretID,
+			UserID: userID,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.User{}, ErrSecretNotOwned
+			}
+			return store.User{}, err
+		}
+		bind = pgUUID(*secretID)
+	}
+	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
+		ID:                     userID,
+		JudgeAnthropicSecretID: bind,
+	})
+}
+
+// ResolveTokenLabel exposes label → secret id for the handler's PATCH body, which
+// accepts a label (what a human types) rather than a uuid. Returns
+// ErrUnknownSecretLabel for a label the user has no token under.
+func (s *Service) ResolveTokenLabel(ctx context.Context, userID uuid.UUID, label string) (uuid.UUID, error) {
+	id, err := s.resolveSecretLabel(ctx, userID, label)
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	if !id.Valid {
+		return uuid.UUID{}, ErrUnknownSecretLabel
+	}
+	return uuid.UUID(id.Bytes), nil
 }
 
 // ListWorkers returns the user's workers with derived busy status.

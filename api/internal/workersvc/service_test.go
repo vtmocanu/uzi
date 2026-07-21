@@ -35,6 +35,18 @@ type fakeStore struct {
 	claimCtxCalled bool
 	anthropic      []byte
 	anthropicErr   error
+	// byIDSecrets is the by-id secret lookup (PRD #104): secret id → sealed row, the
+	// path a WORKER-BOUND claim takes instead of the by-kind default. Keyed by id so
+	// a test can stage two credentials and prove a rebind changes which one the
+	// claim payload carries. byIDLookups records every (id, user) asked for, which is
+	// what proves the lookup is owner-scoped.
+	byIDSecrets map[uuid.UUID]store.GetUserSecretCiphertextByIDRow
+	byIDLookups []store.GetUserSecretCiphertextByIDParams
+	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
+	// "unbound", which is every user's state until they choose otherwise, so existing
+	// judge fixtures keep resolving the default with no change.
+	judgeSecret    pgtype.UUID
+	judgeSecretErr error
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
 	anthropicSealedWith string
@@ -256,6 +268,17 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 		sealedWith = store.SealedWithMaster // default: fixtures seal with the master box
 	}
 	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: sealedWith}, f.anthropicErr
+}
+func (f *fakeStore) GetUserJudgeAnthropicSecret(context.Context, uuid.UUID) (pgtype.UUID, error) {
+	return f.judgeSecret, f.judgeSecretErr
+}
+func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
+	f.byIDLookups = append(f.byIDLookups, arg)
+	row, ok := f.byIDSecrets[arg.ID]
+	if !ok {
+		return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
+	}
+	return row, nil
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
@@ -1880,7 +1903,7 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
 	svc := New(fs, newBox(t), testParams())
-	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", "jvm")
+	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", "jvm", "")
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
 	}
@@ -1900,7 +1923,7 @@ func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 func TestCreateWorkerEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
 	svc := New(fs, newBox(t), testParams())
-	if _, _, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", ""); err != nil {
+	if _, _, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", "", ""); err != nil {
 		t.Fatalf("CreateWorker: %v", err)
 	}
 	if fs.createWorkerParams == nil || fs.createWorkerParams.TemplateDeclared.Valid {
@@ -2203,5 +2226,376 @@ func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
 	}
 	if len(lc.notes) != 1 || lc.notes[0].status != "failed" || lc.notes[0].runID != runID {
 		t.Fatalf("a credential-failed claim must notify 'failed', got %+v", lc.notes)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Worker → token binding (PRD #104 M3)
+// -------------------------------------------------------------------------
+
+// TestClaimRebindChangesCredentialWithoutRestart is M3's headline acceptance
+// criterion: flipping a worker's binding changes the credential in its NEXT claim
+// payload, with no container restart and no re-minted join token.
+//
+// It is expressible as a test at all only because of how uzi delivers the token:
+// the worker never holds it, the API decrypts it per claim and ships it in the
+// claim response. So "no restart needed" is not a timing claim to be measured —
+// it is the structural fact that the same worker row, with the same token_hash,
+// claims twice and gets two different credentials because resolution happens on
+// the server at claim time. The test drives exactly that: one worker identity,
+// three claims, three bindings.
+func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
+	const defaultToken = "anthropic-DEFAULT-abcdef1234567890"
+	const consoleToken = "anthropic-CONSOLE-abcdef1234567890"
+
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-REBIND-abcdef1234567890"))
+	sealedDefault, _ := box.Seal([]byte(defaultToken))
+	sealedConsole, _ := box.Seal([]byte(consoleToken))
+
+	owner := uuid.New()
+	consoleID := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), UserID: owner, IssueIid: pgtype.Int8{Int64: 9, Valid: true},
+			IssueTitle: "Do the thing", IssueDescription: "d", Status: "claimed",
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		// The by-kind row is the owner's DEFAULT token; the by-id map holds the
+		// specific credential a bound worker resolves.
+		anthropic: sealedDefault,
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
+			consoleID: {
+				UserID: owner, Kind: store.KindAnthropicToken,
+				Ciphertext: sealedConsole, SealedWith: store.SealedWithMaster,
+			},
+		},
+	}
+	svc := New(fs, box, testParams())
+
+	// ONE worker identity throughout: same id, same owner, same join-token hash.
+	// Only the binding column changes between claims.
+	wkr := store.Worker{ID: uuid.New(), UserID: owner, TokenHash: []byte{0xde, 0xad}}
+
+	claimToken := func(t *testing.T, w store.Worker) string {
+		t.Helper()
+		payload, err := svc.Claim(context.Background(), w)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if payload == nil {
+			t.Fatal("expected a payload, got idle")
+		}
+		return payload.Secrets.AnthropicOAuthToken
+	}
+
+	// 1. Unbound → the owner's default.
+	if got := claimToken(t, wkr); got != defaultToken {
+		t.Fatalf("unbound worker claimed %q, want the owner's default token", got)
+	}
+
+	// 2. Bound to console-key → that credential, same worker row.
+	wkr.AnthropicSecretID = pgtype.UUID{Bytes: consoleID, Valid: true}
+	if got := claimToken(t, wkr); got != consoleToken {
+		t.Fatalf("bound worker claimed %q, want the console-key token — a rebind did not reach the claim payload", got)
+	}
+	if len(fs.byIDLookups) != 1 {
+		t.Fatalf("by-id lookups = %d, want exactly 1 (the bound claim)", len(fs.byIDLookups))
+	}
+	// The lookup must be scoped to the claiming worker's OWNER, not to some
+	// caller-supplied user: this is what stops a worker row carrying a foreign
+	// secret id from resolving that credential (D11).
+	if fs.byIDLookups[0].UserID != owner || fs.byIDLookups[0].ID != consoleID {
+		t.Fatalf("by-id lookup was (%v,%v), want (%v,%v)",
+			fs.byIDLookups[0].ID, fs.byIDLookups[0].UserID, consoleID, owner)
+	}
+
+	// 3. Unbound again → back to the default, no restart in between.
+	wkr.AnthropicSecretID = pgtype.UUID{}
+	if got := claimToken(t, wkr); got != defaultToken {
+		t.Fatalf("after clearing the binding the worker claimed %q, want the default again", got)
+	}
+
+	// The worker's identity never changed across the three claims — no re-mint.
+	if string(wkr.TokenHash) != string([]byte{0xde, 0xad}) {
+		t.Fatal("the worker's join token hash changed; a rebind must never re-mint it")
+	}
+}
+
+// TestClaimBoundToVanishedSecretFailsClosed: a binding that no longer resolves
+// must FAIL the run with the credential-unavailable reason, never silently fall
+// back to the default. A silent fallback is the R4 failure mode — it would spend
+// the wrong account and report success.
+func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-VANISH-abcdef1234567890"))
+	sealedDefault, _ := box.Seal([]byte("anthropic-DEFAULT-vanish-abcdef12345"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 3, Valid: true},
+			IssueTitle: "t", IssueDescription: "d", Status: "claimed",
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:   sealedDefault,
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // the bound id resolves to nothing
+	}
+	svc := New(fs, box, testParams())
+
+	wkr := worker()
+	wkr.AnthropicSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+
+	payload, err := svc.Claim(context.Background(), wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload != nil {
+		t.Fatal("a claim whose bound credential does not resolve must not produce a payload — " +
+			"silently falling back to the default would spend the wrong account with no error")
+	}
+	if fs.markedFailed == nil {
+		t.Fatal("the run should have been failed with credential-unavailable")
+	}
+}
+
+// TestJudgeClaimIgnoresWorkerBinding pins D1's boundary: a judge run claimed by a
+// BOUND worker still spends the owner's default, because the judge lane is bound
+// per user (M4), not per worker. Getting this wrong would silently bill
+// retrospectives to whichever worker happened to pick them up.
+func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
+	const defaultToken = "anthropic-JUDGEDEFAULT-abcdef1234567"
+
+	box := newBox(t)
+	sealedDefault, _ := box.Seal([]byte(defaultToken))
+	sealedConsole, _ := box.Seal([]byte("anthropic-JUDGECONSOLE-abcdef123456"))
+
+	owner, consoleID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
+		},
+		anthropic: sealedDefault,
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
+			consoleID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedConsole, SealedWith: store.SealedWithMaster},
+		},
+	}
+	svc := New(fs, box, testParams())
+
+	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true}}
+	payload, err := svc.Claim(context.Background(), wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a judge payload, got idle")
+	}
+	if payload.Secrets.AnthropicOAuthToken != defaultToken {
+		t.Fatalf("judge claim spent %q, want the owner's DEFAULT — the judge lane binds per user (D1), not per worker",
+			payload.Secrets.AnthropicOAuthToken)
+	}
+	if len(fs.byIDLookups) != 0 {
+		t.Fatalf("judge claim did a by-id secret lookup (%d); it must resolve the default", len(fs.byIDLookups))
+	}
+	if fs.claimCtxCalled {
+		t.Fatal("judge claim must not touch the repo/forge claim context")
+	}
+}
+
+// -------------------------------------------------------------------------
+// Judge-lane → token binding (PRD #104 M4)
+// -------------------------------------------------------------------------
+
+// TestJudgeClaimUsesJudgeBinding: a judge run spends the OWNER's judge-bound
+// credential, not their default and not the claiming worker's binding. This is the
+// milestone's whole point — retrospectives billed to a different account from the
+// runs they review.
+func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
+	const defaultToken = "anthropic-DEFAULT-judgebind-abcdef12"
+	const judgeToken = "anthropic-JUDGEKEY-judgebind-abcdef1"
+
+	box := newBox(t)
+	sealedDefault, _ := box.Seal([]byte(defaultToken))
+	sealedJudge, _ := box.Seal([]byte(judgeToken))
+
+	owner := uuid.New()
+	judgeID, workerBoundID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
+		},
+		anthropic:   sealedDefault,
+		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
+			judgeID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
+		},
+	}
+	svc := New(fs, box, testParams())
+
+	// The claiming worker is bound to something ELSE entirely, to prove the judge
+	// lane ignores it (D1).
+	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true}}
+	payload, err := svc.Claim(context.Background(), wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a judge payload, got idle")
+	}
+	if payload.Secrets.AnthropicOAuthToken != judgeToken {
+		t.Fatalf("judge claim spent %q, want the owner's JUDGE-bound token", payload.Secrets.AnthropicOAuthToken)
+	}
+	if len(fs.byIDLookups) != 1 || fs.byIDLookups[0].ID != judgeID {
+		t.Fatalf("by-id lookups = %+v, want exactly the judge binding (%v)", fs.byIDLookups, judgeID)
+	}
+	// Owner-scoped, so a judge binding can never resolve someone else's credential.
+	if fs.byIDLookups[0].UserID != owner {
+		t.Fatalf("judge lookup scoped to %v, want the run owner %v", fs.byIDLookups[0].UserID, owner)
+	}
+}
+
+// TestJudgeClaimUnboundUsesDefault: the unbound case is every user's state until
+// they choose otherwise, and must keep resolving the default with no by-id lookup.
+func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
+	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234"
+	box := newBox(t)
+	sealedDefault, _ := box.Seal([]byte(defaultToken))
+
+	owner := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
+		},
+		anthropic:   sealedDefault,
+		judgeSecret: pgtype.UUID{}, // unbound
+	}
+	svc := New(fs, box, testParams())
+
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil || payload.Secrets.AnthropicOAuthToken != defaultToken {
+		t.Fatalf("unbound judge claim did not resolve the default: %+v", payload)
+	}
+	if len(fs.byIDLookups) != 0 {
+		t.Fatalf("unbound judge claim did %d by-id lookups, want 0", len(fs.byIDLookups))
+	}
+}
+
+// TestJudgeBindingLookupErrorFailsClaim: a failed read of the binding must NOT be
+// treated as "unbound". Falling back to the default there would spend the wrong
+// account on every retrospective while a transient DB fault lasted, and nothing
+// would report it — R4's failure mode exactly.
+func TestJudgeBindingLookupErrorFailsClaim(t *testing.T) {
+	box := newBox(t)
+	sealedDefault, _ := box.Seal([]byte("anthropic-DEFAULT-lookuperr-abcdef12"))
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			IssueTitle: "judge", IssueDescription: "d", UserID: uuid.New(),
+		},
+		anthropic:      sealedDefault,
+		judgeSecretErr: errors.New("db down"),
+	}
+	svc := New(fs, box, testParams())
+
+	_, err := svc.Claim(context.Background(), worker())
+	if err == nil {
+		t.Fatal("a failed judge-binding lookup must fail the claim, never silently fall back to the default")
+	}
+	if !strings.Contains(err.Error(), "judge token binding lookup") {
+		t.Fatalf("error should name the binding lookup, got: %v", err)
+	}
+}
+
+// TestJudgeBoundToVanishedSecretFailsClosed: same rule as M3's worker binding — a
+// judge binding that no longer resolves fails the run rather than falling back.
+func TestJudgeBoundToVanishedSecretFailsClosed(t *testing.T) {
+	box := newBox(t)
+	sealedDefault, _ := box.Seal([]byte("anthropic-DEFAULT-vanish-judge-abcd"))
+	owner := uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), Kind: RunKindJudge, Status: "claimed",
+			IssueTitle: "judge", IssueDescription: "d", UserID: owner,
+		},
+		anthropic:   sealedDefault,
+		judgeSecret: pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{}, // resolves to nothing
+	}
+	svc := New(fs, box, testParams())
+
+	payload, err := svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: owner})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload != nil {
+		t.Fatal("a judge claim whose bound credential does not resolve must not produce a payload")
+	}
+	if fs.markedFailed == nil {
+		t.Fatal("the judge run should have been failed with credential-unavailable")
+	}
+}
+
+// TestSelfImproveClaimFollowsJudgeBinding pins the branch that makes the PRD's
+// "self-improve runs follow the judge binding" true. A self_improve run is repo-ful
+// and rides the ORDINARY run lane, not assembleJudgeClaim, so without an explicit
+// branch it would silently follow the claiming worker's binding instead.
+func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
+	const judgeToken = "anthropic-JUDGEKEY-selfimprove-abcd"
+
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-SELFIMPROVE-abcdef1234567890"))
+	sealedDefault, _ := box.Seal([]byte("anthropic-DEFAULT-selfimprove-abcde"))
+	sealedJudge, _ := box.Seal([]byte(judgeToken))
+
+	owner := uuid.New()
+	judgeID, workerID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		claimRun: store.Run{
+			ID: uuid.New(), UserID: owner, Kind: RunKindSelfImprove, Status: "claimed",
+			IssueIid: pgtype.Int8{Int64: 1, Valid: true}, IssueTitle: "improve uzi", IssueDescription: "d",
+		},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/uzi", RepoPath: "g/uzi",
+			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:   sealedDefault,
+		judgeSecret: pgtype.UUID{Bytes: judgeID, Valid: true},
+		byIDSecrets: map[uuid.UUID]store.GetUserSecretCiphertextByIDRow{
+			judgeID:  {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedJudge, SealedWith: store.SealedWithMaster},
+			workerID: {UserID: owner, Kind: store.KindAnthropicToken, Ciphertext: sealedDefault, SealedWith: store.SealedWithMaster},
+		},
+	}
+	svc := New(fs, box, testParams())
+
+	// Claimed by a worker bound to a DIFFERENT credential: the judge binding wins.
+	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true}}
+	payload, err := svc.Claim(context.Background(), wkr)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload == nil {
+		t.Fatal("expected a self_improve payload, got idle")
+	}
+	if payload.Secrets.AnthropicOAuthToken != judgeToken {
+		t.Fatalf("self_improve claim spent %q, want the JUDGE-bound token — it rides the run lane, "+
+			"so this only holds because claimSecretID branches on the kind", payload.Secrets.AnthropicOAuthToken)
+	}
+	// It is still a repo-ful run-lane claim, not a judge claim.
+	if !fs.claimCtxCalled {
+		t.Fatal("a self_improve claim must still take the ordinary repo-ful claim path")
 	}
 }

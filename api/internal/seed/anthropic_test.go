@@ -21,7 +21,7 @@ type fakeSecretStore struct {
 	userErr  error
 	secrets  []store.ListUserSecretsMetaRow
 	listErr  error
-	upserted *store.UpsertUserSecretParams
+	inserted *store.InsertUserSecretParams
 }
 
 func (s *fakeSecretStore) GetUserByEmail(context.Context, string) (store.User, error) {
@@ -30,9 +30,9 @@ func (s *fakeSecretStore) GetUserByEmail(context.Context, string) (store.User, e
 func (s *fakeSecretStore) ListUserSecretsMeta(context.Context, uuid.UUID) ([]store.ListUserSecretsMetaRow, error) {
 	return s.secrets, s.listErr
 }
-func (s *fakeSecretStore) UpsertUserSecret(_ context.Context, arg store.UpsertUserSecretParams) (store.UpsertUserSecretRow, error) {
-	s.upserted = &arg
-	return store.UpsertUserSecretRow{Kind: arg.Kind}, nil
+func (s *fakeSecretStore) InsertUserSecret(_ context.Context, arg store.InsertUserSecretParams) (store.InsertUserSecretRow, error) {
+	s.inserted = &arg
+	return store.InsertUserSecretRow{Kind: arg.Kind, Label: arg.Label, IsDefault: arg.WantDefault}, nil
 }
 
 // fakeSealer stands in for the vault: it DEK-seals with a recognizable prefix so
@@ -66,27 +66,37 @@ func TestAnthropicTokenSeedsWhenAbsent(t *testing.T) {
 	if err := AnthropicToken(context.Background(), st, box, anthropicCfg()); err != nil {
 		t.Fatalf("AnthropicToken: %v", err)
 	}
-	if st.upserted == nil {
+	if st.inserted == nil {
 		t.Fatal("expected the token to be stored")
 	}
-	if st.upserted.UserID != userID {
-		t.Fatalf("token stored for the wrong user: %v", st.upserted.UserID)
+	if st.inserted.UserID != userID {
+		t.Fatalf("token stored for the wrong user: %v", st.inserted.UserID)
 	}
-	if st.upserted.Kind != store.KindAnthropicToken {
-		t.Fatalf("token stored under the wrong kind: %q", st.upserted.Kind)
+	if st.inserted.Kind != store.KindAnthropicToken {
+		t.Fatalf("token stored under the wrong kind: %q", st.inserted.Kind)
 	}
-	if got := string(st.upserted.Ciphertext); got != "dek:sk-ant-oat-abc123" {
+	if got := string(st.inserted.Ciphertext); got != "dek:sk-ant-oat-abc123" {
 		t.Fatalf("token not DEK-sealed via the vault: %q", got)
 	}
 	// M2 seeds a DEK-sealed token (the seed admin's vault is boot-unlocked by main);
 	// sealed_with must record 'dek' (an empty value would violate the migration's
 	// CHECK at runtime, which the fake hides), and the seal must be bound to the
 	// seed admin + the anthropic kind.
-	if st.upserted.SealedWith != store.SealedWithDEK {
-		t.Fatalf("seeded secret sealed_with = %q, want %q", st.upserted.SealedWith, store.SealedWithDEK)
+	if st.inserted.SealedWith != store.SealedWithDEK {
+		t.Fatalf("seeded secret sealed_with = %q, want %q", st.inserted.SealedWith, store.SealedWithDEK)
 	}
 	if box.lastUserID != userID || box.lastKind != store.KindAnthropicToken {
 		t.Fatalf("seal bound to (%v,%q), want (%v,%q)", box.lastUserID, box.lastKind, userID, store.KindAnthropicToken)
+	}
+	// PRD #104 M1: the seeded token must land in the same shape 00077 backfills
+	// onto an upgraded deployment's existing row — labelled 'default' and flagged
+	// as the default — or a seeded stack's fallback resolution finds no row at all
+	// (every by-kind read is `AND is_default` now).
+	if st.inserted.Label != store.LabelDefaultSecret {
+		t.Fatalf("seeded secret label = %q, want %q", st.inserted.Label, store.LabelDefaultSecret)
+	}
+	if !st.inserted.WantDefault {
+		t.Fatal("the seeded token must be the user's default, else nothing resolves it")
 	}
 }
 
@@ -103,7 +113,7 @@ func TestAnthropicTokenExistingIsNoOp(t *testing.T) {
 	if box.sealed != 0 {
 		t.Fatal("an existing token must not be re-sealed")
 	}
-	if st.upserted != nil {
+	if st.inserted != nil {
 		t.Fatal("an existing token must be left entirely untouched")
 	}
 }
@@ -117,7 +127,7 @@ func TestAnthropicTokenDisabledIsNoOp(t *testing.T) {
 	if err := AnthropicToken(context.Background(), st, box, cfg); err != nil {
 		t.Fatalf("disabled seed must be a no-op, got: %v", err)
 	}
-	if box.sealed != 0 || st.upserted != nil {
+	if box.sealed != 0 || st.inserted != nil {
 		t.Fatal("disabled seed must not touch the store or the cipher")
 	}
 }
@@ -144,7 +154,7 @@ func TestAnthropicTokenMalformedIsFatalAndRedacted(t *testing.T) {
 	if strings.Contains(err.Error(), "has a space") {
 		t.Fatalf("error must not leak the token value: %v", err)
 	}
-	if st.upserted != nil {
+	if st.inserted != nil {
 		t.Fatal("nothing should be stored when the token format is invalid")
 	}
 }

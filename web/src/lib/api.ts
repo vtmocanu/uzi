@@ -24,14 +24,26 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
+  // Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4),
+  // independent of what their runs spend — the point of the feature. Both null ⇒
+  // unbound ⇒ their default token. The label, never the value.
+  judge_anthropic_secret_id: string | null;
+  judge_anthropic_secret_label: string | null;
   created_at: string;
   last_login: string | null;
 }
 
-// SecretMeta is the metadata-only view of a stored per-user secret. The secret
+// SecretMeta is the metadata-only view of ONE stored per-user secret. The secret
 // value is never returned by the API, so it never appears here.
+//
+// Since PRD #104 a user may hold several tokens of one kind, so this carries the
+// id (without it a multi-token list is indistinguishable rows), the user-chosen
+// label, and which one is the default that unbound workers spend.
 export interface SecretMeta {
+  id: string;
   kind: string;
+  label: string;
+  is_default: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -626,6 +638,16 @@ export interface Worker {
   stats_mem_bytes: number | null;
   stats_mem_limit_bytes: number | null;
   stats_source: string | null;
+  // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
+  // Both null means unbound: the worker spends its owner's default token, which is
+  // every worker's state until someone binds one. The label rides alongside the id
+  // so a row can say "spends: console-key" without a second lookup — a name, never
+  // the credential.
+  //
+  // Caveat worth knowing at the call site: a bound worker's CHAT runs still spend
+  // the DEFAULT (D1) — the binding covers the run lane only.
+  anthropic_secret_id: string | null;
+  anthropic_secret_label: string | null;
 }
 
 export interface AdminWorker extends Worker {
@@ -851,16 +873,35 @@ export type MyRateLimits =
   | { status: "no_token" }
   | { status: "unavailable" };
 
+// TokenRateLimits is ONE token's meter (PRD #104 M5): the credential's label and
+// default flag — a name, never a value — plus the same status union PRD #53 froze.
+// secret_id keys the row for a rebind or a delete.
+export interface TokenRateLimits {
+  secret_id: string;
+  label: string;
+  is_default: boolean;
+  limits: MyRateLimits;
+}
+
+// MyRateLimitsResponse is what GET /me/rate-limits returns since PRD #104 M5: an
+// ARRAY of per-token meters, replacing PRD #53's single reading. An EMPTY array is
+// the token-less signal — there is no per-token status to report when there is no
+// token, so the "no_token" branch of MyRateLimits is now only ever produced
+// client-side (see rateLimits.ts).
+export interface MyRateLimitsResponse {
+  tokens: TokenRateLimits[];
+}
+
 // AdminRateLimitUser is one row of the admin all-users view: every user appears,
-// including no_token ones. vault_locked flags a user whose dek-sealed token can't
-// be opened right now (their reading ages, marked stale). limits is the same
-// union as GET /me/rate-limits.
+// including token-less ones (whose `tokens` is empty). vault_locked flags a user
+// whose dek-sealed tokens can't be opened right now (their readings age, marked
+// stale). Since #104 M5 the row carries one meter PER TOKEN.
 export interface AdminRateLimitUser {
   id: string;
   email: string;
   name: string;
   vault_locked: boolean;
-  limits: MyRateLimits;
+  tokens: TokenRateLimits[];
 }
 
 export interface AdminRateLimits {
@@ -1349,9 +1390,35 @@ const realApi = {
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
   // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
   // the body carries no user id. Returns the updated user.
-  setJudgeEnabled: (enabled: boolean) =>
-    request<{ user: User }>("PUT", "/me/judge", { enabled }),
+  // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):
+  // omitted leaves the binding alone, null clears it back to the default, a label
+  // binds it. Omitting it is what every pre-#104 caller did, and must stay a no-op
+  // on the binding.
+  setJudgeEnabled: (enabled: boolean, anthropicToken?: string | null) =>
+    request<{ user: User }>(
+      "PUT",
+      "/me/judge",
+      anthropicToken === undefined
+        ? { enabled }
+        : { enabled, anthropic_token: anthropicToken },
+    ),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all
+  // cookie-only (D8) — the SPA is the only client that can reach them.
+  createAnthropicToken: (token: string, label: string, isDefault: boolean) =>
+    request<{ secret: SecretMeta }>("POST", "/me/secrets/anthropic_token", {
+      token,
+      label,
+      default: isDefault,
+    }),
+  // PATCH carries only the fields being changed: label renames, default promotes
+  // (false is refused server-side — promote another instead), token rotates.
+  patchAnthropicToken: (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) => request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}`, body),
+  deleteAnthropicTokenById: (id: string) =>
+    request<null>("DELETE", `/me/secrets/anthropic_token/${id}`),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
   deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
@@ -1481,6 +1548,12 @@ const realApi = {
   createWorker: (name: string, template?: string) =>
     request<{ worker: Worker; token: string }>("POST", "/workers", { name, template }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
+  // Point a worker at one of the caller's named tokens, or clear the binding with
+  // null so it falls back to the default (PRD #104 M3). Takes a LABEL, not an id —
+  // the name is what a human picks. Lands on the worker's NEXT claim: no restart,
+  // no re-minted join token.
+  setWorkerToken: (id: string, label: string | null) =>
+    request<{ worker: Worker }>("PATCH", `/workers/${id}`, { anthropic_token: label }),
 
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.
@@ -1528,7 +1601,7 @@ const realApi = {
   getAdminUsage: () => request<AdminUsage>("GET", "/admin/usage"),
   /** The caller's own Claude rate-limit reading (PRD #53): the two windows, or a
    *  no_token / unavailable status. Percentages only — the token never leaves the api. */
-  getMyRateLimits: () => request<MyRateLimits>("GET", "/me/rate-limits"),
+  getMyRateLimits: () => request<MyRateLimitsResponse>("GET", "/me/rate-limits"),
   /** Every user's rate-limit reading (PRD #53). Admin-only — a non-admin 403s. */
   getAdminRateLimits: () => request<AdminRateLimits>("GET", "/admin/rate-limits"),
   getRunMessages: (id: string, afterSeq = 0) =>

@@ -54,6 +54,27 @@ RETURNING *;
 UPDATE users SET judge_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserJudgeAnthropicSecret :one
+-- Point a user's JUDGE lane at one of their own Anthropic credentials, or clear the
+-- binding back to their default (PRD #104 M4, D1). Per-user, not per-worker: which
+-- credential reviews your work is a property of you, not of whichever worker
+-- claimed the retrospective.
+--
+-- Nothing here validates ownership of @judge_anthropic_secret_id — the composite FK
+-- from 00079 does, in the database. A foreign secret id has no (users.id, id) pair
+-- in user_secrets and this UPDATE raises a foreign_key_violation. The handler
+-- checks too, so the caller gets a 404 rather than a constraint violation, but the
+-- FK is the layer that holds when the handler check does not.
+UPDATE users SET judge_anthropic_secret_id = @judge_anthropic_secret_id WHERE id = @id
+RETURNING *;
+
+-- name: GetUserJudgeAnthropicSecret :one
+-- The user's judge-lane binding, read at judge-claim time. NULL ⇒ resolve their
+-- default token. Selects only the binding: the judge claim needs no other user
+-- column, and a narrow read keeps it obvious that nothing else about the user
+-- influences which credential a retrospective spends.
+SELECT judge_anthropic_secret_id FROM users WHERE id = @id;
+
 -- name: GetUserDefaultModel :one
 -- The current user's per-user default worker model (PRD #17); NULL = inherit.
 SELECT default_model FROM users WHERE id = $1;
