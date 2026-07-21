@@ -363,8 +363,13 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//
 	// SCOPE — READ THIS BEFORE CONCLUDING "THE COORDINATE PREDICATE IS PINNED". The SAME two
 	// three-part joins appear a SECOND time in that file, on ListJudgeTriageRowsForRuns (M4's
-	// /runs badge count, lines 144 and 146). NOTHING ABOVE TOUCHES IT — every fold in the
-	// table is a mutation of the FIRST body, and the second one was measured entirely
+	// /runs badge count, lines 144 and 146). Nothing above touches it — PROVIDED YOU MUTATE
+	// LINE 71 (or 69), NOT EVERY MATCH. The join text is BYTE-IDENTICAL between the two
+	// bodies, so a plain `sed` for `AND f.target = rr.target` changes FOUR lines rather than
+	// two and silently folds body 2 as well; a reproducer doing that would conclude the table
+	// covered both bodies. Address the line by NUMBER and assert the changed-line count.
+	// (The reviewer's reproduction hit exactly this on all eleven of its runs.) The second
+	// body was measured entirely
 	// unpinned: dropping BOTH coordinate halves off its `f` join, and separately off its `d`
 	// join, each left the ENTIRE live-DB suite green.
 	// TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB at the end of this file now covers
@@ -755,14 +760,42 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// the sibling's — the two ran in the same sweep and only the sibling's message appeared,
 	// which is the evidence that this assertion is a value check and not a scoping one.
 	//
-	// DO NOT REACH FOR `f.filed_at -> now()`, the obvious fold. It does not work here and its
-	// failure is not this assertion firing: sqlc types the folded column as NOT NULL, the
-	// generated struct field becomes `FiledAt interface{}`, and the package no longer
-	// COMPILES (`sibling.FiledAt.Valid undefined`). That is loud, but a build error is not a
-	// red assertion — the line below never executes. `d.set_at` is the fold that works,
-	// because a nullable timestamptz off the other LEFT JOIN preserves the type AND looks
-	// like data. (An earlier version of this comment credited the `now()` fold with the
-	// result `d.set_at` actually produced; it could not have run.)
+	// CHOOSING THE FOLD FOR THIS ASSERTION — two corrections deep, and each correction had the
+	// conclusion right and the mechanism wrong, which is the harder failure to catch.
+	//
+	// `f.filed_at -> now()` does not build. The FIRST version of this comment credited that
+	// fold with a result it could not have produced. The SECOND blamed nullability: "sqlc
+	// types the folded column NOT NULL". That is also wrong, and it is disproved by one
+	// experiment — `now()::timestamptz` is EQUALLY not-null and it COMPILES
+	// (`FiledAt pgtype.Timestamptz`), while bare `now()` yields `interface{}`. So nullability
+	// is not the differentiator: THE MISSING EXPLICIT CAST IS. sqlc falls back to
+	// `interface{}` for a bare function expression it cannot resolve. The obvious fold is not
+	// unusable — it is one cast away from usable, and a reader sent to look at nullability
+	// finds nothing there.
+	//
+	// `d.set_at` is still the right choice, for a reason neither earlier version gave. It is
+	// not that it "preserves the type" — the cast does that too. IT IS SELECTIVE. Measured by
+	// the reviewer and re-run here, one fold per run against a fresh database:
+	//
+	//   f.filed_at -> now()::timestamptz   RED here AND at the sibling and cross-category
+	//                                      assertions, whose messages then blame the filed
+	//                                      join's TARGET/CATEGORY half while the join is
+	//                                      untouched (settled=false at=true iid=false url="")
+	//   f.filed_at -> d.set_at             RED here ONLY
+	//
+	// `now()::timestamptz` is non-NULL for EVERY row, so it trips those two conditions as
+	// well — they OR `FiledAt.Valid` in with three other fields. `d.set_at` is NULL for the
+	// undisposed rows, so exactly one assertion moves. A fold that reddens four assertions
+	// tells you less than one that reddens the right one.
+	//
+	// THE GENERAL RULE, which would have prevented all three mistakes: SQLC TYPES BY
+	// EXPRESSION. Folding a LEFT-JOIN-nullable column to any NON-COLUMN expression drops the
+	// nullability and breaks every `.Valid` in the tests. The only fold shape that works on
+	// such a column is ANOTHER NULLABLE COLUMN OFF A LEFT JOIN — which is also exactly what
+	// "looks like data" asks for, so the two criteria agree rather than compete. And a fold
+	// prescribed in a comment is a BUILD-CHECKABLE claim: `sqlc generate` + `go vet` settles
+	// it in under a minute, with no container and no database. Build it before you prescribe
+	// it.
 	if hand.FiledAt.Valid {
 		t.Errorf("a coordinate with NO filed row anywhere carries filed_at %v — the projection is "+
 			"not reading the joined filed row", hand.FiledAt.Time)
@@ -931,17 +964,38 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 	//
 	// Shared ON PURPOSE, and load-bearing: within a run the two coordinates share the review
 	// (so `f.review_id = rv.id` cannot be what separates them — the whole point) and exactly
-	// ONE coordinate half. Across runs everything shares one owner and one repo, which is
-	// what keeps the read owner-scoped.
+	// ONE coordinate half.
 	//
 	// Shared BY ACCIDENT, and NOT currently observable — flagged so the next author does not
 	// inherit an inert fixture the way this branch already has:
+	//   - ONE OWNER, ONE REPO across every run. This entry was originally filed under
+	//     "on purpose", worded as "which is what keeps the read owner-scoped". THAT WAS
+	//     BACKWARDS: a single-owner fixture does not keep the read owner-scoped, it makes
+	//     `WHERE rv.user_id = @user_id` UNOBSERVABLE — there is no other user's row for a
+	//     broken predicate to return. Unlike the rest of this list it is not
+	//     hypothetical-on-a-future-column: the predicate exists today and the query's own
+	//     comment states a security claim about it. Closed below by the foreign-run assertion.
+	//   - `AND rv.target_run_id = ANY(@run_ids)`: every run in the fixture is passed in, so
+	//     dropping the predicate returns the identical set. Same closure.
 	//   - every review carries verdict 'issues';
 	//   - every recommendation carries confidence 'high';
-	//   - every run carries status 'completed'.
-	// None of those three is projected by THIS query, so nothing here is weakened today. But
-	// the moment a column is added to the SELECT, a fold of it would be invisible on this
+	//   - every run carries status 'completed';
+	//   - `d.set_via` is NULL on every disposition — worth naming above the rest, because it
+	//     is the column PRD #98 B3 added, its fold is one of the checkpoint's canonical
+	//     examples, and it is exactly the kind of column someone adds to this projection next;
+	//   - and, as one catch-all: `d.set_by_user_id`, `f.filed_by_user_id`, `f.filed_repo_id`,
+	//     `rr.addressed_by_run_id` (NULL throughout), `runs.issue_description` ('d'), and
+	//     every timestamp (all `now()`).
+	// None of those is projected by THIS query, so nothing here is weakened today. But the
+	// moment a column is added to the SELECT, a fold of it would be invisible on this
 	// fixture. Vary the value before you pin a new column, not after.
+	//
+	// 🔴 ONE EXCEPTION, AND IT CUTS THE OTHER WAY: `d.rationale_hash` is uniform ('h' on both
+	// disposed runs) and that uniformity is LOAD-BEARING — it is what makes the fifth fold
+	// (`d.status -> d.rationale_hash`) collapse the pair and fire assertion 6. If you follow
+	// the instruction above and vary it, you SILENTLY DISARM that fold. Re-derive the fold
+	// rather than assuming it still discriminates. (The two instructions are not in conflict:
+	// the sqlc rule constrains the fold's TYPE, this list constrains the fixture's VALUES.)
 	//
 	// Deliberately NOT uniform, because these ARE projected: the two dispositions differ
 	// ('done' vs 'dismissed', pinned in assertion 6), the filed and disposed coordinates sit
@@ -981,9 +1035,44 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 		 VALUES ($1, $2, $3, $4, $5, now())`,
 		uuid.New(), revCL, catA, tgt1, owner)
 
+	// A SIXTH run belonging to a DIFFERENT USER, passed in @run_ids as if spoofed. This closes
+	// the two live predicates the inventory above names as unobservable: `WHERE rv.user_id =
+	// @user_id` and `AND rv.target_run_id = ANY(@run_ids)`. Until now every run in the fixture
+	// belonged to the caller AND was passed in, so dropping either predicate returned the
+	// identical set and every assertion passed.
+	//
+	// The query's own comment makes this an explicit security claim: "Owner-scoped by
+	// rv.user_id, so the caller's own page can never surface another user's recommendation
+	// counts even if a run id were somehow spoofed into the list." That is the exact sentence
+	// this asserts. TestJudgeBacklogRunAnchorLiveDB already does the same for body 1; the
+	// pattern was in this file and was not carried across.
+	//
+	// A separate user needs a separate connection and repo: repos.connection_id ->
+	// forge_connections.user_id, so a user cannot borrow another's repo.
+	stranger, strangerConn, strangerRepo := uuid.New(), uuid.New(), uuid.New()
+	strangerRun, strangerRev := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		stranger, fmt.Sprintf("judgebadge-stranger-%s@e2e", stranger))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, strangerConn, stranger, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 2, 'g/stranger', 'https://forge.e2e/g/stranger', 'main', true)`,
+		strangerRepo, strangerConn)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+		 VALUES ($1, $2, $3, 1, 'stranger run', 'd', 'completed')`, strangerRun, stranger, strangerRepo)
+	mustExec(ctx, t, pool,
+		`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
+		strangerRev, strangerRun, stranger)
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, $2, $3, 'stranger rationale', 'high')`, strangerRev, catA, tgt1)
+
 	rows, err := q.ListJudgeTriageRowsForRuns(ctx, store.ListJudgeTriageRowsForRunsParams{
 		UserID: owner,
-		RunIds: []uuid.UUID{runFT, runFC, runDT, runDC, runCL},
+		RunIds: []uuid.UUID{runFT, runFC, runDT, runDC, runCL, strangerRun},
 		Lim:    500,
 	})
 	if err != nil {
@@ -1139,5 +1228,163 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 	}
 	if cl.disposed != 0 {
 		t.Errorf("runCL reports %d dispositions, want 0 — nothing disposed this coordinate", cl.disposed)
+	}
+
+	// 8. THE OWNER PREDICATE. The stranger's run was passed in @run_ids exactly as a spoofed
+	// id would be, and it holds a recommendation on the same coordinate as everything else.
+	// It must come back with NO rows.
+	//
+	// ASSERTED DIRECTLY, NEVER THROUGH at(). That helper Fatalfs when a run returns no rows —
+	// which is precisely the CORRECT behaviour here — so routing this through it would fail
+	// on correct code, and the natural "fix" (make at() tolerate nil) would disarm the guard
+	// for all five legitimate runs. That guard is the only thing between a broken fixture and
+	// five vacuously-passing tallies. For the same reason the stranger is deliberately absent
+	// from assertion 0's loop.
+	if tl := got[strangerRun]; tl != nil {
+		t.Errorf("another user's run came back with %d rows (filed=%d disposed=%d) despite being "+
+			"only a spoofed id in @run_ids — either `WHERE rv.user_id = @user_id` is gone, in which "+
+			"case this caller's badge counts another tenant's recommendations, or the run_ids filter "+
+			"is. The query's own comment claims exactly this cannot happen",
+			tl.rows, tl.filed, tl.disposed)
+	}
+}
+
+// ---- the tenant boundary, with two real tenants -------------------------------------
+
+// TestJudgeBacklogIsTenantScopedLiveDB is the cross-TENANT half of the review_id pin, and it
+// is deliberately a separate test from the cross-REVIEW coordinate in
+// TestJudgeBacklogProjectsEveryColumnLiveDB. The two are NOT redundant and should not be
+// merged later on the argument that they are:
+//
+//   - the cross-review coordinate (one user, two reviews) pins "the join is at least
+//     REVIEW-scoped". Drop either review_id half and handRev's occurrence inherits autoRev's
+//     link. Sufficient as a guard against the predicate being REMOVED.
+//   - this test pins "and not merely USER-scoped, or looser". A one-user fixture cannot tell
+//     those apart, and per-user is a plausible future request precisely BECAUSE of this PRD's
+//     premise: "the same recommendation recurs across runs, triage it once" invites someone
+//     to propose that one filed issue should cover the coordinate across all of a user's
+//     reviews. Whoever implements that will delete the cross-review assertion as part of the
+//     change — it is red by design under it — rewrite the join as per-user, and at that
+//     moment the tenant boundary would rest on nothing with no test red anywhere.
+//
+// PROVENANCE: the auditor wrote, RAN and then DELETED this test in a throwaway worktree, so
+// the strongest evidence for this session's most serious finding existed in no tree. It
+// handed over the exact fixture, assertions and measured output; this is that test, landed,
+// so the durable citation is a pin in the repo rather than "an agent demonstrated it once".
+//
+// 🟢 THE PRODUCTION CODE IS CORRECT — all three predicates are present and right. This closes
+// a gap in what the SUITE can observe. Nothing shipped leaking.
+//
+// EITHER HALF ALONE LEAKS ITS OWN HALF (measured by the auditor): with only `f.review_id`
+// gone the caller inherits the victim's filed link and the disposition stays clean; with only
+// `d.review_id` gone, the reverse. So this is TWO pins with TWO separately-worded assertions
+// — one combined check would name the wrong join under a single-half break.
+//
+// DO NOT "HARDEN" THIS WITH `AND d.set_by_user_id = @user_id`. It is the natural-looking fix
+// and it would SILENTLY DROP EVERY AUTO-DONE: judge_issue_close.sql writes M6's issue-close
+// sync with set_via='issue_close' and set_by_user_id hardcoded NULL, deliberately, so a
+// system inference is never attributed to a person (Decision 6 / PF-4). `filed_by_user_id`
+// and `set_by_user_id` are nullable ATTRIBUTION pointers that are NULL by design for a whole
+// class of rows. `review_id -> run_reviews.user_id` is not merely the best available
+// ownership path — it is the ONLY one, and that is a property of the design.
+func TestJudgeBacklogIsTenantScopedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// THE SAME on both tenants. This is the load-bearing line: if the two users' coordinates
+	// differ by so much as the target string, nothing can leak and this test passes forever
+	// while proving nothing — the memberRow lesson, which is that a fixture unable to
+	// construct the failing input silently bounds every test built on it.
+	const cat, target = "install_worker_tool", "tenant-shared-rg"
+
+	// Each tenant is fully independent: repos.connection_id -> forge_connections.user_id, so
+	// one user cannot borrow the other's repo.
+	seed := func(label string, iid int64) (userID, reviewID, repoID uuid.UUID) {
+		userID, reviewID, repoID = uuid.New(), uuid.New(), uuid.New()
+		connID, runID := uuid.New(), uuid.New()
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			userID, fmt.Sprintf("tenant-%s-%s@e2e", label, userID))
+		mustExec(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+		mustExec(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', 'main', true)`,
+			repoID, connID, iid, fmt.Sprintf("g/%s", label))
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, $5, 'd', 'completed')`,
+			runID, userID, repoID, iid, fmt.Sprintf("%s run", label))
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
+			reviewID, runID, userID)
+		mustExec(ctx, t, pool,
+			`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+			 VALUES ($1, $2, $3, $4, 'high')`, reviewID, cat, target,
+			fmt.Sprintf("%s's own rationale for %s/%s", label, cat, target))
+		return userID, reviewID, repoID
+	}
+
+	victim, victimRev, victimRepo := seed("victim", 8801)
+	caller, _, _ := seed("caller", 8802)
+
+	// Only the VICTIM's coordinate is filed and disposed. Both live on one coordinate, so a
+	// single fixture covers both join halves.
+	mustExec(ctx, t, pool,
+		`INSERT INTO recommendation_filed_issues
+		   (id, review_id, category, target, filed_repo_id, filed_issue_iid, filed_issue_url, filed_by_user_id, filed_at)
+		 VALUES ($1, $2, $3, $4, $5, 7777, 'https://forge.e2e/g/r/-/issues/7777', $6, now())`,
+		uuid.New(), victimRev, cat, target, victimRepo, victim)
+	mustExec(ctx, t, pool,
+		`INSERT INTO recommendation_dispositions
+		   (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id)
+		 VALUES ($1, $2, $3, 'dismissed', 'wont_do', 'h', $4)`, victimRev, cat, target, victim)
+
+	// Read as the CALLER and assert on the CALLER's own occurrence. Reading as the victim
+	// shows the link correctly present and proves nothing.
+	rows, err := q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+		UserID: caller,
+		Lim:    100,
+	})
+	if err != nil {
+		t.Fatalf("list backlog rows: %v", err)
+	}
+	var got *store.ListJudgeRecommendationRowsForUserRow
+	for i := range rows {
+		if rows[i].Category == cat && rows[i].Target == target {
+			got = &rows[i]
+			break
+		}
+	}
+	// LOAD-BEARING, not defensive noise: without it, a change that drops the caller's row from
+	// the result entirely makes both assertions below vacuously true and this test goes green
+	// on a worse bug.
+	if got == nil {
+		t.Fatalf("fixture broken: the caller's own occurrence of %s/%s is missing", cat, target)
+	}
+
+	if got.FiledSettled || got.FiledIssueIid.Valid || got.FiledIssueUrl.Valid || got.FiledAt.Valid {
+		t.Errorf("CROSS-TENANT LEAK: another user's filed issue reached this caller's backlog "+
+			"(settled=%v iid=%d url=%q) — recommendation_filed_issues has no user column, so "+
+			"`f.review_id = rv.id` is the only thing scoping it",
+			got.FiledSettled, got.FiledIssueIid.Int64, got.FiledIssueUrl.String)
+	}
+	if got.DispositionStatus.Valid {
+		t.Errorf("CROSS-TENANT LEAK: another user's disposition (%q) reached this caller's backlog "+
+			"— recommendation_dispositions has no user column, so `d.review_id = rv.id` is the only "+
+			"thing scoping it. This caller's own open recommendation would also drop out of todo "+
+			"because someone else settled theirs", got.DispositionStatus.String)
 	}
 }
