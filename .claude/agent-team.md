@@ -204,6 +204,17 @@ wrong is what makes rule 1 too expensive to keep.**
   or the ASSERTIONS change. `git diff <measured-sha>..HEAD -- <those paths>`
   settles it in seconds, and a **comment-only diff means the result STANDS**.
 
+**A measurement is bound to a WORKING TREE as well as to a SHA, and a persisted `cd` silently
+rebinds it.** Evidence: an auditor verified a "zero hits" grep from a shell whose working
+directory still pointed at its own detached worktree, so it measured a clean pre-merge tree
+while believing it was measuring the live one — the conclusion happened to be right, the
+method was luck. It earns its line because **the failure is invisible in the output**: a grep
+against the wrong tree looks exactly like a grep against the right one. Applies to everyone
+whose shell has a persisted working directory, which is everyone running verification greps.
+**Corollary — a tree with `MERGE_HEAD` set is NEITHER state and cannot support a tally.** File
+lists and mechanisms survive from a mid-merge tree; counts do not. Cite the former, re-derive
+the latter on the committed merge.
+
 Worked example, both halves from one day: the auditor reported a comment gap at
 `c1fcdfce` that `a2b554a6` had already closed — genuinely stale. Its **fold**
 results from the same run still stood, because
@@ -371,6 +382,31 @@ ask what it implied beyond the file.
 first two, and the cheapest to fix once named. The counterpart to *compile before you believe*
 is **before you ship a fix, name the other instances of the same claim** — usually with one
 `grep` for the string you just corrected.
+
+**But NAMING the instances is only half of it — CLASSIFY each hit before you touch it.** A
+`grep` cannot tell a CURRENT CLAIM (fix it) from a HISTORICAL RECORD (leave it — rewriting it
+manufactures a false history), and the more mechanical the sweep, the more reliably it
+corrupts the second kind. **A stale reference is the lesser failure; the mechanical sweep is
+the greater one.**
+
+Measured twice on PRD #98's landing, and the second measurement is why the rule needs the
+second half. The auditor told the coder *"grep `00075` afterwards, the number is referenced
+elsewhere"*. The coder ran the grep instead of following the instruction: the premise was
+false — no code or spec referenced it — and of the tree hits that existed, one needed the
+renumber while the rest belonged to **other PRDs**, two of them reading *"draft `00075` …
+landed as `00055`"*. Those are accurate records of a previous renumber done right, and a blind
+`sed` would have erased the evidence of the last person who got it exactly right.
+
+Then the landing merge changed the answer. On the MERGED tree the same grep hits live code
+(`runtime.sql.go`, `queries/runtime.sql`, an integration test), `specs/ai.md` twice, a mock
+fixture and a neighbouring migration's comment — **all of them correct**, because `00075` on
+`main` belongs to PRD #99's `run_message_instance`. The sweep that was merely useless before
+the merge would have rewritten seven true statements after it.
+
+**The general move: sweep on the UNIQUE token, not the ambiguous one.** `judge_issue_close_sync`
+identifies exactly one migration; `00075` identifies whatever each writer meant on the day. When
+the string you just corrected is a number, an id, or a version, assume it is ambiguous and find
+the token that is not.
 
 Evidence, all from PRD #98 and each one caught by somebody else: a coder identified that a
 bare suite tally in a comment reads as a current fact, bound it correctly at the site it was
