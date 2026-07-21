@@ -44,7 +44,21 @@ any other, and this one was written from memory of dispatches rather than from `
 **LANDED AT SESSION END BUT ⚠️ WHOLLY UNVALIDATED — no reviewer or auditor pass on ANY of the
 commits below.** All pushed. Verified against the tree, not from the coders' reports:
 
-- **`t2-seam6` @ `37c4dd98`** — 6 commits, 9 files, **+5172/−69**. Seam 6 appears *complete*:
+**⚠️ A LEAD CLAIM CORRECTED BY THE IMPLEMENTER, because it would have mis-set the next session's
+expectations:** I wrote in seam 6's dispatch that *"the fixture pins truncation regardless of demo
+reachability, and the design already requires truncation as one of its cases"*. **It does not, and
+it structurally cannot.** That came from this PRD's original framing list; the architect's design
+**narrowed it** at A7 item 2 — the row cap and `truncated` are a SQL/service property that cuts
+rows *before* grouping, the Go grouper never sees the cap, and they are assigned to **M8b/B4**. The
+fixture therefore has **no truncation case**, correctly. Adding one would have been worse than the
+gap: Go's cut lives inline in `JudgeRecommendationBacklog` (needs a `*Service` and a database),
+and exporting a pure helper would test it at a value neither production path uses while the
+interaction that actually matters (`Lim: JudgeBacklogMaxRows + 1`, which distinguishes a full page
+from an exactly-full one) stays out of reach — a proxy that would *read* as pinning the cap.
+**So truncation is pinned MOCK-side only (5 folds); the cross-implementation pin remains M8b/B4's.**
+
+- **`t2-seam6` @ `37c4dd98`** — 6 commits, 9 files, **+5172/−69**. Seam 6 is *complete for its
+  scope* (see the correction above for what that scope is NOT):
   `edc8e585` trims with Go's cutset, `c96e0f49` extracts the grouper to the server's layer,
   `70c1e301` adds the golden fixture (`fixtures/judge-fidelity/{cases,expected}.json` + README),
   `5429ebe9` the sort-tiebreak case, `71cc2a63` the demo-truncation toggle. **Both halves of the
@@ -57,10 +71,19 @@ commits below.** All pushed. Verified against the tree, not from the coders' rep
   2001-row seed, so **B4 lands last and the two land together.**
 - **`t2-lim` @ `8ce7ba50`** — 5 commits, 14 files, +1378. `c309e8a0` is the **admin CLI-token
   inventory (new product code)**; `537394fc` records the `/repos/{id}/sync` mutation in the file;
-  `8ce7ba50` pins which config field each limiter is constructed from — **i.e. the construction
-  residual described above may now be closed.** That parse was dispatched with a condition: measure
-  the false-positive risk of a legitimate rename *before* landing. **Confirm that condition was met
-  before trusting it** — the SHA landing is not evidence the control was run.
+  `8ce7ba50` pins which config field each limiter is constructed from, **closing the construction
+  residual** — and its control **came back AGAINST the proposed design**, which is why it landed as
+  something else. The reviewer's stem-matching rule (variable stem ↔ config-field stem) is
+  convention-brittle *and fails on the tree as it stands*: `cliPollLimiter` reads
+  `cfg.CLIPollRateLimitMax`, and naive capitalisation gives `CliPoll`, not a prefix of `CLIPoll` —
+  **Go initialisms break the transform before any refactor happens**, so the convention needs two
+  standing exceptions, not one. Built case-insensitively (the strongest form, so as not to measure
+  a strawman) it is green today but still reddens on a legitimate rename. What landed instead is an
+  **exact declared table**, keyed by the `limForge`-style constant `limiterNames` already forces you
+  to rename — green at zero edits across that same rename, and with no exception list at all.
+  **The pattern, worth more than either incident:** twice now a parse mechanism was specified from
+  *reading* the convention, and twice the convention had exceptions that only appeared when someone
+  ran it. The hole was real both times; the proposed mechanism needed changing both times.
 
 **So the validation debt is the whole story on resume.** Three branches carrying ~8,400 insertions
 have had **no review and no audit**, including new product code (an admin endpoint) and a new

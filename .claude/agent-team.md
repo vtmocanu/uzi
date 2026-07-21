@@ -623,6 +623,23 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   package counts, use `go test ./...`'s own output, which additionally separates the two questions
   people conflate — `ok` lines are packages that RAN tests, `no test files` lines are packages that
   exist. A zero-failures claim is entitled to the first denominator only.
+- **A LOST WORKING DIRECTORY PRODUCES A CLEAN GREEN FOR CODE IT NEVER RAN — and the positive
+  control is the only thing that catches it.** Measured 2026-07-21, the worst instrument failure of
+  the wave. A coder's bash cwd silently became **another agent's worktree, on another branch**,
+  while it believed it was in its own. Its relative-path commands resolved there, and its first live
+  sweep returned `EXIT 0, RUN=95 PASS=95 SKIP=0 FAIL=0` — a clean green describing **a different
+  branch's suite**. It caught this only by grepping the output for its own named test and finding it
+  absent. Without that grep it would have reported a 95-pass sweep as evidence for code the run
+  never executed. Its follow-up `go test -list` and `ls`, run to "confirm" the test did not exist,
+  ALSO ran in the wrong tree — so a wrong-tree diagnosis nearly became a wrong-code diagnosis.
+  Compounding it, the throwaway Postgres had the *other* branch's migrations applied and had to be
+  destroyed and recreated.
+  **Defences, in order of strength:** an absolute `cd` on **every** command (not the first one);
+  verifying the tree **in the same command** that produces the measurement; and requiring every
+  suite result to name the test you were looking for. A run that cannot name your test is not your
+  run, however green. This is the "a measurement is bound to a WORKING TREE as well as to a SHA"
+  rule, and it had already bitten the same agent once that day as a harmless near-miss — filed as
+  minor, which was the mistake.
 - **THE VERIFICATION TOOLING IS WHERE THIS TEAM ACTUALLY FAILS — NOT THE READING.** Measured
   2026-07-21 across one wave: **four agents, four broken instruments, zero wrong conclusions from
   careless reading.** Listed because the pattern is the finding, and because every one of them
