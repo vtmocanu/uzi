@@ -34,6 +34,23 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    `git fetch origin && git ls-tree --name-only origin/main api/internal/store/migrations/ | sort | tail -3`.
    This instruction is itself an instance of the expiry rule in `.claude/agent-team.md`, and
    it has already expired once.
+   ⚠️ **RENAMING THE FILE IS NOT THE WHOLE JOB — but a tree-wide replace is WORSE than not
+   sweeping.** The instruction "grep `00075` afterwards, the number is referenced elsewhere"
+   is right in principle; its stated premise is **false at HEAD**, and following it naively
+   corrupts records. Measured 2026-07-21, `rg -n "00075|judge_issue_close_sync"`:
+   - **`api/`, `specs/`, `docs/`, `e2e/`, `deploy/`: ZERO hits.** No code comment and no spec
+     line references this migration by number. The claim that they do was relayed, not
+     measured.
+   - **Exactly ONE reference to renumber**, besides the file itself: this PRD's M6 milestone
+     entry, which says "(migration `00075`, draft number — renumber on the landing rebase)".
+   - **Four hits belong to OTHER PRDs and MUST NOT BE TOUCHED** — `adr/0042`,
+     `prds/done/42-worker-run-concurrency.md` (3×), `prds/done/46-…`, `prds/done/49-…`. They
+     are historical draft numbers, and two of them correctly read "draft `00075` … **landed
+     as `00055`**". A blind `sed 00075→00081` across the tree rewrites four accurate
+     historical records into false ones, which is a worse outcome than a stale reference.
+   So: rename the file, update the M6 entry and the entry above, and **leave every
+   `prds/done/` and `adr/` hit alone**. Re-run the grep at landing rather than trusting this
+   list — it is a claim about a tree that will have moved.
    After renumbering: `sqlc generate` (zero-diff check), then re-run the full api gate **on
    the merged tip**, not the pre-merge one.
 3. **Merge `origin/main`**, then re-run the three gates (api, web, `./e2e/run-store-it.sh`)
