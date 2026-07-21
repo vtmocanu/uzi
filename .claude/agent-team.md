@@ -223,3 +223,124 @@ against the actual submodule code, not from memory.
 - Inspiration submodules: `inspiration/{bottega,multica,dot-agent-deck}`
 - Slash commands the orchestrator may invoke between delegations: none
   project-specific
+
+## The pattern worth inheriting, above any individual finding
+
+*Migrated from `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` (PRD #98, 2026-07-21)
+before that file dies — `.gitignore:27` ignores `agent-team-tasks/`, so nothing written there
+survives the worktree. None of this is PRD-98-specific.*
+
+**Every substantive correction on that branch was someone applying a rule its own author had
+stated and not applied to themselves.** Not carelessness — the rule-holder is simply not the
+person best placed to notice their own instance of it.
+
+- The lead recorded "do not claim more than was executed", then wrote "16 of 16" from an
+  **assertion count**. Caught by the reviewer.
+- The auditor coined "the mutation that looks like data is the one worth choosing", then
+  folded a column to a **blank** — the mutation that looks *wrong*. Caught by the reviewer,
+  an hour after applying the rule correctly to someone else's commit.
+- The reviewer established "verify from the code, not the surrounding comments", then
+  endorsed a comment's obtainability claim without running the command. Caught by the auditor.
+- The coder wrote the correct standard — *"a version spelling `"because"` would pass under the
+  fold exactly as the fake one does"* — against a fixture that made that standard
+  unsatisfiable. **Then, one commit later, restated that same superseded criterion in the very
+  comment written to correct it**, three paragraphs from the corrected lesson. It caught its
+  own instance only because a mechanical re-screen was already running for another reason.
+- The lead prescribed an **uncompilable mutation twice — the second time inside the correction
+  of the first**, by which point the failure mode was known.
+
+**Four for four, and the tally includes whoever is reading this.** The fix is never "be more
+careful": it is a mechanism that does not depend on the author noticing.
+
+**A second, distinct shape — the true local fact that ends the search.** Three times one
+validator stated something correct about the thing in front of it and stopped, because a true
+finding feels like a finished one. The sharpest instance: it wrote *"there is no custom timeout
+configured anywhere in the file **or a vitest config**"* as context for one flaky test. That
+sentence **was** the root cause of five intermittent failures across four PRDs, and it did not
+ask what it implied beyond the file.
+
+**The unifying diagnosis: all of these substitute a PROXY for the PROPERTY.** An assertion
+count proxies for isolation. A blanking fold proxies for a discriminating one. A comment
+proxies for the behaviour. Agreement proxies for verification. A passing commit proxies for a
+measured property. The property is always the same question — *would this fail if the code
+were wrong in the way it is actually likely to be wrong* — and no proxy answers it.
+
+**Why two validators:** neither miss above was catchable by the person holding the rule. That
+is the argument, and it is *not* redundancy — the second validator is not re-doing the first
+one's job, it is doing the part the first one structurally cannot.
+
+**Two agents reaching the same conclusion independently is itself the finding.** Both hit the
+same flaky test in separate sweeps and both declined to attribute it to their own change;
+recorded as load-driven on the strength of the independence, not of either judgement.
+
+**Practical consequence: do not rely on care.** The mechanisms are what worked — mutation with
+an assert-it-applied check, a positive control on every run, folds chosen to look like data,
+fixtures with distinct values per row, and a deferred-instruction backstop that fails the build
+for the instruction nobody has written yet.
+
+## Standing rules — each exists because something went wrong once
+
+*Also migrated from the PRD #98 checkpoint. Each keeps its incident: a rule without its
+evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
+compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
+
+- **Bound every enumeration where you write it**, not after a validator finds it. Four needed
+  bounding on one branch; the fourth got one at authoring time and that was the first time the
+  conversation did not happen afterwards.
+- **Assert the mutation actually applied — not just that the test ran.** A mutation that
+  silently fails to apply produces a *false green* indistinguishable from a passing gate. A
+  coder's edit targeted `BucketAll       = "all"` while gofmt had written `BucketAll = "all"`,
+  so it matched nothing and the "verified" result came from **unmutated code**. This is the
+  "did I run something that would fail if this were false?" bar failing on its own enforcement
+  mechanism, which is why it needs stating separately.
+- **A projection pin is isolated ONLY if it reddens under a fold to a value the fixture ALREADY
+  CONTAINS.** Blanking, or folding to a novel constant, proves nothing — any assertion catches
+  those. **The discriminating fold looks like DATA.**
+  **Corollary — THE FIXTURE IS THE PRECONDITION, and it comes first.** Read-back assertions and
+  pairwise-different assertions are **both inert while every fixture row carries the same
+  value**: with a fixture writing `'because'` everywhere, "read it back from the table" and
+  "spell it in the test" are *literally the same expression*, so no experiment could distinguish
+  them. Make fixture values distinct per row first; only then does assertion style matter.
+- **Restore by COPY-ASIDE, never `git checkout`** — a git restore silently does nothing for an
+  untracked or newly-created file. That left a neutered `WHERE (rv.user_id = @user_id OR true)`
+  alive past a cleanup step once: a total authz bypass in a file whose own tests were green.
+- **Scope live-DB assertions to the fixture, never the whole table.** The LiveDB packages share
+  ONE database and fixtures accumulate, so a table-wide assertion passes or fails on what other
+  tests left behind. Measured twice: a global `improve_uzi` backlog assertion filtered only by
+  target, so an unrelated fixture in another package failed it.
+- **Read a file back after writing it through a shell heredoc** — that path corrupts silently.
+- **No amends after a SHA is dispatched for review.** Fixes land as follow-up commits.
+- **State an invariant where it is ENFORCED; do not derive it from a decision made elsewhere.**
+  The tell: *if removing an unrelated predicate elsewhere would make this code unsafe, the
+  predicate belongs here too.* Six instances on one branch, the sharpest being a comment
+  claiming a join "cannot fan out" — true only because the join used all three columns of a
+  unique key, and silently false the moment one was dropped.
+- **A printed instruction is an untested claim.** Any string telling a user what to do next is
+  a testable assertion and nothing typechecks it. Of three in one CLI, **exactly one had ever
+  been executed, and when it was, it was false** — it told the user to re-run a WRITE to
+  recover data a re-run cannot return. The only mechanism that catches this class: run the
+  command, then execute exactly what its output told the user to do, and assert the outcome.
+- **Apply the screen PER CLAIM, not per comment block.** A verified-true sentence adjacent to
+  an unverified one reads as *one continuous argument*, and the reader's guard drops after the
+  part that checks out. Live example: a rigorous, correctly-cited sentence sitting four lines
+  above its own contradiction, read past by both a reviewer and the implementer because the
+  true half had just earned their trust. This is nastier than a wholly false comment — the
+  credibility is borrowed from the neighbour.
+- **Screen every test you write with TWO questions.** (1) *"What would I have to change in
+  PRODUCTION code to make this fail?"* — if the honest answer is "nothing, only the test file
+  or stdlib behaviour", it is decoration. (2) *"Would this line ever EXECUTE in the failing
+  case?"* — **an assertion sitting behind an earlier `waitFor`/`Fatalf` in the same test is
+  documentation, not a gate.** Five instances on one branch of a commit crediting an assertion
+  that never runs when the property breaks; in each the property *was* pinned by something
+  else, so only the credit was wrong — which is exactly why it kept recurring unnoticed.
+  **Apply it hardest to tests whose NAMES make strong claims**, because the name is what stops
+  anyone looking again: an assertion on the test file's own mock factory, a test that
+  marshalled a hand-built struct and so asserted a property of `encoding/json`, and a "renders
+  the two DIFFERENTLY" test that compared a parent element to its own child.
+- **Do not run a live-DB suite while another agent is running one — but do NOT record a
+  reason.** Two confident explanations have already been wrong (a "fixed container name" that a
+  two-line file disproves; a load-contention refutation measured on a far quieter machine).
+  Keep the sequencing: it costs nothing, and "we do not know" is the honest inheritance.
+- **"Did I run something that would fail if this were false?"** — ask it *before* writing a
+  claim down, not after. Every claim mutation-tested has held; every claim reasoned to has
+  needed correcting.
