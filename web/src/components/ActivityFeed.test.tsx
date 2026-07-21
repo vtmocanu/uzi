@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { Run, RunHealth, RunMessage, RunStatus } from "../lib/api";
 import { ActivityFeed } from "./ActivityFeed";
+import { mockBusyMessages } from "../mocks/data";
 
 // This jsdom build does not expose window.localStorage (see prefs.test.ts), so the view
 // preference has to be backed by a Map-based Storage stub — without one `prefs` silently
@@ -792,6 +793,77 @@ describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
     // claim — it is scoped to the lane list.
     const crew = container.querySelector('[aria-label="Crew"]');
     expect(crew?.querySelectorAll(".animate-pulse").length).toBe(0);
+  });
+
+  it("orders rollup chips ATTENTION-FIRST, not first-seen", () => {
+    // The mockup's caption is explicit: "the one stalled tester is the first thing you
+    // see." Only the POSITION diverged — the dot colour was already worst-state-wins.
+    // Priority: stalled > waiting > working > idle > done.
+    const now = Date.now();
+    const old = new Date(now - 120_000).toISOString(); // >45s -> idle
+    const recent = new Date(now - 20_000).toISOString(); // <45s -> waiting
+    const { container } = renderFeed(
+      [
+        // `coder` is seen FIRST and is doubled, but both its lanes are stale -> idle…
+        mi(1, "coder", "toolu_c1", "a", { created_at: old }),
+        mi(2, "coder", "toolu_c2", "b", { created_at: old }),
+        // …while `tester` is seen SECOND and is doubled with a recent lane -> waiting,
+        // which outranks idle and must therefore sort ahead of coder.
+        mi(3, "tester", "toolu_t1", "x", { created_at: old }),
+        mi(4, "tester", "toolu_t2", "y", { created_at: recent }),
+        // A third role holds the ACTIVE slot so neither doubled role is the live lane —
+        // otherwise `tester` would win on `working` and the waiting-vs-idle comparison
+        // this test exists for would never be made. (A `waiting_worker` health would
+        // flatten every lane to `waiting` and make it a tie, which is how the first
+        // draft of this fixture passed for the wrong reason.)
+        mi(5, "lead", null, null),
+      ],
+      { status: "running", health: "ok" },
+    );
+    const chips = [...(container.querySelectorAll('[aria-label="Crew"] button') ?? [])].map((b) =>
+      b.getAttribute("title"),
+    );
+    // Pin the FULL ordering across three different states, not just the head: it
+    // exercises waiting(1) > working(2) > idle(3) in one go. First-seen order would
+    // read ["coder …", "tester …", "lead …"] and fails on the first element.
+    expect(chips.map((c) => (c ?? "").split(" ")[0])).toEqual(["tester", "lead", "coder"]);
+    expect(chips[0]).toMatch(/^tester ×2: waiting/);
+    expect(chips[2]).toMatch(/^coder ×2: idle/);
+  });
+
+  it("orders the shipped run-busy demo fixture attention-first too", () => {
+    // Against the REAL mock fixture rather than a synthetic one, so the demo everybody
+    // looks at is the thing under test. run-busy has a doubled `tester` (one lane
+    // active, one recent -> waiting) and a doubled `coder` (both stale -> idle), so
+    // waiting must sort ahead of idle and `tester` leads the strip.
+    const { container } = renderFeed(mockBusyMessages, { status: "running", health: "ok" });
+    const chips = [...container.querySelectorAll('[aria-label="Crew"] button')].map(
+      (b) => b.getAttribute("title") ?? "",
+    );
+    expect(chips.length).toBeGreaterThan(1);
+    expect(chips[0]).toMatch(/^tester ×2: waiting/);
+    // …and `coder ×2`, seen earlier in the stream, is pushed behind it.
+    const coderAt = chips.findIndex((c) => c.startsWith("coder"));
+    expect(coderAt).toBeGreaterThan(0);
+  });
+
+  it("keeps the lane label SHRINKABLE, the single cause of the narrow-viewport overflow", () => {
+    // jsdom does no layout, so this CANNOT prove the page stops scrolling — that was
+    // measured in real Chrome (390px: scrollWidth 432 -> 390; 560px on the busy run:
+    // 579 -> 560; 640/900/1440 unchanged). What it CAN pin is the structural cause, so
+    // the fix is not silently undone: the label was `shrink-0`, and at up to 48 mono
+    // characters (~300px) it alone overflowed a 390px viewport because it could not
+    // yield while everything around it was also fixed.
+    const r = renderFeed(
+      [mi(1, "coder", "toolu_A", "a reasonably long task label for the lane header")],
+      { status: "running", health: "ok" },
+    );
+    const header = r.getByRole("button", { name: /coder · a reasonably/ }).parentElement;
+    const label = header?.querySelector(".font-mono");
+    expect(label).not.toBeNull();
+    expect(label?.className).not.toContain("shrink-0");
+    expect(label?.className).toContain("truncate");
+    expect(label?.className).toContain("min-w-0");
   });
 
   it("keeps the Timeline jump strip, which groups by ROLE and never mentions instances", () => {

@@ -536,6 +536,19 @@ export function ActivityFeed({
     }
     return worst;
   };
+  // Chips render ATTENTION-FIRST, not first-seen: the worst state sorts to the front so
+  // "the one stalled tester is the first thing you see" (the mockup's caption). Only the
+  // POSITION was diverging — the dot colour was already worst-state-wins. Ties keep
+  // first-seen order, so the strip does not reshuffle for equal-priority roles.
+  const rolesByAttention = useMemo(
+    () =>
+      roles.order
+        .map((role, seen) => ({ role, seen, state: worstStateFor(role) }))
+        .sort((a, b) => STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] || a.seen - b.seen),
+    // worstStateFor closes over lanes/liveLane/laneAgg/now, so every input is listed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [roles, lanes, liveLane, laneAgg, now, run],
+  );
   const jumpToRole = (role: string) => {
     const hits = lanes.filter((l) => l.role === role);
     if (hits.length === 0) return;
@@ -611,9 +624,12 @@ export function ActivityFeed({
         {announcement}
       </div>
 
-      <div className="flex items-center justify-between gap-2">
+      {/* flex-wrap (E1): this cluster is ~440px of fixed-width controls, so on a narrow
+          viewport it used to push the whole page sideways rather than wrap. Wrapping
+          is inert from 640px up, where it has always fit on one line. */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Activity</h2>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           {/* By agent / Timeline (Decision 2). By-agent groups an invocation's whole
               contribution into one lane; Timeline is the raw chronological stream. */}
           <div
@@ -671,8 +687,7 @@ export function ActivityFeed({
         // + state, so a roster beside it would re-render the lane list (Decision 5).
         showRollup && (
           <div aria-label="Crew" className="flex flex-wrap items-center gap-1.5">
-            {roles.order.map((r) => {
-              const state = worstStateFor(r);
+            {rolesByAttention.map(({ role: r, state }) => {
               const n = roles.count.get(r) ?? 0;
               return (
                 <button
@@ -940,9 +955,15 @@ function AgentBlock({
             />
           </span>
         )}
-        <span className={cx("shrink-0 text-sm font-semibold", accent.split(" ")[0])}>{agent}</span>
+        <span className={cx("max-w-[40%] shrink-0 truncate text-sm font-semibold", accent.split(" ")[0])}>
+          {agent}
+        </span>
         {label && (
-          <span className="shrink-0 font-mono text-[11px] text-faint">
+          // min-w-0 + truncate, NOT shrink-0 (E1): a 48-code-unit mono label is ~300px,
+          // so as a fixed item it alone overflowed a 390px viewport. It now yields and
+          // ellipsises like the one-liner beside it. No effect at 640px+, where there
+          // is slack and nothing truncates.
+          <span className="min-w-0 truncate font-mono text-[11px] text-faint">
             <span aria-hidden="true">· </span>
             {label}
           </span>
