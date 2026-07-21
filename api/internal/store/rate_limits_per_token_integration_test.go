@@ -136,8 +136,10 @@ func TestRateLimitsPerTokenLiveDB(t *testing.T) {
 	// --- The admin listing folds correctly: one row per (user, token), plus a row
 	// per token-less user ---
 	third := uuid.New()
+	// Email derived from the uuid, like every other user in this file: users.email is
+	// UNIQUE, so a constant makes the test fail its own second run on a re-used DB.
 	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
-		third, "rl-notoken@e2e")
+		third, fmt.Sprintf("rl-notoken-%s@e2e", third))
 
 	adminRows, err := q.ListRateLimits(ctx)
 	if err != nil {

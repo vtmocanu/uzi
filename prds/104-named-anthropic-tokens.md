@@ -218,6 +218,24 @@ Validation mirrors `maxTokenBytes`'s spirit in `handler/secrets.go:37`: bounded
 length (64), no control characters, no leading/trailing whitespace.
 
 **D8 — The token-CRUD routes stay cookie-only; worker rebinding is `RequireUser`.**
+
+*Amended during M2: this decision and M2's stated CLI scope contradicted each
+other, and D8 wins.* M2's milestone text listed
+`uzi token list|add|rename|set-default|rm` while the same sentence kept write
+paths cookie-only. Those are incompatible — the CLI authenticates only with
+`Authorization: Bearer <uzc_>`, which a `RequireAuth` route rejects, so every
+write command would 401. **Only `uzi token list` exists**, mirroring the `uzi
+worker` precedent (no `worker create`, for exactly this reason), and
+`TestTokenHasOnlyList` pins the absence so nobody adds one by reflex. The
+command's help says the writes are web-only and why.
+
+`GET /api/me/secrets` moved from `RequireAuth` to `RequireUser` to make `token
+list` reachable — safe, since it returns labels, ids and flags, never a value.
+
+Relaxing D8 to allow CLI writes would make token create/rotate/delete
+Bearer-reachable, so a stolen `uzc_` could replace a user's credentials rather
+than merely read metadata. That is the precise escalation D8 exists to prevent,
+and it is not taken.
 `/api/me/secrets/*` is `RequireAuth` today (`handler/handler.go:320`) and stays
 that way: minting and replacing credentials is the CLI's exclusion zone,
 consistent with `POST /workers` being cookie-only because its join token yields a
@@ -251,6 +269,32 @@ ON DELETE SET NULL`. The handler validates ownership too (for a 404 rather than 
 constraint violation), and `OpenByID` re-checks `(user_id, kind)` — defense in
 depth, with the schema as the backstop. Same treatment for
 `users.judge_anthropic_secret_id`.
+
+**D12 — The default invariant is serialized by an ADVISORY LOCK, not `FOR UPDATE`.**
+
+*Corrected during M2. The original text below specified `SELECT ... FOR UPDATE`,
+which is the wrong primitive and would not have closed the races this decision
+names.* `FOR UPDATE` locks **existing rows**: it cannot block a concurrent
+`INSERT` of a new row, and it locks nothing at all when the set is empty — which
+are exactly races (a) and (b). Every mutation instead takes
+`pg_advisory_xact_lock(SecretMutationLockClass, objid(user_id))` as its
+transaction's first statement, matching the hosted-provision quota lock already
+in this codebase (`store/migrate.go`).
+
+Proven, not asserted: with the lock removed,
+`TestConcurrentDeleteDefaultVsCreateLiveDB` fails with
+`user has 1 tokens but 0 defaults — the delete-vs-create race left a no-default
+state` — precisely the state the kind-path alias 500s on. With the lock, 25
+interleavings pass.
+
+**Which test proves what** (recorded because the two are not equivalent):
+`TestConcurrentFirstTokenCreatesLiveDB` passes *without* the lock too — the
+partial unique index already prevents two defaults there, so the lock only
+upgrades a loser's outcome from a 409 to a clean non-default create. Only the
+delete-vs-create test demonstrates the lock is load-bearing. Do not cite the
+first as evidence the lock is necessary.
+
+*Original text, retained for provenance:*
 
 **D12 — The default invariant is transactional; the index alone is not enough.**
 The partial unique index enforces **at most** one default. "Exactly one while any
