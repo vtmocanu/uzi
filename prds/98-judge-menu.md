@@ -5,9 +5,41 @@
 
 **Progress (2026-07-21, end of day)** — **FIRST MR MERGED.** [MR !90](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/90) landed on `main` as `8515cfab` with CI green across every stage: all seven implementation milestones (M1-M7) plus M8a's docs half, 95 files, +15,594/−225. The migration shipped as `00081_judge_issue_close_sync.sql`, renumbered above the live head at landing (the draft `00075` collided with a *different* migration already on `main`; the `00076` gap was deliberately not filled, since a free number below the applied head is the boot-refusing case).
 
-**A second branch, `feature/prd-98-followup`, carries the cheap tier of Remaining work** — four items closed there and reviewed, unmerged as of this writing.
+**A second branch, `feature/prd-98-followup`, carried the cheap tier of Remaining work** — four items closed there and reviewed. **MERGED 2026-07-21 as [MR !91](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/91), landing on `main` as `ad6c63d9`.** *(This line read "unmerged as of this writing" until 2026-07-21 late; it was stale for hours and a resuming session read it as live. A sentence containing "as of this writing" with no date is a claim that cannot be checked — it is always true of the moment it was typed and never true afterwards. The durable form is the SHA.)*
 
-**THE PRD REMAINS OPEN.** Work resumes here, not in a follow-up PRD. Eight items remain below, four of them substantial: M8b (e2e), the printed-instruction backstop, seam 6's golden fixture, and widening the query inventory beyond the judge family. **None of the four is cheaper later than now** — they were deferred for scope, not because they are blocked.
+**A third wave — SIX branches, all based on `ad6c63d9`.** State as of 2026-07-21 late; SHAs are the
+last observed tip, not a guarantee about now.
+
+| branch | tip | state |
+|---|---|---|
+| `feature/prd-98-t2-web` | `abf039e4` | anchored-href render pin + first `OccurrenceFileIssue` tests. **Reviewed + audited, 0 Blocking.** |
+| `feature/prd-98-tier2` | `536f9730` | M1 fold re-derivation + query inventory (10 files, 46 queries). Reviewed; **one BLOCKING row fixed**; audit of the fix open. |
+| `feature/prd-98-t2-lim` | `a42b346d` | route mount-table test (**new**, user-added scope). **Reviewed + audited, 0 Blocking.** |
+| `feature/prd-98-t2-fid` | `e30f97e0` | architect's design note: seam 6 **ruled**, backstop + M8b passes pending. |
+| `feature/prd-98-t2-seam6` | — | seam 6 implementation, in progress. |
+| `feature/prd-98-t2-cli` | — | M8b. **Not started** — blocked on the backstop design pass. |
+
+**Two items of NEW scope the user added mid-wave, neither in the original PRD:**
+1. **A route mount-table test.** It began as "our route's limiter is untested" and generalised three
+   times under measurement to **all 24 per-user limiter mounts across six limiters, none asserted** —
+   see the follow-up entry below. Landed as a test that walks the real `Routes(...)` table and names
+   which limiter instance each route carries.
+2. **An admin-wide CLI-token inventory** — the first new *product* functionality this wave produced.
+   Everything else here is tests, fixtures and docs. It exists because the mount sweep surfaced two
+   credential-minting routes with no limiter, and the severity read landed on something other than
+   the rate: **workers are admin-visible, CLI tokens are not.** All six queries in `cli_tokens.sql`
+   are per-user or by-hash, so **no admin-wide token inventory exists anywhere in the product**, while
+   user-scope tokens carry no expiry. The missing limiter caps the rate; the missing visibility caps
+   the consequence, and only the first had any remediation. Hard constraint on the build: **never
+   project `token_hash`** — an admin-wide query that returns hashes converts a visibility fix into a
+   credential-disclosure surface.
+
+**THE PRD REMAINS OPEN.** Work resumes here, not in a follow-up PRD. The substantial remainder is: M8b (e2e), the **executing half** of the printed-instruction backstop, seam 6's golden fixture, and widening the query inventory beyond the judge family. **None is cheaper later than now** — they were deferred for scope, not because they are blocked.
+
+**Read the checkboxes below, not a count.** This paragraph said "eight items remain, four of them substantial" and **two of the four were wrong within the day**, in opposite directions and both silently:
+- the **filed-issues join** item was already CLOSED in the tree it was listed as open against (`45381961` + `8c6be2b8`, both ancestors of `ad6c63d9`) — the prescribed fixture change was sitting at `judge_recommendations_integration_test.go:383` with its folds recorded RED;
+- the **printed-instruction backstop** had already landed its registry half (`api/cmd/uzi/instructions_test.go`, both scan tests, an AST lift and a vacuity guard), leaving only the executing half — so the item was real but half its stated scope was not.
+A tally is a claim about a tree, and it goes stale exactly like a line number while reading as a summary. Both errors were caught by validators re-deriving the items against the code before any coder started, which is the cheapest place this class is ever caught: one was found while priming, before a single commit existed.
 
 **What this PRD does NOT cover, stated because the alternative is a false claim:** no e2e coverage exists for it at all; mock↔server fidelity is not asserted (and the landing merge widened this — `mockApi` now emulates a composite-FK cascade); `OccurrenceFileIssue` is 236 lines with zero tests and is the only forge-writing web path here; and the query inventory test proves someone *declared* where a query is pinned, not that the pin is good. A claim that the judge backlog is covered end to end would be wrong on four counts.
 
@@ -975,6 +1007,48 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       independently. Constraint: each row must bind to the command that **emits** it —
       running an instruction against the wrong command manufactures a false finding exactly
       as reading it manufactures a false pass.
+      **STATUS 2026-07-21 (late): the registry half LANDED and its central guarantee is FALSE.**
+      `api/cmd/uzi/instructions_test.go` ships both `TestPrintedInstructionsAreRegistered` and
+      `TestRegisteredInstructionsAreStillPrinted`, with an AST lift, a cobra-tree verb filter and
+      a "0 instructions found" vacuity guard — and it has already fired once in anger, on a PRD
+      #104 instruction that arrived at the landing merge. So the *scanning* half is done. **What
+      remains is the executing half**, and by the file's own bar at `:38-41` ("adding a line here
+      is a claim that the instruction has been EXECUTED and its outcome asserted") **0 of its 8
+      entries qualify today**: six disclaim execution outright, and the two that do not rest on
+      `FakeClient` component pins — one of them asserting only that stderr *contains the word*
+      `"refresh"`, which is presence, not the command.
+      **The guarantee at `:32-36` — "a FOURTH instruction cannot land silently" — does not hold
+      for the shape a real instruction takes.** `instructionRE` (`:130`) is
+      `` `(uzi [a-z][a-z0-9 -]*)` ``; the class excludes `%`, `<` and `|`, so the group ends at
+      the disallowed byte and the required closing backtick is not there. Three printed
+      instructions are therefore **unliftable**: `` `uzi review show %s` `` (`review.go:531`),
+      `` `uzi review backlog --run <run-id>` `` (`:403`), and `` `uzi review resolve|dismiss …` ``
+      (`:54`). The first is the instruction the `uzi review show` registry entry exists for — **it
+      is registered only because a human happened to type it**; had they not, the check designed
+      to force it would have stayed green.
+      **The root cause is not the character class, it is that the two directions use different
+      matchers for the same concept.** `TestRegisteredInstructionsAreStillPrinted` uses
+      `strings.Contains` on raw literals, so it finds `uzi review show` *inside*
+      `uzi review show %s` — while the registration scan never saw it. Only the weaker matcher is
+      the one that fails the build on a new instruction. A fix that only widens the class leaves
+      the disagreement in place.
+      **The resolution, and it dissolves the problem rather than working around it:** `%s` exists
+      only in the SOURCE literal. `uzicli.Exitf` is `fmt.Errorf(format, a...)`
+      (`api/internal/uzicli/output.go:48`), so by the time the text reaches a user it is a
+      complete runnable command with no verb in it. **Never read the source literal on the
+      execution path** — capture the emitting command's real stderr/stdout, lift the backticked
+      span from *that*, and exec what was lifted. Which gives the split the two matchers should
+      have had from the start: the **static** check ("does a row exist?") must read source, and
+      needs the widened class plus a boundary-aware prefix match (`cmd == k.command ||
+      strings.HasPrefix(cmd, k.command+" ")` — today `uzi review backlog-export` is silently
+      absorbed by the `uzi review backlog` entry, confirmed by execution); the **runtime** row
+      ("does the printed text work?") must read emitted output, and needs no regex widening at
+      all. Splitting them by what they are FOR, not by what they match, is the actual fix.
+      **Known cost, priced before committing:** a runtime row for `uzi review show` needs the id
+      `resolveRecID` printed, so its `arrange` step requires a real no-match against a booted API
+      — an e2e-shaped cost for a unit-shaped test, and the likely reason six entries say NOT
+      EXECUTED rather than nobody having tried. If only a subset is reachable, the registry is
+      already the right artifact for saying which, honestly.
 - [ ] **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
       demo fixture cannot reach the two riskiest behaviours.** A differential harness dumped
       the shipped `mockReviews`, ran the real `GroupJudgeRecommendations` over rows built in
@@ -1025,7 +1099,26 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       keeping other-run occurrences, truncation cutting **before** grouping), and check
       ordering explicitly — Go uses `sort.SliceStable(run_count DESC, open_count DESC)` and a
       JS `.sort()` is not stable the same way for equal keys.
-- [ ] **The filed-issues join's coordinate half is asserted but NOT exercised** (measured
+- [x] **DONE — and it was already done when this checkbox still said otherwise (closed 2026-07-21, late).**
+      The prescribed fix — an unfiled coordinate INSIDE `autoRev` — is at
+      `api/internal/store/judge_recommendations_integration_test.go:383`
+      (`const unfiledInAutoRev = "rg-unfiled-sibling"`, used at `:386` and `:642`), landed by
+      `45381961` + `8c6be2b8`, **both ancestors of `ad6c63d9`**, with the folds recorded RED in
+      the comment at `:361-366` — including the exact `drop AND f.target = rr.target` this item
+      prescribes. Verified by ancestry, not by reading a commit message.
+      **The item was dispatched to a coder as work before anyone checked**, and a validator
+      priming its context found it closed before a single commit existed. So the cost was one
+      re-scope message rather than a duplicated fixture — but the lesson is the cheaper one only
+      because someone re-derived an open item instead of trusting the checkbox.
+      **Its residual claim was stale too, which is the subtler half:** the text below still says
+      "what remains open in this item is only the JOIN predicate, and only on the M1 read query".
+      That is disproved by the same fixture comment. An item can be closed in the tree while its
+      own status paragraph — written to be precise about what remains — goes on describing a gap
+      that no longer exists. **A checkbox is an assertion; so is the sentence explaining it, and
+      the explanation rots first** because it is the part nobody re-runs.
+      *Original entry preserved below unchanged, because the measurements in it are still the
+      record of how the gap was found:*
+- ~~**The filed-issues join's coordinate half is asserted but NOT exercised**~~ (measured
       2026-07-21). Dropping `AND f.target = rr.target` from the `LEFT JOIN` leaves
       `TestJudgeBacklogProjectsEveryColumnLiveDB` **green**, because the fixture's `autoRev`
       and `handRev` are **different reviews** — so `f.review_id = rv.id` alone separates the
@@ -1099,7 +1192,9 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       never executed under test. The judge's oldest-first input cap rides this query
       (`follow_up_inputs_integration_test.go:21` describes the shape). Recorded rather than
       fixed because scope is frozen; it is declared `UNPINNED` with this reason in
-      `api/internal/store/judge_query_inventory_test.go`, which is the only reason it is
+      `api/internal/store/query_inventory_test.go` (renamed off the `judge` prefix at `041c5291`
+      when the table outgrew the judge family — it was `judge_query_inventory_test.go`), which is
+      the only reason it is
       visible at all.
 
 - [ ] **Widen the query inventory beyond the judge family.** The declaration test landed for
@@ -1231,8 +1326,33 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       `forgeLimiter`, draft gate, provenance box, `isHttpsUrl`) — but that duplication also
       duplicated away its coverage. A test on the duplicate is wanted, **not** a refactor.
       Also still open: its stale-filed-link warning is absent because `JudgeOccurrenceDTO`
-      carries no review `updated_at`; the comment now says so plainly rather than implying
-      there is nothing to guard.
+      carries no review `updated_at`; ~~the comment now says so plainly rather than implying
+      there is nothing to guard.~~
+      **CORRECTION 2026-07-21 (late): that last clause was FALSE when written, and stayed false
+      until `8b2ac005`.** At `ad6c63d9` the comment at the site did not mention the DTO at all —
+      it said the occurrence's link is always settled "so … there is nothing to re-derive here",
+      which reads as *no hazard*, the exact implication the PRD sentence claimed it had stopped
+      making. Found by the coder writing the tests, who checked the comment against the code
+      instead of against this file.
+      **The hazard is real and the mechanism is now recorded at the site:**
+      `UpsertRunReviewWithRecommendations` upserts the review IN PLACE
+      (`ON CONFLICT (target_run_id) DO UPDATE … updated_at = now()`) and deletes/reinserts
+      `review_recommendations`, while `recommendation_filed_issues` is
+      `UNIQUE (review_id, category, target)` and cascades only from `run_reviews` (migration
+      `00071`) — **so a filed link survives a re-judge.** What is missing is visibility, not the
+      guard: `rv.updated_at` is available in the backlog query's `FROM` and simply unprojected,
+      so RunView's `filed_at < updated_at` comparison is not computable client-side. Still not
+      fixed — documented, per this item. The absence is deliberately NOT pinned as behaviour;
+      pinning it would freeze the gap.
+      **Why this one is worth the space: a PRD sentence asserted the state of a comment, the
+      comment asserted the state of the code, and only the code was checked.** Two assertion
+      layers, one gate, and the gate was on the wrong layer.
+
+      **Implementation landed** on `feature/prd-98-t2-web` (`8b2ac005`, comments corrected in
+      `3194633a` + `4a469178`): a new `OccurrenceFileIssue.test.tsx` reaching the filer through
+      the Judge occurrence expander for the first time, with nine mutations each reddening
+      exactly its target. **Pending review/audit at `4a469178`** — do not mark this item closed
+      on the strength of this paragraph; that is precisely the mistake recorded above.
 
 **Known limitation, accepted deliberately (2026-07-21):** the `⚖ issues` badge is
 **byte-identical on `/runs` and on Judge occurrence rows**, but means different things. On
@@ -1259,11 +1379,106 @@ costs nothing; do not attribute it.
 - [ ] **M8a — Tests + Docs (docs half in the first MR)**: e2e leg (dedup grouping; a group **Dismiss** fans out
       across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
       Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
-      deep-links to `/judge?run=`; **no token spend** on any disposition); vitest for
+      deep-links to `/judge?run=`; ~~**no token spend** on any disposition~~); vitest for
       the page/tabs/zero-state + the `/runs` badge; `docs/judge.md` (the menu, dedup
       grain, group disposition fan-out, inbox grouping, filed-sync incl. its
       PRD-label/enabled-repo preconditions) + `docs/cli.md` (`review backlog` +
       disposition verbs); `specs/ai.md` records the decisions.
+      **CORRECTION 2026-07-21: "no token spend, proven by the e2e leg" IS NOT ACHIEVABLE AND THE
+      CRITERION IS RETIRED, NOT DEFERRED.** An e2e spend assertion here **cannot fail**: a
+      disposition creates no run, so a before/after run-count or `run.usage` delta sits at zero
+      whether or not the property holds. The harness already says so in its own words at
+      `e2e/run-e2e.sh:2832-2836` — the structural proof is *"strictly stronger than this harness's
+      before/after run count and forge-state signature, which could only catch a write that
+      happened to land"*. The one honest precedent (`run-e2e.sh:1690-1700`) could attach to
+      `run.usage` only **because a run existed**.
+      **Where the property IS proven:** `TestDispositionTouchesStoreOnly`
+      (`api/internal/handler/review_disposition_test.go:421`) and
+      `TestBulkDispositionTouchesStoreOnly` (`judge_bulk_disposition_test.go:678`) — positive
+      store-call allowlists, which is a stronger proof than any delta assertion.
+      **Struck through rather than deleted, deliberately.** The architect wrote this e2e assertion
+      into its M8b design *while quoting the refuting comment two blocks earlier*, and a silent
+      deletion here would invite the next reader to re-add it from this very bullet — which is how
+      it got written the first time. The strike-through is the guard.
+      **The general defect, since it recurs:** a criterion phrased as *"proven by <mechanism>"* is
+      two claims, and the second one is the one nobody checks. This bullet named a mechanism that
+      is structurally incapable of proving it, and the mechanism sounded more rigorous than the
+      test that actually does the job.
+
+**Follow-up (not in this PRD), found 2026-07-21 while covering `OccurrenceFileIssue`: ALL 24
+PER-USER LIMITER MOUNTS ARE UNASSERTED, PROVEN BY EXECUTION.** It began as "our route looks
+uncovered" and generalised three times under measurement; each widening was run, not reasoned.
+**Measured, in throwaway detached worktrees, restored after:** `api/internal/handler/handler.go`
+carries **24** `PerUserMiddleware` mounts (a bare grep says 27; three are comments) across six
+limiter instances — forge 13, auth 3, chat 3, slackDM 2, hosted 2, judge 1. Removing all 13
+`forgeLimiter` mounts leaves `go vet` clean and `go test ./...` at **zero failures**; removing the
+8 non-forge, non-auth mounts does the same; **removing all 24 at once, across all six limiters,
+does the same.** Two agents ran the forge half independently, in separate worktrees, without
+reading each other — convergent measurement, not a shared assumption. It COMPILES because each
+limiter stays used as a signature argument, so this is a live mutation and not a build break.
+**IT WAS "21 OF 24" FOR AN HOUR, AND THE CORRECTION IS THE MOST INSTRUCTIVE PART OF THIS ENTRY.**
+One validator carved out `authLimiter`'s 3 per-user mounts as genuinely covered, citing
+`e2e/run-e2e.sh:1850-1871`, "which drives repeated logins through the real stack and asserts a
+429". **That e2e assertion is real and it covers a DIFFERENT MOUNT ON THE SAME LIMITER OBJECT.**
+`/api/auth/login` is `authLimiter.`**`Middleware`** (`handler.go:275`, IP-keyed); the three
+unasserted mounts are `authLimiter.`**`PerUserMiddleware`** — `/cli/approve` (`:300`),
+`/vault/unlock` (`:403`), `/vault/passphrase` (`:406`). One limiter instance, two methods, two
+disjoint sets of mounts.
+**Settled by the lead reading the harness rather than choosing between two reports:** the e2e
+block hammers `POST /api/auth/login` with forged `X-Forwarded-For` headers (PRD #58's XFF bypass)
+and touches no per-user mount at all.
+**This is the "two validators can both be right because they asked different questions"
+corollary, with a sting: one of them WAS wrong, and it was the one who had executed more code.**
+The over-credit came from reasoning about the limiter INSTANCE where the claim was about the
+MOUNT — the precise conflation this entire finding is about, committed inside the report that
+established it. Running more of the code does not immunise you against answering a different
+question than the one asked.
+**And the sharpest instance sits in the half that was nearly written off:** `/vault/unlock` and
+`/vault/passphrase` are brute-force controls on a passphrase endpoint — the single worst place in
+the table to wrongly mark green. Had the carve-out stood, both would have been filed as covered.
+**The mistake was available in exactly one place, and that is worth stating precisely so nobody
+guards the wrong thing.** `authLimiter` is the **only** limiter mounted under BOTH methods — 6
+`.Middleware` (IP-keyed: `/register` `:274`, `/login` `:275`, `/config` `:278`, the OIDC pair
+`:282-283`, `/cli/start` `:291`) and 3 `.PerUserMiddleware`. The other five per-user limiters carry
+one method each, so the same mis-credit could not have happened to any of them. Verified by the
+one command that settles it: `comm -12` over the two greps returns `authLimiter` and nothing else
+(the only other `.Middleware` user is `cliPollLimiter`, which has no per-user mount). So this is
+**not** a general hazard across six limiters; it is a specific property of one, and it is cheap to
+re-check.
+**Diagnosis from the agent that made the error, recorded because it is more useful than the
+correction:** its census command was right — it grepped `[a-zA-Z]+Limiter\.PerUserMiddleware`,
+which counts only per-user mounts. Then, attributing coverage, it stopped using that predicate and
+reasoned about the **object**: "authLimiter is exercised by e2e, therefore its mounts are covered."
+The grep was mount-level; the sentence built on top of it was instance-level, and the join between
+them was never re-derived. It had the disproof in hand — when it mutated the 8 non-forge non-auth
+mounts it *excluded* auth on the strength of that reasoning, where simply including them would
+have shown green and ended the question in one run. **It chose to reason where it had already
+built the tool to measure.** Its own generalisation: a stack of real measurements lends unearned
+credibility to the one unmeasured sentence sitting between them.
+**The sharpest single fact:** the two routes carrying the ONLY `PerUserMiddleware` assertions in
+the entire tree — `chat_test.go`'s `/{id}/continue` and `slack_test.go`'s `/test-dm` — are
+**among the 8 deleted, and both suites stayed green.** Those tests do not cover even their own
+routes' mounts. `chat_test.go:210-213` hand-writes `chi.NewRouter()` and **constructs the very
+`.With(...)` it then observes working** — a tautology with respect to the mount.
+**Worse, and easy to state backwards:** neither assertion is on a `forgeLimiter` route at all —
+`/{id}/continue` rides `chatLimiter` (`:759`), `/test-dm` rides `slackDMLimiter` (`:467`). So
+`forgeLimiter`, the instance guarding all 13 forge routes, has **zero assertions of any kind**.
+What those two prove is that `mw.Limiter.PerUserMiddleware`, the shared TYPE, 429s past budget,
+via two other instances. "The middleware is exercised" is fair; "forgeLimiter is exercised" is
+false.
+**Why nothing catches it, which is the durable half:** the file covering the judge route
+(`review_issue_livedb_test.go`) calls `h.FileIssue(rr, req)` **directly as a function** at ten
+sites and never constructs `h.Routes()` — **no middleware chain executes at all**, so it could not
+observe a missing mount even in principle. The only tests that build the real route table use
+`noLimit` or a 100k/minute budget that cannot fire. `chi.Walk` appears **nowhere** in `api/`, so
+no route-table snapshot exists or could be trivially derived. And the only 429 assertion in
+`e2e/run-e2e.sh` (`:1850-1871`, PRD #58's XFF forgery) is on `authLimiter.Middleware` at
+`/api/auth/login` — an **IP-keyed** mount, not a per-user one, so it closes none of the 24.
+Not fixed here: a Go-side change across the whole limiter surface, and folding it into a
+test-quality tier for the judge menu would be scope creep into a security surface deserving its
+own change. **The counts are `ad6c63d9`'s inventory, not constants; the durable claims are
+mount-vs-behaviour, the direct-function-call blindness, and that the only two assertions are
+tautological with respect to the mount they construct.** Raised to the user for a follow-up issue.
 
 **Follow-up (not in this PRD): bulk file-as-one-issue.** A `POST
 .../recommendations/file` that files one aggregated GitLab issue linking N members
