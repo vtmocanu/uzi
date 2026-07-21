@@ -228,8 +228,9 @@ func (h *Handler) notifyReviewReady(ctx context.Context, targetID uuid.UUID, res
 // buildReviewNotification assembles the "review ready" notification (PRD #46 M4,
 // Decision 6). It is PURE (no I/O) so the security-critical shape is unit-testable.
 // The inbox payload and the Slack body carry the verdict, the SCRUBBED summary, and
-// the recommendation count + categories (the full recommendation detail lives on the
-// run page behind the deep link). The summary is untrusted judge/worker text: it was
+// the recommendation count + categories (the full recommendation detail lives on the Judge
+// workbench behind the deep link — `/judge?run={target}` since PRD #98 M5, not the run
+// page). The summary is untrusted judge/worker text: it was
 // already validated + capped + secret-scrubbed at the review POST, and the producer
 // re-scrubs + length-caps it here (belt and suspenders — the notifysvc payload path
 // is stored/served VERBATIM, incl. the admin all-view). Recommendation TARGET and

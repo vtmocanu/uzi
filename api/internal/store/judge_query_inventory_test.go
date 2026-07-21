@@ -33,8 +33,14 @@ import (
 // where it ran, and is not repeated as a live figure: 128 by `c1fcdfce`, 129 by
 // `31080a40`. Corroborated independently rather than taken on trust: the count of top-level
 // Test*LiveDB functions across internal/store + internal/handler is 108 / 110 / 111 at
-// those three SHAs, and the +2 / +1 deltas match. A tally drifts exactly like a line
-// number, so the mechanism is the claim and the number is only its receipt.)
+// those three SHAs, and the +2 / +1 deltas match. (…the two counts measure different
+// things — `RUN` counts `=== RUN` lines, which include subtests, while this counts
+// top-level functions — so only the DELTAS are comparable. Said explicitly because the
+// point of recording the arithmetic was that the next reader can re-check the binding
+// without a database, and 108 against a tally of 126 is an unexplained gap of 18 on a
+// branch where a number that looked wrong has repeatedly been wrong.) A tally drifts
+// exactly like a line number, so the mechanism is the claim and the number is only its
+// receipt.)
 //
 // Everything above is past tense on purpose. The auditor's original wording made those two
 // claims in the PRESENT — and both stopped being true within the day, inside the very

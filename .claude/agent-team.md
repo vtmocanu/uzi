@@ -389,6 +389,17 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   so it matched nothing and the "verified" result came from **unmutated code**. This is the
   "did I run something that would fail if this were false?" bar failing on its own enforcement
   mechanism, which is why it needs stating separately.
+- **A MUTATION CAN APPLY TEXTUALLY AND BE SEMANTICALLY INERT.** "Assert the mutation applied"
+  is necessary and not sufficient — the edit can land, the file can differ, the build can
+  pass, and the code can behave identically. Measured 2026-07-21: a reviewer mutated
+  `s.triage.todo` where `getJudgeStats` returns `TriageCounts` with `.todo` at top level
+  (`api.ts:1745`), so the read silently fell back to the context and changed nothing. It
+  nearly filed a live assertion as decoration on the strength of it. The check is not "did the
+  file change" but "did the BEHAVIOUR change" — **a mutation that reddens nothing has two
+  explanations, a weak test and an inert edit, and they are distinguished only by reading what
+  the mutated expression now evaluates to.** (Third refinement of the mutation rule in one day
+  and the first about semantics rather than mechanics; it is also how that reviewer discovered
+  the assertion WAS load-bearing — the inert mutation was the only thing it caught.)
 - **A projection pin is isolated ONLY if it reddens under a fold to a value the fixture ALREADY
   CONTAINS.** Blanking, or folding to a novel constant, proves nothing — any assertion catches
   those. **The discriminating fold looks like DATA.**

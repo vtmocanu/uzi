@@ -20,7 +20,12 @@ describe("notificationLink (Decision 4: kind-conditional, NOT a URL edit)", () =
   // load-bearing case here is the non-judge one, and why it enumerates several kinds
   // rather than one: a guard written as `kind !== 'run_failed'` would satisfy a single case.
   it("leaves every OTHER kind on the run page", () => {
-    for (const kind of ["run_failed", "mr_merged", "infra_skip", "some_future_kind", ""]) {
+    // selfimprove_started is the ONLY non-judge kind the server currently emits that carries a
+    // run id (selfimprove/engine.go:263-264) — i.e. the only one that reaches this branch in
+    // production today. The rest are deliberately fictional: this is a pure string comparison,
+    // so unknown kinds exercise the same path, and several are here so a guard spelt
+    // `kind !== 'run_failed'` cannot satisfy the case.
+    for (const kind of ["selfimprove_started", "run_failed", "mr_merged", "some_future_kind", ""]) {
       expect(notificationLink(kind, "run-7")).toBe("/runs/run-7");
     }
   });

@@ -49,6 +49,16 @@ export const JUDGE_REVIEW_KIND = "judge_review";
 //
 // Returning null for a row with no run id keeps "there is nothing to open" distinct from
 // "open the wrong thing".
+//
+// WHY THE RAW INTERPOLATION IS SAFE, stated because it is not self-evident and because this
+// comment explains the guard at length while saying nothing about the value being
+// interpolated. `runID` is a server-generated UUID, and the fixed `/judge?run=` prefix makes
+// the result a same-origin PATH whatever it contains — so the worst a hostile value could do
+// is append extra query parameters, which this app ignores. That is why there is no
+// encodeURIComponent. It stops being true if either half changes: if a caller ever passes
+// user-supplied text here, or if this is ever used to build an ABSOLUTE url, encode it. The
+// invariant lives here rather than being inferred from the DTO, because removing the
+// server-side guarantee elsewhere is what would make this unsafe.
 export function notificationLink(kind: string, runID: string | null | undefined): string | null {
   if (!runID) return null;
   if (kind === JUDGE_REVIEW_KIND) return `/judge?run=${runID}`;

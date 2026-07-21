@@ -315,7 +315,11 @@ describe("nav badge vs To-triage tab vs the judge notification (PRD #98 M5)", ()
     // Judge page treats as a first-class state (Decision 8), not an absence.
     await waitFor(() => expect(notificationTodoText()).toContain("0"));
     expect(notificationTodoText()).not.toContain("3");
-    // ...and it never polled for its own copy — the count came down the context.
+    // NOT the own-poll guard, though it reads like one. Measured 2026-07-21 at a48c5afe: an
+    // implementation whose own copy WINS renders 3 here, so the waitFor above throws and this
+    // line never executes. What this catches is the case that waitFor cannot — a redundant
+    // poll alongside the context read, where the number on screen is correct and the only
+    // symptom is the extra round-trip. It found exactly that during review.
     expect(mockApi.getJudgeStats).toHaveBeenCalledTimes(1);
   });
 

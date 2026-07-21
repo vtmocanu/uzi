@@ -15,11 +15,27 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    0 divergences found, but the demo fixture cannot reach the two riskiest behaviours — see
    Remaining work), and `OccurrenceFileIssue` has no tests. `specs/ai.md` already carries M5's
    correction; the rest of its judge section has not been reviewed against the shipped code.
-2. **Renumber the migration, IMMEDIATELY BEFORE the MR and not from any number written down
-   here.** `00075_judge_issue_close_sync.sql` collides; `origin/main`'s head has moved past it
-   and will move again. Re-derive the then-current live head and renumber above it. The
-   failure mode is every upgraded instance refusing to boot, and the check **expires** — a
-   number recorded in this file is already stale by the time it is read.
+2. 🔴 **BLOCKING — the migration is a DUPLICATE VERSION, not merely a low one.** Verified
+   2026-07-21 against a fresh fetch: `origin/main` already holds a **different**
+   `00075_run_message_instance.sql`, landed by someone else, while ours is
+   `00075_judge_issue_close_sync.sql`. `comm` against `origin/main` shows exactly one
+   migration is ours. Two failure modes stack — strict goose with no `allow-missing` refuses
+   to boot on a version below the applied head, and a duplicate version is its own problem
+   before that. This was described in passing as a renumbering chore; it is not one, and it
+   was found by running the check rather than inheriting the framing.
+   ⚠️ **`00076` IS ABSENT FROM `main` — there is a GAP between `00075` and `00077`. DO NOT
+   FILL IT.** A free number *below* the applied head is exactly the boot-refusing case, and
+   the gap is what makes it look available. Stated because it is the trap a careful person
+   walks into while trying to be tidy.
+   ⚠️ **RE-DERIVE THE NUMBER IMMEDIATELY BEFORE THE MR. DO NOT INHERIT ONE FROM THIS FILE.**
+   The head measured at the time of writing was `00080`, making the answer `00081` — and that
+   is already an expiring claim; `main` moved twice on the day it was measured, and `00076`
+   went from "free" to "trap" the same morning. Thirty seconds:
+   `git fetch origin && git ls-tree --name-only origin/main api/internal/store/migrations/ | sort | tail -3`.
+   This instruction is itself an instance of the expiry rule in `.claude/agent-team.md`, and
+   it has already expired once.
+   After renumbering: `sqlc generate` (zero-diff check), then re-run the full api gate **on
+   the merged tip**, not the pre-merge one.
 3. **Merge `origin/main`**, then re-run the three gates (api, web, `./e2e/run-store-it.sh`)
    before the MR. The live sweep needs its positive control checked, not just its exit code.
 4. **Then the MR**, after a review pass.
@@ -1105,6 +1121,38 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       test passes for any tree are "the glob found nothing" and "the regex matched nothing",
       and each check catches only its own.
 
+- [ ] **The inbox is the ONLY judge-text renderer with no escaping pin** (M5 audit,
+      2026-07-21). `notificationBody` returns `payload.body`, which carries
+      `reviewSummaryPreview(sub.SummaryMd)` — scrubbed and capped, but untrusted judge free
+      text. React escapes it, so the property HOLDS; nothing asserts it. The other two
+      renderers both carry the pin (`RunView.test.tsx:256`, `Judge.test.tsx:117`);
+      `Notifications.test.tsx` has no equivalent.
+      **Provenance, which is why it is not fixed here:** the auditor checked `a48c5afe^` and
+      the inbox already rendered those fields before M5 — M5 only EXTRACTED them into
+      `lib/notifications.ts`. Pre-existing, so the freeze applies.
+      **Why it matters more now than it did yesterday:** the M3 pre-flag that produced the
+      other two pins was explicitly about a new author reaching for a markdown renderer, and
+      M5 makes the inbox a first-class judge surface — so it is now the obvious next place
+      someone does that, and the one place nothing would fail.
+
+- [ ] **The anchored deep-link is the RARER path in practice** (M5 review, 2026-07-21). The
+      group header's "Open Judge" link (`Notifications.tsx`) is a hardcoded `/judge` with no
+      run anchor. Correct in itself — a group spans several runs, so there is no single run to
+      anchor to — but it means the anchored link that Decision 1's `bucket=all` exception
+      exists for is reachable only from an **ungrouped** judge row, and on a busy day every
+      judge row is grouped. **Product question, not a defect**; being raised with the user
+      separately. Recorded so the `bucket=all` exception is re-evaluated against how often its
+      path is actually taken, rather than defended on its original reasoning alone.
+
+- [ ] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/`.** Two
+      instances in this PRD were corrected 2026-07-21 (they cited the checkpoint as
+      authoritative for the pre-MR migration gate — the one item with the worst failure mode on
+      this branch — while line 813 of the same document said the directory is gitignored). The
+      same dangling pointer survives at **`prds/58-hosted-k8s-workers.md:1311`,
+      `prds/done/25-slack-integration.md:118`, `prds/done/39-chat-agent.md:101`, and
+      `specs/ai.md:7931`**. Outside this PRD and outside the freeze — recorded, not touched.
+      The grep that finds the whole class is one string: `agent-team-tasks`.
+
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,
@@ -1122,6 +1170,13 @@ left to triage"* (M4 behaviour (c)); on the Judge page an occurrence carries no 
 user who does not hover reads the `/runs` meaning. Splitting the *label* was rejected because
 it reintroduces the two-grammar problem the fable review removed and N8 closed, so the title
 carries the distinction alone. Revisit only with a design that keeps one visual grammar.
+
+**Not this PRD's, verified twice so it is not challenged at MR time:** `gofmt -l
+internal/store/` flags three unrelated test files — `pipeline_statuses`, `skills`,
+`worker_concurrency`. A stash comparison proves only that uncommitted work did not cause it;
+the auditor ran the same check at **`06ce378b`, the branch base before any PRD #98 commit**,
+and the same three are flagged there. So it is not merely "not mine", it is not this branch's.
+Leave them: reformatting unrelated files inside this MR is noise a reviewer has to read.
 
 **Also unresolved, lower priority:** the live-DB harness's intermittent *"postgres never became
 ready"* — **mechanism unknown**, with two confident explanations already disproved (a "fixed
