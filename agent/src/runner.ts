@@ -19,6 +19,7 @@ import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, ForgejoClient, type ForgeClient } from "./forge.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 import {
   buildCheckEnv,
@@ -192,6 +193,44 @@ export class RunRunner {
       worktreePath = runnerClone.path;
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `runner clone ready on ${runnerClone.branch}` } });
 
+      // Resume preflight (issue #105). The claim carries the session id the run last
+      // reported, but the transcript it names lives under the per-run HOME on the
+      // worker that WROTE it — and a requeued run whose affinity grace lapsed can land
+      // on a different worker (or the same worker on a fresh volume), where it does not
+      // exist. The SDK resolves a resume locally, so an unresolvable id does not start
+      // fresh: it fails the very first turn with `error_during_execution` and takes the
+      // whole run with it. Check first, and if it is gone, drop the resume and SAY so —
+      // continuing without the earlier context beats losing the run, but only if the
+      // feed admits the context is gone rather than quietly re-treading ground.
+      //
+      // Only when this run HAS a private HOME: the stub executor has none (main.ts),
+      // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
+      // untouched by construction rather than by an executor-kind check here.
+      let sessionId = claim.session_id ?? undefined;
+      let resumeDropped = false;
+      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, sessionId, runLog))) {
+        resumeDropped = true;
+        sessionId = undefined;
+        runLog.warn("resume session transcript is not on this worker; starting a fresh SDK session", {
+          run_home: runHome,
+        });
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text:
+              "this run was picked up again, but the earlier session is not on this worker — " +
+              "continuing WITHOUT its earlier context, so some work may be repeated",
+          },
+        });
+      }
+      // The lead is about to plan with no memory of the earlier turns. If the branch it
+      // is standing on already carries pushed work, tell it so in the planning prompt —
+      // otherwise the honest degradation just becomes silently duplicated work, which
+      // is the harder failure to notice. Both conditions required: a fresh run reading
+      // its own first-attempt branch needs no such warning.
+      const priorWork = resumeDropped && runnerClone.priorCommits > 0 ? { commits: runnerClone.priorCommits } : undefined;
+
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report
       // rather than the gate so that an autopilot run — which never parks at
@@ -242,7 +281,10 @@ export class RunRunner {
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
         memory,
         config: claim.config,
-        sessionId: claim.session_id,
+        // Preflighted above: the claim's id, or undefined when its transcript is not
+        // on this worker (issue #105).
+        sessionId,
+        priorWork,
         signal: cancel.signal,
         // Persist the SDK session id the moment the executor learns it, so a
         // re-queued run can resume it. Best-effort.

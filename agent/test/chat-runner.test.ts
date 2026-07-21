@@ -207,3 +207,75 @@ describe("ChatRunner — per-session executor isolation (PRD #42 Decision 4)", (
     assert.notStrictEqual(built[0], built[1], "each session gets its OWN instance (private spawnedPids)");
   });
 });
+
+// ── Resume preflight (issue #105) ────────────────────────────────────────────
+//
+// Chat shares ONE SDK HOME across sessions by design (a Continue is a new run id
+// resuming the same session, so a per-run HOME would file the transcript under the new
+// id and break resume outright). That sidesteps the run lane's per-run HOME hazard but
+// NOT the cross-worker one: the server copies the prior run's session id onto a
+// Continue unconditionally (GetChatRunClaimContext) and ClaimChatRun hands the run to
+// any of the user's workers once the affinity grace lapses.
+//
+// Before this, the Decision 11 honesty message was gated on `!claim.session_id`, so on
+// a cross-worker Continue — the exact case its comment described — it stayed silent
+// while the id pointed at another machine's disk. Every turn then died with
+// `error_during_execution`, and because an errored chat turn parks for the next message
+// instead of ending, the conversation was bricked for good.
+describe("ChatRunner — resume preflight (issue #105)", () => {
+  const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  function runnerWithHome(
+    client: WorkerClient,
+    executor: ChatExecutor,
+    source: ChatInputSource,
+    sdkHomeDir?: string,
+  ): ChatRunner {
+    return new ChatRunner(client, () => executor, nullLogger(), 5, DEFAULTS, JOIN, {
+      makeSource: () => source,
+      ...(sdkHomeDir ? { sdkHomeDir } : {}),
+    });
+  }
+
+  it("drops an unresolvable session and reaches the Decision 11 message it could not reach before", async () => {
+    const { messages, states, client } = fakeClient();
+    const { queryFn, options } = fakeQuery();
+    // homeDir is a fresh tmpdir with no .claude/projects — a worker that never held
+    // this session, which is what a cross-worker Continue lands on.
+    await runnerWithHome(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), fakeSource([msg("q"), { kind: "idle" }]), homeDir)
+      .execute(baseClaim({ resume_of_run_id: "prior-run", session_id: SID }));
+
+    assert.strictEqual(options[0]!.resume, undefined, "a dead session id must not be passed to the SDK");
+    assert.ok(
+      messages.some((m) => m.kind === "status" && /without its earlier context/.test(String(m.payload["text"]))),
+      "the Continue must admit it lost the context",
+    );
+    // And the dead id is not carried back to the server as this run's resume target.
+    assert.strictEqual(states[0]!.session_id, undefined);
+  });
+
+  it("keeps a session whose transcript IS on this worker", async () => {
+    const { messages, client } = fakeClient();
+    const { queryFn, options } = fakeQuery();
+    const dir = path.join(homeDir, ".claude", "projects", "-some-cwd");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${SID}.jsonl`), "{}\n");
+
+    await runnerWithHome(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), fakeSource([msg("q"), { kind: "idle" }]), homeDir)
+      .execute(baseClaim({ resume_of_run_id: "prior-run", session_id: SID }));
+
+    assert.strictEqual(options[0]!.resume, SID, "a resolvable session still resumes");
+    assert.ok(
+      !messages.some((m) => m.kind === "status" && /without its earlier context/.test(String(m.payload["text"]))),
+      "must not cry wolf on a working Continue",
+    );
+  });
+
+  it("does not preflight without a configured SDK HOME (the stub lane is untouched)", async () => {
+    const { client } = fakeClient();
+    const { queryFn, options } = fakeQuery();
+    await runnerWithHome(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), fakeSource([msg("q"), { kind: "idle" }]))
+      .execute(baseClaim({ resume_of_run_id: "prior-run", session_id: SID }));
+    assert.strictEqual(options[0]!.resume, SID, "no HOME configured ⇒ the claim's id passes through unchanged");
+  });
+});

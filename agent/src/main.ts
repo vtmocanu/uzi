@@ -90,8 +90,18 @@ async function main(): Promise<void> {
   // never shared across two concurrent runs (the B1 pre-push reap) — and gets its
   // OWN HOME `agent-home/<runId>` so the SDK's process-global $HOME/.claude state
   // (history/todos/shell-snapshots/~/.claude.json) can't race or leak between runs.
-  // The runId keeps it stable across resume (a requeue keeps the run_id) and the
-  // runner removes it on terminal.
+  // The runner removes it on terminal.
+  //
+  // This comment used to end "the runId keeps it stable across resume (a requeue keeps
+  // the run_id)". The run id is stable, but the PATH is only stable ON THIS WORKER: it
+  // lives on the claiming worker's own data volume, and a requeued run whose affinity
+  // grace lapsed can be claimed by a different worker (or by this one on a fresh
+  // volume), where `agent-home/<runId>` has never existed. The claim still carries the
+  // session id, but the transcript it names does not — and the SDK resolves a resume
+  // LOCALLY, so that used to kill the run on its first turn. The wording is arguably
+  // what hid it: "stable across resume" reads as a guarantee it cannot make. The
+  // runner now preflights the transcript and drops an unresolvable resume with an
+  // honest run message (issue #105, sdk-session.ts).
   const makeExecutor: ExecutorFactory = (runId) => {
     // The stub has no SDK $HOME (no session transcript to isolate); its only homeDir
     // use is the provisioning subprocess HOME, which stays SHARED (warm-start) like
@@ -151,7 +161,13 @@ async function main(): Promise<void> {
     turnTimeoutMs: config.chatTurnTimeoutMs,
     idleTimeoutMs: config.chatIdleTimeoutMs,
     pollMs: config.chatPollMs,
-  }, config.workerToken);
+  }, config.workerToken, {
+    // Issue #105: the HOME a Continue's transcript would have to live under, so the
+    // runner can tell a resumable session from one written on another worker. Omitted
+    // for the stub (it persists no real SDK session), which is the same discriminator
+    // the run lane gets for free from the stub's absent per-run HOME above.
+    ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
+  });
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
   // HOME root but needs no executor/clone — it fetches the trace, calls the model
