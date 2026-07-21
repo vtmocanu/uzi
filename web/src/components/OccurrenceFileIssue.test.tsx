@@ -120,6 +120,19 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  // `clearAllMocks` clears CALL HISTORY, not implementations, so the CSRF test's
+  // `mockImplementation(real.fileIssue)` would survive into every test written after it —
+  // silently running the real HTTP client against no fetch stub (`unstubAllGlobals` does
+  // remove that), and its failure would read as a component bug. Measured before this line
+  // existed: a probe appended after the CSRF test saw `getMockImplementation()` still set.
+  // The CSRF test is currently last, so this is a landmine for the next author, not a live
+  // defect — which is exactly when it is cheap to defuse.
+  mockApi.fileIssue.mockReset();
+  // Same shape, different mechanism: the cookie was cleared in the CSRF test's BODY, so a
+  // thrown assertion skipped it and left `uzi_csrf=tok-abc123` set for the rest of the file.
+  // Measured by forcing that test to throw before its cleanup line — the probe then read
+  // the leaked cookie. Teardown runs either way; a test body does not.
+  document.cookie = "uzi_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
 });
 
 // Renders the component on its own, with the draft already scripted, and opens it — the
@@ -438,7 +451,7 @@ describe("OccurrenceFileIssue — the write is issued through the app's API clie
       title: draftFixture().title,
       description: draftFixture().description,
     });
-
-    document.cookie = "uzi_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    // No cleanup here on purpose — the cookie and this test's mockImplementation are both
+    // undone in the file's afterEach, which runs even when an assertion above throws.
   });
 });
