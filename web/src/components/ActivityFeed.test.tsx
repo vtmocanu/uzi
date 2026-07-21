@@ -831,6 +831,33 @@ describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
     expect(chips[2]).toMatch(/^coder ×2: idle/);
   });
 
+  it("sorts a STALLED role to the very front — the mockup's headline case", () => {
+    // The other ordering test covers waiting > working > idle. `stalled` cannot appear
+    // in that render: crewStateFor only returns it for the ACTIVE lane when run.health
+    // is degraded, so it needs its own fixture — and it is priority 0, ahead of
+    // everything. Together the two tests pin the whole ladder.
+    const now = Date.now();
+    const old = new Date(now - 120_000).toISOString(); // >45s -> idle
+    const recent = new Date(now - 20_000).toISOString(); // <45s -> waiting
+    const { container } = renderFeed(
+      [
+        mi(1, "coder", "toolu_c1", "a", { created_at: old }),
+        mi(2, "coder", "toolu_c2", "b", { created_at: old }),
+        mi(3, "reviewer", "toolu_r1", "r", { created_at: recent }),
+        // Doubled `tester`, seen LAST, and its active lane is stalled by run health.
+        mi(4, "tester", "toolu_t1", "x", { created_at: old }),
+        mi(5, "tester", "toolu_t2", "y", { created_at: recent }),
+      ],
+      { status: "running", health: "looping" },
+    );
+    const chips = [...container.querySelectorAll('[aria-label="Crew"] button')].map(
+      (b) => b.getAttribute("title") ?? "",
+    );
+    expect(chips[0]).toMatch(/^tester ×2: stalled/);
+    // Seen first, but idle, so it sorts last.
+    expect(chips[chips.length - 1]).toMatch(/^coder ×2: idle/);
+  });
+
   it("orders the shipped run-busy demo fixture attention-first too", () => {
     // Against the REAL mock fixture rather than a synthetic one, so the demo everybody
     // looks at is the thing under test. run-busy has a doubled `tester` (one lane
@@ -864,6 +891,41 @@ describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
     expect(label?.className).not.toContain("shrink-0");
     expect(label?.className).toContain("truncate");
     expect(label?.className).toContain("min-w-0");
+  });
+
+  it("makes the one-liner yield BEFORE the label — identity outranks detail", () => {
+    // Shrinkable was not enough. With the label and the one-liner both at the default
+    // flex-shrink:1 they yielded at the same rate and the label lost: MEASURED in
+    // Chrome at 390px it rendered 11px of an 86px `· web gate UX` — zero characters —
+    // so two same-role lanes stopped being tellable apart, which is the one thing this
+    // PRD exists to deliver. The label is the lane's IDENTITY; the one-liner is detail
+    // about what it is doing right now, so detail yields first.
+    //
+    // jsdom does no layout, so this pins the PRIORITY RELATIONSHIP rather than the
+    // widths: the one-liner carries an explicit larger shrink and the label does not.
+    // Post-fix widths at 390px were 46-80px per label with zero starved; full labels
+    // return by 768-900px.
+    const r = renderFeed(
+      [
+        mi(1, "coder", "toolu_A", "web gate UX", {
+          kind: "tool_use",
+          payload: { id: "u1", name: "Bash", input: { command: "npm run build" } },
+        }),
+        mi(2, "reviewer", "toolu_R", "audit", {
+          kind: "tool_use",
+          payload: { id: "u2", name: "Read", input: { file_path: "/x" } },
+        }),
+      ],
+      { status: "running", health: "ok" },
+    );
+    const header = r.getByRole("button", { name: /coder · web gate UX/ }).parentElement;
+    const label = header?.querySelector(".font-mono");
+    const oneLiner = header?.querySelector("span.truncate.text-xs.text-muted");
+    expect(label).not.toBeNull();
+    expect(oneLiner).not.toBeNull();
+    // The one-liner shrinks faster; the label carries no explicit shrink override.
+    expect(oneLiner?.className).toContain("shrink-[20]");
+    expect(label?.className).not.toContain("shrink-[");
   });
 
   it("keeps the Timeline jump strip, which groups by ROLE and never mentions instances", () => {

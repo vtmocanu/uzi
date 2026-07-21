@@ -960,17 +960,27 @@ function AgentBlock({
         </span>
         {label && (
           // min-w-0 + truncate, NOT shrink-0 (E1): a 48-code-unit mono label is ~300px,
-          // so as a fixed item it alone overflowed a 390px viewport. It now yields and
-          // ellipsises like the one-liner beside it. No effect at 640px+, where there
-          // is slack and nothing truncates.
+          // so as a fixed item it alone overflowed a 390px viewport.
+          //
+          // But shrinkable is not enough — it must shrink SLOWER than the one-liner
+          // beside it. With both at the default flex-shrink:1 they yield at the same
+          // rate and the label loses: at 390px it rendered 11px of an 86px `· web gate
+          // UX`, i.e. ZERO characters, so two same-role lanes stopped being tellable
+          // apart — the one thing this PRD exists to deliver. The label is the lane's
+          // IDENTITY; the one-liner is detail about what it is doing right now. When
+          // space runs out, detail yields first. Hence shrink-[20] on the one-liner
+          // below rather than anything on the label.
           <span className="min-w-0 truncate font-mono text-[11px] text-faint">
             <span aria-hidden="true">· </span>
             {label}
           </span>
         )}
         {/* The live one-liner updates IN PLACE (no scroll) — the thing you read instead
-            of expanding the log. On a lane it shows the lane's newest message. */}
-        {oneLiner && <span className="min-w-0 truncate text-xs text-muted">{oneLiner}</span>}
+            of expanding the log. On a lane it shows the lane's newest message.
+            shrink-[20] (E1 follow-up): it yields ~20x faster than the label, which is
+            what keeps the lane identifiable at phone widths and also restores full
+            labels at 640-768 where the equal-rate version had started truncating. */}
+        {oneLiner && <span className="min-w-0 shrink-[20] truncate text-xs text-muted">{oneLiner}</span>}
         {state && (
           <span className={cx("shrink-0 text-[11px] uppercase tracking-wide", CREW_TONE[state])}>
             {state}

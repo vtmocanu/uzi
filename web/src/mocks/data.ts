@@ -1763,6 +1763,25 @@ export const mockLaneRuns: Run[] = [
     status: "running",
     health: "ok",
   }),
+  // run-stalled — the SAME message stream as run-busy, differing only in run health.
+  // `stalled` is not a per-lane property: crewStateFor returns it only for the ACTIVE
+  // lane and only when the RUN's health is degraded, so the mockup's headline case
+  // ("the one stalled tester is the first thing you see") could not be browsed on any
+  // healthy fixture. Reusing run-busy's stream rather than authoring a third one keeps
+  // run-busy meaning exactly what its ordering tests say about it — the two runs differ
+  // by one field, so the rollup's stalled-first behaviour is visible as a DIFF against
+  // the run beside it rather than as a separate story.
+  demoIssueRun({
+    id: "run-stalled",
+    issue_iid: 99,
+    issue_title: "Busy crew, degraded: the stalled role sorts to the front",
+    issue_description: "Demo run: same stream as run-busy with a looping health flag, so the active tester lane reads stalled and its role chip leads the rollup.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "looping",
+    health_reason: "no new tool calls in the last few minutes",
+    health_since: minsAgo(3),
+  }),
 ];
 
 export const mockCrewRuns: Run[] = [

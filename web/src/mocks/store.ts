@@ -53,6 +53,8 @@ function seed(): MockState {
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
   messages.set("run-busy", mockBusyMessages.map((m) => ({ ...m })));
+  // Same stream, degraded health — see the run-stalled comment in data.ts.
+  messages.set("run-stalled", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));
   messages.set("run-done", [...mockDoneMessages]);
   // run-closed is a completed run (its MR was later closed unmerged); reuse the

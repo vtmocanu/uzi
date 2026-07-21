@@ -55,7 +55,19 @@ describe("PRD #99 mock lane fixtures", () => {
     expect(mockBusyMessages.some((m) => (m.agent_label?.length ?? 0) > 48)).toBe(true);
   });
 
-  it("registers both demo runs so they are reachable in mock mode", () => {
-    expect(mockLaneRuns.map((r) => r.id).sort()).toEqual(["run-busy", "run-lanes"]);
+  it("registers the demo runs so they are reachable in mock mode", () => {
+    expect(mockLaneRuns.map((r) => r.id).sort()).toEqual(["run-busy", "run-lanes", "run-stalled"]);
+  });
+
+  it("makes run-stalled differ from run-busy ONLY in health", () => {
+    // The pair is the point: `stalled` is a run-level condition, not a lane property,
+    // so the only way to browse "a stalled role sorts first" is a second run over the
+    // same stream. If these two ever diverge in anything but health, the comparison
+    // stops being a controlled one and run-busy's ordering tests stop describing it.
+    const busy = mockLaneRuns.find((r) => r.id === "run-busy");
+    const stalled = mockLaneRuns.find((r) => r.id === "run-stalled");
+    expect(busy?.health).toBe("ok");
+    expect(stalled?.health).toBe("looping");
+    expect(stalled?.status).toBe(busy?.status);
   });
 });
