@@ -380,10 +380,10 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 // access they did not have — but that argument holds only while the ownership
 // check does, which is why the composite FK backs it independently of this handler.
 //
-// The body names a token by LABEL, the thing a human knows, and `{"anthropic_token":
-// null}` clears the binding. The distinction between "absent" and "explicit null"
-// is what makes clearing expressible at all, so the field is decoded as a
-// *json.RawMessage rather than a string.
+// The body names a token by LABEL, the thing a human knows. `null` (or "") clears
+// the binding; an OMITTED key leaves it alone. Distinguishing those two is why the
+// field is a json.RawMessage rather than a *string — see parseTokenField, where a
+// nil *string would have collapsed "clear" and "don't touch" into one request.
 //
 // The rebind lands on the worker's NEXT claim. No restart, no re-minted join token.
 func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
@@ -398,20 +398,31 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		AnthropicToken *string `json:"anthropic_token"`
+		AnthropicToken json.RawMessage `json:"anthropic_token"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	token, ok := parseTokenField(req.AnthropicToken)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
+		return
+	}
+	// An omitted key is NOT a clear. Today this route carries only the binding, so a
+	// body without it asks for nothing and is a client bug worth naming — but the
+	// rule is the load-bearing part: PATCH means "change what I named", and the day
+	// this body grows a second field, absent-means-clear would wipe a user's binding
+	// every time someone renamed a worker. Answering 400 rather than 200-with-no-op
+	// avoids inventing a read path just to echo an unchanged worker back.
+	if !token.present {
+		httpx.Error(w, http.StatusBadRequest, "anthropic_token is required; pass null to use your default token")
+		return
+	}
 
-	// nil (absent or JSON null) clears the binding; a label resolves to the id it
-	// names. An empty/whitespace label is a clear too — "" is what a shell passes
-	// for an omitted value, and treating it as a lookup would 400 on something the
-	// user plainly meant as "none".
 	var secretID *uuid.UUID
-	if req.AnthropicToken != nil && strings.TrimSpace(*req.AnthropicToken) != "" {
-		resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, *req.AnthropicToken)
+	if token.label != "" {
+		resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, token.label)
 		if rerr != nil {
 			if errors.Is(rerr, workersvc.ErrUnknownSecretLabel) {
 				httpx.Error(w, http.StatusBadRequest, "no Anthropic token with that label")
@@ -437,11 +448,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	label := ""
-	if req.AnthropicToken != nil {
-		label = strings.TrimSpace(*req.AnthropicToken)
-	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, label)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label)})
 }
 
 // -------------------------------------------------------------------------

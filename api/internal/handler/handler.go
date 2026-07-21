@@ -220,6 +220,10 @@ func toDTO(u store.User) apitypes.UserDTO {
 		AutopilotEnabled: u.AutopilotEnabled,
 		JudgeEnabled:     u.JudgeEnabled,
 		CreatedAt:        u.CreatedAt.Time,
+		// The judge binding's id; the LABEL is filled in only by the routes that
+		// resolved it (PUT /api/me/judge), since a bare users row carries no join to
+		// look it up. A bound user rendered without a label is honest, not a bug.
+		JudgeAnthropicSecretID: uuidPtrValue(u.JudgeAnthropicSecretID),
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String

@@ -375,25 +375,26 @@ type ToolAllowlist struct {
 }
 
 type User struct {
-	ID                   uuid.UUID          `json:"id"`
-	Email                string             `json:"email"`
-	PasswordHash         pgtype.Text        `json:"password_hash"`
-	DisplayName          pgtype.Text        `json:"display_name"`
-	IsAdmin              bool               `json:"is_admin"`
-	IsActive             bool               `json:"is_active"`
-	TokenVersion         int32              `json:"token_version"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	LastLogin            pgtype.Timestamptz `json:"last_login"`
-	DefaultModel         pgtype.Text        `json:"default_model"`
-	AutopilotEnabled     bool               `json:"autopilot_enabled"`
-	Theme                pgtype.Text        `json:"theme"`
-	SlackMemberID        pgtype.Text        `json:"slack_member_id"`
-	SlackNotify          bool               `json:"slack_notify"`
-	SlackResolvedID      pgtype.Text        `json:"slack_resolved_id"`
-	SlackLinkConfirmedAt pgtype.Timestamptz `json:"slack_link_confirmed_at"`
-	OidcIssuer           pgtype.Text        `json:"oidc_issuer"`
-	OidcSubject          pgtype.Text        `json:"oidc_subject"`
-	JudgeEnabled         bool               `json:"judge_enabled"`
+	ID                     uuid.UUID          `json:"id"`
+	Email                  string             `json:"email"`
+	PasswordHash           pgtype.Text        `json:"password_hash"`
+	DisplayName            pgtype.Text        `json:"display_name"`
+	IsAdmin                bool               `json:"is_admin"`
+	IsActive               bool               `json:"is_active"`
+	TokenVersion           int32              `json:"token_version"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	LastLogin              pgtype.Timestamptz `json:"last_login"`
+	DefaultModel           pgtype.Text        `json:"default_model"`
+	AutopilotEnabled       bool               `json:"autopilot_enabled"`
+	Theme                  pgtype.Text        `json:"theme"`
+	SlackMemberID          pgtype.Text        `json:"slack_member_id"`
+	SlackNotify            bool               `json:"slack_notify"`
+	SlackResolvedID        pgtype.Text        `json:"slack_resolved_id"`
+	SlackLinkConfirmedAt   pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	OidcIssuer             pgtype.Text        `json:"oidc_issuer"`
+	OidcSubject            pgtype.Text        `json:"oidc_subject"`
+	JudgeEnabled           bool               `json:"judge_enabled"`
+	JudgeAnthropicSecretID pgtype.UUID        `json:"judge_anthropic_secret_id"`
 }
 
 type UserSecret struct {

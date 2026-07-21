@@ -46,7 +46,11 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled", "created_at", "last_login")
+		"autopilot_enabled", "judge_enabled",
+		// PRD #104 M4: which credential this user's retrospectives spend. Both null
+		// ⇒ their default. The label, never the token value.
+		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
+		"created_at", "last_login")
 }
 
 func TestRepoAgentTags(t *testing.T) {

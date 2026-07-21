@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -128,6 +129,26 @@ func scanCommandNotFound(payloads [][]byte) []ToolMiss {
 	return out
 }
 
+// judgeSecretID reads the user's judge-lane Anthropic binding as openAnthropic's
+// override: nil when they have named none, which resolves their default token
+// (PRD #104 M4).
+//
+// A lookup error is propagated, never swallowed into "use the default": treating a
+// failed read as "unbound" would silently spend the wrong account, which is R4's
+// failure mode — a resolution bug that costs money and raises nothing. The claim
+// fails instead, and the run is retried.
+func (s *Service) judgeSecretID(ctx context.Context, userID uuid.UUID) (*uuid.UUID, error) {
+	bound, err := s.q.GetUserJudgeAnthropicSecret(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("judge token binding lookup: %w", err)
+	}
+	if !bound.Valid {
+		return nil, nil
+	}
+	id := uuid.UUID(bound.Bytes)
+	return &id, nil
+}
+
 // assembleJudgeClaim builds the claim payload for a judge run (PRD #46 Decisions 1, 3
 // & 4). Unlike the ordinary run lane it does NOT call GetRunClaimContext (no repo, no
 // forge connection) and NEVER opens the bot PAT: least privilege, and a judge must
@@ -136,14 +157,19 @@ func scanCommandNotFound(payloads [][]byte) []ToolMiss {
 // run's id (its trace is fetched out-of-band), the judge model, and the deterministic
 // command-not-found pre-scan. The trace itself never rides the claim (it can be MB).
 func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
-	// nil: the default token — and deliberately NOT the claiming worker's binding,
-	// even though a judge run is claimed by an ordinary worker through the same
-	// ClaimRun lane. Under PRD #104 D1 the judge lane is bound per USER, not per
-	// worker: which credential reviews your work is a property of you, not of
-	// whichever worker happened to pick the retrospective up. M4 replaces this with
-	// the owner's judge_anthropic_secret_id when set, so retrospectives can bill a
-	// different credential from the runs they review.
-	anthropic, err := s.openAnthropic(ctx, run.UserID, nil)
+	// The run owner's JUDGE binding, falling back to their default — and deliberately
+	// NOT the claiming worker's binding, even though a judge run is claimed by an
+	// ordinary worker through the same ClaimRun lane. Under PRD #104 D1 the judge
+	// lane is bound per USER: which credential reviews your work is a property of
+	// you, not of whichever worker happened to pick the retrospective up, which would
+	// otherwise bill the same retrospective to different accounts run to run for no
+	// reason a user could see. Self-improve runs ride this same path and so follow
+	// the same binding.
+	judgeSecret, err := s.judgeSecretID(ctx, run.UserID)
+	if err != nil {
+		return nil, err
+	}
+	anthropic, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
 	if err != nil {
 		return nil, err
 	}

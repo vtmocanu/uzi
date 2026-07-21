@@ -256,6 +256,10 @@ type Store interface {
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
+	// Judge-lane → token binding (PRD #104 M4): read at judge-claim time, written by
+	// PUT /api/me/judge.
+	GetUserJudgeAnthropicSecret(ctx context.Context, id uuid.UUID) (pgtype.UUID, error)
+	SetUserJudgeAnthropicSecret(ctx context.Context, arg store.SetUserJudgeAnthropicSecretParams) (store.User, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
@@ -726,6 +730,28 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 	}
 }
 
+// claimSecretID resolves WHICH credential a run-lane claim spends, and is the one
+// place that decision is made (R4: three copies of resolution drift, and a wrong
+// fallback spends the wrong account silently).
+//
+//   - self_improve → the owner's JUDGE binding (PRD #104 M4). This branch is not
+//     cosmetic and it is not automatic: a self_improve run is repo-ful and rides
+//     the ordinary run lane, NOT assembleJudgeClaim, so without it "self-improve
+//     follows the judge binding" would simply be false while appearing to be
+//     handled. It belongs with the judge because it is uzi reviewing and improving
+//     itself — the same activity the judge binding exists to bill separately —
+//     not work the user asked a particular worker to do.
+//   - everything else on this lane (issue, ci_fix) → the CLAIMING worker's binding,
+//     else the owner's default.
+//
+// Judge runs never reach here; they fork to assembleJudgeClaim earlier.
+func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (*uuid.UUID, error) {
+	if run.Kind == RunKindSelfImprove {
+		return s.judgeSecretID(ctx, run.UserID)
+	}
+	return workerSecretID(wkr), nil
+}
+
 // workerSecretID is a worker's Anthropic binding as openAnthropic's override:
 // nil when the worker names no credential, which resolves the owner's default
 // (PRD #104 M3). An invalid/unset pgtype.UUID and a NULL column are the same
@@ -764,12 +790,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	// The run lane spends the CLAIMING WORKER's bound credential, falling back to
-	// the owner's default when the worker names none (PRD #104 D1). Resolution is
-	// per-claim, which is what makes a rebind take effect on the worker's next claim
-	// with no restart and no re-minted join token — the token has never ridden the
-	// worker, only each claim response.
-	anthropic, err := s.openAnthropic(ctx, run.UserID, workerSecretID(wkr))
+	// Which credential this claim spends: the claiming worker's binding for ordinary
+	// runs, the owner's judge binding for self_improve, the owner's default when
+	// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
+	// rebind take effect on the worker's next claim with no restart and no re-minted
+	// join token — the token has never ridden the worker, only each claim response.
+	secretID, err := s.claimSecretID(ctx, wkr, run)
+	if err != nil {
+		return nil, err
+	}
+	anthropic, err := s.openAnthropic(ctx, run.UserID, secretID)
 	if err != nil {
 		return nil, err
 	}
@@ -1577,6 +1607,34 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 		return store.Worker{}, err
 	}
 	return wkr, nil
+}
+
+// SetUserJudgeToken points the user's JUDGE lane at one of their own Anthropic
+// credentials, or clears it back to their default when secretID is nil (PRD #104
+// M4). Per-user, not per-worker: which credential reviews your work is a property
+// of you, not of whichever worker claims the retrospective.
+//
+// Ownership is checked here so the caller gets a 404 rather than a constraint
+// violation; 00079's composite FK refuses the same binding independently, and is
+// the layer that holds if this check is ever bypassed (D11).
+func (s *Service) SetUserJudgeToken(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (store.User, error) {
+	var bind pgtype.UUID
+	if secretID != nil {
+		if _, err := s.q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+			ID:     *secretID,
+			UserID: userID,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.User{}, ErrSecretNotOwned
+			}
+			return store.User{}, err
+		}
+		bind = pgUUID(*secretID)
+	}
+	return s.q.SetUserJudgeAnthropicSecret(ctx, store.SetUserJudgeAnthropicSecretParams{
+		ID:                     userID,
+		JudgeAnthropicSecretID: bind,
+	})
 }
 
 // ResolveTokenLabel exposes label → secret id for the handler's PATCH body, which

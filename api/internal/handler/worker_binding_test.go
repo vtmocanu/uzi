@@ -128,11 +128,12 @@ func TestPatchWorkerBindsByLabel(t *testing.T) {
 }
 
 // TestPatchWorkerClearsBinding: an explicit JSON null clears it, and so does an
-// empty string (what a shell passes for an omitted value).
+// empty string (what a shell passes for an omitted value). An OMITTED key is not a
+// clear — see TestPatchWorkerOmittedTokenIsRejected.
 func TestPatchWorkerClearsBinding(t *testing.T) {
 	owner := store.User{ID: uuid.New(), IsActive: true}
 	workerID := uuid.New()
-	for _, body := range []string{`{"anthropic_token":null}`, `{"anthropic_token":""}`, `{}`} {
+	for _, body := range []string{`{"anthropic_token":null}`, `{"anthropic_token":""}`} {
 		st := &bindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
 		h := newBindHandler(t, st)
 		rec := httptest.NewRecorder()
@@ -146,6 +147,24 @@ func TestPatchWorkerClearsBinding(t *testing.T) {
 		if st.setArg.AnthropicSecretID.Valid {
 			t.Fatalf("%s: wrote %+v, want a NULL binding", body, st.setArg.AnthropicSecretID)
 		}
+	}
+}
+
+// TestPatchWorkerOmittedTokenIsRejected: a body that names nothing changes nothing.
+// PATCH means "change what I named", so an omitted key must never be read as a
+// clear — the day this body grows a second field, absent-means-clear would wipe a
+// user's binding every time they renamed a worker.
+func TestPatchWorkerOmittedTokenIsRejected(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	st := &bindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newBindHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.PatchWorker(rec, patchWorkerReq(t, owner, uuid.New(), `{}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400 for a body that names nothing", rec.Code)
+	}
+	if st.setCalled {
+		t.Fatal("an omitted anthropic_token must not clear the binding")
 	}
 }
 
