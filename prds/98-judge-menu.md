@@ -153,7 +153,17 @@ one action.
    live-DB test, not by a fake.
    A malformed uuid or unknown bucket is a **400**; a well-formed unknown/foreign
    run uuid is an **empty list, not a 404** (no existence oracle) — so a CLI typo
-   can never look like an empty backlog. `rationale_preview` is capped at
+   can never look like an empty backlog.
+   **Exception, user-decided 2026-07-21: an ANCHORED `/judge?run={id}` defaults to
+   `?bucket=all`, not `todo`.** Un-anchored `/judge` still defaults to `todo` as
+   above. The reason is a direct consequence of Decision 2's cross-run dedup: a
+   notified run's coordinate may already be **settled via a different run**, so a
+   `todo` default would deep-link a fresh `judge_review` notification to an
+   apparently-empty page, with no hint the item exists under another bucket — the
+   worst possible first impression for the feature, and precisely the "row vanished"
+   confusion the `bucket=all` re-read exists to prevent elsewhere. M5's notification
+   deep-link therefore lands on `all`. Do not "correct" this back to `todo` for
+   consistency with the un-anchored default; the two defaults differ deliberately. `rationale_preview` is capped at
    `RationalePreviewMaxRunes = 280` **runes** (never bytes — a byte cut splits
    UTF-8), ellipsis appended only on an actual cut. Occurrence order is
    `rv.updated_at DESC` (most-recently-**judged** first, so a re-judge counts as
