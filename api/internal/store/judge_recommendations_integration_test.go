@@ -363,12 +363,13 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//
 	// SCOPE — READ THIS BEFORE CONCLUDING "THE COORDINATE PREDICATE IS PINNED". The SAME two
 	// three-part joins appear a SECOND time in that file, on ListJudgeTriageRowsForRuns (M4's
-	// /runs badge count, lines 144 and 146). Nothing above touches it, and it is NOT pinned:
-	// dropping BOTH coordinate halves off its `f` join, and separately off its `d` join, each
-	// left the ENTIRE live-DB suite green (measured the same day). Its only tests are
-	// fake-backed (judge_run_badge_test.go hands hand-built rows to a fake store), which by
-	// construction cannot observe which column the real query put in which field. Tracked as
-	// an open gap, not closed here.
+	// /runs badge count, lines 144 and 146). NOTHING ABOVE TOUCHES IT — every fold in the
+	// table is a mutation of the FIRST body, and the second one was measured entirely
+	// unpinned: dropping BOTH coordinate halves off its `f` join, and separately off its `d`
+	// join, each left the ENTIRE live-DB suite green.
+	// TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB at the end of this file now covers
+	// it — read ITS verification-status block before treating that query as pinned, because
+	// it was written without a database slot and its folds are still owed.
 	//
 	// PROVENANCE OF THE "was GREEN" CLAIMS, because they are not all the same strength: the
 	// category-half GREEN was measured here, on this fixture with the sibling but before the
@@ -671,4 +672,237 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 		t.Fatalf("read rec id for %s/%s: %v", category, target, err)
 	}
 	return id
+}
+
+// ---- the /runs badge count query: ListJudgeTriageRowsForRuns -------------------------
+
+// TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB pins the SECOND query body in
+// judge_recommendations.sql — ListJudgeTriageRowsForRuns, which feeds M4's per-run judge
+// badge on /runs (workersvc.JudgeTodoCountsForRuns).
+//
+// WHY IT EXISTS, measured rather than argued (PRD #98, 2026-07-21). Everything the big
+// projection test above proves concerns the FIRST body. This one carries the SAME two
+// three-part LEFT JOINs, and NOTHING observed them: dropping BOTH coordinate halves off its
+// `f` join, and separately off its `d` join, each left the ENTIRE live-DB suite green. Its
+// only other coverage is judge_run_badge_test.go, which hands hand-built rows to a fake
+// store — and a fake cannot observe which column the real query put in which field. That is
+// the third recurrence of the class the checkpoint's live-DB-pin rule names.
+//
+// The production effect is a WRONG NUMBER, not a missing one. The consumer buckets each row
+// with the shared ladder — BucketOf(disposition_status, filed_settled) == "todo" — so a
+// disposition or filed row cross-attached from a NEIGHBOURING coordinate silently pushes
+// occurrences off the todo rung and the badge under-counts. This query's own ORDER BY
+// comment makes exactly that argument about truncation.
+//
+// SHAPE, and it is the whole point: the row struct projects only
+// (run_id, disposition_status, filed_settled) — no category, no target — so a single review
+// cannot tell you WHICH coordinate inherited. So each of the four join halves gets its OWN
+// RUN, holding exactly two coordinates that share one half of the coordinate and differ in
+// the other. Each fold then moves the tally in exactly one run, against its own assertion:
+//
+//	run   coordinates                      fold it is BUILT to catch
+//	FT    (catA,tgt1) filed + (catA,tgt2)   drop `f.target = rr.target`
+//	FC    (catA,tgt1) filed + (catB,tgt1)   drop `f.category = rr.category`
+//	DT    (catA,tgt1) done  + (catA,tgt2)   drop `d.target = rr.target`
+//	DC    (catA,tgt1) dism. + (catB,tgt1)   drop `d.category = rr.category`
+//
+// The pairs are deliberately NOT uniform. A fixture whose rows all look alike is what made
+// both of the holes this branch just closed invisible, twice, one level down each time.
+//
+// 🔴 VERIFICATION STATUS: WRITTEN, NOT YET FOLDED. The four "fold it is BUILT to catch"
+// entries above are DESIGN INTENT, not measurements — this test was authored without a
+// database slot (the validators held it), so no fold has been executed against it. Only the
+// pre-existing GREENs in the paragraph above were measured. "Fix written" is not "closed",
+// and a table that reads like results is exactly the proxy this branch keeps correcting.
+// Replace this block with the measured per-fold results — one mutation per run, fresh
+// database, mutation asserted present in both the .sql and the regenerated .sql.go before
+// and gone from both after — and do not record this query as pinned until that is done.
+func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	owner := uuid.New()
+	connID, repoID := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		owner, fmt.Sprintf("judgebadge-%s@e2e", owner))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, owner, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	const (
+		catA = "install_worker_tool"
+		catB = "improve_uzi"
+		tgt1 = "rg"
+		tgt2 = "fd"
+	)
+
+	// iids must be unique per repo; one counter serves runs and filed issues alike.
+	iid := int64(0)
+	newRun := func() (uuid.UUID, uuid.UUID) {
+		iid++
+		runID, reviewID := uuid.New(), uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, $5, 'd', 'completed')`,
+			runID, owner, repoID, iid, fmt.Sprintf("run %d", iid))
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
+			reviewID, runID, owner)
+		return runID, reviewID
+	}
+	// Distinct rationale per row, for the same reason bulkFixture now does it.
+	rec := func(reviewID uuid.UUID, category, target string) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+			 VALUES ($1, $2, $3, $4, 'high')`, reviewID, category, target,
+			fmt.Sprintf("rationale for %s/%s in review %s", category, target, reviewID))
+	}
+	fileIt := func(reviewID uuid.UUID, category, target string) {
+		iid++
+		mustExec(ctx, t, pool,
+			`INSERT INTO recommendation_filed_issues
+			   (id, review_id, category, target, filed_repo_id, filed_issue_iid, filed_issue_url, filed_by_user_id, filed_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())`,
+			uuid.New(), reviewID, category, target, repoID, iid,
+			fmt.Sprintf("https://forge.e2e/g/r/-/issues/%d", iid), owner)
+	}
+	disposeDone := func(reviewID uuid.UUID, category, target string) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO recommendation_dispositions
+			   (review_id, category, target, status, rationale_hash, set_by_user_id)
+			 VALUES ($1, $2, $3, 'done', 'h', $4)`, reviewID, category, target, owner)
+	}
+	disposeDismissed := func(reviewID uuid.UUID, category, target string) {
+		mustExec(ctx, t, pool,
+			`INSERT INTO recommendation_dispositions
+			   (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id)
+			 VALUES ($1, $2, $3, 'dismissed', 'not_an_issue', 'h', $4)`, reviewID, category, target, owner)
+	}
+
+	runFT, revFT := newRun()
+	rec(revFT, catA, tgt1)
+	rec(revFT, catA, tgt2)
+	fileIt(revFT, catA, tgt1)
+
+	runFC, revFC := newRun()
+	rec(revFC, catA, tgt1)
+	rec(revFC, catB, tgt1)
+	fileIt(revFC, catA, tgt1)
+
+	runDT, revDT := newRun()
+	rec(revDT, catA, tgt1)
+	rec(revDT, catA, tgt2)
+	disposeDone(revDT, catA, tgt1)
+
+	runDC, revDC := newRun()
+	rec(revDC, catA, tgt1)
+	rec(revDC, catB, tgt1)
+	disposeDismissed(revDC, catA, tgt1)
+
+	rows, err := q.ListJudgeTriageRowsForRuns(ctx, store.ListJudgeTriageRowsForRunsParams{
+		UserID: owner,
+		RunIds: []uuid.UUID{runFT, runFC, runDT, runDC},
+		Lim:    500,
+	})
+	if err != nil {
+		t.Fatalf("list triage rows: %v", err)
+	}
+
+	type tally struct{ rows, filed, disposed int }
+	got := map[uuid.UUID]*tally{}
+	for _, r := range rows {
+		tl := got[r.RunID]
+		if tl == nil {
+			tl = &tally{}
+			got[r.RunID] = tl
+		}
+		tl.rows++
+		if r.FiledSettled {
+			tl.filed++
+		}
+		if r.DispositionStatus.Valid {
+			tl.disposed++
+		}
+	}
+	at := func(name string, runID uuid.UUID) *tally {
+		t.Helper()
+		tl := got[runID]
+		if tl == nil {
+			t.Fatalf("run %s (%s) returned NO rows — the fixture or the run_ids filter is wrong, "+
+				"so nothing below proves anything", name, runID)
+		}
+		return tl
+	}
+
+	// 0. run_id, and the no-fan-out contract. Each review holds exactly two recommendations
+	// and both side joins are UNIQUE on the coordinate, so each run must come back with
+	// exactly two rows. A cross-wired run_id collapses the four tallies into the wrong
+	// buckets and every assertion below becomes meaningless, so this is checked first.
+	for name, runID := range map[string]uuid.UUID{"FT": runFT, "FC": runFC, "DT": runDT, "DC": runDC} {
+		if n := at(name, runID).rows; n != 2 {
+			t.Errorf("run %s returned %d rows, want 2 — either run_id is not projecting this "+
+				"review's own run, or a side join fanned out", name, n)
+		}
+	}
+
+	// 1. THE FILED JOIN'S TARGET HALF. runFT holds (catA,tgt1) filed and (catA,tgt2) unfiled:
+	// same category, different target. Dropping `AND f.target = rr.target` makes tgt2 inherit
+	// tgt1's filed issue, and both rows read settled.
+	if n := at("FT", runFT).filed; n != 1 {
+		t.Errorf("runFT: %d of 2 coordinates read filed_settled, want exactly 1 — the filed join's "+
+			"TARGET half is gone, so every coordinate sharing a category with a filed one reads as "+
+			"filed and drops off the todo rung", n)
+	}
+
+	// 2. THE FILED JOIN'S CATEGORY HALF. runFC holds (catA,tgt1) filed and (catB,tgt1) unfiled:
+	// same target, different category. This is the half the big test above could not see until
+	// its own fourth coordinate was added.
+	if n := at("FC", runFC).filed; n != 1 {
+		t.Errorf("runFC: %d of 2 coordinates read filed_settled, want exactly 1 — the filed join's "+
+			"CATEGORY half is gone, so filing under one category marks the SAME target filed under "+
+			"every other category", n)
+	}
+
+	// 3. THE DISPOSITION JOIN'S TARGET HALF. runDT holds (catA,tgt1) marked done and
+	// (catA,tgt2) undisposed.
+	if n := at("DT", runDT).disposed; n != 1 {
+		t.Errorf("runDT: %d of 2 coordinates carry a disposition, want exactly 1 — the disposition "+
+			"join's TARGET half is gone, so resolving one coordinate silently resolves every other "+
+			"one in the review that shares its category", n)
+	}
+
+	// 4. THE DISPOSITION JOIN'S CATEGORY HALF. runDC holds (catA,tgt1) dismissed and
+	// (catB,tgt1) undisposed.
+	if n := at("DC", runDC).disposed; n != 1 {
+		t.Errorf("runDC: %d of 2 coordinates carry a disposition, want exactly 1 — the disposition "+
+			"join's CATEGORY half is gone, so dismissing one category's coordinate silently "+
+			"dismisses the same target under every other category", n)
+	}
+
+	// 5. The columns must stay in their own lanes. A filed row is not a disposition and vice
+	// versa: without these, a join collapsed so far that BOTH side tables attach everywhere
+	// could still satisfy the four counts above.
+	if n := at("FT", runFT).disposed + at("FC", runFC).disposed; n != 0 {
+		t.Errorf("the two filed-only runs report %d dispositions, want 0 — disposition_status is "+
+			"not reading the dispositions table for this coordinate", n)
+	}
+	if n := at("DT", runDT).filed + at("DC", runDC).filed; n != 0 {
+		t.Errorf("the two disposition-only runs report %d settled filed links, want 0 — "+
+			"filed_settled is not reading the filed table for this coordinate", n)
+	}
 }
