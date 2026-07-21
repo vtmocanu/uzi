@@ -336,6 +336,54 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
 		 VALUES ($1, $2, $3, 'because', 'low')`, handRev.reviewID, cat, handTarget)
 
+	// A THIRD coordinate, unfiled, INSIDE autoRev — the review that owns the filed link.
+	//
+	// Without it the filed and unfiled coordinates sat in DIFFERENT reviews, so
+	// `f.review_id = rv.id` alone separated them and the filed join's coordinate halves never
+	// carried any weight: dropping `AND f.target = rr.target` left the whole suite GREEN
+	// (measured). With an unfiled sibling in the same review, that fold makes THIS row
+	// inherit autoRev's filed link, so filed_at / filed_settled / filed_issue_iid /
+	// filed_issue_url all become observable — four columns on one fixture change.
+	//
+	// Same root cause as the rationale literal next door: every fixture row looked alike, so
+	// the assertions had nothing to discriminate. The fix is in the fixture, not the
+	// assertions.
+	//
+	// MEASURED, one fold per run against a FRESH database (PRD #98, 2026-07-21). Each line is
+	// a mutation of judge_recommendations.sql regenerated through sqlc, and each names the
+	// assertion that caught it:
+	//
+	//   drop `AND f.target = rr.target`     RED  — the sibling's filed-link assertion
+	//   drop `AND f.category = rr.category`  RED  — the cross-category coordinate's, below
+	//   drop BOTH coordinate halves          RED  — both of the above fire together
+	//   drop `AND d.target = rr.target`      RED  — the sibling's disposition assertion
+	//   drop `AND d.category = rr.category`  RED  — the cross-category disposition assertion
+	//   `f.filed_at` -> `d.set_at`           RED  — the no-filed-row filed_at assertion
+	//
+	// Before this fixture grew its third and fourth coordinates, the first three of those
+	// were GREEN across the entire live-DB suite.
+	const unfiledInAutoRev = "rg-unfiled-sibling"
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, $2, $3, 'because', 'medium')`, autoRev.reviewID, cat, unfiledInAutoRev)
+
+	// A FOURTH coordinate: autoRev again, the filed coordinate's OWN target, a DIFFERENT
+	// category. The sibling above pins only the join's TARGET half — measured: dropping
+	// `AND f.category = rr.category` alone left the whole live-DB suite GREEN, because every
+	// coordinate in the fixture carried the same category, so nothing could observe a
+	// category mismatch. Same root cause one level down: the sibling was the obvious
+	// mutation's antidote, not the predicate's.
+	//
+	// This is a real state, not a contrived one — a target is a tool/file/agent name and
+	// recurs across categories (`improve_uzi/docs` and `adjust_template/docs`). With the
+	// category half dropped, filing an issue on one category's coordinate would mark the
+	// SAME target under every other category as filed: a wrong `filed` bucket, a wrong
+	// "filed as #IID" chip, and an M6 close edge attributed to a coordinate nobody filed.
+	const otherCat = "improve_uzi"
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, $2, $3, 'because', 'medium')`, autoRev.reviewID, otherCat, autoTarget)
+
 	// The filed link + the cached CLOSED issue that makes it an M6 close edge.
 	filedID := uuid.New()
 	const filedIID = int64(4242)
@@ -391,7 +439,9 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 		t.Fatalf("list backlog rows: %v", err)
 	}
 	byTarget := map[string]store.ListJudgeRecommendationRowsForUserRow{}
+	byCoord := map[[2]string]store.ListJudgeRecommendationRowsForUserRow{}
 	for _, r := range rows {
+		byCoord[[2]string{r.Category, r.Target}] = r
 		if r.Category == cat {
 			byTarget[r.Target] = r
 		}
@@ -456,8 +506,17 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	}
 	// The unfiled row must NOT inherit them — otherwise a projection returning a constant
 	// iid would satisfy the assertions above.
+	//
+	// BE PRECISE ABOUT WHAT THIS CATCHES. `hand` lives in a DIFFERENT review that owns no
+	// filed row at all, so `f.review_id = rv.id` alone already separates it: this fires on a
+	// wrong VALUE (a fold to a constant, or a join loose enough to cross reviews), NOT on the
+	// join's coordinate halves. Dropping `AND f.target = rr.target` leaves this green —
+	// measured. The coordinate halves are pinned by the same-review sibling below, and this
+	// message said "not row-scoped" while that hole was open.
 	if hand.FiledIssueIid.Valid || hand.FiledIssueUrl.Valid {
-		t.Errorf("the UNFILED row carries a filed link (iid=%v url=%q) — the columns are not row-scoped",
+		t.Errorf("a coordinate with NO filed row anywhere carries a filed link (iid=%v url=%q) — "+
+			"the projection is not reading the joined filed row (a constant fold, or a join that "+
+			"matches across reviews)",
 			hand.FiledIssueIid.Int64, hand.FiledIssueUrl.String)
 	}
 	// And filed_at drives filed_settled, so a settled link must read as settled.
@@ -466,6 +525,52 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	}
 	if hand.FiledSettled {
 		t.Error("the unfiled row reports filed_settled=true")
+	}
+
+	// The unfiled sibling IN THE SAME REVIEW as the filed coordinate. This is what makes the
+	// filed join's coordinate half observable: with only cross-review comparisons above,
+	// `f.review_id = rv.id` alone accounted for every difference.
+	sibling, ok := byTarget[unfiledInAutoRev]
+	if !ok {
+		t.Fatalf("no backlog row for the unfiled sibling %s/%s", cat, unfiledInAutoRev)
+	}
+	if sibling.ReviewID != auto.ReviewID {
+		t.Fatalf("fixture broken: the sibling must share autoRev with the filed coordinate, got %s vs %s",
+			sibling.ReviewID, auto.ReviewID)
+	}
+	if sibling.FiledSettled || sibling.FiledAt.Valid || sibling.FiledIssueIid.Valid || sibling.FiledIssueUrl.Valid {
+		t.Errorf("an unfiled coordinate sharing autoRev AND its category with the filed one inherited "+
+			"its link (settled=%v at=%v iid=%v url=%q) — the filed join's TARGET half is gone, so every "+
+			"coordinate in a review sharing a category with any filed issue reads as filed",
+			sibling.FiledSettled, sibling.FiledAt.Valid, sibling.FiledIssueIid.Valid, sibling.FiledIssueUrl.String)
+	}
+	// And its disposition columns stay clear too — the disposition join is coordinate-keyed
+	// for the same reason.
+	if sibling.SetVia.Valid || sibling.DispositionStatus.Valid {
+		t.Errorf("the undisposed sibling inherited a disposition (set_via=%q status=%q) — the disposition "+
+			"join is not coordinate-scoped", sibling.SetVia.String, sibling.DispositionStatus.String)
+	}
+
+	// The CATEGORY half, which the sibling above cannot see: same review, same target as the
+	// filed coordinate, different category. Measured — with only the sibling in place,
+	// dropping `AND f.category = rr.category` left the ENTIRE live-DB suite green.
+	crossCat, ok := byCoord[[2]string{otherCat, autoTarget}]
+	if !ok {
+		t.Fatalf("no backlog row for the cross-category coordinate %s/%s", otherCat, autoTarget)
+	}
+	if crossCat.ReviewID != auto.ReviewID {
+		t.Fatalf("fixture broken: the cross-category coordinate must share autoRev with the filed one, got %s vs %s",
+			crossCat.ReviewID, auto.ReviewID)
+	}
+	if crossCat.FiledSettled || crossCat.FiledAt.Valid || crossCat.FiledIssueIid.Valid || crossCat.FiledIssueUrl.Valid {
+		t.Errorf("an unfiled coordinate sharing autoRev AND its target with the filed one inherited "+
+			"its link (settled=%v at=%v iid=%v url=%q) — the filed join's CATEGORY half is gone, so "+
+			"filing under one category marks the SAME target filed under every other category",
+			crossCat.FiledSettled, crossCat.FiledAt.Valid, crossCat.FiledIssueIid.Valid, crossCat.FiledIssueUrl.String)
+	}
+	if crossCat.SetVia.Valid || crossCat.DispositionStatus.Valid {
+		t.Errorf("the cross-category coordinate inherited a disposition (set_via=%q status=%q) — the "+
+			"disposition join's category half is gone", crossCat.SetVia.String, crossCat.DispositionStatus.String)
 	}
 
 	// 8. rec_id — THE ONE THAT WRITES, and the reason these three were worth a second pass.
@@ -511,8 +616,15 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	if !auto.FiledAt.Valid {
 		t.Error("the filed+settled row carries a NULL filed_at")
 	}
+	// Same correction as the filed-link pair above: `hand` is in a review with no filed row,
+	// so this fires when filed_at is a VALUE the projection invented (`f.filed_at -> now()`
+	// reddens here — measured) rather than one read off the joined row. It is NOT a
+	// row-scoping check: the coordinate halves of the filed join are pinned by the
+	// same-review unfiled sibling above, and this assertion stays green when
+	// `AND f.target = rr.target` is dropped.
 	if hand.FiledAt.Valid {
-		t.Errorf("the UNFILED row carries filed_at %v — the column is not row-scoped", hand.FiledAt.Time)
+		t.Errorf("a coordinate with NO filed row anywhere carries filed_at %v — the projection is "+
+			"not reading the joined filed row", hand.FiledAt.Time)
 	}
 }
 

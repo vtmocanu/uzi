@@ -75,9 +75,24 @@ func bulkFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, runs int
 			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
 			reviewID, runID, userID)
 		for _, c := range coords {
+			// DISTINCT rationale per (run, coordinate). It used to be the literal 'because'
+			// on every row, which silently bounded every test built on this fixture — the
+			// memberRowIn lesson from 136acb53, in this file's neighbour, not carried
+			// forward. Specifically it made the rationale_md projection pin UNABLE TO FAIL:
+			// folding `rr.rationale_md -> 'because'::text` left the stamped hash and the
+			// read-back expectation both sha256("because"), so the test could not tell "SQL
+			// projected the column" from "SQL returned a constant that happens to equal the
+			// fixture". Measured GREEN under that fold before this change, and RED after it —
+			// on a fresh database, at both the per-coordinate hash assertion and the
+			// two-hashes-must-differ one in
+			// TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB below.
+			//
+			// Uniqueness is per ROW, not per coordinate, so a fold to ANY constant collapses
+			// a pair that the assertions compare.
 			mustExecT(ctx, t, pool,
 				`INSERT INTO review_recommendations (review_id, category, target, rationale_md)
-				 VALUES ($1, $2, $3, 'because')`, reviewID, c[0], c[1])
+				 VALUES ($1, $2, $3, $4)`, reviewID, c[0], c[1],
+				fmt.Sprintf("rationale for %s/%s in run %d of %s", c[0], c[1], i, userID))
 		}
 	}
 	return userID
@@ -631,36 +646,70 @@ func TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB(t *testing.T) {
 	h, pool, _ := bulkDispositionLiveDB(t)
 	ctx := context.Background()
 	rg := [2]string{"install_worker_tool", "rg"}
+	docs := [2]string{"improve_uzi", "docs"}
 
-	userID := bulkFixture(ctx, t, pool, 1, rg)
+	// TWO coordinates, and bulkFixture now gives them different rationale texts. That is what
+	// makes this discriminating: a projection folded to ANY single constant gives both
+	// coordinates the SAME stamped hash, which the final assertion catches regardless of
+	// which constant was chosen. Asserting only "hash equals the read-back text" was not
+	// enough while the fixture made every row identical.
+	userID := bulkFixture(ctx, t, pool, 1, rg, docs)
 	if _, got := doBulk(t, h, store.User{ID: userID},
-		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done"}`); got.Updated != 1 {
-		t.Fatalf("fixture: updated = %d, want 1", got.Updated)
+		`{"items":[{"category":"install_worker_tool","target":"rg"},{"category":"improve_uzi","target":"docs"}],"status":"done"}`); got.Updated != 2 {
+		t.Fatalf("fixture: updated = %d, want 2 (one per coordinate)", got.Updated)
 	}
 
-	var storedHash, currentRationale string
-	if err := pool.QueryRow(ctx,
-		`SELECT d.rationale_hash, rr.rationale_md
+	type stamped struct{ hash, rationale string }
+	rows := map[string]stamped{}
+	q, err := pool.Query(ctx,
+		`SELECT d.target, d.rationale_hash, rr.rationale_md
 		   FROM recommendation_dispositions d
 		   JOIN run_reviews rv ON rv.id = d.review_id
 		   JOIN review_recommendations rr
 		     ON rr.review_id = d.review_id AND rr.category = d.category AND rr.target = d.target
-		  WHERE rv.user_id = $1`, userID).Scan(&storedHash, &currentRationale); err != nil {
-		t.Fatalf("read back the stamped hash: %v", err)
+		  WHERE rv.user_id = $1`, userID)
+	if err != nil {
+		t.Fatalf("read back the stamped hashes: %v", err)
 	}
-	if currentRationale == "" {
-		t.Fatal("fixture broken: the recommendation has no rationale text, so this proves nothing")
+	defer q.Close()
+	for q.Next() {
+		var target, hash, rationale string
+		if err := q.Scan(&target, &hash, &rationale); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		rows[target] = stamped{hash, rationale}
+	}
+	if err := q.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("read back %d disposition rows, want 2", len(rows))
 	}
 
-	want := workersvc.RationaleHash(currentRationale)
-	if storedHash != want {
-		t.Errorf("stamped rationale_hash = %q, want RationaleHash of the recommendation's CURRENT text %q = %q — "+
-			"the write hashed something other than rr.rationale_md, so this coordinate reads STALE the moment it is set",
-			storedHash, currentRationale, want)
+	// The fixture must actually differ, or everything below is vacuous again.
+	if rows[rg[1]].rationale == rows[docs[1]].rationale {
+		t.Fatalf("fixture broken: both coordinates carry the same rationale %q — this test cannot "+
+			"discriminate a folded projection from a real one", rows[rg[1]].rationale)
 	}
 
-	// And state it the way the user experiences it: freshly disposed is NOT stale.
-	if workersvc.RationaleHash(currentRationale) != storedHash {
-		t.Error("a coordinate a human just marked done already reads as stale")
+	// Each stamped hash is the hash of ITS OWN current text, read back from the table. The
+	// expected value never appears in this file — a version spelling the rationale here would
+	// pass under a fold to that same spelling, which is exactly the trap this test fell into.
+	for target, got := range rows {
+		if want := workersvc.RationaleHash(got.rationale); got.hash != want {
+			t.Errorf("%s: stamped rationale_hash = %q, want RationaleHash of its CURRENT text %q = %q — "+
+				"the write hashed something other than rr.rationale_md, so this coordinate reads STALE "+
+				"the moment it is set", target, got.hash, got.rationale, want)
+		}
+	}
+
+	// THE DISCRIMINATING ASSERTION: two different rationales must produce two different
+	// hashes. A projection folded to any constant — including the fixture's own former
+	// 'because' — collapses these, whichever constant it is.
+	if rows[rg[1]].hash == rows[docs[1]].hash {
+		t.Errorf("both coordinates stamped the same rationale_hash %q despite different rationale text — "+
+			"the projection is returning a constant, and every coordinate disposed through the bulk path "+
+			"will read stale (or, worse, never read stale when the text genuinely changes)",
+			rows[rg[1]].hash)
 	}
 }
