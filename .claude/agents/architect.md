@@ -94,7 +94,7 @@ If the requirement, constraints, or affected code area are unclear,
 surface that rather than guessing; the lead will re-delegate with the
 missing context.
 
-## This repo (uzi)
+## For this repo (uzi)
 
 Components your designs map onto: `web` (Vite + React SPA, nginx-unprivileged,
 reverse-proxies `/api/*` same-origin), `api` (Go, chi + pgx + sqlc + goose;
