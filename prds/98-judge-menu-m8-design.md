@@ -17,7 +17,7 @@ the ones to attack first.
 
 **v1 (`4c647f84`)** — first pass, both mechanisms.
 
-**v2 (this commit)** — seam 6 revised in place after four follow-ups and four user rulings.
+**v2 (`e30f97e0`)** — seam 6 revised in place after four follow-ups and four user rulings.
 What changed, and why each change was forced rather than chosen:
 
 - **A10 is new.** A real mock↔server divergence exists *today* in `rationalePreview` (runes vs
@@ -39,6 +39,13 @@ What changed, and why each change was forced rather than chosen:
   with its refutation rather than deleted, per the rule that a removed check with no recorded
   reason gets re-added by the next person who reads the PRD's criteria list.
 - **Part B is otherwise unrevised** and awaits pass 3. Do not build from it yet.
+
+**v3 (this commit)** — **Part C is new**: the printed-instruction backstop, pass 2 of the
+approved three-way split. Everything in it is measured by execution against `api/cmd/uzi/`,
+not by reading. It supersedes v1's B9/B10, which are marked as such in place. The headline: the
+registry conflates **two kinds** of string — runtime emissions and help references — and the
+"must have been EXECUTED" bar is right for the first and wrong for the second. Four of the
+eight entries' notes misdescribe their own site.
 
 **Correction to v1's reporting, recorded because the error was mine.** I attributed the lead's
 stale status read to the persisted-cwd trap in `.claude/agent-team.md`. That was wrong, and the
@@ -293,11 +300,14 @@ comparator `run_count DESC, open_count DESC`):
 | **interleaved two-key** — `run_count` alternating `1,2,1,2,…` | ≤12 | never |
 | **interleaved two-key** | **13** | **YES** — `[9 1 3 5 7 11 2 4 6 8 0 10 12]` |
 
-**So the mutation produces a false green for every fixture shape anyone would naturally
-write**, and v1's instinct that "many tied groups" would catch it was exactly backwards. Two
-mechanisms, both in Go's pdqsort: below n=12 it uses insertion sort, which is stable; and it
-short-circuits on input it detects as already-ordered — which is what an all-tied run and a
-realistically recency-ordered backlog both are.
+**THE FINDING, and it is more useful than the fixture spec below: the obvious fixture is the
+one that cannot catch this.** "Many tied groups will catch a stability regression" is what
+almost anyone would write, and it is precisely wrong — **the mutation produces a false green
+for every fixture shape anyone would naturally reach for**, including the two most obvious
+ones (all-tied, and a realistic recency-ordered backlog), at any n. Two mechanisms, both in
+Go's pdqsort: below n=12 it uses insertion sort, which is stable; and it short-circuits on
+input it detects as already-ordered — which is exactly what those two shapes are. A fixture
+author optimising for realism optimises directly away from detection here.
 
 **The construction rule, therefore — case 11:** the stability case needs **≥13 groups**, **at
 least two distinct `run_count` values**, **ties within each value**, and an input order that
@@ -461,13 +471,20 @@ Revised for v2 — the fixture grew from 9 cases to 11, three of them multibyte 
 | **Seam 6 total** | **~2 days** |
 | Truncation fix (A8), after the remaining product decision | 2h |
 
-**Authoring note that will otherwise cost the coder an afternoon.** Cases 8-10 must not have
-their expected previews hand-counted. Compute them — the rune index, the code-unit index and
-the trimmed tail — and paste the result. My own probes hit this twice: a heredoc silently
-corrupted a literal U+FEFF into a raw BOM that Go refuses to compile anywhere in a source file
-(the repo's own "read a file back after a shell heredoc" rule, earned again), and the
-`slice(-3)` artifact above. **Build exotic characters by code point** (`string(rune(0xFEFF))`,
-`"\u{FEFF}"`), never by pasting the glyph.
+**Two authoring RULES, not tips. Both of these produced FALSE RESULTS rather than errors,
+which is why they are rules — an error stops you, a false result gets published.**
+
+1. **Build exotic characters by code point, never by pasting the glyph.**
+   `string(rune(0xFEFF))` / `"\u{FEFF}"`. Measured: writing a literal U+FEFF through a shell
+   heredoc silently produced a raw BOM, which Go then refuses to compile **anywhere** in a
+   source file — three probe attempts died on it before the cause was visible. This is the
+   repo's standing "read a file back after a shell heredoc" rule, earned again in a new place.
+2. **Compute expected previews; never count them by eye or by a convenience slice.** Measured:
+   a probe reading `o.slice(-3)` to inspect a tail **manufactured the very lone surrogate it
+   was testing for** — `slice` is code-unit based, so it split a surrogate pair by itself and
+   reported a defect on the *fixed* implementation. An instrument that produces the defect it
+   is hunting returns a plausible, wrong, publishable answer. Scan whole strings, not slices,
+   and derive the rune index, the code-unit index and the trimmed tail programmatically.
 
 ---
 
@@ -774,6 +791,292 @@ precisely what a fake cannot fake.
 | B10 registry change + third test + citation cleanup | 1.5h |
 | iteration against a 30-min harness — budget ≥3 full runs | 2× write time |
 | **M8b total** | **~3 days** |
+
+---
+
+## Part C — the printed-instruction backstop (pass 2)
+
+Everything in this part is MEASURED by execution against `api/cmd/uzi/` at `e30f97e0`, using
+the real regex, the real AST walk and the real prefix matcher, not by reading. Probes were run
+in throwaway packages under `api/` and deleted; the tree is clean.
+
+### C0. The finding that reframes the mechanism: there are TWO kinds, and the registry conflates them
+
+I classified every lifted candidate by its **enclosing syntactic position**. Every one resolved
+to a definite kind — zero `UNKNOWN`:
+
+| candidate | kind | site |
+|---|---|---|
+| `uzi login` | **RUNTIME** `Exitf` | `login.go:104`, `:110` |
+| `uzi repo list` | **RUNTIME** `Exitf` | `run.go:192` |
+| `uzi review backlog --run <run-id>` | **RUNTIME** `Println` | `review.go:403` |
+| `uzi review show %s` | **RUNTIME** `Exitf` | `review.go:531` |
+| `uzi review undo %s %s` | **RUNTIME** `Printf` | `review.go:447` |
+| `uzi review backlog` | **HELP** flag usage | `review.go:212`, `:213` |
+| `uzi run inputs` | **HELP** `Long` | `run.go:287` |
+| `uzi skill install` | **HELP** `Short` | `skill.go:95` |
+| `uzi worker set-token` | **HELP** `Long` | `token.go:25` |
+
+**A runtime emission tells a user what to do next at a decision point. A help reference is
+documentation cross-linking a sibling command.** The file's bar — *"adding a line here is a
+claim that the instruction has been EXECUTED and its outcome asserted"* (`:38-41`) — is the
+right bar for the first kind and **the wrong bar for the second**. Nobody needs to *execute*
+`uzi skill install` to validate a `Short` description that mentions it; what that string can be
+wrong about is naming a command path that does not exist.
+
+**Consequence: four of the eight registry notes misdescribe their own site.** Measured:
+
+- `uzi run inputs` — note says *"Printed by run.go after submitting a steer"*. It is in a
+  `Long` help string (`run.go:287`).
+- `uzi skill install` — note says *"Printed by the skill auto-upgrade warning"*. It is a
+  `Short` description (`skill.go:95`).
+- `uzi login` — note says *"Printed by the auth-required path"*. It is the **device-auth
+  polling loop**'s retry hint (`login.go:104`/`:110`), a different path with different
+  reachability.
+- `uzi review backlog` — note says *"Printed by both truncation warnings"*. The candidate the
+  extractor actually lifts comes from **flag usage** (`:212`/`:213`); the truncation remedy
+  lifts as the longer, distinct `uzi review backlog --run <run-id>` — and only after the
+  widening below, because the current extractor cannot see it at all.
+
+The registry's notes are themselves unverified claims. That is the exact class the registry
+exists to catch, applied to the registry.
+
+### C1. Extractor blindness — MEASURED, and the widening ruling
+
+The claim that a fourth instruction "cannot land silently" (`instructions_test.go:32-36`) is
+**false for the shape a real instruction takes.** Running the real `instructionRE` against the
+real literals:
+
+| literal | current extractor lifts |
+|---|---|
+| `` `uzi review show %s` `` (`review.go:531`) | **nothing** |
+| `` `uzi review backlog --run <run-id>` `` (`review.go:403`) | **nothing** |
+| `  uzi review undo %s %s` (`review.go:447`) | `uzi review undo` — truncated at the `%` |
+
+`uzi review show` is registered **only because a human happened to type it**. Had they not,
+the registration check would have stayed green.
+
+**RULING — widen the class to `%`, `<`, `>` ONLY. Do not add `|` or `/`.** Measured
+package-wide, three variants:
+
+| class | candidates | new vs current |
+|---|---|---|
+| current | 7 | — |
+| **`% < >`** | **9** | the three real instructions above, **zero false positives** |
+| `% < > \| / _` | 10 | those three **plus** `uzi review resolve\|dismiss --category/--target` |
+
+The only thing `|` and `/` buy is `review.go:54`'s shorthand — an **alternation that is not
+runnable as printed**. Registering it would assert someone executed a string nobody can. And
+excluding it needs no special case: **the alternation character is itself the marker that a
+span is a reference rather than a command.**
+
+**The auditor's read is confirmed: the cobra-verb filter carries the load, not the character
+class.** Measured — the root's own `Long`, *"uzi drives the factory from the terminal"*, is
+rejected under **both** the current and the widened class, because `drives` is not a verb in
+the tree. So widening costs nothing in prose leakage.
+
+### C2. Matcher asymmetry — RULING: make them symmetric
+
+MEASURED: for `uzi review show`, `strings.Contains` over raw literals returns **true** while
+the registration scan sees **nothing**. So `TestRegisteredInstructionsAreStillPrinted` keeps an
+entry alive that `TestPrintedInstructionsAreRegistered` is blind to — and **only the blind one
+fails the build on a new instruction**. That asymmetry, not the character class alone, is the
+defect.
+
+**Fix: compute the lift set ONCE and run both directions over it.**
+
+- registration: every lifted candidate must match some entry;
+- staleness: every entry must be matched by some lifted candidate.
+
+This also removes a hazard nobody has hit yet: `strings.Contains` would keep an entry alive on
+the strength of the command name appearing in a **comment** or a doc string, since it never
+asked whether anything *prints* it.
+
+### C3. Prefix absorption — RULING: take the one-liner, it is measured
+
+MEASURED, the proposed `cmd == k.command || strings.HasPrefix(cmd, k.command+" ")` against the
+same corpus:
+
+| candidate | absorbed today | absorbed with the fix |
+|---|---|---|
+| `uzi review backlog` | yes | yes |
+| `uzi review backlog --run x` | yes | yes |
+| `uzi review undo a b` | yes | yes |
+| `uzi review backlog-export --all` | **yes (hole)** | **no** |
+| `uzi review backlogger` | **yes (hole)** | **no** |
+| `uzi review showdown` | **yes (hole)** | **no** |
+
+All three holes close; every legitimate match survives, **including the newly-widened longer
+forms** (`uzi review show %s` still matches the `uzi review show` entry, and so on). It is a
+real hole and it is one line — **close it in this wave.**
+
+### C4. The static/runtime split — the lead's reframing, adopted, with its consequence
+
+The `Exitf` finding is confirmed at `uzicli/output.go:48`: `fmt.Errorf(format, a...)`
+substitutes at emit time, so a user sees `uzi review show <a real uuid>` — complete and
+runnable, no verb in it.
+
+- **STATIC — "does a row exist?"** Must read source literals, because an unregistered
+  instruction has to fail the build *before* anyone runs anything. This is the direction with
+  the holes: it needs C1's widening, C2's symmetry and C3's boundary. **It can never verify
+  execution and must not imply it.**
+- **RUNTIME — "does the printed text work?"** Must read **emitted output**, never source.
+  **It needs no regex widening at all**, because formatting has already happened.
+
+**The consequence worth stating: `kind` is DERIVED, not declared.** It comes from the AST
+position (C0), so an author cannot label a runtime instruction as "help" to dodge the execution
+bar. That answers *"what fails if someone flips an entry to EXECUTED with no row behind it"*
+from the stronger side — they cannot choose the kind in the first place.
+
+### C5. The registry shape
+
+```go
+type instructionKind int   // DERIVED from the AST position — never hand-declared
+const (kindHelp instructionKind = iota; kindRuntime)
+
+type evidenceKind int
+const (
+    evidenceNotExecuted evidenceKind = iota // LEGAL, GREEN, PERMANENT — requires a reason
+    evidenceGoTest
+    evidenceE2E
+)
+
+type knownInstruction struct {
+    command  string
+    evidence evidenceKind
+    where    string // a Go test NAME, or the e2e phase's `say` label
+    reason   string // required when evidence == evidenceNotExecuted
+    note     string
+}
+```
+
+Checks, all static, no stack, all in `go test ./...`:
+
+1. **HELP entries: assert the referenced path RESOLVES in the cobra tree.** New, cheap, and
+   *stronger than today* — nothing currently checks that `uzi worker set-token` is a real
+   command path, only that `worker` is a real top-level verb. This is the right and complete
+   bar for the help kind.
+2. `evidenceE2E` → `where` must appear in `e2e/run-e2e.sh`.
+3. `evidenceGoTest` → `func <where>(` must exist under `api/`.
+4. `evidenceNotExecuted` → `reason` must be non-empty.
+5. **Positive control**: fail if `e2e/run-e2e.sh` cannot be **read**. A moved harness must
+   redden this, not silently satisfy it. Do **not** assert "≥1 entry is `evidenceE2E`" — that
+   fails today, before any row lands.
+
+**`evidenceNotExecuted` stays legal, green and permanent.** A mechanism that fails the build on
+an honestly-declared gap gets deleted the first time someone is in a hurry, taking the
+arriving-instruction check with it. The `reason` requirement is what stops it becoming a
+shrug.
+
+**What this proves and what it does not:** it proves the claim's *address* is live. It does
+**not** prove the named phase asserts anything — the same honest boundary the query-inventory
+test carries, and it must be written at the site in those words.
+
+### C6. Reachability triage — the truthful subset
+
+The baseline first, and it is worse than "6 of 8": against the file's own bar at `:38-41`,
+**0 of 8 qualify today**, and 4 of the 8 are help references that were never the right subject
+for that bar.
+
+**RUNTIME kind — the four that need execution rows:**
+
+| instruction | reachable? | cost / mechanism |
+|---|---|---|
+| `uzi review undo %s %s` | **YES — flagship** | Arrange 2 open members → group dismiss → extract 2 addresses → execute both → assert both rows gone **and** `triage.todo` back up by 2 |
+| `uzi review show %s` | **YES — and CHEAP** | Arrange = `uzi review resolve $J_RUN <bogus-id>` against a run that already has a review. **Corrects the standing inference that this is e2e-expensive**: the arrange step is one extra CLI call, not a new fixture |
+| `uzi repo list` | **YES — cheap** | Arrange = a run-start call with `--repo` omitted; execute `uzi repo list` (a pure read); assert it lists `$REPO_ID` |
+| `uzi review backlog --run <run-id>` | **YES, but gated** | Needs Part B's B4 2001-row seed. This is the only arrangement in the repo where the truncation remedy can be executed at all |
+| `uzi login` | **NO — permanent** | `login.go` declares **no flags**; it is a device-authorization flow, and the hint is emitted from inside the polling loop on a terminal/timeout state. Executing it verbatim means driving a browser approval. Honest permanent `evidenceNotExecuted` with *that* reason — not "inherited gap" |
+
+**Two traps in the two Exitf rows.** `uzi review show %s` and `uzi repo list` are emitted
+through `Exitf`, so they go to **stderr** and the process exits **non-zero**
+(`ExitNotFound`/`ExitUsage`). A row must capture stderr and **tolerate a non-zero exit** —
+under `set -euo pipefail` the naive form kills the harness, and a row that "passes" because it
+never ran is the false green this whole mechanism exists to prevent.
+
+**HELP kind — the four that need no execution, ever:** `uzi review backlog`, `uzi run inputs`,
+`uzi skill install`, `uzi worker set-token`. Covered completely by C5 check 1. Their current
+`NOT EXECUTED` notes should be **replaced**, not upgraded — they answer a question that was
+never the right one to ask of a `Short` description.
+
+So the honest landing state is **4 runtime rows executed, 1 runtime permanently declared with
+a real reason, 4 help entries fully checked by a bar that actually fits them** — against 0 of 8
+today.
+
+### C7. Making the hand-written shortcut unavailable — and the honest residual
+
+The requirement is that a row execute the printed text **verbatim**, never a hand-written
+argv, because both previously-false instructions **parsed perfectly** and a copy would have
+passed on both.
+
+Three mechanisms, in descending strength:
+
+1. **One shared helper, used by every row.** Extraction and execution live in a single
+   `run_printed_instruction` function; a row that hand-writes argv has to *visibly bypass* the
+   helper, which is reviewable in a way that a subtly-wrong string is not.
+2. **A shape-guarded `eval`.** The helper matches the captured span against a fixed shape
+   (line-anchored, UUID-shaped where applicable) before executing. `eval` therefore cannot see
+   text that did not come out of the command in the expected form — and this is also what makes
+   `eval` safe here rather than reckless.
+3. **Assert the count before using any match.** Never `head -1`: output that stops at your
+   limit is indistinguishable from output that ended (the repo's own truncated-view rule).
+
+**The honest residual, stated because the requirement was "structurally unavailable" and shell
+cannot deliver that.** A determined author can still assign a literal to the variable the
+helper reads. There is no type system here to forbid it. What the three mechanisms buy is that
+the shortcut becomes *visible in review* rather than *invisible in a passing test* — which is a
+real improvement and is not the same as impossible. I would rather record that than claim a
+guarantee the substrate cannot make.
+
+### C8. Extraction must never be positional
+
+MEASURED at `run.go:478-485`: `sanitizeTTY` strips C0 except `\t` and `\n`, and C1
+(`0x80-0x9f`) — but **`0x7f` (DEL) survives**, and the tab/DEL fold lives only in `cellText`
+(`run.go:577`), which the backlog path does not use. `renderBacklog` (`review.go:308-314`)
+sanitizes `target` and `rationale_preview` and prints `category`/`bucket` raw (sound — there is
+a real CHECK constraint at `00059_run_reviews.sql:47`).
+
+**So an embedded tab in a judge `target` shifts the rendered columns.** Any row reading
+`renderBacklog`'s table must extract by a **delimiter the sanitizer guarantees absent**, never
+by column position. There is a measured precedent in this repo (`run.go:564-566`): a benign
+label put a payload at rendered column 58, `a\tb\tc\td\te` at 76, and eight tabs at 107 — while
+the *rune* offset stayed pinned at 58 throughout, which is exactly why the existing alignment
+test could not see it.
+
+### C9. Isolation — no new env var needed
+
+Confirmed against `run-e2e.sh:103-107`: the allowlist is exactly 19 names. **None of Part C
+needs a new one** — the rows run through the existing `uzi_cli` helper (`:1407`), which already
+carries `UZI_URL`, `UZI_TOKEN` and `UZI_SKILL_AUTO_UPGRADE=0` under `env -i`. The argv sentinel
+(`[ "${1:-}" != "--e2e-sanitized" ]`, `:101`) is untouched. Flagging this explicitly because
+widening that allowlist is a blocking-class change and a silent addition is how it would land.
+
+### C10. Effort
+
+| | |
+|---|---|
+| C1 widening + C2 symmetry + C3 boundary (one file, all static) | 2h |
+| C0/C4 kind derivation from the AST position | 2h |
+| C5 registry restructure + the five checks | 2.5h |
+| C6 four runtime rows in the harness (undo, show, repo list; backlog gated on B4) | 3h |
+| C7 the shared helper | 1h |
+| Rewriting the four help notes + the five misdescribing notes | 1h |
+| Negative controls — one per check, RED then restored | 2h |
+| **Part C total** | **~1.5-2 days** |
+
+Note C6's `uzi review backlog --run` row is **gated on Part B's B4**; the other three are
+independent of Part B entirely and can land first.
+
+### C11. What Part C cannot catch
+
+- That a named e2e phase **asserts** anything — only that its address is live (C5).
+- A **new** instruction printed through a helper the AST walk does not recognise as an emitter.
+  C0's classifier knows `Printf`/`Println`/`Print`/`Exitf`/`Errorf`/`Fprintf`/`Fprintln`; a new
+  wrapper would classify `UNKNOWN`. **Design requirement: `UNKNOWN` must FAIL, not default to
+  help** — defaulting to help would let a new emitter dodge the execution bar silently, which
+  is the whole failure this part exists to close.
+- An instruction assembled from concatenated fragments at runtime; the walk sees literals.
+- Whether the *outcome* a row asserts is the right outcome.
 
 ---
 
