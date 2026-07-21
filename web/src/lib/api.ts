@@ -1065,6 +1065,12 @@ export interface JudgeOccurrence {
   // Typed as a literal union, not `string`: that is what makes `set_via === "issue_close"`
   // compiler-guarded here. (A raw string comparison would be the one client-side shape that
   // fails silently — see isBucket, the one site tsc does not guard.)
+  //
+  // NOTE this NARROWS HARDER THAN THE WIRE GUARANTEES. Go ships `SetVia string`, so a future
+  // server-side provenance value is a state this type calls impossible. It fails safe — an
+  // unrecognised value falls through to the plain "✓ Done" chip rather than mis-labelling —
+  // but the guarantee lives in Go's two SQL writers (the M6 literal and the human-write
+  // NULL), not in this declaration. Widen the union here when a third value is added there.
   set_via?: "issue_close";
   filed_issue?: JudgeFiledIssueRef;
 }

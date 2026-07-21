@@ -267,4 +267,48 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     expect(after.bucket).toBe("dismissed");
     expect(after.set_via).toBeUndefined();
   });
+
+  // The SINGLE-COORDINATE write path must clear the provenance too, and until now only the
+  // bulk path was driven (PRD #98 review N-a). Measured: removing the clear from
+  // setDisposition left typecheck clean and all 849 tests green — half-defended, which is
+  // the state most likely to read as fully defended.
+  //
+  // It is the path RunView's per-recommendation Mark done / Dismiss drives, and it is
+  // reachable on the very fixture B3 seeded: run-closed's enable_tool/ripgrep is an
+  // issue-close auto-done, and that run's page renders per-rec controls. So without the
+  // clear, hand-marking it from RunView leaves the Judge chip reading "Done via #91" for a
+  // decision the user just made.
+  it("the SINGLE-coordinate write path clears the provenance too, not just the bulk one", async () => {
+    installStorage();
+    const api = await reload();
+
+    const backlog = await api.getJudgeBacklog("all");
+    const group = backlog.groups.find((g) => g.category === "enable_tool" && g.target === "ripgrep")!;
+    const occ = group.occurrences[0];
+    expect(occ.set_via).toBe("issue_close"); // the fixture really is an auto-done
+
+    // A human marks it done from the run page — the #94 per-recommendation route.
+    await api.setDisposition(occ.run_id, occ.rec_id, "done");
+
+    const after = (await api.getJudgeBacklog("all")).groups.find(
+      (g) => g.category === "enable_tool" && g.target === "ripgrep",
+    )!.occurrences[0];
+    expect(after.bucket).toBe("done");
+    expect(after.set_via).toBeUndefined();
+  });
+
+  // The mock must not invent wire fields. set_via is a mock-side extension of the STORED
+  // disposition; the run-page DispositionDTO has no such field, so GET /runs/{id}/review
+  // must not carry it (PRD #98 review N-b). A mock that ships more than the API does makes a
+  // future RunView provenance feature work in demo mode and fail in production.
+  it("does not leak set_via onto the run-page review DTO", async () => {
+    installStorage();
+    const api = await reload();
+
+    // The endpoint answers an ENVELOPE, {review: ...|null}.
+    const { review } = await api.getRunReview("run-closed");
+    const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
+    expect(disp).toBeTruthy();
+    expect("set_via" in (disp as object)).toBe(false);
+  });
 });

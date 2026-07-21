@@ -244,3 +244,226 @@ func TestJudgeBacklogPreviewRecencyLiveDB(t *testing.T) {
 		t.Errorf("first row = %q, want run A (re-judged most recently)", rows[0].RunTitle)
 	}
 }
+
+// TestJudgeBacklogProjectsEveryColumnLiveDB pins the backlog read's PROJECTION — that each
+// selected column carries the value from the column it names, and not a constant, a NULL, or
+// a neighbouring column.
+//
+// WHY THIS EXISTS, measured rather than argued (PRD #98 review). The read projects 16
+// columns; before this test the two backlog LiveDB tests touched five (run_title, run_id,
+// rationale_md, target, category). Constant-folding the other six SIMULTANEOUSLY —
+// verdict→'ideal', confidence→”, dismiss_reason→NULL, set_via→NULL, filed_issue_iid→NULL,
+// filed_issue_url→NULL — and regenerating left the ENTIRE live-DB suite green, plus
+// `go test ./...`, typecheck and every vitest. Folding them together makes it unambiguous:
+// had any one been pinned, that run would have been red.
+//
+// A fake cannot stand in for this. Every Go-level test hands the grouper rows whose fields
+// are already populated, so it passes whether or not SQL ever produced them — the same
+// structural blindness the file header describes for the owner predicate.
+//
+// Two of these carry B3's headline label TOGETHER: "Done via #91" needs set_via AND
+// filed_issue_iid. Pinning only set_via would leave that feature one silent SQL edit from
+// rendering the unnamed "Done via issue close" fallback for every auto-done — the fallback
+// firing for the wrong reason, with every gate green.
+//
+// ASSERTIONS ARE PAIRWISE-DIFFERENT WHERE THEY CAN BE, not equal-to-a-constant. Two reviews
+// carry different verdicts, two recommendations different confidences, two dispositions
+// different reasons and different provenance. A fold to ANY single constant collapses a pair
+// and fails, whichever constant is chosen — an equality assertion only catches folds to a
+// value other than the one the fixture happens to use.
+//
+// A NOTE ON THE LADDER'S TWO INPUTS, deliberately not covered here: folding
+// disposition_status or filed_settled DOES fail today, but only via
+// TestBulkDispositionFansOutAcrossRunsLiveDB — a BULK-DISPOSITION test, which catches it
+// because M2's post-write re-read happens to run this query. That is coverage by accident,
+// not by design: deleting or narrowing that M2 test would silently unpin both columns here.
+func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	owner := uuid.New()
+	connID, repoID := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		owner, fmt.Sprintf("judgeproj-%s@e2e", owner))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, owner, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	// Two runs, each judged with a DIFFERENT verdict, so a fold to any constant collapses
+	// the pair. iids are unique per repo (issues is keyed on (repo_id, forge_issue_iid)).
+	type review struct {
+		runID, reviewID uuid.UUID
+	}
+	newReview := func(iid int64, verdict string) review {
+		r := review{uuid.New(), uuid.New()}
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+			 VALUES ($1, $2, $3, $4, $5, 'd', 'completed')`, r.runID, owner, repoID, iid,
+			fmt.Sprintf("run %d", iid))
+		mustExec(ctx, t, pool,
+			`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, $4)`,
+			r.reviewID, r.runID, owner, verdict)
+		return r
+	}
+	autoRev := newReview(9001, "issues")
+	handRev := newReview(9002, "ideal")
+
+	// autoRev's coordinate: filed as #4242, that issue CLOSED, so the M6 sync marks it done
+	// with set_via='issue_close'. handRev's: dismissed by a person, with a different reason
+	// and no provenance. Confidences differ too.
+	const cat = "install_worker_tool"
+	autoTarget, handTarget := "rg-auto", "rg-hand"
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, $2, $3, 'because', 'high')`, autoRev.reviewID, cat, autoTarget)
+	mustExec(ctx, t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, $2, $3, 'because', 'low')`, handRev.reviewID, cat, handTarget)
+
+	// The filed link + the cached CLOSED issue that makes it an M6 close edge.
+	filedID := uuid.New()
+	const filedIID = int64(4242)
+	const filedURL = "https://forge.e2e/g/r/-/issues/4242"
+	mustExec(ctx, t, pool,
+		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, web_url, forge_updated_at, synced_at)
+		 VALUES ($1, $2, 'filed from a recommendation', 'closed', $3, now(), now())`,
+		repoID, filedIID, filedURL)
+	mustExec(ctx, t, pool,
+		`INSERT INTO recommendation_filed_issues
+		   (id, review_id, category, target, filed_repo_id, filed_issue_iid, filed_issue_url, filed_by_user_id, filed_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())`,
+		filedID, autoRev.reviewID, cat, autoTarget, repoID, filedIID, filedURL, owner)
+
+	// Settle the auto coordinate through the REAL M6 path, not by inserting the disposition
+	// by hand: ApplyFiledIssueCloseEdge is the query that writes set_via='issue_close' as a
+	// literal. That makes this a producer -> consumer pin — M6 writes the column, the backlog
+	// read projects it — rather than a projection pin standing on a hand-made row.
+	edges, err := q.ListFiledIssueCloseEdges(ctx, store.ListFiledIssueCloseEdgesParams{RepoID: repoID, Lim: 50})
+	if err != nil {
+		t.Fatalf("list close edges: %v", err)
+	}
+	var edge *store.ListFiledIssueCloseEdgesRow
+	for i := range edges {
+		if edges[i].FiledID == filedID {
+			edge = &edges[i]
+			break
+		}
+	}
+	if edge == nil {
+		t.Fatalf("the seeded filed+closed coordinate produced no M6 close edge (got %d edges) — "+
+			"the fixture, not the projection, is wrong", len(edges))
+	}
+	if _, err := q.ApplyFiledIssueCloseEdge(ctx, store.ApplyFiledIssueCloseEdgeParams{
+		ReviewID: edge.ReviewID, Category: edge.Category, Target: edge.Target,
+		RationaleHash: "hash-does-not-matter-here", FiledID: edge.FiledID,
+	}); err != nil {
+		t.Fatalf("apply close edge: %v", err)
+	}
+
+	// The hand-set one: a person dismisses it, so set_via stays NULL and the reason differs.
+	mustExec(ctx, t, pool,
+		`INSERT INTO recommendation_dispositions
+		   (review_id, category, target, status, dismiss_reason, rationale_hash, set_by_user_id)
+		 VALUES ($1, $2, $3, 'dismissed', 'not_an_issue', 'h', $4)`,
+		handRev.reviewID, cat, handTarget, owner)
+
+	rows, err := q.ListJudgeRecommendationRowsForUser(ctx, store.ListJudgeRecommendationRowsForUserParams{
+		UserID: owner,
+		Lim:    500,
+	})
+	if err != nil {
+		t.Fatalf("list backlog rows: %v", err)
+	}
+	byTarget := map[string]store.ListJudgeRecommendationRowsForUserRow{}
+	for _, r := range rows {
+		if r.Category == cat {
+			byTarget[r.Target] = r
+		}
+	}
+	auto, ok := byTarget[autoTarget]
+	if !ok {
+		t.Fatalf("no backlog row for %s/%s", cat, autoTarget)
+	}
+	hand, ok := byTarget[handTarget]
+	if !ok {
+		t.Fatalf("no backlog row for %s/%s", cat, handTarget)
+	}
+
+	// 1+2. verdict — different per review, so ANY constant fold collapses them.
+	if auto.Verdict == hand.Verdict {
+		t.Errorf("both rows carry verdict %q — the column is folded to a constant", auto.Verdict)
+	}
+	if auto.Verdict != "issues" || hand.Verdict != "ideal" {
+		t.Errorf("verdict = (%q, %q), want (issues, ideal)", auto.Verdict, hand.Verdict)
+	}
+
+	// 3. confidence — likewise a pair.
+	if auto.Confidence == hand.Confidence {
+		t.Errorf("both rows carry confidence %q — the column is folded", auto.Confidence)
+	}
+	if auto.Confidence != "high" || hand.Confidence != "low" {
+		t.Errorf("confidence = (%q, %q), want (high, low)", auto.Confidence, hand.Confidence)
+	}
+
+	// 4. set_via — the PF-4 distinction, and the one whose failure is NOT fail-safe: a wrong
+	// value here renders a system inference as the user's own decision.
+	if auto.SetVia.String == hand.SetVia.String {
+		t.Errorf("auto-done and hand-set carry the same set_via %q — provenance never reaches a client",
+			auto.SetVia.String)
+	}
+	if !auto.SetVia.Valid || auto.SetVia.String != "issue_close" {
+		t.Errorf("auto-done set_via = %q (valid=%v), want issue_close — written by the M6 close edge",
+			auto.SetVia.String, auto.SetVia.Valid)
+	}
+	if hand.SetVia.Valid {
+		t.Errorf("a human's dismissal carries set_via %q, want NULL", hand.SetVia.String)
+	}
+
+	// 5. dismiss_reason — carries false_positives on the ladder.
+	if auto.DismissReason.Valid {
+		t.Errorf("the auto-DONE row carries dismiss_reason %q, want NULL", auto.DismissReason.String)
+	}
+	if !hand.DismissReason.Valid || hand.DismissReason.String != "not_an_issue" {
+		t.Errorf("hand dismiss_reason = %q (valid=%v), want not_an_issue",
+			hand.DismissReason.String, hand.DismissReason.Valid)
+	}
+
+	// 6+7. the filed link — filed_issue_iid is B3's other half, and filed_issue_url is what
+	// the occurrence's external link renders.
+	if !auto.FiledIssueIid.Valid || auto.FiledIssueIid.Int64 != filedIID {
+		t.Errorf("filed_issue_iid = %v (valid=%v), want %d",
+			auto.FiledIssueIid.Int64, auto.FiledIssueIid.Valid, filedIID)
+	}
+	if !auto.FiledIssueUrl.Valid || auto.FiledIssueUrl.String != filedURL {
+		t.Errorf("filed_issue_url = %q (valid=%v), want %s",
+			auto.FiledIssueUrl.String, auto.FiledIssueUrl.Valid, filedURL)
+	}
+	// The unfiled row must NOT inherit them — otherwise a projection returning a constant
+	// iid would satisfy the assertions above.
+	if hand.FiledIssueIid.Valid || hand.FiledIssueUrl.Valid {
+		t.Errorf("the UNFILED row carries a filed link (iid=%v url=%q) — the columns are not row-scoped",
+			hand.FiledIssueIid.Int64, hand.FiledIssueUrl.String)
+	}
+	// And filed_at drives filed_settled, so a settled link must read as settled.
+	if !auto.FiledSettled {
+		t.Error("the filed+settled row reports filed_settled=false")
+	}
+	if hand.FiledSettled {
+		t.Error("the unfiled row reports filed_settled=true")
+	}
+}

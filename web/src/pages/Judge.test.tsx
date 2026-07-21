@@ -483,6 +483,19 @@ describe("Judge — an auto-done is visibly distinct from a hand-marked done (PR
     renderJudge();
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+
+    // The same fixture-broken guard the Go grouper test carries. Every occurrence here must
+    // bucket `done`: if a future edit to the `occ` default drifted one off `done`, these
+    // tests would quietly become ladder tests — passing because the BUCKETS differ rather
+    // than because the PROVENANCE does, which is the property they exist for.
+    for (const o of occurrences) {
+      if (o.bucket !== "done") {
+        throw new Error(
+          `fixture broken: every occurrence must bucket "done" (got ${o.bucket}) — otherwise this ` +
+            "proves something about the ladder, not about set_via",
+        );
+      }
+    }
     return screen.getAllByRole("listitem");
   }
 
@@ -508,21 +521,32 @@ describe("Judge — an auto-done is visibly distinct from a hand-marked done (PR
   });
 
   it("renders the two DIFFERENTLY — the same chip for both is the bug this exists for", async () => {
-    const items = await expandedChips([
+    await expandedChips([
       occ({
         run_id: "run-auto",
         rec_id: "rec-auto",
+        run_title: "auto run",
         bucket: "done",
         set_via: "issue_close",
         filed_issue: { issue_iid: 91, issue_url: "https://forge.example/issues/91", filed_at: "2026-07-20T10:00:00Z" },
       }),
-      occ({ run_id: "run-hand", rec_id: "rec-hand", bucket: "done" }),
+      occ({ run_id: "run-hand", rec_id: "rec-hand", run_title: "hand run", bucket: "done" }),
     ]);
-    const auto = items.find((li) => li.textContent?.includes("run-auto") || li.textContent?.includes("Done via"))!;
-    const hand = items.find((li) => li !== auto && li.textContent?.includes("Done"))!;
-    expect(auto).toBeTruthy();
-    expect(hand).toBeTruthy();
+
+    // Scoped to the two OCCURRENCE rows by their run titles. An earlier version took
+    // getAllByRole("listitem") and picked by textContent, which silently bound `auto` to the
+    // enclosing GROUP row — first in document order and containing "Done via" through its
+    // own descendants — so the comparison was parent-vs-child and `not.toEqual` could never
+    // fail. Proven: under the label-every-done-as-auto mutation both chips render
+    // identically and that version stayed GREEN. Scoping is what makes this assertion real.
+    const auto = screen.getByText("auto run").closest("li")!;
+    const hand = screen.getByText("hand run").closest("li")!;
+    expect(auto).not.toBe(hand);
+    expect(auto.contains(hand)).toBe(false); // neither may enclose the other
     expect(auto.textContent).not.toEqual(hand.textContent);
+    // And specifically on the chip, so a difference in some unrelated cell cannot satisfy it.
+    expect(auto.textContent).toContain("Done via #91");
+    expect(hand.textContent).not.toContain("Done via");
   });
 
   // An auto-done whose filed link is gone still STATES its provenance rather than printing

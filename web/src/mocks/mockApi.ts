@@ -247,7 +247,13 @@ function reviewDTO(review: MockReview): MockReview {
     filed_issues: review.filed_issues.map((x) => ({ ...x })),
     dispositions: review.dispositions
       .filter((d) => recCoords.has(coordKey(d.category, d.target)))
-      .map((x) => ({ ...x })),
+      // set_via is STRIPPED here, deliberately. It is a mock-side extension of the stored
+      // disposition (PRD #98 B3) because the run-page DispositionDTO carries no provenance —
+      // only the Judge menu's occurrence does. A spread would leak it onto
+      // GET /runs/{id}/review, where the real API sends no such field, and the mock would be
+      // lying about the wire: a future RunView provenance feature would work in demo mode
+      // and have nothing to read in production.
+      .map(({ set_via: _setVia, ...d }) => ({ ...d })),
     triage: recomputeTriage(review),
   };
 }
