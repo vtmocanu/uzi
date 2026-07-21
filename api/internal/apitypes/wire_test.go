@@ -183,6 +183,10 @@ var workerDTOKeys = []string{
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
+	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
+	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
+	// this DTO is the shape the web UI and the CLI both read.
+	"anthropic_secret_id", "anthropic_secret_label",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

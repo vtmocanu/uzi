@@ -86,6 +86,15 @@ WHERE id = $1 AND user_id = $2;
 SELECT id FROM user_secrets
 WHERE user_id = $1 AND kind = $2 AND is_default;
 
+-- name: GetUserSecretIDByLabel :one
+-- Resolve a user-facing label to the credential it names, case-insensitively to
+-- match the unique index 00077 put on (user_id, kind, lower(label)) — `Console` and
+-- `console` are the same token, so the CLI and the mint-time label accept either.
+-- pgx.ErrNoRows means the user has no token by that name, which callers report as
+-- "unknown label", never as a server error.
+SELECT id FROM user_secrets
+WHERE user_id = @user_id AND kind = @kind AND lower(label) = lower(@label);
+
 -- name: ListUserSecretsMeta :many
 -- Metadata-only listing for the current user; never selects ciphertext.
 SELECT kind, created_at, updated_at

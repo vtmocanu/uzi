@@ -621,6 +621,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListWorkers)
+				// PATCH rebinds a worker between the OWNER'S OWN Anthropic tokens
+				// (PRD #104 M3, D8). RequireUser, unlike the POST below: it mints
+				// nothing and yields no credential the caller lacks — it only re-points
+				// a worker at a token they already hold, so `uzi worker set-token` can
+				// reach it from a CLI token. That reasoning depends entirely on the
+				// ownership check holding, which is why the composite FK enforces it in
+				// the schema too.
+				r.Patch("/{id}", h.PatchWorker)
 				// DELETE stays swapped: destroying a worker exfiltrates nothing and the
 				// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
 				// covers BOTH worker kinds (the middleware cannot see the row's kind).

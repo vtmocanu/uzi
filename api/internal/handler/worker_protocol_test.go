@@ -392,7 +392,7 @@ func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 		StatsMemLimitBytes: pgtype.Int8{Int64: 2147483648, Valid: true},
 		StatsSource:        pgtype.Text{String: "cgroup", Valid: true},
 	}
-	dto := apitypes.AdminWorkerDTO{WorkerDTO: workerDTOFromWorker(w, 0, false), OwnerEmail: "u@example.test"}
+	dto := apitypes.AdminWorkerDTO{WorkerDTO: workerDTOFromWorker(w, 0, false, ""), OwnerEmail: "u@example.test"}
 	b, err := json.Marshal(dto)
 	if err != nil {
 		t.Fatalf("marshal admin dto: %v", err)

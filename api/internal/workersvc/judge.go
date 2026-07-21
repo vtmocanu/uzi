@@ -136,9 +136,13 @@ func scanCommandNotFound(payloads [][]byte) []ToolMiss {
 // run's id (its trace is fetched out-of-band), the judge model, and the deterministic
 // command-not-found pre-scan. The trace itself never rides the claim (it can be MB).
 func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
-	// nil: the default token. M4 replaces this with the owner's
-	// judge_anthropic_secret_id when set, so retrospectives can bill a different
-	// credential from the runs they review (PRD #104 D1).
+	// nil: the default token — and deliberately NOT the claiming worker's binding,
+	// even though a judge run is claimed by an ordinary worker through the same
+	// ClaimRun lane. Under PRD #104 D1 the judge lane is bound per USER, not per
+	// worker: which credential reviews your work is a property of you, not of
+	// whichever worker happened to pick the retrospective up. M4 replaces this with
+	// the owner's judge_anthropic_secret_id when set, so retrospectives can bill a
+	// different credential from the runs they review.
 	anthropic, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		return nil, err

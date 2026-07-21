@@ -437,4 +437,5 @@ type Worker struct {
 	HostedSize         pgtype.Text        `json:"hosted_size"`
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
 }

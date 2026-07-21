@@ -89,6 +89,8 @@ uzi review undo <run-id> <rec-id>
 uzi review stats
 uzi worker list
 uzi worker rm <worker-id>
+uzi worker set-token <worker-id> <label>
+uzi worker set-token <worker-id> --default
 uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
@@ -190,6 +192,15 @@ as inert data.
 - `uzi worker list` — your workers. `uzi worker rm <worker-id>` — delete one of
   your workers (its runs requeue). There is no `worker create`: minting a join
   token is a web action, because the token can read decrypted secrets.
+- `uzi worker set-token <worker-id> <label>` — point a worker at one of your
+  named Anthropic tokens, so its runs spend that credential instead of your
+  default one; `--default` clears the binding again. It takes effect on the
+  worker's **next claim** — no restart, no new join token — and `worker list`
+  shows the binding as `anthropic_secret_label` (null ⇒ your default). Rebinding
+  is allowed from the CLI, unlike minting, because it hands you no credential you
+  do not already own. Two caveats worth knowing: a worker's **chat** runs still
+  spend your default token (the binding covers the run lane), and deleting a
+  bound token silently returns its workers to the default rather than failing.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

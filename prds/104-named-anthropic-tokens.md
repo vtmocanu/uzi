@@ -340,7 +340,19 @@ Phase 2 (parallel, all depend only on M1):
       value), `DELETE .../{id}` (D5/D6 rules). D14's aliases kept and deprecated.
       **D12's transaction + `FOR UPDATE` is this milestone's core risk** —
       concurrent-create and concurrent-delete-default tests are acceptance
-      criteria, not extras. `uzi token list|add|rename|set-default|rm`, read
+      criteria, not extras.
+      **Three defects M1 deliberately left live for M2 to close** (found by the
+      M1 audit, verified against Postgres 17; they are unreachable in M1 because
+      no second token can exist yet, and become reachable the instant this
+      milestone ships): (i) a user in the "tokens exist, none is default" state
+      gets a raw **500** from `PutAnthropicToken` — the alias INSERT finds no
+      arbiter conflict and collides on the label index instead
+      (`user_secrets_user_kind_label_key`); D12's `FOR UPDATE` transaction is
+      what makes that state unreachable, so no handler branch is wanted, only the
+      transaction. (ii) `DELETE /api/me/secrets/anthropic_token` deletes the
+      default unconditionally instead of D14's 409 for a multi-token user.
+      (iii) `RotateUserSecret` exists with no caller until this milestone wires
+      the id-keyed rotate route — it is not dead code. `uzi token list|add|rename|set-default|rm`, read
       paths `RequireUser`, write paths per D8. Every create/rotate pokes the
       usage poller (`handler/secrets.go:128-132` today pokes by user id;
       coordinate the new poke identity with M5 — whichever lands first defines
@@ -455,8 +467,40 @@ Phase 4 (last):
   starts returning 409 for multi-token users. Low blast radius (the web UI moves
   to the id routes in M6) but it is a contract change and belongs in the docs
   diff, not just the code.
-- **R6 — Requeue is an unacknowledged mid-run rebind, and SDK resume across
-  accounts is unverified.** The token is delivered only at claim (no later
+- **R6 — Requeue is an unacknowledged mid-run rebind. RESOLVED during M3: resume
+  is NOT at risk; attribution is, and rides as a documented limitation.**
+
+  *Investigated 2026-07-21.* The original premise — that resuming an SDK session
+  under a different account's token might fail — is **wrong**. Session state is a
+  local JSONL transcript under `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`,
+  not server-side account-bound state; `agent/src/sdk-env.ts:19-21` says so
+  explicitly ("HOME is pinned onto the persistent data volume … so the SDK's
+  session transcripts … survive a container restart (resume)"). Resume replays
+  that local file and re-sends the history; the OAuth token is the credential on
+  the next API call, not part of session identity. **So pinning the resolved
+  secret id on the run row would protect nothing, and is not done.**
+
+  What remains is the attribution half: `run_usage` cannot say which credential
+  paid across a requeue that changed the binding. That is real but small, and
+  pinning is deliberately still rejected — it would introduce a second source of
+  truth for "which token" that must agree with the binding forever after, on a
+  PRD whose top risk (R4) is precisely resolution-order divergence. M7 documents
+  it as a limitation.
+
+  *Unverified residual, flagged not designed around:* the chat lane uses a shared
+  `sdkHomeRoot` (`agent/src/main.ts:146`, deliberate — a Continue is a new run id
+  resuming the same session), so one `$HOME/.claude` can see token A then token B.
+  If the SDK caches account-scoped metadata there, behavior is unknown. Chat is
+  unbindable under D1, so this is reachable only via a default flip, never a
+  worker rebind.
+
+  *Separate pre-existing bug found while investigating, filed as its own issue:*
+  the run lane's `agent-home/<runId>` (`main.ts:103`) lives on the **claiming
+  worker's** data volume, so a requeued run re-claimed by a different worker once
+  the affinity grace lapses has no transcript to resume — today, with one token
+  per user, unrelated to this PRD.
+
+  *Original text, retained for provenance:* The token is delivered only at claim (no later
   re-delivery in `chat.go`, `judge.go`, or the steering path), but the stale-run
   sweeper requeues and the affinity grace re-claims — so a rebind or default flip
   between claims switches credentials mid-run. Two consequences: Problem-4's

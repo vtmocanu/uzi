@@ -142,6 +142,29 @@ func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSe
 	return i, err
 }
 
+const getUserSecretIDByLabel = `-- name: GetUserSecretIDByLabel :one
+SELECT id FROM user_secrets
+WHERE user_id = $1 AND kind = $2 AND lower(label) = lower($3)
+`
+
+type GetUserSecretIDByLabelParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+	Label  string    `json:"label"`
+}
+
+// Resolve a user-facing label to the credential it names, case-insensitively to
+// match the unique index 00077 put on (user_id, kind, lower(label)) — `Console` and
+// `console` are the same token, so the CLI and the mint-time label accept either.
+// pgx.ErrNoRows means the user has no token by that name, which callers report as
+// "unknown label", never as a server error.
+func (q *Queries) GetUserSecretIDByLabel(ctx context.Context, arg GetUserSecretIDByLabelParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getUserSecretIDByLabel, arg.UserID, arg.Kind, arg.Label)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertUserSecret = `-- name: InsertUserSecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 VALUES ($1, $2, $3, $4, $5, $6)
