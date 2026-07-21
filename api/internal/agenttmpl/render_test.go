@@ -191,7 +191,7 @@ func TestCoderParallelModeContract(t *testing.T) {
 		{"stop and report on out-of-scope need", "stop and report that instead of editing it"},
 		{"shared files are called out as out-of-scope", "including shared files like go.mod, lockfiles, generated code, or wiring and registration files"},
 		{"no git commit in parallel mode", "In parallel mode do not run `git commit`"},
-		{"no build/test unless it covers only exclusively-owned code", "do not run build or test commands unless they cover only code you exclusively own"},
+		{"no gate/build/test unless it covers only exclusively-owned code", "do not run gate, build, or test commands unless they cover only code you exclusively own"},
 		{"lead integrates, commits, and runs the repo-wide gate", "the lead integrates, commits, and runs the repo-wide gate"},
 	}
 	for _, c := range cases {
