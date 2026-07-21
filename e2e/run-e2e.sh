@@ -3697,14 +3697,44 @@ BINDW_TOKEN="$(printf '%s' "$BINDW" | jq -r '.token')"
 { [ -n "$BINDW_ID" ] && [ "$BINDW_ID" != null ] && [ -n "$BINDW_TOKEN" ] && [ "$BINDW_TOKEN" != null ]; } \
   || fail "could not mint the binding-test worker"
 
-# claim_token — POST a claim as the binding-test worker and print ONLY the delivered
-# Anthropic plaintext. The payload carries a decrypted credential, so it is never
-# echoed, never logged, and never written to disk: the value crosses into a shell
-# variable and is compared there. A 204 (idle) yields an empty body and an empty
-# result, which the callers below fail on explicitly rather than silently matching "".
+# claim_token DESC — POST a claim as the binding-test worker and leave the delivered
+# Anthropic plaintext in $CLAIM_TOKEN. Sets a global rather than printing, because
+# `fail` inside a command substitution would exit only the SUBSHELL and its message
+# would be captured instead of printed — the run would abort with no diagnosis.
+#
+# The token lives at .secrets.anthropic_oauth_token. The first version of this phase
+# read it from the TOP level and failed the whole suite: ClaimPayload nests it under
+# `secrets` (workersvc/claim.go:68), which a grep for the json tag alone does not
+# show. Read the parent struct, not just the matching line.
+#
+# STATUS AND EXTRACTION ARE DELIBERATELY SEPARATE, and that split matters more than
+# the path fix. The first version compared the extracted string against "" and
+# reported an idle 204 whenever it was empty — but a 200 whose field sits at another
+# path yields the identical empty string, so the failure message asserted a cause it
+# had never measured and sent the reader hunting queue contention. Three distinct
+# failures now: a non-200, a 200 of the wrong shape, and a 200 whose token is absent.
+#
+# The body carries a DECRYPTED forge PAT and Anthropic token. It never touches disk
+# (a shell variable, piped through the printf BUILTIN so it never reaches an argv
+# either) and no failure prints it: a shape mismatch reports KEY NAMES only, which
+# is exactly enough to spot a wrong path and reveals no value. Do not widen that
+# under debugging pressure.
+CLAIM_TOKEN=""
 claim_token() {
-  curl -fsS -X POST "$BASE/api/worker/runs/claim" -H "Authorization: Bearer $BINDW_TOKEN" \
-    | jq -r '.anthropic_oauth_token // empty'
+  local raw code body
+  CLAIM_TOKEN=""
+  # No -f: a non-2xx must reach the checks below as a status, not abort the run.
+  raw="$(curl -sS -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" \
+    -H "Authorization: Bearer $BINDW_TOKEN")"
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  [ "$code" = 200 ] \
+    || fail "claim for '$1' returned HTTP $code, not 200 (204 means the queue was idle — the run existed but was not claimable by this worker)"
+  printf '%s' "$body" | jq -e 'has("secrets")' >/dev/null 2>&1 \
+    || fail "claim for '$1' returned 200 with no 'secrets' object — top-level keys: $(printf '%s' "$body" | jq -c 'keys' 2>/dev/null)"
+  CLAIM_TOKEN="$(printf '%s' "$body" | jq -r '.secrets.anthropic_oauth_token // empty')"
+  [ -n "$CLAIM_TOKEN" ] \
+    || fail "claim for '$1' carried no anthropic_oauth_token — .secrets keys: $(printf '%s' "$body" | jq -c '.secrets | keys' 2>/dev/null)"
 }
 # queue_run DESC — an issue + a run for it, ready to be claimed. Prints the run id.
 queue_run() {
@@ -3720,8 +3750,7 @@ queue_run() {
 
 # (a) UNBOUND → the owner's default token.
 RUN_B1="$(queue_run unbound)" || fail "binding phase: could not queue the unbound-claim run"
-GOT1="$(claim_token)"
-[ -n "$GOT1" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B1 — the assertion would be vacuous"
+claim_token "unbound (run $RUN_B1)"; GOT1="$CLAIM_TOKEN"
 [ "$GOT1" = "$DUMMY_ANTHROPIC" ] \
   || fail "an UNBOUND worker's claim did not carry the default token (it carried some other credential)"
 pass "unbound worker: the claim payload carries the owner's DEFAULT token"
@@ -3733,8 +3762,7 @@ apipatch "/api/workers/$BINDW_ID" '{"anthropic_token":"console-key"}' \
   | jq -e '.worker.anthropic_secret_label == "console-key"' >/dev/null \
   || fail "PATCH /api/workers/{id} did not report the worker bound to console-key"
 RUN_B2="$(queue_run bound)" || fail "binding phase: could not queue the bound-claim run"
-GOT2="$(claim_token)"
-[ -n "$GOT2" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B2 — the assertion would be vacuous"
+claim_token "bound to console-key (run $RUN_B2)"; GOT2="$CLAIM_TOKEN"
 [ "$GOT2" != "$GOT1" ] || fail "the claim payload did NOT change after the rebind — the binding never reached the claim"
 [ "$GOT2" = "$DUMMY_ANTHROPIC_2" ] \
   || fail "a worker bound to 'console-key' did not receive that token's value"
@@ -3746,8 +3774,7 @@ apipatch "/api/workers/$BINDW_ID" '{"anthropic_token":null}' \
   | jq -e '.worker.anthropic_secret_label == null' >/dev/null \
   || fail "PATCH with a null anthropic_token did not clear the worker's binding"
 RUN_B3="$(queue_run cleared)" || fail "binding phase: could not queue the cleared-claim run"
-GOT3="$(claim_token)"
-[ -n "$GOT3" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B3 — the assertion would be vacuous"
+claim_token "binding cleared (run $RUN_B3)"; GOT3="$CLAIM_TOKEN"
 [ "$GOT3" = "$DUMMY_ANTHROPIC" ] \
   || fail "clearing the binding did not return the worker to the owner's default token"
 pass "clearing the binding (anthropic_token: null) returns the next claim to the default token"
