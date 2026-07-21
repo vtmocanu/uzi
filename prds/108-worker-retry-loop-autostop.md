@@ -1,7 +1,7 @@
 # PRD #108: Poison-pill message batches — classify permanent failures, auto-stop confirmed retry loops, and stop leaking run HOMEs
 
 **GitLab Issue**: [#108](https://gitlab.example.com/vtmocanu/uzi/-/issues/108)
-**Status**: Draft (created 2026-07-21; **revised the same day after a fable adversarial review that verified every citation against the code** — three findings changed the design rather than the wording, and four claims in the first draft were measured FALSE; each is corrected in place with the correction left visible).
+**Status**: **Phase 1 implemented, not yet fully validated** (see "Phase 1 progress" below). Created 2026-07-21; **revised the same day after a fable adversarial review that verified every citation against the code** — three findings changed the design rather than the wording, and four claims in the first draft were measured FALSE; each is corrected in place with the correction left visible. Implementation then falsified **six more** of this document's own claims; those corrections are queued and listed below.
 **Priority**: High. A run wedges with no product-surface symptom: it reads `running`, spends nothing, produces nothing, holds a run slot, and pins a worker in a ~2 Hz loop against the API. **Bounded, not unbounded** — `RUN_TIMEOUT` (default 2h, `config.go:537`) would have failed it around 20:25. Observed cost on 2026-07-21: 27 minutes and 239 lost messages; worst case without intervention is 2 hours of a held slot and a hot loop. This PRD targets ~2 minutes.
 **Depends on**: **one migration** — `runs.stop_kind` is `CHECK (stop_kind IN ('cancelled','plan_rejected'))` (`00050_run_stop_kind.sql:25`), so a distinguishable auto-stop outcome cannot be expressed today. *(The first draft said "nothing new"; that was wrong and is why this line is explicit.)* Touches PRD #4's worker message path, PRD #47's RunHealth detector, PRD #42/#58's per-run `$HOME`.
 **Related**: PRD #87 (the run that surfaced this — its Chromium spike produced the first NUL bytes any uzi worker has emitted). PRD #99 (rewrote `workersvc` message handling in the same release; see the honesty note in M0).
@@ -132,11 +132,55 @@ Measured leftover: **167.3 MB for one run** (`/data` at 219 MB of 19.5 GB — no
 
 ### Phase 1 — close the incident
 
-- [ ] **M1 — Reproduce, RED first.** Integration test POSTing a payload carrying the `\u0000` escape (assert today's 500); a lone-surrogate case; an oversized-batch case crossing the 1 MiB cap; a runner test with a `0555` directory under a fake HOME. **Run the message test against v0.9.0 and v0.10.0** and record which — the incident write-up guessed and was wrong once.
-- [ ] **M2 — Sanitation + honest status code (api).** Strip `\u0000` and unpaired surrogates, JSON-aware, in the payload and in `agent`/`agent_instance`/`agent_label`; add `ErrUnstorableMessage` mapped to 400 for SQLSTATEs 22P05/22P02/22021. Count and log every strip so a NUL-emitting tool stays visible rather than silently laundered.
-- [ ] **M3 — Bounded batch, backoff, breaker (agent).** Byte cap + splitting; bisection to isolate one poisoned message; exponential backoff; 4xx not retried **except** the oversize case, which splits; breaker after N identical-batch failures; the failure report routed through `reportState`, never the batcher.
-- [ ] **M6 — HOME cleanup that survives read-only directories (agent).** Permission-restoring removal, still best-effort, tested against a `0555` directory. Plus a one-off reclaim that **skips any `agent-home/<runId>` whose run is non-terminal** — a sweep racing a live run is worse than the leak. **Fully independent of everything else here** — it shares only the incident that surfaced it, so it can land first or in parallel.
+- [x] **M1 — Reproduce, RED first.** Integration test POSTing a payload carrying the `\u0000` escape (assert today's 500); a lone-surrogate case; an oversized-batch case crossing the 1 MiB cap; a runner test with a `0555` directory under a fake HOME. **Run the message test against v0.9.0 and v0.10.0** and record which — the incident write-up guessed and was wrong once.
+- [x] **M2 — Sanitation + honest status code (api).** Strip `\u0000` and unpaired surrogates, JSON-aware, in the payload and in `agent`/`agent_instance`/`agent_label`; add `ErrUnstorableMessage` mapped to 400 for SQLSTATEs 22P05/22P02/22021. Count and log every strip so a NUL-emitting tool stays visible rather than silently laundered.
+- [x] **M3 — Bounded batch, backoff, breaker (agent).** Byte cap + splitting; bisection to isolate one poisoned message; exponential backoff; 4xx not retried **except** the oversize case, which splits; breaker after N identical-batch failures; the failure report routed through `reportState`, never the batcher.
+- [x] **M6 — HOME cleanup that survives read-only directories (agent).** Permission-restoring removal, still best-effort, tested against a `0555` directory. Plus a one-off reclaim that **skips any `agent-home/<runId>` whose run is non-terminal** — a sweep racing a live run is worse than the leak. **Fully independent of everything else here** — it shares only the incident that surfaced it, so it can land first or in parallel.
 - [ ] **M9a — Phase-1 docs.** `ARCHITECTURE.md` gains the message-path contract (what is sanitized, what returns 400, how a batch is bounded and bisected); `specs/ai.md` records Decisions 1-4. No CLI change in this phase: Phase 1 alters no DTO and adds no reason string the CLI renders.
+
+### Phase 1 progress — 2026-07-21
+
+**4 of 5 milestones implemented and gated; M9a not started. Implementation is NOT the same as validated — see the gaps below.**
+
+Branch `feature/prd-108-phase1`, 16 commits from `893fe7eb`. Two tracks (`api/**` and `agent/**`) built in parallel worktrees and merged twice with no conflicts.
+
+| Milestone | Commits |
+|---|---|
+| M1 | `0d99731a` (api, 7 RED cases) · `5b5e5caf` (agent characterization) |
+| M2 | `4bfb70d2` · `c88cfea8` · `0e62e8cc` · `e1935d78` · `f2ddb5ce` |
+| M3 | `cdfd91d4` (cap/split/backoff) · `05d138a3` (bisect/tombstone/breaker) |
+| M6 | `c7d9cce6` · `00ad07ba` (audit) · `b173ce4c` (review) |
+
+Gates on the merged tip: api `go vet` + `go test ./...` clean (var unset), live sweep RUN=154 PASS=154 SKIP=0, fuzz clean; agent 792 tests / 791 pass / 0 fail / 1 pre-existing skip; web 948 passing, typecheck and `check-docs` clean.
+
+**M1's version question is answered: both v0.9.0 (`89a76017`) and v0.10.0 (`1a3c5494`) reproduce identically** — status 500, SQLSTATE 22P05, 0 rows persisted, measured in separate detached worktrees against separate databases. M0's "Postgres behaviour, not a uzi regression" is confirmed; PRD #99's rewrite did not introduce it.
+
+**What is NOT done, stated plainly because the checkboxes above cannot say it:**
+
+- **M9a is not started.** ARCHITECTURE.md, `docs/configuration.md`, `.env.example` and `specs/ai.md` are outlined and approved but unwritten.
+- **Review is incomplete: 1 of 13 code commits reviewed.** That one review found a test that could not fail (a symlink fixture that never triggered the code path it asserted on). The remaining 12 have not had that treatment.
+- **Nothing has exercised the real runtime path.** No e2e run. Every green above is unit or integration level — and this PRD exists because of a failure that appeared only in production.
+- **No MR opened.**
+
+**Three milestones shipped beyond their written scope**, so the checkbox text above no longer describes what landed:
+
+- **M2** additionally returns **413** for an oversize body (`DecodeJSONLimited`, so `DecodeJSON`'s 57 call sites are untouched), enumerates **four** SQLSTATEs rather than three (22003 added — `{"n":1e1000000}` is valid JSON, survives sanitation and is permanently unstorable), sanitizes **`kind`** as a fourth worker-controlled text column the PRD never listed, and caps `agent` at `agenttmpl.MaxNameLen` where it previously reached an unbounded `text` column on every frame.
+- **M3** **tombstones instead of dropping** — a dropped seq permanently freezes the web client's live run view, because `runStream.ts` buffers any `seq > lastSeq+1` and never advances — and its breaker trips on a **duration** (~10 min transient) plus the permanent class, not on "N identical-batch failures"; a tight N would fail healthy runs through an ordinary API restart.
+- **M6** gained a startup bail (the awaited sweep could gate worker registration for hours against a hanging API), a `UZI_HOME_RECLAIM` operator kill switch, and a terminality oracle that deletes only on a positively-observed terminal status.
+
+**OPEN BLOCKING FINDING — a second poison pill on this route, not closed by Phase 1 as it stands.** `run_usage`'s primary key is `(run_id, session_id, model)` (`00062_run_usage.sql:35`), and both `session_id` and `model` are unbounded worker-controlled `text`. A btree index entry is capped at 2704 bytes; exceeding it raises **SQLSTATE 54000**, which is not in the enumerated permanent set, so it falls through to 500 and the batcher retries forever. Measured on `postgres:17` against the real schema, via two independent vectors (oversized `model`, and oversized `session_id` with a normal model). The payload survives everything Phase 1 does — it is valid UTF-8 with no escapes, so the sanitizer's fast path returns it untouched.
+
+**Adding 54000 to the enumerated set would not fix it**: the error is raised by `foldRunUsage`, not by `InsertRunMessage`, and the classifier is deliberately statement-level. The fix is a **cap, not a code** — `truncateRunes` on `model` and a bound on `session_id` before the upsert, the same treatment `c88cfea8` gave `agent`.
+
+*Reproduction note worth keeping: `repeat('m',3000)` does **not** reproduce it, because pglz compresses the index entry. It needs incompressible data. Anyone testing this with a repeated character concludes there is no bug.*
+
+This falsifies Success Criterion 2 ("returns 400, is not retried, and costs one message, not the run") by the same standard that put 22003 in the permanent set. **It is deliberately left open at this checkpoint rather than fixed in haste**, on two grounds: accidental reachability is materially lower than the NUL case (SDK model names are short and session ids are UUIDs, so this needs a garbled or hostile worker, where the incident's NUL arrived by accident from a headless Chromium), so Phase 1 still closes the *accidental* class that caused the incident; and unlike 22003 this is not a one-line addition to an existing set. **It is the first item for the next session.**
+
+It also makes `e1935d78`'s tripwire comment wrong in the way that matters most: its column enumeration is complete, but its *argument* reasons only about character validity and never about length, and its `session_id` claim ("comes from the runs row, so Postgres already accepted it") does not transfer — acceptance into an unindexed `text` column says nothing about indexability inside a composite primary key. A reader trusting that comment, which is what it was designed for, would believe both columns are handled. Fix the comment with the cap.
+
+**Six of this document's claims were falsified by implementing it.** Corrections are drafted and queued across eight edit sites: the three-SQLSTATE enumeration (Decision 3, Solution §2); "drop only that one" (Solution §3); "Decisions 1-4" (M9a — Phase 1 also ships M6); the breaker's N-consecutive-same-batch rule (Solution §3, M3); Solution §1's account of the text columns, wrong twice in one bullet (`agent` was uncapped entirely, not merely unstripped; and `kind` is a fourth column) — the latter also in M2's checkbox.
+
+*(Two things deliberately **not** corrected: M0's account of the pre-fix failure is history and stays as written — fixing what a passage describes does not falsify the passage; and Risk §2's "~8 extra round-trips" is correct for the one-sided bisection that shipped, and only looked wrong against a two-sided variant costing 16.)*
 
 ### Phase 2 — detect and stop
 
