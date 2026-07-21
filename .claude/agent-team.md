@@ -119,6 +119,42 @@ decides where the next person spends their time. Re-derive those too.
 - **`web/` has two `role="status"` regions** — `RateLimitAnnouncer` (app-wide,
   always-present, empty) comes first in the DOM, so any `querySelector("[role=status]")`
   silently grabs the wrong one. Selector-by-role here is ambiguous by construction.
+- **`${PIPESTATUS[0]}` IS A BASH-ISM AND THIS SHELL IS zsh — IT EXPANDS TO NOTHING,
+  SILENTLY.** zsh's array is `$pipestatus` and it is **1-indexed** (`$pipestatus[1]` is the
+  first command; bash's `PIPESTATUS` is 0-indexed). In zsh, `${PIPESTATUS[0]}` is simply an
+  unset variable: no error, no warning, an empty string. Verified in zsh 5.9 — `false | true`
+  gives zsh `pipestatus=(1 0)` and bash `PIPESTATUS=(1 0)` at `[0]`.
+  **Why this earns a traps entry rather than a footnote: it fails in a VERIFICATION step.** A
+  bash-ism in a *command* fails loudly and you fix it. A bash-ism in the *check that proves
+  the command passed* fails quiet, and the surrounding output still looks like success.
+  Measured on PRD #98's merged tip: a `npm run build` run ended with
+  `echo "=== BUILD EXIT: ${PIPESTATUS[0]} ==="`, which printed `=== BUILD EXIT:  ===` directly
+  beneath `✓ built in 3.19s`. The gate had genuinely passed — but nothing in that output
+  proved it, and the line written to prove it contributed nothing.
+  **`$pipestatus` IS CLOBBERED BY THE VERY NEXT COMMAND, INCLUDING A PLAIN `echo` — capture it
+  on the same line or it lies.** This is the half that makes the trap dangerous rather than
+  merely useless, and it was found while verifying the entry above: a first attempt read
+  `$pipestatus[1]` after an intervening `echo` and got **`0`** — a plausible, passing-looking
+  number describing the *echo*, not the pipeline. So the empty-string form is the LUCKY
+  failure (an empty string where a `0` belongs is visible); the correct-array-wrong-moment
+  form is the silent one, and it is exactly the "stale `0` would have shipped" case. Capture
+  with `a=("${pipestatus[@]}")` immediately, or do not pipe at all.
+  **The robust form: do not pipe when you need the exit status.** Redirect to a file, capture
+  `$?` on the very next line, then grep the file:
+  ```sh
+  npm run build > /tmp/build.log 2>&1
+  echo "BUILD EXIT CODE: $?"          # $? is unambiguous in both shells
+  grep -E "check-docs|✓ built" /tmp/build.log
+  ```
+  This also gives you the second half for free: grepping the log for the stage you care about
+  proves that stage RAN, not merely that the wrapper exited 0.
+  **The honest part, and the reason this is not a story about being careful:** the lesson is
+  not "watch for bash-isms", it is that **a verification step needs its own positive control**
+  — the same demand made of a live-DB run (`PASS>0`, `SKIP=0`) and of a mutation (assert it
+  applied). **Third variant of one shape on this branch**, alongside the fold that produced no
+  log file and the grep that ran against the wrong working tree: *the verification mechanism
+  failed silently while the thing it was verifying looked fine.* In all three, the output of a
+  broken check is indistinguishable from the output of a passing one.
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
