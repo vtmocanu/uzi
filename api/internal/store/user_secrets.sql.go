@@ -70,13 +70,14 @@ func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecret
 }
 
 const listMasterSealedSecrets = `-- name: ListMasterSealedSecrets :many
-SELECT kind, ciphertext FROM user_secrets
+SELECT id, kind, ciphertext FROM user_secrets
 WHERE user_id = $1 AND sealed_with = 'master'
 `
 
 type ListMasterSealedSecretsRow struct {
-	Kind       string `json:"kind"`
-	Ciphertext []byte `json:"ciphertext"`
+	ID         uuid.UUID `json:"id"`
+	Kind       string    `json:"kind"`
+	Ciphertext []byte    `json:"ciphertext"`
 }
 
 // The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault
@@ -84,6 +85,10 @@ type ListMasterSealedSecretsRow struct {
 // (RewrapUserSecret). Selects the ciphertext because rewrap must decrypt it; the
 // rows are only ever handed to the vault, never serialized out. Empty once a user
 // has been fully migrated, so the steady-state unlock does no rewrap work.
+//
+// Selects id because RewrapUserSecret is keyed on it (PRD #104 D10): the rewrap
+// loop reseals one row's plaintext and must write it back to THAT row, which is
+// only expressible once the row it opened carries an identity.
 func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID) ([]ListMasterSealedSecretsRow, error) {
 	rows, err := q.db.Query(ctx, listMasterSealedSecrets, userID)
 	if err != nil {
@@ -93,7 +98,7 @@ func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID)
 	items := []ListMasterSealedSecretsRow{}
 	for rows.Next() {
 		var i ListMasterSealedSecretsRow
-		if err := rows.Scan(&i.Kind, &i.Ciphertext); err != nil {
+		if err := rows.Scan(&i.ID, &i.Kind, &i.Ciphertext); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -141,13 +146,13 @@ func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]
 const rewrapUserSecret = `-- name: RewrapUserSecret :execrows
 UPDATE user_secrets
 SET ciphertext = $1, sealed_with = 'dek', updated_at = now()
-WHERE user_id = $2 AND kind = $3 AND sealed_with = 'master'
+WHERE id = $2 AND user_id = $3 AND sealed_with = 'master'
 `
 
 type RewrapUserSecretParams struct {
 	Ciphertext []byte    `json:"ciphertext"`
+	ID         uuid.UUID `json:"id"`
 	UserID     uuid.UUID `json:"user_id"`
-	Kind       string    `json:"kind"`
 }
 
 // Lazy migration (PRD #32): re-seal a legacy master-key-sealed secret under the
@@ -157,8 +162,16 @@ type RewrapUserSecretParams struct {
 // This does NOT un-leak a token that ever existed master-sealed — an operator
 // may have snapshotted the DB first; rotation is the real fix. It only improves
 // the at-rest posture going forward.
+//
+// Keyed on id, not (user_id, kind) (PRD #104 D10). The by-kind form was a silent
+// data-loss bug the moment a user could hold two secrets of one kind: the rewrap
+// loop opens row 1, reseals it, and the UPDATE matched EVERY master-sealed row of
+// that kind — overwriting siblings 2..N with row 1's bytes, after which the
+// remaining iterations matched nothing and the loop reported success. user_id is
+// kept in the predicate as a defensive scope (an id alone is already unique; this
+// makes a caller that hands us another user's id a no-op rather than a write).
 func (q *Queries) RewrapUserSecret(ctx context.Context, arg RewrapUserSecretParams) (int64, error) {
-	result, err := q.db.Exec(ctx, rewrapUserSecret, arg.Ciphertext, arg.UserID, arg.Kind)
+	result, err := q.db.Exec(ctx, rewrapUserSecret, arg.Ciphertext, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}

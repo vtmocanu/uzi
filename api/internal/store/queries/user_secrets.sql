@@ -41,7 +41,11 @@ SELECT count(*) FROM user_secrets WHERE sealed_with = 'master';
 -- (RewrapUserSecret). Selects the ciphertext because rewrap must decrypt it; the
 -- rows are only ever handed to the vault, never serialized out. Empty once a user
 -- has been fully migrated, so the steady-state unlock does no rewrap work.
-SELECT kind, ciphertext FROM user_secrets
+--
+-- Selects id because RewrapUserSecret is keyed on it (PRD #104 D10): the rewrap
+-- loop reseals one row's plaintext and must write it back to THAT row, which is
+-- only expressible once the row it opened carries an identity.
+SELECT id, kind, ciphertext FROM user_secrets
 WHERE user_id = $1 AND sealed_with = 'master';
 
 -- name: RewrapUserSecret :execrows
@@ -52,6 +56,14 @@ WHERE user_id = $1 AND sealed_with = 'master';
 -- This does NOT un-leak a token that ever existed master-sealed — an operator
 -- may have snapshotted the DB first; rotation is the real fix. It only improves
 -- the at-rest posture going forward.
+--
+-- Keyed on id, not (user_id, kind) (PRD #104 D10). The by-kind form was a silent
+-- data-loss bug the moment a user could hold two secrets of one kind: the rewrap
+-- loop opens row 1, reseals it, and the UPDATE matched EVERY master-sealed row of
+-- that kind — overwriting siblings 2..N with row 1's bytes, after which the
+-- remaining iterations matched nothing and the loop reported success. user_id is
+-- kept in the predicate as a defensive scope (an id alone is already unique; this
+-- makes a caller that hands us another user's id a no-op rather than a write).
 UPDATE user_secrets
 SET ciphertext = @ciphertext, sealed_with = 'dek', updated_at = now()
-WHERE user_id = @user_id AND kind = @kind AND sealed_with = 'master';
+WHERE id = @id AND user_id = @user_id AND sealed_with = 'master';

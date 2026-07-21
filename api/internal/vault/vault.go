@@ -231,9 +231,12 @@ func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
 			slog.Error("vault: rewrap seal (dek)", "user", userID, "kind", row.Kind, "error", serr)
 			continue
 		}
+		// Keyed on the row's id, never on (user_id, kind): a user may hold several
+		// secrets of one kind (PRD #104), and a by-kind UPDATE here would write this
+		// row's resealed bytes over every sibling (PRD #104 D10).
 		if _, rerr := v.q.RewrapUserSecret(ctx, store.RewrapUserSecretParams{
+			ID:         row.ID,
 			UserID:     userID,
-			Kind:       row.Kind,
 			Ciphertext: sealed,
 		}); rerr != nil {
 			slog.Error("vault: rewrap persist", "user", userID, "kind", row.Kind, "error", rerr)

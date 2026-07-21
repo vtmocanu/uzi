@@ -17,7 +17,14 @@ import (
 // race-safe create, lazy rewrap) are exercised without a live database. It models
 // the real semantics that matter: CreateUserVaultIfAbsent's DO NOTHING (returns
 // pgx.ErrNoRows on conflict) and RewrapUserSecret's guard on sealed_with='master'.
+//
+// Secrets are a flat ROW LIST, not a kind-keyed map: since PRD #104 a user may
+// hold several secrets of one kind, and a map keyed by kind would silently make
+// that impossible to stage — hiding exactly the rewrap-clobber bug D10 fixes.
 type fakeSecret struct {
+	id         uuid.UUID
+	userID     uuid.UUID
+	kind       string
 	ciphertext []byte
 	sealedWith string
 }
@@ -25,31 +32,45 @@ type fakeSecret struct {
 type fakeVaultStore struct {
 	mu      sync.Mutex
 	vaults  map[uuid.UUID]store.UserVault
-	secrets map[uuid.UUID]map[string]fakeSecret // userID → kind → secret
+	secrets []*fakeSecret
 }
 
 func newFakeVaultStore() *fakeVaultStore {
-	return &fakeVaultStore{
-		vaults:  make(map[uuid.UUID]store.UserVault),
-		secrets: make(map[uuid.UUID]map[string]fakeSecret),
-	}
+	return &fakeVaultStore{vaults: make(map[uuid.UUID]store.UserVault)}
 }
 
-// putSecret seeds a stored secret (used to stage a legacy master-sealed row).
-func (f *fakeVaultStore) putSecret(userID uuid.UUID, kind string, ciphertext []byte, sealedWith string) {
+// putSecret seeds a stored secret (used to stage a legacy master-sealed row) and
+// returns its id, so a test can assert on one specific row of a kind.
+func (f *fakeVaultStore) putSecret(userID uuid.UUID, kind string, ciphertext []byte, sealedWith string) uuid.UUID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.secrets[userID] == nil {
-		f.secrets[userID] = make(map[string]fakeSecret)
-	}
-	f.secrets[userID][kind] = fakeSecret{ciphertext: ciphertext, sealedWith: sealedWith}
+	s := &fakeSecret{id: uuid.New(), userID: userID, kind: kind, ciphertext: ciphertext, sealedWith: sealedWith}
+	f.secrets = append(f.secrets, s)
+	return s.id
 }
 
+// getSecret returns the user's single secret of a kind. It is only valid where the
+// test staged exactly one; multi-row cases use getSecretByID.
 func (f *fakeVaultStore) getSecret(userID uuid.UUID, kind string) (fakeSecret, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s, ok := f.secrets[userID][kind]
-	return s, ok
+	for _, s := range f.secrets {
+		if s.userID == userID && s.kind == kind {
+			return *s, true
+		}
+	}
+	return fakeSecret{}, false
+}
+
+func (f *fakeVaultStore) getSecretByID(id uuid.UUID) (fakeSecret, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.secrets {
+		if s.id == id {
+			return *s, true
+		}
+	}
+	return fakeSecret{}, false
 }
 
 func (f *fakeVaultStore) GetUserVault(_ context.Context, userID uuid.UUID) (store.UserVault, error) {
@@ -77,23 +98,31 @@ func (f *fakeVaultStore) ListMasterSealedSecrets(_ context.Context, userID uuid.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := []store.ListMasterSealedSecretsRow{}
-	for kind, s := range f.secrets[userID] {
-		if s.sealedWith == store.SealedWithMaster {
-			out = append(out, store.ListMasterSealedSecretsRow{Kind: kind, Ciphertext: s.ciphertext})
+	for _, s := range f.secrets {
+		if s.userID == userID && s.sealedWith == store.SealedWithMaster {
+			out = append(out, store.ListMasterSealedSecretsRow{ID: s.id, Kind: s.kind, Ciphertext: s.ciphertext})
 		}
 	}
 	return out, nil
 }
 
+// RewrapUserSecret models the real statement's predicate exactly —
+// WHERE id = @id AND user_id = @user_id AND sealed_with = 'master' — including
+// that it is a set-based UPDATE, so a predicate matching several rows would write
+// all of them (which is how the pre-D10 by-kind form destroyed siblings).
 func (f *fakeVaultStore) RewrapUserSecret(_ context.Context, arg store.RewrapUserSecretParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s, ok := f.secrets[arg.UserID][arg.Kind]
-	if !ok || s.sealedWith != store.SealedWithMaster { // guard: WHERE sealed_with='master'
-		return 0, nil
+	var n int64
+	for _, s := range f.secrets {
+		if s.id != arg.ID || s.userID != arg.UserID || s.sealedWith != store.SealedWithMaster {
+			continue
+		}
+		s.ciphertext = arg.Ciphertext
+		s.sealedWith = store.SealedWithDEK
+		n++
 	}
-	f.secrets[arg.UserID][arg.Kind] = fakeSecret{ciphertext: arg.Ciphertext, sealedWith: store.SealedWithDEK}
-	return 1, nil
+	return n, nil
 }
 
 func newTestVault(t *testing.T) (*Vault, *secretbox.Box) {
@@ -326,6 +355,70 @@ func TestLazyRewrapOnUnlock(t *testing.T) {
 	// A second unlock finds nothing left to rewrap (idempotent).
 	if rows, _ := st.ListMasterSealedSecrets(ctx, uid); len(rows) != 0 {
 		t.Fatalf("still %d master-sealed rows after rewrap", len(rows))
+	}
+}
+
+// TestRewrapPreservesSiblingSecretsOfSameKind is the PRD #104 D10 regression gate.
+//
+// Before the fix, RewrapUserSecret was keyed on (user_id, kind, sealed_with='master')
+// and ListMasterSealedSecrets returned no id, so the rewrap loop's FIRST iteration
+// resealed token 1 and wrote it over EVERY master-sealed row of that kind. The
+// remaining iterations then matched nothing (the siblings were already 'dek') and
+// the loop finished without a single error: tokens 2..N were silently replaced by a
+// copy of token 1. It is reachable in a supported configuration — a vault-nil
+// deployment seals everything 'master', and PRD #32's documented upgrade is to
+// enable the vault later, at which point the owner's first unlock runs this loop.
+//
+// The gate: two master-sealed rows of ONE kind with DIFFERENT plaintexts must both
+// survive an unlock with their own original plaintext. Asserting on the plaintexts
+// (not just on distinct ciphertexts) is what makes the clobber unmissable — the
+// buggy path leaves two rows that both open, but to the SAME secret.
+func TestRewrapPreservesSiblingSecretsOfSameKind(t *testing.T) {
+	v, master, st := newTestVaultWithStore(t)
+	ctx := context.Background()
+	uid := uuid.New()
+
+	// Two legacy rows of the same kind, distinct plaintexts (a Max subscription and
+	// a console key, in the motivating scenario).
+	first := []byte("token-one-subscription")
+	second := []byte("token-two-console-key")
+	sealFirst, err := master.Seal(first)
+	if err != nil {
+		t.Fatalf("master.Seal first: %v", err)
+	}
+	sealSecond, err := master.Seal(second)
+	if err != nil {
+		t.Fatalf("master.Seal second: %v", err)
+	}
+	idFirst := st.putSecret(uid, testKind, sealFirst, store.SealedWithMaster)
+	idSecond := st.putSecret(uid, testKind, sealSecond, store.SealedWithMaster)
+
+	if err := v.Unlock(ctx, uid, "rewrap-two-rows-pw"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   uuid.UUID
+		want []byte
+	}{
+		{"first", idFirst, first},
+		{"second", idSecond, second},
+	} {
+		row, ok := st.getSecretByID(tc.id)
+		if !ok {
+			t.Fatalf("%s row vanished during rewrap", tc.name)
+		}
+		if row.sealedWith != store.SealedWithDEK {
+			t.Fatalf("%s row sealed_with = %q, want %q (it was never rewrapped)", tc.name, row.sealedWith, store.SealedWithDEK)
+		}
+		opened, oerr := v.Open(uid, testKind, store.SealedWithDEK, row.ciphertext)
+		if oerr != nil {
+			t.Fatalf("Open %s row after rewrap: %v", tc.name, oerr)
+		}
+		if !bytes.Equal(opened, tc.want) {
+			t.Fatalf("%s row now holds %q, want %q — a sibling secret was overwritten by the rewrap", tc.name, opened, tc.want)
+		}
 	}
 }
 
