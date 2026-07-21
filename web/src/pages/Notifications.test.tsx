@@ -278,11 +278,14 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(rowLink("review one")?.getAttribute("href")).toBe("/judge?run=run-one");
     expect(rowLink("review two")?.getAttribute("href")).toBe("/judge?run=run-two");
     expect(rowLink("review three")?.getAttribute("href")).toBe("/judge?run=run-three");
-    // The distinctness property spelled out. It is strictly WEAKER than the three lines
-    // above (differing-but-wrong satisfies it, and they would already catch a constant), so
-    // it adds no discrimination — it is here to state the property those three lines depend
-    // on, so a later edit that collapses the fixture back to one shared run id has to walk
-    // past a line naming what that would destroy.
+    // The distinctness property spelled out. Against PRODUCTION code it is strictly WEAKER
+    // than the three lines above (differing-but-wrong satisfies it, and they already catch a
+    // constant anchor) — but its gate is the FIXTURE, and that is a failure mode the three
+    // cannot cover. Measured: collapse the rows back onto one shared run id and then repair
+    // only the assertions that went red — the fix-what-failed-and-stop workflow, production
+    // code untouched — and this line is the one that still fails, `expected 1 to be 3`. It
+    // is the last thing standing between a tidy-looking edit and the silent loss of the
+    // discrimination the whole test depends on.
     const hrefs = screen.getAllByText("· Open in Judge").map((el) => el.closest("a")?.getAttribute("href"));
     expect(new Set(hrefs).size).toBe(3);
     // …and the HEADER deliberately carries NO anchor: it spans several runs, so anchoring it

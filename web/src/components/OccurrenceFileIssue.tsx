@@ -70,9 +70,11 @@ export function OccurrenceFileIssue({
   //
   // What is missing is the ability to SEE it: JudgeOccurrence (and its enclosing group)
   // ships no review timestamp — see lib/api.ts — so the comparison RunView makes is not
-  // computable from this DTO. The server has it (`rv.updated_at` is right there in the
-  // backlog query's FROM clause, just unprojected); projecting it is what would let this
-  // filed row carry the same warning.
+  // computable from this DTO. The server does not merely have the column, it ALREADY READS
+  // it: `rv.updated_at` is the leading sort key of the backlog query
+  // (api/internal/store/queries/judge_recommendations.sql:100, `ORDER BY rv.updated_at
+  // DESC …`). So it is loaded and simply not selected, and projecting it onto the occurrence
+  // is what would let this filed row carry the same warning.
   if (filed || local) {
     const iid = local ? local.iid : filed!.issue_iid;
     const url = local ? local.web_url : filed!.issue_url;

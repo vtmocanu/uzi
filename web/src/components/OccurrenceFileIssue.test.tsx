@@ -401,25 +401,40 @@ describe("OccurrenceFileIssue — the write is issued through the app's API clie
   //   - owner/admin scoping: covered (NonOwnerNotFound, AdminNonOwnedRepoNotFound, …)
   //   - the write-boundary sanitizer: covered (WriteBoundarySanitizesClientBody,
   //     TitleSanitizedAtPost, EmptyTitleRejected)
-  //   - the forge limiter's MOUNT: not covered — and NOT just on this route.
+  //   - the forge limiter's MOUNT: not covered — and the gap is far wider than this route.
   //
-  // That last one is broader than "our route is untested", so state it as the class it is.
-  // Measured at 3194633a (line numbers below belong to that SHA; the SHA is the durable
-  // half, the 13 is that tree's inventory): THIRTEEN routes in handler.go mount
-  // `forgeLimiter.PerUserMiddleware` — :596 /{id}/verify, :598 /{id}/projects, :600 PUT
-  // /{id}, :603 /{id}/privilege-check, :621 /{id}/runs, :636 /{id}/issues/{iid}, :638
-  // …/move, :641 …/prdless, :642 /{id}/sync, :644 POST /{id}/issues, :647 /{id}/ci-fix-runs,
-  // :731 this route, :760 /{id}/proposals/{pid}/confirm. The only `PerUserMiddleware`
-  // occurrences in the entire api test tree are chat_test.go:212 and slack_test.go:322, and
-  // each builds its OWN `chi.NewRouter()` with its own `mw.NewLimiter(1, …)` for its own
-  // route.
+  // THE DURABLE CLAIM IS THE MECHANISM; the numbers below are one tree's inventory, measured
+  // at 40e96a4c (line numbers belong to that SHA):
   //
-  // So be precise about what is and is not claimed. The middleware itself IS exercised —
-  // those two prove it answers 429 past the budget. What NOTHING asserts is that any of the
-  // thirteen forge routes actually CARRIES it: deleting a `.With(forgeLimiter…)` from any of
-  // them leaves the api suite and this file green alike. Named here because a web test that
-  // looked like it covered this would be worse than no test; out of scope to fix from web/,
-  // and a Go-side change besides.
+  // (a) MOUNT vs BEHAVIOUR. handler.go carries 24 per-user limiter mounts across five
+  //     limiter instances — forge 13, chat 3, auth 3, slackDM 2, hosted 2, judge 1. (A bare
+  //     grep says 27; :399, :456 and :618 are comments.) The only `PerUserMiddleware`
+  //     assertions in the entire api test tree are chat_test.go:212 and slack_test.go:322.
+  //     Deleting ALL 13 `.With(forgeLimiter…)` wrappers leaves `go vet` clean and
+  //     `go test ./...` at zero failures against an equally green baseline — re-run here,
+  //     not inherited. (The auditor separately deleted the 8 chat/slackDM/hosted/judge
+  //     mounts with the same result, so 21 of the 24 are proven unasserted; the remaining 3
+  //     are authLimiter, covered by e2e/run-e2e.sh's repeated-login 429, not by Go.)
+  //
+  // (b) NEITHER ASSERTION IS ON A forgeLimiter ROUTE AT ALL. chat_test.go's
+  //     `/{id}/continue` rides chatLimiter (handler.go:759) and slack_test.go's `/test-dm`
+  //     rides slackDMLimiter (:467). So `forgeLimiter` — the instance guarding all 13 forge
+  //     routes, including this one — has ZERO assertions of any kind. What those two prove
+  //     is that the shared TYPE `mw.Limiter.PerUserMiddleware` 429s past its budget, through
+  //     two other instances. Do not read "the middleware is exercised" as "forgeLimiter is".
+  //     Worse, each hand-writes its own `chi.NewRouter()` and CONSTRUCTS the very `.With(…)`
+  //     it then observes working — a tautology with respect to the mount, so those two
+  //     routes' own mounts are unasserted too, and both suites stayed green when they were
+  //     deleted.
+  //
+  // (c) WHY NOTHING CATCHES IT. review_issue_livedb_test.go calls `h.FileIssue(rr, req)` as
+  //     a plain function and never constructs a router (zero `Routes()` / `chi.NewRouter`
+  //     hits in that file), so no middleware chain executes and it could not observe a
+  //     missing `.With(…)` even in principle. And `chi.Walk` appears NOWHERE under api/, so
+  //     there is no route-table snapshot test and none can be trivially derived.
+  //
+  // Named here because a web test that looked like it covered this would be worse than no
+  // test. Out of scope to fix from web/, and a Go-side change besides.
   it("POSTs to the recommendation's issue route with the CSRF header and the session cookie", async () => {
     const real = (await vi.importActual<typeof import("../lib/api")>("../lib/api")).api;
     mockApi.fileIssue.mockImplementation(real.fileIssue);
