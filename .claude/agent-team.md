@@ -246,9 +246,20 @@ wrong is what makes rule 1 too expensive to keep.**
   comment, which on a branch doing comment corrections is roughly every commit.
   One expired *within a single commit* on PRD #98. Re-read HEAD immediately
   before sending.
-- A claim about a **QUERY'S BEHAVIOUR** expires only when the QUERY, the FIXTURE
-  or the ASSERTIONS change. `git diff <measured-sha>..HEAD -- <those paths>`
-  settles it in seconds, and a **comment-only diff means the result STANDS**.
+- A claim about a QUERY'S BEHAVIOUR expires when anything it executed against changes — the
+  query, the fixture, the assertions, and the ENVIRONMENT. `git diff <measured-sha>..HEAD --
+  <those paths>` can only FALSIFY a measurement, never confirm one: a changed path proves it
+  stale, an unchanged path proves nothing about the environment it ran against. Use it to stop
+  early, never to conclude. The environment is the part that moves without appearing in any
+  diff you would think to run: the migration set that applies before yours, the Postgres
+  version, the sqlc version. Measured on PRD #98's landing merge (2026-07-21): the five files
+  carrying the tenant-boundary pins were BYTE-IDENTICAL across the merge while FIVE new
+  migrations landed ahead of ours, so every fold on the branch had been measured against DDL
+  the suite no longer ran on. A green suite does not close this — passing proves the tests
+  pass, not that they would still FAIL if the code were wrong, and four green gates were in
+  hand at the time. The pins were re-folded and all three still reddened. THAT IS THE REASON TO
+  RE-FOLD, NOT A REASON TO SKIP IT: "they survived last time" is the inference this entry
+  exists to prevent.
 
 **A measurement is bound to a WORKING TREE as well as to a SHA, and a persisted `cd` silently
 rebinds it.** Evidence: an auditor verified a "zero hits" grep from a shell whose working
@@ -271,9 +282,15 @@ of replying "anchor not found".
 
 Worked example, both halves from one day: the auditor reported a comment gap at
 `c1fcdfce` that `a2b554a6` had already closed — genuinely stale. Its **fold**
-results from the same run still stood, because
+results from the same run still stood, and note carefully WHAT that took, because the
+path diff was only half of it:
 `git diff c1fcdfce..HEAD -- api/internal/store/recommendation_dispositions_integration_test.go`
-was comment-only: no SQL, no fixture row, no assertion changed.
+was comment-only — no SQL, no fixture row, no assertion changed — **and** no migration moved
+in that window, so the environment was constant too (verified after the fact:
+`git diff c1fcdfce..965d7b3e -- internal/store/migrations/` is empty). The comment-only diff
+alone would NOT have licensed the conclusion; it merely failed to falsify it. Had a migration
+landed in between — as five did at the landing merge — the same empty diff would have
+accompanied a dead measurement.
 
 **The point of the entry is the cost.** Without the split, the honest response to
 "your tree was stale" is to re-run eleven folds that nothing invalidated — and a
@@ -306,6 +323,15 @@ it named as declared-but-unfolded had since been folded. The author caught its
 own decay and supplied a past-tense rewrite. Ship the claim verbatim; restate the
 examples as **dated history** ("as of <date>, before X landed, …"), which cannot
 expire and reads as evidence rather than assertion.
+
+**A SUMMARY IS CHECKABLE FOR SHAPE; ONLY THE ARTIFACT IS CHECKABLE FOR FACTS.** Both are real
+capabilities and they are not substitutes. Evidence: a reviewer described a draft and asked
+the auditor to critique it; the auditor correctly refused to approve prose it could not read,
+was right about the draft's STRUCTURAL defect anyway — predicting it from the shape alone,
+sight unseen — and then found a wrong NUMBER in it within ninety seconds of finally being sent
+the actual words. Record with it what that cost: **the lead's screening step and the author's
+own self-review had both passed the text with the wrong number in it.** The second validator
+reading the artifact is the only reason it is not in a tracked file.
 
 **2. A LINE NUMBER IS MEANINGLESS WITHOUT A SHA.** `grep -n` answers a question
 about a tree that may not survive the hour. `git show <sha>:<path>` is the only
