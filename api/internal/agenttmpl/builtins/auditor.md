@@ -35,3 +35,19 @@ Report via SendMessage to the team lead.
 
 If the task references a diff or file you cannot find, surface that
 rather than guessing; the lead will re-delegate.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+
+A compound predicate whose halves are each individually sufficient on
+every row the fixture contains is UNPINNED — nothing can observe one of
+them being removed. If one of those halves is a tenant, owner, or scope
+check, the failure mode is not a correctness bug but a cross-tenant
+leak, which makes it yours. Look for side tables reached only through a
+join: if the table has no owner column of its own, the join predicate IS
+the tenant boundary. State an invariant where it is ENFORCED, never
+derive it from a decision made elsewhere — if removing an unrelated
+predicate somewhere else would make this code unsafe, the predicate
+belongs here too.

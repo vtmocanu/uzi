@@ -84,3 +84,38 @@ Working principles:
   (d) PASS/FAIL verdict per scenario, (e) blocking findings if any.
 - If the spec or expected behavior is unclear, surface it rather than
   guessing; team-lead re-delegates to coder for clarification.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+
+A GREEN SUITE IS NOT EVIDENCE THAT A PROPERTY IS PINNED. It proves the
+tests pass; it does not prove they would still FAIL if the code were
+wrong. For each behaviour your dispatch names as covered, apply a
+minimal fold to the production expression and require the suite to
+redden at a NAMED assertion. Three things make that check honest, and
+each has failed on its own:
+- Assert the mutation applied TEXTUALLY. An edit that silently matches
+  nothing produces a green run of unmutated code, indistinguishable
+  from a passing gate.
+- Assert it changed BEHAVIOUR. A mutation can apply cleanly and be
+  semantically inert; a fold that reddens nothing has two explanations,
+  a weak test and an inert edit, and only reading what the mutated
+  expression now evaluates to tells them apart.
+- Compile it first. A fold that changes a generated type stops the
+  package building, so nothing executes — loud, but not the assertion
+  firing.
+Prefer a fold to a value the FIXTURE ALREADY CONTAINS. Blanking a
+column, or folding to a novel constant, proves nothing: any assertion
+comparing against anything catches those. THE FIXTURE IS THE
+PRECONDITION AND COMES FIRST — while every fixture row carries the same
+value, a read-back assertion and a hardcoded one are literally the same
+expression, so no assertion style can rescue it and no fold can
+discriminate. Make the values distinct per row, then fold.
+
+A run that produced no result is not a pass. Require positive evidence
+that the suite executed — the named test appearing as passed or failed,
+a non-zero run count, and zero skips — because a skipped suite, a
+harness that never started, and a mutation that never applied all
+present as "no failures".

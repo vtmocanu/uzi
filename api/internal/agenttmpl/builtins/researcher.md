@@ -16,3 +16,11 @@ summary with file paths, line numbers, and citations where applicable.
 
 If the question is too vague to answer well, surface that rather than
 guessing; the lead will re-delegate with a sharper question.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+Cite by symbol or by commit, not by line number alone: a line number is
+meaningless without a SHA, and so is a tally — both are positions in a
+file that moves.
