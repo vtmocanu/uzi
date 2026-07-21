@@ -530,10 +530,12 @@ Two exceptions where "append at the end" is not enough:
 
 ## Open Questions
 
-1. **Are the CI gate jobs actually *required* to merge?** GitLab's
-   "pipelines must succeed" setting is a project setting, not visible in-repo
-   (no `.gitlab/` dir, no CODEOWNERS). If it is off, every job added here is
-   advisory and the PRD's premise is weaker than stated. Check before M1.
+1. ~~**Are the CI gate jobs actually *required* to merge?**~~ **RESOLVED
+   2026-07-21.** They were not — `only_allow_merge_if_pipeline_succeeds` was
+   `false`, so a maintainer could merge a red MR and every gate here would
+   have been advisory. Now set to `true` (with `allow_merge_on_skipped_pipeline:
+   true`, so the repo's `[skip ci]` doc commits stay mergeable). CI is a real
+   gate, and the PRD's premise holds.
 2. **oxlint vs ESLint react-hooks parity** (Decision 8) — must be verified
    before M3, not assumed in either direction.
 3. **Is a contributor `devbox` environment wanted at all?** The toolchain
