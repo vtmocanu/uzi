@@ -987,9 +987,21 @@ function AgentBlock({
           </span>
         )}
         {!expanded && unseen > 0 && (
+          // Hidden below `sm` (E1 follow-up). The pill is shrink-0, as are the state
+          // word and the timestamp, so on a LIVE run at 390px it takes the last of the
+          // space the one-liner has already given up and the label starves again:
+          // MEASURED mid-flight, the label averaged 23px (min 19) of the 166px it
+          // needed — zero characters — against 46px with no pill. Seeded fixtures have
+          // no unseen counts, so this configuration only reproduces on a live run and
+          // every earlier 390px number was the BEST case.
+          //
+          // Same principle as the shrink priority above, one layer out: the pill is a
+          // "there is more here" nudge, and it is redundant on a phone where the lane
+          // is a tap away — the label is the lane's identity and cannot be recovered by
+          // tapping. Detail yields before identity.
           <span
             title={`${unseen} new since you last looked`}
-            className="shrink-0 rounded-full bg-brand/15 px-1.5 py-0.5 text-[10px] font-medium text-brand"
+            className="hidden shrink-0 rounded-full bg-brand/15 px-1.5 py-0.5 text-[10px] font-medium text-brand sm:inline-flex"
           >
             +{unseen}
           </span>

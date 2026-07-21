@@ -170,7 +170,10 @@ function implementScript(runId: string): Timed[] {
       "Bash",
       { command: "cd api && go test ./internal/handler/..." },
       "--- FAIL: TestWorkerMetrics_Stale (0.02s)\n    metrics_test.go:41: staleness window off by one",
-      { error: true, runFor: 2600, attr: ATTR_B },
+      // Unit A's failure: it is A that wrote metrics.go a frame earlier, and A that
+      // diagnoses and fixes it below. Attributing the FAIL to B left a reader who
+      // expanded both lanes finding the diagnosis in the wrong unit.
+      { error: true, runFor: 2600, attr: ATTR_A },
     ),
     ...say(runId, "coder", "The staleness comparison used `>` where the sweeper uses `>=`. Aligning with the sweeper and re-running.", undefined, ATTR_A),
     ...tool(runId, "coder", "Edit", { file_path: "api/internal/handler/metrics.go" }, "ok", { attr: ATTR_A }),

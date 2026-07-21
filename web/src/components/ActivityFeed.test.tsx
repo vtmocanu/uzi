@@ -863,6 +863,18 @@ describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
     // looks at is the thing under test. run-busy has a doubled `tester` (one lane
     // active, one recent -> waiting) and a doubled `coder` (both stale -> idle), so
     // waiting must sort ahead of idle and `tester` leads the strip.
+    //
+    // TIME MUST BE PINNED. data.ts bakes its timestamps at MODULE LOAD via minsAgo(),
+    // so they age in real time while the suite runs: the recent tester lane sits 24s
+    // back, and once this file is reached more than ~21s after data.ts loads it falls
+    // out of the 45s recency window, flips waiting -> idle, and the rollup reads
+    // `tester ×2: working` instead. MEASURED as a real flake across repeated runs
+    // (1 in 3), and it is a property of the FIXTURE's clock, not of the ordering under
+    // test. Pinning to just after the newest frame makes it deterministic without
+    // weakening the assertion.
+    const newest = Math.max(...mockBusyMessages.map((m) => new Date(m.created_at).getTime()));
+    vi.useFakeTimers();
+    vi.setSystemTime(newest + 1_000);
     const { container } = renderFeed(mockBusyMessages, { status: "running", health: "ok" });
     const chips = [...container.querySelectorAll('[aria-label="Crew"] button')].map(
       (b) => b.getAttribute("title") ?? "",
