@@ -576,9 +576,24 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   on that WHERE clause counts the DDL as an execution. **It is guaranteed for exactly the queries
   important enough to have a supporting index — i.e. the ones most worth counting.** Header-anchored,
   the same log gives the true count; only `execute` lines carry the `-- name:` header.
-  **Keep this entry and the stderr one together: they fail in OPPOSITE directions.** A broken capture
-  under-counts to zero; a WHERE-clause grep over-counts. A tally that agrees with your expectation is
-  not thereby correct — it may be two errors, or the wrong one cancelling.
+  **THIRD FAILURE MODE: Postgres echoes the offending statement on a `STATEMENT:` line beside every
+  `ERROR`, so any query a test deliberately makes fail is logged TWICE and counted twice.** Measured:
+  17 such lines in one sweep, inflating 10 queries (`CreateUserOIDC` 32→27, `InsertUserSecret`
+  129→126, `UpsertRecommendationDisposition` 7→5). Exclude `STATEMENT:` lines. Found by the agent
+  that had itself written the recipe everyone else was told to use — no published figure moved, but
+  only because the affected queries sat inside stated ranges rather than being quoted individually,
+  which is **luck, not method**.
+  **SO THE INSTRUMENT HAS THREE KNOWN WAYS OF LYING AND THEY DO NOT POINT THE SAME DIRECTION** — a
+  broken capture **under**-counts to zero; a body-text anchor **over**-counts by catching DDL; a
+  `STATEMENT:` echo **over**-counts by double-counting errors. Each needs its own guard, and a tally
+  that matches your expectation is not thereby correct: it may be two errors, or the wrong one
+  cancelling.
+  **The one reading no over-count can fake is a ZERO** — which is fortunate, because "this query has
+  never executed" is the claim these tallies are usually load-bearing for. The corollary is the
+  practical rule: **verifying the CAPTURE matters more than verifying any tally.** Confirm the log
+  contains a statement you know ran before believing any zero in it.
+  Anchor precisely, too: `ListAppSettings` matches `ListAppSettingsForUpdate` unless the anchor
+  carries the trailing `" :"`.
   **The resolution is also the model for settling a disagreement between two measurements: ask the
   PROPERTY, not the total.** The dispute here looked like arithmetic and was actually "does the
   masking layer reject before the handler runs?" — settled by a probe that bracketed each principal's
