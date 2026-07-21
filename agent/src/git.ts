@@ -131,6 +131,18 @@ export interface RunnerClone {
   path: string;
   /** Branch the runner clone is on — `agent/issue-{iid}`, `ci-fix/…`, or `uzi/…`. */
   branch: string;
+  /** How many commits the seeded branch already carries that the default branch does
+   *  not — i.e. work a PREVIOUS run (or a human) pushed to this branch, which the
+   *  clone was based off. 0 when seeded off the default branch, and 0 when the count
+   *  could not be taken (best-effort: this is prompt colour, never load-bearing).
+   *
+   *  NOT "the commits the interrupted attempt made": a run pushes exactly once, after
+   *  the executor returns (runner.ts), and this seed `fs.rm`s and re-clones — so an
+   *  attempt requeued mid-flight left NOTHING behind. What lands here is prior
+   *  PUSHED work: an earlier completed run on the same issue, the self_improve fixed
+   *  branch's previous cycles, or a human's commits. Issue #105 uses it to warn the
+   *  lead off redoing work it can no longer remember doing. */
+  priorCommits: number;
 }
 
 /**
@@ -280,7 +292,12 @@ export class GitCache {
       const resume = await this.refExists(barePath, originRef);
       const baseRef = resume ? originRef : await this.defaultBranchRef(barePath);
       const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
-      this.log.info("runner clone: seeding", { branch, base: baseRef, resume, path: clonePath });
+      // How much prior pushed work the seed carries (issue #105). Counted in the BARE,
+      // which holds both refs; the clone does not necessarily have the default branch.
+      // Best-effort by construction — a repo with no resolvable default branch, or any
+      // rev-list failure, yields 0 rather than failing a run over prompt colour.
+      const priorCommits = resume ? await this.commitsAheadOfDefault(barePath, baseSha) : 0;
+      this.log.info("runner clone: seeding", { branch, base: baseRef, resume, prior_commits: priorCommits, path: clonePath });
 
       // The seed clone + checkout run as the RUNNER uid (PRD #51 M4), so the clone +
       // working tree are runner-owned (the agent commits there; the worker never writes
@@ -289,8 +306,18 @@ export class GitCache {
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
       await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
-      return { path: clonePath, branch };
+      return { path: clonePath, branch, priorCommits };
     });
+  }
+
+  /** Commits reachable from `sha` but not from the repo's default branch. Best-effort:
+   *  any failure (no resolvable default, an unexpected rev-list error) answers 0, so a
+   *  caller can treat a non-zero count as "there is prior work here" and nothing else. */
+  private async commitsAheadOfDefault(barePath: string, sha: string): Promise<number> {
+    const defaultRef = await this.defaultBranchRef(barePath).catch(() => undefined);
+    if (!defaultRef) return 0;
+    const n = Number.parseInt(await this.tryGitStdout(barePath, ["rev-list", "--count", `${defaultRef}..${sha}`]), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
   }
 
   /**

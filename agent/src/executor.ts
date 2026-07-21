@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Logger } from "./log.js";
 import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
+import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
@@ -70,8 +71,16 @@ export interface RunContext {
   memory?: MemoryEntry[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
-  /** SDK session to resume; null/absent for a fresh run. */
+  /** SDK session to resume; null/absent for a fresh run. The runner clears this when
+   *  the named transcript is not on THIS worker's disk (issue #105) — the SDK resolves
+   *  a resume locally, so passing an unresolvable id fails the whole run before the
+   *  first turn instead of resuming anything. */
   sessionId?: string | null;
+  /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
+   *  already carries pushed work. The executor forwards it to the planning prompt so
+   *  an amnesiac lead is told to read the existing commits rather than redo them —
+   *  the honest degradation must not become silently duplicated work. */
+  priorWork?: PriorWork;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */

@@ -376,6 +376,9 @@ export class SdkExecutor implements Executor {
           // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
           // nonce-fenced cross-run memory back (empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: only set when a dropped resume left this turn amnesiac on a
+          // branch that already carries pushed work.
+          priorWork: ctx.priorWork,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -388,6 +391,8 @@ export class SdkExecutor implements Executor {
           // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
           // nonce-fenced cross-run memory back (empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: see above — the fixed self_improve branch's prior cycles.
+          priorWork: ctx.priorWork,
         });
       } else {
         planPrompt = buildPlanPrompt({
@@ -399,6 +404,8 @@ export class SdkExecutor implements Executor {
           // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
           // runner fetched it at claim time; empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: see above — prior pushed work on this issue's branch.
+          priorWork: ctx.priorWork,
         });
       }
       const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";

@@ -403,3 +403,48 @@ describe("buildCIFixPlanPrompt untrusted-field hardening (PRD #6)", () => {
     assert.notEqual(mk(), mk());
   });
 });
+
+// ── Prior-work note (issue #105) ─────────────────────────────────────────────
+//
+// When a dead resume is dropped, the lead re-plans with NO memory of the earlier
+// turns. If the branch it is standing on already carries pushed work, it must be told
+// — otherwise the honest degradation (drop the resume, keep going) just becomes
+// silently duplicated work, which is the harder failure to notice.
+describe("plan prompts — prior-work note (issue #105)", () => {
+  const base = { issueIid: 1, issueTitle: "t", issueDescription: "d", branch: "agent/issue-1", subagentNames: [] };
+
+  it("injects nothing when there is no prior work to warn about", () => {
+    assert.ok(!/already carries/.test(buildPlanPrompt(base)));
+    assert.ok(!/already carries/.test(buildPlanPrompt({ ...base, priorWork: { commits: 0 } })));
+  });
+
+  it("tells the lead it cannot remember the work already on the branch", () => {
+    const p = buildPlanPrompt({ ...base, priorWork: { commits: 3 } });
+    assert.match(p, /interrupted and restarted/);
+    assert.match(p, /do not remember/);
+    assert.match(p, /already carries 3 commits/);
+    assert.match(p, /Do not redo what is already committed/);
+  });
+
+  it("gets the singular right (a one-commit branch is not '1 commits')", () => {
+    assert.match(buildPlanPrompt({ ...base, priorWork: { commits: 1 } }), /already carries 1 commit of work/);
+  });
+
+  it("carries the same note on the ci_fix and self_improve planning turns", () => {
+    const ciFix = buildCIFixPlanPrompt({
+      ref: "main", branch: "b", pipelineWebURL: "u", failedJobs: [], subagentNames: [], priorWork: { commits: 2 },
+    });
+    assert.match(ciFix, /already carries 2 commits/);
+    const selfImprove = buildSelfImprovePlanPrompt({
+      branch: "uzi/self-improve", recommendations: "r", subagentNames: [], priorWork: { commits: 2 },
+    });
+    assert.match(selfImprove, /already carries 2 commits/);
+  });
+
+  it("states the note OUTSIDE every untrusted fence (it is uzi's own fact about the branch)", () => {
+    const p = buildPlanPrompt({ ...base, issueDescription: "untrusted body", priorWork: { commits: 2 } });
+    // The note precedes the untrusted frame entirely, so no fenced content can
+    // impersonate or suppress it.
+    assert.ok(p.indexOf("already carries 2 commits") < p.indexOf("<issue_description>"));
+  });
+});

@@ -147,6 +147,35 @@ export function buildMemoryContext(entries: readonly MemoryEntryView[]): string 
   return [memoryFrame(openTag, closeTag), openTag, rendered, closeTag].join("\n");
 }
 
+/** Issue #105: this run was resumed, but the SDK session it named could not be
+ *  resolved on this worker, so the lead starts with NO memory of the earlier turns —
+ *  while the branch it is standing on already carries `commits` of pushed work. The
+ *  runner sets this ONLY when both are true; absent ⇒ nothing is injected.
+ *
+ *  Without it, the honest degradation (drop the dead resume, keep going) would trade a
+ *  loud failure for silently redone work — a worse failure, because it looks like
+ *  success. `commits` is prior PUSHED work (an earlier completed run on this issue, a
+ *  previous self_improve cycle, a human), never the interrupted attempt's own commits:
+ *  a run pushes once, at the end, so an attempt requeued mid-flight left nothing. */
+export interface PriorWork {
+  commits: number;
+}
+
+/** The paragraph that tells the lead it is standing on work it cannot remember doing.
+ *  Deliberately plain and outside every untrusted fence: it is uzi's own statement of
+ *  fact about the branch, not repo- or user-supplied text. */
+function priorWorkNote(prior: PriorWork | undefined): string {
+  if (!prior || prior.commits <= 0) return "";
+  const commits = prior.commits === 1 ? "1 commit" : `${prior.commits} commits`;
+  return [
+    `IMPORTANT — this run was interrupted and restarted, and its earlier conversation`,
+    `could not be recovered, so you do not remember any of it. The branch you are on`,
+    `already carries ${commits} of work beyond the default branch.`,
+    `Read that existing work FIRST (\`git log\`, \`git diff\` against the default branch)`,
+    `and build on it. Do not redo what is already committed there.`,
+  ].join("\n");
+}
+
 export interface PlanPromptInput {
   issueIid: number;
   issueTitle: string;
@@ -157,6 +186,9 @@ export interface PlanPromptInput {
   /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. */
   memory?: readonly MemoryEntryView[];
+  /** Issue #105: set only when a dropped resume left the lead amnesiac ON a branch
+   *  that already carries pushed work. */
+  priorWork?: PriorWork;
 }
 
 /**
@@ -167,8 +199,10 @@ export interface PlanPromptInput {
  */
 export function buildPlanPrompt(input: PlanPromptInput): string {
   const memoryBlock = buildMemoryContext(input.memory ?? []);
+  const priorNote = priorWorkNote(input.priorWork);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
+    ...(priorNote ? ["", priorNote] : []),
     "",
     UNTRUSTED_FRAME,
     "",
@@ -300,6 +334,10 @@ export interface SelfImprovePlanPromptInput {
    *  self_improve run can WRITE memory, so it must also READ it back (write/read
    *  symmetry). */
   memory?: readonly MemoryEntryView[];
+  /** Issue #105: set only when a dropped resume left the lead amnesiac ON a branch
+   *  that already carries pushed work — for the FIXED self_improve branch that is
+   *  the previous cycles' commits. */
+  priorWork?: PriorWork;
 }
 
 /**
@@ -321,10 +359,12 @@ export function buildSelfImprovePlanPrompt(input: SelfImprovePlanPromptInput): s
   // PRD #90: inert, nonce-fenced cross-run memory (its own fence, distinct from the
   // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
+  const priorNote = priorWorkNote(input.priorWork);
   return [
     "You are running an AUTONOMOUS self-improvement task on uzi's own repository.",
     `You are on the fixed branch \`${input.branch}\`, which may already carry an open`,
     "merge request from a previous cycle — extend it rather than starting over.",
+    ...(priorNote ? ["", priorNote] : []),
     "",
     "Pick exactly ONE top improvement to make this cycle — a single bug fix, feature, or",
     "refactor that you can complete and verify in one merge request. Do NOT attempt a list.",
@@ -396,6 +436,9 @@ export interface CIFixPlanPromptInput {
    *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
    *  ci_fix run can WRITE memory, so it must also READ it back (write/read symmetry). */
   memory?: readonly MemoryEntryView[];
+  /** Issue #105: set only when a dropped resume left the lead amnesiac ON a branch
+   *  that already carries pushed work. */
+  priorWork?: PriorWork;
 }
 
 // CI job logs are the most attacker-influenceable text uzi ever feeds an agent:
@@ -427,9 +470,11 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const nonce = fenceNonce();
   const openTag = `<job_log_${nonce}>`;
   const closeTag = `</job_log_${nonce}>`;
+  const priorNote = priorWorkNote(input.priorWork);
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,
+    ...(priorNote ? ["", priorNote] : []),
     "",
     ciLogFrame(openTag, closeTag),
     "",
