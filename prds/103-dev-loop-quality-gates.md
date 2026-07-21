@@ -100,11 +100,15 @@ Two things are adapted rather than copied:
 
 **1. Taskfile, not Makefile or root npm scripts.**
 
-`Taskfile.yml` at the repo root, with per-component namespaces. Matches
-git-manager and the wider org convention (there is a `dot-ai-taskfile` skill
-and a shared `wxs/task` library), gives `deps:`/`sources:` for free, and
-handles `dir:` per component cleanly — which matters when the four gates run
-in `api/`, `controller/`, `web/` and `agent/`.
+A single self-contained `Taskfile.yml` at the repo root, with per-component
+namespaces. Matches git-manager and the wider org convention (there is a
+`dot-ai-taskfile` skill), gives `deps:`/`sources:` for free, and handles
+`dir:` per component cleanly — which matters when the four gates run in
+`api/`, `controller/`, `web/` and `agent/`.
+
+Everything is defined inline. No `includes:`, no remote taskfiles: the gate
+must be readable in one file, and uzi's CI has no route to any external task
+library anyway.
 
 *Rejected — Makefile*: tab-significant syntax and no native per-target working
 directory, so every recipe would carry its own `cd`. (Not because make lacks
@@ -234,6 +238,12 @@ A contributor toolchain, if one is added, goes in a separate file
 one-line comment pointing at it so the next reader does not repeat the
 mistake. Treated as optional and deferred (Open Question 3).
 
+**Whatever is decided there, it is a local convenience only.** CI does not run
+`devbox run`; CI images carry the tools directly. The Taskfile targets invoke
+`golangci-lint`/`shellcheck`/`knip` by name and are indifferent to what put
+them on `PATH`, so a contributor with a devbox shell and a CI job with a
+prepared image run the identical target.
+
 **8. ESLint for `web/` and `agent/`, pending one verification.**
 
 Default to ESLint flat config with `typescript-eslint`, plus
@@ -269,13 +279,24 @@ be amended, not worked around.
       expects). Line numbers re-derived at implementation time, not trusted
       from here.
 
+      **One self-contained `Taskfile.yml`. No `includes:`, no remote
+      taskfiles, no shared task library.** Every target is defined in the
+      file itself. A contributor or an agent reading it sees the whole gate
+      without resolving anything.
+
       **`task` is not in the CI images.** `golang:1.26`, `node:22-alpine`
       and `alpine/helm` are digest-pinned and ship no task runner, so every
       job needs an install step (or a shared `.task_setup` `before_script`
       fragment, which is the cheaper option and keeps the pin in one place).
-      This is the milestone's main risk: the checks are unchanged, but a
-      `task`-install or PATH failure reds CI having changed no check at all.
-      Land it as its own MR and watch the first pipeline.
+      Same rule for every tool a later milestone adds: **the CI image must
+      provide it.** This is the milestone's main risk: the checks are
+      unchanged, but a `task`-install or PATH failure reds CI having changed
+      no check at all. Land it as its own MR and watch the first pipeline.
+
+      **The Taskfile does not know about devbox.** Targets invoke tools
+      directly (`golangci-lint run`, `shellcheck …`), and whatever put them
+      on `PATH` is not its concern — a devbox shell locally, the image in
+      CI. CI jobs call `task <target>`, never `devbox run -- task <target>`.
 
       **Two jobs do not map cleanly onto a component gate and must keep
       their current shape:** `validate:web` (check-docs + tsc) and
@@ -487,7 +508,9 @@ Two exceptions where "append at the end" is not enough:
    (go 1.26.4, node 22, helm, sqlc, glab, jq, openssl, docker, and now
    golangci-lint, shellcheck, gitleaks) is currently unpinned and documented
    only in prose. Decision 7 says *where* it must not go; whether to add one
-   is undecided. If yes, it is its own milestone.
+   is undecided. If yes, it is its own milestone, and it changes nothing
+   about the Taskfile or CI — it is a local way to get the tools on `PATH`,
+   nothing more.
 4. **Does `e2e/run-e2e.sh` survive shellcheck baselining, or does it want
    splitting first?** 3646 lines in one file may produce a baseline so large
    it is meaningless. M5 should measure before committing to the approach.
