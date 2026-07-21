@@ -401,8 +401,28 @@ func TestReviewGroupHumanPointsAtTheUndoAddresses(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "to revert") || !strings.Contains(out, "uzi review undo") {
-		t.Errorf("a settling fan-out must point at the undo route:\n%s", out)
+	// The PAIRS themselves, as runnable commands — one per settled member. The earlier
+	// version printed "re-run with --json for the N pairs", which was measured failing end to
+	// end: the CLI sends no scope, the server defaults to open, and after this call those
+	// members are done, so a re-run returns settled=0. Printing them is the only form of this
+	// line that is true, because once the command has run without --json they are gone.
+	for _, want := range []string{
+		"to revert (2 member coordinate(s))",
+		"uzi review undo run-a rec-a",
+		"uzi review undo run-b rec-b",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q from the revert listing:\n%s", want, out)
+		}
+	}
+	// And it must not send the user back for a second invocation that cannot work.
+	if strings.Contains(out, "re-run with --json") {
+		t.Errorf("the revert line still gives advice a re-run cannot satisfy:\n%s", out)
+	}
+	// EVERY pair is listed, never a capped sample: an omitted one is a member the user
+	// cannot revert.
+	if n := strings.Count(out, "uzi review undo "); n != 2 {
+		t.Errorf("listed %d undo commands for 2 settled members — every pair must appear", n)
 	}
 	// Nothing settled ⇒ no revert advice; there is nothing to revert.
 	fc2 := backlogFake()

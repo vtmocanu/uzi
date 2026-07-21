@@ -444,9 +444,14 @@ export function Judge() {
 // is `string | null` — a raw URL param — so every comparison is legal against any string and
 // a drift here fails SILENTLY, rendering an empty list rather than erroring.
 //
-// Deriving the check from JUDGE_BUCKETS removes the hand-copied union: the array is already
-// typed JudgeBacklogBucket[], so adding a rung to the type without adding it here is a
-// compile error at the array, and the validator follows automatically.
+// Deriving the check from JUDGE_BUCKETS removes the hand-copied union, and as of PRD #98
+// review N-a that array really does carry the guarantee. It did not before: the old
+// `JudgeBacklogBucket[]` annotation checked only that every ELEMENT was a legal bucket, never
+// that every bucket was an element, so a 5-element array stayed assignable when the union
+// grew to 6 — measured, and the errors all landed in judgeBacklog.ts's Record maps, none at
+// the array. It is now `as const satisfies` plus a type-level exhaustiveness assertion, so
+// adding a rung to the union without listing it, or dropping one from the list, is a compile
+// error AT THE ARRAY, and this validator follows automatically.
 function isBucket(v: string | null): v is JudgeBacklogBucket {
   return v !== null && (JUDGE_BUCKETS as readonly string[]).includes(v);
 }
@@ -661,8 +666,20 @@ function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
   // Unreachable while the DTO types verdict as a non-null enum; judgeBadge returns null only
   // for an unjudged run, and an occurrence exists because a review produced it.
   if (!badge) return null;
+  // THE TITLE IS OVERRIDDEN, and the label deliberately is not (PRD #98 review N-b).
+  //
+  // One glyph, two inference rules: on /runs the count is always rendered when > 0, so a
+  // bare `⚖ issues` there genuinely means "nothing left to triage" (M4 behaviour (c)). Here
+  // it means "no count is carried" — and these badges sit on rows that are by construction
+  // still open. The two render byte-identically, so a reader who learned the grammar on
+  // /runs would parse this as the opposite of the truth.
+  //
+  // The fix goes in the title rather than the label because the shared visual grammar is
+  // what the fable review fought for, and splitting it again to disambiguate would trade one
+  // false inference for the two-grammars problem N8 just removed. The distinguishing claim
+  // belongs where the claim actually lives.
   return (
-    <Badge tone={badge.tone} title={badge.title}>
+    <Badge tone={badge.tone} title={`This run's judge verdict: ${occ.verdict}. Triage state is the chip beside it.`}>
       {badge.label}
     </Badge>
   );

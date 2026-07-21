@@ -430,10 +430,20 @@ describe("Judge — one grammar for the verdict fact (PRD #98 review N8)", () =>
     fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
 
     // The shared judgeBadge() grammar — the scale glyph plus the raw verdict enum.
-    expect(screen.getAllByText(/⚖ issues/).length).toBeGreaterThan(0);
+    const badges = screen.getAllByText(/⚖ issues/);
+    expect(badges.length).toBeGreaterThan(0);
     // NOT the second grammar this page had reintroduced. `verdictLabel` renders
     // "Issues found"; two grammars for one fact is the regression.
     expect(screen.queryByText("Issues found")).toBeNull();
+
+    // One glyph, two inference rules (PRD #98 review N-b): on /runs a bare `⚖ issues` means
+    // the backlog is CLEARED, because the count is always rendered when > 0. Here it means
+    // no count is carried, on a row that is still open. The label is deliberately identical —
+    // that shared grammar is the point of N8 — so the disambiguation must be in the TITLE,
+    // and it must not claim anything about triage state.
+    const title = badges[0].getAttribute("title") ?? "";
+    expect(title).toContain("verdict");
+    expect(title).not.toMatch(/to triage|still to triage|nothing left/i);
   });
 });
 

@@ -172,10 +172,21 @@ describe("Judge nav badge vs the To-triage tab (PRD #98 review BLK-BADGE)", () =
     });
     fireEvent.click(screen.getByRole("tab", { name: /All/ }));
 
+    // ORDER MATTERS HERE (PRD #98 review). This assertion used to sit AFTER the two digit
+    // waitFors, where it could never execute in the failing case: the mutation it is aimed at
+    // — obtaining the number by RE-FETCHING instead of publishing — makes the digit waitFor
+    // throw first (the mock's getJudgeStats returns the stale count, so a refetch actively
+    // re-stales the badge). The premise was proven by a different line than the one credited.
+    // Asserting the call count first makes this line the discriminator it was written to be.
+    //
+    // It pins a real secondary property: the fix spends NO round-trip, because the response
+    // already carries the canonical triage. The shell polls once, on mount; a bucket switch
+    // changes the search, not the pathname.
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledTimes(2));
+    expect(mockApi.getJudgeStats).toHaveBeenCalledTimes(1);
+
     await waitFor(() => expect(tabText()).toContain("1"));
     await waitFor(() => expect(navBadgeText()).toContain("1"));
-    // The shell never re-polled — the pathname did not change.
-    expect(mockApi.getJudgeStats).toHaveBeenCalledTimes(1);
   });
 
   // Control: what the page publishes is the SERVER's canonical count, never a tally of the

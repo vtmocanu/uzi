@@ -17,7 +17,25 @@ import type {
 // The bucket tabs, in ladder order. "To triage" is the landing tab (the backlog's
 // reason to exist); "All" is the unfiltered view. The order matches the #94 ladder plus
 // the catch-all last.
-export const JUDGE_BUCKETS: JudgeBacklogBucket[] = ["todo", "filed", "done", "dismissed", "all"];
+export const JUDGE_BUCKETS = ["todo", "filed", "done", "dismissed", "all"] as const satisfies readonly JudgeBacklogBucket[];
+
+// Exhaustiveness, enforced HERE rather than asserted (PRD #98 review N-a).
+//
+// `JUDGE_BUCKETS: JudgeBacklogBucket[]` — the previous annotation — checks only that every
+// ELEMENT is a legal bucket, never that every bucket is an element: a 5-element array stays
+// assignable when the union grows to 6. Measured: adding a sixth rung produced four errors,
+// all in this file's Record maps and exhaustive switch, and NONE at the array. So the
+// comment on isBucket that credited the array with catching it was crediting the wrong site
+// — the same state-the-invariant-where-it-is-enforced inversion this PRD keeps finding, and
+// a live risk, because replacing those Record maps with a lookup-plus-fallback (a natural
+// refactor) would have removed the only real guard while the comment still promised one.
+//
+// The tuple wrapper is load-bearing: `JudgeBacklogBucket extends …` would DISTRIBUTE over
+// the union and collapse the missing case to `never`, which vanishes in a union and yields
+// `true` regardless. `[A] extends [B]` compares the unions whole.
+type AllBucketsListed = [JudgeBacklogBucket] extends [(typeof JUDGE_BUCKETS)[number]] ? true : false;
+const _judgeBucketsAreExhaustive: AllBucketsListed = true;
+void _judgeBucketsAreExhaustive;
 
 const BUCKET_LABELS: Record<JudgeBacklogBucket, string> = {
   todo: "To triage",

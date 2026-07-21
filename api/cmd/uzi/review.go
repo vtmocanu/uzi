@@ -362,19 +362,37 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 		// something they are not looking at.
 		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled; re-check with `uzi review backlog --bucket all`")
 	}
-	// `settled` names the exact (run, rec) coordinates this call wrote, which is what an
-	// agent needs to revert it: `uzi review undo <run-id> <rec-id>` per entry. It is NOT
-	// derivable from anything else the CLI has — with scope=open the server decides
-	// membership at write time, so a client reconstructing the set from `uzi review backlog`
-	// would name members this action never touched (PRD #98 review BLK-UNDO). --json carries
-	// the full list; the human view says how to get it rather than printing N uuid pairs.
-	// Suppressed by --quiet, unlike the two reports above, and the line between them is the
-	// flag's actual contract: this is ADVICE about output the caller can obtain another way
-	// (--json carries `settled` in full), printed when nothing is wrong. The zero-updated
-	// and truncation reports are the opposite — they say something IS wrong or did not
-	// happen, and no exit code carries either.
+	// `settled` names the exact (run, rec) coordinates this call wrote — the ONLY way to
+	// revert it. It is not derivable from anything else: with scope=open the server decides
+	// membership at write time, so a set reconstructed from `uzi review backlog` would name
+	// members this action never touched (PRD #98 review BLK-UNDO).
+	//
+	// The pairs are PRINTED, as runnable commands. This line used to say "re-run with --json
+	// for the N pairs", which is advice that CANNOT WORK, measured failing end to end against
+	// a real database:
+	//
+	//	FIRST  call: updated=2 settled=2
+	//	SECOND call: updated=0 settled=0
+	//
+	// because the CLI sends no scope, the server defaults to `open`, and after the first call
+	// those members are `done` — so a re-run selects nothing and returns an empty list. Once
+	// this command has run without --json the pairs are UNRECOVERABLE, which is precisely why
+	// they must go on screen now rather than be pointed at.
+	//
+	// Everything is listed, never a capped sample: an omitted pair is a member the user
+	// cannot revert, so truncating would recreate the same unrecoverability in smaller print.
+	//
+	// --quiet still suppresses it, and the reasoning is NOT the one the old comment gave.
+	// These are not "obtainable another way" — nothing obtains them afterwards. They are
+	// suppressed because --quiet is a scripting flag and a caller who wants the pairs
+	// controls the invocation: --json carries `settled` in full ON THIS CALL. That differs
+	// from the zero-updated and truncation reports, which survive --quiet because they say
+	// something did not happen or may be wrong and NO exit code carries either.
 	if n := len(res.Settled); n > 0 && !gf.quiet && p.Format != uzicli.FormatJSON {
-		p.Printf("to revert: re-run with --json for the %d (run, rec) pair(s), then `uzi review undo <run-id> <rec-id>` for each\n", n)
+		p.Printf("to revert (%d member coordinate(s)):\n", n)
+		for _, m := range res.Settled {
+			p.Printf("  uzi review undo %s %s\n", m.RunID, m.RecID)
+		}
 	}
 	return nil
 }
