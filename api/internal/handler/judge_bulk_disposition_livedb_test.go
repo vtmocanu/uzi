@@ -736,9 +736,22 @@ func TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB(t *testing.T) {
 		}
 	}
 
-	// THE DISCRIMINATING ASSERTION: two different rationales must produce two different
-	// hashes. A projection folded to any constant — including the fixture's own former
-	// 'because' — collapses these, whichever constant it is.
+	// A corroborating assertion, NOT the discriminating one — the credit is corrected here.
+	//
+	// It used to be labelled "THE DISCRIMINATING ASSERTION", and that was wrong for a reason
+	// worth keeping: the Fatalf twenty lines up already establishes the two rationales differ,
+	// so two hashes can only collide when at least one has ALREADY diverged from the hash of
+	// its own text — which the loop above catches first, as an Errorf, on the same run. The
+	// measured fold reddened BOTH together; no fault reddens this one alone. An assertion
+	// sitting behind an earlier check is documentation of the property, not the gate on it.
+	// (Fifth instance of this class on the branch; the previous four are in the checkpoint.)
+	//
+	// WHAT ACTUALLY PINS THE PROPERTY, so removing this line is not mistaken for a loss: the
+	// expected value is read back through the hand-written query above, which does NOT pass
+	// through the sqlc body being folded, and bulkFixture gives every row a distinct text. The
+	// loop above then compares each stamped hash against its own coordinate's current text.
+	// Keeping this line is still worth it — it states the pairwise property in one place a
+	// reader can see — but it is a restatement, not the mechanism.
 	if rows[rg[1]].hash == rows[docs[1]].hash {
 		t.Errorf("both coordinates stamped the same rationale_hash %q despite different rationale text — "+
 			"the projection is returning a constant, and every coordinate disposed through the bulk path "+

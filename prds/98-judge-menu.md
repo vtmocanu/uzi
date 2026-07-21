@@ -643,7 +643,7 @@ exactly as #68 already does.
       test asserts at the **DB level** (their row unchanged), not on HTTP status:
       with coordinates there is no id to 404 on, so a status-only assertion is
       vacuous.
-- [x] **M3 — Judge page + nav (web)** — DONE; review pending. Web gates green
+- [x] **M3 — Judge page + nav (web)** — DONE `c629ce28`; reviewed + audited. Web gates green
       (`typecheck` + 837 vitest). **One interpretation to confirm:** an anchored
       deep-link (`/judge?run={id}`) with no explicit `?bucket=` defaults to the `all`
       bucket, not `todo`, so a notification reliably shows that run's recs even when its
@@ -715,7 +715,7 @@ exactly as #68 already does.
       backlog; **Undo sticks** (next tick does not re-apply); a coordinate the user
       **dismissed** is **not** overwritten; a reopen does not re-open. Builds on
       #68/#94 + the existing poll loop — parallel from the start.
-- [ ] **M7 — CLI (`api/cmd/uzi/review.go`)**: `uzi review backlog` (grouped,
+- [x] **M7 — CLI (`api/cmd/uzi/review.go`)** — DONE `de2d8de3`; reviewed + audited: `uzi review backlog` (grouped,
       `--bucket`, `--json`) + `resolve`/`dismiss --category/--target` (Decision 10);
       **no `file` verb** (filing stays browser-only). Tests cover the grouped output
       and the bulk disposition fan-out. **Correction, measured 2026-07-21 while
