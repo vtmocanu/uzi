@@ -542,6 +542,126 @@ for the instruction nobody has written yet.
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
 compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
 
+- **AN EXECUTION ORACLE IS NOT A COVERAGE ORACLE: the log tells you a query RAN, never that anyone
+  was WATCHING.** Postgres `log_statement='all'` on a throwaway container is the strongest
+  instrument this repo has for "is this query exercised" — it observes execution instead of
+  inferring it from call sites, and on 2026-07-21 it settled in one run what call-site reading had
+  got wrong in both directions (an inventory row asserting "no live test executes it" against **4**
+  measured executions; `ListCLITokens` at **0** versus `TouchCLIToken` at **54**).
+  **Its limit, worth stating in the same breath as its win:** it distinguishes `UNPINNED` from
+  not-unpinned, and it is **blind between "pinned" and "executed but unasserted"** — both execute.
+  So evidence from the statement log alone supports only the weaker claim. Answering "did anything
+  notice?" needs a different instrument: reading what the test asserts, or a fold, which is the only
+  thing that shows an assertion would have caught a change. Worst case for the log alone: a caller
+  that **swallows the error** (`if x, err := q.Foo(ctx); err == nil`) makes even an outright query
+  failure invisible, so the log can show a query running while nothing downstream could observe any
+  result it returned.
+  **Naming a tool's limits right after it wins an argument is the harder discipline**, and it was a
+  validator who did it here, unprompted, about its own technique.
+  **HOW THE METHOD ITSELF FAILS, measured the same day: `docker logs X > f 2>&1` and
+  `docker logs X 2>&1 > f` are DIFFERENT COMMANDS, and Postgres logs to STDERR.** The second form
+  redirects stderr to the terminal's stdout and then points stdout at the file, so the file gets a
+  well-formed, non-empty log **with every statement missing** — and the run reported **0 executions
+  of a query that runs once**, which for a minute read as evidence against a correct finding.
+  **A zero from a broken capture is indistinguishable from a zero from a query nobody calls.** So
+  the instrument needs its own positive control like everything else: before believing any zero,
+  confirm the capture contains a statement you KNOW ran. Redirect order is the failure, not the
+  tool.
+  **ANCHOR THE TALLY ON `-- name: <QueryName>`, NEVER ON THE QUERY'S WHERE CLAUSE — and this one is
+  STRUCTURAL, not a grep you can be careful around.** Two runs disagreed (1 execution versus 2 in the
+  same isolated test) and the cause was neither sloppiness nor parameter lines: **a partial index's
+  predicate is textually identical to the query it exists to serve** — necessarily so, since that is
+  what makes the index usable. `store.Migrate` runs at test setup, so every fresh database emits
+  `CREATE UNIQUE INDEX … WHERE kind = 'self_improve' AND status NOT IN (…)` once, and a tally grepped
+  on that WHERE clause counts the DDL as an execution. **It is guaranteed for exactly the queries
+  important enough to have a supporting index — i.e. the ones most worth counting.** Header-anchored,
+  the same log gives the true count; only `execute` lines carry the `-- name:` header.
+  **Keep this entry and the stderr one together: they fail in OPPOSITE directions.** A broken capture
+  under-counts to zero; a WHERE-clause grep over-counts. A tally that agrees with your expectation is
+  not thereby correct — it may be two errors, or the wrong one cancelling.
+  **The resolution is also the model for settling a disagreement between two measurements: ask the
+  PROPERTY, not the total.** The dispute here looked like arithmetic and was actually "does the
+  masking layer reject before the handler runs?" — settled by a probe that bracketed each principal's
+  request with SQL marker statements so the log segmented attributably (`uza_` → 1 execution, `uzc_`
+  → **0**). A total could never have answered it; segmenting by principal did, in one run.
+- **`go list ./...` CAN RETURN SILENCE INSTEAD OF AN ERROR, INCONSISTENTLY, IN THE SAME SESSION.**
+  Measured 2026-07-21: **42** in a detached audit worktree and **0** in `/uzi/main/api` minutes
+  apart, same repo, no error either way. So this is not a predictable worktree-shaped failure anyone
+  can learn to expect — it is a command that sometimes returns a plausible number and sometimes
+  returns nothing, silently. Strictly more dangerous than one that always fails, and the same family
+  as the `head` trap below: **a tool whose silence is indistinguishable from a real answer.** For
+  package counts, use `go test ./...`'s own output, which additionally separates the two questions
+  people conflate — `ok` lines are packages that RAN tests, `no test files` lines are packages that
+  exist. A zero-failures claim is entitled to the first denominator only.
+- **THE VERIFICATION TOOLING IS WHERE THIS TEAM ACTUALLY FAILS — NOT THE READING.** Measured
+  2026-07-21 across one wave: **four agents, four broken instruments, zero wrong conclusions from
+  careless reading.** Listed because the pattern is the finding, and because every one of them
+  produced output indistinguishable from success:
+  - `| head -12` cut the twelfth call site, publishing "ten" — the truncated-view trap, committed
+    inside a report by the agent that had been citing that trap at others, then relayed onward
+    twice by the lead.
+  - A mutation targeted **by line number** landed on a comment line, so nothing was mutated and the
+    probe returned **PASS**. Caught only because that agent prints the mutated line before every run.
+  - A `gsed -E` alternation whose `|` collided with the chosen `s#…#` delimiter errored, the `&&`
+    chain skipped to a `go vet` in the wrong directory, and **nothing was mutated or measured**.
+    Had the chain not broken, the result would have been a green `go test` from an unmutated tree.
+  - A presence check (`getMockImplementation() === undefined`) nearly filed a **false finding
+    against a working fix**: vitest's `mockReset()` installs `() => void 0`, not `undefined`, so the
+    probe could not distinguish "reset to a stub" from "still holding the real client".
+  **The shared part is the DIAGNOSIS, not the remedy — and conflating them is its own failure.**
+  What all four have in common is only this: *the verification step had no positive control of its
+  own, so its failure was indistinguishable from success.* The mechanisms are different and each
+  needs its own countermeasure. Recording a single fix would send the next reader to repair a
+  `head` with a content-addressed `sed` — the same shape as applying one correct answer to a sweep
+  of hits that needed different ones.
+  | mechanism | remedy |
+  |---|---|
+  | mutation addressed by LINE NUMBER, landed on a comment | address **by content**; assert the changed-line count |
+  | census truncated by `head` | count with `rg -c` / `wc -l` / `--stat` and **reconcile the total against the rows shown** |
+  | pipeline broke; nothing mutated or measured | prove application with `git diff --numstat` **plus** a re-grep showing zero remaining |
+  | check asked the wrong QUESTION (presence, not behaviour) | assert **identity/behaviour** (`String(impl)`, `toBe(el)`, `git grep <sha>`), never presence |
+  Before believing any verification step, ask *what would this print if it were broken?* If the
+  answer matches what it prints when it passes, it is not evidence. **Naming the class buys no
+  immunity:** three of the four were committed by the agents most fluent in these rules, on the
+  branch that exists to enforce them — and the fifth instance was the lead asserting that one of
+  these remedies covered all three of the others, corrected before it landed here.
+- **A MEASUREMENT EXPIRES RELATIVE TO THE SHA IT WAS TAKEN AT — NOT TO WHATEVER LATER LANDMARK IS
+  CONVENIENT.** Measured 2026-07-21, and the lead got it backwards first. Fold receipts were taken
+  at `31080a40`; six migration files changed between there and the landing merge; zero changed
+  between the landing merge and today. The lead read the empty *merge-to-today* diff as showing the
+  receipts "were never actually stale" — **which inverts the conclusion.** They were stale, and
+  re-folding was genuinely owed; the clean window since the merge says nothing about a measurement
+  predating it. Both underlying numbers were correct and neither agent was wrong; the error was
+  entirely in choosing a baseline that made the answer comfortable. **Before citing a diff as
+  evidence that a measurement still holds, check that the diff STARTS at the SHA the measurement
+  was taken at.** A later landmark — a merge, a release, "current main" — is the wrong baseline
+  however tidy its diff looks.
+- **A MUTATION CAN GO RED FOR THE WRONG REASON, AND NO GATE CAN SEE IT.** The completion of the
+  two rules below, and the one they do not cover. Measured 2026-07-21, reproduced independently
+  by a reviewer and an auditor on separate trees: dropping `AND f.target = rr.target` from the M1
+  filed-issues join reddened at a duplicate-coordinate `t.Fatalf` — *"two backlog rows share the
+  coordinate … the fixture is ambiguous"* — **blaming the FIXTURE for a broken production join**,
+  while the sibling assertion the comment credited never executed. The tell was in the failure
+  text: the two `rec_id`s it printed were **identical**, so it was one recommendation appearing
+  twice, a join fan-out, not two rows.
+  **Why the existing rules miss it:** the positive control passes (the suite ran), assert-it-
+  applied passes (the mutation applied), and the tree comparison passes (the tree changed). Every
+  instrument this file already mandates reports green-for-the-right-reasons. **The only thing that
+  catches it is reading WHICH assertion fired.** It is the mutation-testing analogue of a live
+  suite that exits 0 having run nothing.
+  **The rule: a fold result must record the assertion by MESSAGE, not merely RED/GREEN — and a
+  fold that lands on a `Fatalf` about the fixture has certified nothing.** A table of folds with
+  a RED column and no message column is not evidence.
+  **The same class, one layer up, appeared three times in the single commit that fixed it:** a
+  message naming a `review_id` half that was never mutated; another naming a CATEGORY half never
+  touched; and a third printing `url=""` when `FiledIssueUrl.Valid` was the condition that fired.
+  So ask of every diagnostic *could this string be printed by a condition other than the one it
+  names?* — and treat a confidently-wrong diagnosis as worse than a vague one, because it routes
+  the next reader into the wrong subsystem with evidence attached.
+  **Rarest sibling, same session: a REPRO that cannot reproduce.** The obvious way to trip an
+  unscoped sweep — run its test twice on one database — fails, because the sweep deletes its own
+  row and self-cleans. A fix attempt starting from that repro would have concluded the finding was
+  false. "A check that cannot fail is not evidence" applies to the reproduction step too.
 - **Bound every enumeration where you write it**, not after a validator finds it. Four needed
   bounding on one branch; the fourth got one at authoring time and that was the first time the
   conversation did not happen afterwards.
