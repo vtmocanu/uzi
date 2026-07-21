@@ -145,3 +145,110 @@ func TestUserSecretsRewrapLiveDB(t *testing.T) {
 		t.Fatalf("rewrapping another user's secret affected %d rows, want 0", n)
 	}
 }
+
+// TestUserSecretsDefaultResolutionLiveDB pins the invariant that makes every
+// existing "does this user have a token?" gate keep telling the truth after 00077,
+// and proves the two indexes it adds actually bite. Real SQL, because all three
+// claims are properties of the schema and of the ON CONFLICT arbiter, none of which
+// a fake store has.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
+// (./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix).
+func TestUserSecretsDefaultResolutionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// --- A user's FIRST token must be born default, or it is invisible ---
+	//
+	// The existence gates (UserHasAnthropicToken here, plus autopilot's
+	// has_anthropic_token and the two judge gates) are EXISTS queries with no
+	// is_default filter, while every resolution path is by-kind AND is_default. A
+	// create path that leaves is_default false therefore produces a token the UI
+	// reports as "Set" and the gates green-light runs against, while every open
+	// returns ErrNoSecret — a silent failure with no error anywhere. The migration's
+	// backfill cannot cover this: it only touched rows that existed at migration
+	// time, and the alias route and the seed keep creating rows afterwards.
+	fresh := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		fresh, fmt.Sprintf("first-token-%s@e2e", fresh))
+
+	created, err := q.UpsertDefaultUserSecret(ctx, store.UpsertDefaultUserSecretParams{
+		UserID: fresh, Kind: store.KindAnthropicToken,
+		Ciphertext: []byte("first-token"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("create first token: %v", err)
+	}
+	if !created.IsDefault || created.Label != store.LabelDefaultSecret {
+		t.Fatalf("first token created as (label=%q, is_default=%v), want (%q, true)",
+			created.Label, created.IsDefault, store.LabelDefaultSecret)
+	}
+
+	// The two halves must agree: what the gates see exists, the read path resolves.
+	exists, err := q.UserHasAnthropicToken(ctx, fresh)
+	if err != nil {
+		t.Fatalf("existence gate: %v", err)
+	}
+	got, err := q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+		UserID: fresh, Kind: store.KindAnthropicToken,
+	})
+	if err != nil {
+		t.Fatalf("the existence gate says the user has a token (%v) but the read path cannot resolve it: %v — "+
+			"every run for this user would fail on credential-unavailable with nothing logged as wrong", exists, err)
+	}
+	if string(got.Ciphertext) != "first-token" {
+		t.Fatalf("resolved ciphertext = %q, want first-token", got.Ciphertext)
+	}
+
+	// Rotating through the alias hits the arbiter, keeps ONE row, and keeps it the
+	// default — it must not mint a second credential per save.
+	rotated, err := q.UpsertDefaultUserSecret(ctx, store.UpsertDefaultUserSecretParams{
+		UserID: fresh, Kind: store.KindAnthropicToken,
+		Ciphertext: []byte("rotated-token"), SealedWith: store.SealedWithMaster,
+	})
+	if err != nil {
+		t.Fatalf("rotate via the alias: %v", err)
+	}
+	if rotated.ID != created.ID {
+		t.Fatalf("rotation created a NEW row (%s vs %s) instead of updating the default", rotated.ID, created.ID)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_secrets WHERE user_id = $1`, fresh).Scan(&n); err != nil {
+		t.Fatalf("count after rotate: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("user holds %d secrets after one create + one rotate, want 1", n)
+	}
+
+	// --- The indexes 00077 adds must actually bite ---
+	insertSecond := func(label string, isDefault bool) error {
+		_, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
+			UserID: fresh, Kind: store.KindAnthropicToken, Label: label, IsDefault: isDefault,
+			Ciphertext: []byte("second"), SealedWith: store.SealedWithMaster,
+		})
+		return err
+	}
+	if err := insertSecond("DEFAULT", false); err == nil {
+		t.Fatal("a label differing only by case was accepted — the lower(label) unique index is not enforcing (D7)")
+	}
+	if err := insertSecond("console-key", true); err == nil {
+		t.Fatal("a second is_default row was accepted — the partial unique index is not enforcing (D2)")
+	}
+	// The same second token, correctly non-default, is allowed — the constraint is
+	// on defaults and label collisions, not on holding several credentials.
+	if err := insertSecond("console-key", false); err != nil {
+		t.Fatalf("a second non-default token must be storable, got: %v", err)
+	}
+}
