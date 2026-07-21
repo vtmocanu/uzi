@@ -1405,6 +1405,39 @@ costs nothing; do not attribute it.
       is structurally incapable of proving it, and the mechanism sounded more rigorous than the
       test that actually does the job.
 
+**Follow-up (not in this PRD), found 2026-07-21 while designing M8b: `forge-fake` IGNORES
+`updated_after`, so the e2e harness STRUCTURALLY CANNOT exercise the incremental-sync path.**
+Measured, and it corrected the design's own earlier claim in the opposite direction.
+`IncrementalSync` does pass `UpdatedAfter` (`forgesvc/service.go:294-298`) and the GitLab driver
+does send it (`forge/gitlab.go:257`) — but **`forge-fake`'s `GET /issues` returns every recorded
+issue by deliberate design**, so the parameter has no effect in the harness.
+**Two consequences, and the second is the one that matters.**
+1. The M8b issue-close mutator must bump `updated_at` — **but not for the reason first written.**
+   The design said an unbumped close would be "invisible until the next `FullSync`"; measured, in
+   the harness it lands immediately either way. It must bump because **a real forge does, and the
+   fake must not lie about the forge.** The instruction survived; its justification was backwards,
+   which is the form that later gets removed by someone simplifying.
+2. **The gap is in the FAKE, not in M6 — and stating it the other way round would read as a
+   shipped defect, which it is not.** M6's production path is correct: `IncrementalSync` sends the
+   filter, the GitLab driver honours it, and a real GitLab bumps `updated_at` on close itself, so a
+   real close is never missed. **What is missing is the harness's ability to EXERCISE that path.**
+   Because the fake returns every recorded issue regardless of `updated_after`, the e2e leg proves
+   the close→Done edge fires *given the cache was updated* — it cannot prove the incremental sync
+   would have observed the close in the first place, because in the harness that filter never
+   discriminates. A harness that cannot exercise the path it certifies is this PRD's recurring
+   finding, arriving in the harness itself.
+   *(Corrected 2026-07-21 immediately after first being written: the lead's original wording said
+   "against a real GitLab an unbumped issue is excluded and the close is missed", which describes a
+   production defect that does not exist. The architect caught it. A coverage gap written as a
+   behaviour claim is the more expensive error of the two, because the next reader goes looking for
+   a bug.)*
+**Deliberately NOT fixed here, and the reason is the scope of the blast radius:** making the fake
+honour `updated_after` changes `GET /issues` semantics for **every** phase that relies on
+"return all recorded issues", and that handler's own comment records the behaviour as load-bearing
+for reconcile-eviction. It needs its own change, its own measurement and its own full harness run —
+a semantics change to a shared fixture buried inside a test-quality tier would be reviewed as a
+footnote. Raised to the user for a follow-up issue.
+
 **Follow-up (not in this PRD), found 2026-07-21 while covering `OccurrenceFileIssue`: ALL 24
 PER-USER LIMITER MOUNTS ARE UNASSERTED, PROVEN BY EXECUTION.** It began as "our route looks
 uncovered" and generalised three times under measurement; each widening was run, not reasoned.
