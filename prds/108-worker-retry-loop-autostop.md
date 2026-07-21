@@ -119,29 +119,50 @@ Measured leftover: **167.3 MB for one run** (`/data` at 219 MB of 19.5 GB — no
 
 ## Milestones
 
+**Two phases, two MRs, and the split is load-bearing rather than cosmetic.** Phase 1 closes the incident outright: after it, a NUL cannot wedge a run, a permanent failure cannot be retried forever, a batch cannot grow into the 1 MiB cap, and HOMEs stop leaking. It is small diffs in small files (`batcher.ts` is 142 lines; `worker_protocol.go` 515) at low risk. Phase 2 adds *detection and killing*, which is where both the cost and the danger are — a new signal source in the health detector, a migration for the `stop_kind` vocabulary, and a test suite whose centre of gravity is **negative** cases.
+
+**Phase 1 is shippable alone and Phase 2 is genuinely optional**, which the honest scope note in §4 already implies: on a single-active-run instance M5 degrades to flag-and-notify permanently, so on this deployment class Phase 1 *is* the fix and Phase 2 buys observability plus protection for multi-run instances and for workers on older images. Do not let Phase 2's difficulty delay Phase 1.
+
+| Phase | Milestones | Depends on | Touches |
+|---|---|---|---|
+| **1 — close the incident (MR 1)** | M1 repro · M2 sanitize + 400 · M3 batcher · M6 HOME · M9a docs | nothing | `workersvc`, `handler/worker_protocol.go`, `agent/src/batcher.ts`, `agent/src/runner.ts`, `ARCHITECTURE.md`, `specs/ai.md` |
+| **2 — detect and stop (MR 2)** | M4 detector · M5 auto-stop (+ migration) · M7 observability · M9b CLI + docs | Phase 1 | `workersvc/health.go`, a migration, `deploy/chart/values.yaml`, `api/cmd/uzi/`, `docs/` |
+
+*(M8 was **"audit the other unbounded retry loops"**. It is now issue [#109](https://gitlab.example.com/vtmocanu/uzi/-/issues/109) — an audit has no natural end, it does not belong inside a fix, and leaving it here made this PRD look ~30% larger than the actual work. The number is deliberately not reused: a gap that records where something went beats a renumbering that hides it.)*
+
+### Phase 1 — close the incident
+
 - [ ] **M1 — Reproduce, RED first.** Integration test POSTing a payload carrying the `\u0000` escape (assert today's 500); a lone-surrogate case; an oversized-batch case crossing the 1 MiB cap; a runner test with a `0555` directory under a fake HOME. **Run the message test against v0.9.0 and v0.10.0** and record which — the incident write-up guessed and was wrong once.
 - [ ] **M2 — Sanitation + honest status code (api).** Strip `\u0000` and unpaired surrogates, JSON-aware, in the payload and in `agent`/`agent_instance`/`agent_label`; add `ErrUnstorableMessage` mapped to 400 for SQLSTATEs 22P05/22P02/22021. Count and log every strip so a NUL-emitting tool stays visible rather than silently laundered.
 - [ ] **M3 — Bounded batch, backoff, breaker (agent).** Byte cap + splitting; bisection to isolate one poisoned message; exponential backoff; 4xx not retried **except** the oversize case, which splits; breaker after N identical-batch failures; the failure report routed through `reportState`, never the batcher.
-- [ ] **M4 — Server-side loop detection → `looping` health.** Per-run consecutive-failure counter with **eviction on terminal state**; flag `looping` with a reason naming the persistence failure.
-- [ ] **M5 — Auto-stop, guarded.** Stop-verdict input + no-poller fallback + the `stop_kind` migration + the values.yaml singleton note. **The tests are mostly negative**: an API-wide outage must auto-fail nothing; a single failing run beside healthy neighbours must; **no comparison set must flag and not kill**; one success resets the streak; a wedged **chat** run (`chat-runner.ts:128` builds the same batcher against the same endpoint) is covered by the same rule.
-- [ ] **M6 — HOME cleanup that survives read-only directories (agent).** Permission-restoring removal, still best-effort, tested against a `0555` directory. Plus a one-off reclaim that **skips any `agent-home/<runId>` whose run is non-terminal** — a sweep racing a live run is worse than the leak.
+- [ ] **M6 — HOME cleanup that survives read-only directories (agent).** Permission-restoring removal, still best-effort, tested against a `0555` directory. Plus a one-off reclaim that **skips any `agent-home/<runId>` whose run is non-terminal** — a sweep racing a live run is worse than the leak. **Fully independent of everything else here** — it shares only the incident that surfaced it, so it can land first or in parallel.
+- [ ] **M9a — Phase-1 docs.** `ARCHITECTURE.md` gains the message-path contract (what is sanitized, what returns 400, how a batch is bounded and bisected); `specs/ai.md` records Decisions 1-4. No CLI change in this phase: Phase 1 alters no DTO and adds no reason string the CLI renders.
+
+### Phase 2 — detect and stop
+
+- [ ] **M4 — Server-side loop detection → `looping` health.** Per-run consecutive-failure counter with **eviction on terminal state**; flag `looping` with a reason naming the persistence failure. **Ships independently of M5 and is the cheap two-thirds of this phase's value** — the flag alone turns the incident from silent into obvious.
+- [ ] **M5 — Auto-stop, guarded.** Stop-verdict input + no-poller fallback + the `stop_kind` migration + the values.yaml singleton note. **The tests are mostly negative**: an API-wide outage must auto-fail nothing; a single failing run beside healthy neighbours must; **no comparison set must flag and not kill**; one success resets the streak; a wedged **chat** run (`chat-runner.ts:128` builds the same batcher against the same endpoint) is covered by the same rule. *(The multi-run live-DB fixture these negatives need is the single fiddliest thing in this PRD — size the milestone around that, not around the detector.)*
 - [ ] **M7 — Observability + the honest gap.** Structured fields on the auto-stop decision (run id, streak, window, comparison-set size, decision) so an operator can reconstruct why a run died. Record that no metrics surface exists and name the log lines; leave a metrics endpoint to its own PRD.
-- [ ] **M8 — Audit the other unbounded retry loops.** Not unique to this batcher: sweep for retry loops with no bound, no backoff, or no permanent-vs-transient classification (forge sync, judge dispatch, notification delivery, `uzicli` polling). **One file at a time with the call sites open** — a repo-wide table written in one sitting is an audit-shaped artifact nobody verified.
-- [ ] **M9 — CLI + docs.** Per CLAUDE.md's second-consumer rule, `api/cmd/uzi/` must render the new health reason and the `message_persist_permanent` failure reason. `ARCHITECTURE.md` gains the auto-stop rule and its guards; `docs/` gains the operator-facing "why was my run auto-failed"; `specs/ai.md` records the decisions.
+- [ ] **M9b — CLI + Phase-2 docs.** Per CLAUDE.md's second-consumer rule, `api/cmd/uzi/` must render the new health reason and the `message_persist_permanent` failure reason — this phase is where a reason string first reaches a consumer. `ARCHITECTURE.md` gains the auto-stop rule and its guards; `docs/` gains the operator-facing "why was my run auto-failed"; `specs/ai.md` records Decisions 5-10.
 
 ## Success Criteria
+
+**Phase 1 — after this, the incident cannot recur:**
 
 - A tool result containing NUL bytes or a lone surrogate is **persisted sanitized** and the run continues; nothing 500s.
 - A genuinely unstorable payload returns **400**, is **not** retried, and costs **one message** (bisected out), not the run.
 - A chatty run that rides out a transient outage **never** takes a permanent 400 from batch growth.
+- A Go-touching run leaves **no HOME behind**; stranded HOMEs are reclaimed without touching live runs.
+
+**Phase 2 — after this, a loop of any cause is visible and bounded:**
+
+- A run whose writes are failing reads `looping` with a truthful reason, not `slow`.
 - A confirmed per-run loop is auto-stopped within **~2 minutes**, against 27 minutes observed and a 2-hour `RUN_TIMEOUT` worst case.
 - An **API-wide outage auto-stops nothing**, and a **run with no comparison set is flagged, not killed** — both proven by tests, because these are the failure modes worse than the bug.
-- A run whose writes are failing reads `looping` with a truthful reason, not `slow`.
-- A Go-touching run leaves **no HOME behind**; stranded HOMEs are reclaimed without touching live runs.
 
 ## Risks
 
-- **Auto-stop killing healthy runs.** The whole design risk. Mitigated by the five-guard conjunction, the comparison-set requirement, and making the negative tests the milestone's centre of gravity. If confidence is low at review, **ship M4 (flag only) and hold M5** — the flag alone turns this incident from silent into obvious, and M2+M3 already close the incident.
+- **Auto-stop killing healthy runs.** The whole design risk, and it lives entirely in Phase 2. Mitigated by the five-guard conjunction, the comparison-set requirement, and making the negative tests the milestone's centre of gravity. **The phasing is itself the mitigation**: Phase 1 closes the incident without any kill path, so Phase 2 can be reviewed on its merits rather than under pressure to fix an open defect. If confidence is still low at that review, **ship M4 (flag only) and hold M5** — the flag alone turns this incident from silent into obvious.
 - **Bisection amplifying load.** Isolating one poisoned message in a 239-message batch costs ~8 extra round-trips. Bounded, one-off per poison, and cheaper than the 2 Hz loop it replaces.
 - **Sanitation hiding a real bug.** Silently dropping bytes means a future NUL-emitting tool is never investigated — hence the count-and-log requirement in M2.
 - **In-process counters and restarts.** A restart does not "survive" the window — nothing is counted while the process is down, so the window restarts. That **delays** a kill (fail-safe) rather than causing a false positive; stated because the first draft's guard table implied the opposite.
