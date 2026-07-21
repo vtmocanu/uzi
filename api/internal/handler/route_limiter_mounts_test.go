@@ -115,6 +115,10 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/skills/{id}", noLimiter},
 	{"DELETE", "/api/tool-allowlist/{id}", noLimiter},
 	{"DELETE", "/api/workers/{id}", limHosted},
+	// The one admin read that carries a per-user budget: it enumerates standing
+	// credentials, so it rides the credential-surface limiter. Its bucket is keyed by
+	// (pattern, user) and is therefore disjoint from the other authLimiter mounts.
+	{"GET", "/api/admin/cli-tokens", limAuth},
 	{"GET", "/api/admin/rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
 	{"GET", "/api/admin/selfimprove", noLimiter},
