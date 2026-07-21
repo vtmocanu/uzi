@@ -3,7 +3,13 @@
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
-**Progress (2026-07-21, late)** — **all seven implementation milestones landed** (M1-M7); M8a docs and M8b e2e remain. **NO MR opened yet.** Work resumes in THIS PRD, not a follow-up. Branch `feature/prd-98-judge-menu` @ `a48c5afe`.
+**Progress (2026-07-21, end of day)** — **FIRST MR MERGED.** [MR !90](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/90) landed on `main` as `8515cfab` with CI green across every stage: all seven implementation milestones (M1-M7) plus M8a's docs half, 95 files, +15,594/−225. The migration shipped as `00081_judge_issue_close_sync.sql`, renumbered above the live head at landing (the draft `00075` collided with a *different* migration already on `main`; the `00076` gap was deliberately not filled, since a free number below the applied head is the boot-refusing case).
+
+**A second branch, `feature/prd-98-followup`, carries the cheap tier of Remaining work** — four items closed there and reviewed, unmerged as of this writing.
+
+**THE PRD REMAINS OPEN.** Work resumes here, not in a follow-up PRD. Eight items remain below, four of them substantial: M8b (e2e), the printed-instruction backstop, seam 6's golden fixture, and widening the query inventory beyond the judge family. **None of the four is cheaper later than now** — they were deferred for scope, not because they are blocked.
+
+**What this PRD does NOT cover, stated because the alternative is a false claim:** no e2e coverage exists for it at all; mock↔server fidelity is not asserted (and the landing merge widened this — `mockApi` now emulates a composite-FK cascade); `OccurrenceFileIssue` is 236 lines with zero tests and is the only forge-writing web path here; and the query inventory test proves someone *declared* where a query is pinned, not that the pin is good. A claim that the judge backlog is covered end to end would be wrong on four counts.
 
 ### RESUME HERE — what is left, in order (updated 2026-07-21, late)
 
@@ -933,7 +939,7 @@ times in one session from comment edits alone; an assertion *count* drifted the 
 Five items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
 **These are PRD #98 work, not a follow-up PRD** — resume here.
 
-- [ ] **An unscoped assertion in an M6 test — a landmine with a measured detonation.**
+- [x] **DONE `0da9186a` (reviewed) — An unscoped assertion in an M6 test — a landmine with a measured detonation.** Fixed by scoping the assertion to the recommendation's row id (the returned row carries no `review_id`, so the id is the only handle), plus a **decoy** row that trips the old assertion. Reviewer measured the discrimination: reverting the fix with the decoy left in place reddens, and the failure names the decoy itself (`RationaleMd:decoy`). Recorded against itself in the commit: the FIRST decoy was never in the backlog at all — `seedCloseSync` always writes a `recommendation_filed_issues` row and #68 Decision 12 makes the row's *existence* the exclusion — and the test's own precondition caught it before any result was claimed.
       `ListOpenImproveUziRecommendations` (selfimprove.sql) selects
       `WHERE rr.category = 'improve_uzi'` across the **whole table** — no user scope, no
       review scope — and `TestFiledIssueCloseAutoDonesOnceLiveDB`
@@ -1085,7 +1091,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       (`sqlc generate` + `go vet`) before being believed; `false::bool` is type-preserving here
       because the projection is already NOT NULL via the cast — the nullability trap in
       `CLAUDE.md` applies to folding a nullable LEFT-JOIN column, which this is not.
-- [ ] **`ListRunInputsForRun` has NO live exercise — found by the query inventory, 2026-07-21.**
+- [x] **DONE `a5235362` + `d5121684` (reviewed) — `ListRunInputsForRun` has NO live exercise — found by the query inventory, 2026-07-21.** The inventory's first find, against a query outside the work that motivated it. Four folds, all RED. The fourth was added after review: the commit claimed the cap taking the oldest *n* was "the strongest property" and **no fold reached it** (`:102` fatals first), so it was asserted, plausible and unmeasured — the fourth fold (`LIMIT` inside a subquery, applied before `ORDER BY`) proved it reachable. Two of the first three folds land on the same assertion (`:96`); noted rather than left implying three independent pins. Known limit recorded at the site: `consumed_at` and `created_at` are unpinnable on this fixture twice over — neither is asserted, and the insert supplies only `(run_id, kind, body)` so both are uniform across all rows.
       `judge.sql`'s `ListRunInputsForRun` is called from exactly one place in production
       (`workersvc/judge_trace.go:89`) and from **no test that touches a database**. Every test
       reaching `JudgeTrace` runs against workersvc's `fakeStore`
@@ -1132,7 +1138,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       test passes for any tree are "the glob found nothing" and "the regex matched nothing",
       and each check catches only its own.
 
-- [ ] **The inbox is the ONLY judge-text renderer with no escaping pin** (M5 audit,
+- [x] **DONE `97bd9528` + `0745c5f1` (audited) — The inbox is the ONLY judge-text renderer with no escaping pin** (M5 audit,
       2026-07-21). `notificationBody` returns `payload.body`, which carries
       `reviewSummaryPreview(sub.SummaryMd)` — scrubbed and capped, but untrusted judge free
       text. React escapes it, so the property HOLDS; nothing asserts it. The other two
