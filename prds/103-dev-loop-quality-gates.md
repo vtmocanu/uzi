@@ -155,7 +155,7 @@ file.**
 The first run of each tool on a codebase this size will produce a large
 finding list, and blocking the gate until that list is zero is not an option.
 An earlier draft of this decision said each tool lands with "a committed
-baseline capturing today's findings". **That was wrong for three of the four
+baseline capturing today's findings". **That was wrong for four of the five
 tools** (verified against current upstream docs, 2026-07-21), and the
 correction matters enough to record, because the wrong version is the
 intuitive one and it will be re-proposed otherwise:
@@ -165,7 +165,8 @@ intuitive one and it will be re-proposed otherwise:
 | `golangci-lint` | **No** | Diff-based only: `--new-from-merge-base=main` (upstream's own large-project advice), plus `--new-from-rev` / `--new-from-patch`. No file records existing findings. |
 | `knip` | **No** | Severity staging: `rules: { exports: "warn", files: "error" }` per issue type, promoted to `error` as each reaches zero. Plus `--max-issues` as an issue budget, and workspace scoping. |
 | `deadcode` | **No** | Nothing whatsoever. Plain report output. Gating on new findings requires a wrapper script: run the tool, diff against a committed findings file, fail on additions. |
-| ESLint | **Yes** | Native bulk suppressions (`--suppress-all` writing `eslint-suppressions.json`), ESLint ≥ 9.24. This is the only true baseline file in the set. |
+| ESLint | **Yes** | Native bulk suppressions (`--suppress-all` writing a committed `eslint-suppressions.json`, with `--suppressions-location` and `--prune-suppressions`), ESLint ≥ 9.24. The only true baseline file in the set. **Caveat: it only suppresses rules configured as `error`** — `warn`-level rules are neither suppressed nor gated, so the M3 config must enable rules as `error`, not `warn`. |
+| `shellcheck` | **No** | Severity staging (`--severity=error`, tightened to `warning` later), `.shellcheckrc` rule-level disables (blanket, not per-instance), per-line `# shellcheck disable=` comments, or the same diff-wrapper as `deadcode`. |
 
 So each milestone states its own mechanism rather than inheriting a shared
 one. Two consequences worth pricing in now:
@@ -173,9 +174,10 @@ one. Two consequences worth pricing in now:
 - **`--new-from-merge-base` reports nothing on `main` pipelines** (the
   merge-base of `main` with itself is `main`), so the debt does not stay
   "visible" the way a baseline file would keep it. It also needs real git
-  history — GitLab's default shallow clone (`GIT_DEPTH`) breaks merge-base
-  resolution, and `--whole-files` is needed or findings that are not on a
-  changed line are skipped.
+  history: set `GIT_DEPTH: "0"` on the lint job **and** make sure `origin/main`
+  is actually fetched — MR pipelines do not fetch it by default, and
+  merge-base needs the ref, not merely the depth. `--whole-files` is needed
+  too, or findings that are not on a changed line are skipped.
 - **`deadcode` needs a small committed wrapper** (~20 lines: run, sort, diff
   against `.deadcode-baseline`, fail on additions). That is real work M4 must
   budget, not a flag.
@@ -211,7 +213,7 @@ against the parent tree is sufficient for a pure-format commit).
 
 **6. Coverage is measured before any threshold is set.**
 
-M5 adds `-coverprofile` and `vitest --coverage`, reports the numbers in CI job
+M6 adds `-coverprofile` and `vitest --coverage`, reports the numbers in CI job
 output, and sets **no** failing threshold. A threshold is chosen in a
 follow-up, once the real number is known, starting with the security-critical
 packages (`internal/store`, secretbox, the PAT redactor) rather than a global
@@ -264,11 +266,12 @@ be amended, not worked around.
 
 - [ ] **M1 — `Taskfile.yml` is the single source of truth for the gate**:
       root `Taskfile.yml` with `gate`, `gate:api`, `gate:controller`,
-      `gate:web`, `gate:agent`, plus the individual `fmt-check`, `lint`,
-      `typecheck`, `test` targets each composes (Decision 2 — applicable
-      subset per component, not a uniform four). `task gate` reproduces
-      exactly today's recipes and nothing more: **this milestone adds no new
-      checks.** It does change how every CI job invokes them, which is not
+      `gate:web`, `gate:agent`, plus only the individual targets that have
+      something to run today — `typecheck` and `test` per component, plus
+      `web`'s `check-docs`. **`fmt-check` and `lint` are NOT created here**:
+      no format or lint check exists yet, and M2 and M3 add those targets
+      alongside the checks themselves. `task gate` reproduces exactly today's
+      recipes and nothing more: **this milestone adds no new checks.** It does change how every CI job invokes them, which is not
       the same as changing nothing — see the CI caveats below.
 
       Files: `Taskfile.yml` (new); `.gitlab-ci.yml`; `CLAUDE.md` §Commands;
@@ -288,10 +291,26 @@ be amended, not worked around.
       and `alpine/helm` are digest-pinned and ship no task runner, so every
       job needs an install step (or a shared `.task_setup` `before_script`
       fragment, which is the cheaper option and keeps the pin in one place).
-      Same rule for every tool a later milestone adds: **the CI image must
-      provide it.** This is the milestone's main risk: the checks are
-      unchanged, but a `task`-install or PATH failure reds CI having changed
-      no check at all. Land it as its own MR and watch the first pipeline.
+      Same rule for every tool a later milestone adds: **the CI job must
+      provide it — never devbox.** "Provide" means whichever of these fits:
+      baked into a digest-pinned image (the lint jobs can use the official
+      `golangci/golangci-lint`, `koalaman/shellcheck-alpine` and `gitleaks`
+      images rather than installing into `golang:1.26`), fetched at job time
+      via a pinned `go run …@vX.Y.Z` (the `sqlc@v1.30.0` precedent in
+      `validate:api`, and how M4 will invoke `deadcode`), installed as an npm
+      devDependency by the existing `npm ci` (knip, ESLint), or a
+      `before_script` install.
+
+      **Anything fetched in a `before_script` must be version- and
+      sha256-pinned**, matching what `e2e:kind-smoke` already does for
+      kind/kubectl/helm. Every image in this file is digest-pinned; an
+      unverified `curl | sh` for `task` would be the first unpinned fetch in
+      the pipeline, and it would arrive in the MR that claims to add no new
+      checks.
+
+      This is the milestone's main risk: the checks are unchanged, but a
+      `task`-install or PATH failure reds CI having changed no check at all.
+      Land it as its own MR and watch the first pipeline.
 
       **The Taskfile does not know about devbox.** Targets invoke tools
       directly (`golangci-lint run`, `shellcheck …`), and whatever put them
@@ -302,8 +321,10 @@ be amended, not worked around.
       their current shape:** `validate:web` (check-docs + tsc) and
       `test:web` (vitest) are separate jobs in separate stages, so a job
       calling `task gate:web` would run vitest twice — CI calls the
-      fine-grained targets (`task lint:web`, `task test:web`), and
-      `task gate:web` stays the local convenience wrapper. And
+      fine-grained targets instead (at M1 that is `task check-docs:web` +
+      `task typecheck:web` for `validate:web` and `task test:web` for
+      `test:web`; M3 adds `task lint:web` to the first), and `task gate:web`
+      stays the local convenience wrapper. And
       `test:api-store-it` (`.gitlab-ci.yml:185-197`) wraps `go test` in a
       pipefail + `grep -c '^--- PASS'` / `'^--- SKIP'` assertion that exists
       to catch the suite silently skipping against a missing Postgres; that
@@ -340,7 +361,7 @@ be amended, not worked around.
       here — it is a much larger reformat and belongs with M3's ratchet if
       wanted at all.
 
-- [ ] **M3 — Linting: golangci-lint + ESLint, with baselines**: `.golangci.yml`
+- [ ] **M3 — Linting: golangci-lint + ESLint, each ratcheted its own way**: `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`
       `ineffassign` `unused` `unparam` `goconst` on; each *disabled* linter
       carries a one-line justification in the file, per that repo's
@@ -385,7 +406,8 @@ be amended, not worked around.
       a deletion lens rather than relying on tooling alone.
 
 - [ ] **M5 — The long tail: shell, YAML, secrets, vulns**: `shellcheck` over
-      `e2e/*.sh` and `scripts/*.sh` (baselined — 3646 lines of
+      `e2e/*.sh` and `scripts/*.sh` (shellcheck has no baseline file either —
+      start at `--severity=error` and tighten to `warning` once clean; 3646 lines of
       `run-e2e.sh` will not be clean on day one, and per #101 that file must
       be referenced by content anchor, never by line number); `yamllint` over
       `.gitlab-ci.yml` and `deploy/values/`; `gitleaks` in CI, which lets
@@ -421,10 +443,13 @@ be amended, not worked around.
       Also fixes the `web/` vitest configuration: `jsdom` is currently opted
       into per-file via `// @vitest-environment jsdom` in 54 of 79 test
       files, so a missing pragma silently runs a DOM test under node.
-      Prefer `environmentMatchGlobs` (or an explicit per-directory project
-      config) over flipping the global default — a blanket default flips the
-      remaining ~25 files from node to jsdom, which is the same class of
-      silent-wrong-environment bug in the opposite direction. Removes the
+      Prefer an explicit per-directory project config over flipping the
+      global default — a blanket default flips the remaining ~25 files from
+      node to jsdom, which is the same class of silent-wrong-environment bug
+      in the opposite direction. (`environmentMatchGlobs` does the same job
+      and works on the pinned `vitest ^2.1.9`, but it is deprecated from
+      Vitest 3 in favour of the projects/workspace config, so it buys a
+      migration later.) Removes the
       vestigial `coverage.out` line from `.gitignore:49` or makes it real.
 
 ## Parallelization
@@ -468,7 +493,14 @@ Two exceptions where "append at the end" is not enough:
    `test:api-store-it`'s Postgres service and its ran/skipped assertion, and
    `e2e:kind-smoke`.
 2. A newly introduced `gofmt` violation, `staticcheck` finding, dead Go
-   function, unused TS export, or `shellcheck` error fails an MR pipeline.
+   function, or `shellcheck` error fails an MR pipeline. **Unused TS exports
+   are the exception and reach this bar last**: knip's staging sets
+   `exports: "warn"`, and warn-severity issues do not count toward its error
+   total, so a new unused export gates nothing until that type is burned down
+   to zero and promoted to `error`. (`--max-issues` is a fixed budget, not a
+   ratchet — fix one old finding, add one new, still under budget.) If
+   gate-on-new is wanted for exports before the burn-down finishes, knip needs
+   the same diff-wrapper M4 writes for `deadcode`.
 3. The gate command appears in exactly one place in the repo; `CLAUDE.md` and
    the `.claude/agents/*` tails reference it rather than restating it.
 4. `.claude/agent-team.md` no longer says "Lint command: none dedicated".
@@ -511,7 +543,7 @@ Two exceptions where "append at the end" is not enough:
    is undecided. If yes, it is its own milestone, and it changes nothing
    about the Taskfile or CI — it is a local way to get the tools on `PATH`,
    nothing more.
-4. **Does `e2e/run-e2e.sh` survive shellcheck baselining, or does it want
+4. **Does `e2e/run-e2e.sh` survive shellcheck severity staging, or does it want
    splitting first?** 3646 lines in one file may produce a baseline so large
    it is meaningless. M5 should measure before committing to the approach.
 5. **Prettier/`gofumpt`** — deliberately excluded from M2. Worth a follow-up
