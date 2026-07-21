@@ -31,6 +31,7 @@ import {
   type Notification,
   type NotificationList,
   type PrivilegeReport,
+  type RecommendationCategory,
   type Run,
   type SelfimproveConfig,
   type SelfimproveUpdate,
@@ -258,16 +259,27 @@ function reviewDTO(review: MockReview): MockReview {
   };
 }
 
-// bucketOfRec buckets ONE recommendation through the shared ladder (dismissed > done >
-// filed > todo), the same precedence recomputeTriage uses — extracted so the Judge
-// backlog (PRD #98) and the stats tally cannot disagree on what a coordinate's state is.
+// bucketOf is the ladder itself (dismissed > done > filed(settled) > todo), and it mirrors
+// workersvc.BucketOf(dispositionStatus string, filedSettled bool) argument for argument.
+// The signature is the point: the server's ladder is a function of TWO SQL-resolved
+// values, so a version of it that takes a mock review object cannot be handed the server's
+// input and cannot be compared against it. This one can — fixtures/judge-fidelity feeds
+// the identical (disposition_status, filed_settled) pair to both.
+export function bucketOf(dispositionStatus: string | null, filedSettled: boolean): JudgeBacklogBucket {
+  if (dispositionStatus === "dismissed") return "dismissed";
+  if (dispositionStatus === "done") return "done";
+  if (filedSettled) return "filed";
+  return "todo";
+}
+
+// bucketOfRec resolves ONE recommendation's coordinate against a mock review's dispositions
+// and filed issues, then defers to bucketOf. It is the mock's stand-in for the SQL join —
+// the two LEFT JOINs that produce disposition_status and filed_settled — and deliberately
+// contains no precedence of its own, so the ladder exists exactly once on this side.
 function bucketOfRec(review: MockReview, category: string, target: string): JudgeBacklogBucket {
   const disp = review.dispositions.find((d) => d.category === category && d.target === target);
   const filed = review.filed_issues.some((f) => f.category === category && f.target === target);
-  if (disp?.status === "dismissed") return "dismissed";
-  if (disp?.status === "done") return "done";
-  if (filed) return "filed";
-  return "todo";
+  return bucketOf(disp?.status ?? null, filed);
 }
 
 // computeTriage sums the per-recommendation ladder over EVERY review the caller owns —
@@ -320,85 +332,197 @@ function rationalePreview(s: string): string {
 const BUCKET_RANK: Record<string, number> = { dismissed: 3, done: 2, filed: 1, todo: 0 };
 const RANK_BUCKET: JudgeBacklogBucket[] = ["todo", "filed", "done", "dismissed"];
 
-// computeBacklog mirrors the server's grouped read (workersvc.GroupJudgeRecommendations):
-// flatten every occurrence, order by review updated_at DESC (a re-judge counts as recent),
-// dedup by (category, target), roll up (todo if any open, else the highest member rung),
-// then sort by frequency (run_count, then open_count). The ?run= anchor keeps only groups
-// that recur in that run (a coordinate-level semi-join) while preserving each kept group's
-// other-run occurrences; ?bucket= filters the GROUP ROLLUP. triage is the canonical
-// aggregate, NEVER tallied from the returned groups.
-function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
-  const ordered = [...reviews].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+// JudgeBacklogRow is ONE ROW of the server's grouped read — the JSON shape of
+// store.ListJudgeRecommendationRowsForUserRow. The keys are BYTE-IDENTICAL to that
+// generated struct's json tags on purpose, because this type is the wire between the two
+// implementations: fixtures/judge-fidelity/cases.json is decoded straight into the Go
+// struct on one side and cast to this on the other, so the two graders are fed the same
+// bytes rather than two hand-built adapters.
+//
+// Note which fields are JOIN OUTPUTS: disposition_status, set_via, filed_settled and the
+// three filed-issue columns arrive already resolved from SQL. The mock's own review
+// objects never reach groupJudgeRecommendations; backlogRowsFromReviews is the mock's
+// stand-in for the join and it runs first.
+export type JudgeBacklogRow = {
+  review_id: string;
+  run_id: string;
+  verdict: string;
+  run_title: string;
+  rec_id: string;
+  category: RecommendationCategory;
+  target: string;
+  rationale_md: string;
+  confidence: JudgeOccurrence["confidence"];
+  disposition_status: string | null;
+  // dismiss_reason is projected by the query but the grouper never reads it (only the #94
+  // triage tally does), so it is optional here — matching the Go decoder, which accepts a
+  // fixture row that omits the key.
+  dismiss_reason?: string | null;
+  set_via: string | null;
+  filed_settled: boolean;
+  filed_issue_iid: number | null;
+  filed_issue_url: string | null;
+  filed_at: string | null;
+};
+
+// groupJudgeRecommendations mirrors workersvc.GroupJudgeRecommendations one-to-one: dedup
+// the flat rows by (category, target), roll up (todo if any member is open, else the
+// highest member rung), and sort by frequency (run_count DESC, then open_count DESC).
+//
+// It expects the query's order — most-recently-JUDGED review first — so a group's FIRST
+// row is its most-recent occurrence and supplies rationale_preview.
+//
+// The ?run= anchor is NOT here, and neither is the row cap: on the server both live in SQL
+// (a coordinate-level semi-join and a LIMIT that cuts rows BEFORE grouping), so a mock that
+// put them inside the grouper would be comparable to nothing. computeBacklog applies its
+// anchor around this call, and says there why that is not the same algorithm.
+export function groupJudgeRecommendations(rows: JudgeBacklogRow[]): JudgeRecommendationGroup[] {
   const byCoord = new Map<string, JudgeRecommendationGroup>();
   const runsSeen = new Map<string, Set<string>>();
   const topRung = new Map<string, number>();
 
-  for (const review of ordered) {
-    for (const rec of review.recommendations) {
-      const key = coordKey(rec.category, rec.target);
-      const b = bucketOfRec(review, rec.category, rec.target);
-      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
-      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
-      const occ: JudgeOccurrence = {
-        run_id: review.target_run_id,
-        run_title: getRun(review.target_run_id)?.issue_title ?? "",
-        review_id: review.id,
-        rec_id: rec.id,
-        verdict: review.verdict as ReviewVerdict,
-        confidence: rec.confidence,
-        bucket: b,
-        // Provenance rides alongside the bucket, because both a hand-marked and an
-        // auto-done are bucket "done" (PRD #98 Decision 6 / review B3).
-        ...(disp?.set_via ? { set_via: disp.set_via } : {}),
-        ...(filed
-          ? { filed_issue: { issue_iid: filed.issue_iid, issue_url: filed.issue_url, filed_at: filed.filed_at } }
-          : {}),
+  for (const row of rows) {
+    const key = coordKey(row.category, row.target);
+    const b = bucketOf(row.disposition_status, row.filed_settled);
+    const occ: JudgeOccurrence = {
+      run_id: row.run_id,
+      run_title: row.run_title,
+      review_id: row.review_id,
+      rec_id: row.rec_id,
+      verdict: row.verdict as ReviewVerdict,
+      confidence: row.confidence,
+      bucket: b,
+      // Provenance rides alongside the bucket, because both a hand-marked and an
+      // auto-done are bucket "done" (PRD #98 Decision 6 / review B3). Omitted rather than
+      // nulled when absent, matching Go's `json:"set_via,omitempty"` on a "" string.
+      ...(row.set_via ? { set_via: row.set_via as JudgeOccurrence["set_via"] } : {}),
+      // filed_settled is the gate, not the presence of an iid — the same test
+      // workersvc.filedIssueRef makes. filed_settled is `(f.filed_at IS NOT NULL)` in SQL,
+      // so the ?? fallbacks below are unreachable through the query; they exist because Go
+      // reads .Int64/.String off a NULL pgtype as the zero value rather than erroring, and
+      // a fixture that hand-wrote that combination must not diverge over it.
+      ...(row.filed_settled
+        ? {
+            filed_issue: {
+              issue_iid: row.filed_issue_iid ?? 0,
+              issue_url: row.filed_issue_url ?? "",
+              filed_at: row.filed_at ?? "",
+            },
+          }
+        : {}),
+    };
+    let g = byCoord.get(key);
+    if (!g) {
+      g = {
+        category: row.category,
+        target: row.target,
+        bucket: "todo",
+        open_count: 0,
+        run_count: 0,
+        // The first row of a group is its most-recent occurrence (query order).
+        rationale_preview: rationalePreview(row.rationale_md),
+        occurrences: [],
       };
-      let g = byCoord.get(key);
-      if (!g) {
-        g = {
-          category: rec.category,
-          target: rec.target,
-          bucket: "todo",
-          open_count: 0,
-          run_count: 0,
-          // First occurrence is the most-recent (ordered above) → its rationale is the preview.
-          rationale_preview: rationalePreview(rec.rationale_md),
-          occurrences: [],
-        };
-        byCoord.set(key, g);
-        runsSeen.set(key, new Set());
-        topRung.set(key, 0);
-      }
-      g.occurrences.push(occ);
-      if (b === "todo") g.open_count += 1;
-      const seen = runsSeen.get(key)!;
-      if (!seen.has(occ.run_id)) {
-        seen.add(occ.run_id);
-        g.run_count += 1;
-      }
-      topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
+      byCoord.set(key, g);
+      runsSeen.set(key, new Set());
+      topRung.set(key, 0);
     }
+    g.occurrences.push(occ);
+    if (b === "todo") g.open_count += 1;
+    const seen = runsSeen.get(key)!;
+    if (!seen.has(occ.run_id)) {
+      seen.add(occ.run_id);
+      g.run_count += 1;
+    }
+    topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
   }
 
-  let groups = [...byCoord.values()];
+  const groups = [...byCoord.values()];
   for (const g of groups) {
     const key = coordKey(g.category, g.target);
     g.bucket = g.open_count > 0 ? "todo" : RANK_BUCKET[topRung.get(key)!];
   }
+  // Array.prototype.sort has been REQUIRED to be stable since ES2019, so ties keep the
+  // first-seen (most-recent-first) order the query established — the same guarantee Go
+  // buys with sort.SliceStable. The difference is where it comes from: here it is a
+  // language guarantee, there it is a call-site choice that can be edited away.
+  groups.sort((a, b) => b.run_count - a.run_count || b.open_count - a.open_count);
+  return groups;
+}
+
+// filterGroups applies the ?bucket= filter to the grouped rows, mirroring
+// workersvc.filterGroups: it matches the GROUP ROLLUP, so "todo" is exactly
+// "open_count >= 1" and the settled rungs are mutually exclusive with it.
+//
+// Go additionally treats an EMPTY bucket as unfiltered, a route-level default this side
+// cannot express — JudgeBacklogBucket is a closed union with no "" member — so that one
+// branch is out of the fixture's reach. It is reachable in Go only from an internal caller
+// that passes "", never from the wire.
+export function filterGroups(
+  groups: JudgeRecommendationGroup[],
+  bucket: JudgeBacklogBucket,
+): JudgeRecommendationGroup[] {
+  return bucket === "all" ? [...groups] : groups.filter((g) => g.bucket === bucket);
+}
+
+// backlogRowsFromReviews flattens the mock's review objects into the server's row shape,
+// in the query's order (rv.updated_at DESC — a re-judge counts as recent). This is the
+// mock's stand-in for the SQL join, and it is deliberately OUTSIDE the grouper: the two
+// LEFT JOINs that resolve disposition_status / filed_settled are the part seam 6 cannot
+// compare, because on the server they are SQL and here they are two array lookups.
+function backlogRowsFromReviews(): JudgeBacklogRow[] {
+  const ordered = [...reviews].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const rows: JudgeBacklogRow[] = [];
+  for (const review of ordered) {
+    for (const rec of review.recommendations) {
+      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
+      rows.push({
+        review_id: review.id,
+        run_id: review.target_run_id,
+        verdict: review.verdict,
+        run_title: getRun(review.target_run_id)?.issue_title ?? "",
+        rec_id: rec.id,
+        category: rec.category,
+        target: rec.target,
+        rationale_md: rec.rationale_md,
+        confidence: rec.confidence,
+        disposition_status: disp?.status ?? null,
+        dismiss_reason: disp?.reason ?? null,
+        set_via: disp?.set_via ?? null,
+        // The mock has no unsettled-claim state: an entry in filed_issues IS a settled
+        // link, which is what the query's (f.filed_at IS NOT NULL) computes.
+        filed_settled: filed !== undefined,
+        filed_issue_iid: filed?.issue_iid ?? null,
+        filed_issue_url: filed?.issue_url ?? null,
+        filed_at: filed?.filed_at ?? null,
+      });
+    }
+  }
+  return rows;
+}
+
+// computeBacklog assembles GET /me/judge/recommendations out of the three pieces above,
+// in the server's order: join (backlogRowsFromReviews) → group → anchor → bucket filter.
+// triage is the canonical aggregate, NEVER tallied from the returned groups.
+function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
+  let groups = groupJudgeRecommendations(backlogRowsFromReviews());
   // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
   // run, but keep ALL its occurrences (so a notification still shows the other runs it
   // recurs in). A foreign/unknown run matches nothing → empty, no existence oracle.
+  //
+  // This filters GROUPS after grouping; the server filters ROWS before it, inside the
+  // query's WHERE. The two read as equivalent and are NOT the same algorithm, which is why
+  // the anchor is excluded from the fidelity fixture (see fixtures/judge-fidelity/README.md)
+  // and belongs to the e2e leg instead.
   if (runAnchor) {
     groups = groups.filter((g) => g.occurrences.some((o) => o.run_id === runAnchor));
   }
-  groups.sort((a, b) => (b.run_count - a.run_count) || (b.open_count - a.open_count));
-  const filtered = bucket === "all" ? groups : groups.filter((g) => g.bucket === bucket);
 
   return {
     bucket,
     run: runAnchor,
-    groups: filtered,
+    groups: filterGroups(groups, bucket),
     truncated: false,
     triage: computeTriage(),
   };
