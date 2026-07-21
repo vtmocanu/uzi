@@ -737,7 +737,7 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
   kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
   **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution
-  (both nullable, appended by `00076`, no backfill): `agent_instance` is the SDK's
+  (both nullable, appended by `00075`, no backfill): `agent_instance` is the SDK's
   per-frame `parent_tool_use_id` — the subagent INVOCATION id, which is what keeps
   two parallel same-role subagents distinguishable — and `agent_label` its
   `task_description`. Both are NULL whenever the frame carried no
@@ -9389,7 +9389,7 @@ The activity feed groups by **invocation**, not by role and not by consecutive a
 Two `coder` subagents running in parallel are two lanes, not one merged block.
 
 - **Two nullable `run_messages` columns, `agent_instance` and `agent_label`**, appended
-  by `00076` with no backfill. `agent_instance` is the SDK's per-frame
+  by `00075` with no backfill. `agent_instance` is the SDK's per-frame
   `parent_tool_use_id` (the INVOCATION id); `agent_label` is its `task_description`.
   Both are read exactly as `agentOf` already reads its sibling `subagent_type`: pure,
   per-frame, **no worker-side correlation state and no client-side join**, so they are

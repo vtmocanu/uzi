@@ -13,7 +13,7 @@ import (
 )
 
 // TestRunMessageInstanceLiveDB proves the PRD #99 columns against a REAL Postgres:
-// the 00076 migration applies, InsertRunMessage persists agent_instance +
+// the 00075 migration applies, InsertRunMessage persists agent_instance +
 // agent_label, and ListRunMessagesAfter reads them back on the same row. The load-
 // bearing half is the NULL contract — a message emitted with neither field (the
 // lead, an infra frame, or any pre-migration row) must come back with

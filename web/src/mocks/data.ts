@@ -1737,7 +1737,7 @@ export const mockBusyMessages: RunMessage[] = [
   // no `·` suffix and no placeholder (the label-absent degradation).
   bm("tool_use", "auditor", "toolu_01audit1", null, { id: "b-4", name: "Grep", input: { pattern: "CLAUDE_CODE_OAUTH_TOKEN", path: "agent/src" } }, 8),
   bm("tool_use", "documenter", "toolu_01docs01", "docs: run activity page", { id: "b-5", name: "Edit", input: { file_path: "docs/run-activity.md" } }, 7),
-  bm("tool_use", "reviewer", "toolu_01review", "review the migration + wire threading", { id: "b-6", name: "Read", input: { file_path: "api/internal/store/migrations/00076_run_message_instance.sql" } }, 6),
+  bm("tool_use", "reviewer", "toolu_01review", "review the migration + wire threading", { id: "b-6", name: "Read", input: { file_path: "api/internal/store/migrations/00075_run_message_instance.sql" } }, 6),
   // The doubled role. Y spoke recently (waiting), X is the newest speaker (working) —
   // so the `tester ×2` chip rolls up as `waiting` while X's lane pulses.
   bm("tool_use", "tester", "toolu_01testY", "unit: RunEvent", { id: "b-7", name: "Bash", input: { command: "npx vitest run src/components/RunEvent.test.tsx" } }, 0.4),
