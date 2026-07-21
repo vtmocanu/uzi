@@ -1082,12 +1082,40 @@ type IncomingMessage struct {
 // This function returns store errors from three places — the insert,
 // UpdateRunLastSeq and foldRunUsage — and 400 on this route tells the worker
 // "this batch is permanently poisoned, stop retrying it". Only the insert's error
-// is evidence for that claim. A 22P02 raised by the usage fold would be a fault
-// in a server-side value (the run's own session_id rides that insert), and
-// reporting it as the batch's fault makes the worker drop messages that were
-// never the problem: data loss from a misattributed error. The narrow shape has
-// in-repo precedent in handler/secrets.go's constraint-name check, for the same
-// reason.
+// is evidence for that claim. Reporting a failure from elsewhere as the batch's
+// fault makes the worker drop messages that were never the problem: data loss
+// from a misattributed error. The narrow shape has in-repo precedent in
+// handler/secrets.go's constraint-name check, for the same reason.
+//
+// 🔴 THE ASSUMPTION THIS RESTS ON, AND WHEN IT BREAKS:
+//
+//	EVERY worker-controlled value that reaches the store on this path does so
+//	through the sanitized InsertRunMessage.
+//
+// If you add a store call here that writes a worker-controlled value, or add such
+// a value to one of the two existing calls, THAT VALUE IS NO LONGER COVERED —
+// silently. It gets a 500, the worker retries it forever, and this PRD's exact
+// wedge reappears in a new location with no signal. Revisit this placement in the
+// same change, and extend the audit below rather than assuming it still holds.
+//
+// The audit as it stands, per non-insert call:
+//
+//   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
+//   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
+//     because "I cannot think of a case" is not the same as "there is no case".
+//     `model` IS worker-controlled (a JSON object key out of the payload) and is
+//     safe only because sanitation writes through the index in a pass that
+//     completes before foldRunUsage iterates msgs, so the name it inserts is
+//     already clean — pinned by TestWorkerMessagesUsageFoldSeesSanitizedModelNames-
+//     LiveDB, which reddens if that ordering inverts. `session_id` comes from the
+//     runs row, so Postgres already accepted it. `run_id` is a uuid. The token
+//     columns are bigint and take an int64, which always fits. `cost_usd` is
+//     numeric(12,6) and numericUSD clamps to that domain (its own comment names
+//     22003 as the poison-loop trigger it exists to prevent).
+//
+// A broader wrap was considered and rejected: with the above holding it catches
+// nothing extra, while reintroducing exactly the misattribution this narrowness
+// exists to prevent.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
@@ -1169,6 +1197,8 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			Payload:       []byte(m.Payload),
 		})
 		if err != nil {
+			// The ONLY classified error on this path. See the tripwire on
+			// AppendMessages before widening this to another store call.
 			insertErr = classifyStoreError(err)
 			// The one diagnostic line for this event, emitted HERE because this is
 			// the only place that holds the seq and kind alongside the SQLSTATE. The
