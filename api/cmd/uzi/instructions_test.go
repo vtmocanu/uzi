@@ -61,6 +61,15 @@ import (
 // kindUnknown, and kindUnknown FAILS — it must never default to help, or a new emitter
 // wrapper would silently buy every future instruction an exemption.
 //
+// THE BASELINE IS ZERO UNKNOWNS, and that number is what makes a future one meaningful.
+// MEASURED when this landed: all 9 lifted candidates resolved to a definite kind. So a
+// kindUnknown you hit later is a genuinely NEW emitter, not a gap in the classifier's
+// original coverage — and widening `emitters` is therefore a DECISION to record with its
+// reason, not a nuisance to clear. It is the one edit that can quietly re-open the hole
+// this file exists to close: every string printed through the newly-added function becomes
+// classifiable, and if the wrapper is not really an emitter they all become HELP, exempt
+// from the execution bar, silently.
+//
 // WHY A REGISTRY RATHER THAN THREE TESTS. Fixing three strings leaves the seam open: the next
 // commit that prints a hint reopens it, and nothing says so. These tests fail the build when
 // this package prints a `uzi …` command that has no entry below — so a FOURTH instruction

@@ -2998,6 +2998,14 @@ pass "printed-instruction fixture removed; wire todo back to the pre-seed $PI_TO
 # permanently unreachable: no flags, a device-authorization flow, and the hint fires inside
 # the polling loop on a terminal or timed-out approval. Both are declared, with those
 # reasons, in api/cmd/uzi/instructions_test.go — an honest declaration is a green state.
+#
+# WHOEVER BUILDS M8b/B4 (the 2001-row truncation seed) OWNS THE FOURTH ROW, and the two must
+# land TOGETHER in this file. B4 is the only arrangement in the repo that can reach
+# `truncated: true` — JudgeBacklogMaxRows is a compile-time const — so the truncation-remedy
+# row cannot be built before it and B4 is not worth its cost without it. Practical
+# consequence: **B4 lands last in the #98 work**, after this phase, and its author should
+# extend this block rather than open a second one. There is ONE writer for run-e2e.sh; two
+# concurrent agents editing it is the conflict this note exists to prevent.
 
 # Restore the default (judge OFF) so later sections' runs are not auto-judged and the
 # PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
