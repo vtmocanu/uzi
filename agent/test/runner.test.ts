@@ -869,6 +869,62 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     }
   });
 
+  // PRD #108 M6. The Go module cache writes its package directories mode 0555, and
+  // `fs.rm(force: true)` suppresses ENOENT, not EACCES — so before this fix the
+  // runner's terminal cleanup rejected on the first unlink inside such a directory
+  // and stranded the module cache (measured: 167.3 MB for one run,
+  // "EACCES: permission denied, unlink '<home>/go/pkg/mod/…/benchmark_test.go'").
+  //
+  // RED against the unfixed runner: with `fs.rm` restored at runner.ts's cleanup
+  // this test fails on `HOME … must be removed` while the run itself still
+  // completes — which is the other half of the contract, below.
+  it("removes a run HOME containing read-only (0555) directories, and cleanup failure never fails the run", async (t) => {
+    // Root ignores the permission bits, so the fixture would not be hostile and
+    // the assertion would hold against the UNFIXED runner too. Say so; do not
+    // pass quietly.
+    if (process.getuid?.() === 0) {
+      t.skip("running as uid 0 — root bypasses the 0555 fixture, so it proves nothing here");
+      return;
+    }
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-runhome-ro-"));
+    let runHome = "";
+    let modDir = "";
+    // The mode as the FILESYSTEM reported it, read back after the chmod and
+    // immediately before the run returns — so the fixture is proven hostile at
+    // the moment the runner's cleanup sees it, not merely requested to be.
+    let observedMode = "";
+    const factory: ExecutorFactory = (runId) => {
+      runHome = path.join(homeRoot, runId);
+      modDir = path.join(runHome, "go", "pkg", "mod", "gopkg.in", "inf.v0@v0.9.1");
+      const executor: Executor = {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          // Mirror what a `go build` inside the run leaves behind.
+          fs.mkdirSync(modDir, { recursive: true });
+          fs.writeFileSync(path.join(modDir, "benchmark_test.go"), "package inf\n");
+          fs.chmodSync(modDir, 0o555);
+          observedMode = (fs.lstatSync(modDir).mode & 0o777).toString(8);
+          return { branch: ctx.branch };
+        },
+      };
+      return { executor, homeDir: runHome };
+    };
+    const claim = gitlabClaim(57);
+    try {
+      await runnerWith(factory, gitlab).execute(claim);
+      assert.strictEqual(observedMode, "555", "fixture directory was not actually read-only when the run ended");
+      assert.strictEqual(fs.existsSync(runHome), false, `HOME ${runHome} must be removed even with a 0555 dir inside`);
+      // Cleanup is best-effort and lives in a `finally`; it must never turn a
+      // completed run into a failed one.
+      const state = api.states.filter((s) => s.runId === claim.run_id).at(-1);
+      assert.strictEqual(state?.body.status, "completed");
+    } finally {
+      // Only reachable when the fix regressed and the tree survived.
+      if (fs.existsSync(modDir)) fs.chmodSync(modDir, 0o755);
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("registers the run's secrets and evicts them all on terminal (Decision 7)", async () => {
     const { gitlab } = fakeGitlab();
     const { logger, added, removed } = secretRecordingLogger();
