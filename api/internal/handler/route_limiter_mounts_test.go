@@ -392,6 +392,16 @@ func describeLimiter(name string) string {
 // wantRouteMounts), and the limiters' real production budgets (this test substitutes
 // its own).
 //
+// It DOES catch the most plausible maintenance error of all, which is worth naming
+// because it looks like a fix rather than a regression: swapping a route's
+// PerUserMiddleware for the same limiter's IP-keyed Middleware. Measured on
+// /repos/{id}/sync — `forgeLimiter.PerUserMiddleware` -> `forgeLimiter.Middleware`
+// compiles, keeps a limiter on the route, and still reddens here with "per-user
+// limiter is noLimiter, want forgeLimiter", because the probe's second-user
+// discriminator refuses to credit an IP-keyed bucket as per-user protection. A
+// reader who assumed "some limiter is present" was the property would have called
+// that a false positive; it is the point.
+//
 // On REORDERS, measured rather than reasoned — an earlier version of this comment
 // claimed this test was blind to all of them, and that was wrong:
 //   - reordering Routes' PARAMETERS does redden it (16 routes report the wrong
