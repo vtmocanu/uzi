@@ -413,12 +413,16 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   chance of landing back on the worker whose disk still holds the session and
   git worktree. After the grace window any of the user's workers may claim it —
   and when one does, the SDK session is **not** portable: a session is a local
-  JSONL transcript under the claiming worker's own `$HOME/.claude/projects/`,
-  not server-side state. The worker therefore preflights the transcript before
-  resuming (`agent/src/sdk-session.ts`, issue #105) and, when it is not on this
-  machine, drops the resume and says so on the feed rather than passing an id
-  the SDK can only fail on. The run continues without its earlier context; if
-  the branch already carries pushed work, the planning prompt says so, so an
+  JSONL transcript at `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
+  on the worker that wrote it, not server-side state. Being keyed by **both**
+  HOME and cwd, it is lost to a different worker, to a replaced volume, and to
+  a changed clone path on the very same machine. The worker therefore
+  preflights the transcript before resuming (`agent/src/sdk-session.ts`, issue
+  #105) and, when it is not resolvable here, drops the resume and says so on
+  the feed rather than passing an id the SDK can only fail on — it resolves a
+  resume locally, so an unresolvable id kills the run on its first turn instead
+  of starting fresh. The run continues without its earlier context; if the
+  branch already carries pushed work, the planning prompt says so, so an
   amnesiac lead reads that work instead of redoing it.
 - **running → awaiting_approval → running** — the lead agent produces a plan;
   the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks

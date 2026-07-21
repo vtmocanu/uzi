@@ -14,6 +14,7 @@ import { GitCache } from "../src/git.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { encodeCwd } from "../src/sdk-session.js";
 import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
@@ -1173,8 +1174,11 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     });
   }
 
-  function plantTranscript(runHome: string, sessionId: string): void {
-    const dir = path.join(runHome, ".claude", "projects", "-data-runner-repo-issue-70");
+  /** Plant a transcript where the CLI would look for it: the project dir the run's
+   *  own clone path encodes to. Planting it anywhere else is invisible to the CLI, and
+   *  the preflight is scoped to match — see sdk-session.ts. */
+  function plantTranscript(runHome: string, iid: number, sessionId: string): void {
+    const dir = path.join(runHome, ".claude", "projects", encodeCwd(worktreeDirFor(iid)));
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
@@ -1188,7 +1192,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
       assert.strictEqual(seen[0]?.sessionId, undefined, "the dead session id must not reach the executor");
       const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      const notice = texts.find((t) => /earlier session is not on this worker/.test(t));
+      const notice = texts.find((t) => /earlier session could not be found/.test(t));
       assert.ok(notice, `expected an honest resume notice, got ${JSON.stringify(texts)}`);
       // Both facts the user needs to make sense of the feed: context is gone, AND that
       // is why the agent may re-tread ground. A bare "session not found" is not enough.
@@ -1205,11 +1209,11 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     const seen: RunContext[] = [];
     const claim = gitlabClaim(71, { session_id: SID });
     try {
-      plantTranscript(path.join(homeRoot, claim.run_id), SID);
+      plantTranscript(path.join(homeRoot, claim.run_id), 71, SID);
       await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
       assert.strictEqual(seen[0]?.sessionId, SID, "a resolvable session must still resume");
       const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      assert.ok(!texts.some((t) => /earlier session is not on this worker/.test(t)), "must not cry wolf");
+      assert.ok(!texts.some((t) => /earlier session could not be found/.test(t)), "must not cry wolf");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -1258,7 +1262,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       // remembers its own work and needs no warning.
       const kept: RunContext[] = [];
       const keptClaim = gitlabClaim(73, { session_id: SID });
-      plantTranscript(path.join(homeRoot, keptClaim.run_id), SID);
+      plantTranscript(path.join(homeRoot, keptClaim.run_id), 73, SID);
       await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(keptClaim);
       assert.strictEqual(kept[0]?.priorWork, undefined, "a live resume needs no prior-work warning");
 

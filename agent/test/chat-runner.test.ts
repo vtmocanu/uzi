@@ -9,6 +9,7 @@ import { ChatRunner, type ChatRunnerDefaults } from "../src/chat-runner.js";
 import type { ChatInput, ChatInputSource } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { ChatClaimResponse, OutgoingMessage, StateRequest } from "../src/protocol.js";
+import { encodeCwd } from "../src/sdk-session.js";
 import { nullLogger } from "./helpers.js";
 
 // The ChatRunner is exercised with a fake in-memory client (state + message
@@ -233,7 +234,8 @@ describe("ChatRunner — resume preflight (issue #105)", () => {
   ): ChatRunner {
     return new ChatRunner(client, () => executor, nullLogger(), 5, DEFAULTS, JOIN, {
       makeSource: () => source,
-      ...(sdkHomeDir ? { sdkHomeDir } : {}),
+      // The chat executor's cwd is its srcDir, which these tests leave at the default.
+      ...(sdkHomeDir ? { sdkSession: { homeDir: sdkHomeDir, cwd: UZI_SRC_DIR } } : {}),
     });
   }
 
@@ -257,7 +259,8 @@ describe("ChatRunner — resume preflight (issue #105)", () => {
   it("keeps a session whose transcript IS on this worker", async () => {
     const { messages, client } = fakeClient();
     const { queryFn, options } = fakeQuery();
-    const dir = path.join(homeDir, ".claude", "projects", "-some-cwd");
+    // Where the CLI would actually look: the project dir the executor's cwd encodes to.
+    const dir = path.join(homeDir, ".claude", "projects", encodeCwd(UZI_SRC_DIR));
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${SID}.jsonl`), "{}\n");
 

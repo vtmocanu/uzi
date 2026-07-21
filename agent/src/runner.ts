@@ -196,30 +196,41 @@ export class RunRunner {
       // Resume preflight (issue #105). The claim carries the session id the run last
       // reported, but the transcript it names lives under the per-run HOME on the
       // worker that WROTE it — and a requeued run whose affinity grace lapsed can land
-      // on a different worker (or the same worker on a fresh volume), where it does not
-      // exist. The SDK resolves a resume locally, so an unresolvable id does not start
-      // fresh: it fails the very first turn with `error_during_execution` and takes the
-      // whole run with it. Check first, and if it is gone, drop the resume and SAY so —
+      // on a different worker, where it does not exist. Not only cross-worker: a session
+      // is keyed by HOME *and* cwd, so a replaced volume or a changed clone path loses
+      // it on the same box. The SDK resolves a resume locally, so an unresolvable id
+      // does not start fresh: it fails the very first turn with `error_during_execution`
+      // and takes the whole run with it. If it is gone, drop the resume and SAY so —
       // continuing without the earlier context beats losing the run, but only if the
       // feed admits the context is gone rather than quietly re-treading ground.
+      //
+      // Checked against the CLONE PATH because a transcript is filed per cwd, not per
+      // HOME. That path is deterministic and worker-independent (`runner/<repoDir>/
+      // issue-<iid>`, git.ts), so it is the same string on whichever worker claims the
+      // run — the HOME is the only half that moves.
       //
       // Only when this run HAS a private HOME: the stub executor has none (main.ts),
       // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
       // untouched by construction rather than by an executor-kind check here.
       let sessionId = claim.session_id ?? undefined;
       let resumeDropped = false;
-      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, sessionId, runLog))) {
+      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, runnerClone.path, sessionId, runLog))) {
         resumeDropped = true;
         sessionId = undefined;
-        runLog.warn("resume session transcript is not on this worker; starting a fresh SDK session", {
+        runLog.warn("resume session transcript is not resolvable here; starting a fresh SDK session", {
           run_home: runHome,
+          cwd: runnerClone.path,
         });
         batcher.emit({
           kind: "status",
           agent: "worker",
           payload: {
+            // Says what is true without over-claiming a cause: the usual one is a
+            // re-claim by another worker, but the same box loses it too if the cwd
+            // changed or the volume was replaced. Both facts the reader needs are
+            // stated — the context is gone, AND that is why work may be re-tread.
             text:
-              "this run was picked up again, but the earlier session is not on this worker — " +
+              "this run was picked up again, but its earlier session could not be found on this worker — " +
               "continuing WITHOUT its earlier context, so some work may be repeated",
           },
         });

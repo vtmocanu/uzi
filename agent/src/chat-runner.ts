@@ -54,16 +54,20 @@ export interface ChatRunnerOptions {
    */
   makeSource?: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
   /**
-   * The SDK HOME the chat executor runs under, so a Continue can check whether the
-   * session it was handed is actually resolvable on THIS worker (issue #105). Chat
-   * shares one HOME across sessions by design (main.ts) — a Continue is a new run id
-   * resuming the same session, so a per-run HOME would file the transcript under the
+   * Where the chat executor's SDK session transcripts live, so a Continue can check
+   * whether the session it was handed is actually resolvable on THIS worker (issue
+   * #105). BOTH halves are needed: a transcript is filed under
+   * `<homeDir>/.claude/projects/<encoded cwd>/`, so the HOME alone cannot locate it.
+   * `cwd` is the executor's `srcDir` (the baked read-only source snapshot).
+   *
+   * Chat shares one HOME across sessions by design (main.ts) — a Continue is a new run
+   * id resuming the same session, so a per-run HOME would file the transcript under the
    * new id and break resume outright.
    *
    * Absent ⇒ no preflight. main.ts omits it for the stub executor, which persists no
    * real SDK session, so the e2e's report → resume_of → Continue flow is unaffected.
    */
-  sdkHomeDir?: string;
+  sdkSession?: { homeDir: string; cwd: string };
 }
 
 /**
@@ -73,7 +77,7 @@ export interface ChatRunnerOptions {
  */
 export class ChatRunner {
   private readonly makeSource: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
-  private readonly sdkHomeDir?: string;
+  private readonly sdkSession?: { homeDir: string; cwd: string };
 
   constructor(
     private readonly client: WorkerClient,
@@ -91,7 +95,7 @@ export class ChatRunner {
     this.makeSource =
       opts.makeSource ??
       ((runId, cancel, runLog) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel));
-    this.sdkHomeDir = opts.sdkHomeDir;
+    this.sdkSession = opts.sdkSession;
   }
 
   /**
@@ -155,7 +159,11 @@ export class ChatRunner {
     // target; the feed message it warrants is emitted in that block.
     let sessionId = claim.session_id ?? undefined;
     let resumeDropped = false;
-    if (sessionId && this.sdkHomeDir && !(await sessionTranscriptResolvable(this.sdkHomeDir, sessionId, runLog))) {
+    if (
+      sessionId &&
+      this.sdkSession &&
+      !(await sessionTranscriptResolvable(this.sdkSession.homeDir, this.sdkSession.cwd, sessionId, runLog))
+    ) {
       runLog.warn("chat resume session transcript is not on this worker; continuing without it");
       sessionId = undefined;
       resumeDropped = true;
