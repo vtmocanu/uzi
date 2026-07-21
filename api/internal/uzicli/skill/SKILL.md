@@ -83,7 +83,7 @@ uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi review show <run-id>
-uzi review backlog [--bucket todo|filed|done|dismissed|all]
+uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>]
 uzi review resolve <run-id> <rec-id> | --category <c> --target <t>
 uzi review dismiss <run-id> <rec-id> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <run-id> <rec-id>
@@ -180,7 +180,10 @@ factory but is refused (exit 4) writing another user's review.
 across all your runs, **deduped by `(category, target)`**, so a recommendation
 that recurs in five runs is ONE row carrying `seen in 5 runs` — the frequency
 signal is the point. `--bucket` filters by the group's rollup and defaults to
-`todo`; `all` shows settled groups too.
+`todo`; `all` shows settled groups too. `--run <run-id>` keeps only coordinates that also
+occur in that run — and it is the **only** filter applied BEFORE the server's row cap, so it
+is the only thing that can answer a `truncated` response. `--bucket` filters the rows the cap
+already cut, so no bucket value changes what is missing.
 
 Triage a whole group in one call with the coordinate `backlog` prints:
 
@@ -205,7 +208,7 @@ Three contracts to read carefully before acting on the output:
 - **`truncated: true` means a missing group is UNKNOWN, not settled.** The row
   cap applies *before* grouping, so a surviving group's `run_count`/`open_count`
   can be understated and its rollup wrong. Never treat a truncated page as
-  authoritative. `triage` is exempt — it is the canonical all-time tally and
+  authoritative. Narrow with `--run <run-id>`, not `--bucket` — see above. `triage` is exempt — it is the canonical all-time tally and
   stays correct under both the filter and the cut, which is why the numbers
   there match `uzi review stats` and the web nav badge exactly.
 

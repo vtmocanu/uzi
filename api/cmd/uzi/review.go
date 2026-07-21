@@ -62,6 +62,14 @@ func newReviewCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	backlog.Flags().String("bucket", "", backlogBucketFlagUsage)
+	// --run is the ONLY parameter that can narrow a pull below the server's row cap, because
+	// the anchor is a coordinate semi-join pushed into SQL BEFORE the LIMIT while --bucket
+	// filters the already-cut rows in Go. That makes it the only answer to a `truncated`
+	// backlog, which is why it exists here despite Decision 10's flag list not naming it —
+	// the list described the surface being specified, and #98's own Decision 1 has carried
+	// ?run= since M1. A well-formed but unknown/foreign run id is an EMPTY list, never a 404
+	// (no existence oracle), so a typo cannot be told from a run with nothing in it.
+	backlog.Flags().String("run", "", "narrow to the coordinates that also occur in this run id — the one filter applied BEFORE the server's row cap")
 
 	resolve := &cobra.Command{
 		Use:   "resolve <run-id> <rec-id> | --category C --target T",
@@ -249,7 +257,8 @@ func reviewCoord(cmd *cobra.Command, args []string) (apitypes.JudgeDispositionCo
 // alongside the groups.
 func runReviewBacklog(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command) error {
 	bucket, _ := cmd.Flags().GetString("bucket")
-	b, err := c.JudgeBacklog(cmd.Context(), strings.TrimSpace(bucket))
+	runAnchor, _ := cmd.Flags().GetString("run")
+	b, err := c.JudgeBacklog(cmd.Context(), strings.TrimSpace(bucket), strings.TrimSpace(runAnchor))
 	if err != nil {
 		return err
 	}
@@ -275,6 +284,7 @@ func renderBacklog(p *uzicli.Printer, b apitypes.JudgeBacklogDTO) error {
 		// open occurrence fell outside the cut is missing from a todo view entirely. A
 		// MISSING group is therefore UNKNOWN, not settled.
 		p.Println("warning: backlog truncated at the server's row cap — counts below may be understated and groups may be missing; a missing group is UNKNOWN, not settled")
+		p.Println("         narrow with `--run <run-id>`: the anchor is applied BEFORE the cap, so it is the only filter that changes what gets cut (--bucket filters after)")
 	}
 	if len(b.Groups) == 0 {
 		p.Println("no recommendations in this bucket")
@@ -346,21 +356,51 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 			coord.Category, sanitizeTTY(coord.Target), dispositionOutcome(status, reason), res.Updated)
 	}
 	if res.Updated == 0 {
-		// A 200 with nothing written. There is no 404 on this route by design — a
-		// coordinate that does not exist and one belonging to another user are the same
-		// answer (#94 Decision 5's no-existence-oracle rule) — so the CLI must not let a
-		// silent no-op read as success. It also must not claim WHY: "already settled" and
-		// "no such coordinate" are exactly what the server refuses to distinguish.
-		p.Println("nothing was written: no open member of yours matched that coordinate (it may already be settled, or the category/target may be misspelt)")
+		// A 200 with nothing written, which must never read as success.
+		//
+		// BE PRECISE ABOUT WHICH PAIR IS INDISTINGUISHABLE, because the earlier comment here
+		// named the wrong one and that error cost the user information. Measured against a
+		// live database, three causes:
+		//
+		//	A already settled    updated=0  groups=1
+		//	B misspelt           updated=0  groups=0
+		//	C another user's     updated=0  groups=0
+		//
+		// The server DOES separate A from the rest — the re-read returns the caller's own
+		// group. What #94 Decision 5 refuses to distinguish is B from C, which are
+		// byte-identical, and that pair is what the "of yours" wording below carries.
+		//
+		// So reporting A definitely leaks nothing: it is the caller's own data, and the
+		// server already hands it to `--json` in res.Groups today. Withholding it protected
+		// nothing and cost a user the one cause that is actionable.
+		//
+		// The !res.Truncated gate is load-bearing, not caution: past the row cap a settled
+		// coordinate can fall outside the read window and return NO group, so `groups` being
+		// empty would otherwise be read as "not settled" when the DTO's own contract says a
+		// missing group is UNKNOWN.
+		switch {
+		case len(res.Groups) > 0 && !res.Truncated:
+			p.Println("nothing was written: that coordinate is already settled")
+		default:
+			p.Println("nothing was written: no open member of yours matched — it may be misspelt, it may belong to another user, or it may be settled but outside a truncated read window")
+		}
 	}
 	if res.Truncated {
-		// BOTH halves of the contract, like the read path's warning. The earlier wording
-		// carried only the missing-group half, and the cap applies BEFORE grouping on this
-		// re-read for the same reason it does on the read — so a group that SURVIVES it can
-		// have lost occurrences and be understated too. It also said "--json output" while
-		// printing on the human path, which prints no groups at all, pointing the reader at
-		// something they are not looking at.
-		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled; re-check with `uzi review backlog --bucket all`")
+		// BOTH halves of the contract, and a remedy that WORKS.
+		//
+		// This used to end "re-check with `uzi review backlog --bucket all`", which is the
+		// second false printed instruction found on this path. Measured: every bucket
+		// truncates identically, because `truncated` is computed and the rows sliced BEFORE
+		// filterGroups runs — so no bucket value can reach what the cap cut. It handed the
+		// user the one knob that provably cannot help.
+		//
+		// --run can: the anchor is a coordinate semi-join pushed into SQL before the LIMIT.
+		// And --json ON THE ORIGINAL CALL is the authoritative record of what this write
+		// actually did, which no later read reconstructs. Note the re-read itself is
+		// unanchored by construction (BulkSetDispositions passes uuid.Nil), so --run narrows
+		// a FOLLOW-UP look, it does not retroactively widen this response.
+		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled")
+		p.Println("         --json on THIS call is the only complete record of what was written; `uzi review backlog --run <run-id>` narrows a re-check below the cap (--bucket cannot: it filters after the cut)")
 	}
 	// `settled` names the exact (run, rec) coordinates this call wrote — the ONLY correct
 	// basis for a revert. Be precise about what is and is not recoverable, because the loose

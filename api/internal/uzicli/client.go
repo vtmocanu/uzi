@@ -106,7 +106,11 @@ type Client interface {
 	// 400 ("invalid bucket") and maps to the usage exit code. Restating the enum here
 	// would add a second definition that could drift from the enforcing one; forwarding
 	// keeps the validator the only place the set is written down.
-	JudgeBacklog(ctx context.Context, bucket string) (apitypes.JudgeBacklogDTO, error)
+	// runAnchor is the ?run= coordinate semi-join (PRD #98 Decision 1). It is the ONLY
+	// predicate pushed into SQL before the row cap — bucket filtering happens in Go on the
+	// already-cut rows — so it is the only parameter that can narrow a pull below
+	// JudgeBacklogMaxRows and thereby answer a `truncated` warning. Empty omits it.
+	JudgeBacklog(ctx context.Context, bucket, runAnchor string) (apitypes.JudgeBacklogDTO, error)
 	// BulkSetDispositions applies one triage verdict to every member coordinate of the
 	// given groups (PRD #98 M2, Decision 3): PUT
 	// /api/me/judge/recommendations/disposition. status ∈ {done, dismissed}; reason
@@ -511,13 +515,20 @@ func (c *HTTPClient) JudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
 	return out, nil
 }
 
-func (c *HTTPClient) JudgeBacklog(ctx context.Context, bucket string) (apitypes.JudgeBacklogDTO, error) {
+func (c *HTTPClient) JudgeBacklog(ctx context.Context, bucket, runAnchor string) (apitypes.JudgeBacklogDTO, error) {
 	path := "/api/me/judge/recommendations"
+	// Both omitted rather than sent empty when unset: the handler's `== ""` branches are what
+	// apply its defaults, and an explicit empty value would take the same branch only by
+	// coincidence. Escaped because both are user input off a flag.
+	q := url.Values{}
 	if bucket != "" {
-		// Omitted rather than sent empty when unset: the handler's `bucket == ""` branch
-		// is what applies its default, and an explicit empty value would take the same
-		// branch only by coincidence. Escaped because it is user input off a flag.
-		path += "?bucket=" + url.QueryEscape(bucket)
+		q.Set("bucket", bucket)
+	}
+	if runAnchor != "" {
+		q.Set("run", runAnchor)
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
 	}
 	var out apitypes.JudgeBacklogDTO
 	if err := c.get(ctx, path, &out); err != nil {

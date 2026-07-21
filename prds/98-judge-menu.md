@@ -565,7 +565,7 @@ one action.
 
 10. **CLI parity — `uzi review backlog` + bulk *disposition* verbs**
     (`api/cmd/uzi/review.go`, the #94 group). `uzi review backlog [--bucket
-    todo|filed|done|dismissed|all] [--json]` prints the deduped groups (`category ·
+    todo|filed|done|dismissed|all] [--run <run-id>] [--json]` prints the deduped groups (`category ·
     target · seen in N runs · open N`) from the M1 endpoint; `uzi review
     resolve|dismiss --category C --target T [--reason wont-do|not-an-issue]` drives
     the M2 bulk **disposition** endpoint (group fan-out). **No `uzi review file`** —
@@ -574,6 +574,22 @@ one action.
     show/resolve/dismiss/undo/stats` stay. The web-only surfaces (nav badge, inbox
     grouping, per-row `/runs` badge) have no CLI analogue and are called out as
     such.
+    **Correction 2026-07-21: `--run` was added, and this decision's flag list did not
+    originally name it.** The omission was treated as deliberate during M7 and the flag
+    was left out; the review then measured why that was wrong. The truncation warning
+    told the user to "re-check with `uzi review backlog --bucket all`", and **no bucket
+    value can reach what the cap cut**: `truncated` is computed and the rows sliced
+    *before* `filterGroups` runs, so every bucket truncates identically (measured with
+    the cap lowered to 2 against a 9-row fixture — `all`, `todo`, `filed`, `done` and
+    `dismissed` all returned `truncated=true`, and `all` returned the same surviving
+    groups as `todo`). The `?run=` anchor is the **only** predicate pushed into SQL
+    *before* the `LIMIT` (Decision 1's semi-join), so it is the only parameter that can
+    change what gets cut — which made it the only possible remedy for a warning the CLI
+    was already printing. The flag list described the surface being specified, not a
+    prohibition on the endpoint's other parameter, and CLAUDE.md's second-consumer rule
+    points the same way: a route capability only the web drives is the "CLI silently
+    stale" case. Both truncation warnings now name `--run` (and `--json` on the original
+    call, which is the only complete record of what a write did).
 
 **Interactions (for completeness):** **Hosted workers / claim / agent code** are
 untouched — API + web + CLI + poller only. **Run deletion** cascades the review,
@@ -783,6 +799,30 @@ Four items. All found by execution, all with evidence recorded here or in the M3
       keeping other-run occurrences, truncation cutting **before** grouping), and check
       ordering explicitly — Go uses `sort.SliceStable(run_count DESC, open_count DESC)` and a
       JS `.sort()` is not stable the same way for equal keys.
+- [ ] **The filed-issues join's coordinate half is asserted but NOT exercised** (measured
+      2026-07-21). Dropping `AND f.target = rr.target` from the `LEFT JOIN` leaves
+      `TestJudgeBacklogProjectsEveryColumnLiveDB` **green**, because the fixture's `autoRev`
+      and `handRev` are **different reviews** — so `f.review_id = rv.id` alone separates the
+      filed row from the unfiled one and the coordinate half never carries weight. **This
+      covers four columns**: `filed_settled`, `filed_issue_iid`, `filed_issue_url`,
+      `filed_at`. Drift would leak a filed link onto **sibling coordinates of the same
+      review** — a never-filed coordinate rendering "Filed #4242", and `filed_settled`
+      flipping it to the `filed` rung so the ladder hides it from To triage. Silent and
+      user-visible. **One-line fix: add an unfiled coordinate INSIDE `autoRev`**, so dropping
+      the predicate cross-matches and the assertion becomes load-bearing. (Caveat from the
+      measurement: only the *minimal type-preserving* fold is a valid test here — two earlier
+      attempts changed the generated Go type or perturbed an unrelated test, so a green from
+      a non-minimal fold proves nothing.)
+      **Honest count for the MR: 14 of 16 projections pinned with VERIFIED isolation.** Two
+      are asserted but not exercised, and **both have the same root cause: every fixture row
+      carries identical values.** `bulkFixture` hardcodes `'because'` as the rationale on
+      every row, so folding `rr.rationale_md → 'because'::text` collapses the stored hash and
+      the read-back value to the same thing and the test **goes green** (measured). And
+      `autoRev`/`handRev` put the filed and unfiled coordinates in *different reviews*, so
+      `f.review_id = rv.id` alone separates them and the join's coordinate half never works.
+      **One fixture principle fixes both — distinct values per fixture row**, which is the
+      `memberRowIn` lesson from `136acb53` never applied to the rationale text or the
+      filed/unfiled split. The fix is in the fixture, not the assertions.
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,

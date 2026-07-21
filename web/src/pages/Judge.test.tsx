@@ -271,21 +271,18 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
       triage: { total: 24, todo: 0, filed: 0, done: 24, dismissed: 0, false_positives: 0 },
     });
 
-    let inFlight = 0;
-    let peak = 0;
-    mockApi.deleteDisposition.mockImplementation(() => {
-      inFlight += 1;
-      peak = Math.max(peak, inFlight);
-      // Resolve on a later microtask so overlapping calls are actually observable — an
-      // already-resolved promise would let each await unwind before the next begins and the
-      // peak would read 1 no matter what the code does.
-      return new Promise<null>((resolve) =>
-        setTimeout(() => {
-          inFlight -= 1;
-          resolve(null);
-        }, 0),
-      );
-    });
+    // DEFERRED PROMISES, NO TIMERS. Every call parks until this test releases it, so the
+    // bound is observed structurally rather than by racing the clock: with all N calls
+    // outstanding, the number the code has issued IS the concurrency limit.
+    //
+    // The earlier version resolved on a `setTimeout(…, 0)` and measured a peak counter. It
+    // was correct and it survived four mutations, but it made a wall-clock-dependent
+    // assertion out of a property that has nothing to do with elapsed time — and this suite
+    // is where CI flakes get born. Nothing here can now be perturbed by a slow machine.
+    const release: Array<() => void> = [];
+    mockApi.deleteDisposition.mockImplementation(
+      () => new Promise<null>((resolve) => release.push(() => resolve(null))),
+    );
 
     renderJudge();
     await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
@@ -293,12 +290,30 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     const toast = await screen.findByRole("status");
     fireEvent.click(within(toast).getByText("Undo"));
 
-    await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(settled.length));
-    expect(peak).toBeLessThanOrEqual(6);
-    // Control: with 24 members and a bound of 6 the work really was concurrent, so a peak of
-    // 1 would mean this measured a fully serial implementation and proves nothing about the
-    // bound.
-    expect(peak).toBeGreaterThan(1);
+    // Exactly UNDO_CONCURRENCY calls start, and no more, while all of them are outstanding.
+    await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(6));
+    // Nothing may sneak a 7th through on a later microtask. Draining the queue repeatedly is
+    // the deterministic equivalent of "wait and see": an unbounded implementation has already
+    // issued all 24 by now, so this is where it fails.
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(6);
+
+    // Control: the work really is concurrent, not serialised. A serial implementation would
+    // have exactly ONE call outstanding here, so this discriminates a bound of 6 from a
+    // bound of 1 — the failure mode that would make the assertion above pass vacuously.
+    expect(release.length).toBe(6);
+
+    // Drain: each release frees a worker to take the next member. Releasing a batch and then
+    // waiting for the call count to GROW is what keeps this terminating — waiting on a
+    // steady-state predicate would be satisfied instantly and spin.
+    let seen = mockApi.deleteDisposition.mock.calls.length;
+    while (seen < settled.length) {
+      release.splice(0).forEach((r) => r());
+      await waitFor(() => expect(mockApi.deleteDisposition.mock.calls.length).toBeGreaterThan(seen));
+      seen = mockApi.deleteDisposition.mock.calls.length;
+    }
+    release.splice(0).forEach((r) => r()); // let the last batch settle
+    expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(settled.length);
   });
 
   // Partial failure is reported honestly (PRD #98 review N4). The previous Promise.all form

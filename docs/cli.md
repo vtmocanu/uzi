@@ -146,6 +146,7 @@ row reading `seen in 5 runs`:
 ```sh
 uzi review backlog                                           # what still needs triage
 uzi review backlog --bucket all --json                       # settled groups too, for an agent
+uzi review backlog --run <run-id>                            # only coordinates that recur in that run
 uzi review resolve --category <c> --target <t>               # mark the whole group done
 uzi review dismiss --category <c> --target <t> --reason wont-do
 ```
@@ -161,7 +162,9 @@ Three things to know before acting on a group action's output:
   exists. Re-read `backlog` rather than guessing.
 - **`truncated: true` means a missing group is unknown, not settled** — the row
   cap applies before grouping, so a surviving group's counts can be understated
-  too. The `triage` tally is exempt: it's the canonical all-time aggregate and
+  too. Narrow with **`--run <run-id>`**: the anchor is the only filter applied
+  *before* the cap, so it is the only one that changes what gets cut. `--bucket`
+  filters the surviving rows and cannot reach the missing ones. The `triage` tally is exempt: it's the canonical all-time aggregate and
   matches `uzi review stats` and the web nav badge exactly.
 
 Passing only one of `--category`/`--target` is a usage error (exit 2). An empty

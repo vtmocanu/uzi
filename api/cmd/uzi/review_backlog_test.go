@@ -142,6 +142,64 @@ func TestReviewBacklogBucketForwardedVerbatim(t *testing.T) {
 	}
 }
 
+// --run forwards the anchor, and an unset flag omits it. The anchor is the ONLY filter
+// applied before the server's row cap, so it is the only thing that can answer a truncation
+// warning — which is why the warnings now name it and why it exists at all (PRD #98 review;
+// Decision 10's flag list predates the finding and is corrected in the PRD).
+func TestReviewBacklogRunAnchorForwarded(t *testing.T) {
+	fc := backlogFake()
+	if _, _, code := runCLI(t, fakeEnv(fc), "review", "backlog", "--run", "run-42"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastBacklogRun != "run-42" {
+		t.Errorf("run anchor forwarded as %q, want run-42", fc.LastBacklogRun)
+	}
+
+	fc2 := backlogFake()
+	if _, _, code := runCLI(t, fakeEnv(fc2), "review", "backlog"); code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc2.LastBacklogRun != "" {
+		t.Errorf("an unset --run must send nothing, got %q", fc2.LastBacklogRun)
+	}
+}
+
+// Both truncation warnings must name a remedy that WORKS. `--bucket all` does not: every
+// bucket truncates identically, because `truncated` is computed and the rows sliced before
+// the bucket filter runs, so no bucket value reaches what the cap cut. Naming it was the
+// second false printed instruction on this path.
+func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
+	// The read path.
+	fc := backlogFake()
+	fc.JudgeBacklogResult.Truncated = true
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "backlog")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "--run") {
+		t.Errorf("the read-path truncation warning must point at --run:\n%s", out)
+	}
+	if strings.Contains(out, "--bucket all") {
+		t.Errorf("the read-path warning still names --bucket, which cannot reach the cut:\n%s", out)
+	}
+
+	// The post-write path.
+	fc2 := backlogFake()
+	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 2, Truncated: true}
+	out2, _, code2 := runCLI(t, fakeEnv(fc2), "review", "resolve", "--category", "tests", "--target", "unit")
+	if code2 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code2)
+	}
+	if strings.Contains(out2, "--bucket all") {
+		t.Errorf("the post-write warning still names the remedy that cannot work:\n%s", out2)
+	}
+	for _, want := range []string{"--json on THIS call", "--run"} {
+		if !strings.Contains(out2, want) {
+			t.Errorf("the post-write warning is missing %q:\n%s", want, out2)
+		}
+	}
+}
+
 // An unknown bucket is the SERVER's 400, surfacing as the usage exit code — never a
 // silently empty list. This is the pass-through design's payoff: the CLI holds no bucket
 // predicate, so there is nothing here that can fail quietly.
@@ -308,32 +366,104 @@ func TestReviewGroupUpdatedIsCoordinatesNotRecommendations(t *testing.T) {
 
 // Updated == 0 is a 200 that wrote nothing, and it must never read as success.
 //
-// This is the honest form of the PRD's "uza_ token on a bulk mutation" case. There is NO
-// 404 on this route to assert: it is owner-only BY CONSTRUCTION (the service resolves under
-// `user_id = caller`), and coordinates are not ids, so a read-only uza_ token aimed at
-// another user's coordinate, a coordinate that does not exist, and one already settled are
-// ALL the same answer — 200, updated 0 (#94 Decision 5's no-existence-oracle rule; the
-// branch's own judge_bulk_disposition_livedb_test.go says a status assertion here is
-// vacuous). The only thing the CLI can get wrong is presenting that silence as a
-// completed action, so that is what this pins — including that it does not guess WHY,
-// which would rebuild the oracle the server refuses to provide.
+// REWRITTEN (PRD #98 review). The previous version was wrong three ways, and all three came
+// from being written in the same sitting as the production comment it justified — so the
+// test and the comment were never independent evidence:
+//
+//  1. it repeated the comment's false premise, that "already settled" and "no such
+//     coordinate" are what the server declines to distinguish. Measured, they are not: an
+//     already-settled coordinate comes back with groups=1, a misspelt one with groups=0. The
+//     indistinguishable pair is misspelt vs another user's;
+//  2. it asserted a PHRASE (`Contains(out, "may already be settled")`), so it would have
+//     blocked any rewording — including this strictly better one;
+//  3. its fixture had nil Groups, so it only ever exercised the ambiguous branch and could
+//     not observe the distinction in either direction.
+//
+// The replacement is DIFFERENTIAL, which survives rewording and actually pins the property:
+// two responses differing only in Groups must read DIFFERENTLY, and the two causes the server
+// merges must read IDENTICALLY.
 func TestReviewGroupZeroUpdatedIsNotReportedAsSuccess(t *testing.T) {
+	run := func(res apitypes.JudgeDispositionResultDTO) string {
+		t.Helper()
+		fc := backlogFake()
+		fc.BulkDispositionResult = res
+		out, _, code := runCLI(t, fakeEnv(fc), "review", "dismiss",
+			"--category", "install_worker_tool", "--target", "rg", "--reason", "wont-do")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d, want 0 (the request succeeded; nothing matched)", code)
+		}
+		return out
+	}
+
+	// A: already settled — the re-read returns the caller's OWN group.
+	settled := run(apitypes.JudgeDispositionResultDTO{
+		Updated: 0,
+		Groups:  []apitypes.JudgeRecommendationGroupDTO{{Category: "install_worker_tool", Target: "rg", Bucket: "done"}},
+	})
+	// B: misspelt — nothing of the caller's matched.
+	misspelt := run(apitypes.JudgeDispositionResultDTO{Updated: 0})
+	// There is deliberately NO "C: another user's coordinate" fixture here, and that absence
+	// is the honest version of a check I first wrote and then caught by mutation.
+	//
+	// I originally added C as a third `run(...)` with the SAME value as B and asserted
+	// `misspelt != foreign`. That compares a value to itself: at the CLI, B and C ARE the
+	// identical response (#94 Decision 5 makes the server answer them the same), so the
+	// assertion could not fail whatever the CLI did — the tautology class, in a test written
+	// to guard against exactly that class. A mutation printing the group count came back
+	// GREEN and showed it.
+	//
+	// The real division of labour: the B/C indistinguishability is a SERVER property, pinned
+	// live-DB where the two requests genuinely differ. What the CLI can get wrong is
+	// asserting a cause it cannot know, which the next assertion pins.
+
+	// Neither may read as success.
+	for name, out := range map[string]string{"already-settled": settled, "misspelt": misspelt} {
+		if !strings.Contains(out, "nothing was written") {
+			t.Errorf("%s: a 0-updated fan-out must say nothing was written:\n%s", name, out)
+		}
+	}
+
+	// The distinction the server DOES make is surfaced...
+	if settled == misspelt {
+		t.Errorf("an already-settled coordinate reads identically to a misspelt one — the CLI is holding res.Groups and throwing it away:\n%s", settled)
+	}
+	// ...and where the server makes NO distinction, the CLI must not invent one. With no
+	// group returned it may not name a single cause: misspelt and another-user's are the same
+	// response, so any message committing to one of them asserts something unknowable.
+	// Pinned as a property (several causes offered), not as a phrase, so a rewording that
+	// keeps the ambiguity still passes.
+	for _, cause := range []string{"misspelt", "another user"} {
+		if !strings.Contains(misspelt, cause) {
+			t.Errorf("the ambiguous message must keep %q among the possibilities, not commit to one cause:\n%s", cause, misspelt)
+		}
+	}
+	if strings.Contains(misspelt, "already settled\n") {
+		t.Errorf("the ambiguous branch asserted a definite cause:\n%s", misspelt)
+	}
+}
+
+// Truncation collapses the definite branch back to the ambiguous one, and that gate is not
+// caution: past the row cap a SETTLED coordinate can fall outside the read window and return
+// no group, so `groups` present-or-absent stops meaning settled-or-not. The DTO's own
+// contract says a missing group is UNKNOWN — and here a PRESENT group with truncated=true is
+// equally untrustworthy as evidence of the whole picture.
+func TestReviewGroupTruncatedDoesNotClaimAlreadySettled(t *testing.T) {
 	fc := backlogFake()
-	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 0}
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated:   0,
+		Truncated: true,
+		Groups:    []apitypes.JudgeRecommendationGroupDTO{{Category: "install_worker_tool", Target: "rg", Bucket: "done"}},
+	}
 	out, _, code := runCLI(t, fakeEnv(fc), "review", "dismiss",
 		"--category", "install_worker_tool", "--target", "rg", "--reason", "wont-do")
-	// The request itself succeeded; nothing matched. Faithful reporting, not an invented
-	// failure — the same posture `review undo` takes for an already-undone coordinate.
 	if code != uzicli.ExitOK {
-		t.Fatalf("exit = %d, want 0 (the request succeeded; nothing matched)", code)
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "already settled") {
+		t.Errorf("a TRUNCATED response must not assert already-settled — the group's presence is not evidence:\n%s", out)
 	}
 	if !strings.Contains(out, "nothing was written") {
-		t.Errorf("a 0-updated fan-out must say nothing was written:\n%s", out)
-	}
-	// It must not claim a cause: "already settled" and "no such coordinate" are precisely
-	// what the server declines to distinguish.
-	if !strings.Contains(out, "may already be settled") {
-		t.Errorf("want the ambiguity stated, not a single cause asserted:\n%s", out)
+		t.Errorf("still must not read as success:\n%s", out)
 	}
 }
 

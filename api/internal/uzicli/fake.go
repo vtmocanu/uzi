@@ -87,6 +87,7 @@ type FakeClient struct {
 	// whichever call came first and prove nothing about the write.
 	JudgeBacklogResult    apitypes.JudgeBacklogDTO
 	LastBacklogBucket     string
+	LastBacklogRun        string
 	BulkDispositionResult apitypes.JudgeDispositionResultDTO
 	LastBulkItems         []apitypes.JudgeDispositionCoordDTO
 	LastBulkStatus        string
@@ -211,8 +212,9 @@ func (f *FakeClient) JudgeStats(context.Context) (apitypes.TriageDTO, error) {
 	return f.JudgeStatsResult, nil
 }
 
-func (f *FakeClient) JudgeBacklog(_ context.Context, bucket string) (apitypes.JudgeBacklogDTO, error) {
+func (f *FakeClient) JudgeBacklog(_ context.Context, bucket, runAnchor string) (apitypes.JudgeBacklogDTO, error) {
 	f.LastBacklogBucket = bucket
+	f.LastBacklogRun = runAnchor
 	if f.Err != nil {
 		return apitypes.JudgeBacklogDTO{}, f.Err
 	}
