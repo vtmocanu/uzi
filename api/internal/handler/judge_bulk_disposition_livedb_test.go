@@ -300,6 +300,112 @@ func TestBulkDispositionScopeLiveDB(t *testing.T) {
 	}
 }
 
+// ---- 3b. a FILED member is not open, and the filed row is COORDINATE-scoped ----------
+
+// TestBulkDispositionFiledMemberIsNotOpenLiveDB pins the one rung of Decision 2's ladder
+// that no live exercise of this endpoint reached: `filed_settled` — the boolean
+// ListOwnedRecommendationsForCoords computes from its `recommendation_filed_issues` LEFT
+// JOIN and BucketOf turns into the `filed` rung.
+//
+// WHY IT WAS WORTH ADDING, stated as the measurement rather than the conclusion: before
+// this test, `grep -c "recommendation_filed_issues\|filed_settled"` over this whole file
+// returned 0. No live bulk fixture had ever inserted a filed row, so `f` matched nothing on
+// every row of every live run and `filed_settled` was FALSE everywhere. The rung was pinned
+// only by fakes — and a fake takes the boolean as a PARAMETER, so it cannot be wrong about
+// where the boolean comes from. That is the shape this branch kept finding: the assertion
+// existed, the code path did not execute.
+//
+// The fixture is one review holding TWO coordinates with a filed row on exactly ONE, which
+// is what makes the assertion discriminating in BOTH directions. `updated` is the
+// load-bearing number:
+//
+//   - drop `AND f.category = rr.category AND f.target = rr.target` from the join (keeping
+//     `f.review_id = rv.id`) and the single filed row cross-matches its SIBLING coordinate
+//     too, so BOTH members bucket `filed`, neither is open, and updated = 0;
+//   - drop the join or the `filed_at IS NOT NULL` projection and NOTHING is filed, so both
+//     members are open and updated = 2.
+//
+// A one-coordinate fixture would catch only the second. The coordinate half is exactly the
+// predicate the PRD's Remaining Work records as asserted-but-unexercised on the M1 read
+// query; this pins the bulk query's own copy of it, which is a different query body.
+//
+// The scope=all leg is not decoration: it proves the skip above was the LADDER refusing an
+// already-filed member, not a resolve that silently failed to find it. Same argument as leg
+// (c) of the owner-only matrix.
+func TestBulkDispositionFiledMemberIsNotOpenLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	rg, coder := [2]string{"install_worker_tool", "rg"}, [2]string{"improve_agent", "coder"}
+	userID := bulkFixture(ctx, t, pool, 1, rg, coder)
+	user := store.User{ID: userID}
+
+	// One review, both coordinates. The filed row lands on rg ONLY.
+	var reviewID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM run_reviews WHERE user_id = $1`, userID).Scan(&reviewID); err != nil {
+		t.Fatalf("pick review: %v", err)
+	}
+	mustExecT(ctx, t, pool,
+		`INSERT INTO recommendation_filed_issues
+		     (review_id, category, target, filed_issue_iid, filed_issue_url, filed_at, filing_since)
+		 VALUES ($1, 'install_worker_tool', 'rg', 4242, 'https://forge.e2e/i/4242', now(), now())`,
+		reviewID)
+	// Fixture precondition — without it every assertion below is vacuous, and the whole
+	// point of this test is that the precondition was silently absent for the entire file.
+	var filedRows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM recommendation_filed_issues WHERE review_id = $1 AND filed_at IS NOT NULL`,
+		reviewID).Scan(&filedRows); err != nil {
+		t.Fatalf("count filed rows: %v", err)
+	}
+	if filedRows != 1 {
+		t.Fatalf("fixture broken: %d settled filed rows on the review, want exactly 1 — otherwise this test proves nothing", filedRows)
+	}
+
+	body := `{"items":[{"category":"install_worker_tool","target":"rg"},{"category":"improve_agent","target":"coder"}],"status":"done"}`
+	rec, got := doBulk(t, h, user, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got.Updated != 1 {
+		t.Fatalf("updated = %d, want 1 — scope=open must settle the UNFILED sibling only. "+
+			"0 means the filed row cross-matched its sibling coordinate (the join's coordinate half is gone); "+
+			"2 means nothing read as filed at all", got.Updated)
+	}
+	rows := dispositionRowsFor(ctx, t, pool, userID)
+	if rows["improve_agent/coder"] != "done" {
+		t.Fatalf("the unfiled sibling = %q, want done; rows=%v", rows["improve_agent/coder"], rows)
+	}
+	if s, ok := rows["install_worker_tool/rg"]; ok {
+		t.Fatalf("the FILED coordinate got a %q disposition; scope=open must leave it alone; rows=%v", s, rows)
+	}
+
+	// The re-read groups agree with the ladder: rg rolls up `filed`, its sibling `done`.
+	// (This half rides the M1 read query, not the bulk resolve, so it does not redden under
+	// the folds above — it is here so the response the client renders is checked too.)
+	byTarget := map[string]string{}
+	for _, g := range got.Groups {
+		byTarget[g.Target] = g.Bucket
+	}
+	if byTarget["rg"] != "filed" || byTarget["coder"] != "done" {
+		t.Fatalf("group rollups = %v, want rg=filed and coder=done", byTarget)
+	}
+	if got.Triage.Filed != 1 || got.Triage.Done != 1 || got.Triage.Todo != 0 {
+		t.Fatalf("triage = %+v, want filed 1 / done 1 / todo 0", got.Triage)
+	}
+
+	// scope=all reaches the filed member, so the skip above was the ladder and not a
+	// resolve that quietly found nothing.
+	_, all := doBulk(t, h, user,
+		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done","scope":"all"}`)
+	if all.Updated != 1 {
+		t.Fatalf("scope=all updated %d on the filed coordinate, want 1 — the member resolves fine, "+
+			"it was scope=open that declined it", all.Updated)
+	}
+	if rows := dispositionRowsFor(ctx, t, pool, userID); rows["install_worker_tool/rg"] != "done" {
+		t.Fatalf("scope=all left the filed coordinate at %q, want done; rows=%v", rows["install_worker_tool/rg"], rows)
+	}
+}
+
 // ---- 4. idempotence ------------------------------------------------------------------
 
 // TestBulkDispositionIdempotentLiveDB: calling twice with scope=all converges — the second

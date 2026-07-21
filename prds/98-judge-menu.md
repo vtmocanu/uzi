@@ -773,11 +773,23 @@ failures observed" WITH NOTHING EXECUTED**, and no single weaker check catches a
 | the mutation silently did not apply | a real, fully green run of **unmutated** code | everything except diffing the file |
 | the run never happened | `run-store-it.sh` exits 1, log holds only "postgres never became ready", `PASS=0 SKIP=0 FAIL=0` | "no FAIL lines" |
 
-The third was observed twice on 2026-07-21 by two agents on two different commands. Only
-`PASS > 0` **and** `SKIP == 0` **and** the named test appearing as `--- PASS`/`--- FAIL`
-catches all three — which is why the rule is not "check the exit code". Note also that the
-rule was written before the third mechanism was seen and caught it anyway: that is the
-argument for a mechanism over an enumeration of known failure modes.
+The third was observed twice on 2026-07-21 by two agents on two different commands.
+
+**THE POSITIVE CONTROL CATCHES TWO OF THESE THREE, NOT ALL THREE, AND THE DISTINCTION IS
+LOAD-BEARING.** `PASS > 0` **and** `SKIP == 0` **and** the named test appearing as
+`--- PASS`/`--- FAIL` catches the skipped suite and the run that never happened — which is why
+the rule is not "check the exit code". It **cannot** catch the silently-unapplied mutation, and
+no property of the *run* can: the suite genuinely runs, every assertion genuinely executes, the
+control passes cleanly, and the result is green because the code under test was never mutated.
+Only comparing the TREE sees that one, which is why `.claude/agent-team.md`'s "assert the
+mutation actually applied — not just that the test ran" is a **separate** rule and must stay
+one. A reader who believes the control covers all three will drop the tree comparison as
+duplicated effort, and that is the one of the three that has already produced a false green on
+this branch. (Corrected 2026-07-21: the lead originally wrote "one check catches all three",
+which the table above already contradicted.)
+
+Note also that the control was written before the third mechanism was seen and caught it
+anyway: that is the argument for a mechanism over an enumeration of known failure modes.
 
 **The tenant boundary, and the precise claim.** Neither `recommendation_filed_issues`
 (00071) nor `recommendation_dispositions` (00073) has an owner column. `filed_by_user_id`
@@ -935,6 +947,41 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       **One fixture principle fixes both — distinct values per fixture row**, which is the
       `memberRowIn` lesson from `136acb53` never applied to the rationale text or the
       filed/unfiled split. The fix is in the fixture, not the assertions.
+      **STATUS CORRECTION, 2026-07-21 (later the same day): the `rationale_md` half of the
+      paragraph above is STALE and is left visible rather than deleted, because the staleness
+      is itself the lesson.** `bulkFixture` no longer hardcodes `'because'` — it writes
+      `"rationale for %s/%s in run %d of %s"`, distinct per row, and the fixture's own comment
+      records the measurement (GREEN under `rr.rationale_md → 'because'::text` before the
+      change, RED after, on a fresh database, at both the per-coordinate hash assertion and
+      the two-hashes-must-differ one). So "15 of 16 with one unisolated projection" understates
+      the tree it is now read against. **What remains open in this item is only the JOIN
+      predicate**, and only on the M1 read query (`judge_recommendations.sql`) — see the
+      distinction recorded immediately below.
+      **The BULK query carries its OWN copy of that join, and it is now PINNED (2026-07-21).**
+      `judge_bulk_disposition.sql`'s `ListOwnedRecommendationsForCoords` has a second,
+      independent `LEFT JOIN recommendation_filed_issues` — a different query body, so the M1
+      fix above would not have covered it. It was worse than unexercised: measured at
+      `a2b554a6`, `grep -c "recommendation_filed_issues\|filed_settled"` over
+      `api/internal/handler/judge_bulk_disposition_livedb_test.go` returned **0**. No live bulk
+      fixture had ever inserted a filed row, so `filed_settled` was FALSE on every row of every
+      live exercise and Decision 2's "a FILED member is not open" rung was pinned only by a
+      fake — which takes the boolean as a **parameter** and therefore cannot be wrong about
+      where the boolean comes from.
+      `TestBulkDispositionFiledMemberIsNotOpenLiveDB` closes it with one review holding TWO
+      coordinates and a filed row on exactly ONE, which is what makes it discriminating in
+      both directions. Measured, each fold on a fresh throwaway Postgres with the positive
+      control passing (control RUN/PASS lines = 2, `SKIP == 0`) and the restore verified by
+      `sqlc generate` giving a zero diff:
+      **baseline GREEN** (129 PASS / 0 FAIL / 0 SKIP);
+      **`ON f.review_id = rv.id AND f.category = rr.category AND f.target = rr.target` →
+      `ON f.review_id = rv.id`** ⇒ **RED**, `updated = 0` (the one filed row cross-matches its
+      sibling coordinate, so BOTH members bucket `filed` and neither is open);
+      **`(f.filed_at IS NOT NULL)::bool` → `false::bool`** ⇒ **RED**, `updated = 2` (nothing
+      reads as filed, so both members are open). Each fold reddened **exactly this one test**.
+      A one-coordinate fixture would have caught only the second. Both folds were compiled
+      (`sqlc generate` + `go vet`) before being believed; `false::bool` is type-preserving here
+      because the projection is already NOT NULL via the cast — the nullability trap in
+      `CLAUDE.md` applies to folding a nullable LEFT-JOIN column, which this is not.
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,
