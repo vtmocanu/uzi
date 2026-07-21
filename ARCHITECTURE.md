@@ -331,7 +331,7 @@ composite FK on `(user_id, id)`, which makes cross-user binding
 unspellable rather than merely rejected. Every write path stays cookie-only:
 a Bearer-reachable mint would let a stolen CLI token replace a user's
 credentials. See [docs/anthropic-token.md](docs/anthropic-token.md) for the
-user-facing flow and `prds/104-named-anthropic-tokens.md` for the rationale.
+user-facing flow and `prds/done/104-named-anthropic-tokens.md` for the rationale.
 
 ## Claude rate-limit visibility (PRD #53)
 

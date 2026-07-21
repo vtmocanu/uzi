@@ -9410,7 +9410,7 @@ single `UNIQUE (user_id, kind)` row PRD #3 established and PRD #32 vaulted. Buil
 PRD #3 (`user_secrets` + `secretbox`, §29–30), PRD #32 (per-user vault, §136–138),
 PRD #53/#54 (rate-limit meters), PRD #46 (judge lane + self-improve), and PRD #64
 (the CLI). Migrations `00077`–`00080`. Full rationale + Decision Log:
-`prds/104-named-anthropic-tokens.md`.
+`prds/done/104-named-anthropic-tokens.md`.
 
 Two things in this PRD are corrections to already-shipped code rather than new
 feature, and they had to land FIRST: §347 (the write paths were keyed on a pair that

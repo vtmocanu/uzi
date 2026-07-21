@@ -1,7 +1,7 @@
 # PRD #104: Named Anthropic tokens — multiple credentials per user, bound to workers and the judge lane
 
 **GitLab Issue**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104)
-**Status**: Draft (created 2026-07-21; revised 2026-07-21 after a citation-verification review)
+**Status**: **COMPLETE** (created 2026-07-21; completed 2026-07-21) — MR [!89](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/89), 21 commits from `b94c45b4`. All seven milestones landed; every code milestone reviewed **and** security-audited; full `run-e2e.sh` green including the new binding phase. Also folds in [#105](https://gitlab.example.com/vtmocanu/uzi/-/issues/105).
 **Priority**: Medium
 **Related**: [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — this PRD repoints its table), [#32](https://gitlab.example.com/vtmocanu/uzi/-/issues/32) (user vault — whose rewrap path this PRD must fix before it can store a second token), [#50](https://gitlab.example.com/vtmocanu/uzi/-/issues/50) (LLM egress proxy — must learn which token to inject), [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69) (judge mode + per-user model — draft; overlapping settings surface)
 
