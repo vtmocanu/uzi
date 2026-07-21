@@ -156,6 +156,36 @@ func inputReq(user store.User, runID uuid.UUID, body string) *http.Request {
 	return req.WithContext(ctx)
 }
 
+// TestRunToDTOStopKind pins that the PRD #33 deliberate-stop signal actually reaches the
+// RunDTO that GET /api/runs/{id} serves. Added by PRD #97 M4, which dropped the e2e leg
+// asserting `.run.stop_kind == plan_rejected` over the wire.
+//
+// The e2e leg was NOT redundant with the citation the PRD gave: store/stop_kind_integration_test.go
+// proves the COLUMN is stamped, apitypes/wire_test.go pins the JSON KEY (shape only), and
+// board_latestrun_test.go asserts a stop_kind VALUE — but through mapLatestRun, a different
+// DTO built by a different call site. Nothing covered runToDTO's own mapping (workers.go:166).
+//
+// Both directions, so the test can discriminate: a stamped value surfaces, and an unstamped
+// (NULL) column becomes nil rather than the empty string a naive `.String` read would yield.
+func TestRunToDTOStopKind(t *testing.T) {
+	stamped := runToDTO(store.Run{
+		Status:   "failed",
+		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
+	})
+	if stamped.StopKind == nil {
+		t.Fatal("a stamped stop_kind must reach the RunDTO, got nil")
+	}
+	if *stamped.StopKind != "plan_rejected" {
+		t.Errorf("stop_kind = %q, want plan_rejected", *stamped.StopKind)
+	}
+
+	// NULL column ⇒ nil pointer (omitted from JSON), never "".
+	unstamped := runToDTO(store.Run{Status: "completed"})
+	if unstamped.StopKind != nil {
+		t.Errorf("an unstamped stop_kind must map to nil, got %q", *unstamped.StopKind)
+	}
+}
+
 func TestGetRunOwnerNonOwnerAdmin(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	runID := uuid.New()
