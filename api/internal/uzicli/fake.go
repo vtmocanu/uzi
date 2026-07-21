@@ -75,6 +75,24 @@ type FakeClient struct {
 	SetDispositionErr     error
 	DeleteDispositionErr  error
 
+	// Judge backlog + bulk group disposition (PRD #98 M7). JudgeBacklogResult is the
+	// canned `review backlog` reply and LastBacklogBucket records the bucket the command
+	// forwarded (empty = the flag was unset and the parameter omitted, so the SERVER's
+	// default applies — the fake must not substitute one, or a test could not tell the
+	// two apart).
+	//
+	// BulkDispositionResult / LastBulk* capture the fan-out. BulkDispositionErr, like
+	// SetDispositionErr above, is returned by the WRITE in preference to Err, so a test
+	// can model a read-succeeds/write-fails sequence precisely; a global Err would fail
+	// whichever call came first and prove nothing about the write.
+	JudgeBacklogResult    apitypes.JudgeBacklogDTO
+	LastBacklogBucket     string
+	BulkDispositionResult apitypes.JudgeDispositionResultDTO
+	LastBulkItems         []apitypes.JudgeDispositionCoordDTO
+	LastBulkStatus        string
+	LastBulkReason        string
+	BulkDispositionErr    error
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -191,6 +209,30 @@ func (f *FakeClient) JudgeStats(context.Context) (apitypes.TriageDTO, error) {
 		return apitypes.TriageDTO{}, f.Err
 	}
 	return f.JudgeStatsResult, nil
+}
+
+func (f *FakeClient) JudgeBacklog(_ context.Context, bucket string) (apitypes.JudgeBacklogDTO, error) {
+	f.LastBacklogBucket = bucket
+	if f.Err != nil {
+		return apitypes.JudgeBacklogDTO{}, f.Err
+	}
+	return f.JudgeBacklogResult, nil
+}
+
+// BulkSetDispositions records the fan-out and returns the canned result. It captures
+// BEFORE the error branch — mirroring SetDisposition — so a test asserting a refusal can
+// still prove the write was REACHED, rather than passing on any earlier failure.
+func (f *FakeClient) BulkSetDispositions(_ context.Context, items []apitypes.JudgeDispositionCoordDTO, status, reason string) (apitypes.JudgeDispositionResultDTO, error) {
+	f.LastBulkItems = items
+	f.LastBulkStatus = status
+	f.LastBulkReason = reason
+	if f.BulkDispositionErr != nil {
+		return apitypes.JudgeDispositionResultDTO{}, f.BulkDispositionErr
+	}
+	if f.Err != nil {
+		return apitypes.JudgeDispositionResultDTO{}, f.Err
+	}
+	return f.BulkDispositionResult, nil
 }
 
 func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {

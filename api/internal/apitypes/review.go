@@ -198,6 +198,41 @@ type JudgeDispositionResultDTO struct {
 	Triage    TriageDTO                     `json:"triage"`
 }
 
+// JudgeDispositionCoordDTO is one (category, target) coordinate in a bulk group-disposition
+// request (PRD #98 M2/M7). It is the DISPLAY grain the Judge menu groups by, deliberately
+// NOT a recommendation id, because one group spans many runs and therefore many ids. It is
+// the caller's REQUEST, never a resolved row: nothing here is written to the database — the
+// values only match against review_recommendations, and the disposition is written from the
+// resolved row's own columns.
+//
+// It lives in apitypes rather than in workersvc so the CLI ENCODES the same struct the
+// handler DECODES: workersvc.JudgeDispositionCoord is a type alias of this, so there is one
+// set of JSON tags and a client/server key mismatch is not expressible. That matters more
+// than usual here — the handler decodes with DisallowUnknownFields, so a client-side key
+// typo would be a 400 rather than a quietly-ignored field. uzicli could not have referenced
+// the workersvc type in any case: importing workersvc drags pgx into the CLI binary and
+// turns cmd/uzi's TestNoServerDeps red.
+type JudgeDispositionCoordDTO struct {
+	Category string `json:"category"`
+	Target   string `json:"target"`
+}
+
+// JudgeBulkDispositionRequest is the PUT /api/me/judge/recommendations/disposition body
+// (PRD #98 M2, Decision 3): one triage verdict fanned out to every member coordinate of the
+// listed groups.
+//
+// Status ∈ {done, dismissed}; Reason ∈ {wont_do, not_an_issue} and is legal only on a
+// dismissal. Scope ∈ {open, all}, and EMPTY IS MEANINGFUL: the handler reads "" as the
+// default open scope (settle what is open, never re-assert a settled member). A client that
+// does not expose a scope choice therefore sends the zero value rather than naming a scope,
+// which is why the CLI spells neither wire value — see uzicli.Client.BulkSetDispositions.
+type JudgeBulkDispositionRequest struct {
+	Items  []JudgeDispositionCoordDTO `json:"items"`
+	Status string                     `json:"status"`
+	Reason string                     `json:"reason"`
+	Scope  string                     `json:"scope"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {

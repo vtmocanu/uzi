@@ -74,14 +74,15 @@ type memberKey struct {
 	target   string
 }
 
-// JudgeDispositionCoord is one requested (category, target) coordinate. It is the
-// caller's REQUEST, not a resolved row: nothing from here is ever written to the database.
-// The values are used only to match against review_recommendations; the disposition is
-// written from the resolved row's own columns (see BulkSetDispositions).
-type JudgeDispositionCoord struct {
-	Category string `json:"category"`
-	Target   string `json:"target"`
-}
+// JudgeDispositionCoord is one requested (category, target) coordinate — see
+// apitypes.JudgeDispositionCoordDTO for the full contract.
+//
+// It is an ALIAS, not a copy (PRD #98 M7): the CLI has to encode this body and cannot
+// import workersvc (that would drag pgx into the CLI binary), so the struct itself moved to
+// the shared apitypes leaf. An alias keeps every existing workersvc.JudgeDispositionCoord
+// reference — including its use as a map key in dedupeCoords/groupsForCoords — compiling
+// unchanged, while leaving exactly one set of JSON tags for both sides of the wire.
+type JudgeDispositionCoord = apitypes.JudgeDispositionCoordDTO
 
 // BulkSetDispositions fans a group disposition out to its member coordinates (PRD #98
 // Decision 3) — the Judge menu's "Dismiss" / "Mark done" on one group, and the

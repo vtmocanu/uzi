@@ -5,20 +5,11 @@ import (
 	"log/slog"
 	"net/http"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
-
-// bulkDispositionRequest is the group fan-out body (PRD #98 Decision 3). Items are
-// (category, target) coordinates — the DISPLAY grain the Judge menu groups by — not
-// recommendation ids, because one group spans many runs and therefore many ids.
-type bulkDispositionRequest struct {
-	Items  []workersvc.JudgeDispositionCoord `json:"items"`
-	Status string                            `json:"status"`
-	Reason string                            `json:"reason"`
-	Scope  string                            `json:"scope"`
-}
 
 // BulkSetDispositions applies one triage verdict to every member coordinate of the given
 // groups (PRD #98 M2, Decision 3) — the Judge menu's per-group Mark done / Dismiss and the
@@ -45,7 +36,10 @@ func (h *Handler) BulkSetDispositions(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	var req bulkDispositionRequest
+	// The body type is shared with the CLI (apitypes), not declared locally: the client
+	// encodes the same struct this decodes, and DecodeJSON runs with DisallowUnknownFields,
+	// so a key that matched on only one side would be a 400 rather than a silent no-op.
+	var req apitypes.JudgeBulkDispositionRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return

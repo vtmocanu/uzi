@@ -94,6 +94,36 @@ type Client interface {
 	// #94 Decision 8): GET /api/me/judge/stats. Owner-scoped; the reply is an
 	// unenveloped TriageDTO.
 	JudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
+	// JudgeBacklog returns the caller's all-time recommendation backlog deduped by
+	// (category, target) (PRD #98 M1): GET /api/me/judge/recommendations. Owner-scoped
+	// on RequireUser, read-only, no token spend; the reply is an unenveloped
+	// JudgeBacklogDTO carrying the groups, the canonical triage tally and `truncated`.
+	//
+	// bucket is passed through VERBATIM and an empty bucket OMITS the parameter, so the
+	// SERVER's default (todo) applies. The valid set is deliberately not restated on this
+	// side: the CLI never compares against a bucket value, it only forwards one, so there
+	// is no predicate to fail silently — an unknown bucket comes back as the server's own
+	// 400 ("invalid bucket") and maps to the usage exit code. Restating the enum here
+	// would add a second definition that could drift from the enforcing one; forwarding
+	// keeps the validator the only place the set is written down.
+	JudgeBacklog(ctx context.Context, bucket string) (apitypes.JudgeBacklogDTO, error)
+	// BulkSetDispositions applies one triage verdict to every member coordinate of the
+	// given groups (PRD #98 M2, Decision 3): PUT
+	// /api/me/judge/recommendations/disposition. status ∈ {done, dismissed}; reason
+	// (∈ {wont_do, not_an_issue}) rides only a dismissal.
+	//
+	// The request's `scope` is left at its zero value, which the server reads as the
+	// default open scope — settle what is open, never re-assert a settled member. The CLI
+	// exposes no scope choice, so it names no scope: sending "" is what makes the server's
+	// default the single definition of that behaviour.
+	//
+	// There is NO 404 on this route and none should be expected. It is owner-only by
+	// construction (the service resolves members under `user_id = caller`), and
+	// coordinates are not ids, so a coordinate that does not exist and one belonging to
+	// another user are BOTH a 200 with Updated == 0 — #94 Decision 5's no-existence-oracle
+	// rule. A caller learning "0 written" learns only that none of THEIR rows matched, and
+	// must render that as "nothing was written" rather than as success.
+	BulkSetDispositions(ctx context.Context, items []apitypes.JudgeDispositionCoordDTO, status, reason string) (apitypes.JudgeDispositionResultDTO, error)
 }
 
 // ErrNoDisposition is returned by DeleteDisposition when the recommendation had
@@ -477,6 +507,34 @@ func (c *HTTPClient) JudgeStats(ctx context.Context) (apitypes.TriageDTO, error)
 	var out apitypes.TriageDTO
 	if err := c.get(ctx, "/api/me/judge/stats", &out); err != nil {
 		return apitypes.TriageDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) JudgeBacklog(ctx context.Context, bucket string) (apitypes.JudgeBacklogDTO, error) {
+	path := "/api/me/judge/recommendations"
+	if bucket != "" {
+		// Omitted rather than sent empty when unset: the handler's `bucket == ""` branch
+		// is what applies its default, and an explicit empty value would take the same
+		// branch only by coincidence. Escaped because it is user input off a flag.
+		path += "?bucket=" + url.QueryEscape(bucket)
+	}
+	var out apitypes.JudgeBacklogDTO
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.JudgeBacklogDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) BulkSetDispositions(ctx context.Context, items []apitypes.JudgeDispositionCoordDTO, status, reason string) (apitypes.JudgeDispositionResultDTO, error) {
+	// Scope is left zero on purpose — see the interface doc. Reason is likewise sent as
+	// "" for a `done`, which is what the shared validator requires (done carries no
+	// reason); this is a struct, not the omit-when-empty map SetDisposition builds, and
+	// the two agree because "" IS the legal value there.
+	reqBody := apitypes.JudgeBulkDispositionRequest{Items: items, Status: status, Reason: reason}
+	var out apitypes.JudgeDispositionResultDTO
+	if err := c.put(ctx, "/api/me/judge/recommendations/disposition", reqBody, &out); err != nil {
+		return apitypes.JudgeDispositionResultDTO{}, err
 	}
 	return out, nil
 }

@@ -56,8 +56,10 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run":    {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "inputs"},
-		"review": {"show", "resolve", "dismiss", "undo", "stats"},
+		"run": {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "inputs"},
+		// backlog is the PRD #98 M7 read; there is deliberately no `file` verb —
+		// filing stays browser-only (#68's stance, Decision 10).
+		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats"},
 		"worker": {"list", "rm"},
 		"repo":   {"list"},
 		"admin":  {"users", "runs", "workers", "usage", "rate-limits"},

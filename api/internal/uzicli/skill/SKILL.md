@@ -83,8 +83,9 @@ uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi review show <run-id>
-uzi review resolve <run-id> <rec-id>
-uzi review dismiss <run-id> <rec-id> --reason wont-do|not-an-issue
+uzi review backlog [--bucket todo|filed|done|dismissed|all]
+uzi review resolve <run-id> <rec-id> | --category <c> --target <t>
+uzi review dismiss <run-id> <rec-id> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <run-id> <rec-id>
 uzi review stats
 uzi worker list
@@ -172,6 +173,45 @@ The short id is resolved against the run's **current** review; an ambiguous
 prefix asks for a longer id and an unknown id asks you to refresh. Triage
 mutations are owner-only: a read-only `uza_` token can `show`/`stats` across the
 factory but is refused (exit 4) writing another user's review.
+
+### The cross-run backlog (`uzi review backlog`)
+
+`uzi review show` is one run. `uzi review backlog` is **every** recommendation
+across all your runs, **deduped by `(category, target)`**, so a recommendation
+that recurs in five runs is ONE row carrying `seen in 5 runs` — the frequency
+signal is the point. `--bucket` filters by the group's rollup and defaults to
+`todo`; `all` shows settled groups too.
+
+Triage a whole group in one call with the coordinate `backlog` prints:
+
+- `uzi review resolve --category <c> --target <t>` — mark the group **done**.
+- `uzi review dismiss --category <c> --target <t> --reason wont-do|not-an-issue`.
+
+There is deliberately **no `file` verb** under `review` — filing a recommendation
+as a forge issue stays a web action.
+
+Three contracts to read carefully before acting on the output:
+
+- **`updated` counts `(review_id, category, target)` coordinates, not
+  recommendations.** One review can carry the same coordinate twice, and both
+  share one disposition row. So dismissing a group of 5 can legitimately report
+  4 — that is correct, not a lost write.
+- **`updated: 0` is a success that wrote nothing**, and the reason is
+  deliberately unknowable. There is no 404 on this route: a coordinate that does
+  not exist, one already settled, and one belonging to another user are the
+  **same** answer, so nothing leaks whether it exists. Re-read `backlog` rather
+  than inferring a cause. (This is also why a `uza_` token needs no refusal here
+  — it simply matches none of another user's rows.)
+- **`truncated: true` means a missing group is UNKNOWN, not settled.** The row
+  cap applies *before* grouping, so a surviving group's `run_count`/`open_count`
+  can be understated and its rollup wrong. Never treat a truncated page as
+  authoritative. `triage` is exempt — it is the canonical all-time tally and
+  stays correct under both the filter and the cut, which is why the numbers
+  there match `uzi review stats` and the web nav badge exactly.
+
+Passing only one of `--category`/`--target` is refused rather than sent: an
+empty half is a literal empty string, not a wildcard, and would report a
+successful no-op.
 
 A visible-but-unjudged run prints `not judged` and exits **0** (not 4). A
 fallback review carries wire status `"failed"` (the web badge says "judge

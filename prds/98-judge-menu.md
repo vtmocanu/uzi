@@ -668,9 +668,23 @@ exactly as #68 already does.
       #68/#94 + the existing poll loop — parallel from the start.
 - [ ] **M7 — CLI (`api/cmd/uzi/review.go`)**: `uzi review backlog` (grouped,
       `--bucket`, `--json`) + `resolve`/`dismiss --category/--target` (Decision 10);
-      **no `file` verb** (filing stays browser-only). `commands_test.go` covers the
-      grouped output, the bulk disposition fan-out, and a uza_ token refused on a
-      bulk disposition mutation. Depends on M1 + M2.
+      **no `file` verb** (filing stays browser-only). Tests cover the grouped output
+      and the bulk disposition fan-out. **Correction, measured 2026-07-21 while
+      implementing M7: this milestone used to also ask for "a uza_ token refused on a
+      bulk disposition mutation", and that test cannot honestly exist.** There is no
+      refusal to assert on this route: it is owner-only BY CONSTRUCTION (the service
+      resolves members under `user_id = caller`) and coordinates are not ids, so a uza_
+      token aimed at another user's coordinate gets **200 `updated: 0`** — identical to a
+      misspelt or already-settled coordinate, which is exactly Decision 5's
+      no-existence-oracle rule working. The branch's own
+      `judge_bulk_disposition_livedb_test.go` had already written this down: "the authz
+      case the PRD calls for has no id to 404 on … a status-only assertion is therefore
+      VACUOUS." A CLI test scripting a 404 here would have gone green only because the
+      fake returned an error the real server never sends. What the CLI *can* get wrong is
+      presenting that silence as a completed action, so
+      `TestReviewGroupZeroUpdatedIsNotReportedAsSuccess` pins that instead — and the
+      genuine 404 refusal stays covered where it genuinely exists, on the per-run route
+      (`TestReviewMutationRefusedForReadOnlyToken`). Depends on M1 + M2.
 - [ ] **M8 — Tests + Docs**: e2e leg (dedup grouping; a group **Dismiss** fans out
       across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
       Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
