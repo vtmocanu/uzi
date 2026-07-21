@@ -3,14 +3,32 @@
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
-**Progress (2026-07-21, session end)** — 6 of 8 milestones landed. **NO MR opened yet.** Work resumes in THIS PRD, not a follow-up. Branch `feature/prd-98-judge-menu` @ `a5b65617`, 35 commits.
+**Progress (2026-07-21, late)** — **all seven implementation milestones landed** (M1-M7); M8a docs and M8b e2e remain. **NO MR opened yet.** Work resumes in THIS PRD, not a follow-up. Branch `feature/prd-98-judge-menu` @ `a48c5afe`.
 
-### RESUME HERE — the four things to do next, in order
+### RESUME HERE — what is left, in order (updated 2026-07-21, late)
 
-1. **Finish the in-flight fixture fix (BLOCKING, partly written and uncommitted).** Two test files are dirty in the worktree: `api/internal/handler/judge_bulk_disposition_livedb_test.go` and `api/internal/store/judge_recommendations_integration_test.go`. **Three parts:** (a) give `bulkFixture` **two recommendations with different rationale texts** — today it writes `'because'` on every row, so folding `rr.rationale_md → 'because'::text` passes **and nothing in the live-DB suite catches it**; (b) add an **unfiled coordinate inside `autoRev`** — today `autoRev`/`handRev` are different reviews, so `f.review_id = rv.id` alone separates them and the filed-issues join's **coordinate predicate is unpinned by anything**; (c) **fix the assertion wording** — `judge_recommendations_integration_test.go:514` fails with *"the column is not row-scoped"* but fires on a wrong **value**; real row-scoping stays green. Without (c) the fix closes the holes and leaves the misleading label pointing at them. **Acceptance: both folds must redden after the fix. NOTE — parts of this fix may already be written (`bulkFixture`'s hardcoded `'because'` is now a bound parameter), but NO VALIDATOR HAS FOLDED THE CORRECTED FIXTURE. Status is "fix written, unverified", NOT closed — do not read "Blocking found" next to "fix landed" as closed; that is a commit proxying for the property. The fold is still owed and must prove three things: (i) the `rationale_md` pin reddens under `→ 'because'::text`; (ii) the join predicate becomes observable when BOTH coordinate halves are dropped, not just the target half — a weaker mutation passing while a stronger one fails is what made this worth checking, and stopping at the obvious one is how it was missed the first time; (iii) the `filed_at` assertion's message matches what it now actually checks.**
-2. **M5** — the notification retarget. Land the **third `triage.todo` consumer** as it is written: the notification must read the canonical count, not re-derive it, and one test must mount nav badge + tab + notification **together** (mounted apart they have always all been correct — that is how the earlier badge/tab drift survived a whole milestone).
-3. **M8a docs** — `docs/judge.md`, `docs/cli.md`, `specs/ai.md`. **Do not describe deferred work as shipped**: no e2e coverage exists, mock↔server fidelity is not asserted, and `OccurrenceFileIssue` has no tests.
-4. **Then the MR** — after a review pass, and with the **migration re-check run fresh** (see the PRE-MR GATE in the checkpoint; it expires and its failure mode is every upgraded instance refusing to boot).
+**All seven implementation milestones have landed.** M5 closed at `a48c5afe`, which was the
+last one. What remains is documentation, one merge hazard that expires, and the MR.
+
+1. **M8a docs** — `docs/judge.md`, `docs/cli.md`, `specs/ai.md`. **Do not describe deferred
+   work as shipped**: no e2e coverage exists, mock↔server fidelity is not asserted (measured:
+   0 divergences found, but the demo fixture cannot reach the two riskiest behaviours — see
+   Remaining work), and `OccurrenceFileIssue` has no tests. `specs/ai.md` already carries M5's
+   correction; the rest of its judge section has not been reviewed against the shipped code.
+2. **Renumber the migration, IMMEDIATELY BEFORE the MR and not from any number written down
+   here.** `00075_judge_issue_close_sync.sql` collides; `origin/main`'s head has moved past it
+   and will move again. Re-derive the then-current live head and renumber above it. The
+   failure mode is every upgraded instance refusing to boot, and the check **expires** — a
+   number recorded in this file is already stale by the time it is read.
+3. **Merge `origin/main`**, then re-run the three gates (api, web, `./e2e/run-store-it.sh`)
+   before the MR. The live sweep needs its positive control checked, not just its exit code.
+4. **Then the MR**, after a review pass.
+
+**Superseded resume items, kept only so a stale copy of this file is recognisable:** the
+in-flight fixture fix (item 1 as of midday) is closed — `bulkFixture` writes distinct
+rationales per row and the folds were run; the bulk query's own filed-issues join is pinned
+at `31080a40`. M5 (item 2) landed at `a48c5afe` with the together-mount test the item asked
+for. See the milestone entries for what was measured.
 
 **Handoff document:** `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` — branch state, standing rules with the incident behind each, the docker safety rule about the user's real stack, the projection-pin criterion, and the pre-MR gate.
 
