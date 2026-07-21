@@ -120,19 +120,35 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
-  // `clearAllMocks` clears CALL HISTORY, not implementations, so the CSRF test's
-  // `mockImplementation(real.fileIssue)` would survive into every test written after it —
-  // silently running the real HTTP client against no fetch stub (`unstubAllGlobals` does
-  // remove that), and its failure would read as a component bug. Measured before this line
-  // existed: a probe appended after the CSRF test saw `getMockImplementation()` still set.
-  // The CSRF test is currently last, so this is a landmine for the next author, not a live
-  // defect — which is exactly when it is cheap to defuse.
+  // BOTH LINES BELOW ARE LOAD-BEARING, AND NEITHER HAS A TEST — their gate is this
+  // teardown, the way the `Set(hrefs)` line in Notifications.test.tsx has the fixture as
+  // its. So the measurement is recorded here rather than left in a commit message: a probe
+  // appended after the CSRF test was run four ways, then deleted (nothing in production
+  // code can fail it, which makes it an instrument, not a test).
+  //
+  // REMOVE `mockReset()` → the probe fails `expected Promise{…} to be undefined`.
+  // `clearAllMocks` clears CALL HISTORY, not implementations, and nothing global undoes
+  // them (no `mockReset`/`restoreMocks` in vite.config.ts or src/test-setup.ts), so the
+  // CSRF test's `mockImplementation(real.fileIssue)` survives into every test written after
+  // it — silently running the real HTTP client, with `unstubAllGlobals` having already
+  // removed the fetch stub that might have caught it. Its failure would read as a component
+  // bug. This leak is UNCONDITIONAL.
   mockApi.fileIssue.mockReset();
-  // Same shape, different mechanism: the cookie was cleared in the CSRF test's BODY, so a
-  // thrown assertion skipped it and left `uzi_csrf=tok-abc123` set for the rest of the file.
-  // Measured by forcing that test to throw before its cleanup line — the probe then read
-  // the leaked cookie. Teardown runs either way; a test body does not.
+  // REMOVE the line below → the probe fails `expected 'uzi_csrf=tok-abc123' not to contain
+  // 'uzi_csrf'` (the exact needle depends on the probe's assertion; the leak is the point).
+  // This one is CONDITIONAL: the cookie used to be cleared in the CSRF test's BODY, which
+  // works right up until an assertion above it throws — measured by forcing exactly that.
+  // Teardown runs either way; a test body does not.
   document.cookie = "uzi_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+  //
+  // The other two runs are the positive controls: with both lines present the probe passes,
+  // and it still passes when the CSRF test is forced to throw — which is the case the
+  // in-body cleanup structurally could not cover.
+  //
+  // One trap for whoever re-derives this: `getMockImplementation()` being `undefined` is NOT
+  // the check. vitest 2.1.9's `mockReset()` installs `() => void 0`, so that assertion fails
+  // on correctly-reset code. Ask the behavioural question instead — does the mock still call
+  // through (returns undefined, zero fetch calls against a spy).
 });
 
 // Renders the component on its own, with the draft already scripted, and opens it — the
@@ -410,9 +426,10 @@ describe("OccurrenceFileIssue — the write is issued through the app's API clie
   //     24 per-user limiter mounts across SIX limiter instances: forge 13, auth 3, chat 3,
   //     hosted 2, slackDM 2, judge 1. (A bare grep says 27; :399, :456 and :618 are
   //     comments.) Stripping ALL 24 `.With(<x>Limiter.PerUserMiddleware)` wrappers leaves
-  //     `go vet` clean and `go test ./...` at zero failures across 41 packages, against an
-  //     equally green baseline — re-run here, not inherited. Every per-user limiter mount in
-  //     this codebase is unasserted.
+  //     `go vet` clean and `go test ./...` at zero failures across all 41 TEST-RUNNING
+  //     packages (42 exist; internal/httpx has no test files), against an equally green
+  //     baseline — re-run here, not inherited. Every per-user limiter mount in this codebase
+  //     is unasserted.
   //
   // (b) THE AUTH CARVE-OUT THAT LOOKS LIKE COVERAGE IS A DIFFERENT METHOD. It is tempting to
   //     except authLimiter, because e2e/run-e2e.sh hammers `POST /api/auth/login` and asserts
