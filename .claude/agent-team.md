@@ -250,16 +250,6 @@ wrong is what makes rule 1 too expensive to keep.**
   or the ASSERTIONS change. `git diff <measured-sha>..HEAD -- <those paths>`
   settles it in seconds, and a **comment-only diff means the result STANDS**.
 
-**The fourth term is the SCHEMA.** A live-DB fold is a claim about the query, the fixture,
-the assertions AND the schema they run against — and the fourth is the one that moves without
-touching any file you would think to diff. Measured on PRD #98's landing merge (2026-07-21):
-the five files carrying the tenant-boundary pins were BYTE-IDENTICAL across the merge, while
-three new migrations landed ahead of ours, so every fold on the branch had been measured
-against a schema the suite no longer used. Byte-identical test code is not a surviving
-measurement. A green suite does not help here: passing proves the tests pass, not that they
-would still FAIL if the code were wrong. Re-fold after any merge that adds a migration, even
-when `git diff` on the test files is empty.
-
 **A measurement is bound to a WORKING TREE as well as to a SHA, and a persisted `cd` silently
 rebinds it.** Evidence: an auditor verified a "zero hits" grep from a shell whose working
 directory still pointed at its own detached worktree, so it measured a clean pre-merge tree
