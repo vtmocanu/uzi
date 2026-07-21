@@ -6,10 +6,10 @@ audience: user
 
 # Run activity pane
 
-The run view's activity pane shows your crew at work: a roster strip for
-"who's alive," collapsed-by-default logs so a live run doesn't drag your
-scroll position around, and a steer queue that tells you whether a
-follow-up you sent actually reached the worker.
+The run view's activity pane shows your crew at work: one lane per actor
+with its own status dot, collapsed-by-default logs so a live run doesn't
+drag your scroll position around, and a steer queue that tells you whether
+a follow-up you sent actually reached the worker.
 
 ## Plan approval gate
 
@@ -37,34 +37,101 @@ Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
+## Lanes: one per actor, not one per turn
+
+**By agent** (the default) gives every actor a single lane holding its whole
+contribution, however many times it spoke. A lead that delegates, waits, and
+delegates again is one lead lane, not four near-empty bars.
+
+Crucially, an actor is an *invocation*, not a role. When the lead runs two
+`coder` subagents in parallel they get **two separate lanes**, each titled by
+its own task:
+
+```
+coder · API wiring      ● working
+coder · web gate UX     ● waiting
+```
+
+Their messages interleave in real time and still land in the right lane,
+live and after a reconnect. Without this they would merge into one garbled
+`coder` block — which is what a naive "group by agent name" would do.
+
+**Timeline** is the other half of the toggle in the pane header: the raw
+chronological stream, grouped the way it was before lanes existed. Reach for
+it when you need to see the exact cross-agent ordering. The choice sticks
+across runs and reloads.
+
+Two fallbacks, both deliberate:
+
+- **The lead, and any run from before lanes shipped**, carries no invocation
+  id, so those messages fall back to **one lane per role**. Old runs
+  therefore re-render as coalesced role lanes under By agent; `Timeline`
+  reproduces exactly what you used to see. Nothing was migrated.
+- **A subagent with no task label** shows the bare role name, with no `·`
+  suffix and no placeholder.
+
+Labels are model-authored, so they render as plain single-line text,
+truncated with an ellipsis when long — never as markdown.
+
+> **Subagent lanes are mostly tool activity.** By default the agent SDK
+> forwards only a subagent's tool calls and results upstream, not its prose,
+> so a subagent lane shows what it *did* and little of what it *said*. That
+> is expected, not a bug or a dropped message; a lane that looks thin is a
+> lane doing tool work. Turning the prose on is a separate, deliberate change
+> — it multiplies message volume and token cost, so it is not bundled here.
+
 ## Crew roster
 
-One chip per agent, with a state dot:
+Every lane header carries its own dot, so a small By-agent crew needs **no
+separate roster strip** — the collapsed lanes *are* the roster. A strip
+appears only when it can tell you something the lanes cannot: when a role is
+**doubled** (two or more invocations) or there are more lanes than fit a
+glance. Then you get a **role rollup** — one chip per role with a count and
+a single dot:
+
+```
+coder ×2  ● working      tester ×2  ● stalled
+```
+
+**A rollup dot shows the role's _worst_ state, not its most active one**, so
+a stalled tester surfaces past a healthy sibling. That means a chip can read
+`waiting` while one of its own lanes is visibly pulsing `working` — the chip
+is a summary of what needs attention, the lane is what is happening now.
+Click a chip to expand and jump to that role's lanes.
+
+In **Timeline** view the roster stays the per-role jump strip it has always
+been, because a scattered chronological stream still needs a navigation aid.
+
+The state dots themselves, in both places:
 
 | State | Meaning |
 |---|---|
-| working (pulsing) | The active speaker, and the run is healthy — see [Run health](./run-health.md). Stays `working` through a long tool call (a build, a test suite); it does not time out on its own. |
-| stalled (amber) | The active speaker, but the run's health has flagged it (`stalled`, `slow`, or `looping`) — a looping agent never reads as healthy green. |
-| waiting | Either every chip, while the run is blocked on a plan approval or has no worker claimed yet; or a non-active agent that spoke recently. |
-| idle | A non-active agent that hasn't spoken in a while. |
-| done | Every chip, once the run has finished (completed, failed, or cancelled). |
-| *(empty state)* | No agent has spoken yet — a single muted "waiting for the first agent…" placeholder, not zero chips. |
+| working (pulsing) | The newest speaker, and the run is healthy — see [Run health](./run-health.md). Stays `working` through a long tool call (a build, a test suite); it does not time out on its own. **Exactly one lane** pulses, even when one role has two live invocations. |
+| stalled (amber) | The newest speaker, but the run's health has flagged it (`stalled`, `slow`, or `looping`) — a looping agent never reads as healthy green. |
+| waiting | Either everything, while the run is blocked on a plan approval or has no worker claimed yet; or a lane that spoke recently but isn't the newest. |
+| idle | A lane that hasn't spoken in a while. |
+| done | Everything, once the run has finished (completed, failed, or cancelled). |
+| *(empty state)* | No agent has spoken yet — a single muted "waiting for the first agent…" placeholder, not zero lanes. |
 
-Click a chip to jump to that agent's log. The `waiting`/`idle` split for a
-non-active agent is a recency heuristic (no precise handoff signal exists
-yet), so it can lag up to 30 seconds — cosmetic only, it never affects the
-`working`/`stalled`/`done` states above.
+**There is no colour legend on screen, deliberately** — the state word sits
+next to every dot ("● working", "● idle"), so a key would just repeat it. The
+dot also carries the same text as a tooltip.
+
+The `waiting`/`idle` split is a recency heuristic (no precise handoff signal
+exists yet), so it can lag up to 30 seconds — cosmetic only, it never affects
+the `working`/`stalled`/`done` states above.
 
 ## Logs: collapsed by default, opt-in Follow
 
-Each agent's log is an accordion, **closed by default**, with a live
+Each lane's log is an accordion, **closed by default**, with a live
 one-liner in its header ("running `go test ./...`") that updates in place
-and a `+N` pill for messages you haven't seen while collapsed. A finished
-run, or a run with only one agent, auto-expands so you're not stuck
-clicking through every accordion to read a result; **Expand all** /
-**Collapse all** are always one click away.
+and a `+N` pill for messages you haven't seen while collapsed. Both sit on
+the lane itself, so an actor that spoke five times still has one header
+telling you what it is doing now. A finished run, or a run with only one
+actor, auto-expands so you're not stuck clicking through every accordion to
+read a result; **Expand all** / **Collapse all** are always one click away.
 
-**Follow live**, off by default, tails only the *expanded* agent's own log
+**Follow live**, off by default, tails only the *expanded* lane's own log
 as new messages arrive. This replaces the old whole-pane auto-scroll: a
 burst of tool activity now updates the crew strip and unseen-count pills in
 place, without yanking your scroll position around.

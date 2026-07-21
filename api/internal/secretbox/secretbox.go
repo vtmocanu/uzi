@@ -88,6 +88,12 @@ func (b *Box) Open(sealed []byte) ([]byte, error) {
 // so a DB-write operator cannot swap a ciphertext onto a different owner/kind and
 // have it still authenticate. A nil aad is equivalent to plain Seal, keeping the
 // existing at-rest ciphertexts (sealed with no aad) openable.
+//
+// The binding is only as fine-grained as the context the caller supplies: it pins
+// a ciphertext to a ROW only where that context identifies one. It stopped doing
+// so for user_secrets in PRD #104, which lets a user hold several secrets sharing
+// one (user_id, kind) — see vault.secretAAD for the residual risk that leaves and
+// why it is accepted. Choose an aad that identifies what you actually mean to pin.
 func (b *Box) SealWithAAD(plaintext, aad []byte) ([]byte, error) {
 	nonce := make([]byte, b.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {

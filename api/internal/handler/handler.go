@@ -220,6 +220,10 @@ func toDTO(u store.User) apitypes.UserDTO {
 		AutopilotEnabled: u.AutopilotEnabled,
 		JudgeEnabled:     u.JudgeEnabled,
 		CreatedAt:        u.CreatedAt.Time,
+		// The judge binding's id; the LABEL is filled in only by the routes that
+		// resolved it (PUT /api/me/judge), since a bare users row carries no join to
+		// look it up. A bound user rendered without a label is honest, not a bug.
+		JudgeAnthropicSecretID: uuidPtrValue(u.JudgeAnthropicSecretID),
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String
@@ -315,10 +319,30 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// Current-user secrets (per-user, encrypted at rest). No admin read
 		// path to other users' secret values by design.
 		r.Route("/me/secrets", func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
-			r.Get("/", h.ListMySecrets)
-			r.Put("/anthropic_token", h.PutAnthropicToken)
-			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+			// GET is RequireUser (PRD #104 D8): a token LIST is metadata only — labels,
+			// ids, default flags, never a value — so it is safe to reach from a CLI
+			// token (`uzi token list`), which grants no credential the caller lacks.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Get("/", h.ListMySecrets)
+			})
+			// Every WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
+			// rotating and deleting credentials is the CLI's exclusion zone — a
+			// Bearer-reachable mint would let a stolen uzc_ replace a user's tokens, the
+			// same reason POST /workers is cookie-only.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				// PRD #104 M2 id-keyed CRUD. POST creates a named token, PATCH
+				// renames/set-defaults/rotates one, DELETE /{id} removes one (D5/D6).
+				r.Post("/anthropic_token", h.CreateAnthropicToken)
+				r.Patch("/anthropic_token/{id}", h.PatchAnthropicToken)
+				r.Delete("/anthropic_token/{id}", h.DeleteAnthropicTokenByID)
+				// D14 compatibility aliases over the DEFAULT token, deprecated in this
+				// MR: PUT rotates-or-creates the default; DELETE removes it, now 409ing
+				// for a multi-token user (delete by id instead).
+				r.Put("/anthropic_token", h.PutAnthropicToken)
+				r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+			})
 		})
 
 		// CLI token management (PRD #64): the credential the `uzi` CLI presents as a
@@ -633,6 +657,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListWorkers)
+				// PATCH rebinds a worker between the OWNER'S OWN Anthropic tokens
+				// (PRD #104 M3, D8). RequireUser, unlike the POST below: it mints
+				// nothing and yields no credential the caller lacks — it only re-points
+				// a worker at a token they already hold, so `uzi worker set-token` can
+				// reach it from a CLI token. That reasoning depends entirely on the
+				// ownership check holding, which is why the composite FK enforces it in
+				// the schema too.
+				r.Patch("/{id}", h.PatchWorker)
 				// DELETE stays swapped: destroying a worker exfiltrates nothing and the
 				// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
 				// covers BOTH worker kinds (the middleware cannot see the row's kind).

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Logger } from "./log.js";
 import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
+import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
@@ -17,6 +18,13 @@ const execFileAsync = promisify(execFile);
 export interface EmittedMessage {
   kind: MessageKind;
   agent?: string;
+  /** The subagent INVOCATION id (SDK `parent_tool_use_id`) and the task it was
+   *  given (SDK `task_description`), PRD #99. Both are pure per-frame fields —
+   *  no correlation state — and absent when the frame carries neither field.
+   *  "Absent" tracks the SDK fields, not the role name: an agent NAMED lead in a
+   *  repo roster is a real subagent and does carry an instance id. */
+  agentInstance?: string;
+  agentLabel?: string;
   payload: Record<string, unknown>;
 }
 
@@ -70,8 +78,16 @@ export interface RunContext {
   memory?: MemoryEntry[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
-  /** SDK session to resume; null/absent for a fresh run. */
+  /** SDK session to resume; null/absent for a fresh run. The runner clears this when
+   *  the named transcript is not on THIS worker's disk (issue #105) — the SDK resolves
+   *  a resume locally, so passing an unresolvable id fails the whole run before the
+   *  first turn instead of resuming anything. */
   sessionId?: string | null;
+  /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
+   *  already carries pushed work. The executor forwards it to the planning prompt so
+   *  an amnesiac lead is told to read the existing commits rather than redo them —
+   *  the honest degradation must not become silently duplicated work. */
+  priorWork?: PriorWork;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
@@ -205,12 +221,35 @@ export const STUB_HEALTH_STALL_MS = 95_000;
 export const STUB_HEALTH_RESUME_MS = 20_000;
 export const STUB_HEALTH_LOOP_HOLD_MS = 35_000;
 
-export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{ agent: string; text: string }> = [
+// PRD #99 M2: the same six frames now also carry the per-instance attribution a
+// real parallel-subagent run would — `instance` = the SDK's `parent_tool_use_id`
+// (the INVOCATION id), `label` = its `task_description`. The two `coder` frames
+// are two DISTINCT invocations (`stub-inst-a` / `stub-inst-b`) with distinct
+// labels, and they are NON-ADJACENT (a `reviewer` frame sits between them) —
+// which is the whole point: under the old consecutive-author grouping they
+// render as separate bars that a naive "group by agent name" refactor would
+// merge into one garbled `coder` block. Two `reviewer` invocations double a
+// second role, so the role-rollup ("coder ×2 · reviewer ×2") is exercisable too.
+// The `lead` frames deliberately carry NEITHER field (it is the parentless
+// actor), which is the NULL side of the fixture.
+//
+// FRAME COUNT AND AGENT ORDER ARE FROZEN. `e2e/run-e2e.sh` (PRD #43 M5) pins
+// this stream as a literal `[agent, step]` vector (`EXPECT_IL`), and
+// `test/executor.test.ts` asserts the emitted stream matches it exactly. The two
+// new columns were therefore added to the EXISTING frames rather than by
+// appending a new segment — appending would have broken an e2e assertion this
+// PRD is not allowed to touch (PRD #97 is rewriting that harness).
+export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{
+  agent: string;
+  text: string;
+  instance?: string;
+  label?: string;
+}> = [
   { agent: "lead", text: "parallel dispatch: units A (api) and B (web)" },
-  { agent: "coder", text: "unit A: editing the api scope" },
-  { agent: "reviewer", text: "review wave: auditing unit A" },
-  { agent: "coder", text: "unit B: editing the web scope" },
-  { agent: "reviewer", text: "review wave: auditing unit B" },
+  { agent: "coder", text: "unit A: editing the api scope", instance: "stub-inst-a", label: "API wiring" },
+  { agent: "reviewer", text: "review wave: auditing unit A", instance: "stub-inst-rev-a", label: "audit unit A" },
+  { agent: "coder", text: "unit B: editing the web scope", instance: "stub-inst-b", label: "web gate UX" },
+  { agent: "reviewer", text: "review wave: auditing unit B", instance: "stub-inst-rev-b", label: "audit unit B" },
   { agent: "lead", text: "integration: scopes disjoint, committing once" },
 ];
 
@@ -390,7 +429,17 @@ export class StubExecutor implements Executor {
     // seq run; the trailing "committed" message keeps them mid-stream, not last.
     if (ctx.issueDescription.includes(STUB_INTERLEAVE_SENTINEL) || ctx.issueTitle.includes(STUB_INTERLEAVE_SENTINEL)) {
       STUB_INTERLEAVE_STREAM.forEach((frame, i) => {
-        ctx.emit({ kind: "text", agent: frame.agent, payload: { text: frame.text, step: i + 1 } });
+        // Spread the optional PRD #99 fields only when the frame has them, so a
+        // lead frame emits no agentInstance/agentLabel key at all (matching the
+        // live mapper, where the lead's null parent_tool_use_id probes to
+        // undefined) and the API stores SQL NULL rather than "".
+        ctx.emit({
+          kind: "text",
+          agent: frame.agent,
+          ...(frame.instance !== undefined ? { agentInstance: frame.instance } : {}),
+          ...(frame.label !== undefined ? { agentLabel: frame.label } : {}),
+          payload: { text: frame.text, step: i + 1 },
+        });
       });
     }
 

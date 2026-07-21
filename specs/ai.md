@@ -735,7 +735,17 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   bottega's check-then-insert TOCTOU race with a DB constraint. Terminal runs are
   excluded so an issue can be re-run once its prior run finishes.
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
-  kind, agent, payload jsonb, created_at`, **UNIQUE(run_id, seq)**. Per-run gapless
+  kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
+  **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution
+  (both nullable, appended by `00075`, no backfill): `agent_instance` is the SDK's
+  per-frame `parent_tool_use_id` — the subagent INVOCATION id, which is what keeps
+  two parallel same-role subagents distinguishable — and `agent_label` its
+  `task_description`. Both are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a
+  repo may legitimately ship an agent NAMED `lead`, which is a real subagent and
+  does carry an instance id. `agent_label` is model-authored text, so it is
+  secret-redacted worker-side and rune-capped server-side on the untrusted insert
+  path rather than trusted at either end. Per-run gapless
   seq makes the worker's batched append idempotent and the browser stream replayable
   (fixes multica's lossy buffer). `kind ∈ {text, thinking, tool_use, tool_result,
   status, error, user_message, plan}`.
@@ -3502,8 +3512,8 @@ runs queue; forgotten password ⇒ unrecoverable). **Status: built (PRD #32,
 user-vs-AI provenance). These sections record the as-built system; where implementation
 diverged from the design, the as-built decision and its reason are called out inline
 ("as-built").** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
-autopilot's claims. Landed as migration `00044_user_vaults.sql` (the draft number was
-already the next free slot above head `00043`). Extends §17/§29 (secretbox), §40–41 (claim
+autopilot's claims. Landed as migration `00051_user_vaults.sql` (the draft number
+`00044` was renumbered at merge, per the assign-at-merge rule). Extends §17/§29 (secretbox), §40–41 (claim
 path), §24 (seed).
 
 ## 136. Key hierarchy & crypto (Bitwarden model, per-user)
@@ -3538,7 +3548,21 @@ the server stores only the wrapped key".
   `"uzi-vault-dek\x00" || user_id`. Both defend against a DB-*write* operator swapping a
   ciphertext (or a whole `user_vaults` row) between users — a swap fails GCM auth rather
   than yielding a working key (outside the passive threat model — not disclosure — but a
-  few lines). The `kind` / `sealed_with` string literals are centralized as
+  few lines).
+  - **Narrowed by PRD #104, not invalidated.** The cross-user and cross-kind guarantees
+    above still hold verbatim: `user_id` and `kind` are both still in the AAD, so moving
+    a ciphertext between users or kinds still fails GCM auth. What stopped being true is
+    the *per-row* binding that a single `UNIQUE (user_id, kind)` row per user made
+    incidental: `user_secrets` now holds N rows per `(user_id, kind)`, all sealed under
+    the same AAD, so swapping two of **one user's own** `anthropic_token` ciphertexts
+    between rows authenticates cleanly. Consequence is a mislabeled credential inside one
+    account, not disclosure. Widening the AAD to include `user_secrets.id` is strictly
+    better and deliberately NOT done here: every existing ciphertext was sealed without
+    the id, so it needs a re-seal migration rather than a one-line change. Recorded at
+    both ends — `secretbox.SealWithAAD`'s doc comment and `vault.secretAAD` — because the
+    residual is invisible from either site alone. See `docs/vault-threat-model.md`
+    residual #8.
+  The `kind` / `sealed_with` string literals are centralized as
   `store.KindAnthropicToken` and `store.SealedWith{Master,DEK}`
   (`api/internal/store/enums.go`) so no two seal sites can disagree on the AAD and
   silently break decryption.
@@ -3552,7 +3576,7 @@ the server stores only the wrapped key".
 Serves human: server stores only the wrapped key; forgotten password ⇒ unrecoverable by
 design.
 
-- **New `user_vaults`** (migration `00044_user_vaults.sql`): `user_id PK → users ON DELETE
+- **New `user_vaults`** (migration `00051_user_vaults.sql`): `user_id PK → users ON DELETE
   CASCADE, kek_salt bytea, wrapped_dek bytea, created_at, updated_at` — one row per user,
   cascade-scoped like every other per-user table.
 - **`user_secrets` gains `sealed_with TEXT NOT NULL DEFAULT 'master' CHECK IN
@@ -3572,11 +3596,26 @@ design.
   rows are master-key-sealed and cannot be rewrapped without the user's password. On each
   unlock, that user's still-`'master'` rows are opened with the master box, resealed with
   the DEK, and flipped `'master' → 'dek'` — **one guarded UPDATE per row**
-  (`RewrapUserSecret`, `WHERE ... sealed_with='master'`, so a concurrent flip is a no-op),
+  (`RewrapUserSecret`, `WHERE id = @id AND user_id = @user_id AND sealed_with = 'master'`,
+  so a concurrent flip is a no-op),
   not one transaction across all rows as first sketched. Every step is logged (never with
   secret bytes) and a fault leaves the row `'master'` for the next unlock to retry; a
   rewrap error must never fail an otherwise-valid login/unlock. Dormant accounts never
   rewrap.
+  - **"Per row" only became true in PRD #104 M1 — it was false when this line was
+    written, and the ellipsis fell exactly on the bug.** The predicate as shipped in
+    PRD #32 was `WHERE user_id = @user_id AND kind = @kind AND sealed_with = 'master'`,
+    and `ListMasterSealedSecrets` returned `(kind, ciphertext)` with **no id** to key on.
+    With one row per `(user_id, kind)` that is per-row by accident; the moment a user
+    holds two master-sealed `anthropic_token` rows, the first loop iteration matches
+    **both** and overwrites the sibling with token 1's resealed bytes — silent,
+    irreversible destruction of a credential the user never touched. M1 re-keyed the
+    query on `id` (D10), added `id` to the list query, and pinned it with a live-DB
+    regression test that seals two rows with distinct plaintexts and asserts both still
+    open to their own value. The predicate is spelled out in full above rather than
+    elided precisely because the elided fragment was where the defect lived. The same
+    re-keying covers `RotateUserSecret` and `DeleteUserSecret`, both of which had the
+    same "one row per kind" assumption baked into their WHERE clauses.
 - **Migration progress is admin-visible**: `GET /api/admin/vault-migration` returns the
   count of still-`sealed_with='master'` rows (`CountMasterSealedSecrets`), surfaced as a
   progress notice in AdminSettings (Instance settings).
@@ -9376,6 +9415,266 @@ Migration is draft `00070` — renumber above the merged head at landing (live h
   ARCHITECTURE.md's trust model MUST say plan content now goes to Slack's cloud and
   non-pattern secrets in plans are unscrubbed.
 
+## 347. Per-instance activity lanes — identity is `parent_tool_use_id`, label is `task_description`, both stateless per-frame columns (PRD #99)
+
+The activity feed groups by **invocation**, not by role and not by consecutive author.
+Two `coder` subagents running in parallel are two lanes, not one merged block.
+
+- **Two nullable `run_messages` columns, `agent_instance` and `agent_label`**, appended
+  by `00075` with no backfill. `agent_instance` is the SDK's per-frame
+  `parent_tool_use_id` (the INVOCATION id); `agent_label` is its `task_description`.
+  Both are read exactly as `agentOf` already reads its sibling `subagent_type`: pure,
+  per-frame, **no worker-side correlation state and no client-side join**, so they are
+  correct across resume and independent of whether the spawning turn is still in the
+  window. The rejected alternative — persist only the instance and derive the label
+  client-side from the lead's spawn `tool_use` — cost one column but broke when the
+  spawn frame aged out of the 500-message cap, depended on the pane's spawn-tool
+  parsing, and leaned on the unverified `parent_tool_use_id == spawn tool_use id`
+  equality (that forwarding lives in the native CLI binary). A second nullable column
+  denormalized exactly as `agent` already is buys all three problems away.
+- **NULL is not "the lead".** Both columns are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a repo
+  may legitimately ship `.claude/agents/lead.md`, which registers as an ordinary
+  invocable subagent and DOES carry an instance id. `agentOf` is
+  `asString(subagent_type) ?? "lead"`, so the field being ABSENT and the field having
+  the VALUE `"lead"` collapse to the same string — any logic keying off "is this the
+  lead?" must say which it means. A write-side guard that dropped the instance for
+  lead-looking frames was proposed twice and declined twice: keyed on the output it
+  merged two parallel invocations of a repo-authored `lead` (this PRD's own Problem 2,
+  reintroduced by the guard); keyed on presence it was immune to that but still
+  removed one producer of the combination rather than the combination, and lost
+  information on two surfaces. The diagnostic half shipped instead, as a detector that
+  logs rather than a mutator that rewrites.
+- **Read-side derivation, never write-side repair.** A lane takes its role from the
+  first frame naming a **non-lead** role (else the lane's first role, which may
+  legitimately BE `lead`), and its label — independently — from the first frame
+  carrying a non-null one. This exists because `SDKUserMessageReplay` carries
+  `parent_tool_use_id` but neither `subagent_type` nor `task_description`, so a resumed
+  subagent's lane can OPEN with a lead-looking frame. Deriving on read is recomputed
+  every render and repairs already-stored rows for free; `run_messages.agent` is
+  denormalized with no backfill, so anything guessed at write time is permanent.
+- **The roster is conditional, and is a different altitude from the lanes.** With every
+  lane carrying its own `crewStateFor` dot, an always-on crew strip would re-render the
+  lane list. So under By-agent there is **no strip** for a small crew; a **role rollup**
+  appears only when a role is doubled (counted by instances, regardless of liveness) or
+  lanes exceed the glance threshold of 6. A rollup chip's dot is the **worst** state
+  among that role's instances (`stalled > waiting > working > idle > done`), which is a
+  summary the per-instance lanes cannot provide — so it is a tier, not a duplicate.
+  Consequence, accepted: a chip can read `waiting` while one of its own lanes pulses
+  `working`, because `waiting` outranks `working` in attention priority. Timeline view
+  keeps the pre-#99 per-role jump strip.
+- **No standing legend.** The state word renders beside every dot ("● working"), plus a
+  `title` tooltip, so a five-swatch key would only repeat what is already in situ. This
+  is a deliberate removal of chrome, not an omission.
+- **The label is model-authored text and is treated as such at every layer**:
+  secret-redacted worker-side (it rides OUTSIDE the payload object, so the batcher's
+  payload redactor never walked it), rune-capped server-side on the untrusted insert
+  path (80 runes, truncate-never-reject, applied through the slice index so the stored
+  row, the WS broadcast and the usage fold cannot disagree), rendered PLAIN and
+  single-line in the browser — **never through `<Markdown>`** — and sanitize-and-folded
+  on the CLI's human path while `--json` stays byte-exact.
+
+## 348. Additive `OutgoingMessage` fields are a DEPLOY-ORDER constraint: the api image must roll before the agent image
+
+`/api/worker/messages` decodes with `DisallowUnknownFields` (`httpx/respond.go:35`), so
+an api that predates a field the worker has started sending **400s the whole batch, and
+keeps 400ing**. The symptom is not a crash and not a partial write: the worker's batches
+fail forever and its messages never land, so a run looks alive on the worker and silent
+in the UI.
+
+This is **systemic to the strict decoder, not specific to PRD #99** — it applies to any
+additive `OutgoingMessage` field. The rule (**deploy the api image first, always**) is
+already stated in code as the "compat rule" at
+`api/internal/handler/worker_protocol.go:91`, where a field is declared purely so the
+decoder tolerates it in the same release the worker starts sending it; this section
+records the deploy-order half rather than restating the mechanism.
+
+Relaxing `DisallowUnknownFields` on the worker-message route is the real fix and is
+tracked separately — it trades a strict-schema guarantee for forward compatibility, and
+that is a deliberate decision rather than a cleanup.
+
+# PRD #104 — Named Anthropic tokens (multiple credentials per user, bound to workers and the judge lane)
+
+Serves human Feature #104: a user may hold several Anthropic credentials, name them,
+and point individual workers (and the judge lane) at a particular one, instead of the
+single `UNIQUE (user_id, kind)` row PRD #3 established and PRD #32 vaulted. Builds on
+PRD #3 (`user_secrets` + `secretbox`, §29–30), PRD #32 (per-user vault, §136–138),
+PRD #53/#54 (rate-limit meters), PRD #46 (judge lane + self-improve), and PRD #64
+(the CLI). Migrations `00077`–`00080`. Full rationale + Decision Log:
+`prds/done/104-named-anthropic-tokens.md`.
+
+Two things in this PRD are corrections to already-shipped code rather than new
+feature, and they had to land FIRST: §349 (the write paths were keyed on a pair that
+was about to stop being unique) and the AAD narrowing recorded in §136. Neither was
+optional groundwork — shipping the schema half without §349 would have silently
+destroyed credentials.
+
+## 349. The secret write paths are re-keyed on `user_secrets.id` — a correctness fix that must precede the schema (D10)
+
+Three write paths assumed `(user_id, kind)` named at most one row, and all three
+corrupt data the moment it names two. This is a fix to PRD #3/#32 code, not new work,
+and it lands before the migration that makes the assumption false:
+
+- **`RewrapUserSecret` destroyed siblings.** See §137's sub-bullet for the full
+  mechanism and the regression test. `ListMasterSealedSecrets` gained `id`.
+- **`UpsertUserSecret` named the index being dropped.** `ON CONFLICT (user_id, kind)`
+  targets `user_secrets_user_id_kind_key`; it splits into `InsertUserSecret`
+  (plain INSERT … RETURNING) and `RotateUserSecret` (UPDATE … WHERE id), so nothing
+  depends on that constraint's existence.
+- **`DeleteUserSecret` deleted every row of the kind.** Now id-keyed; the by-kind
+  callers resolve the user's default id first.
+- **`secretopen.OpenByID`** joins `Open` with the same three sentinels and the same
+  vault dispatch, and re-checks ownership in Go **as well as** in SQL. Belt and
+  braces behind the composite FK (§351): the SQL predicate is `WHERE id = $1 AND
+  user_id = $2`, and the Go check caught a real fixture bug during M3 rather than
+  staying decorative.
+
+## 350. One resolver, three rules, resolved per claim (D1, R4)
+
+- **`openAnthropic(ctx, userID, secretID *uuid.UUID)`** is the single seam: `nil`
+  resolves the user's default via `Open`, non-nil routes to `OpenByID`. All three
+  lanes (run, judge, chat) already funnelled through this one function, so the
+  override landed in M1 with every call site passing `nil` — which is what kept M3
+  and M4 file-disjoint instead of serialized.
+- **`claimSecretID` is the only place the choice is made**, and there are **three**
+  rules, not the two the PRD first stated:
+  - `self_improve` → the owner's **judge** binding. Not automatic: a self-improve run
+    is repo-ful and rides the ordinary run lane (`assembleClaim`), never
+    `assembleJudgeClaim`, which forks only on `run.Kind == RunKindJudge`. Without an
+    explicit branch, "self-improve follows the judge binding" would have been false
+    while appearing handled, and no test would have asked.
+  - everything else on the run lane (`issue`, `ci_fix`, and therefore autopilot) →
+    the **claiming worker's** binding, else the owner's default.
+  - the chat lane → always the default (`chat.go` passes `nil`). A bound worker's
+    chat still spends the default; this is the single most surprising consequence of
+    the feature and every user-facing doc states it in plain words.
+- **Resolution is per claim, not per worker start.** The credential has never ridden
+  the worker — it rides each claim response — so a rebind takes effect on the next
+  claim with no restart and no re-minted join token. That property is what makes
+  `PATCH /api/workers/{id}` a complete rebind rather than half of one.
+- Per-repo and per-run pinning are deliberately excluded (D1): they multiply the
+  resolution matrix, and per-run pinning would have to survive requeue-to-another-
+  worker, which fights the affinity rule in `runs.worker_id`.
+
+## 351. Cross-user binding is schema-impossible, via a composite FK — and the PG15 column list is load-bearing (D11)
+
+- `user_secrets` gains `UNIQUE (user_id, id)` (a real constraint, not just an index,
+  so a FK can reference it). `workers.anthropic_secret_id` and
+  `users.judge_anthropic_secret_id` each hang a **composite** FK off it:
+  `FOREIGN KEY (user_id, <col>) REFERENCES user_secrets (user_id, id)`. A handler
+  check alone would leave the invariant one bug away from being false; this way
+  binding user A's worker to user B's token cannot be spelled.
+- **`ON DELETE SET NULL (anthropic_secret_id)` — the column list is not decoration.**
+  A bare `ON DELETE SET NULL` on a composite FK nulls **every** referencing column,
+  which here means `workers.user_id` (NOT NULL → the delete errors) and, on `users`,
+  `users.id` (the PRIMARY KEY). Postgres 15+ supports the column list; both halves are
+  asserted against live Postgres, not assumed.
+- D5 rides this: deleting a bound token unbinds and falls back to the default, it
+  never cascade-deletes a worker. The UI names the affected workers in the
+  confirmation, because a quiet fallback is acceptable behavior and unacceptable UX.
+
+## 352. "At most one default" is an index; "exactly one while any token exists" is an advisory lock (D2, D12)
+
+- **The partial unique index** `user_secrets_one_default_key ON (user_id, kind) WHERE
+  is_default` enforces *at most* one. It cannot enforce *at least* one — no index can
+  express "zero is illegal while any sibling row exists".
+- **The gap is closed by `pg_advisory_xact_lock`, not `SELECT … FOR UPDATE`** as the
+  PRD drafted. `FOR UPDATE` locks rows that exist; the dangerous interleavings here
+  are *create* (no row to lock yet) racing *delete-the-default* (the row disappears).
+  A per-user advisory lock (`SecretMutationLockClass`, alongside the existing
+  `HostedProvisionLockClass` precedent) serializes every token mutation for one user.
+  Necessity was proven by removal, not argued: with the lock taken out, the invariant
+  test fails within one iteration (`user has 1 tokens but 0 defaults`).
+- **The index and the lock protect different things, and neither is redundant.** The
+  index protects the DATA (a second default can never commit); the lock protects the
+  USER-VISIBLE OUTCOME (two concurrent first-token creates both succeed instead of
+  one 500ing on a unique violation). Measured: without the lock the concurrent-create
+  test fails with a 500 every run.
+- **The D14 compatibility alias is deliberately NOT under the lock**, and stays safe
+  for two independent reasons — only one of which is the index. It always inserts
+  `is_default = true` with an `ON CONFLICT … WHERE is_default` arbiter, so the only
+  path to a *second* default is refused by the index; and it writes `is_default =
+  false` nowhere, so it can never *subtract* one. The second half is a property of
+  the SQL text alone, enforced by no index — any future change giving the alias an
+  `is_default = false` path breaks it **without the index noticing**.
+
+## 353. Labels: user-scoped, case-insensitively unique, never secret (D7)
+
+`CREATE UNIQUE INDEX … ON user_secrets (user_id, kind, lower(label))` — an
+expression, so it must be an index, not a UNIQUE constraint. Validation mirrors
+`maxTokenBytes`'s spirit: 1–64 chars, trimmed, no control characters, checked in the
+schema (`CHECK (char_length(label) BETWEEN 1 AND 64 AND label = btrim(label))`) as
+well as the handler. Labels appear in the UI, the CLI, admin views and logs; the
+value continues to appear nowhere. A collision is detected by constraint name
+(`user_secrets_user_kind_label_key`) and answered 409, not 500.
+
+**The first token is born default on the INSERT path, not by a follow-up UPDATE**:
+`is_default` is computed as `@want_default OR NOT EXISTS (SELECT 1 FROM user_secrets
+WHERE user_id = @user_id AND kind = @kind)`, kind-scoped, inside the same statement.
+A create that a caller forgot to flag cannot produce a token-holding user with no
+default even if the lock above were ever bypassed.
+
+## 354. Rate limits key on the token, not the user (D4)
+
+`anthropic_rate_limits` is repointed to `user_secret_id PRIMARY KEY`, keeping a
+`user_id` column for the admin cross-user view and the cascade, with `FOREIGN KEY
+(user_id, user_secret_id) REFERENCES user_secrets (user_id, id) ON DELETE CASCADE`.
+That pair can never be mismatched **by construction** rather than by caller
+discipline: `user_secret_id` is the global primary key of `user_secrets`, so an id
+belongs to exactly one owner for its whole life.
+
+`GET /api/me/rate-limits` returns `{tokens: [{secret_id, label, is_default, limits}]}`
+— a **breaking response-shape change**, so web, the CLI (`apitypes/ratelimit.go`) and
+the e2e assertions move in the same MR. Alternative rejected: polling only the
+default would keep the meters rendering confidently while describing an account most
+of the user's workers no longer spend against. The poller polls one row per token;
+the save-time poke still refreshes only the **default** (its only caller is the
+kind-path alias, which has no token id to offer), so a newly added non-default token
+waits one interval for its first reading. Auto-failover on exhaustion is explicitly
+out of scope (D3) — it needs its own policy design for which token, chosen when, and
+how `run_usage` attributes a mid-run switch.
+
+## 355. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
+
+- `POST`/`PATCH`/`DELETE` on `/api/me/secrets/anthropic_token*` keep `RequireAuth`
+  (cookie + CSRF). A Bearer-reachable mint would let a stolen `uzc_` **replace** a
+  user's credentials rather than merely read metadata — redirecting every future
+  run's spend — which is the precise escalation D8 exists to prevent, and the same
+  reason `POST /workers` is cookie-only.
+- `GET /api/me/secrets` moved `RequireAuth → RequireUser`: it returns labels, ids and
+  flags, never a value, so it grants a CLI token nothing it lacked.
+- **The PRD's own M2 scope contradicted D8 and D8 won.** It listed `uzi token
+  add|rename|set-default|rm` in the same breath as "writes stay cookie-only"; those
+  are incompatible, because the CLI authenticates only with `Authorization: Bearer`,
+  which `RequireAuth` rejects — every one of those commands would have 401'd.
+  **Only `uzi token list` exists**, `TestTokenHasOnlyList` pins the absence so nobody
+  adds one by reflex, and the command's help says the writes are web-only and why.
+- `PATCH /api/workers/{id}` **is** `RequireUser` (so `uzi worker set-token` works):
+  it mints nothing and returns no credential, it re-points a worker between tokens
+  the caller already owns.
+
+## 356. Absent vs explicit-null in the binding PATCH — `json.RawMessage`, not `*string`
+
+Both binding endpoints take `anthropic_token` as `json.RawMessage` and decode it in
+one place (`parseTokenField`): **omitted** = leave the binding alone, **`null` or
+`""`** = clear it to the default, a **label** = bind. The distinction is not
+pedantry — the judge toggle sends `{enabled: true}` with no token field when a user
+flips the switch, and a `*string`-shaped decoder that could not tell "absent" from
+"null" would silently unbind the credential the user had just picked. On
+`PATCH /api/workers/{id}`, where the body carries only this field today, an omitted
+key is answered **400** rather than a 200 no-op: naming the client bug is better than
+inventing a read path to echo an unchanged worker back, and the rule is what matters
+the day this body grows a second field.
+
+## 357. The kind-path routes survive as deprecated aliases over the default (D14)
+
+`PUT /api/me/secrets/anthropic_token` rotates-or-creates the default;
+`DELETE /api/me/secrets/anthropic_token` deletes it — but now answers **409** once
+the user holds more than one token, because "delete the anthropic token" stopped
+naming one row. Single-token users (every user before this PRD) see no change at all.
+The delete stays **204** on success rather than becoming 200-with-body: it is an
+existing contract with existing consumers, and D14 is about not breaking them.
+
 # PRD #98 — Judge menu (cross-run recommendation workbench)
 
 Serves human: extends the Run retrospective (LLM judge) feature
@@ -9383,7 +9682,7 @@ Serves human: extends the Run retrospective (LLM judge) feature
 cross-run home, so the same recurring idea was re-triaged once per run it
 appeared in. Design record: `prds/98-judge-menu.md`.
 
-## 347. A new, WIDER read on #94's join shape — grouped by `(category, target)`, migration-free (D1)
+## 358. A new, WIDER read on #94's join shape — grouped by `(category, target)`, migration-free (D1)
 
 - `GET /api/me/judge/recommendations` (`RequireUser`, owner-scoped, all-time).
   It keeps `ListJudgeTriageRowsForUser`'s spine — `run_reviews` where
@@ -9412,7 +9711,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   survivors. Stated in `docs/judge-menu.md` and `docs/cli.md` because a consumer
   that reads truncation as emptiness silently under-reports a backlog.
 
-## 348. The group is a DISPLAY construct — disposition fans out to member coordinates, no new storage (D3)
+## 359. The group is a DISPLAY construct — disposition fans out to member coordinates, no new storage (D3)
 
 - `PUT .../recommendations/disposition` resolves each requested
   `(category, target)` to the caller's member recommendations and reuses #94's
@@ -9442,7 +9741,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   loop would be N round-trips on a no-CSRF token path. One statement also removes
   the partial-apply window rather than documenting it.
 
-## 349. ONE canonical to-triage number — a shared source is NOT enough; it needs a shared propagation channel
+## 360. ONE canonical to-triage number — a shared source is NOT enough; it needs a shared propagation channel
 
 - The nav badge, the Judge page's To-triage tab and the judge notification all
   read `triage.todo`. That was necessary and **not sufficient**, and the gap is
@@ -9463,7 +9762,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   route, because a router-faithful version would unmount one to reach another and
   could never compare them.
 
-## 350. The notification retarget is a GUARD on the web and a plain URL change on the API — the asymmetry is the design (D4/D5)
+## 361. The notification retarget is a GUARD on the web and a plain URL change on the API — the asymmetry is the design (D4/D5)
 
 - `reviewDeepLink` (`handler/judge_worker.go`) becomes
   `baseURL + "/judge?run=" + targetID`. It is called from exactly one place, the
@@ -9488,7 +9787,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   Un-anchored `/judge` still defaults `todo`. The inconsistency is deliberate;
   user-confirmed.
 
-## 351. Filed→Done is EDGE-triggered off the poller's snapshot, `DO NOTHING` not `DO UPDATE` — the PRD's one migration (D6)
+## 362. Filed→Done is EDGE-triggered off the poller's snapshot, `DO NOTHING` not `DO UPDATE` — the PRD's one migration (D6)
 
 - Migration adds `set_via` on `recommendation_dispositions` and `close_synced_at`
   on `recommendation_filed_issues`.
@@ -9513,7 +9812,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   (the issue cache is filtered by `prdLabel`). Filed issues get the label
   automatically, so only removing it breaks the sync.
 
-## 352. `/runs` per-row badge — one grammar, verdict-first; an unjudged run renders NOTHING (D7)
+## 363. `/runs` per-row badge — one grammar, verdict-first; an unjudged run renders NOTHING (D7)
 
 - `⚖ {verdict} · {N}`, with the count appended only when `> 0`. The concept mock
   had two grammars (a verdict badge plus a separate count badge); two badges for
@@ -9536,7 +9835,7 @@ appeared in. Design record: `prds/98-judge-menu.md`.
   `user_id` always equals its target run's owner. Stated where it is enforced,
   because removing the outer predicate would make this unsafe.
 
-## 353. What this PRD does NOT cover — the coverage boundary, recorded as a decision
+## 364. What this PRD does NOT cover — the coverage boundary, recorded as a decision
 
 Written here rather than left to be inferred, because every Blocking after M3 was
 about evidence rather than behaviour, and a doc claiming "the judge backlog is

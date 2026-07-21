@@ -68,8 +68,8 @@ import {
   mockMemories,
   mockConnection,
   mockForgeConfig,
-  mockMyRateLimits,
   mockMyRateLimitsByUser,
+  mockMyTokenRateLimits,
   mockNotifications,
   type MockNotification,
   mockRepos,
@@ -462,6 +462,17 @@ let selfimprove: SelfimproveConfig = {
   active: false,
 };
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
+
+// requireUnlockedVault mirrors the real API: sealing a token needs the vault
+// unlocked (PRD #32), so every create/rotate path throws the same 409 the SPA
+// turns into an unlock prompt.
+function requireUnlockedVault(): void {
+  if (!state.vaultUnlocked) {
+    throw new ApiError(409, "vault is locked; unlock it with your password, then save again", {
+      code: "vault_locked",
+    });
+  }
+}
 let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
@@ -840,9 +851,26 @@ export const mockApi = {
 
   // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server's audit H3).
-  setJudgeEnabled: async (enabled: boolean) => {
+  setJudgeEnabled: async (enabled: boolean, anthropicToken?: string | null) => {
     const u = requireSession();
     u.judge_enabled = enabled;
+    // Three-way, like the server: undefined leaves the binding, null clears it, a
+    // label binds it (400 when it names nothing).
+    if (anthropicToken !== undefined) {
+      if (anthropicToken === null || anthropicToken.trim() === "") {
+        u.judge_anthropic_secret_id = null;
+        u.judge_anthropic_secret_label = null;
+      } else {
+        const secret = secrets.find(
+          (x) =>
+            x.kind === "anthropic_token" &&
+            x.label.toLowerCase() === anthropicToken.trim().toLowerCase(),
+        );
+        if (!secret) throw new ApiError(400, "no Anthropic token with that label");
+        u.judge_anthropic_secret_id = secret.id;
+        u.judge_anthropic_secret_label = secret.label;
+      }
+    }
     return delay({ user: { ...u } }, 200);
   },
   // Admin per-user toggle: target from the id argument (the path on the server).
@@ -884,19 +912,130 @@ export const mockApi = {
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
-  listSecrets: async () => delay({ secrets: secrets.map((s) => ({ ...s })) }),
+  listSecrets: async () =>
+    delay({
+      // Default first, then by label — the order the server's query returns.
+      secrets: [...secrets]
+        .sort((a, b) =>
+          a.is_default === b.is_default ? a.label.localeCompare(b.label) : a.is_default ? -1 : 1,
+        )
+        .map((s) => ({ ...s })),
+    }),
   putAnthropicToken: async (_token: string) => {
     // Mirror the real API: a locked vault cannot seal a new token (PRD #32).
-    if (!state.vaultUnlocked) {
-      throw new ApiError(409, "vault is locked; unlock it with your password, then save again", {
-        code: "vault_locked",
-      });
-    }
+    requireUnlockedVault();
     const now = new Date().toISOString();
-    const existing = secrets.find((s) => s.kind === "anthropic_token");
-    if (existing) existing.updated_at = now;
-    else secrets.push({ kind: "anthropic_token", created_at: now, updated_at: now });
-    return delay({ secret: { ...secrets.find((s) => s.kind === "anthropic_token")! } });
+    // The D14 alias rotates the DEFAULT, or creates the first one labelled
+    // "default" — exactly what UpsertDefaultUserSecret does server-side.
+    const existing = secrets.find((s) => s.kind === "anthropic_token" && s.is_default);
+    if (existing) {
+      existing.updated_at = now;
+      return delay({ secret: { ...existing } });
+    }
+    const created: SecretMeta = {
+      id: `sec-${Math.random().toString(36).slice(2, 8)}`,
+      kind: "anthropic_token",
+      label: "default",
+      is_default: true,
+      created_at: now,
+      updated_at: now,
+    };
+    secrets.push(created);
+    return delay({ secret: { ...created } });
+  },
+
+  // ── Token CRUD (PRD #104 M2) ───────────────────────────────────────────────
+  createAnthropicToken: async (_token: string, label: string, isDefault: boolean) => {
+    requireUnlockedVault();
+    const trimmed = label.trim();
+    if (trimmed === "") throw new ApiError(400, "label must not be empty");
+    const anthropic = () => secrets.filter((s) => s.kind === "anthropic_token");
+    if (anthropic().some((s) => s.label.toLowerCase() === trimmed.toLowerCase())) {
+      throw new ApiError(409, "a token with that label already exists");
+    }
+    // The server FORCES a user's first token to be the default whatever the body
+    // asks (the invisible-token hazard); mirror that here or the mock teaches the
+    // wrong lesson.
+    const first = anthropic().length === 0;
+    const wantDefault = isDefault || first;
+    if (wantDefault) anthropic().forEach((s) => (s.is_default = false));
+    const now = new Date().toISOString();
+    const created: SecretMeta = {
+      id: `sec-${Math.random().toString(36).slice(2, 8)}`,
+      kind: "anthropic_token",
+      label: trimmed,
+      is_default: wantDefault,
+      created_at: now,
+      updated_at: now,
+    };
+    secrets.push(created);
+    return delay({ secret: { ...created } });
+  },
+  patchAnthropicToken: async (
+    id: string,
+    body: { label?: string; default?: boolean; token?: string },
+  ) => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row) throw new ApiError(404, "token not found");
+    if (body.token !== undefined) requireUnlockedVault();
+    if (body.default === false) {
+      throw new ApiError(400, "cannot clear the default; set another token as default instead");
+    }
+    if (body.label !== undefined) {
+      const trimmed = body.label.trim();
+      if (trimmed === "") throw new ApiError(400, "label must not be empty");
+      if (
+        secrets.some(
+          (s) => s.id !== id && s.kind === row.kind && s.label.toLowerCase() === trimmed.toLowerCase(),
+        )
+      ) {
+        throw new ApiError(409, "a token with that label already exists");
+      }
+      row.label = trimmed;
+    }
+    if (body.default === true) {
+      secrets.filter((s) => s.kind === row.kind).forEach((s) => (s.is_default = false));
+      row.is_default = true;
+    }
+    row.updated_at = new Date().toISOString();
+    return delay({ secret: { ...row } });
+  },
+  deleteAnthropicTokenById: async (id: string) => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row) throw new ApiError(404, "token not found");
+    const siblings = secrets.filter((s) => s.kind === row.kind);
+    // D6: the default may not be deleted while others exist — promote first.
+    if (row.is_default && siblings.length > 1) {
+      throw new ApiError(
+        409,
+        "cannot delete the default token while other tokens exist; set another token as default first",
+      );
+    }
+    secrets = secrets.filter((s) => s.id !== id);
+    // The real schema CASCADES: migrations 00078/00079 hang composite FKs off
+    // user_secrets (user_id, id) with ON DELETE SET NULL, so deleting a bound token
+    // unbinds its workers and the judge rather than orphaning them. Without this the
+    // mock left workers reading "spends console-key" forever — and with one token
+    // left the picker is hidden, so there was no way to correct it. Two reasons that
+    // matters beyond tidiness: the shipped Dockerfile.mock demo was showing D5's own
+    // promise being broken, and D5's cascade otherwise has schema-level evidence
+    // only. Mirrored here so a browser can prove the behaviour end to end.
+    workers.forEach((w) => {
+      if (w.anthropic_secret_id === id) {
+        w.anthropic_secret_id = null;
+        w.anthropic_secret_label = null;
+      }
+    });
+    // `state.session` is a COPY, not a reference into `users`, so both have to be
+    // swept or the cascade would be invisible to /me — which is the read every
+    // judge surface actually uses.
+    [...users, state.session].forEach((u) => {
+      if (u && u.judge_anthropic_secret_id === id) {
+        u.judge_anthropic_secret_id = null;
+        u.judge_anthropic_secret_label = null;
+      }
+    });
+    return delay(null);
   },
 
   // ── Vault (PRD #32) ───────────────────────────────────────────────────────────
@@ -920,6 +1059,14 @@ export const mockApi = {
   },
   vaultStatus: async () => delay({ unlocked: state.vaultUnlocked }, 40),
   deleteAnthropicToken: async () => {
+    // D14: the kind-path alias 409s for a multi-token user — they delete by id.
+    const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
+    if (anthropic.length > 1) {
+      throw new ApiError(
+        409,
+        "you have multiple tokens; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})",
+      );
+    }
     secrets = secrets.filter((s) => s.kind !== "anthropic_token");
     return delay(null);
   },
@@ -1449,6 +1596,8 @@ export const mockApi = {
       stats_mem_bytes: null,
       stats_mem_limit_bytes: null,
       stats_source: null,
+      anthropic_secret_id: null,
+      anthropic_secret_label: null,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -1457,6 +1606,25 @@ export const mockApi = {
   deleteWorker: async (id: string) => {
     workers = workers.filter((w) => w.id !== id);
     return delay(null);
+  },
+  // PRD #104 M3: rebind a worker to a named token, or clear it with null. Mirrors
+  // the real route's label→id resolution and its 400 for an unknown label, so the
+  // picker's error path is browsable.
+  setWorkerToken: async (id: string, label: string | null) => {
+    const w = workers.find((x) => x.id === id);
+    if (!w) throw new ApiError(404, "worker not found");
+    if (label === null || label.trim() === "") {
+      w.anthropic_secret_id = null;
+      w.anthropic_secret_label = null;
+      return delay({ worker: { ...w } });
+    }
+    const secret = secrets.find(
+      (x) => x.kind === "anthropic_token" && x.label.toLowerCase() === label.trim().toLowerCase(),
+    );
+    if (!secret) throw new ApiError(400, "no Anthropic token with that label");
+    w.anthropic_secret_id = secret.id;
+    w.anthropic_secret_label = secret.label;
+    return delay({ worker: { ...w } });
   },
 
   // Hosted workers (PRD #58). The demo is the only place M5 can be seen working: on a
@@ -1497,6 +1665,8 @@ export const mockApi = {
       stats_mem_bytes: null,
       stats_mem_limit_bytes: null,
       stats_source: null,
+      anthropic_secret_id: null,
+      anthropic_secret_label: null,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does
@@ -1646,7 +1816,7 @@ export const mockApi = {
   // row state. Percentages only — no token material ever appears here.
   getMyRateLimits: async () => {
     const me = requireSession();
-    return delay(mockMyRateLimitsByUser[me.id] ?? mockMyRateLimits, 60);
+    return delay({ tokens: mockMyRateLimitsByUser[me.id] ?? mockMyTokenRateLimits }, 60);
   },
   getAdminRateLimits: async () => delay({ users: mockAdminRateLimits.map((u) => ({ ...u })) }, 60),
   getRun: async (id: string) => {

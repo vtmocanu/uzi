@@ -166,7 +166,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id": updated.ID.String(),
-		"worker":    workerDTOFromWorker(updated, 0, false),
+		"worker":    workerDTOFromWorker(updated, 0, false, ""),
 	})
 }
 
@@ -211,7 +211,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false, "")})
 }
 
 // parseWorkerStats is Decision 3's second-step defensive parse plus Decision 5's

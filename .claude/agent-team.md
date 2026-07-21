@@ -278,6 +278,33 @@ implementation, and beat it where we can. Reviewer and fact-checker
 cross-check our work against these; verify "we do it better than X" claims
 against the actual submodule code, not from memory.
 
+## Quality gates
+
+Paste this block into every tester, reviewer and auditor dispatch — teammates
+cold-start and never read this file, so a slot you do not paste is a slot they
+cannot run. A `none (gap)` slot that has been raised once gets a `noted` marker
+appended here; roles report a gap only when its line carries no marker.
+
+```
+format         none (gap)          # gofmt -l ./api reports 26 drifted files
+lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
+typecheck      cd web && npm run typecheck
+               cd agent && npm run typecheck
+test           cd api && go test ./...
+               cd controller && go test ./...
+               cd web && npm test
+               cd agent && npm test
+               cd web && npm run check-docs
+dead code      none (gap)
+coverage       none (gap)
+security scan  none (gap, noted 2026-07-21)
+pre-commit     none (gap)
+long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
+```
+
+Every gap above is what PRD #103 exists to close; re-derive this block when its
+milestones land rather than trusting these lines.
+
 ## Project signals
 
 - Test commands (see CLAUDE.md for detail): `cd api && go test ./...`;
@@ -285,8 +312,6 @@ against the actual submodule code, not from memory.
   integration: `./e2e/run-e2e.sh` (isolated stack, dummy creds) and
   `./scripts/smoke.sh` (needs a fresh stack). Never bare `docker compose up`
   for testing — `--env-file` with dummy secrets + unique `-p` project.
-- Lint command: none dedicated; `npm run build` in web/ runs the
-  check-docs + tsc gate
 - Release flow: tag-driven (PRD #52). `v*` tags publish the api/web images +
   the OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the
   tag); k8s deploy is GitOps via ArgoCD to dev-cluster (see `deploy/` +

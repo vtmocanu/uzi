@@ -18,7 +18,7 @@ import {
 afterEach(cleanup);
 
 function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunMessage {
-  return { agent: "lead", payload: {}, created_at: "2026-07-04T00:00:00.000Z", ...partial };
+  return { agent: "lead", agent_instance: null, agent_label: null, payload: {}, created_at: "2026-07-04T00:00:00.000Z", ...partial };
 }
 
 describe("toolSummary", () => {

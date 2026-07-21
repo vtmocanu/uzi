@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -485,7 +486,10 @@ func sanitizeTTY(s string) string {
 
 // renderMessage prints one run message. In --json mode it emits one compact JSON
 // object per line (NDJSON), so `--follow` streams cleanly and an agent parses it
-// line by line; in human mode it prints a single #seq/kind/agent/payload line.
+// line by line — and since it marshals the DTO whole, `agent_instance` and
+// `agent_label` have been in the JSON output since they were added to MessageDTO
+// (PRD #99 M1), with no work here. In human mode it prints a single
+// #seq/kind/actor/payload line, where the actor cell is what M4 widens.
 func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	if p.Format == uzicli.FormatJSON {
 		b, err := json.Marshal(m)
@@ -495,12 +499,127 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 		p.Println(string(b))
 		return nil
 	}
-	agent := "-"
-	if m.Agent != nil && *m.Agent != "" {
-		agent = *m.Agent
-	}
-	p.Printf("#%-4d %-16s %-10s %s\n", m.Seq, m.Kind, agent, compactPayload(m.Payload))
+	// %-*s pads to a fixed RUNE width (Go's fmt measures width in runes, not bytes),
+	// and actorCell has already capped its result to that width, so the payload column
+	// starts at the same rune offset on every line.
+	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), compactPayload(m.Payload))
 	return nil
+}
+
+// actorCellWidth bounds the human table's actor column. The payload column beside
+// it already runs to 200 characters, so terminal width is not the scarce resource
+// this trades against — the cap exists to keep the columns ALIGNED down the stream,
+// which is what `uzi run logs --follow` is read through. (Rune alignment, like the
+// rest of this CLI's tables: a CJK label still occupies two terminal columns per
+// rune, which no part of this tool accounts for — out of scope, not a regression.)
+const actorCellWidth = 34
+
+// actorCell renders WHO produced a message: the role, the short id of the
+// invocation that produced it when the frame carries one, and that invocation's
+// task label. Two parallel `coder` subagents therefore read distinctly (PRD #99
+// Decision 10) instead of as two identical `coder` rows:
+//
+//	#12   tool_use   coder/3v6ptu · API wi…  {"name":"Edit"}
+//	#13   tool_use   coder/2k9xqf · web ga…  {"name":"Edit"}
+//
+// The short id alone already separates them, so a truncated label costs clarity,
+// never correctness. A frame with no instance — the orchestrator's own turns, infra
+// frames, and every pre-migration message — renders as the bare role exactly as it
+// did before, and a missing role still renders "-".
+//
+// Both new fields are worker-supplied text bound for a TTY, and `agent_label` is
+// free model-authored prose rather than a role drawn from a fixed roster, so each
+// goes through cellText's sanitize-and-fold (Risk 13: a raw CSI sequence in this
+// cell could clear the screen or spoof output). That also closes the same hole for
+// `agent`, which this function inherited printing verbatim.
+func actorCell(m apitypes.MessageDTO) string {
+	cell := "-"
+	if m.Agent != nil {
+		if role := cellText(*m.Agent); role != "" {
+			cell = role
+		}
+	}
+	if m.AgentInstance != nil {
+		if id := cellText(shortInstanceID(*m.AgentInstance)); id != "" {
+			cell += "/" + id
+		}
+	}
+	if m.AgentLabel != nil {
+		if label := cellText(*m.AgentLabel); label != "" {
+			cell += " · " + label
+		}
+	}
+	return capCell(cell, actorCellWidth)
+}
+
+// cellText is compactText plus the two folds a FIXED-WIDTH column needs and the
+// shared compactText must not do — it also backs the payload and steer columns,
+// which are free text where a tab is ordinary content and where nothing is
+// promised about width.
+//
+// Tab. sanitizeTTY spares `\t` deliberately, and compactText folds only `\n`, so a
+// tab in `agent_label` reaches the cell. `%-*s` then pads to actorCellWidth in
+// RUNES and a tab is one rune, so every invariant the code checks still holds while
+// the terminal expands it to the next 8-column stop and the payload column walks
+// right. MEASURED before the fix: a benign label put the payload at rendered column
+// 58; `a\tb\tc\td\te` put it at 76; eight interior tabs at 107 — with the rune
+// offset pinned at 58 throughout, which is why the existing alignment test could
+// not see it. Folded to a space, which preserves the word break the tab was doing.
+//
+// DEL. 0x7f is outside sanitizeTTY's C0 (<0x20) and C1 (0x80–0x9f) ranges, so it
+// survives too. It advances no column but some terminals draw a glyph for it, so it
+// is dropped rather than folded.
+//
+// Both are cosmetic — no cursor motion, no erase, no OSC, and `\n` cannot survive
+// compactText — but the actor column's whole purpose is to stay aligned down a
+// `uzi run logs --follow` stream, and model-authored prose is exactly where a stray
+// tab comes from.
+func cellText(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\t':
+			return ' '
+		case 0x7f:
+			return -1
+		}
+		return r
+	}, compactText(s))
+	// Folding can leave an edge space behind (compactText trimmed before the fold).
+	return strings.TrimSpace(s)
+}
+
+// shortInstanceID renders an invocation id compactly: its LAST 6 runes.
+//
+// A tail, not a prefix, and deliberately NOT shortRecID's first-8 rule. That rule is
+// right for a random UUID, but an SDK tool-use id carries a constant `toolu_01`
+// prefix, so first-8 would return the same eight characters for every instance in a
+// run — the one thing this column exists to tell apart. A tail needs no claim about
+// the prefix's shape at all, which matters because the real id format is documented
+// (~30 characters, PRD #99) but is not verified here against a live SDK run.
+//
+// Display only, and lossy: two ids CAN share a 6-rune tail. --json carries the full
+// value, and that is the agent contract.
+func shortInstanceID(id string) string {
+	const n = 6
+	r := []rune(id)
+	if len(r) <= n {
+		return id
+	}
+	return string(r[len(r)-n:])
+}
+
+// capCell truncates a table cell to max RUNES, appending an ellipsis. Rune-based
+// per the house idiom (workersvc.deriveChatTitle): byte-slicing splits a multibyte
+// codepoint into invalid UTF-8. Note the neighbouring compactText still byte-slices
+// at its 200-char cap — milder there, since a mangled rune reaches a terminal rather
+// than an INSERT, but the two are inconsistent and compactText is the one that is
+// wrong. Left alone here: it is shared with the payload and steer-body columns, so
+// changing it changes output this milestone does not own.
+func capCell(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	return string([]rune(s)[:max-1]) + "…"
 }
 
 // compactPayload renders a message payload as a single truncated line for the

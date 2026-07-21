@@ -12,6 +12,11 @@ issue without leaving the app. The conversation is answered by an agent
 running on **your own worker**, billed to **your own Anthropic token** — the
 same worker that executes your runs.
 
+Specifically, chat always spends your **default** token, even on a worker you
+have bound to a different one: the binding covers that worker's *runs*, not
+its chat. See [Anthropic tokens](./anthropic-token.md) if you are reconciling
+a meter against what you expected to spend.
+
 ## What it can see and do
 
 - **uzi's own source.** The agent reads a copy of uzi's code baked into the

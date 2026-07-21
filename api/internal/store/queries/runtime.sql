@@ -3,9 +3,31 @@
 -- name: CreateWorker :one
 -- Issue a worker: the plaintext join token is shown once by the caller; only its
 -- sha256 (token_hash) is stored. template_declared is the UI-chosen template
--- (PRD #18), NULL when the caller made no choice.
-INSERT INTO workers (user_id, name, token_hash, template_declared)
-VALUES (@user_id, @name, @token_hash, @template_declared)
+-- (PRD #18), NULL when the caller made no choice. anthropic_secret_id is the
+-- optional mint-time token binding (PRD #104 M3); NULL means "my owner's default",
+-- which is what every worker minted before this was and stays.
+INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
+VALUES (@user_id, @name, @token_hash, @template_declared, @anthropic_secret_id)
+RETURNING *;
+
+-- name: SetWorkerAnthropicSecret :one
+-- Point a worker at one of its owner's Anthropic credentials, or clear the binding
+-- back to "use my default" (PRD #104 M3, D1). Scoped to the owner so a caller
+-- holding a foreign worker id changes nothing and gets no rows — the handler turns
+-- that into the same 404 it gives for an unknown worker, never a 403 that would
+-- confirm the worker exists.
+--
+-- Nothing here validates that @anthropic_secret_id belongs to the caller: the
+-- composite FK does, in the database (D11). A foreign secret id has no
+-- (workers.user_id, id) pair in user_secrets and the UPDATE raises a
+-- foreign_key_violation. That is the layer that still holds when the handler's own
+-- ownership check is bypassed, which is exactly what M3's acceptance test asserts.
+--
+-- Takes effect on the worker's NEXT claim — no restart, no re-minted join token,
+-- because the token never rides the worker, only each claim response.
+UPDATE workers
+SET anthropic_secret_id = @anthropic_secret_id, updated_at = now()
+WHERE id = @id AND user_id = @user_id
 RETURNING *;
 
 -- name: GetWorkerByTokenHash :one
@@ -29,7 +51,15 @@ SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 --     active_runs, which now omits chat.
 -- max_concurrent_runs (the advertised cap, NULL when unadvertised) rides on w.*; it
 -- is observability only and never enforced.
+--
+-- anthropic_secret_label is the NAME of the bound credential (PRD #104 M3), NULL
+-- for an unbound worker (the overwhelming majority — unbound means "my owner's
+-- default"). LEFT JOIN, so a worker whose token was deleted still lists: the FK's
+-- ON DELETE SET NULL already cleared the binding, and the join simply finds
+-- nothing. It carries the label only — never the ciphertext, which no worker-facing
+-- query may select.
 SELECT w.*,
+       s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -42,6 +72,7 @@ SELECT w.*,
              AND r.kind <> 'chat'
        ) AS active_runs
 FROM workers w
+LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
 WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
 
@@ -606,15 +637,22 @@ WHERE worker_id = @worker_id
 -- name: InsertRunMessage :execrows
 -- Idempotent seq-numbered append: a re-delivered batch (worker retry) is a
 -- no-op on the duplicate (run_id, seq).
-INSERT INTO run_messages (run_id, seq, kind, agent, payload)
-VALUES (@run_id, @seq, @kind, @agent, @payload)
+INSERT INTO run_messages (run_id, seq, kind, agent, agent_instance, agent_label, payload)
+VALUES (@run_id, @seq, @kind, @agent, @agent_instance, @agent_label, @payload)
 ON CONFLICT (run_id, seq) DO NOTHING;
 
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
 -- cache on top of this.
-SELECT id, run_id, seq, kind, agent, payload, created_at
+-- Column order matches the run_messages table order (the two PRD #99 columns were
+-- appended by 00075), so sqlc keeps returning store.RunMessage rather than
+-- minting a separate ...Row type.
+-- TO DO IT RIGHT: new columns must be APPENDED to both this SELECT list and
+-- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
+-- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
+-- []store.RunMessage contract (a compile error at cmd/server/main.go).
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
@@ -773,7 +811,10 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 -- A bounded page of a run's messages after a seq (the worker read tool's paging).
 -- Authorization (the run is the worker's user's) is checked by the caller before
 -- this; here @lim caps the page so a single response can't be unbounded.
-SELECT id, run_id, seq, kind, agent, payload, created_at
+-- Column order matches the table (see ListRunMessagesAfter) so the row stays
+-- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
+-- in the same order the ALTER TABLE adds them — see that query's note.
+SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC

@@ -9,7 +9,8 @@ audience: user
 With the run judge on, every one of your **finished** runs gets a
 retrospective: an LLM reads the run's trace (agents, tools, plan, review
 cycles, delivery) and produces a verdict plus structured recommendations —
-never code changes, only advice. It runs on **your own Anthropic token**, so
+never code changes, only advice. It runs on **your own Anthropic token** —
+your default one, or a token you name for the judge lane specifically — so
 it's opt-in and off by default; your instance admin also has to enable it
 globally first.
 
@@ -19,6 +20,21 @@ Your admin enables the feature globally under **Admin → Instance settings →
 Run judge**. Once that's on, open **Settings → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
 judge for any individual user from **Admin → Users**.
+
+## Which token the judge spends
+
+By default the judge spends your default [Anthropic token](./anthropic-token.md)
+— the same credential your runs use. If you hold more than one, **Settings →
+Run judge** offers a **Token the judge spends** picker, so retrospectives can
+bill a different account from the work they review (a cheaper console key for
+the reviewing, a subscription for the runs).
+
+The picker also covers uzi's **self-improvement** runs, for the same reason:
+they are uzi reviewing and improving itself, not work you asked a particular
+worker to do, so they follow the judge's credential rather than the claiming
+worker's. Everything else — issue runs, autopilot, CI-fix, chat — is unaffected
+by this setting. Leave it on **your default token** to keep everything on one
+account.
 
 ## What you get
 

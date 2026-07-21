@@ -33,6 +33,8 @@ const user = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -208,8 +210,13 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     stats_mem_bytes: null,
     stats_mem_limit_bytes: null,
     stats_source: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   });
   const aToken = (): SecretMeta => ({
+    id: "sec-1",
+    label: "default",
+    is_default: true,
     kind: "anthropic_token",
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",

@@ -27,6 +27,7 @@ import type {
   RunMessage,
   RunUsage,
   SecretMeta,
+  TokenRateLimits,
   SteerInput,
   Skill,
   ToolAllowlistEntry,
@@ -48,6 +49,8 @@ export const mockAdmin: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  judge_anthropic_secret_id: null,
+  judge_anthropic_secret_label: null,
   created_at: daysAgo(41),
   last_login: minsAgo(7),
 };
@@ -62,6 +65,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: true,
     judge_enabled: true,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(33),
     last_login: minsAgo(95),
   },
@@ -73,6 +78,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(20),
     last_login: daysAgo(1),
   },
@@ -84,6 +91,8 @@ export const mockUsers: User[] = [
     is_active: false,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(18),
     last_login: daysAgo(12),
   },
@@ -97,6 +106,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(15),
     last_login: minsAgo(20),
   },
@@ -108,6 +119,8 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    judge_anthropic_secret_id: null,
+    judge_anthropic_secret_label: null,
     created_at: daysAgo(25),
     last_login: daysAgo(1),
   },
@@ -139,42 +152,63 @@ function okReading(
   };
 }
 
-// The signed-in demo user's own reading (Settings card + sidebar), matching mockup
-// frame A: 8% / 47%, both green, "Live".
+// The signed-in demo user's own readings (Settings card + sidebar). Since PRD #104
+// this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 47%,
+// both green, "Live"), and the console key is busier so the two meter pairs are
+// visibly different rather than duplicates.
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 47, 2 * D + 4 * H);
+
+export const mockMyTokenRateLimits: TokenRateLimits[] = [
+  { secret_id: "sec-default", label: "default", is_default: true, limits: mockMyRateLimits },
+  {
+    secret_id: "sec-console",
+    label: "console-key",
+    is_default: false,
+    limits: okReading(64, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
+  },
+];
+
+// tokenised wraps a single reading as a one-token list, for the personas whose
+// fixture is a single credential.
+function tokenised(limits: MyRateLimits, label = "default"): TokenRateLimits[] {
+  return limits.status === "no_token"
+    ? [] // token-less is an EMPTY list since M5, not a status
+    : [{ secret_id: `sec-${label}`, label, is_default: true, limits }];
+}
 
 // Per-persona readings so a demo login as a seeded non-admin reaches every own-
 // reading state; anyone else gets the live-ok default (u-admin). warn (radu) and
 // stale (mihai) are here so the sidebar-dim + Settings "Stale" badge and a warn-
 // tone bar are browsable, not just visible in the admin table.
-export const mockMyRateLimitsByUser: Record<string, MyRateLimits> = {
-  "u-admin": mockMyRateLimits, // live ok
-  "u-radu": okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3), // warn (7d 83%)
-  "u-mira": okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1), // danger (5h 97%)
+export const mockMyRateLimitsByUser: Record<string, TokenRateLimits[]> = {
+  "u-admin": mockMyTokenRateLimits, // live ok, TWO tokens
+  "u-radu": tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)), // warn (7d 83%)
+  "u-mira": tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)), // danger (5h 97%)
   // stale own-reading: no live countdown (resets null), aged synced_at, stale flag.
-  "u-mihai": {
+  "u-mihai": tokenised({
     status: "ok",
     five_hour: { pct: 31, resets_at: null },
     seven_day: { pct: 12, resets_at: null },
     source: "header_probe",
     synced_at: minsAgo(180),
     stale: true,
-  },
-  "u-andrei": { status: "unavailable" },
-  "u-dan": { status: "no_token" },
+  }),
+  "u-andrei": tokenised({ status: "unavailable" }),
+  "u-dan": [], // token-less: an EMPTY list, not a no_token status (PRD #104 M5)
 };
 
 // The admin all-users table (mockup frame C) plus a warn row and an unavailable
 // row, so every row state is demonstrable: live-ok, live-warn, live-danger,
 // stale+vault-locked, unavailable, no_token.
 export const mockAdminRateLimits: AdminRateLimitUser[] = [
-  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, limits: mockMyRateLimits },
-  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, limits: okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3) },
-  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, limits: okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1) },
-  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, limits: okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4) },
-  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, limits: okReading(31, 0, 12, 0, 180, "header_probe", true) },
-  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, limits: { status: "unavailable" } },
-  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, limits: { status: "no_token" } },
+  // vlad holds TWO tokens, so the admin table's per-user grouping is demonstrable.
+  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, tokens: mockMyTokenRateLimits },
+  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
+  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
+  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
+  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
+  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },
+  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, tokens: [] },
 ];
 
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
@@ -533,8 +567,26 @@ export const mockReviews: MockReview[] = [
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
 
+// Two tokens for the demo user (PRD #104): the multi-token list, the default
+// badge, the per-token meters and the worker/judge pickers are only browsable in
+// the mock if the fixture actually has more than one.
 export const mockSecrets: SecretMeta[] = [
-  { kind: "anthropic_token", created_at: daysAgo(30), updated_at: daysAgo(4) },
+  {
+    id: "sec-default",
+    kind: "anthropic_token",
+    label: "default",
+    is_default: true,
+    created_at: daysAgo(30),
+    updated_at: daysAgo(4),
+  },
+  {
+    id: "sec-console",
+    kind: "anthropic_token",
+    label: "console-key",
+    is_default: false,
+    created_at: daysAgo(9),
+    updated_at: daysAgo(9),
+  },
 ];
 
 // ── Forge ────────────────────────────────────────────────────────────────────
@@ -1008,6 +1060,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 2254857830, // 2.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~52%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -1029,6 +1083,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1610612736, // 1.5 GiB
     stats_mem_limit_bytes: 2147483648, // 2 GiB → 75%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -1050,6 +1106,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 503316480, // 480 MiB
     stats_mem_limit_bytes: null, // unlimited/unknown → no bar
     stats_source: "process",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -1075,6 +1133,8 @@ export const mockWorkers: Worker[] = [
     stats_mem_bytes: 1181116006, // 1.1 GiB
     stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
   },
 ];
 
@@ -1103,6 +1163,8 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_mem_bytes: 8160437862, // 7.6 GiB
     stats_mem_limit_bytes: 8589934592, // 8 GiB → 95%
     stats_source: "cgroup",
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
     owner_email: "mira@uzi.local",
   },
 ];
@@ -1624,6 +1686,8 @@ const dm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++doneSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: doneAt(minAgo),
 });
@@ -1677,6 +1741,8 @@ const am = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++awaitSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1697,6 +1763,8 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
   seq: ++failSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: daysAgo(1.15),
 });
@@ -1734,6 +1802,8 @@ const cm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++crewSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1763,6 +1833,8 @@ const gm = (kind: string, agent: string | null, payload: unknown, minAgo: number
   seq: ++degradedSeq,
   kind,
   agent,
+  agent_instance: null,
+  agent_label: null,
   payload,
   created_at: minsAgo(minAgo),
 });
@@ -1813,6 +1885,142 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     ...over,
   };
 }
+
+// ── PRD #99: per-instance lane demo runs ─────────────────────────────────────
+// Every other fixture in this file hardcodes both attribution columns to null, so
+// before these existed `VITE_UZI_MOCK=1 npm run dev` showed NONE of PRD #99: every
+// run coalesced to legacy role lanes and the feature had no demoable state. That is
+// the same blind spot that let both code suites stay green while the lane grouping
+// was removable (see the M5 mutation record) — a fixture that cannot express a
+// feature cannot demo it OR guard it.
+let laneSeq = 0;
+const nm = (
+  kind: string,
+  agent: string | null,
+  instance: string | null,
+  label: string | null,
+  payload: unknown,
+  minAgo: number,
+): RunMessage => ({
+  seq: ++laneSeq,
+  kind,
+  agent,
+  agent_instance: instance,
+  agent_label: label,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+// run-lanes — the PRD headline. Two `coder` invocations running in parallel, with
+// DISTINCT instance ids and their own task labels, interleaved NON-adjacently (a
+// reviewer frame sits between them). Non-adjacency is the load-bearing part: two
+// contiguous coder frames render correctly even under the pre-#99 consecutive-author
+// grouping, so they would not show the fix. The lead's own turns carry neither
+// column, so its lane is the role-keyed fallback beside the two instance-keyed ones.
+export const mockLaneMessages: RunMessage[] = [
+  nm("status", null, null, null, { event: "init", model: "claude-opus-4-8" }, 18),
+  nm("text", "lead", null, null, { text: "Dispatching two coders in parallel: API wiring and the web gate." }, 17),
+  nm("tool_use", "lead", null, null, { id: "ln-1", name: "Agent", input: { description: "API wiring", subagent_type: "coder" } }, 17),
+  nm("tool_use", "lead", null, null, { id: "ln-2", name: "Agent", input: { description: "web gate UX", subagent_type: "coder" } }, 17),
+  nm("tool_use", "coder", "toolu_01coderA", "API wiring", { id: "ln-3", name: "Read", input: { file_path: "api/internal/store/queries/runtime.sql" } }, 12),
+  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-3", content: "-- name: InsertRunMessage :execrows" }, 12),
+  nm("tool_use", "reviewer", "toolu_01review", "audit the wire threading", { id: "ln-4", name: "Grep", input: { pattern: "agent_instance", path: "api" } }, 9),
+  nm("tool_use", "coder", "toolu_01coderB", "web gate UX", { id: "ln-5", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 7),
+  nm("tool_result", "coder", "toolu_01coderB", "web gate UX", { tool_use_id: "ln-5", content: "1 change applied" }, 7),
+  // The same instance speaking again, several frames later: it folds back into its
+  // OWN lane instead of opening a fresh near-empty bar (Problem 1's fix).
+  nm("tool_use", "coder", "toolu_01coderA", "API wiring", { id: "ln-6", name: "Bash", input: { command: "cd api && go test ./internal/store/..." } }, 3),
+  nm("tool_result", "coder", "toolu_01coderA", "API wiring", { tool_use_id: "ln-6", content: "ok  gitlab.example.com/vtmocanu/uzi/api/internal/store  0.42s" }, 2),
+  nm("tool_use", "coder", "toolu_01coderB", "web gate UX", { id: "ln-7", name: "Bash", input: { command: "cd web && npx vitest run src/components/ActivityFeed.test.tsx" } }, 0.3),
+];
+
+// run-busy — the conditional role rollup, and specifically the ONE state pairing
+// nobody had seen on screen: a doubled role whose worst state is `waiting` while one
+// of its own lanes is visibly pulsing `working`. worstStateFor takes the MIN of
+// STATE_PRIORITY and `waiting`(1) outranks `working`(2), so the chip reads `waiting`
+// and does not pulse while the lane below it does. That is by design (the chip is a
+// worst-state summary, not a most-active one) but nothing on screen says so, and the
+// no-legend decision removed the obvious place to say it. This fixture exists so the
+// pairing is browsable rather than theoretical — see the open question in PRD #99.
+//
+// Shape: `tester` is doubled — toolu_01testX is the newest speaker (active → working)
+// and toolu_01testY spoke 0.4 min ago, inside the 45s recency window (→ waiting).
+let busySeq = 0;
+const bm = (
+  kind: string,
+  agent: string | null,
+  instance: string | null,
+  label: string | null,
+  payload: unknown,
+  minAgo: number,
+): RunMessage => ({
+  seq: ++busySeq,
+  kind,
+  agent,
+  agent_instance: instance,
+  agent_label: label,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+export const mockBusyMessages: RunMessage[] = [
+  bm("status", null, null, null, { event: "init", model: "claude-opus-4-8" }, 22),
+  bm("text", "lead", null, null, { text: "Six subagents across the migration and the web rebuild." }, 21),
+  bm("tool_use", "researcher", "toolu_01resrch", "survey prior art in inspiration/", { id: "b-1", name: "Read", input: { file_path: "inspiration/bottega/README.md" } }, 20),
+  // A long label, over the 48-rune layout clamp: it renders truncated with an
+  // ellipsis, which is the only on-screen signal that text was dropped.
+  bm("tool_use", "coder", "toolu_01coder1", "thread agent_instance and agent_label through the entire message wire, end to end", { id: "b-2", name: "Bash", input: { command: "cd api && go build ./... && go test ./..." } }, 12),
+  bm("tool_use", "coder", "toolu_01coder2", "rebuild the activity pane around per-instance lanes", { id: "b-3", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 10),
+  // A subagent frame with an instance but NO label: its lane titles as the bare role,
+  // no `·` suffix and no placeholder (the label-absent degradation).
+  bm("tool_use", "auditor", "toolu_01audit1", null, { id: "b-4", name: "Grep", input: { pattern: "CLAUDE_CODE_OAUTH_TOKEN", path: "agent/src" } }, 8),
+  bm("tool_use", "documenter", "toolu_01docs01", "docs: run activity page", { id: "b-5", name: "Edit", input: { file_path: "docs/run-activity.md" } }, 7),
+  bm("tool_use", "reviewer", "toolu_01review", "review the migration + wire threading", { id: "b-6", name: "Read", input: { file_path: "api/internal/store/migrations/00075_run_message_instance.sql" } }, 6),
+  // The doubled role. Y spoke recently (waiting), X is the newest speaker (working) —
+  // so the `tester ×2` chip rolls up as `waiting` while X's lane pulses.
+  bm("tool_use", "tester", "toolu_01testY", "unit: RunEvent", { id: "b-7", name: "Bash", input: { command: "npx vitest run src/components/RunEvent.test.tsx" } }, 0.4),
+  bm("tool_use", "tester", "toolu_01testX", "e2e: approval gate", { id: "b-8", name: "Bash", input: { command: "./e2e/run-e2e.sh" } }, 0.1),
+];
+
+export const mockLaneRuns: Run[] = [
+  demoIssueRun({
+    id: "run-lanes",
+    issue_iid: 99,
+    issue_title: "Two parallel coders (PRD #99 headline case)",
+    issue_description: "Demo run: two same-role subagent invocations that must not merge into one lane.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "ok",
+  }),
+  demoIssueRun({
+    id: "run-busy",
+    issue_iid: 99,
+    issue_title: "Busy crew: role rollup, doubled tester, clamped label",
+    issue_description: "Demo run: enough lanes and doubled roles to trigger the conditional role rollup.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "ok",
+  }),
+  // run-stalled — the SAME message stream as run-busy, differing only in run health.
+  // `stalled` is not a per-lane property: crewStateFor returns it only for the ACTIVE
+  // lane and only when the RUN's health is degraded, so the mockup's headline case
+  // ("the one stalled tester is the first thing you see") could not be browsed on any
+  // healthy fixture. Reusing run-busy's stream rather than authoring a third one keeps
+  // run-busy meaning exactly what its ordering tests say about it — the two runs differ
+  // by one field, so the rollup's stalled-first behaviour is visible as a DIFF against
+  // the run beside it rather than as a separate story.
+  demoIssueRun({
+    id: "run-stalled",
+    issue_iid: 99,
+    issue_title: "Busy crew, degraded: the stalled role sorts to the front",
+    issue_description: "Demo run: same stream as run-busy with a looping health flag, so the active tester lane reads stalled and its role chip leads the rollup.",
+    branch: "agent/issue-99",
+    status: "running",
+    health: "looping",
+    health_reason: "no new tool calls in the last few minutes",
+    health_since: minsAgo(3),
+  }),
+];
 
 export const mockCrewRuns: Run[] = [
   demoIssueRun({
@@ -1933,6 +2141,8 @@ function makeChatLog(entries: [kind: string, agent: string | null, payload: unkn
     seq: i + 1,
     kind,
     agent,
+    agent_instance: null,
+    agent_label: null,
     payload,
     created_at: minsAgo(6 - i * 0.5),
   }));

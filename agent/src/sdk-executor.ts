@@ -43,7 +43,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { assistantUsageOf, isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
+import { assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { errMessage } from "./util.js";
 
@@ -376,6 +376,9 @@ export class SdkExecutor implements Executor {
           // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
           // nonce-fenced cross-run memory back (empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: only set when a dropped resume left this turn amnesiac on a
+          // branch that already carries pushed work.
+          priorWork: ctx.priorWork,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -388,6 +391,8 @@ export class SdkExecutor implements Executor {
           // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
           // nonce-fenced cross-run memory back (empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: see above — the fixed self_improve branch's prior cycles.
+          priorWork: ctx.priorWork,
         });
       } else {
         planPrompt = buildPlanPrompt({
@@ -399,6 +404,8 @@ export class SdkExecutor implements Executor {
           // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
           // runner fetched it at claim time; empty/absent injects nothing).
           memory: ctx.memory,
+          // Issue #105: see above — prior pushed work on this issue's branch.
+          priorWork: ctx.priorWork,
         });
       }
       const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
@@ -615,6 +622,21 @@ export class SdkExecutor implements Executor {
         // usage. A frame whose messages are ALL filtered loses its usage (accepted).
         // Result-frame usage travels inside mapResult's payload instead, so it is
         // never re-attached here (assistantUsageOf is assistant-only, not results).
+        // PRD #99: alarm on a frame that carries an invocation id but no role
+        // field. Logged HERE rather than in the mapper because sdk-messages.ts is
+        // a pure module with no logger, and this is the only executor that can
+        // produce subagent frames at all (chat-executor and judge-runner both
+        // prevent the Agent tool — chat via disallowedTools, judge via a deny-all
+        // PreToolUse hook). The `kind` is the ONLY thing logged — no id, no label —
+        // so nothing new reaches `docker logs`, keeping the deliberate omission at
+        // batcher.ts's debug line intact.
+        const orphanKind = orphanInstanceKind(msg);
+        if (orphanKind !== undefined) {
+          this.log.warn("frame carried parent_tool_use_id without subagent_type", {
+            run_id: ctx.runId,
+            kind: orphanKind,
+          });
+        }
         const frameUsage = assistantUsageOf(msg);
         let usageAttached = false;
         for (const em of mapSdkMessage(msg)) {

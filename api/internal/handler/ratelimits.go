@@ -1,12 +1,11 @@
 package handler
 
 import (
-	"errors"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
@@ -20,52 +19,73 @@ import (
 
 const (
 	rateLimitStatusOK          = "ok"
-	rateLimitStatusNoToken     = "no_token"
 	rateLimitStatusUnavailable = "unavailable"
+	// rateLimitStatusNoToken is no longer produced by these handlers since #104 M5:
+	// "the user has no token" is now an EMPTY tokens array, not a status on a single
+	// reading, because there is no per-token reading to attach a status to when there
+	// is no token. The constant is retained because the CLI and the web client still
+	// render this string, and the frozen union (apitypes.RateLimitDTO) still admits it.
+	rateLimitStatusNoToken = "no_token"
 )
 
-// SelfRateLimits returns the caller's own two Claude rate-limit meters (PRD #53).
-// Session-authed, scoped to the caller. no_token is derived from secret-existence
-// (not the gauge row being absent), so a stale/failed row cleanup still reads as
-// no_token; a token with no reading yet (fresh save, probe disabled, refused
-// credential) reads as unavailable.
+var _ = rateLimitStatusNoToken // retained for the wire contract; see the const comment
+
+// SelfRateLimits returns the caller's Claude rate-limit meters, ONE PER TOKEN since
+// PRD #104 M5 (D4): a `{"tokens": [...]}` array replacing PRD #53's single reading —
+// a breaking response-shape change the web client, the CLI, and the e2e assertions
+// all move for in the same MR. Session-authed, scoped to the caller.
+//
+// Each element carries its credential's label + default flag (a name, never the
+// value) and the same status union as before: a token with a reading is `ok`, a
+// token with no reading yet (fresh save, probe disabled, refused credential) is
+// `unavailable`. A user with no tokens gets an empty array, which the client
+// renders as the old no_token state — there is no per-token status to report when
+// there is no token.
 func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	hasToken, err := h.q.UserHasAnthropicToken(r.Context(), user.ID)
+	rows, err := h.q.ListRateLimitsForUser(r.Context(), user.ID)
 	if err != nil {
-		slog.Error("rate limits: token existence", "error", err)
+		slog.Error("rate limits: list for user", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if !hasToken {
-		httpx.JSON(w, http.StatusOK, apitypes.RateLimitDTO{Status: rateLimitStatusNoToken})
-		return
+	tokens := make([]apitypes.TokenRateLimitDTO, 0, len(rows))
+	for _, row := range rows {
+		var limits apitypes.RateLimitDTO
+		if !row.SyncedAt.Valid {
+			// LEFT JOIN miss: the token exists but has no reading yet.
+			limits = apitypes.RateLimitDTO{Status: rateLimitStatusUnavailable}
+		} else {
+			limits = h.okRateLimitDTO(
+				row.FiveHourPct, row.FiveHourResetsAt,
+				row.SevenDayPct, row.SevenDayResetsAt,
+				row.Source, row.SyncedAt,
+			)
+		}
+		tokens = append(tokens, apitypes.TokenRateLimitDTO{
+			SecretID:  row.UserSecretID.String(),
+			Label:     row.Label,
+			IsDefault: row.IsDefault,
+			Limits:    limits,
+		})
 	}
-	row, err := h.q.GetRateLimits(r.Context(), user.ID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		httpx.JSON(w, http.StatusOK, apitypes.RateLimitDTO{Status: rateLimitStatusUnavailable})
-		return
-	}
-	if err != nil {
-		slog.Error("rate limits: get", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	httpx.JSON(w, http.StatusOK, h.okRateLimitDTO(
-		row.FiveHourPct, row.FiveHourResetsAt,
-		row.SevenDayPct, row.SevenDayResetsAt,
-		row.Source, row.SyncedAt,
-	))
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": tokens})
 }
 
-// AdminRateLimits returns every user's meters + staleness (PRD #53). Admin-only —
-// the route is under the RequireAdmin group (mirroring AdminUsage), so a non-admin
-// never reaches here (403). Each user carries their live vault lock state and the
-// same status union as /me; no_token users are included.
+// AdminRateLimits returns every user's meters + staleness (PRD #53), grouped BY USER
+// THEN BY TOKEN since #104 M5 (D4). Admin-only — the route is under the RequireAdmin
+// group (mirroring AdminUsage), so a non-admin never reaches here (403). Each user
+// carries their live vault lock state and one meter per token; a token-less user is
+// present with an empty tokens array.
+//
+// The query returns one row per (user, token) — and one row per token-less user with
+// a NULL user_secret_id — ordered by email, so consecutive rows for one user
+// collapse into a single AdminRateLimitRowDTO without a map (the ORDER BY is what
+// makes the fold correct rather than incidental).
 func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.q.ListRateLimits(r.Context())
 	if err != nil {
@@ -73,28 +93,40 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	users := make([]apitypes.AdminRateLimitRowDTO, 0, len(rows))
+	users := make([]apitypes.AdminRateLimitRowDTO, 0)
 	for _, u := range rows {
+		// A new user starts a new group. vaultUnlocked is looked up once per user, on
+		// the first row, not once per token.
+		if len(users) == 0 || users[len(users)-1].ID != u.UserID.String() {
+			users = append(users, apitypes.AdminRateLimitRowDTO{
+				ID:          u.UserID.String(),
+				Email:       u.Email,
+				Name:        u.DisplayName.String, // "" when the user has no display name
+				VaultLocked: !h.vaultUnlocked(u.UserID),
+				Tokens:      []apitypes.TokenRateLimitDTO{},
+			})
+		}
+		// A token-less user is a single row with a NULL secret id: no token to append,
+		// the empty Tokens array is the no_token signal.
+		if !u.UserSecretID.Valid {
+			continue
+		}
 		var limits apitypes.RateLimitDTO
-		switch {
-		case !u.HasToken:
-			limits = apitypes.RateLimitDTO{Status: rateLimitStatusNoToken}
-		case !u.SyncedAt.Valid:
-			// Token held but no gauge row yet (LEFT JOIN miss): no reading.
+		if !u.SyncedAt.Valid {
 			limits = apitypes.RateLimitDTO{Status: rateLimitStatusUnavailable}
-		default:
+		} else {
 			limits = h.okRateLimitDTO(
 				u.FiveHourPct, u.FiveHourResetsAt,
 				u.SevenDayPct, u.SevenDayResetsAt,
 				u.Source, u.SyncedAt,
 			)
 		}
-		users = append(users, apitypes.AdminRateLimitRowDTO{
-			ID:          u.UserID.String(),
-			Email:       u.Email,
-			Name:        u.DisplayName.String, // "" when the user has no display name
-			VaultLocked: !h.vaultUnlocked(u.UserID),
-			Limits:      limits,
+		grp := &users[len(users)-1]
+		grp.Tokens = append(grp.Tokens, apitypes.TokenRateLimitDTO{
+			SecretID:  uuid.UUID(u.UserSecretID.Bytes).String(),
+			Label:     u.Label.String,
+			IsDefault: u.IsDefault.Bool,
+			Limits:    limits,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"users": users})

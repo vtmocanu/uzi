@@ -80,7 +80,8 @@ uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all]
 uzi review resolve <id> <rec> | --category <c> --target <t>
 uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
-uzi worker list | rm <id>
+uzi token list
+uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
 uzi skill status | install [--force] | install-hook | uninstall-hook
@@ -94,6 +95,9 @@ A few worth knowing:
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
+- **`token` is list-only, and `worker set-token` is the one write near it.**
+  See [Anthropic tokens](#anthropic-tokens) below for why the split falls
+  exactly there.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
@@ -115,6 +119,41 @@ A few worth knowing:
   row, so `run inputs` against a chat run lists the whole conversation, not
   just steering messages; an issue or CI-fix run's queue starts empty and
   only ever holds what you actually sent mid-run.
+- **`run logs <id>` names the invocation, not just the role.** The actor
+  column reads `role[/<short id>][ · <task label>]`, so two `coder`
+  subagents running in parallel are distinguishable instead of being two
+  identical `coder` rows:
+
+  ```
+  #12   tool_use         coder/3v6ptu · API wiring          {"name":"Edit"}
+  #13   tool_use         coder/2k9xqf · web gate UX         {"name":"Write"}
+  #14   text             lead                               {"text":"delegating"}
+  ```
+
+  The short id is the **last** 6 characters of the invocation id, not the
+  first — these ids share a constant prefix, so a leading slice would render
+  every instance identically. A message with no invocation (the lead's own
+  turns, infra frames, and anything from before this shipped) prints the bare
+  role, with no `/id` and no `· label` — note the actor column itself is
+  wider than it used to be, so the payload column of *every* line has moved.
+  The cell is capped and the label truncated so the payload column stays
+  aligned (single-width characters — a CJK label still occupies two terminal
+  columns per rune, which this tool does not model).
+
+  `--json` carries the stored invocation id and label in full, with no
+  CLI-side truncation — but note the **server caps the label at 80 runes on
+  write, and appends no ellipsis**, so a longer label was already shortened
+  before the CLI ever saw it, with nothing in the value marking the cut. Both
+  fields are always present in `--json`, `null` when absent:
+
+  ```jsonc
+  {"seq":12,"kind":"tool_use","agent":"coder",
+   "agent_instance":"toolu_01AAAAAAAAAAAAAAAA3v6ptu","agent_label":"API wiring", ...}
+  ```
+
+  These two keys are the same per-invocation attribution the web pane draws
+  its lanes from — see
+  [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn).
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports
@@ -206,6 +245,45 @@ comes back `200`, `updated: 0` — the same answer a misspelt or already-settled
 coordinate gives. That indistinguishability is the point; a per-item outcome
 would rebuild exactly the existence oracle the 404-on-everything rule removes.
 Don't read `updated: 0` as an error, and don't read it as success either.
+
+## Anthropic tokens
+
+You can hold several named [Anthropic credentials](./anthropic-token.md) and
+point individual workers at them. The CLI can **read** that set and **move a
+worker between its members** — it cannot change the set itself:
+
+```sh
+uzi token list                                 # labels, default flag, timestamps
+uzi worker set-token <worker-id> console-key   # bind a worker to a named token
+uzi worker set-token <worker-id> --default     # clear the binding
+```
+
+`set-token` takes a **label** (the name from `token list`), not an id, and
+takes effect on that worker's next claim — no restart and no re-minted join
+token. Passing both a label and `--default`, or neither, is a usage error
+(exit 2) rather than a guess; an unknown label is refused rather than stored.
+A bound worker's **chat** runs still spend your default token: the binding
+covers the run lane only.
+
+**Adding, renaming, re-defaulting and deleting a token are web-only, and
+that is a security boundary rather than an unfinished feature.** A CLI token
+is a bearer credential — a stolen `uzc_` is meant to be able to read and to
+drive runs, but never to *replace the credentials it runs on*. If token
+writes were reachable over Bearer auth, an attacker holding a leaked `uzc_`
+could swap a user's Anthropic credential for their own and quietly redirect
+every future run's spend. That is exactly the escalation the split prevents,
+and it is the same reasoning that keeps `worker create` out of the CLI.
+`set-token` sits on the allowed side because it mints nothing and hands back
+no credential: it re-points a worker between tokens the caller already owns.
+
+**Driving the API directly?** The old kind-path routes still work as
+deprecated aliases over your *default* token: `PUT
+/api/me/secrets/anthropic_token` rotates-or-creates it, and `DELETE
+/api/me/secrets/anthropic_token` removes it. The DELETE alias now answers
+**409** once you hold more than one token, because "delete the anthropic
+token" stopped naming one row — delete by id instead
+(`DELETE /api/me/secrets/anthropic_token/{id}`). All of these are cookie-only,
+for the reason above.
 
 ## Agents: `--json` and exit codes
 

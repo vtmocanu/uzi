@@ -621,7 +621,7 @@ func TestServeWSDeliversLiveEventsToOwner(t *testing.T) {
 			case <-stop:
 				return
 			case <-tick.C:
-				h.hub.PublishMessage(runID, 1, "text", "coder", json.RawMessage(`{"x":1}`), time.Now())
+				h.hub.PublishMessage(runID, 1, "text", "coder", "", "", json.RawMessage(`{"x":1}`), time.Now())
 			}
 		}
 	}()

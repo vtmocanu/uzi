@@ -115,7 +115,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	out := make([]apitypes.AdminWorkerDTO, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, apitypes.AdminWorkerDTO{
-			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy),
+			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, ""),
 			OwnerEmail: row.OwnerEmail,
 		})
 	}

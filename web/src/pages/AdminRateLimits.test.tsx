@@ -28,8 +28,20 @@ function ok(pct5: number, pct7: number, over: Partial<Extract<MyRateLimits, { st
     ...over,
   };
 }
+// One reading per TOKEN since PRD #104 M5; these tests exercise a user's single
+// credential, so row() wraps it as their default and a "no_token" reading becomes
+// the empty list the API sends for a token-less user.
 function row(name: string, limits: MyRateLimits, vault_locked = false): AdminRateLimitUser {
-  return { id: name, name, email: `${name}@example.com`, vault_locked, limits };
+  return {
+    id: name,
+    name,
+    email: `${name}@example.com`,
+    vault_locked,
+    tokens:
+      limits.status === "no_token"
+        ? []
+        : [{ secret_id: `sec-${name}`, label: "default", is_default: true, limits }],
+  };
 }
 
 const USERS = [
@@ -81,7 +93,9 @@ describe("AdminRateLimits", () => {
     expect(within(mihai).getByText("31%")).toBeTruthy(); // pct still shown, just dimmed
 
     const irina = screen.getByText("irina").closest("tr")!;
-    // no_token → em-dashes in both window cells and the Updated cell.
-    expect(within(irina).getAllByText("—").length).toBe(3);
+    // no_token → em-dashes in the token cell, both window cells, and Updated.
+    // (Four since PRD #104 added the Token column; the badge keeps its own cell so
+    // the row stays aligned with the live ones.)
+    expect(within(irina).getAllByText("—").length).toBe(4);
   });
 });

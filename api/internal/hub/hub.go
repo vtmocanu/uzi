@@ -30,13 +30,19 @@ const subBuffer = 256
 // (PRD #95) — for all three the client re-reads over REST, since WS never carries
 // authoritative run state.
 type Event struct {
-	Type      string          `json:"type"` // "message" | "state" | "health" | "input"
-	Seq       int32           `json:"seq,omitempty"`
-	Kind      string          `json:"kind,omitempty"`
-	Agent     *string         `json:"agent,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
-	CreatedAt *time.Time      `json:"created_at,omitempty"`
-	Status    string          `json:"status,omitempty"` // set on "state" frames
+	Type  string  `json:"type"` // "message" | "state" | "health" | "input"
+	Seq   int32   `json:"seq,omitempty"`
+	Kind  string  `json:"kind,omitempty"`
+	Agent *string `json:"agent,omitempty"`
+	// AgentInstance/AgentLabel are the PRD #99 subagent invocation id + task
+	// label. The browser lanes a live frame off these without a REST re-read, so
+	// they must ride the frame exactly as Agent does. Absent when the frame
+	// carried no parent_tool_use_id (which is NOT the same as Agent == "lead").
+	AgentInstance *string         `json:"agent_instance,omitempty"`
+	AgentLabel    *string         `json:"agent_label,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+	CreatedAt     *time.Time      `json:"created_at,omitempty"`
+	Status        string          `json:"status,omitempty"` // set on "state" frames
 }
 
 // Subscription is one browser's view of a single run's live events.
@@ -97,10 +103,16 @@ func (h *Hub) unsubscribe(s *Subscription) {
 
 // PublishMessage forwards a persisted run message to a run's subscribers. It
 // satisfies the workersvc broadcaster contract.
-func (h *Hub) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time) {
+func (h *Hub) PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time) {
 	ev := Event{Type: "message", Seq: seq, Kind: kind, Payload: json.RawMessage(payload), CreatedAt: &createdAt}
 	if agent != "" {
 		ev.Agent = &agent
+	}
+	if agentInstance != "" {
+		ev.AgentInstance = &agentInstance
+	}
+	if agentLabel != "" {
+		ev.AgentLabel = &agentLabel
 	}
 	h.broadcast(runID, ev)
 }

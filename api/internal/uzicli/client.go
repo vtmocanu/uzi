@@ -41,6 +41,11 @@ type Client interface {
 	// *ExitError{ExitNotFound}, never another user's steer text.
 	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
 	ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error)
+	// ListSecrets returns the caller's Anthropic tokens as metadata (labels, ids,
+	// default flags — never values): GET /api/me/secrets, RequireUser (PRD #104 D8,
+	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
+	// entry's value appears nowhere — there is no reveal endpoint.
+	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
@@ -70,6 +75,15 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
 	// there is no create counterpart here.
 	DeleteWorker(ctx context.Context, id string) error
+	// SetWorkerToken points a worker at one of the caller's named Anthropic tokens,
+	// or clears the binding when label is "" so the worker falls back to the
+	// caller's default: PATCH /api/workers/{id} {anthropic_token}. It takes a LABEL,
+	// the name a human knows, not a secret id. Unlike minting a worker this yields
+	// no credential the caller lacks, so it is RequireUser and reachable from a CLI
+	// token (PRD #104 D8). An unknown label is a 400 (exit 3); an unknown/foreign
+	// worker is a 404 (exit 4). The change lands on the worker's next claim — no
+	// restart, no re-minted join token.
+	SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error)
 	// ListMemory returns the caller's agent memory across all repos (PRD #90):
 	// GET /api/me/memory. Each entry carries its repo + provenance so the owner can
 	// see what a future run would read back.
@@ -291,6 +305,17 @@ func (c *HTTPClient) put(ctx context.Context, path string, reqBody, out any) err
 	return decode2xx(resp, body, path, out)
 }
 
+// patch executes a PATCH with a JSON body and, on a 2xx, decodes the reply into
+// out. Mirrors put with http.MethodPatch — PATCH is the verb for a partial update
+// whose absent fields mean "leave alone" (PRD #104 M3's worker rebind).
+func (c *HTTPClient) patch(ctx context.Context, path string, reqBody, out any) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodPatch, path, reqBody)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, out)
+}
+
 // del executes a DELETE and treats any 2xx (the endpoint answers 204) as success,
 // discarding the (empty) body. Non-2xx maps to the documented exit code.
 func (c *HTTPClient) del(ctx context.Context, path string) error {
@@ -457,8 +482,37 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 	return env.Workers, nil
 }
 
+func (c *HTTPClient) ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error) {
+	var env struct {
+		Secrets []apitypes.SecretDTO `json:"secrets"`
+	}
+	if err := c.get(ctx, "/api/me/secrets", &env); err != nil {
+		return nil, err
+	}
+	return env.Secrets, nil
+}
+
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
+}
+
+func (c *HTTPClient) SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error) {
+	// An empty label sends JSON null, which is what clears the binding — distinct
+	// from omitting the field, which would mean "leave it alone". *string is what
+	// makes the two expressible on the wire.
+	body := struct {
+		AnthropicToken *string `json:"anthropic_token"`
+	}{}
+	if label != "" {
+		body.AnthropicToken = &label
+	}
+	var env struct {
+		Worker apitypes.WorkerDTO `json:"worker"`
+	}
+	if err := c.patch(ctx, "/api/workers/"+url.PathEscape(id), body, &env); err != nil {
+		return apitypes.WorkerDTO{}, err
+	}
+	return env.Worker, nil
 }
 
 func (c *HTTPClient) ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO, error) {

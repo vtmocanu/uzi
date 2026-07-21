@@ -137,6 +137,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newRunCmd(env, gf),
 		newReviewCmd(env, gf),
 		newWorkerCmd(env, gf),
+		newTokenCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newRepoCmd(env, gf),
 		newAdminCmd(env, gf),

@@ -44,6 +44,30 @@ const RegistrationLockKey int64 = 0x757A69 // "uzi"
 //     path to forget and no way to leak it by returning early.
 const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
 
+// SecretMutationLockClass is the class half of the advisory lock that serializes
+// one user's anthropic-token mutations — create, set-default, delete (PRD #104 M2,
+// D12). Taken as pg_advisory_xact_lock(SecretMutationLockClass, objid(user_id)) as
+// the first statement of every mutating transaction.
+//
+// It exists because the "exactly one default while any token exists" invariant is
+// not schema-enforceable and three races break it under READ COMMITTED (D12): two
+// concurrent first-token creates both claiming default; a delete-default that
+// passes its "no other tokens" check while a second token is being inserted
+// (leaving tokens with no default); and set-default, a two-statement clear-then-set
+// swap. The PRD suggests `SELECT ... FOR UPDATE`, but that is INSUFFICIENT for the
+// create-vs-delete race: FOR UPDATE locks existing rows, so it cannot block a
+// concurrent INSERT of a NEW row, and it locks nothing at all when the set is empty
+// (the first-token case). An advisory lock is a mutex over the whole (user, kind)
+// key, so it serializes create against delete against set-default regardless of
+// which rows exist — the same reasoning HostedProvisionLockClass records for the
+// quota count.
+//
+// Disjoint from the other two lock spaces: the two-int space differs from
+// RegistrationLockKey's one-bigint space, and this class differs from
+// HostedProvisionLockClass, so none can collide. XACT-scoped: released on commit or
+// rollback, no unlock to forget.
+const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

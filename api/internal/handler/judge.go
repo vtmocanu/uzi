@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,19 @@ import (
 
 type setJudgeRequest struct {
 	Enabled bool `json:"enabled"`
+	// AnthropicToken is the LABEL of the credential this user's retrospectives should
+	// spend (PRD #104 M4, D1). Three-way — omitted leaves the binding alone, null or
+	// "" clears it back to the user's default, a label binds it — which is why it is
+	// a json.RawMessage and not a *string: a nil *string cannot tell "clear" from
+	// "don't touch", and every pre-M4 client sends {"enabled":true} with no token
+	// key at all. Collapsing those two would make enabling the judge silently unbind
+	// the user's judge credential. See parseTokenField.
+	//
+	// This EXTENDS the existing enabled-only body; it does not assume PRD #69's
+	// per-user judge-model surface, which is still Draft. judge_model remains a
+	// GLOBAL admin setting (settings.KeyJudgeModel) — if #69 lands, the two per-user
+	// judge settings merge there rather than here.
+	AnthropicToken json.RawMessage `json:"anthropic_token"`
 }
 
 // SetJudgeEnabled flips the CURRENT user's run-judge opt-in (PRD #46 Decision 7).
@@ -45,7 +59,54 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(updated)})
+
+	// The token binding is a SEPARATE statement, and only runs when the field was
+	// present: an absent anthropic_token must leave an existing binding alone, or
+	// every existing client that PUTs {"enabled":true} would silently unbind the
+	// user's judge credential. The two writes are not transactional, and deliberately
+	// not: they are independent settings, and the worst a half-applied pair does is
+	// leave the opt-in flipped without the rebind, which the user can see and redo.
+	token, ok := parseTokenField(req.AnthropicToken)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
+		return
+	}
+	if token.present {
+		var secretID *uuid.UUID
+		if l := token.label; l != "" {
+			resolved, rerr := h.wsvc.ResolveTokenLabel(r.Context(), user.ID, l)
+			if rerr != nil {
+				if errors.Is(rerr, workersvc.ErrUnknownSecretLabel) {
+					httpx.Error(w, http.StatusBadRequest, "no Anthropic token with that label")
+					return
+				}
+				slog.Error("resolve judge token label", "error", rerr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			secretID = &resolved
+		}
+		bound, berr := h.wsvc.SetUserJudgeToken(r.Context(), user.ID, secretID)
+		if berr != nil {
+			if errors.Is(berr, workersvc.ErrSecretNotOwned) {
+				// 404, not 403: a 403 would confirm the id names a real credential
+				// belonging to someone else.
+				httpx.Error(w, http.StatusNotFound, "anthropic token not found")
+				return
+			}
+			slog.Error("set judge anthropic token", "error", berr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		updated = bound
+	}
+
+	dto := toDTO(updated)
+	if token.label != "" {
+		l := token.label
+		dto.JudgeAnthropicSecretLabel = &l
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"user": dto})
 }
 
 // SetUserJudgeEnabled is the admin per-user toggle (PRD #46 Decision 7): it
@@ -54,6 +115,13 @@ func (h *Handler) SetJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 // taken from the path, never the body, and is a distinct user id from the actor's.
 // It sets the flag on the target user's OWN account, so the judge still only ever
 // spends that user's tokens — an admin cannot redirect the spend elsewhere.
+//
+// It shares setJudgeRequest with the self-service route but deliberately IGNORES
+// anthropic_token (PRD #104 M4): "an admin cannot redirect the spend elsewhere" is
+// the property above, and honoring a binding here would let an admin choose WHICH of
+// a user's credentials burns — a narrower version of the same thing. An admin who
+// needs that asks the user. The field being silently ignored is safe precisely
+// because the only reachable effect would be the one we are refusing.
 func (h *Handler) SetUserJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {

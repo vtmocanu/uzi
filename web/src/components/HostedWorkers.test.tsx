@@ -40,6 +40,8 @@ const provisioned: Worker = {
   stats_mem_bytes: null,
   stats_mem_limit_bytes: null,
   stats_source: null,
+  anthropic_secret_id: null,
+  anthropic_secret_label: null,
 };
 
 function renderCard(hostedCount = 0, onProvisioned = vi.fn()) {

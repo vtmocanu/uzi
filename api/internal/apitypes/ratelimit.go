@@ -22,13 +22,27 @@ type RateLimitDTO struct {
 	Stale    *bool            `json:"stale,omitempty"`
 }
 
+// TokenRateLimitDTO is one TOKEN's meter (PRD #104 M5, D4): the credential's label
+// and default flag — a name, never the value — plus the same status union PRD #53
+// froze. secret_id lets a client key a rebind or a delete off the row; label is what
+// it renders. This is the element GET /api/me/rate-limits now returns an ARRAY of,
+// replacing the single reading — a breaking response-shape change the web client,
+// the CLI, and the e2e assertions all move for in the same MR.
+type TokenRateLimitDTO struct {
+	SecretID  string       `json:"secret_id"`
+	Label     string       `json:"label"`
+	IsDefault bool         `json:"is_default"`
+	Limits    RateLimitDTO `json:"limits"`
+}
+
 // AdminRateLimitRowDTO is one user's row on the admin view: identity + the live
-// vault lock state + the same union as /me. Every user appears, including
-// no_token ones.
+// vault lock state + one meter PER TOKEN (PRD #104 M5, D4 — the admin view groups by
+// user then token). Every user appears, including token-less ones, whose Tokens is
+// empty and whose status the client renders as no_token.
 type AdminRateLimitRowDTO struct {
-	ID          string       `json:"id"`
-	Email       string       `json:"email"`
-	Name        string       `json:"name"`
-	VaultLocked bool         `json:"vault_locked"`
-	Limits      RateLimitDTO `json:"limits"`
+	ID          string              `json:"id"`
+	Email       string              `json:"email"`
+	Name        string              `json:"name"`
+	VaultLocked bool                `json:"vault_locked"`
+	Tokens      []TokenRateLimitDTO `json:"tokens"`
 }

@@ -18,6 +18,7 @@ import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-e
 import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { errMessage } from "./util.js";
 
 /** Cap on a reported failure_reason (matches RunRunner / the GitLab error cap). */
@@ -52,6 +53,22 @@ export interface ChatRunnerOptions {
    * user_message emission and the turn/idle/cancel flow are provable without HTTP.
    */
   makeSource?: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
+  /**
+   * The SDK HOME the chat executor runs under, so a Continue can check whether the
+   * session it was handed is actually resolvable on THIS worker (issue #105). The check
+   * globs this HOME's project dirs (sdk-session.ts) rather than computing the one the
+   * cwd encodes to, so only the HOME is needed here, not the cwd: every chat session
+   * runs under the same baked-source cwd, so the shared chat HOME holds exactly one
+   * project dir.
+   *
+   * Chat shares one HOME across sessions by design (main.ts) — a Continue is a new run
+   * id resuming the same session, so a per-run HOME would file the transcript under the
+   * new id and break resume outright.
+   *
+   * Absent ⇒ no preflight. main.ts omits it for the stub executor, which persists no
+   * real SDK session, so the e2e's report → resume_of → Continue flow is unaffected.
+   */
+  sdkHomeDir?: string;
 }
 
 /**
@@ -61,6 +78,7 @@ export interface ChatRunnerOptions {
  */
 export class ChatRunner {
   private readonly makeSource: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
+  private readonly sdkHomeDir?: string;
 
   constructor(
     private readonly client: WorkerClient,
@@ -78,6 +96,7 @@ export class ChatRunner {
     this.makeSource =
       opts.makeSource ??
       ((runId, cancel, runLog) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel));
+    this.sdkHomeDir = opts.sdkHomeDir;
   }
 
   /**
@@ -102,7 +121,11 @@ export class ChatRunner {
     const secrets = [claim.secrets.anthropic_oauth_token, this.joinToken];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
+    // redactText also covers the PRD #99 top-level agent_label/agent_instance the
+    // batcher carries beside the payload. A chat run never spawns a subagent
+    // (NESTED_AGENT_TOOL is disallowed), so those fields stay absent here — the
+    // redactor is wired anyway so the two runner paths cannot drift.
+    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText);
 
     // A `cancel` (End chat) input, or worker shutdown, aborts the whole conversation.
     // This SAME controller is the steering channel's cancel AND the executor's
@@ -135,21 +158,55 @@ export class ChatRunner {
     const turnTimeoutMs = secondsToMs(claim.config.turn_timeout_seconds) ?? this.defaults.turnTimeoutMs;
     const idleTimeoutMs = secondsToMs(claim.config.idle_timeout_seconds) ?? this.defaults.idleTimeoutMs;
 
+    // Resume preflight (issue #105) — see the Decision 11 block below for why the
+    // TRANSCRIPT, not the id, is the honest signal. Done before the first state report
+    // so a dropped session id is never carried back to the server as this run's resume
+    // target; the feed message it warrants is emitted in that block.
+    let sessionId = claim.session_id ?? undefined;
+    let resumeDropped = false;
+    if (sessionId && this.sdkHomeDir && !(await sessionTranscriptResolvable(this.sdkHomeDir, sessionId, runLog))) {
+      runLog.warn("chat resume session transcript is not on this worker; continuing without it");
+      sessionId = undefined;
+      resumeDropped = true;
+    }
+
     // Last SDK session id observed, carried on every state report so resume survives
-    // a lost report (§51, same as RunRunner). Seeded from the claim so a resumed/
-    // continued chat reports its resume target even before the first turn.
-    let observedSessionId = claim.session_id ?? undefined;
+    // a lost report (§51, same as RunRunner). Seeded from the (preflighted) claim so a
+    // resumed/continued chat reports its resume target even before the first turn.
+    let observedSessionId = sessionId;
     const reportState = (body: StateRequest): Promise<void> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
 
     try {
-      runLog.info("chat claimed", { resume_of: claim.resume_of_run_id ?? null, session: claim.session_id ?? null });
+      runLog.info("chat claimed", {
+        resume_of: claim.resume_of_run_id ?? null,
+        session: claim.session_id ?? null,
+        resume_dropped: resumeDropped,
+      });
       await reportState({ status: "running" });
       source.start();
 
       // Decision 11: a Continue whose prior session is not on this worker's disk
       // resumes without context — say so honestly instead of pretending.
-      if (claim.resume_of_run_id && !claim.session_id) {
+      //
+      // This USED to test `resume_of_run_id && !claim.session_id`, and that condition
+      // could not detect the case the comment describes (issue #105). The server copies
+      // the prior run's session id onto a Continue unconditionally
+      // (GetChatRunClaimContext, api/internal/store/queries/chat.sql) and ClaimChatRun
+      // hands the run to any of the user's workers once the affinity grace lapses — so
+      // on a cross-worker Continue the id IS present, this stayed silent, and the id
+      // pointed at a transcript on another machine. The SDK resolves a resume locally,
+      // so every turn then died with `error_during_execution` and, because an errored
+      // chat turn parks for the next message instead of ending, the conversation was
+      // bricked for good. "Session id absent" is only ever the case where the prior run
+      // never persisted one at all.
+      //
+      // So the honest signal is the TRANSCRIPT, not the id: the preflight above drops an
+      // unresolvable resume so the chat continues context-free (and says so here)
+      // instead of failing forever. `resumeDropped` covers the cross-worker Continue;
+      // the original `!sessionId` arm still covers a prior run that never persisted a
+      // session at all. No preflight without a HOME to look in (the stub, e2e).
+      if ((claim.resume_of_run_id && !sessionId) || resumeDropped) {
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -160,7 +217,9 @@ export class ChatRunner {
       const ctx: ChatContext = {
         runId,
         oauthToken: claim.secrets.anthropic_oauth_token,
-        sessionId: claim.session_id,
+        // Preflighted above: the claim's id, or undefined when its transcript is not
+        // on this worker (issue #105).
+        sessionId,
         emit: (m) => batcher.emit(m),
         onSessionId: (sessionId) => {
           observedSessionId = sessionId;

@@ -35,13 +35,16 @@ var (
 	ErrVaultLocked = errors.New("secretopen: vault locked")
 )
 
-// Store is the narrow query surface Open needs. *store.Queries satisfies it, as
-// does workersvc's own Store interface (both carry GetUserSecretCiphertext).
+// Store is the narrow query surface Open and OpenByID need. *store.Queries
+// satisfies it, as does workersvc's own Store interface.
 type Store interface {
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
+	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
 }
 
-// Open returns the decrypted plaintext of the user's secret of the given kind.
+// Open returns the decrypted plaintext of the user's DEFAULT secret of the given
+// kind (PRD #104 D14 — with several secrets of a kind possible, by-kind resolution
+// means the default; the partial unique index makes at most one row match).
 // vlt is the concrete *vault.Vault (nil in tests → open under box directly, the
 // pre-vault behavior); passing the concrete type keeps the nil check honest (a
 // typed-nil interface would not be nil). box opens legacy master-sealed rows and
@@ -58,6 +61,37 @@ func Open(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, us
 		return nil, fmt.Errorf("secretopen: lookup: %w", err)
 	}
 	return OpenSealed(vlt, box, userID, kind, secret.SealedWith, secret.Ciphertext)
+}
+
+// OpenByID returns the decrypted plaintext of ONE specific secret of the user's,
+// named by identity rather than by kind — the primitive a bound worker (M3) or a
+// bound judge lane (M4) resolves through. Same sentinels and the same vault
+// dispatch as Open, so callers map one set of errors either way.
+//
+// A secret id that does not belong to userID is ErrNoSecret, never that other
+// user's credential: the query is owner-scoped AND the returned owner is
+// re-checked here. Both are deliberate (PRD #104 D11) and neither is the primary
+// defense — M3's composite FK is what makes a cross-user binding unrepresentable.
+// This is the layer that holds if a handler check is ever bypassed, and the check
+// below is the layer that holds if the query is ever edited to drop its scope.
+//
+// The row's OWN kind feeds the vault dispatch: the DEK AAD is user_id||kind, so a
+// caller-supplied kind could only ever be a guess that fails GCM authentication.
+func OpenByID(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, userID, secretID uuid.UUID) ([]byte, error) {
+	row, err := q.GetUserSecretCiphertextByID(ctx, store.GetUserSecretCiphertextByIDParams{
+		ID:     secretID,
+		UserID: userID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNoSecret
+		}
+		return nil, fmt.Errorf("secretopen: lookup by id: %w", err)
+	}
+	if row.UserID != userID {
+		return nil, ErrNoSecret
+	}
+	return OpenSealed(vlt, box, userID, row.Kind, row.SealedWith, row.Ciphertext)
 }
 
 // OpenSealed decrypts an already-fetched sealed row, without a DB lookup — the

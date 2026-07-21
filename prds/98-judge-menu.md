@@ -15,44 +15,22 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    0 divergences found, but the demo fixture cannot reach the two riskiest behaviours — see
    Remaining work), and `OccurrenceFileIssue` has no tests. `specs/ai.md` already carries M5's
    correction; the rest of its judge section has not been reviewed against the shipped code.
-2. 🔴 **BLOCKING — the migration is a DUPLICATE VERSION, not merely a low one.** Verified
-   2026-07-21 against a fresh fetch: `origin/main` already holds a **different**
-   `00075_run_message_instance.sql`, landed by someone else, while ours is
-   `00075_judge_issue_close_sync.sql`. `comm` against `origin/main` shows exactly one
-   migration is ours. Two failure modes stack — strict goose with no `allow-missing` refuses
-   to boot on a version below the applied head, and a duplicate version is its own problem
-   before that. This was described in passing as a renumbering chore; it is not one, and it
-   was found by running the check rather than inheriting the framing.
-   ⚠️ **`00076` IS ABSENT FROM `main` — there is a GAP between `00075` and `00077`. DO NOT
-   FILL IT.** A free number *below* the applied head is exactly the boot-refusing case, and
-   the gap is what makes it look available. Stated because it is the trap a careful person
-   walks into while trying to be tidy.
-   ⚠️ **RE-DERIVE THE NUMBER IMMEDIATELY BEFORE THE MR. DO NOT INHERIT ONE FROM THIS FILE.**
-   The head measured at the time of writing was `00080`, making the answer `00081` — and that
-   is already an expiring claim; `main` moved twice on the day it was measured, and `00076`
-   went from "free" to "trap" the same morning. Thirty seconds:
-   `git fetch origin && git ls-tree --name-only origin/main api/internal/store/migrations/ | sort | tail -3`.
-   This instruction is itself an instance of the expiry rule in `.claude/agent-team.md`, and
-   it has already expired once.
-   ⚠️ **RENAMING THE FILE IS NOT THE WHOLE JOB — but a tree-wide replace is WORSE than not
-   sweeping.** The instruction "grep `00075` afterwards, the number is referenced elsewhere"
-   is right in principle; its stated premise is **false at HEAD**, and following it naively
-   corrupts records. Measured 2026-07-21, `rg -n "00075|judge_issue_close_sync"`:
-   - **`api/`, `specs/`, `docs/`, `e2e/`, `deploy/`: ZERO hits.** No code comment and no spec
-     line references this migration by number. The claim that they do was relayed, not
-     measured.
-   - **Exactly ONE reference to renumber**, besides the file itself: this PRD's M6 milestone
-     entry, which says "(migration `00075`, draft number — renumber on the landing rebase)".
-   - **Four hits belong to OTHER PRDs and MUST NOT BE TOUCHED** — `adr/0042`,
-     `prds/done/42-worker-run-concurrency.md` (3×), `prds/done/46-…`, `prds/done/49-…`. They
-     are historical draft numbers, and two of them correctly read "draft `00075` … **landed
-     as `00055`**". A blind `sed 00075→00081` across the tree rewrites four accurate
-     historical records into false ones, which is a worse outcome than a stale reference.
-   So: rename the file, update the M6 entry and the entry above, and **leave every
-   `prds/done/` and `adr/` hit alone**. Re-run the grep at landing rather than trusting this
-   list — it is a claim about a tree that will have moved.
-   After renumbering: `sqlc generate` (zero-diff check), then re-run the full api gate **on
-   the merged tip**, not the pre-merge one.
+2. ✅ **DONE at the landing merge (2026-07-21) — the migration is `00081_judge_issue_close_sync.sql`.**
+   It was `00075`, which by then was **TAKEN on `origin/main` by a different migration**
+   (`00075_run_message_instance.sql`) — a duplicate version, not merely a low one, so two
+   failure modes stacked: strict goose with no `allow-missing` refuses to boot below the
+   applied head, and a duplicate version is its own problem before that. It was described in
+   passing as a renumbering chore; running the check rather than inheriting that framing is
+   what found it.
+   **Re-derived immediately before merging, not inherited:** `origin/main` @ `6080e12b`, head
+   `00080`, derived 2026-07-21T13:59Z — so `00081`. `00076` was left alone: it is a gap on
+   `main` and a free number *below* the applied head is exactly the boot-refusing case.
+   **The reference sweep was re-run on the MERGED tree and the earlier measurement held:**
+   exactly one reference to renumber besides the file itself (M6's draft-number note below).
+   The merge added six further `00075` hits — `runtime.sql.go`, `queries/runtime.sql`,
+   `run_message_instance_integration_test.go`, `specs/ai.md` ×2, `mocks/data.ts` — every one
+   of them naming **main's** `00075`, plus four `prds/done/` + `adr/` hits that are other
+   PRDs' historical drafts. A tree-wide `sed 00075→00081` would have corrupted all ten.
 3. **Merge `origin/main`**, then re-run the three gates (api, web, `./e2e/run-store-it.sh`)
    before the MR. The live sweep needs its positive control checked, not just its exit code.
 4. **Then the MR**, after a review pass.
@@ -811,7 +789,8 @@ exactly as #68 already does.
       link. And `judge_notify_test.go` asserted the old `/runs/` URL; it was found by the
       suite, not by a grep for `reviewDeepLink`, because it pins the literal string.
 - [x] **M6 — Filed→Done sync (api/poller) — the migration** — DONE `d6a8545c`
-      (migration `00075`, draft number — renumber on the landing rebase); review wave
+      (migration **landed as `00081`**; drafted as `00075`, renumbered at the landing merge
+      on 2026-07-21 — `00075` was by then TAKEN on `main` by a different migration); review wave
       dispatched.: add `set_via` on
       `recommendation_dispositions` + `close_synced_at` on
       `recommendation_filed_issues` (draft number above the live head, renumber at

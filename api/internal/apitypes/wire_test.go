@@ -46,7 +46,11 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "judge_enabled", "created_at", "last_login")
+		"autopilot_enabled", "judge_enabled",
+		// PRD #104 M4: which credential this user's retrospectives spend. Both null
+		// ⇒ their default. The label, never the token value.
+		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
+		"created_at", "last_login")
 }
 
 func TestRepoAgentTags(t *testing.T) {
@@ -92,7 +96,11 @@ func TestRunListItemDTOTags(t *testing.T) {
 }
 
 func TestMessageDTOTags(t *testing.T) {
-	assertTags(t, "MessageDTO", MessageDTO{}, "seq", "kind", "agent", "payload", "created_at")
+	// agent_instance/agent_label (PRD #99) are NOT omitempty: like agent, the keys
+	// are always on the wire and carry JSON null when absent, so a consumer can
+	// read them unconditionally and fall back on null.
+	assertTags(t, "MessageDTO", MessageDTO{},
+		"seq", "kind", "agent", "agent_instance", "agent_label", "payload", "created_at")
 }
 
 func TestRunInputTags(t *testing.T) {
@@ -268,6 +276,14 @@ func TestReviewNullEnvelope(t *testing.T) {
 	}
 }
 
+func TestSecretDTOTags(t *testing.T) {
+	// PRD #104 M2: the token-list element. It MUST NOT carry any value/ciphertext
+	// field — the pin is here so a future field addition that leaks the secret trips
+	// this test.
+	assertTags(t, "SecretDTO", SecretDTO{},
+		"id", "kind", "label", "is_default", "created_at", "updated_at")
+}
+
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
@@ -286,6 +302,10 @@ var workerDTOKeys = []string{
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
 	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
+	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
+	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
+	// this DTO is the shape the web UI and the CLI both read.
+	"anthropic_secret_id", "anthropic_secret_label",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -335,9 +355,14 @@ func TestRateLimitDTOTags(t *testing.T) {
 		"status", "five_hour", "seven_day", "source", "synced_at", "stale")
 }
 
+func TestTokenRateLimitDTOTags(t *testing.T) {
+	assertTags(t, "TokenRateLimitDTO", TokenRateLimitDTO{},
+		"secret_id", "label", "is_default", "limits")
+}
+
 func TestAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "AdminRateLimitRowDTO", AdminRateLimitRowDTO{},
-		"id", "email", "name", "vault_locked", "limits")
+		"id", "email", "name", "vault_locked", "tokens")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: exactly {title, body}

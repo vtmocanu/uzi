@@ -50,6 +50,30 @@ type knownInstruction struct {
 
 var knownInstructions = []knownInstruction{
 	{
+		command: "uzi worker set-token",
+		// NOT PRD #98's command — it arrived from PRD #104 on the landing merge (2026-07-21),
+		// and this entry exists because the backstop did exactly what it was built to do:
+		// failed the build on the FOURTH instruction, the one nobody had written yet, at the
+		// moment it entered the tree rather than at review time. It came from another PRD,
+		// which is a better outcome than the one designed for, not a worse one.
+		//
+		// HONEST STATUS: NOT EXECUTED AS A LITERAL INSTRUCTION. Registered per this file's own
+		// rule that a stated gap beats an invisible one. What IS covered, verified rather than
+		// assumed: `worker set-token <id> <label>` and `--default` are both driven through the
+		// real cobra parse into a fake client in worker_test.go:56-82, which asserts the
+		// (id, label) pair reaching SetWorkerToken and that the output names the token. So the
+		// argv shape this string tells the user to type is pinned.
+		// What is NOT: nobody has run this string verbatim against a booted API and asserted
+		// the worker's binding actually moved. That is PRD #104's to close, not this MR's —
+		// registering it here without saying so would be the precise lie the registry exists
+		// to prevent.
+		note: "Printed in `uzi token`'s Long help (token.go). Argv shape executed through the real " +
+			"parse against a fake client (worker_test.go:56-82: id+label and --default, both " +
+			"asserting the pair reaching SetWorkerToken). NOT yet executed against a booted API — " +
+			"no test asserts the binding moved. Arrived from PRD #104 at the landing merge; " +
+			"closing the gap belongs to that PRD.",
+	},
+	{
 		command: "uzi review undo",
 		note: "Printed per settled member by runGroupDisposition. Executed: the (run, rec) pair is " +
 			"fed straight to DeleteDisposition in TestBulkDispositionSettledIsAWorkingUndoAddressLiveDB " +

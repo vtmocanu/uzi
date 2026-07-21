@@ -44,9 +44,18 @@ const staleReading: MyRateLimits = {
   stale: true,
 };
 
+// Since PRD #104 M5 the endpoint returns ONE READING PER TOKEN. These tests are
+// about how a single reading renders, so tokens() wraps one as the user's default
+// — the multi-token rendering has its own tests below.
+function tokens(limits: MyRateLimits) {
+  return { tokens: [{ secret_id: "sec-1", label: "default", is_default: true, limits }] };
+}
+// A token-less user is an EMPTY list, not a no_token status.
+const noTokens = { tokens: [] };
+
 describe("RateLimitCard (Settings)", () => {
   it("renders the two live meters and a Live badge on an ok reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("8%")).toBeTruthy();
@@ -57,7 +66,7 @@ describe("RateLimitCard (Settings)", () => {
   });
 
   it("greys the windows and drops the Live badge on 'unavailable'", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue({ status: "unavailable" });
+    mockApi.getMyRateLimits.mockResolvedValue(tokens({ status: "unavailable" }));
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("No reading yet")).toBeTruthy();
@@ -66,7 +75,7 @@ describe("RateLimitCard (Settings)", () => {
   });
 
   it("renders nothing when the user has no token", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue({ status: "no_token" });
+    mockApi.getMyRateLimits.mockResolvedValue(noTokens);
     render(<RateLimitCard />);
     await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
     await Promise.resolve();
@@ -74,7 +83,7 @@ describe("RateLimitCard (Settings)", () => {
   });
 
   it("swaps Live for a neutral stale badge on a stale reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(staleReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(staleReading));
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("stale")).toBeTruthy();
@@ -92,7 +101,7 @@ describe("RateLimitCard (Settings)", () => {
   });
 
   it("escalates the badge to danger on a ≥95% reading and paints the 5h bar red", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("5h nearly out")).toBeTruthy();
@@ -104,7 +113,7 @@ describe("RateLimitCard (Settings)", () => {
   });
 
   it("keeps a warn reading on the Live badge but paints the bar amber", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(warnReading));
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("Live")).toBeTruthy();
@@ -115,7 +124,7 @@ describe("RateLimitCard (Settings)", () => {
 
 describe("SidebarRateLimits", () => {
   it("shows the 5h/7d micro-bars on an ok reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<SidebarRateLimits />);
     await screen.findByLabelText("Claude rate limits");
     expect(screen.getByText("5h")).toBeTruthy();
@@ -124,7 +133,7 @@ describe("SidebarRateLimits", () => {
   });
 
   it("renders nothing for no_token / unavailable (no dead chrome)", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue({ status: "unavailable" });
+    mockApi.getMyRateLimits.mockResolvedValue(tokens({ status: "unavailable" }));
     render(<SidebarRateLimits />);
     await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
     await Promise.resolve();
@@ -132,7 +141,7 @@ describe("SidebarRateLimits", () => {
   });
 
   it("dims both micro-bars on a stale reading", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(staleReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(staleReading));
     render(<SidebarRateLimits />);
     await screen.findByLabelText("Claude rate limits");
     const fills = screen.getAllByRole("progressbar").map((b) => b.firstChild as HTMLElement);
@@ -152,36 +161,36 @@ describe("RateLimitAnnouncer (aria-live)", () => {
   const region = () => screen.getByRole("status").textContent;
 
   it("announces once when the worst window steps ok → warn", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<RateLimitAnnouncer />);
     await flush(); // seed the ref at ok — first read never announces
     expect(region()).toBe("");
 
-    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(warnReading));
     await flush(60_000); // 60s poll → warn (7d at 83%)
     expect(region()).toMatch(/^7-day window at 83%, resets in /);
   });
 
   it("announces again when the tone steps warn → danger", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(warnReading));
     render(<RateLimitAnnouncer />);
     await flush(); // seed at warn, silent (first read)
     expect(region()).toBe("");
 
-    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
     await flush(60_000); // → danger (5h at 97%)
     expect(region()).toMatch(/^5-hour window at 97%, resets in /);
   });
 
   it("stays silent on the first read even when already in danger", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
     render(<RateLimitAnnouncer />);
     await flush();
     expect(region()).toBe("");
   });
 
   it("stays silent when consecutive polls keep the same tone", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<RateLimitAnnouncer />);
     await flush(); // seed ok
     await flush(60_000); // a second ok poll — no step up
@@ -189,10 +198,10 @@ describe("RateLimitAnnouncer (aria-live)", () => {
   });
 
   it("does not re-announce on a bare 30s clock tick with no tone change", async () => {
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<RateLimitAnnouncer />);
     await flush();
-    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(warnReading));
     await flush(60_000); // announce warn
     const announced = region();
     expect(announced).toMatch(/^7-day window at 83%/);
@@ -205,10 +214,10 @@ describe("RateLimitAnnouncer (aria-live)", () => {
 
   it("does not announce on a stale reading even at a danger pct", async () => {
     const staleDanger: MyRateLimits = { ...staleReading, five_hour: { pct: 97, resets_at: null } };
-    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
     render(<RateLimitAnnouncer />);
     await flush(); // seed ok
-    mockApi.getMyRateLimits.mockResolvedValue(staleDanger);
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(staleDanger));
     await flush(60_000);
     expect(region()).toBe("");
   });
