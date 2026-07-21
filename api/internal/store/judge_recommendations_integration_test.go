@@ -350,9 +350,19 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// assertions.
 	//
 	// MEASURED, one fold per run against a FRESH database, RE-DERIVED IN FULL at `ad6c63d9`
-	// (2026-07-21) rather than carried forward — the landing merge put four new migrations
-	// (00078-00081) ahead of ours, so every earlier fold on this fixture had run against DDL
-	// the suite no longer applies. Each line mutates ListJudgeRecommendationRowsForUser — THE
+	// (2026-07-21) rather than carried forward — FIVE migrations from main landed ahead of PRD
+	// #98's own, whose file was renumbered 00075 -> 00081 with identical content, so every
+	// earlier fold on this fixture had run against DDL the suite no longer applies.
+	//
+	// THE COUNT TOOK THREE ATTEMPTS AND THE ERROR IS THE SAME ONE EACH TIME: a count taken off a
+	// diff without asking what each line MEANS. This comment first said "four new migrations
+	// (00078-00081)" — wrong twice over, counting 00081 (which is ours) and dropping 00075 and
+	// 00077. The correction to it said "six migration files changed" — true of the DIFF, and
+	// still wrong for the sentence, because one of the six is our own file being renamed.
+	// `git diff --name-status -M 31080a40..8515cfab -- api/internal/store/migrations/` separates
+	// them in one flag: five `A` lines, one `R100`. A count over a diff is a claim about CHANGE;
+	// only a count over `A` lines is a claim about ARRIVAL, and "landed ahead of ours" is an
+	// arrival claim. A pure renumber applies identical DDL, so the schema moved by exactly five. Each line mutates ListJudgeRecommendationRowsForUser — THE
 	// FIRST QUERY BODY in judge_recommendations.sql, at its lines 61, 64, 69 and 71 —
 	// regenerated through sqlc, `go vet` clean, the change confirmed present in BOTH the .sql
 	// and the .sql.go by `git diff --numstat` before each run and gone after. Every run
@@ -510,7 +520,9 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//     join, while the assertion written for that fold never executes. A red naming the wrong
 	//     thing is not the same pin, and an assertion behind an earlier Fatalf is documentation
 	//     rather than a gate.
-	//   claim under otherCat:  the fold reaches the sibling's assertion, but ALSO reddens the
+	//   claim under otherCat (which IS `improve_uzi` — see the const below; these are two
+	//     objections to ONE option, not two options):  the fold reaches the sibling's assertion,
+	//     but ALSO reddens the
 	//     cross-category one — whose message then blames the CATEGORY half, which was never
 	//     mutated. Not a false positive: the cross-category coordinate really does inherit this
 	//     claim row under that fold. The mechanism is filed_issue_url being `NOT NULL DEFAULT ''`
@@ -523,10 +535,11 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// nothing else. Its own purpose is unaffected: it pins filed_settled's SOURCE, which is
 	// about filed_at vs row-existence and never about the coordinate.
 	//
-	// NOT improve_uzi, for the reason the badge fixture at the end of this file spells out —
-	// that is the one category with a second, table-wide consumer
+	// A SECOND, INDEPENDENT reason for the same verdict — not a third candidate. otherCat IS
+	// improve_uzi, so this reinforces the rejection above rather than ruling out a new option:
+	// improve_uzi is the one category with a second, table-wide consumer
 	// (ListOpenImproveUziRecommendations, selfimprove.sql), so an open improve_uzi row here can
-	// fail an M6 test in another package.
+	// fail an M6 test in another package, as the badge fixture at the end of this file records.
 	//
 	// It pins the derived boolean's SOURCE. `filed_settled` is
 	// `(f.filed_at IS NOT NULL)::bool`, and the natural wrong implementation is "did the LEFT
@@ -705,10 +718,10 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//     unfiled-row absence check, after satisfying every positive assertion. No fold of
 	//     filed_issue_iid or filed_issue_url was executed in the 2026-07-21 sweep.
 	if hand.FiledIssueIid.Valid || hand.FiledIssueUrl.Valid {
-		t.Errorf("a coordinate with NO filed row anywhere carries a filed link (iid=%v url=%q) — "+
+		t.Errorf("a coordinate with NO filed row anywhere carries a filed link (iid=%v urlValid=%v url=%q) — "+
 			"the projection is not reading the joined filed row (a constant fold, or a join that "+
 			"matches across reviews)",
-			hand.FiledIssueIid.Int64, hand.FiledIssueUrl.String)
+			hand.FiledIssueIid.Int64, hand.FiledIssueUrl.Valid, hand.FiledIssueUrl.String)
 	}
 	// And filed_at drives filed_settled, so a settled link must read as settled.
 	if !auto.FiledSettled {
@@ -724,9 +737,10 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	sibling := at("the unfiled sibling", autoRev.reviewID, cat, unfiledInAutoRev)
 	if sibling.FiledSettled || sibling.FiledAt.Valid || sibling.FiledIssueIid.Valid || sibling.FiledIssueUrl.Valid {
 		t.Errorf("an unfiled coordinate sharing autoRev AND its category with the filed one inherited "+
-			"its link (settled=%v at=%v iid=%v url=%q) — the filed join's TARGET half is gone, so every "+
+			"its link (settled=%v at=%v iid=%v urlValid=%v url=%q) — the filed join's TARGET half is gone, so "+
 			"coordinate in a review sharing a category with any filed issue reads as filed",
-			sibling.FiledSettled, sibling.FiledAt.Valid, sibling.FiledIssueIid.Valid, sibling.FiledIssueUrl.String)
+			sibling.FiledSettled, sibling.FiledAt.Valid, sibling.FiledIssueIid.Valid, sibling.FiledIssueUrl.Valid,
+			sibling.FiledIssueUrl.String)
 	}
 	// And its disposition columns stay clear too — the disposition join is coordinate-keyed
 	// for the same reason.
@@ -738,12 +752,22 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// The CATEGORY half, which the sibling above cannot see: same review, same target as the
 	// filed coordinate, different category. Measured — with only the sibling in place,
 	// dropping `AND f.category = rr.category` left the ENTIRE live-DB suite green.
+	// PRINT `.Valid`, NOT THE STRING, FOR THE URL — the condition tests Valid and the string is
+	// not the same fact. filed_issue_url is `NOT NULL DEFAULT ''` (00071:43), so a matched row
+	// that is merely CLAIMED carries Valid=true with String="". The old message printed
+	// `url=""` there, which reads as "no url inherited" at exactly the moment a url column IS
+	// what fired — a reader debugging that red goes looking in the wrong place. Same defect the
+	// cross-review disposition message carried, and the same one the fold table records: a
+	// diagnostic must report the condition it evaluated, not a neighbouring value.
 	crossCat := at("the cross-category coordinate", autoRev.reviewID, otherCat, autoTarget)
 	if crossCat.FiledSettled || crossCat.FiledAt.Valid || crossCat.FiledIssueIid.Valid || crossCat.FiledIssueUrl.Valid {
 		t.Errorf("an unfiled coordinate sharing autoRev AND its target with the filed one inherited "+
-			"its link (settled=%v at=%v iid=%v url=%q) — the filed join's CATEGORY half is gone, so "+
-			"filing under one category marks the SAME target filed under every other category",
-			crossCat.FiledSettled, crossCat.FiledAt.Valid, crossCat.FiledIssueIid.Valid, crossCat.FiledIssueUrl.String)
+			"its link (settled=%v at=%v iid=%v urlValid=%v url=%q) — the filed join's CATEGORY half "+
+			"is gone, so filing under one category marks the SAME target filed under every other "+
+			"category. NOTE urlValid can be true with url empty: filed_issue_url is NOT NULL "+
+			"DEFAULT '', so a merely-CLAIMED row still satisfies it",
+			crossCat.FiledSettled, crossCat.FiledAt.Valid, crossCat.FiledIssueIid.Valid,
+			crossCat.FiledIssueUrl.Valid, crossCat.FiledIssueUrl.String)
 	}
 	// THE REVIEW_ID HALF — the tenant boundary. Same category AND same target as autoRev's
 	// filed+disposed coordinate, in a DIFFERENT review. The category and target halves cannot
@@ -756,11 +780,11 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	crossReview := at("the cross-review coordinate", handRev.reviewID, cat, crossReviewTarget)
 	if crossReview.FiledSettled || crossReview.FiledAt.Valid || crossReview.FiledIssueIid.Valid || crossReview.FiledIssueUrl.Valid {
 		t.Errorf("a coordinate identical to autoRev's filed one but in ANOTHER review inherited its "+
-			"filed link (settled=%v at=%v iid=%v url=%q) — the filed join's REVIEW_ID half is gone. "+
+			"filed link (settled=%v at=%v iid=%v urlValid=%v url=%q) — the filed join's REVIEW_ID half is gone. "+
 			"That half is the ONLY tenant boundary on recommendation_filed_issues, which has no "+
 			"owner column of its own, so one user's filed issue would surface in another's backlog",
 			crossReview.FiledSettled, crossReview.FiledAt.Valid, crossReview.FiledIssueIid.Valid,
-			crossReview.FiledIssueUrl.String)
+			crossReview.FiledIssueUrl.Valid, crossReview.FiledIssueUrl.String)
 	}
 	// 🔴 THIS MESSAGE MUST NOT NAME A SINGLE HALF, and the reason is measured rather than
 	// cautious. It used to end "the disposition join's REVIEW_ID half is gone" — and dropping
@@ -978,7 +1002,7 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 //
 // 🟡 BOUND, because the table above is the strongest-looking artifact in this file and its
 // binding is the thing a reader will not check: it was measured on the BRANCH, before the
-// landing merge put migrations 00078-00081 ahead of ours. It has NOT been re-run against the
+// landing merge put five migrations from main ahead of ours. It has NOT been re-run against the
 // merged schema. The sibling table on the M1 body was re-derived at `ad6c63d9` for exactly
 // that reason and every fold still reddened — which is evidence that re-folding is worth the
 // minutes, NOT evidence that this one is fine. Re-fold before citing it.
@@ -1530,9 +1554,9 @@ func TestJudgeBacklogIsTenantScopedLiveDB(t *testing.T) {
 
 	if got.FiledSettled || got.FiledIssueIid.Valid || got.FiledIssueUrl.Valid || got.FiledAt.Valid {
 		t.Errorf("CROSS-TENANT LEAK: another user's filed issue reached this caller's backlog "+
-			"(settled=%v iid=%d url=%q) — recommendation_filed_issues has no user column, so "+
+			"(settled=%v iid=%d urlValid=%v url=%q) — recommendation_filed_issues has no user column, so "+
 			"`f.review_id = rv.id` is the only thing scoping it",
-			got.FiledSettled, got.FiledIssueIid.Int64, got.FiledIssueUrl.String)
+			got.FiledSettled, got.FiledIssueIid.Int64, got.FiledIssueUrl.Valid, got.FiledIssueUrl.String)
 	}
 	if got.DispositionStatus.Valid {
 		t.Errorf("CROSS-TENANT LEAK: another user's disposition (%q) reached this caller's backlog "+

@@ -330,7 +330,9 @@ func TestBulkDispositionScopeLiveDB(t *testing.T) {
 // query; this pins the bulk query's own copy of it, which is a different query body.
 //
 // ✅ RE-DERIVED AT `041c5291`, AND THE REASON IS THE POINT. The two folds above were first
-// measured at `31080a40`; SIX migration files changed between there and the landing merge, so
+// measured at `31080a40`; FIVE migrations from main landed between there and the landing merge
+// (six paths appear in the diff — the sixth is PRD #98's own file renumbered 00075 -> 00081 with
+// identical content, which `git diff --name-status -M` separates as R100 from the five A lines), so
 // by the expiry rule in .claude/agent-team.md they had been measured against DDL the suite no
 // longer applies and certified nothing about today's tree. Re-run, one fold per run, each on
 // its OWN fresh throwaway Postgres, each confirmed present in both the .sql and the

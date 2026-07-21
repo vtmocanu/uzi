@@ -91,6 +91,50 @@ import (
 // carried before was 276, written weeks of merges earlier and never re-derived; it is quoted
 // here only to make the point that the figure drifts and the command does not.)
 //
+// 🔴 HOW TO ESTABLISH THAT A QUERY RUNS: OBSERVE IT, DO NOT REASON ABOUT IT. Every row here
+// was first written by reading call sites, and that method PUT A FALSEHOOD IN THIS FILE —
+// CountActiveSelfImproveRuns was declared "No live test executes it" when a live test executes
+// it. The reasoning was not sloppy; it was answering the wrong question. That query sits behind
+// GET /api/admin/selfimprove, whose PUT sibling IS cookie-only and 401s at middleware, and the
+// auth posture of the route got substituted for the execution of the query.
+//
+// The method that settles it, and the one to use before adding or changing any row:
+//
+//	docker run -d --rm --name cdr-<yours>-pg -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi \
+//	  -e POSTGRES_PASSWORD=... -p 127.0.0.1:<port>:5432 postgres:17 -c log_statement=all
+//	UZI_TEST_DATABASE_URL=... go test -count=1 -p 1 -run 'LiveDB$' ./internal/store/... ./internal/handler/...
+//	docker logs cdr-<yours>-pg > pg.log 2>&1        # ORDER MATTERS, see below
+//	grep -c -- '-- name: <QueryName> :' pg.log
+//
+// It is exact rather than approximate: sqlc emits each query's `-- name: X :kind` header as the
+// FIRST LINE of the SQL it sends, so that string appears in the log once per execution and
+// belongs to exactly one query. No fuzzy matching, no false hits from a neighbouring statement —
+// which matters, since a generic `INSERT INTO runs` grep hits from 145 unrelated fixtures.
+//
+// 🔴 `docker logs X > f 2>&1` AND `docker logs X 2>&1 > f` ARE NOT THE SAME COMMAND, and
+// Postgres logs to STDERR. The second sends stderr to the terminal and only stdout to the file,
+// producing a log file that is well-formed, non-empty, and missing every statement. It cost a
+// measurement here: an isolated run reported 0 executions of a query that runs once, which
+// briefly looked like evidence AGAINST the finding being fixed. Always redirect stdout first,
+// and sanity-check the capture with `grep -c -- '-- name:'` before trusting a zero — a zero from
+// a broken capture is indistinguishable from a zero from a query nobody calls.
+//
+// EXECUTION COUNTS FOR ALL 46 ROWS, measured this way on one whole-sweep run (RUN=141 PASS=141
+// FAIL=0 SKIP=0). Bound to that run, not offered as constants — they move with the fixtures, and
+// the ZEROES are the load-bearing part:
+//
+//	0  CreateSelfImproveRun, MarkImproveUziRecommendationsAddressed  (selfimprove.sql)
+//	0  ListCLITokens                                                 (cli_tokens.sql)
+//	0  ListNotificationsForUser, CountUnreadNotificationsForUser,
+//	   MarkNotificationRead, ListAllNotifications, CountAllNotifications (notifications.sql)
+//	1  CountActiveSelfImproveRuns  — the row that was wrong
+//	35 TouchCLIToken               — runs constantly, asserted nowhere
+//	1..39 everything else
+//
+// Those eight zeroes are exactly the eight UNPINNED rows below, and the two non-zero sentinels
+// are exactly the two EXERCISED-UNASSERTED rows. That correspondence is the check: if a row's
+// state and its execution count ever disagree, the ROW is wrong.
+//
 // WIDENING IS DELIBERATELY ONE FILE AT A TIME, AND THE REASON IS NOT CAUTION. A repo-wide
 // table written in one sitting would be mostly UNPINNED rows authored by someone who had
 // investigated none of them — a WORSE artifact than no table, because it reads as an audit.
@@ -403,11 +447,19 @@ var queryInventory = []queryPin{
 			"index, which is the guard that stops a boot re-run double-creating onto the fixed " +
 			"branch. engine_test.go:326 asserts the 23505 handling against a fake that RETURNS " +
 			"23505; nothing has made Postgres produce one"},
-	{"CountActiveSelfImproveRuns", "selfimprove.sql", unpinnedPin,
-		"No live test executes it. handler/selfimprove_test.go drives it through a fake store and " +
-			"selfimprove/engine_test.go:52 returns a canned count. Its status list " +
-			"('completed','failed','cancelled') is a second, hand-maintained copy of what 'terminal' " +
-			"means, and no live row has ever been compared against it"},
+	{"CountActiveSelfImproveRuns", "selfimprove.sql", unassertedPin,
+		"🔴 THIS ROW SAID UNPINNED / 'No live test executes it' AND THAT WAS FALSE. It EXECUTES: " +
+			"TestCLIAdminSurfaceLiveDB asserts 200 for a uza_ token on GET /api/admin/selfimprove " +
+			"(cli_auth_livedb_test.go:415 in adminReadPaths) -> GetSelfimproveConfig -> " +
+			"selfimproveConfig() -> handler/selfimprove.go:198. Measured with log_statement=all, not " +
+			"reasoned: 1 execution running that test alone against a fresh database, 1 across the " +
+			"whole sweep. The wrong row came from reading the route's AUTH POSTURE — the PUT half IS " +
+			"cookie-only and 401s at middleware (:442), which is true and was the wrong question. " +
+			"Nothing asserts what it returned: no test anywhere touches the DTO's Active field, and " +
+			"the caller SWALLOWS the error (`if active, err := ...; err == nil`), so 'it ran without " +
+			"erroring' is unobservable — the same profile as TouchCLIToken, which is why the sentinel " +
+			"and not a pin. Its status list ('completed','failed','cancelled') is still a second, " +
+			"hand-maintained copy of what terminal means, and no live row has been compared against it"},
 	{"MarkImproveUziRecommendationsAddressed", "selfimprove.sql", unpinnedPin,
 		"No live test executes it — only the fake at selfimprove/engine_test.go:56. It is a WRITE " +
 			"with two guards nothing has exercised against a database: `category = 'improve_uzi'` " +
