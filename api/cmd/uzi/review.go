@@ -287,6 +287,14 @@ func renderBacklog(p *uzicli.Printer, b apitypes.JudgeBacklogDTO) error {
 		// renderReview gives the per-run panel. rationale_preview in particular ships
 		// deliberately UNESCAPED (the no-raw-render guarantee is the client's job, and for
 		// a terminal client that job is stripping the control bytes, not escaping HTML).
+		//
+		// g.Category is printed RAW, and that is a considered exception rather than an
+		// oversight: category is CHECK-constrained to six literals on review_recommendations
+		// (00059_run_reviews.sql), which is the table the grouped read selects it from, so it
+		// cannot carry a control byte. (00071/00073 drop that CHECK on their coordinate
+		// copies — deliberately, see their comments — but neither is the source here.)
+		// Bucket is likewise a closed server-side enum. If a future read ever sourced
+		// category from a table without the CHECK, this line would need sanitising too.
 		p.Printf("- [%s] %s → %s · seen in %s · %d open\n",
 			g.Bucket, g.Category, sanitizeTTY(g.Target), runsPhrase(g.RunCount), g.OpenCount)
 		if r := sanitizeTTY(strings.TrimSpace(g.RationalePreview)); r != "" {
@@ -317,16 +325,26 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(res)
 	}
-	if gf.quiet {
-		return nil
+	// --quiet suppresses the SUCCESS line and nothing else, matching reportDisposition on
+	// the per-run path. It used to return here, which silently swallowed both reports below
+	// — so `uzi review dismiss --quiet --category X --target <typo>` produced empty stdout,
+	// empty stderr and exit 0: exactly the silent-success shape the zero-updated report
+	// exists to prevent, reachable through a documented global flag.
+	//
+	// The flag is documented as "suppress non-essential output". A warning that the data may
+	// be wrong, and the only signal that nothing happened, are not non-essential — they are
+	// the two things a script CANNOT recover any other way, since neither has a distinct
+	// exit code.
+	if !gf.quiet {
+		// "coordinates", never "recommendations". Updated counts (review_id, category,
+		// target) TRIPLES, and one review can carry the same coordinate on two
+		// recommendations, which share ONE disposition row and contribute ONE to this
+		// count. So Updated can be lower than the number of recommendations the group
+		// visibly spans, and reporting it as a recommendation count would be a number the
+		// user could disprove from `backlog`.
+		p.Printf("%s → %s: %s, %d member coordinate(s) updated\n",
+			coord.Category, sanitizeTTY(coord.Target), dispositionOutcome(status, reason), res.Updated)
 	}
-	// "coordinates", never "recommendations". Updated counts (review_id, category, target)
-	// TRIPLES, and one review can carry the same coordinate on two recommendations, which
-	// share ONE disposition row and contribute ONE to this count. So Updated can be lower
-	// than the number of recommendations the group visibly spans, and reporting it as a
-	// recommendation count would be a number the user could disprove from `backlog`.
-	p.Printf("%s → %s: %s, %d member coordinate(s) updated\n",
-		coord.Category, sanitizeTTY(coord.Target), dispositionOutcome(status, reason), res.Updated)
 	if res.Updated == 0 {
 		// A 200 with nothing written. There is no 404 on this route by design — a
 		// coordinate that does not exist and one belonging to another user are the same
@@ -336,7 +354,13 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 		p.Println("nothing was written: no open member of yours matched that coordinate (it may already be settled, or the category/target may be misspelt)")
 	}
 	if res.Truncated {
-		p.Println("warning: the post-write re-read hit the server's row cap — a group missing from --json output is UNKNOWN, not settled")
+		// BOTH halves of the contract, like the read path's warning. The earlier wording
+		// carried only the missing-group half, and the cap applies BEFORE grouping on this
+		// re-read for the same reason it does on the read — so a group that SURVIVES it can
+		// have lost occurrences and be understated too. It also said "--json output" while
+		// printing on the human path, which prints no groups at all, pointing the reader at
+		// something they are not looking at.
+		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled; re-check with `uzi review backlog --bucket all`")
 	}
 	// `settled` names the exact (run, rec) coordinates this call wrote, which is what an
 	// agent needs to revert it: `uzi review undo <run-id> <rec-id>` per entry. It is NOT
@@ -344,7 +368,12 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 	// membership at write time, so a client reconstructing the set from `uzi review backlog`
 	// would name members this action never touched (PRD #98 review BLK-UNDO). --json carries
 	// the full list; the human view says how to get it rather than printing N uuid pairs.
-	if n := len(res.Settled); n > 0 && p.Format != uzicli.FormatJSON {
+	// Suppressed by --quiet, unlike the two reports above, and the line between them is the
+	// flag's actual contract: this is ADVICE about output the caller can obtain another way
+	// (--json carries `settled` in full), printed when nothing is wrong. The zero-updated
+	// and truncation reports are the opposite — they say something IS wrong or did not
+	// happen, and no exit code carries either.
+	if n := len(res.Settled); n > 0 && !gf.quiet && p.Format != uzicli.FormatJSON {
 		p.Printf("to revert: re-run with --json for the %d (run, rec) pair(s), then `uzi review undo <run-id> <rec-id>` for each\n", n)
 	}
 	return nil

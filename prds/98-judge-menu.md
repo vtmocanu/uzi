@@ -469,7 +469,22 @@ one action.
      `set_via` to that INSERT list, the `EXCLUDED` form would silently start
      carrying system provenance through a human write, with no edit to the line
      that guarantees it. That is exactly the class of latent breakage this PRD has
-     been finding all run.)* The
+     been finding all run.)*
+     **Postscript (2026-07-21): the visible half is what makes the invisible half
+     checkable.** `set_via` reached the wire only at M3's B3 fix — before that it
+     lived entirely inside `api/internal/store`, so no consumer could distinguish an
+     auto-done from a hand-marked one and the PRD documented a label that did not
+     exist. The moment the field became visible, the **mock reproduced this exact
+     misattribution**: `mockApi`'s disposition upsert used `Object.assign(existing,
+     next)`, which copies only the keys `next` carries, so a human overriding an
+     auto-done **kept** `set_via='issue_close'` and the chip went on reading "Done
+     via #91" after the user had overridden it. That is precisely what the literal
+     `NULL` above prevents server-side, re-created client-side the instant the field
+     had a reader — and it was uncatchable before, because nothing could observe the
+     value. Fixed in both mock write paths with an end-to-end override test. The
+     general lesson: **a provenance field no consumer reads cannot be tested, only
+     asserted** — descoping the visible half would have left the invisible half
+     permanently unverifiable. The
      disposition lands on the **review owner's** coordinate regardless of who
      filed — **filed issues are NOT owner-scoped** (#68 Decision 8 keeps admin
      filing on another user's review; `filed_by_user_id` may be an admin).

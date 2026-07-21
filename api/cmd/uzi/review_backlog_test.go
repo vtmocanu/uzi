@@ -428,6 +428,93 @@ func TestReviewGroupAuthFailurePropagates(t *testing.T) {
 	}
 }
 
+// --quiet suppresses the SUCCESS line and NOTHING else. It used to return before both the
+// zero-updated report and the truncation warning, so
+// `uzi review dismiss --quiet --category X --target <typo>` produced empty stdout, empty
+// stderr and exit 0 — the silent-success shape
+// TestReviewGroupZeroUpdatedIsNotReportedAsSuccess exists to prevent, reachable through a
+// documented global flag and previously untested (no test passed --quiet on this path).
+//
+// Neither signal has a distinct exit code, so --quiet swallowing them leaves a script with
+// NO way to recover either. "Suppress non-essential output" does not cover "the data may be
+// wrong" or "nothing happened".
+func TestReviewGroupQuietStillReportsNothingWritten(t *testing.T) {
+	fc := backlogFake()
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 0}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "dismiss", "--quiet",
+		"--category", "install_worker_tool", "--target", "typoed", "--reason", "wont-do")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("--quiet produced NO output for a fan-out that wrote nothing — a silent success is the one outcome this path must never produce")
+	}
+	if !strings.Contains(out, "nothing was written") {
+		t.Errorf("--quiet must keep the nothing-written report:\n%s", out)
+	}
+	// The success line IS suppressed — that is what --quiet is for.
+	if strings.Contains(out, "coordinate(s) updated") {
+		t.Errorf("--quiet must still suppress the success line:\n%s", out)
+	}
+}
+
+// --quiet likewise keeps the truncation warning: it says the response may be WRONG, which
+// is not "non-essential output".
+func TestReviewGroupQuietStillWarnsOnTruncation(t *testing.T) {
+	fc := backlogFake()
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 2, Truncated: true}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "resolve", "--quiet", "--category", "tests", "--target", "unit")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "UNKNOWN, not settled") {
+		t.Errorf("--quiet must keep the truncation warning:\n%s", out)
+	}
+	if strings.Contains(out, "coordinate(s) updated") {
+		t.Errorf("--quiet must still suppress the success line:\n%s", out)
+	}
+}
+
+// A clean --quiet success really is silent: nothing was wrong and nothing needs saying.
+// Without this, the two tests above would pass on a --quiet that does nothing at all.
+func TestReviewGroupQuietIsSilentOnACleanSuccess(t *testing.T) {
+	fc := backlogFake()
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated: 2,
+		Settled: []apitypes.JudgeSettledMemberDTO{{RunID: "run-a", RecID: "rec-a"}},
+	}
+	out, errb, code := runCLI(t, fakeEnv(fc), "review", "resolve", "--quiet", "--category", "tests", "--target", "unit")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.TrimSpace(out) != "" || strings.TrimSpace(errb) != "" {
+		t.Errorf("a clean --quiet success must print nothing, got stdout=%q stderr=%q", out, errb)
+	}
+}
+
+// The post-write truncation warning carries BOTH halves of the contract, like the read
+// path's. It previously said only that a MISSING group was unknown, dropping that a
+// SURVIVING one may be understated — the cap applies before grouping on this re-read too —
+// and it pointed at "--json output" while printing on the human path, which shows no groups.
+func TestReviewGroupTruncationWarningCarriesBothHalves(t *testing.T) {
+	fc := backlogFake()
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 2, Truncated: true}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "resolve", "--category", "tests", "--target", "unit")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "understated") {
+		t.Errorf("the warning must say surviving counts may be understated:\n%s", out)
+	}
+	if !strings.Contains(out, "UNKNOWN, not settled") {
+		t.Errorf("the warning must say an unreturned coordinate is unknown:\n%s", out)
+	}
+	// It must not send a human reader to output they are not looking at.
+	if strings.Contains(out, "--json output") {
+		t.Errorf("the human-path warning must not point at --json output:\n%s", out)
+	}
+}
+
 // The two forms may not be mixed, half a coordinate is not a coordinate, and neither form
 // at all is a usage error. Every leg must write NOTHING: these are checked before a client
 // is built.
