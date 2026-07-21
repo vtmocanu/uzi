@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -708,5 +709,111 @@ func TestWorkerMessagesAgentIsCappedLiveDB(t *testing.T) {
 	if len(got) != 64 {
 		t.Errorf("persisted agent is %d bytes, want 64 (agenttmpl.MaxNameLen) — an untrusted "+
 			"worker field reached an unbounded text column", len(got))
+	}
+}
+
+// `kind` is the FIFTH worker-controlled sink, and the one the PRD and my own M2
+// both missed. It is `text NOT NULL` with its vocabulary in a COMMENT and no
+// CHECK constraint (00020_workers_runs.sql), and it decodes into a Go string
+// exactly like agent/agent_instance/agent_label — so a u0000 escape becomes a
+// real 0x00 and Postgres answers 22021.
+//
+// Before the strip, M2's status code already contained this: the batch returned
+// 400, not 500, so the run could not wedge. That is the contract working exactly
+// where sanitation was incomplete — but the message was permanently DROPPED where
+// a strip would have persisted it, and once M3's bisection lands that drop becomes
+// designed behaviour rather than an accident.
+func TestWorkerMessagesNulEscapeInKindLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"messages":[{"seq":1,"kind":"tool` + poisonNulEsc + `_result","agent":"lead","payload":{"t":"x"}}]}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	rec := f.post(t, body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /messages with a u0000 escape in KIND: status = %d, want 204 — %s", rec.Code, f.diagnose(t, body))
+	}
+	got, ok := f.storedColumn(t, 1, "kind")
+	if !ok {
+		t.Fatal("the handler answered 204 but no run_messages row with seq=1 exists — the message was dropped, not persisted")
+	}
+	if want := "tool_result"; got != want {
+		t.Errorf("persisted kind = %q (% x), want %q — the NUL must be stripped from kind too", got, got, want)
+	}
+}
+
+// A kind of NOTHING BUT NUL escapes is the ordering trap: it is non-empty on the
+// wire, so it passes the emptiness check, and would then strip to "" — which
+// `text NOT NULL` accepts happily, persisting a message with no kind at all.
+// Rejecting it is what the emptiness check exists to do.
+func TestWorkerMessagesKindOfOnlyNULsIsRejectedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"messages":[{"seq":1,"kind":"` + poisonNulEsc + poisonNulEsc + `","agent":"lead","payload":{"t":"x"}}]}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	if rec := f.post(t, body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a kind of nothing but NUL escapes: status = %d, want 400 — it is non-empty on the wire, "+
+			"so it passes the emptiness check and then strips to \"\", which text NOT NULL accepts. %s",
+			rec.Code, f.diagnose(t, body))
+	}
+	if _, ok := f.storedColumn(t, 1, "kind"); ok {
+		t.Error("a message with an all-NUL kind was persisted; it must be rejected before the insert")
+	}
+}
+
+// The 500 arm logs the WRAPPED error, and its safety rests on a stdlib detail
+// rather than on anything this file does: slog special-cases values implementing
+// `error` and renders them via Error(). pgconn.PgError.Error() emits only
+// Severity + Message + SQLSTATE, so Detail/Where/File/Hint never reach the line.
+//
+// This is a TEST rather than a comment because a comment cannot stop the
+// "improvement" it warns about. Attaching the error as a plain value ("pg",
+// pgErr) or moving to a handler that marshals structs field by field would start
+// leaking worker-controlled bytes into the logs — and for 22P02/22021 those
+// fields quote the offending payload. Both handlers are exercised: the risk is a
+// property of how the error is ATTACHED, not of which handler is configured.
+func TestWorkerMessagesLogDoesNotLeakPgErrorFields(t *testing.T) {
+	// A code deliberately OUTSIDE the enumerated permanent set, so this reaches the
+	// 500 arm — the only arm that logs the error at all.
+	pgErr := &pgconn.PgError{
+		Code:     "22001",
+		Message:  "value too long for type character varying(8)",
+		Detail:   "POISON_DETAIL_the_offending_payload_bytes",
+		Where:    "POISON_WHERE_internal_query_context",
+		File:     "POISON_FILE_varlena.c",
+		Hint:     "POISON_HINT",
+		Routine:  "POISON_ROUTINE",
+		Severity: "ERROR",
+	}
+	for _, tc := range []struct {
+		name string
+		make func(*bytes.Buffer) slog.Handler
+	}{
+		{"json", func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) }},
+		{"text", func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(tc.make(&buf)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			if rec := postToFakeStore(t, pgErr); rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500 (22001 is deliberately not in the permanent set)", rec.Code)
+			}
+			logged := buf.String()
+			for _, poison := range []string{"POISON_DETAIL", "POISON_WHERE", "POISON_FILE", "POISON_HINT", "POISON_ROUTINE"} {
+				if strings.Contains(logged, poison) {
+					t.Errorf("the log line leaked PgError.%s — these fields quote the offending value for "+
+						"22P02/22021, i.e. worker-controlled payload bytes. The error must stay attached AS "+
+						"an error so slog renders it via Error().\n%s", strings.TrimPrefix(poison, "POISON_"), logged)
+				}
+			}
+			// The positive control: without it this test would pass against a version
+			// that logs nothing at all, which is not the property being claimed.
+			if !strings.Contains(logged, "22001") {
+				t.Errorf("the log line does not carry the SQLSTATE, so this test is not measuring a real "+
+					"log line and its absence-of-poison checks are vacuous\n%s", logged)
+			}
+		})
 	}
 }

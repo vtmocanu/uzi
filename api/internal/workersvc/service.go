@@ -1103,6 +1103,9 @@ type IncomingMessage struct {
 //   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
 //   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
 //     because "I cannot think of a case" is not the same as "there is no case".
+//     Read this as a CLEARED suspect, not a live hazard: it is written out because
+//     it is the call that looks most dangerous and the check is what makes the
+//     placement defensible, not because it can currently produce these codes.
 //     `model` IS worker-controlled (a JSON object key out of the payload) and is
 //     safe only because sanitation writes through the index in a pass that
 //     completes before foldRunUsage iterates msgs, so the name it inserts is
@@ -1141,6 +1144,16 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
+		// A kind of nothing but NUL escapes passes the emptiness check above — it is
+		// non-empty on the wire — and would then strip to "" in the sanitation pass,
+		// which `text NOT NULL` accepts happily. Check the POST-STRIP value HERE, in
+		// the validation pass, rather than after stripping: an empty kind is exactly
+		// what that check exists to reject, and rejecting it here keeps both batch
+		// invariants intact — nothing is written, and nothing is logged as laundered.
+		// The double stripNUL costs one strings.Count on the fast path.
+		if stripped, _ := stripNUL(m.Kind); stripped == "" {
+			return ErrInvalidMessage
+		}
 	}
 	// SECOND pass for sanitation, separate from validation on purpose. The
 	// count-and-log requirement (PRD #108 Risk 3) exists so a future NUL-emitting
@@ -1161,11 +1174,21 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// well-formed JSON, and today's invalid-JSON→400 arm must keep answering
 		// first.
 		m.Payload, c = sanitizePayloadJSON(m.Payload)
-		var nAgent, nInstance, nLabel int
+		// FOUR text sinks, not three. `kind` is worker-supplied and lands in a bare
+		// `text NOT NULL` column whose vocabulary lives in a COMMENT with no CHECK
+		// constraint (00020_workers_runs.sql), and it decodes into a Go string exactly
+		// like the other three — so a u0000 escape becomes a real 0x00 and Postgres
+		// answers 22021. Ordinary tool output cannot produce it (kind comes from a
+		// fixed SDK-frame vocabulary), so this needs a hostile or buggy worker — which
+		// is precisely the threat model that produced sanitizeSelfReported on this
+		// same route. Stripped BEFORE the log below, so the log line reports a clean
+		// kind rather than smuggling the NUL into the operator's terminal.
+		var nKind, nAgent, nInstance, nLabel int
+		m.Kind, nKind = stripNUL(m.Kind)
 		m.Agent, nAgent = stripNUL(m.Agent)
 		m.AgentInstance, nInstance = stripNUL(m.AgentInstance)
 		m.AgentLabel, nLabel = stripNUL(m.AgentLabel)
-		c.textNUL = nAgent + nInstance + nLabel
+		c.textNUL = nKind + nAgent + nInstance + nLabel
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
 				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,

@@ -84,8 +84,17 @@ var replacementEscape = []byte(`\` + `ufffd`)
 func sanitizePayloadJSON(p []byte) ([]byte, stripCounts) {
 	var c stripCounts
 	// Fast path for nearly every real message: no escape can hide without a
-	// backslash, and no invalid byte can hide in valid UTF-8. Returns the same
-	// backing array, so a healthy batch copies nothing.
+	// backslash, and no invalid byte can hide in valid UTF-8. Returns the CALLER'S
+	// backing array (the slow path returns a fresh one), so a healthy batch copies
+	// nothing.
+	//
+	// Returning the input's own memory is safe only because json.RawMessage does
+	// not alias the decoder's read buffer — encoding/json copies the bytes out, so
+	// overwriting the source body after Decode leaves the RawMessage unchanged.
+	// That is a property of the DECODER, not of this function: pointing a
+	// RawMessage at a pooled or reused buffer would make this alias live, and the
+	// two return paths would then differ in whether the caller owns the result.
+	// Nothing does that today; this is here so it is noticed if anything starts.
 	if bytes.IndexByte(p, '\\') < 0 && utf8.Valid(p) {
 		return p, c
 	}

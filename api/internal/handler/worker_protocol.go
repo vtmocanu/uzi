@@ -385,6 +385,22 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			// quote a fragment of the offending value.
 			httpx.Error(w, http.StatusBadRequest, "a message in this batch cannot be stored and will never succeed; do not retry it unchanged")
 		default:
+			// This logs the WRAPPED error, which for a store failure is a
+			// *pgconn.PgError — safe for a NON-OBVIOUS reason, because the obvious
+			// "improvement" breaks it.
+			//
+			// slog special-cases values implementing `error` and renders err.Error(),
+			// and PgError.Error() emits only Severity + Message + SQLSTATE. Its
+			// Detail/Where/File/Hint fields — which for 22P02 and 22021 quote the
+			// offending value, i.e. worker-controlled payload bytes — never reach the
+			// line. Keep the error attached AS an error: passing it as a plain value
+			// ("pg", *pgErr) makes slog marshal the struct field by field and the
+			// poison lands in the log.
+			//
+			// TestWorkerMessagesLogDoesNotLeakPgErrorFields holds this, rather than
+			// this comment holding it — a comment cannot stop the change it warns
+			// about. It runs both the JSON and text handlers, because the property
+			// belongs to how the error is ATTACHED, not to which handler is wired.
 			slog.Error("worker run messages", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
