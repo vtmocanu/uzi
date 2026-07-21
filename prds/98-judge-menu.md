@@ -27,10 +27,19 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    `main` and a free number *below* the applied head is exactly the boot-refusing case.
    **The reference sweep was re-run on the MERGED tree and the earlier measurement held:**
    exactly one reference to renumber besides the file itself (M6's draft-number note below).
-   The merge added six further `00075` hits — `runtime.sql.go`, `queries/runtime.sql`,
-   `run_message_instance_integration_test.go`, `specs/ai.md` ×2, `mocks/data.ts` — every one
-   of them naming **main's** `00075`, plus four `prds/done/` + `adr/` hits that are other
-   PRDs' historical drafts. A tree-wide `sed 00075→00081` would have corrupted all ten.
+   The merge brought further `00075` references, **every one of them naming main's**
+   `00075_run_message_instance.sql`: in live code (`runtime.sql.go`, `queries/runtime.sql`,
+   `run_message_instance_integration_test.go`), in `specs/ai.md`, in `mocks/data.ts`, and in a
+   neighbouring migration's own comment (`00077_user_secret_labels.sql`). Alongside them sit
+   the archived PRDs' historical draft numbers — `adr/0042`, `prds/done/42`, `/46`, `/49`, and
+   after the merge `/99` and `/104` too.
+   **Cited as a FILE LIST and a mechanism, not a tally, and that is a correction to what this
+   entry first said.** It read "six further hits … plus four `prds/done/` + `adr/` hits …
+   would have corrupted all ten", which conflated LINE counts with FILE counts and was
+   understated the moment the merge added two more archived files. The durable claim is the
+   classification — *code/spec hits are main's, archived hits are other PRDs' history, exactly
+   one line is ours* — and a blind `sed 00075→00081` corrupts every one of them. The number is
+   whatever the tree holds when you read this; the classification is the finding.
    **Provenance, stated precisely because the timing decides what this is evidence OF:** the
    auditor sent the same seven-file list as a mid-merge warning, and it arrived **after** the
    merge was committed. So this is **two derivations reaching the same answer without reading
