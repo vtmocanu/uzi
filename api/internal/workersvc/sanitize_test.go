@@ -190,7 +190,7 @@ func TestStripNUL(t *testing.T) {
 func TestClassifyStoreError(t *testing.T) {
 	// The three permanent codes, each measured against the real insert before being
 	// put in the map — see the sanitize.go comment.
-	for _, code := range []string{"22P05", "22P02", "22021"} {
+	for _, code := range []string{"22P05", "22P02", "22021", "22003"} {
 		err := classifyStoreError(&pgconn.PgError{Code: code, Message: "boom"})
 		if !errors.Is(err, ErrUnstorableMessage) {
 			t.Errorf("SQLSTATE %s: not classified as unstorable (%v) — the worker would retry it forever", code, err)
@@ -207,8 +207,8 @@ func TestClassifyStoreError(t *testing.T) {
 		"53100", "53200", "53300", // disk/memory/connection-slot exhaustion
 		"40001", "40P01", "55P03", // serialization, deadlock, lock not available
 		"57014", "57P01", "57P02", "57P03", // cancelled, admin shutdown, crash, cannot connect now
-		"23503",          // FK violation: the run was deleted mid-batch — permanent, but not a payload fault
-		"22001", "22003", // adjacent 22* codes that a range match would have swept up
+		"23503", // FK violation: the run was deleted mid-batch — permanent, but not a payload fault
+		"22001", // the one adjacent 22* code deliberately left out: a length fault the rune caps should prevent
 	} {
 		err := classifyStoreError(&pgconn.PgError{Code: code, Message: "boom"})
 		if errors.Is(err, ErrUnstorableMessage) {

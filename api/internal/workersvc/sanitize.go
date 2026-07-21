@@ -203,15 +203,30 @@ func hex4(b []byte) (rune, bool) {
 }
 
 // unstorableSQLSTATEs are the Postgres error codes that mean "this value can
-// never be stored", as opposed to "try again". ENUMERATED, deliberately, and not
-// matched as a 22* range: 22001 (string too long) and 22003 (numeric out of
-// range) live in the same class and are neither this bug nor necessarily
-// permanent for a re-shaped batch. Each was MEASURED on postgres:17 against the
-// real insert, not read off a table:
+// never be stored", as opposed to "try again". ENUMERATED, deliberately, and
+// never matched as a 22* range. Each was MEASURED on postgres:17 against the real
+// insert, not read off a table:
 //
 //	22P05  unsupported Unicode escape sequence  — the six-byte u0000 escape in jsonb
 //	22P02  invalid input syntax for type json   — an unpaired surrogate escape in jsonb
 //	22021  invalid byte sequence for encoding   — raw invalid UTF-8, in jsonb OR in a text column
+//	22003  value overflows numeric format       — a JSON number past numeric's exponent range
+//
+// 22003 is FOUR rather than the PRD's three, added deliberately (M9a records the
+// divergence). `{"n":1e1000000}` is json.Valid, survives every class the sanitizer
+// strips, and jsonb stores numbers as `numeric` — so it is permanently
+// unstorable, and leaving it on the retry path would have shipped a demonstrated
+// poison pill that falsifies the PRD's own Success Criterion 2. It is permanent by
+// CONSTRUCTION and not by circumstance: the failure is determined by the value,
+// not by the environment, so there is no reading of it under which a retry could
+// succeed. The codebase already agreed before this PRD — see the maxCostUSD
+// comment in service.go, which clamps precisely to keep 22003 out of the fold for
+// exactly this reason.
+//
+// 22001 (string too long) is its neighbour and stays OUT. It is a length fault the
+// rune caps above are supposed to make impossible, so if it ever fires we want the
+// 500 and the noise rather than a quiet 400 that files it away as the worker's
+// problem.
 //
 // EVERYTHING ELSE STAYS ON THE 500 PATH, and that is not a leftover — it is the
 // mirror-image bug and it is worse. Misclassifying a transient failure as
@@ -225,6 +240,7 @@ var unstorableSQLSTATEs = map[string]bool{
 	"22P05": true,
 	"22P02": true,
 	"22021": true,
+	"22003": true,
 }
 
 // classifyStoreError tags a store error as permanently unstorable when its

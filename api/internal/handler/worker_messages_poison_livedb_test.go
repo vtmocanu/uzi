@@ -44,6 +44,11 @@ import (
 //	jsonb, a lone surrogate escape ........ SQLSTATE 22P02 invalid input syntax for type json
 //	jsonb, a raw 0xff byte ................ SQLSTATE 22021 invalid byte sequence for encoding "UTF8"
 //	text  (agent_label), a raw NUL byte ... SQLSTATE 22021 invalid byte sequence for encoding "UTF8"
+//	jsonb, 1e1000000 ...................... SQLSTATE 22003 value overflows numeric format
+//
+// The last one is not sanitizable — jsonb stores numbers as `numeric` and there is
+// no benign rewriting of an out-of-range one — so it is closed by the status code
+// alone, which is the case the 400 mapping exists for.
 //
 // all four surfacing as HTTP 500. A batch over the 1 MiB body cap was a 400 —
 // the second poison trigger, and the class change that disarms a "same error
@@ -518,7 +523,7 @@ func TestWorkerMessagesUnstorableStoreErrorReturns400(t *testing.T) {
 // a healthy run that would have succeeded on the next attempt. These must all
 // stay on the retry path.
 func TestWorkerMessagesTransientStoreErrorStays500(t *testing.T) {
-	for _, code := range []string{"08006", "53300", "40P01", "57014", "23503", "22003"} {
+	for _, code := range []string{"08006", "53300", "40P01", "57014", "23503", "22001"} {
 		rec := postToFakeStore(t, &pgconn.PgError{Code: code, Message: "boom"})
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("SQLSTATE %s: status = %d, want 500 — classifying a retryable failure as permanent "+
@@ -532,30 +537,71 @@ func TestWorkerMessagesTransientStoreErrorStays500(t *testing.T) {
 	}
 }
 
-// A MEASURED residual, pinned so it is visible in the suite rather than only in a
-// report. jsonb stores numbers as `numeric`, so a literal past numeric's exponent
-// range (measured: 1e1000000, SQLSTATE 22003 "value overflows numeric format")
-// is permanently unstorable, survives every class the sanitizer strips, and is
-// NOT in the enumerated 400 set — so it still answers 500 and a worker still
-// retries it forever.
+// A jsonb numeric overflow: json.Valid, survives every class the sanitizer
+// strips, and permanently unstorable because jsonb stores numbers as `numeric`
+// (measured: 1e1000000, SQLSTATE 22003 "value overflows numeric format").
 //
-// That is a deliberate scope decision, not an oversight: 22003 also covers
-// genuinely re-shapeable failures, and the PRD enumerates exactly three codes.
-// This test asserts TODAY'S behaviour so that changing it is a decision someone
-// makes, with this test's failure as the prompt — and so the residual cannot be
-// mistaken for "the class is closed".
-func TestWorkerMessagesNumericOverflowIsAResidual500LiveDB(t *testing.T) {
+// This test previously asserted 500 and named itself a residual — the enumerated
+// set was the PRD's three and this fell outside it. That shipped a demonstrated
+// poison pill still on the retry-forever path, which falsifies the PRD's own
+// Success Criterion 2, so the set is four and this is now a 400. The failure below
+// is deliberately the mirror of what the old one said, so the next reader can see
+// which way the decision went rather than only that it was made.
+func TestWorkerMessagesNumericOverflowReturns400LiveDB(t *testing.T) {
 	f := newPoisonFixture(t)
 	body := []byte(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"n":1e1000000}}]}`)
 
 	rec := f.post(t, body)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("a jsonb numeric overflow: status = %d, want 500 — if this is now 400, the enumerated "+
-			"SQLSTATE set was widened past the PRD's three (22P05/22P02/22021) and this residual is "+
-			"closed; delete this test and say so in the PRD. %s", rec.Code, f.diagnose(t, body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a jsonb numeric overflow: status = %d, want 400 — 22003 is permanent by construction "+
+			"(the value determines the failure, not the environment), so a 500 tells the worker to retry "+
+			"a batch that can never land. %s", rec.Code, f.diagnose(t, body))
 	}
 	if n := f.lastSeq(t); n != 0 {
 		t.Errorf("runs.last_seq = %d after a rejected batch, want 0", n)
+	}
+}
+
+// The ordering claim the whole classifier placement rests on, made mechanical
+// rather than left as an assertion in a comment.
+//
+// foldRunUsage inserts a MODEL NAME into run_usage.model, and that name is a JSON
+// object key decoded out of the worker's own payload — a second text sink on this
+// path, reached after the insert. It is safe only because sanitation writes
+// through the index (m := &msgs[i]) in a pass that completes BEFORE foldRunUsage
+// iterates msgs, so the fold reads bytes that have already been cleaned. If that
+// ordering ever inverts, this route grows a second permanent wedge in a place no
+// other test looks.
+//
+// A model name carrying the u0000 escape is the probe: unsanitized it reaches
+// Postgres as a real NUL and the fold raises 22021; sanitized it lands clean.
+func TestWorkerMessagesUsageFoldSeesSanitizedModelNamesLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"messages":[{"seq":1,"kind":"status","agent":"lead","payload":{` +
+		`"event":"result","modelUsage":{"claude-a` + poisonNulEsc + `b":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}}}}]}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	// A precondition, not the assertion: this only says the batch persisted at all.
+	// It cannot distinguish the insert from the fold — both read m.Payload, so
+	// either one rejecting shows up here identically — which is why the message
+	// names neither and the real claim is the column read below.
+	if rec := f.post(t, body); rec.Code != http.StatusNoContent {
+		t.Fatalf("a result frame whose MODEL NAME carries a u0000 escape did not persist: status = %d, "+
+			"want 204. Some sink on this path read the payload before sanitation; the column check below "+
+			"is what would have told them apart. %s", rec.Code, f.diagnose(t, body))
+	}
+	// THE assertion, and the only one specific to the fold: run_usage.model exists
+	// solely because foldRunUsage ran, and its contents are what that call inserted.
+	var model string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT model FROM run_usage WHERE run_id = $1`, f.runID).Scan(&model); err != nil {
+		t.Fatalf("no run_usage row for this run (%v) — the fold never ran, so this test measured "+
+			"nothing about the ordering it exists to pin", err)
+	}
+	if want := "claude-ab"; model != want {
+		t.Errorf("run_usage.model = %q (% x), want %q — foldRunUsage read the payload as it arrived "+
+			"rather than as sanitation left it, so run_usage.model is a second unstorable sink on this "+
+			"path and the strip is not covering it", model, model, want)
 	}
 }
 
@@ -621,9 +667,9 @@ func TestWorkerMessagesPartialBatchAdvancesLastSeqLiveDB(t *testing.T) {
 		`{"seq":2,"kind":"text","agent":"lead","payload":{"t":"two"}},` +
 		`{"seq":3,"kind":"text","agent":"lead","payload":{"n":1e1000000}}]}`)
 
-	if rec := f.post(t, body); rec.Code != http.StatusInternalServerError {
-		t.Fatalf("a batch whose third message the database refuses: status = %d, want 500 — %s",
-			rec.Code, f.diagnose(t, body))
+	if rec := f.post(t, body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a batch whose third message the database refuses: status = %d, want 400 (22003 is in "+
+			"the enumerated permanent set) — %s", rec.Code, f.diagnose(t, body))
 	}
 	// The first two really did commit: that is what makes the stale mark harmful
 	// rather than merely untidy, so assert it rather than assume it.
