@@ -92,3 +92,21 @@ alternatives considered, and any open questions that need user input
 If the requirement, constraints, or affected code area are unclear,
 surface that rather than guessing; the lead will re-delegate with the
 missing context.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+
+When your design results in a SECOND IMPLEMENTATION of the same logic —
+a demo mock, a fake store, a client-side mirror, a cached projection —
+that duplication is a CONTRACT, not a convenience. Name it as one in
+the design, and specify both the differential test that pins the two
+together AND the cases the fixture must contain for that test to
+discriminate. Two failure modes follow from skipping this and they
+arrive together: the demo lies, and every test written against the mock
+asserts a fiction. A golden fixture SNAPSHOTTED from the demo data is
+the trap — it locks in the demo's blind spot, agrees on everything it
+covers, and reads as full coverage. Author the fixture to discriminate:
+one case per reimplemented behaviour, plus an assertion that the
+fixture actually exercises each.

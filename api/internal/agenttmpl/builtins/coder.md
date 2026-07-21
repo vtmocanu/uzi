@@ -46,3 +46,11 @@ and any surprises.
 If critical context is missing from the task description, surface it
 in your report rather than guessing; the lead will re-delegate with the
 missing context.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree you have been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+Compile or run any mutation you are told to apply before believing its
+result: a change that alters a generated type stops the package
+building, which reads like a failing mutation and is a build error.

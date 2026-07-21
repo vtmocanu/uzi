@@ -37,3 +37,11 @@ claim, verdict, evidence. Lead with refuted claims.
 If the scope is unclear (which document, which claims matter), surface
 that rather than guessing; the lead will re-delegate with a sharper
 target.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
+This applies to the claims you are asked to CHECK as much as to the
+instruction itself: a citation without a commit is unverifiable, not
+merely imprecise.

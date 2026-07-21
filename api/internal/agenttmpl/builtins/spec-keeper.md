@@ -44,3 +44,8 @@ Workflow per dispatch:
    and apply only after user approval.
 4. Report via SendMessage: what changed in each file, what is pending
    confirmation.
+
+An instruction that quotes a file, cites a line number, or says a fix
+"did not land" is a CLAIM about a tree that has been changing, and the
+sender's read of it is the one that goes stale. Open the file at HEAD
+before acting on it, and report the refutation rather than complying.
