@@ -16,6 +16,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       adminListRuns: vi.fn(),
       adminListWorkers: vi.fn(),
+      // Defined but never expected to fire. PRD #98 Decision 7 removed the aggregate strip
+      // from this page, and the strip's fetch went with it — see the removal test below,
+      // which can only assert that against a mock that EXISTS.
+      getJudgeStats: vi.fn().mockResolvedValue({
+        total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0,
+      }),
     },
   };
 });
@@ -211,7 +217,14 @@ describe("RunsList — global judge-triage strip removed (PRD #98 Decision 7)", 
 
     await waitFor(() => expect(screen.getByText("A run")).toBeTruthy());
     expect(screen.queryByText("Judge recommendations · all your runs")).toBeNull();
-    // The strip's fetch is gone entirely — RunsList must not call getJudgeStats.
-    expect((mockApi as unknown as { getJudgeStats?: unknown }).getJudgeStats).toBeUndefined();
+    // The strip's fetch is gone entirely — RunsList must not CALL getJudgeStats.
+    //
+    // This used to assert `getJudgeStats` was `undefined`, which was a property of THIS
+    // FILE'S mock factory rather than of RunsList: it passed whatever the component did
+    // (PRD #98 review N9). The behaviour was in fact defended — re-adding the call blew up
+    // six tests with a TypeError on an undefined mock — but by accident, and with a failure
+    // that named the wrong cause. The mock is now defined, so this asserts the real thing
+    // and a regression reads as "it was called" instead of "undefined is not a function".
+    expect(mockApi.getJudgeStats).not.toHaveBeenCalled();
   });
 })

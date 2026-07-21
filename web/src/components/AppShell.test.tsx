@@ -181,8 +181,15 @@ describe("AppShell navigation", () => {
     mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 12, todo: 7 });
     renderShell("/dashboard");
 
-    // The Judge link's badge shows the to-triage count — the ONE canonical number, so it
-    // agrees with the Judge page's To-triage tab. It reads .todo, never .total.
+    // The Judge link's badge shows the to-triage count — the ONE canonical number, read as
+    // .todo and never .total.
+    //
+    // It does NOT follow from this test that the badge agrees with the Judge page's
+    // To-triage tab, and this comment used to say it did (PRD #98 review BLK-BADGE). Reading
+    // the same number is only half of it: this shell is mounted ALONE, so nothing here can
+    // observe the propagation gap that made the two disagree after a dispose. The agreement
+    // is pinned in JudgeNavBadge.test.tsx, which mounts AppShell and Judge together —
+    // the only configuration in which the bug existed.
     const judge = await screen.findByRole("link", { name: /Judge/ });
     await waitFor(() => expect(judge.textContent).toContain("7"));
     expect(judge.textContent).not.toContain("12");

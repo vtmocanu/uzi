@@ -16,6 +16,7 @@ import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
+import { JudgeTodoContext } from "./JudgeTodoContext";
 import {
   ActivityIcon,
   BellIcon,
@@ -505,8 +506,15 @@ export function AppShell({ children }: { children: ReactNode }) {
   // SidebarContent) and the status favicon, and it survives across routes.
   const [unread, setUnread] = useState(0);
   // Judge to-triage badge (PRD #98). Owned here alongside `unread`, from
-  // /me/judge/stats.todo — the ONE canonical to-triage number, so the nav badge agrees
-  // with the Judge page's To-triage tab and the judge notification.
+  // /me/judge/stats.todo — the ONE canonical to-triage number.
+  //
+  // Reading the same number is necessary but NOT sufficient for the badge to agree with the
+  // Judge page's To-triage tab, and this comment used to claim otherwise (PRD #98 review
+  // BLK-BADGE, measured: after a dispose the nav read 3 while the tab read 0). The poll
+  // below fires on `[user, location.pathname]`, and a disposition changes neither — nor does
+  // switching bucket tabs, which rewrites the SEARCH, not the pathname. Agreement therefore
+  // needs a propagation channel as well as a shared source: JudgeTodoContext publishes this
+  // setter, and the Judge page pushes the fresh canonical `triage.todo` it already has.
   const [judgeTodo, setJudgeTodo] = useState(0);
   // Desktop sidebar collapse, persisted per browser. Initialised lazily from
   // localStorage so the first paint already matches the stored state — a
@@ -635,7 +643,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
           <VaultLockedBanner />
-          {children}
+          <JudgeTodoContext.Provider value={setJudgeTodo}>{children}</JudgeTodoContext.Provider>
         </div>
       </main>
     </div>

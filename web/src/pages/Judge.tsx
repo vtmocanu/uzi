@@ -31,14 +31,16 @@ import {
   bucketTabCount,
   bucketTabLabel,
   JUDGE_BUCKETS,
-  recentVerdictTrend,
+  verdictTrend,
   rollupLabel,
   rollupTone,
   seenInRunsLabel,
 } from "../lib/judgeBacklog";
-import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { coordKey, recommendationLabel } from "../lib/judge";
+import { judgeBadge } from "../lib/judgeBadge";
 import { TriageSummary } from "./RunView";
 import { OccurrenceFileIssue } from "../components/OccurrenceFileIssue";
+import { useSetJudgeTodo } from "../components/JudgeTodoContext";
 import {
   Alert,
   Badge,
@@ -105,6 +107,10 @@ export function Judge() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<Toast | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Publishes the canonical to-triage count to the nav badge. A no-op when this page is
+  // mounted outside an AppShell (every unit test does that), which is exactly why the
+  // BLK-BADGE regression test mounts the two TOGETHER — apart, both are already correct.
+  const setJudgeTodo = useSetJudgeTodo();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -112,12 +118,18 @@ export function Judge() {
     try {
       const data = await api.getJudgeBacklog(bucket, runAnchor || undefined);
       setBacklog(data);
+      // Keep the nav badge in step with every canonical triage this page learns, not only
+      // the ones a disposition produces (PRD #98 review BLK-BADGE). `triage` here IS the
+      // /me/judge/stats aggregate — the server sources it from that query rather than
+      // tallying the returned rows — so this publishes the same number the badge's own poll
+      // would fetch, without the round-trip.
+      setJudgeTodo(data.triage.todo);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load the backlog");
     } finally {
       setLoading(false);
     }
-  }, [bucket, runAnchor]);
+  }, [bucket, runAnchor, setJudgeTodo]);
 
   useEffect(() => {
     // Selection is keyed on coordinates that may not survive a reload; drop it whenever
@@ -160,9 +172,18 @@ export function Judge() {
     setSearchParams(next, { replace: true });
   };
 
+  // Clearing the run anchor must not silently change the BUCKET (PRD #98 review N5). The
+  // default is derived — anchored defaults to `all`, un-anchored to `todo` (Decision 1's
+  // deliberate exception) — so dropping `run` from a URL that never pinned `bucket` snaps the
+  // view from All back to To triage. The user asked to stop filtering by run, not to change
+  // which rung they are looking at, and rows would vanish under them.
+  //
+  // Pinning the CURRENT bucket explicitly preserves what is on screen. It also makes the
+  // resulting URL self-describing, which the derived-default form is not.
   const clearRunAnchor = () => {
     const next = new URLSearchParams(searchParams);
     next.delete("run");
+    next.set("bucket", bucket);
     setSearchParams(next, { replace: true });
   };
 
@@ -194,6 +215,11 @@ export function Judge() {
             truncated: prev.truncated || res.truncated,
           };
         });
+        // The nav badge moves with the tab, in the SAME round-trip. Without this the two
+        // silently disagreed after every dispose: AppShell polls on pathname changes, and a
+        // disposition is not one (BLK-BADGE). The response already carries the canonical
+        // aggregate, so there is nothing to re-fetch.
+        setJudgeTodo(res.triage.todo);
         setSelected(new Set());
         const verb = status === "done" ? "marked done" : "dismissed";
         showToast({
@@ -218,7 +244,7 @@ export function Judge() {
         setActionErr(e instanceof ApiError ? e.message : "Could not apply the disposition");
       }
     },
-    [backlog, showToast],
+    [showToast, setJudgeTodo],
   );
 
   const undo = useCallback(async () => {
@@ -408,8 +434,21 @@ export function Judge() {
   );
 }
 
+// isBucket validates the ?bucket= search param, and it is THE ONE client-side bucket site
+// TypeScript does not guard (PRD #98 review N7, found independently by both validators).
+//
+// Everywhere else the compiler does the work for free: those fields are typed as the literal
+// union JudgeBacklogBucket, so a drifted spelling is a TS2367 "no overlap" error, and
+// judgeBacklog.ts's Record<JudgeBacklogBucket, …> maps plus its exhaustive switch fail to
+// compile if a rung is added or renamed. This function is different only because its input
+// is `string | null` — a raw URL param — so every comparison is legal against any string and
+// a drift here fails SILENTLY, rendering an empty list rather than erroring.
+//
+// Deriving the check from JUDGE_BUCKETS removes the hand-copied union: the array is already
+// typed JudgeBacklogBucket[], so adding a rung to the type without adding it here is a
+// compile error at the array, and the validator follows automatically.
 function isBucket(v: string | null): v is JudgeBacklogBucket {
-  return v === "todo" || v === "filed" || v === "done" || v === "dismissed" || v === "all";
+  return v !== null && (JUDGE_BUCKETS as readonly string[]).includes(v);
 }
 
 // GroupRow is one deduped (category, target) row: the category + target header, the "seen
@@ -586,7 +625,7 @@ function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: R
         >
           {occ.run_title || "Untitled run"}
         </Link>
-        <Badge tone={verdictTone(occ.verdict)}>{verdictLabel(occ.verdict)}</Badge>
+        <OccurrenceVerdictBadge occ={occ} />
         <OccurrenceBucketChip occ={occ} />
       </div>
       {/* Filing stays per-recommendation via the existing #68 browser draft (Decision 3):
@@ -598,6 +637,34 @@ function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: R
         <OccurrenceFileIssue runId={occ.run_id} recId={occ.rec_id} repos={repos} onFiled={onFiled} />
       ) : null}
     </li>
+  );
+}
+
+// OccurrenceVerdictBadge renders the run's judge verdict in the ONE grammar the product
+// uses for that fact: `⚖ issues · 2`, exactly as /runs renders it (PRD #98 review N8).
+//
+// It previously rendered `<Badge>{verdictLabel(occ.verdict)}</Badge>` → "Issues found",
+// which is a SECOND grammar for the same fact on a different screen. Collapsing the mock's
+// two grammars into one was a load-bearing correction earlier in this PRD, and that is
+// precisely the regression this reintroduced.
+//
+// It reuses judgeBadge() rather than re-deriving the label, which is why JudgeBadgeable is a
+// structural subset (`{judge_verdict, judge_todo_count}`) instead of taking RunListItem —
+// the type was made that shape SO this page could pass an occurrence-shaped object.
+//
+// judge_todo_count is 0 here on purpose. M4's badge counts a RUN's open recommendations, and
+// an occurrence is a single coordinate, not a run — synthesising a count would state a
+// number this DTO does not carry. judgeBadge drops the count entirely at 0, so the label is
+// the bare `⚖ issues`: the same grammar, minus a claim we cannot make.
+function OccurrenceVerdictBadge({ occ }: { occ: JudgeOccurrence }) {
+  const badge = judgeBadge({ judge_verdict: occ.verdict, judge_todo_count: 0 });
+  // Unreachable while the DTO types verdict as a non-null enum; judgeBadge returns null only
+  // for an unjudged run, and an occurrence exists because a review produced it.
+  if (!badge) return null;
+  return (
+    <Badge tone={badge.tone} title={badge.title}>
+      {badge.label}
+    </Badge>
   );
 }
 
@@ -803,7 +870,12 @@ function ZeroState({ judgeEnabled }: { judgeEnabled: boolean }) {
     };
   }, []);
 
-  const trend = all ? recentVerdictTrend(all.groups) : null;
+  const trend = all ? verdictTrend(all.groups) : null;
+  // Settled groups, MOST RECURRENT first — the order the server already sorted by
+  // (run_count DESC), not a recency order. The heading below says so. Calling this
+  // "Recently handled" was a claim the code never made: nothing here has a timestamp to sort
+  // by, and slicing the first 6 of a frequency-sorted list yields the most FREQUENT
+  // (PRD #98 review N6).
   const settled = (all?.groups ?? [])
     .filter((g) => g.bucket === "done" || g.bucket === "filed")
     .slice(0, 6);
@@ -838,7 +910,7 @@ function ZeroState({ judgeEnabled }: { judgeEnabled: boolean }) {
 
       {trend && trend.total > 0 && (
         <Card className="space-y-2 p-4">
-          <SectionTitle>Recent verdicts</SectionTitle>
+          <SectionTitle>Verdicts across your judged runs</SectionTitle>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
             <VerdictCount label="ideal" n={trend.ideal} tone="ok" />
             <VerdictCount label="ok" n={trend.ok} tone="info" />
@@ -850,7 +922,7 @@ function ZeroState({ judgeEnabled }: { judgeEnabled: boolean }) {
 
       {settled.length > 0 && (
         <Card className="space-y-2 p-4">
-          <SectionTitle>Recently handled</SectionTitle>
+          <SectionTitle>Settled — most recurrent first</SectionTitle>
           <ul className="space-y-1.5">
             {settled.map((g) => (
               <li key={coordKey(g.category, g.target)} className="flex flex-wrap items-center gap-2 text-sm">

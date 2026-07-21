@@ -345,6 +345,71 @@ describe("Judge — truncation is surfaced, never rendered as authoritative (PRD
   });
 });
 
+// PRD #98 review N10. RunsList.test.tsx pins that the aggregate strip is GONE from /runs;
+// nothing pinned that it ARRIVED here, so "the count is never homeless" was only half
+// enforced — a removal test and an arrival test are different claims, and deleting this
+// header would have left the first one green.
+describe("Judge — the aggregate triage strip has a home here (PRD #98 Decision 7 / N10)", () => {
+  it("renders the all-runs triage summary in the page header", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [group()],
+        triage: { total: 12, todo: 5, filed: 2, done: 3, dismissed: 2, false_positives: 1 },
+      }),
+    );
+    renderJudge();
+
+    // The strip's own title, moved from /runs to here.
+    expect(await screen.findByText(/Recommendations · all your runs/)).toBeTruthy();
+    // And it renders the CANONICAL aggregate, not a tally of the rows on screen.
+    expect(screen.getByText("all time")).toBeTruthy();
+  });
+});
+
+describe("Judge — one grammar for the verdict fact (PRD #98 review N8)", () => {
+  it("renders an occurrence verdict as `⚖ issues`, the same grammar /runs uses", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({ groups: [group()], triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 } }),
+    );
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+
+    // The shared judgeBadge() grammar — the scale glyph plus the raw verdict enum.
+    expect(screen.getAllByText(/⚖ issues/).length).toBeGreaterThan(0);
+    // NOT the second grammar this page had reintroduced. `verdictLabel` renders
+    // "Issues found"; two grammars for one fact is the regression.
+    expect(screen.queryByText("Issues found")).toBeNull();
+  });
+});
+
+describe("Judge — clearing the run filter keeps the bucket (PRD #98 review N5)", () => {
+  it("does not silently snap an anchored `all` view back to To triage", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        bucket: "all",
+        groups: [group({ bucket: "done", open_count: 0 })],
+        triage: { total: 3, todo: 0, filed: 0, done: 3, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    // An anchored deep-link with no explicit bucket: the default derives to `all`
+    // (Decision 1's deliberate exception for notification links).
+    render(
+      <MemoryRouter initialEntries={["/judge?run=run-1"]}>
+        <Judge />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("all", "run-1"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Clear filter/ }));
+
+    // Still `all`. Dropping the anchor used to re-derive the default to `todo`, so the rows
+    // the user was looking at vanished — they asked to stop filtering by run, not to change
+    // which rung they were on.
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("all", undefined));
+  });
+});
+
 describe("Judge — an auto-done is visibly distinct from a hand-marked done (PRD #98 D6/B3)", () => {
   // The whole point of set_via is that "I decided this was done" and "the system inferred it
   // from a closed issue" are DIFFERENT claims. So the load-bearing assertion is that the two
@@ -440,7 +505,11 @@ describe("Judge — inbox-zero is a first-class view (PRD #98 Decision 8)", () =
     expect(await screen.findByText(/Inbox zero/i)).toBeTruthy();
     expect(screen.getByText(/judge is off for your account/i)).toBeTruthy();
     // Recent-verdict trend rendered from the all-bucket snapshot.
-    await waitFor(() => expect(screen.getByText("Recent verdicts")).toBeTruthy());
+    // Heading renamed by PRD #98 review N6: the tally is ALL TIME (no recency window
+    // exists — the occurrence DTO carries no disposition timestamp), so the label may not
+    // say "Recent".
+    await waitFor(() => expect(screen.getByText("Verdicts across your judged runs")).toBeTruthy());
+    expect(screen.queryByText(/^Recent/)).toBeNull();
   });
 });
 

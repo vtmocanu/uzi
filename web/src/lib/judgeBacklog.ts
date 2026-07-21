@@ -86,8 +86,8 @@ export function seenInRunsLabel(runCount: number): string {
   return `seen in ${runCount} ${runCount === 1 ? "run" : "runs"}`;
 }
 
-// VerdictTrend is the zero-state's "recent verdicts" summary: a per-verdict count over
-// the DISTINCT runs the caller has judged. Distinct-by-run because a run carries one
+// VerdictTrend is the zero-state's verdict summary: a per-verdict count over the DISTINCT
+// runs the caller has judged, ALL TIME. Distinct-by-run because a run carries one
 // verdict (its review's), while a group lists it once per occurrence — tallying raw
 // occurrences would over-count a verdict for every recommendation it recurred in.
 export interface VerdictTrend {
@@ -97,10 +97,16 @@ export interface VerdictTrend {
   total: number;
 }
 
-// recentVerdictTrend tallies each judged run's verdict once, from the occurrences a
-// backlog carries. It reads a closed enum (verdict), never free text. Fed the bucket=all
-// snapshot on the zero-state so it reflects the whole history, not the (empty) todo view.
-export function recentVerdictTrend(groups: JudgeRecommendationGroup[]): VerdictTrend {
+// verdictTrend tallies each judged run's verdict once, from the occurrences a backlog
+// carries. It reads a closed enum (verdict), never free text. Fed the bucket=all snapshot on
+// the zero-state so it reflects the whole history, not the (empty) todo view.
+//
+// It was called recentVerdictTrend, and the name asserted something the body contradicts two
+// lines down: there is no recency window here, and there could not be — the occurrence DTO
+// carries no disposition timestamp, so nothing on this page can order by when (PRD #98
+// review N6). Renamed rather than given a fake window, and the zero-state heading changed to
+// match. A label that overstates what it measures is worse than a plainer one.
+export function verdictTrend(groups: JudgeRecommendationGroup[]): VerdictTrend {
   const byRun = new Map<string, ReviewVerdict>();
   for (const g of groups) {
     for (const occ of g.occurrences) {
