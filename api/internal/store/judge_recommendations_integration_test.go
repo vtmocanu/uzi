@@ -797,11 +797,15 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// fixture gained assertions in between. An assertion COUNT drifts exactly like a line
 	// number.
 	//
-	// THE GENERAL RULE is in CLAUDE.md's api section — sqlc types by EXPRESSION, and the
-	// differentiator is whether it can RESOLVE a type, not nullability. TWO shapes compile: a
-	// nullable neighbour column off the LEFT JOIN, or any expression with an EXPLICIT CAST to
-	// the column's type. Prefer the neighbour, for the selectivity reason above. A fold
-	// prescribed in a comment is a BUILD-CHECKABLE claim; build it before you prescribe it.
+	// THE GENERAL RULE IS IN CLAUDE.md's api section — read it there rather than trusting a
+	// restatement here, because this paragraph has now been wrong THREE times and each version
+	// sounded more authoritative than the last. It credited the wrong fold, then blamed
+	// nullability, then claimed "any expression with an explicit cast" works — which is also
+	// false: `'x'::text` has a cast and does NOT compile, because sqlc types a literal as NOT
+	// NULL cast or no cast, while it types a function result as nullable. The reliable shape
+	// is ANOTHER NULLABLE COLUMN OFF THE SAME LEFT JOIN, and it is also the SELECTIVE one for
+	// the reason above. Everything else must be COMPILED before it is believed — which is the
+	// actual rule, and the one this comment's own history is the argument for.
 	if hand.FiledAt.Valid {
 		t.Errorf("a coordinate with NO filed row anywhere carries filed_at %v — the projection is "+
 			"not reading the joined filed row", hand.FiledAt.Time)
@@ -863,10 +867,20 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 //	drop `f.category = rr.category`               RED at the runFC assertion
 //	drop `d.target = rr.target`                   RED at the runDT assertion
 //	drop `d.category = rr.category`               RED at the runDC assertion
-//	drop `f.review_id = rv.id`                    RED — row-count, then four more
-//	drop `d.review_id = rv.id`                    RED — row-count, then five more
+//	drop `f.review_id = rv.id`                    RED — row-count fan-out, then more
+//	drop `d.review_id = rv.id`                    RED — row-count fan-out, then more
 //	`d.status` -> `d.dismiss_reason`              RED at the runDT/runDC VALUE assertions
 //	`(f.filed_at ...)` -> `(f.id IS NOT NULL)`    RED at the runCL claimed assertion
+//
+// 🔴 THE TWO review_id RESULTS ARE AN ACCIDENT OF THIS FIXTURE — DO NOT TIDY IT AWAY. They
+// redden only because runFT/runFC both hold a filed row on the SAME coordinate (catA,tgt1),
+// and runDT/runDC both hold a disposition on it, so dropping a review_id half lets one
+// recommendation match several side rows and the join FANS OUT — caught by the row-count
+// assertion, not by any coverage designed for it. The query's own comment claims "neither
+// side-table join can fan out: both are UNIQUE on the coordinate", which is true ONLY because
+// the join uses all three columns of that unique key; drop review_id and it runs on a
+// NON-UNIQUE prefix. Giving each run its own coordinates would look like tidying and would
+// SILENTLY DELETE this coverage.
 //
 // MUTATIONS MUST BE BODY-SCOPED, and this is not a formality: the two joins are BYTE-
 // IDENTICAL between this body and ListJudgeRecommendationRowsForUser above, so a text-based
