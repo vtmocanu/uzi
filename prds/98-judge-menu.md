@@ -1627,11 +1627,23 @@ swapping two **arguments at main's call site** (`cmd/server/main.go:566`, signat
 **built clean and passed the entire suite** while forge routes ran on the auth budget in
 production. Two `go/ast` parses now pin signature order and call-site order; measured, the
 call-site swap makes exactly one test in the whole api suite fail.
-**THE RESIDUAL IS REAL AND REMAINS OPEN — measured, not reasoned.** Swapping the budgets at
-*construction* (`main.go:483-484`), so `authLimiter` is built with the forge budget and vice versa,
-**names untouched**: `BUILD OK`, `go test ./...` exit 0, 41 packages, zero failures. Every link the
-branch pins holds — budget→name, name→signature, signature→call — and the server still runs forge
-routes on the auth budget. **The chain is pinned from the mount inward and unpinned at its source.**
+**THE RESIDUAL WAS REAL AND IS NOW CLOSED — and this entry said "remains open" for about an hour
+after it stopped being true.** As measured by the auditor, swapping the budgets at *construction*
+(`main.go:483-484`), names untouched, gave `BUILD OK` and `go test ./...` exit 0 across 41
+packages: every link then pinned — budget→name, name→signature, signature→call — while the server
+ran forge routes on the auth budget. **`8ce7ba50` closes it** with a fourth parse,
+`TestEachLimiterIsBuiltFromItsOwnConfigField`, reading each `x := mw.NewLimiter(cfg.Y, …)` out of
+main and comparing against an exact declared table (`limiterConfigFields`, verified present with
+all eight entries). The auditor's fold re-run verbatim at the new tip now fails, naming **both**
+sides: *"main builds authLimiter from cfg.ForgeRateLimitMax, but limiterConfigFields declares
+cfg.RateLimitMax"*.
+**Do not carry "unpinned at its source" forward — it is pinned to the cfg field.** What remains is
+one step further out and **unpinnable by any test**: that `cfg.ForgeRateLimitMax` is the *right*
+number. It could be `1` or `10000` and all four tests stay green. That is a product judgement, and
+the chain honestly stops at the name.
+*(Recorded because it is the same failure this PRD keeps finding: a follow-up entry that outlived
+the fix, in the document a resuming session reads first. The fix landed, the entry did not move,
+and the implementer had to tell the lead.)*
 The shape is the lesson: *each of these tests pins a correspondence between two NAMES, and the one
 thing no name-correspondence can see is whether a name was bound to the right value in the first
 place.*
