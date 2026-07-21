@@ -295,7 +295,11 @@ model); this section is the map. User-facing usage is
 
 `user_secrets` is a generic, kind-keyed table (`kind` currently only
 `anthropic_token`, `CHECK`-constrained so a new kind is one migration, not a
-new table) holding one AES-256-GCM-sealed secret per `(user, kind)`. The
+new table) holding AES-256-GCM-sealed per-user secrets. A user may hold
+**several** secrets of one kind, each under a label they chose, exactly one of
+which is flagged `is_default` — the one every unbound consumer resolves
+(PRD #104). It held exactly one per `(user, kind)` until migration `00077`
+dropped the unique constraint that said so. The
 `secretbox` package (`api/internal/secretbox/`) wraps `Seal`/`Open` around a
 single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
 (refusing to start if it is missing, malformed, or a low-entropy placeholder)
