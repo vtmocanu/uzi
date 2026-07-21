@@ -158,11 +158,13 @@ export class RunRunner {
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
     // Same secret set for both redactors: the batcher scrubs run_message payloads;
-    // redactText scrubs strings that reach the API outside a payload (failure_reason).
+    // redactText scrubs strings that reach the API outside a payload (failure_reason,
+    // and the PRD #99 agent_label/agent_instance the batcher now carries alongside
+    // the payload — `redact` walks inside a payload object and never sees them).
     const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken, gitBasic];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
+    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText);
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
     // steering channel, which the executor's ctx.signal watches.

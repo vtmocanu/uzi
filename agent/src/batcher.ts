@@ -2,7 +2,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { EmittedMessage } from "./executor.js";
 import type { OutgoingMessage } from "./protocol.js";
-import type { PayloadRedactor } from "./redact.js";
+import type { PayloadRedactor, TextRedactor } from "./redact.js";
 import { errMessage, sleep } from "./util.js";
 
 /**
@@ -27,6 +27,16 @@ export class MessageBatcher {
 
   /** Scrubs known secrets from every payload before it leaves the worker. */
   private readonly redact: PayloadRedactor;
+  /**
+   * Scrubs known secrets from the top-level STRING fields that ride beside the
+   * payload. `redact` walks a payload object and never sees its siblings, so
+   * without this an `agent_label` — free, model-authored prose (PRD #99) — would
+   * reach Postgres, the /api/ws frame, the browser and `uzi run logs` unscrubbed.
+   * That is precisely the class redact.ts exists for: the OAuth token lives in
+   * the agent subprocess env as CLAUDE_CODE_OAUTH_TOKEN, and payload scrubbing is
+   * the defense-in-depth net behind the guardrails' credential-read denial.
+   */
+  private readonly redactText: TextRedactor;
 
   constructor(
     private readonly client: WorkerClient,
@@ -35,9 +45,11 @@ export class MessageBatcher {
     private readonly batchMs: number,
     private readonly log: Logger,
     redact?: PayloadRedactor,
+    redactText?: TextRedactor,
   ) {
     this.seq = lastSeq;
     this.redact = redact ?? ((p) => p);
+    this.redactText = redactText ?? ((s) => s);
   }
 
   emit(msg: EmittedMessage): void {
@@ -47,6 +59,15 @@ export class MessageBatcher {
     // if a tool_result echoed the OAuth token from the agent's env.
     const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: this.redact(msg.payload) };
     if (msg.agent !== undefined) out.agent = msg.agent;
+    // PRD #99: copied the same way as `agent` — present only when the frame had
+    // them, so the API's pgText("") maps absence to SQL NULL rather than "".
+    // Both go through redactText: they are top-level siblings of the payload, so
+    // `redact` (which walks INSIDE a payload object) never touches them.
+    // agent_label is the one that matters — free model-authored prose. An
+    // SDK-minted `toolu_*` id cannot hold a secret, but it is scrubbed too so the
+    // treatment is symmetric and a future id format cannot re-open the hole.
+    if (msg.agentInstance !== undefined) out.agent_instance = this.redactText(msg.agentInstance);
+    if (msg.agentLabel !== undefined) out.agent_label = this.redactText(msg.agentLabel);
     // Every outgoing run message passes through here — the single chokepoint for
     // dumping raw frames to the operator's `docker logs` at debug level (PRD #11
     // §4). Log the redacted payload (the child logger's SecretRegistry scrubs the

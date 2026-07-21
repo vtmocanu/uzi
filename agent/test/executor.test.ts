@@ -78,6 +78,47 @@ describe("StubExecutor — PRD #43 M5 interleaved multi-agent stream", () => {
     assert.ok(hasNonAdjacentRepeat, "the script must repeat at least one agent name non-adjacently");
   });
 
+  // PRD #99 M2: the same scripted stream now carries per-instance attribution, so
+  // M3/M5 have a real two-parallel-coders fixture to render and assert against.
+  it("carries two DISTINCT coder instances with distinct labels, non-adjacently", async () => {
+    const wt = makeWorktree();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      issueDescription: `implements prds/43-intra-run-parallel-subagents.md ${STUB_INTERLEAVE_SENTINEL}`,
+    });
+    try {
+      await new StubExecutor(nullLogger()).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+
+    const frames = emitted.filter((m) => typeof (m.payload as Record<string, unknown>).step === "number");
+    const coders = frames.filter((m) => m.agent === "coder");
+    assert.equal(coders.length, 2, "the fixture must have exactly two coder invocations");
+    assert.notEqual(
+      coders[0]?.agentInstance,
+      coders[1]?.agentInstance,
+      "the two coders must be DISTINCT invocations — this is the merge the PRD exists to prevent",
+    );
+    assert.ok(coders[0]?.agentInstance && coders[1]?.agentInstance, "both coder frames must carry an instance id");
+    assert.notEqual(coders[0]?.agentLabel, coders[1]?.agentLabel, "each invocation must be named by its own task");
+
+    // Non-adjacency is the load-bearing property: two CONTIGUOUS coder frames
+    // would render correctly even under today's consecutive-author grouping, so a
+    // contiguous fixture could not catch the bug this PRD fixes.
+    const idxA = frames.indexOf(coders[0]!);
+    const idxB = frames.indexOf(coders[1]!);
+    assert.ok(idxB - idxA > 1, "the two coder invocations must be separated by another agent's frame");
+
+    // The lead is the parentless actor: it carries neither key, which is the NULL
+    // side of the fixture (and what the web's role-name fallback renders).
+    for (const lead of frames.filter((m) => m.agent === "lead")) {
+      const rec = lead as unknown as Record<string, unknown>;
+      assert.ok(!("agentInstance" in rec), "a lead frame must not carry an agentInstance key");
+      assert.ok(!("agentLabel" in rec), "a lead frame must not carry an agentLabel key");
+    }
+  });
+
   it("emits NO scripted frames when the sentinel is absent (no leak into normal runs)", async () => {
     const wt = makeWorktree();
     const { ctx, emitted } = makeCtx({ worktreePath: wt.path });

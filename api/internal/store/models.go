@@ -290,13 +290,15 @@ type Run struct {
 }
 
 type RunMessage struct {
-	ID        int64              `json:"id"`
-	RunID     uuid.UUID          `json:"run_id"`
-	Seq       int32              `json:"seq"`
-	Kind      string             `json:"kind"`
-	Agent     pgtype.Text        `json:"agent"`
-	Payload   []byte             `json:"payload"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID            int64              `json:"id"`
+	RunID         uuid.UUID          `json:"run_id"`
+	Seq           int32              `json:"seq"`
+	Kind          string             `json:"kind"`
+	Agent         pgtype.Text        `json:"agent"`
+	Payload       []byte             `json:"payload"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	AgentInstance pgtype.Text        `json:"agent_instance"`
+	AgentLabel    pgtype.Text        `json:"agent_label"`
 }
 
 type RunReview struct {

@@ -113,11 +113,20 @@ type RunListItemDTO struct {
 // browser reads before going live). Payload is the raw per-kind JSON, forwarded
 // verbatim.
 type MessageDTO struct {
-	Seq       int32           `json:"seq"`
-	Kind      string          `json:"kind"`
-	Agent     *string         `json:"agent"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
+	Seq   int32   `json:"seq"`
+	Kind  string  `json:"kind"`
+	Agent *string `json:"agent"`
+	// AgentInstance is the subagent INVOCATION id (the SDK's per-frame
+	// parent_tool_use_id, PRD #99) and AgentLabel the task description that
+	// invocation was given. Both null when the frame carried no
+	// parent_tool_use_id — the orchestrator's own turns, infra frames, and every
+	// pre-migration message. That is NOT the same as Agent == "lead": a repo may
+	// ship an agent NAMED lead, which is a real subagent and does carry an id.
+	// Consumers fall back to Agent.
+	AgentInstance *string         `json:"agent_instance"`
+	AgentLabel    *string         `json:"agent_label"`
+	Payload       json.RawMessage `json:"payload"`
+	CreatedAt     time.Time       `json:"created_at"`
 }
 
 // RunInputRequest is the POST /api/runs/{id}/inputs body: a steering input

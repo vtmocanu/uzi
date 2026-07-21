@@ -92,7 +92,11 @@ func TestRunListItemDTOTags(t *testing.T) {
 }
 
 func TestMessageDTOTags(t *testing.T) {
-	assertTags(t, "MessageDTO", MessageDTO{}, "seq", "kind", "agent", "payload", "created_at")
+	// agent_instance/agent_label (PRD #99) are NOT omitempty: like agent, the keys
+	// are always on the wire and carry JSON null when absent, so a consumer can
+	// read them unconditionally and fall back on null.
+	assertTags(t, "MessageDTO", MessageDTO{},
+		"seq", "kind", "agent", "agent_instance", "agent_label", "payload", "created_at")
 }
 
 func TestRunInputTags(t *testing.T) {

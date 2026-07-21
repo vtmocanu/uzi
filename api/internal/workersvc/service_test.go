@@ -1918,7 +1918,7 @@ type fakeBroadcaster struct {
 	inputRuns    []uuid.UUID
 }
 
-func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ []byte, _ time.Time) {
+func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _, _, _ string, _ []byte, _ time.Time) {
 	b.msgSeqs = append(b.msgSeqs, seq)
 }
 func (b *fakeBroadcaster) PublishState(_ uuid.UUID, status string) {

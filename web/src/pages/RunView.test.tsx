@@ -665,7 +665,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
 // ── Plan revision at the gate (PRD #41) ────────────────────────────────────────
 function planMsg(seq: number, kind: string, payload: unknown): RunMessage {
-  return { seq, kind, agent: "lead", payload, created_at: "2026-07-04T00:00:00.000Z" };
+  return { seq, kind, agent: "lead", agent_instance: null, agent_label: null, payload, created_at: "2026-07-04T00:00:00.000Z" };
 }
 
 describe("derivePlanRevision (PRD #41)", () => {
