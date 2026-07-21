@@ -281,7 +281,13 @@ export interface MockReview {
   // Triage dispositions (PRD #94), coordinate-keyed like filed_issues. `stale` is a
   // seeded flag (the real server hash-compares); mockApi.recomputeTriage derives
   // `triage` from these + filed_issues on every mutation, matching the server ladder.
-  dispositions: Disposition[];
+  //
+  // `set_via` mirrors the recommendation_dispositions column (PRD #98 Decision 6): absent
+  // means a PERSON set it, "issue_close" means the M6 poller sync did. It is a MOCK-side
+  // extension of Disposition because the run-page DTO does not carry provenance — only the
+  // Judge menu's occurrence does — and without it the mock cannot render an auto-done at
+  // all, which is the one state the "done via #IID" label exists for.
+  dispositions: (Disposition & { set_via?: "issue_close" })[];
   triage: TriageCounts;
 }
 
@@ -429,10 +435,27 @@ export const mockReviews: MockReview[] = [
         created_at: minsAgo(120),
       },
     ],
-    filed_issues: [],
-    dispositions: [],
-    // All three open → todo 3.
-    triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+    // ripgrep was filed as #91 and that issue has since been CLOSED, so the M6 poller sync
+    // marked the coordinate done on its own — the auto-done the Judge menu labels
+    // "Done via #91", visibly distinct from rev-cancelled's hand-marked "Done" on
+    // adjust_template/coder. Both grammars are seeded so the difference is demoable rather
+    // than merely implemented.
+    filed_issues: [
+      {
+        category: "enable_tool",
+        target: "ripgrep",
+        issue_iid: 91,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/91",
+        filed_at: minsAgo(90),
+      },
+    ],
+    dispositions: [
+      // set_by_user_id would be NULL server-side: nobody clicked this.
+      { category: "enable_tool", target: "ripgrep", status: "done", reason: "", set_at: minsAgo(30), stale: false, set_via: "issue_close" },
+    ],
+    // total 3: todo 2 (rc-1, rc-2), done 1 (rc-3 — auto, via the closed #91). The done rung
+    // outranks filed on the shared ladder, so the filed link above does NOT make it filed.
+    triage: { total: 3, todo: 2, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
   },
   {
     id: "rev-cancelled",

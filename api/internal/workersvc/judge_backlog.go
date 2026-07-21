@@ -226,6 +226,10 @@ func GroupJudgeRecommendations(rows []store.ListJudgeRecommendationRowsForUserRo
 			Verdict:    r.Verdict,
 			Confidence: r.Confidence,
 			Bucket:     b,
+			// Passed through, never interpreted here: this layer has no opinion on whether a
+			// done was hand-set or synced, it only refuses to drop the distinction. A NULL
+			// set_via (a hand-set or absent disposition) yields "" and the DTO omits it.
+			SetVia:     r.SetVia.String,
 			FiledIssue: filedIssueRef(r),
 		})
 		if b == BucketTodo {

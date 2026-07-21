@@ -311,6 +311,7 @@ function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBac
       const key = coordKey(rec.category, rec.target);
       const b = bucketOfRec(review, rec.category, rec.target);
       const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
+      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
       const occ: JudgeOccurrence = {
         run_id: review.target_run_id,
         run_title: getRun(review.target_run_id)?.issue_title ?? "",
@@ -319,6 +320,9 @@ function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBac
         verdict: review.verdict as ReviewVerdict,
         confidence: rec.confidence,
         bucket: b,
+        // Provenance rides alongside the bucket, because both a hand-marked and an
+        // auto-done are bucket "done" (PRD #98 Decision 6 / review B3).
+        ...(disp?.set_via ? { set_via: disp.set_via } : {}),
         ...(filed
           ? { filed_issue: { issue_iid: filed.issue_iid, issue_url: filed.issue_url, filed_at: filed.filed_at } }
           : {}),
@@ -1683,13 +1687,21 @@ export const mockApi = {
       throw new ApiError(400, "status must be 'done' or 'dismissed'");
     }
     // Idempotent upsert on the coordinate; a set re-stamps set_at and clears stale.
-    const next: Disposition = {
+    //
+    // set_via is EXPLICITLY cleared, and the explicitness is the point (PRD #98 Decision 6,
+    // mirroring dispositions.sql's literal NULL). This is a HUMAN write, so the provenance
+    // must stop saying "the system inferred it": overriding an issue-close auto-done has to
+    // read "✓ Done", not "Done via #91". Object.assign copies only the keys `next` HAS, so
+    // omitting this would leave a stale set_via on the existing row and the mock would demo
+    // exactly the misattribution the server's literal NULL exists to prevent.
+    const next: Disposition & { set_via?: "issue_close" } = {
       category: rec.category,
       target: rec.target,
       status,
       reason: status === "dismissed" ? (reason as "wont_do" | "not_an_issue") : "",
       set_at: new Date().toISOString(),
       stale: false,
+      set_via: undefined,
     };
     const existing = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
     if (existing) Object.assign(existing, next);
@@ -1763,13 +1775,17 @@ export const mockApi = {
         if (!writtenTriples.has(`${review.id} ${key}`)) {
           settled.push({ run_id: review.target_run_id, rec_id: rec.id });
         }
-        const next: Disposition = {
+        // set_via explicitly cleared: a bulk group action is a HUMAN write too, so it must
+        // drop any issue-close provenance rather than inherit it (see the single-coordinate
+        // path above for why Object.assign makes the omission a live bug, not a tidiness nit).
+        const next: Disposition & { set_via?: "issue_close" } = {
           category: rec.category,
           target: rec.target,
           status,
           reason: status === "dismissed" ? (reason as "wont_do" | "not_an_issue") : "",
           set_at: new Date().toISOString(),
           stale: false,
+          set_via: undefined,
         };
         const existing = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
         if (existing) Object.assign(existing, next);

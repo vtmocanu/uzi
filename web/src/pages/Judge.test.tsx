@@ -345,6 +345,77 @@ describe("Judge — truncation is surfaced, never rendered as authoritative (PRD
   });
 });
 
+describe("Judge — an auto-done is visibly distinct from a hand-marked done (PRD #98 D6/B3)", () => {
+  // The whole point of set_via is that "I decided this was done" and "the system inferred it
+  // from a closed issue" are DIFFERENT claims. So the load-bearing assertion is that the two
+  // chips differ — a test that only checked the auto-done renders would pass unchanged if
+  // both rendered "✓ Done", which is exactly the state this ships to fix (the column existed
+  // and never left the store, so every client rendered them identically).
+  //
+  // Both occurrences are bucket "done" on purpose: if the buckets differed, the test would
+  // be proving something about the ladder rather than about provenance.
+  async function expandedChips(occurrences: JudgeRecommendationGroup["occurrences"]) {
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [group({ bucket: "done", open_count: 0, occurrences })],
+        triage: { total: 2, todo: 0, filed: 0, done: 2, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Expand occurrences/ }));
+    return screen.getAllByRole("listitem");
+  }
+
+  it("labels an issue-close auto-done 'Done via #IID' and a hand-marked one just 'Done'", async () => {
+    await expandedChips([
+      occ({
+        run_id: "run-auto",
+        rec_id: "rec-auto",
+        bucket: "done",
+        set_via: "issue_close",
+        filed_issue: { issue_iid: 91, issue_url: "https://forge.example/issues/91", filed_at: "2026-07-20T10:00:00Z" },
+      }),
+      occ({ run_id: "run-hand", rec_id: "rec-hand", bucket: "done" }),
+    ]);
+
+    // The auto-done names the issue whose closure produced it...
+    expect(screen.getByText(/Done via #91/)).toBeTruthy();
+    // ...and the hand-marked one does NOT claim any issue provenance. queryByText with an
+    // exact matcher, so "Done via #91" cannot satisfy it.
+    const plainDone = screen.getAllByText((_, el) => el?.textContent?.trim() === "✓ Done");
+    expect(plainDone.length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Done via #undefined/)).toBeNull();
+  });
+
+  it("renders the two DIFFERENTLY — the same chip for both is the bug this exists for", async () => {
+    const items = await expandedChips([
+      occ({
+        run_id: "run-auto",
+        rec_id: "rec-auto",
+        bucket: "done",
+        set_via: "issue_close",
+        filed_issue: { issue_iid: 91, issue_url: "https://forge.example/issues/91", filed_at: "2026-07-20T10:00:00Z" },
+      }),
+      occ({ run_id: "run-hand", rec_id: "rec-hand", bucket: "done" }),
+    ]);
+    const auto = items.find((li) => li.textContent?.includes("run-auto") || li.textContent?.includes("Done via"))!;
+    const hand = items.find((li) => li !== auto && li.textContent?.includes("Done"))!;
+    expect(auto).toBeTruthy();
+    expect(hand).toBeTruthy();
+    expect(auto.textContent).not.toEqual(hand.textContent);
+  });
+
+  // An auto-done whose filed link is gone still STATES its provenance rather than printing
+  // "Done via #undefined". The sync always fires from a filed issue, so this is defensive —
+  // but "defensive" is why it needs a test: nothing else would ever exercise it.
+  it("states the provenance even without an issue iid, never '#undefined'", async () => {
+    await expandedChips([occ({ bucket: "done", set_via: "issue_close" })]);
+    expect(screen.getByText(/Done via issue close/)).toBeTruthy();
+    expect(screen.queryByText(/#undefined/)).toBeNull();
+  });
+});
+
 describe("Judge — inbox-zero is a first-class view (PRD #98 Decision 8)", () => {
   it("renders the zero-state (and the opt-in card when the judge is off) when triage.todo is 0", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { judge_enabled: false } } as unknown as ReturnType<typeof useAuth>);

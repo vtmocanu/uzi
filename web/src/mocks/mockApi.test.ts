@@ -182,7 +182,11 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     // The canonical triage is the SAME query getJudgeStats serves — the two cannot drift.
     const stats = await api.getJudgeStats();
     expect(all.triage).toEqual(stats);
-    expect(stats.todo).toBe(5); // per-recommendation, > the 3 open group rows
+    // Per-recommendation, and still > the open group rows. It was 5 before PRD #98 review
+    // B3 seeded run-closed's ripgrep as an issue-close AUTO-DONE (filed #91, then closed):
+    // that moved one recommendation off the todo rung. The number changed because the
+    // fixture gained a state, not because the tally drifted.
+    expect(stats.todo).toBe(4);
   });
 
   it("the ?run= anchor keeps only groups recurring in that run but preserves their other-run occurrences", async () => {
@@ -227,8 +231,40 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     // The done member was NOT overwritten (scope=open left it).
     expect(g.occurrences.map((o) => o.bucket).sort()).toEqual(["dismissed", "done"]);
 
-    // Canonical counts moved: one left To triage, one joined Dismissed.
-    expect(res.triage.todo).toBe(4);
+    // Canonical counts moved: one left To triage, one joined Dismissed. (Baseline todo is 4,
+    // not 5, since B3's seeded auto-done — see the dedup test above.)
+    expect(res.triage.todo).toBe(3);
     expect(res.triage.dismissed).toBe(3);
+  });
+
+  it("surfaces an issue-close auto-done distinctly, and a human override CLEARS the provenance", async () => {
+    installStorage();
+    const api = await reload();
+
+    const ripgrep = (b: Awaited<ReturnType<typeof api.getJudgeBacklog>>) =>
+      b.groups.find((g) => g.category === "enable_tool" && g.target === "ripgrep")!.occurrences[0];
+
+    // Seeded state: filed as #91, that issue closed, so the M6 sync marked it done. The
+    // ladder puts done above filed, so the bucket is `done` and the provenance is what
+    // distinguishes it from a hand-marked one.
+    const before = ripgrep(await api.getJudgeBacklog("all"));
+    expect(before.bucket).toBe("done");
+    expect(before.set_via).toBe("issue_close");
+    expect(before.filed_issue?.issue_iid).toBe(91);
+
+    // A HUMAN now dismisses it. set_via must go back to "a person decided this" — otherwise
+    // the chip would keep reading "Done via #91" after the user overrode it, attributing
+    // their decision to the system. The server guarantees this with a literal NULL rather
+    // than EXCLUDED.set_via (dispositions.sql); the mock must not diverge, and its
+    // Object.assign upsert makes the omission a live bug rather than a tidiness nit.
+    await api.bulkSetJudgeDisposition(
+      [{ category: "enable_tool", target: "ripgrep" }],
+      "dismissed",
+      "not_an_issue",
+      "all",
+    );
+    const after = ripgrep(await api.getJudgeBacklog("all"));
+    expect(after.bucket).toBe("dismissed");
+    expect(after.set_via).toBeUndefined();
   });
 });

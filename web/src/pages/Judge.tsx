@@ -604,9 +604,26 @@ function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: R
 // OccurrenceBucketChip renders one occurrence's triage state from its bucket. The
 // occurrence DTO carries no dismiss reason, so a dismissed occurrence reads a plain
 // "Dismissed" — the group-level controls carry the won't-do / not-an-issue distinction.
+//
+// A DONE splits by provenance (PRD #98 Decision 6): a person's "✓ Done" and the M6
+// issue-close sync's "Done via #IID" are different claims, and rendering them identically
+// attributes a system inference to the user. Both are bucket "done", so the split is on
+// set_via, which is the only thing that carries the difference.
 function OccurrenceBucketChip({ occ }: { occ: JudgeOccurrence }) {
   switch (occ.bucket) {
     case "done":
+      // An auto-done always has a filed link — the sync fires FROM one closing — but the
+      // link is rendered defensively anyway: a filed row deleted after the sync would
+      // otherwise print "Done via #undefined". Without an iid the provenance is still
+      // stated, just unnamed.
+      if (occ.set_via === "issue_close") {
+        return (
+          <Badge tone="ok" title="Marked done automatically when the filed issue was closed">
+            <span aria-hidden="true">✓</span>{" "}
+            {occ.filed_issue ? `Done via #${occ.filed_issue.issue_iid}` : "Done via issue close"}
+          </Badge>
+        );
+      }
       return (
         <Badge tone="ok">
           <span aria-hidden="true">✓</span> Done

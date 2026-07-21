@@ -1056,6 +1056,16 @@ export interface JudgeOccurrence {
   verdict: ReviewVerdict;
   confidence: "" | "low" | "medium" | "high";
   bucket: JudgeBacklogBucket;
+  // The disposition's PROVENANCE (PRD #98 Decision 6). Absent means a PERSON set it;
+  // "issue_close" means the M6 poller sync did when the filed issue was closed. Both are
+  // bucket "done", so the bucket alone cannot tell them apart and a client that ignores
+  // this renders "I decided this was done" and "the system inferred it" identically — two
+  // different claims, only one of them the user's.
+  //
+  // Typed as a literal union, not `string`: that is what makes `set_via === "issue_close"`
+  // compiler-guarded here. (A raw string comparison would be the one client-side shape that
+  // fails silently — see isBucket, the one site tsc does not guard.)
+  set_via?: "issue_close";
   filed_issue?: JudgeFiledIssueRef;
 }
 

@@ -46,6 +46,18 @@ SELECT
     rr.confidence                  AS confidence,
     d.status                       AS disposition_status,
     d.dismiss_reason               AS dismiss_reason,
+    -- set_via is the disposition's PROVENANCE (PRD #98 Decision 6 / review B3): NULL means
+    -- a person set it, 'issue_close' means the M6 poller sync did when the filed issue was
+    -- closed. It is projected so the Judge page can label an auto-done "done via #IID"
+    -- rather than rendering it identically to a hand-marked done.
+    --
+    -- The whole set_via mechanism exists for that one distinction, and it is enforced on
+    -- BOTH sides: the sync writes set_via='issue_close' with set_by_user_id NULL so a system
+    -- action is never attributed to a person, and every human write clears set_via back to
+    -- NULL (a literal NULL, not EXCLUDED.set_via — see dispositions.sql) so a person's
+    -- action is never attributed to the system. Until this projection existed, none of that
+    -- reached a client and the two rendered the same.
+    d.set_via                      AS set_via,
     (f.filed_at IS NOT NULL)::bool AS filed_settled,
     f.filed_issue_iid              AS filed_issue_iid,
     f.filed_issue_url              AS filed_issue_url,

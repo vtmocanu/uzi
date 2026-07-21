@@ -47,7 +47,8 @@ type backlogRow struct {
 	confidence  string
 	disposition string // "" = no disposition row
 	reason      string
-	filedIID    int64 // 0 = no filed link
+	setVia      string // "" = NULL (a PERSON set it); "issue_close" = the M6 sync did
+	filedIID    int64  // 0 = no filed link
 	filedURL    string
 	filedAt     time.Time // zero = claimed-but-unsettled (or not filed at all)
 }
@@ -71,6 +72,7 @@ func (b backlogRow) row() store.ListJudgeRecommendationRowsForUserRow {
 		Confidence:        b.confidence,
 		DispositionStatus: txt(b.disposition),
 		DismissReason:     txt(b.reason),
+		SetVia:            txt(b.setVia),
 		FiledSettled:      !b.filedAt.IsZero(),
 	}
 	if b.filedIID != 0 {
@@ -299,6 +301,40 @@ func TestGroupJudgeRecommendationsFiledIssueOnlySettled(t *testing.T) {
 	claimed := groupByCoord(t, groups, "improve_uzi", "claimed")
 	if claimed.Occurrences[0].Bucket != "todo" || claimed.Occurrences[0].FiledIssue != nil {
 		t.Errorf("an unsettled claim must be todo with no filed_issue, got %+v", claimed.Occurrences[0])
+	}
+}
+
+// TestGroupJudgeRecommendationsCarriesDispositionProvenance is PRD #98 Decision 6 / review
+// B3 at the Go layer: an issue-close auto-done and a hand-marked done are BOTH bucket=done,
+// so the bucket alone cannot tell them apart and the provenance has to ride alongside it.
+//
+// The assertion that matters is the pair DIFFERING. Checking only that the auto-done carries
+// set_via would still pass if the grouper stamped it on every occurrence, which is the same
+// "renders identically" failure one layer up. Both directions, on rows whose bucket is
+// deliberately identical.
+func TestGroupJudgeRecommendationsCarriesDispositionProvenance(t *testing.T) {
+	groups := GroupJudgeRecommendations(rowsOf(
+		backlogRow{runID: uuid.New(), reviewID: uuid.New(), recID: uuid.New(),
+			category: "improve_uzi", target: "auto", disposition: "done", setVia: "issue_close"},
+		backlogRow{runID: uuid.New(), reviewID: uuid.New(), recID: uuid.New(),
+			category: "improve_uzi", target: "hand", disposition: "done"},
+	))
+	auto := groupByCoord(t, groups, "improve_uzi", "auto").Occurrences[0]
+	hand := groupByCoord(t, groups, "improve_uzi", "hand").Occurrences[0]
+
+	if auto.Bucket != "done" || hand.Bucket != "done" {
+		t.Fatalf("fixture broken: both must bucket done, got %q and %q — otherwise this test proves nothing about provenance", auto.Bucket, hand.Bucket)
+	}
+	if auto.SetVia == hand.SetVia {
+		t.Fatalf("an auto-done and a hand-marked done are indistinguishable (both set_via=%q)", auto.SetVia)
+	}
+	if auto.SetVia != "issue_close" {
+		t.Errorf("auto-done set_via = %q, want issue_close", auto.SetVia)
+	}
+	// A NULL column must arrive as "", never as a literal "NULL" or the zero of some other
+	// type: the client keys "was this a person?" off emptiness.
+	if hand.SetVia != "" {
+		t.Errorf("hand-marked done set_via = %q, want empty (a person set it)", hand.SetVia)
 	}
 }
 

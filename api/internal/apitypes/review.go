@@ -99,6 +99,21 @@ type JudgeOccurrenceDTO struct {
 	Verdict    string `json:"verdict"`
 	Confidence string `json:"confidence"`
 	Bucket     string `json:"bucket"`
+	// SetVia is the disposition's PROVENANCE (PRD #98 Decision 6): "" (omitted) means a
+	// PERSON set it, "issue_close" means the M6 poller sync did when the filed issue closed.
+	// A client MUST render the two differently — an auto-done reads "done via #IID" — because
+	// "I decided this was done" and "the system inferred it from a closed issue" are
+	// different claims, and only one of them is the user's.
+	//
+	// The entire set_via mechanism exists for this one visible distinction, guarded from both
+	// directions in SQL: the sync writes set_via='issue_close' with set_by_user_id NULL so a
+	// system action is never attributed to a person, and every human write clears set_via
+	// back to a literal NULL so a person's action is never attributed to the system. None of
+	// that reached a client until this field existed, and the chip rendered both identically.
+	//
+	// omitempty because the overwhelmingly common case is a hand-set (or absent) disposition:
+	// the field carries meaning only when present.
+	SetVia string `json:"set_via,omitempty"`
 	// FiledIssue is the settled forge issue for this occurrence's coordinate, nil when
 	// the coordinate was never filed (or the claim is still in flight).
 	FiledIssue *JudgeFiledIssueRefDTO `json:"filed_issue,omitempty"`

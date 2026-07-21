@@ -139,12 +139,45 @@ func TestTriageDTOTags(t *testing.T) {
 }
 
 func TestJudgeOccurrenceDTOTags(t *testing.T) {
-	// filed_issue is omitempty: an unfiled (or claimed-but-unsettled) occurrence omits it
-	// entirely rather than shipping a null the consumer has to special-case.
+	// filed_issue and set_via are both omitempty: an unfiled (or claimed-but-unsettled)
+	// occurrence omits filed_issue rather than shipping a null the consumer special-cases,
+	// and a hand-set (or absent) disposition omits set_via, which carries meaning only when
+	// present.
 	assertTags(t, "JudgeOccurrenceDTO", JudgeOccurrenceDTO{},
 		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket")
 	assertTags(t, "JudgeOccurrenceDTO(filed)", JudgeOccurrenceDTO{FiledIssue: &JudgeFiledIssueRefDTO{}},
 		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket", "filed_issue")
+	// The auto-done shape: PRD #98 Decision 6's "done via #IID" needs BOTH, since the label
+	// names the issue whose closure produced the done.
+	assertTags(t, "JudgeOccurrenceDTO(auto-done)",
+		JudgeOccurrenceDTO{SetVia: "issue_close", FiledIssue: &JudgeFiledIssueRefDTO{}},
+		"run_id", "run_title", "review_id", "rec_id", "verdict", "confidence", "bucket",
+		"filed_issue", "set_via")
+}
+
+// A hand-marked done and an issue-close auto-done must be DISTINGUISHABLE on the wire —
+// that is the entire reason set_via exists, and until PRD #98 review B3 the column never
+// left the store, so every client rendered the two identically. Asserting the two encodings
+// DIFFER is the pin; asserting only that an auto-done carries the field would still pass if
+// a hand-set one carried it too.
+func TestJudgeOccurrenceAutoDoneIsDistinguishableOnTheWire(t *testing.T) {
+	handSet, err := json.Marshal(JudgeOccurrenceDTO{Bucket: "done"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	autoDone, err := json.Marshal(JudgeOccurrenceDTO{Bucket: "done", SetVia: "issue_close"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(handSet) == string(autoDone) {
+		t.Fatal("a hand-marked done and an issue_close auto-done encode identically — the provenance never reaches a client")
+	}
+	if strings.Contains(string(handSet), "set_via") {
+		t.Errorf("a hand-set disposition must OMIT set_via, got: %s", handSet)
+	}
+	if !strings.Contains(string(autoDone), `"set_via":"issue_close"`) {
+		t.Errorf("an auto-done must carry set_via=issue_close, got: %s", autoDone)
+	}
 }
 
 func TestJudgeFiledIssueRefDTOTags(t *testing.T) {
