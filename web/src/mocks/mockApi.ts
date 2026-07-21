@@ -502,11 +502,58 @@ function backlogRowsFromReviews(): JudgeBacklogRow[] {
   return rows;
 }
 
-// computeBacklog assembles GET /me/judge/recommendations out of the three pieces above,
-// in the server's order: join (backlogRowsFromReviews) → group → anchor → bucket filter.
+// MOCK_BACKLOG_MAX_ROWS is the demo's stand-in for the server's JudgeBacklogMaxRows (2000).
+// It is small because the demo is: data.ts carries 11 rows across 3 reviews, and 6 is the
+// value that cuts through the MIDDLE of a recurring coordinate rather than at a group
+// boundary. A cut at a group boundary would only remove whole groups, which is the easy half
+// of the state and not the half the banner is warning about.
+export const MOCK_BACKLOG_MAX_ROWS = 6;
+
+// capBacklogRows mirrors the cut in JudgeRecommendationBacklog (judge_backlog.go): rows are
+// cut BEFORE grouping, and `truncated` says the cut actually removed something.
+//
+// THE ORDER IS THE ENTIRE POINT, and flipping a boolean instead would demo a lie. The banner
+// means "there are groups you are not seeing, and a coordinate that did not come back is
+// UNKNOWN rather than settled". A `truncated: true` sitting above COMPLETE data shows that
+// warning over a screen that is in fact the whole truth, which teaches the reader the
+// opposite of what the state means. Cutting rows first is also what makes a SURVIVING group
+// under-report run_count and possibly roll up to the wrong bucket -- the subtlety the flag
+// exists to warn about, and the reason the state is worth demoing at all.
+//
+// The comparison is `>` and not `>=` on purpose: a backlog of exactly `max` rows is NOT
+// truncated. That off-by-one is the same one the server buys by reading `max + 1` rows, so
+// that a full page is distinguishable from an exactly-full one without a second COUNT.
+export function capBacklogRows(
+  rows: JudgeBacklogRow[],
+  max: number,
+): { rows: JudgeBacklogRow[]; truncated: boolean } {
+  if (rows.length <= max) return { rows, truncated: false };
+  return { rows: rows.slice(0, max), truncated: true };
+}
+
+// backlogMaxRows returns the row cap in force. There is none by default, so an ordinary demo
+// visitor can never reach this state by accident; the `truncated-backlog` demo scenario turns
+// it on (`?mock=truncated-backlog`, or the uzi_mock_scenario localStorage key -- the same
+// PRD #45 mechanism the OIDC demo states use). The scenario is a single string, so this state
+// and the OIDC ones are mutually exclusive by construction; nothing needs both.
+//
+// WHY A DELIBERATE TOGGLE, rather than a permanently-capped demo or a test-only hook. M3's
+// requirement is that the mock renders EVERY state, and truncation is the one a person most
+// needs to SEE, because it is the only state in which the screen is not the truth -- and the
+// one whose CLI remedy was measured outright false earlier in this PRD. A test-only hook
+// satisfies "every state has a test" while leaving a human clicking the demo unable to reach
+// it; a permanent cap would make the demo permanently wrong about everything else.
+function backlogMaxRows(): number {
+  return mockScenario() === "truncated-backlog" ? MOCK_BACKLOG_MAX_ROWS : Number.POSITIVE_INFINITY;
+}
+
+// computeBacklog assembles GET /me/judge/recommendations out of the pieces above, in the
+// server's order: join (backlogRowsFromReviews) → cap → group → anchor → bucket filter.
 // triage is the canonical aggregate, NEVER tallied from the returned groups.
 function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
-  let groups = groupJudgeRecommendations(backlogRowsFromReviews());
+  // The cap sits between the join and the grouper, which is where the server's LIMIT sits.
+  const capped = capBacklogRows(backlogRowsFromReviews(), backlogMaxRows());
+  let groups = groupJudgeRecommendations(capped.rows);
   // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
   // run, but keep ALL its occurrences (so a notification still shows the other runs it
   // recurs in). A foreign/unknown run matches nothing → empty, no existence oracle.
@@ -523,7 +570,12 @@ function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBac
     bucket,
     run: runAnchor,
     groups: filterGroups(groups, bucket),
-    truncated: false,
+    truncated: capped.truncated,
+    // triage is the canonical /me/judge/stats aggregate and is deliberately NOT affected by
+    // the cut, exactly as on the server, where it comes from a separate query with no LIMIT.
+    // That divergence is not a bug to reconcile: it is what the truncated state LOOKS like.
+    // The badge keeps saying how many coordinates are actually open while the page shows
+    // fewer, and a reader who trusted the page would be wrong.
     triage: computeTriage(),
   };
 }
@@ -2124,7 +2176,12 @@ export const mockApi = {
       updated: writtenTriples.size,
       settled,
       groups,
-      truncated: false,
+      // Carried through from the re-read, exactly as BulkSetDispositions does
+      // (judge_bulk_disposition.go: `Truncated: backlog.Truncated`). It is NOT independently
+      // computed here: the re-read is bounded by the same cap, so a second source for this
+      // flag would be a second implementation of the cut, and the two could disagree about
+      // the very response they are describing.
+      truncated: backlog.truncated,
       triage: backlog.triage,
     };
     return delay(result, 120);
