@@ -12,6 +12,7 @@ import { ChatRunner } from "./chat-runner.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
+import { reclaimStrandedRunHomes } from "./home-reclaim.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected } from "./docker-wiring.js";
@@ -182,6 +183,19 @@ async function main(): Promise<void> {
     homeRoot: sdkHomeRoot,
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
+
+  // PRD #108 M6: one-off reclaim of HOMEs stranded by the pre-fix cleanup, which
+  // could not remove the Go module cache's 0555 directories (167.3 MB measured for
+  // one run). Deliberately BEFORE worker.run(): this process holds no run yet, so
+  // the sweep cannot race a run of its own, and the API's terminal-status check
+  // covers a run live on another worker sharing the volume. It never throws and it
+  // deletes only run ids the API positively reports terminal — every kind of
+  // not-knowing skips (home-reclaim.ts).
+  if (config.homeReclaimEnabled) {
+    await reclaimStrandedRunHomes(sdkHomeRoot, async (runId) => (await client.getChatRun(runId)).status, log).catch(
+      (err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }),
+    );
+  }
 
   const worker = new Worker(config, client, runner, chatRunner, judgeRunner, log);
 

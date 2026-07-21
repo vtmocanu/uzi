@@ -38,6 +38,14 @@ export interface Config {
    */
   stubPlanGate: boolean;
   /**
+   * PRD #108 M6: sweep `agent-home/<runId>` trees stranded by the old cleanup once
+   * at startup. On by default — the leak is on every fleet volume already and the
+   * sweep deletes only run ids the API positively reports terminal. `UZI_HOME_RECLAIM=0`
+   * turns it off, because a destructive startup sweep an operator cannot disable is
+   * a bad thing to ship even when its guards are right.
+   */
+  homeReclaimEnabled: boolean;
+  /**
    * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
    * shipping compose default is a read-only secret mount the entrypoint forces to
    * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
@@ -215,6 +223,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
     stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
+    // Default ON, so unset means enabled — hence the explicit undefined check
+    // rather than parseBool, whose false-by-default is the wrong way round here.
+    homeReclaimEnabled: env.UZI_HOME_RECLAIM === undefined ? true : parseBool(env.UZI_HOME_RECLAIM),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
