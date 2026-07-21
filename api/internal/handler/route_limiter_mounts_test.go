@@ -711,3 +711,160 @@ func TestRoutesCallSitePassesLimitersInLimiterNamesOrder(t *testing.T) {
 		}
 	}
 }
+
+// limiterConfigFields declares which config field each limiter is CONSTRUCTED from.
+// It is the third and last link in the chain, and the one that reaches furthest from
+// this package: limiterNames pins the parameter and argument NAMES, and this pins
+// what the name was built out of.
+//
+// AN EXPLICIT TABLE, NOT A NAME-STEM CONVENTION, and that choice was measured rather
+// than assumed — see TestEachLimiterIsBuiltFromItsOwnConfigField for the experiment
+// and the numbers. Seven of the eight do follow the stem convention
+// (forgeLimiter <- ForgeRateLimitMax), authLimiter is the standing exception
+// (RateLimitMax, no stem), and a convention with a permanent exception is one rename
+// away from needing a second.
+var limiterConfigFields = map[string]string{
+	limAuth:     "RateLimitMax",
+	limForge:    "ForgeRateLimitMax",
+	limSlackDM:  "SlackDMRateLimitMax",
+	limChat:     "ChatRateLimitMax",
+	limProposal: "ProposalRateLimitMax",
+	limJudge:    "JudgeRateLimitMax",
+	limHosted:   "HostedRateLimitMax",
+	limCLIPoll:  "CLIPollRateLimitMax",
+}
+
+// limiterConstruction is one `x := mw.NewLimiter(cfg.Y, …)` found in main.
+type limiterConstruction struct {
+	variable    string
+	configField string
+}
+
+// parseLimiterConstructions reads main's limiter constructions: the variable name on
+// the left and the cfg field supplying its BUDGET (the first argument) on the right.
+//
+// A construction whose budget argument is not a plain cfg.Field is reported rather
+// than skipped — skipping is how a parse quietly stops covering the thing it names.
+func parseLimiterConstructions(t *testing.T) []limiterConstruction {
+	t.Helper()
+	const mainPath = "../../cmd/server/main.go"
+	file, err := parser.ParseFile(token.NewFileSet(), mainPath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", mainPath, err)
+	}
+
+	var out []limiterConstruction
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || fn.Sel.Name != "NewLimiter" {
+			return true
+		}
+		if pkg, ok := fn.X.(*ast.Ident); !ok || pkg.Name != "mw" {
+			return true
+		}
+		lhs, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			t.Errorf("%s: an mw.NewLimiter result is assigned to something other than a plain identifier (%T)", mainPath, assign.Lhs[0])
+			return true
+		}
+		if len(call.Args) == 0 {
+			t.Errorf("%s: %s is built by an mw.NewLimiter call with no arguments", mainPath, lhs.Name)
+			return true
+		}
+		sel, ok := call.Args[0].(*ast.SelectorExpr)
+		if !ok {
+			t.Errorf("%s: %s's budget argument is %T, not a cfg field; this test can only read cfg.Field", mainPath, lhs.Name, call.Args[0])
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "cfg" {
+			t.Errorf("%s: %s's budget argument does not come from cfg", mainPath, lhs.Name)
+			return true
+		}
+		out = append(out, limiterConstruction{variable: lhs.Name, configField: sel.Sel.Name})
+		return true
+	})
+	return out
+}
+
+// TestEachLimiterIsBuiltFromItsOwnConfigField closes the last link: that the variable
+// NAMED forgeLimiter is CONSTRUCTED from the forge budget. Without it,
+// `forgeLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, …)` — an ordinary copy-paste
+// slip — is invisible everywhere: it compiles, every mount test stays green because
+// the name and the position are both still right, and forge routes silently run on
+// the chat budget.
+//
+// WHY A DECLARED TABLE RATHER THAN A NAME-STEM RULE. Both were built and run; this
+// is the measurement, not a preference.
+//
+// A stem rule ("variable fooLimiter must take a cfg field starting Foo") needs a
+// standing exception for authLimiter, which takes RateLimitMax and has no stem. Two
+// things were then measured against it:
+//   - Case-SENSITIVE, it needs a SECOND exception on the unmodified tree:
+//     cliPollLimiter takes cfg.CLIPollRateLimitMax, and a naive capitalisation of the
+//     variable stem yields "CliPoll", which is not a prefix of "CLIPoll". Go
+//     initialisms break the transform before any refactor happens.
+//   - Case-INSENSITIVE — the strongest form, and green on the unmodified tree — it
+//     still reddens on a LEGITIMATE rename. Renaming forgeLimiter to
+//     forgeProxyLimiter keeps the binding perfectly correct, and the rule reports
+//     "cfg.ForgeRateLimitMax does not start with forgeproxy". A correct refactor
+//     would have to buy an exception.
+//
+// The same rename under THIS table is green, and costs zero edits here — the map is
+// keyed by the limForge CONSTANT, so a rename flows through the one constant edit
+// that limiterNames already requires, while the config field it declares is
+// unchanged because the config field genuinely did not change. That is the whole
+// argument: an exact declaration tracks what actually moved, and never argues with a
+// name.
+//
+// WHAT THIS CHAIN DOES AND DOES NOT PIN, stated because "the budget is verified" is
+// the wrong conclusion to draw from three green tests:
+//   - PINNED: the parameter names (signature parse), the argument names at main's
+//     call site, and the cfg field each variable's budget is read from.
+//   - NOT PINNED, and this is the honest end of the chain: that the forge budget is
+//     the RIGHT budget for forge routes. cfg.ForgeRateLimitMax could be set to 1 or
+//     to 10000 and every test here stays green. Nothing mechanical can answer that
+//     question; it is a product judgement, and the chain stops at the name.
+func TestEachLimiterIsBuiltFromItsOwnConfigField(t *testing.T) {
+	got := parseLimiterConstructions(t)
+
+	byVar := make(map[string]string, len(got))
+	for _, c := range got {
+		if prev, dup := byVar[c.variable]; dup {
+			t.Errorf("main builds %s twice (from %s and %s)", c.variable, prev, c.configField)
+			continue
+		}
+		byVar[c.variable] = c.configField
+	}
+
+	// The declaration must cover exactly the limiters the rest of this file knows
+	// about, so the table cannot drift away from limiterNames unnoticed.
+	if len(limiterConfigFields) != len(limiterNames) {
+		t.Fatalf("limiterConfigFields declares %d limiters, limiterNames has %d", len(limiterConfigFields), len(limiterNames))
+	}
+	for _, name := range limiterNames {
+		want, declared := limiterConfigFields[name]
+		if !declared {
+			t.Errorf("limiterConfigFields has no entry for %s", name)
+			continue
+		}
+		field, built := byVar[name]
+		if !built {
+			t.Errorf("main does not build %s with mw.NewLimiter — either it moved, or this parse "+
+				"has stopped seeing it; a missing construction is a failure here, not a skip", name)
+			continue
+		}
+		if field != want {
+			t.Errorf("main builds %s from cfg.%s, but limiterConfigFields declares cfg.%s — "+
+				"the routes that mount %s would run on the wrong budget",
+				name, field, want, name)
+		}
+	}
+}
