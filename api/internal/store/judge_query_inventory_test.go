@@ -29,10 +29,12 @@ import (
 // the entire live-DB suite green, measured four times. Both are now genuinely pinned.
 // Neither was fixed by this mechanism, and neither would have been.
 //
-// (The suite tally from that measurement — 126 pass / 0 fail — is deliberately bound to
-// the tree it ran on, 2026-07-21 morning, and is not repeated as a live figure: it is 129
-// at this commit. A tally drifts exactly like a line number, so the mechanism is the claim
-// and the number is not.)
+// (The suite tally from that measurement — 126 pass / 0 fail — is bound to `8c6be2b8`,
+// where it ran, and is not repeated as a live figure: 128 by `c1fcdfce`, 129 at this
+// commit. Corroborated independently rather than taken on trust: the count of top-level
+// Test*LiveDB functions across internal/store + internal/handler is 108 / 110 / 111 at
+// those three SHAs, and the +2 / +1 deltas match. A tally drifts exactly like a line
+// number, so the mechanism is the claim and the number is only its receipt.)
 //
 // Everything above is past tense on purpose. The auditor's original wording made those two
 // claims in the PRESENT — and both stopped being true within the day, inside the very

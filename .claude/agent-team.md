@@ -323,6 +323,19 @@ configured anywhere in the file **or a vitest config**"* as context for one flak
 sentence **was** the root cause of five intermittent failures across four PRDs, and it did not
 ask what it implied beyond the file.
 
+**A third shape — the rule applied to the INSTANCE and not to the CLASS.** Distinct from the
+first two, and the cheapest to fix once named. The counterpart to *compile before you believe*
+is **before you ship a fix, name the other instances of the same claim** — usually with one
+`grep` for the string you just corrected.
+
+Evidence, all from PRD #98 and each one caught by somebody else: a coder identified that a
+bare suite tally in a comment reads as a current fact, bound it correctly at the site it was
+writing, and left **two identical unbound copies of the same figure in a file it had open** —
+minutes after articulating the rule. Earlier the same day the auditor made the same move with
+its fold prescriptions, and the lead made it four times with the cast rule. **The instance in
+front of you is the one the rule is hardest to see as a class**, because fixing it feels like
+completing the thought.
+
 **The unifying diagnosis: all of these substitute a PROXY for the PROPERTY.** An assertion
 count proxies for isolation. A blanking fold proxies for a discriminating one. A comment
 proxies for the behaviour. Agreement proxies for verification. A passing commit proxies for a

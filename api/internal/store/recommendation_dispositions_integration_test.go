@@ -36,9 +36,15 @@ import (
 // improve_agent/coder), so no two share a category or a target and every half has nothing to
 // discriminate. MEASURED 2026-07-21, four fresh-database runs with a positive control:
 // dropping `d.target`, `d.category`, `f.target` or `f.category` in isolation left the ENTIRE
-// live-DB suite green, 126 pass / 0 fail each time. Only dropping BOTH halves of a join went
-// red — the weaker mutation passing while the stronger one fails, which is what makes this
-// worth stating rather than assuming.
+// live-DB suite green each time. Only dropping BOTH halves of a join went red — the weaker
+// mutation passing while the stronger one fails, which is what makes this worth stating
+// rather than assuming.
+//
+// The load-bearing half of that is "the ENTIRE suite": the fold was invisible to every test,
+// not merely to the one under discussion. The suite tally was 126 pass / 0 fail, and it is
+// BOUND TO `8c6be2b8` rather than stated as a current figure — it was 128 by `c1fcdfce` and
+// is 129 now, so a reader who counts today would conclude this comment is wrong when it is
+// only unlabelled. A tally drifts exactly like a line number; the mechanism is the claim.
 //
 // TestJudgeTriageRowsForUserAreCoordinateScopedLiveDB (below) covers those four halves. Do not
 // delete it as redundant with this one: the properties do not overlap, and this fixture cannot
@@ -272,8 +278,10 @@ func listDispositions(ctx context.Context, t *testing.T, q *store.Queries, revie
 //
 // WHY IT EXISTS, measured (auditor, 2026-07-21, fresh database and positive control per run):
 // each of the four halves was individually INERT. Dropping `d.target`, `d.category`,
-// `f.target` or `f.category` in isolation left the ENTIRE live-DB suite green — 126 pass,
-// 0 fail, every time. Only dropping BOTH halves of a join went red. The cause is the shape of
+// `f.target` or `f.category` in isolation left the ENTIRE live-DB suite green, every time —
+// 126 pass / 0 fail AT `8c6be2b8`, where it was measured (128 by `c1fcdfce`, 129 now; the
+// tally is the receipt, "the ENTIRE suite" is the claim). Only dropping BOTH halves of a join
+// went red. The cause is the shape of
 // TestRecommendationDispositionsLiveDB's fixture above: its three coordinates differ in BOTH
 // halves at once (improve_uzi with an empty target, install_worker_tool/shellcheck,
 // improve_agent/coder), so no
