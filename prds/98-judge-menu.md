@@ -65,10 +65,30 @@ from an exactly-full one) stays out of reach — a proxy that would *read* as pi
   mock fix are in** — `Array.from(s)` for the rune count *and* a spelled-out cutset class, with a
   comment stating they are separate divergences. That was the thing most likely to land half-done;
   it did not.
-- **`t2-cli` @ `4b94f714`** — the backstop split by kind and executed in e2e. **M8b (Part B) is
-  still NOT started** and belongs in this same worktree: both live in `e2e/run-e2e.sh` and one
-  writer per file is the only safe arrangement. Part C's truncation-remedy row is gated on B4's
-  2001-row seed, so **B4 lands last and the two land together.**
+- **`t2-cli` @ `79fada44`** — the backstop split by kind and executed in e2e; **`./e2e/run-e2e.sh`
+  ran to completion: exit 0, 187 PASS / 0 FAIL**, clean `down -v`. Landing state: **3 rows executed
+  against a live stack** (`uzi review undo` ×2 addresses, `uzi review show`, `uzi repo list`),
+  **2 declared with reasons** (`review backlog --run` gated on B4; `uzi login` permanent — no flags
+  declared, device-auth polling loop), **4 HELP entries** checked by path resolution.
+  **M8b (Part B) is still NOT started** and belongs in this same worktree: both live in
+  `e2e/run-e2e.sh` and one writer per file is the only safe arrangement. Part C's truncation-remedy
+  row is gated on B4's 2001-row seed, so **B4 lands last, the two land together, and B4's author
+  should extend the existing block rather than open a second one.** That row flips from
+  `evidenceNotExecuted` to `evidenceE2E` in the same commit that lands B4.
+  **TWO THINGS A COLD START CANNOT RECOVER, both now on disk and repeated here because this block
+  is the entry point:**
+  1. **The classifier's baseline is ZERO UNKNOWNs** — all 9 candidates resolved to a definite kind
+     at landing, and none was resolved away. So a later `kindUnknown` is a **genuinely new emitter,
+     not an original gap**, and widening the `emitters` set is a decision to record with its
+     reason. It is the single edit that can quietly re-open the hole: every string printed through
+     a wrongly-added wrapper becomes HELP and is exempt from the execution bar.
+  2. **An open design question for the architect, implemented but not ruled.** Part C does not say
+     how a candidate chooses between two nested entries — `uzi review backlog` (HELP) versus
+     `uzi review backlog --run <run-id>` (RUNTIME), where the prefix matcher matches both and the
+     shorter entry's derived kind is therefore ambiguous. The coder implemented **most-specific
+     wins** (a candidate goes to the longest matching entry) and documented it at the site, because
+     the kind derivation is incoherent without *some* rule. **Confirm or overrule on resume** — not
+     a blocker, but it is a semantic decision currently made by an implementer.
 - **`t2-lim` @ `8ce7ba50`** — 5 commits, 14 files, +1378. `c309e8a0` is the **admin CLI-token
   inventory (new product code)**; `537394fc` records the `/repos/{id}/sync` mutation in the file;
   `8ce7ba50` pins which config field each limiter is constructed from, **closing the construction
