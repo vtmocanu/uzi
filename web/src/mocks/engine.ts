@@ -37,8 +37,22 @@ function clearTimers(runId: string) {
 // PRD #40: an optional per-call `usage` rides a message so the demo run view can
 // render its per-agent breakdown (Decision 11) — the same shape the worker attaches
 // to a surviving assistant message.
-const say = (runId: string, agent: string | null, text: string, usage?: unknown): Timed[] => [
-  { delay: 900, step: () => appendMessage(runId, "text", agent, usage ? { text, usage } : { text }) },
+// PRD #99: `attr` carries the subagent INVOCATION identity (instance id + task label)
+// so the scripted demo exercises the live lane path, not just the seeded fixtures — a
+// frame with a new agent_instance must open a NEW lane mid-run, and that is precisely
+// the path that only exists over the socket (applyFrame builds the RunMessage from the
+// frame; there is no REST re-read). Optional, so every lead/infra call site is unchanged
+// and keeps emitting NULL attribution.
+type Attr = { instance?: string | null; label?: string | null };
+
+const say = (
+  runId: string,
+  agent: string | null,
+  text: string,
+  usage?: unknown,
+  attr: Attr = {},
+): Timed[] => [
+  { delay: 900, step: () => appendMessage(runId, "text", agent, usage ? { text, usage } : { text }, attr) },
 ];
 
 const tool = (
@@ -47,19 +61,28 @@ const tool = (
   name: string,
   input: Record<string, unknown>,
   result: string,
-  opts: { error?: boolean; runFor?: number } = {},
+  opts: { error?: boolean; runFor?: number; attr?: Attr } = {},
 ): Timed[] => {
   const id = `mock-${Math.random().toString(36).slice(2, 9)}`;
+  const attr = opts.attr ?? {};
   return [
-    { delay: 700, step: () => appendMessage(runId, "tool_use", agent, { id, name, input }) },
+    { delay: 700, step: () => appendMessage(runId, "tool_use", agent, { id, name, input }, attr) },
     {
       delay: opts.runFor ?? 1400,
       step: () =>
-        appendMessage(runId, "tool_result", agent, {
-          tool_use_id: id,
-          content: result,
-          ...(opts.error ? { is_error: true } : {}),
-        }),
+        appendMessage(
+          runId,
+          "tool_result",
+          agent,
+          {
+            tool_use_id: id,
+            content: result,
+            ...(opts.error ? { is_error: true } : {}),
+          },
+          // The result must carry the SAME identity as its call, or a lane holds the
+          // call and its own result lands in a different one.
+          attr,
+        ),
     },
   ];
 };
@@ -111,32 +134,47 @@ function planningScript(runId: string): Timed[] {
   ];
 }
 
+// The scripted run's subagent invocations. Module-level so a lane's frames share one
+// identity across the whole script — a per-call literal would silently mint a new lane
+// on every frame, which is the failure this feature exists to prevent.
+const ATTR_A: Attr = { instance: "toolu_01mockCoderA", label: "metrics query + handler" };
+const ATTR_B: Attr = { instance: "toolu_01mockCoderB", label: "route wiring + tests" };
+const ATTR_REVIEW: Attr = { instance: "toolu_01mockReview", label: "review the diff" };
+
 // implementScript: approve → implement ⇄ review → push → MR → completed.
 function implementScript(runId: string): Timed[] {
   const run = getRun(runId);
   const iid = run?.issue_iid ?? 0;
   const branch = `agent/issue-${iid}`;
   return [
+    // PRD #99: TWO parallel `coder` invocations, deliberately INTERLEAVED rather than
+    // run to completion one after the other. Watching this live is the only way to see
+    // the behaviour the feature exists for — a second `agent_instance` opening its own
+    // lane mid-run, and each one's later turns folding back into its OWN lane instead
+    // of spawning a fresh bar. Contiguous frames would look identical under the old
+    // consecutive-author grouping, so the interleaving is the point, not decoration.
     ...say(runId, "coder", "Plan approved — implementing. Adding the query, the handler, and wiring the route.", {
       input_tokens: 51_600,
       cache_read_input_tokens: 583_900,
       cache_creation_input_tokens: 0,
       output_tokens: 24_100,
-    }),
-    ...tool(runId, "coder", "Edit", { file_path: "api/internal/store/queries/workers.sql" }, "ok"),
-    ...tool(runId, "coder", "Bash", { command: "cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate" }, "sqlc: wrote internal/store/workers.sql.go"),
-    ...tool(runId, "coder", "Write", { file_path: "api/internal/handler/metrics.go" }, "ok"),
+    }, ATTR_A),
+    ...tool(runId, "coder", "Edit", { file_path: "api/internal/store/queries/workers.sql" }, "ok", { attr: ATTR_A }),
+    // Unit B opens its lane here, several frames in — the mid-run lane birth.
+    ...tool(runId, "coder", "Write", { file_path: "api/internal/handler/routes.go" }, "ok", { attr: ATTR_B }),
+    ...tool(runId, "coder", "Bash", { command: "cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate" }, "sqlc: wrote internal/store/workers.sql.go", { attr: ATTR_A }),
+    ...tool(runId, "coder", "Write", { file_path: "api/internal/handler/metrics.go" }, "ok", { attr: ATTR_A }),
     ...tool(
       runId,
       "coder",
       "Bash",
       { command: "cd api && go test ./internal/handler/..." },
       "--- FAIL: TestWorkerMetrics_Stale (0.02s)\n    metrics_test.go:41: staleness window off by one",
-      { error: true, runFor: 2600 },
+      { error: true, runFor: 2600, attr: ATTR_B },
     ),
-    ...say(runId, "coder", "The staleness comparison used `>` where the sweeper uses `>=`. Aligning with the sweeper and re-running."),
-    ...tool(runId, "coder", "Edit", { file_path: "api/internal/handler/metrics.go" }, "ok"),
-    ...tool(runId, "coder", "Bash", { command: "cd api && go test ./..." }, "ok  \tuzi/api/internal/handler\t0.31s\nok  \tuzi/api/internal/store\t0.44s", { runFor: 2800 }),
+    ...say(runId, "coder", "The staleness comparison used `>` where the sweeper uses `>=`. Aligning with the sweeper and re-running.", undefined, ATTR_A),
+    ...tool(runId, "coder", "Edit", { file_path: "api/internal/handler/metrics.go" }, "ok", { attr: ATTR_A }),
+    ...tool(runId, "coder", "Bash", { command: "cd api && go test ./..." }, "ok  \tuzi/api/internal/handler\t0.31s\nok  \tuzi/api/internal/store\t0.44s", { runFor: 2800, attr: ATTR_B }),
     {
       delay: 900,
       step: () => patchRun(runId, { iteration_count: 1 }),
@@ -146,6 +184,7 @@ function implementScript(runId: string): Timed[] {
       "reviewer",
       "Reviewed the diff: the endpoint is read-only, reuses the sweeper's staleness rule, and the new query is covered by tests. No blocking findings.",
       { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 },
+      ATTR_REVIEW,
     ),
     {
       delay: 800,

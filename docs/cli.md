@@ -119,18 +119,26 @@ A few worth knowing:
   identical `coder` rows:
 
   ```
-  #12  tool_use  coder/3v6ptu · API wiring   {"name":"Edit"}
-  #13  tool_use  coder/2k9xqf · web gate UX  {"name":"Write"}
+  #12   tool_use         coder/3v6ptu · API wiring          {"name":"Edit"}
+  #13   tool_use         coder/2k9xqf · web gate UX         {"name":"Write"}
+  #14   text             lead                               {"text":"delegating"}
   ```
 
   The short id is the **last** 6 characters of the invocation id, not the
   first — these ids share a constant prefix, so a leading slice would render
   every instance identically. A message with no invocation (the lead's own
   turns, infra frames, and anything from before this shipped) prints the bare
-  role exactly as it always did. The cell is capped and the label truncated
-  so the payload column stays aligned; `--json` carries the **full**
-  invocation id and the **untruncated** label, since that is what an agent
-  needs. Both fields are always present in `--json`, `null` when absent:
+  role, with no `/id` and no `· label` — note the actor column itself is
+  wider than it used to be, so the payload column of *every* line has moved.
+  The cell is capped and the label truncated so the payload column stays
+  aligned (single-width characters — a CJK label still occupies two terminal
+  columns per rune, which this tool does not model).
+
+  `--json` carries the stored invocation id and label in full, with no
+  CLI-side truncation — but note the **server caps the label at 80 runes on
+  write, and appends no ellipsis**, so a longer label was already shortened
+  before the CLI ever saw it, with nothing in the value marking the cut. Both
+  fields are always present in `--json`, `null` when absent:
 
   ```jsonc
   {"seq":12,"kind":"tool_use","agent":"coder",
