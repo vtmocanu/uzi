@@ -529,27 +529,63 @@ const actorCellWidth = 34
 //
 // Both new fields are worker-supplied text bound for a TTY, and `agent_label` is
 // free model-authored prose rather than a role drawn from a fixed roster, so each
-// goes through compactText's sanitize-and-fold (Risk 13: a raw CSI sequence in this
+// goes through cellText's sanitize-and-fold (Risk 13: a raw CSI sequence in this
 // cell could clear the screen or spoof output). That also closes the same hole for
 // `agent`, which this function inherited printing verbatim.
 func actorCell(m apitypes.MessageDTO) string {
 	cell := "-"
 	if m.Agent != nil {
-		if role := compactText(*m.Agent); role != "" {
+		if role := cellText(*m.Agent); role != "" {
 			cell = role
 		}
 	}
 	if m.AgentInstance != nil {
-		if id := compactText(shortInstanceID(*m.AgentInstance)); id != "" {
+		if id := cellText(shortInstanceID(*m.AgentInstance)); id != "" {
 			cell += "/" + id
 		}
 	}
 	if m.AgentLabel != nil {
-		if label := compactText(*m.AgentLabel); label != "" {
+		if label := cellText(*m.AgentLabel); label != "" {
 			cell += " · " + label
 		}
 	}
 	return capCell(cell, actorCellWidth)
+}
+
+// cellText is compactText plus the two folds a FIXED-WIDTH column needs and the
+// shared compactText must not do — it also backs the payload and steer columns,
+// which are free text where a tab is ordinary content and where nothing is
+// promised about width.
+//
+// Tab. sanitizeTTY spares `\t` deliberately, and compactText folds only `\n`, so a
+// tab in `agent_label` reaches the cell. `%-*s` then pads to actorCellWidth in
+// RUNES and a tab is one rune, so every invariant the code checks still holds while
+// the terminal expands it to the next 8-column stop and the payload column walks
+// right. MEASURED before the fix: a benign label put the payload at rendered column
+// 58; `a\tb\tc\td\te` put it at 76; eight interior tabs at 107 — with the rune
+// offset pinned at 58 throughout, which is why the existing alignment test could
+// not see it. Folded to a space, which preserves the word break the tab was doing.
+//
+// DEL. 0x7f is outside sanitizeTTY's C0 (<0x20) and C1 (0x80–0x9f) ranges, so it
+// survives too. It advances no column but some terminals draw a glyph for it, so it
+// is dropped rather than folded.
+//
+// Both are cosmetic — no cursor motion, no erase, no OSC, and `\n` cannot survive
+// compactText — but the actor column's whole purpose is to stay aligned down a
+// `uzi run logs --follow` stream, and model-authored prose is exactly where a stray
+// tab comes from.
+func cellText(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '\t':
+			return ' '
+		case 0x7f:
+			return -1
+		}
+		return r
+	}, compactText(s))
+	// Folding can leave an edge space behind (compactText trimmed before the fold).
+	return strings.TrimSpace(s)
 }
 
 // shortInstanceID renders an invocation id compactly: its LAST 6 runes.
