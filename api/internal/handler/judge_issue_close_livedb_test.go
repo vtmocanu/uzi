@@ -36,6 +36,10 @@ type closeSyncFixture struct {
 	repoID   uuid.UUID
 	reviewID uuid.UUID
 	filedID  uuid.UUID
+	// recID is the seeded recommendation's own id. It exists so an assertion can scope to
+	// THIS fixture's row rather than to its target string — see the self-improve backlog
+	// check in TestFiledIssueCloseAutoDonesOnceLiveDB.
+	recID    uuid.UUID
 	category string
 	target   string
 	issueIID int64
@@ -69,6 +73,7 @@ func seedCloseSync(ctx context.Context, t *testing.T, pool *pgxpool.Pool, catego
 	t.Helper()
 	f := closeSyncFixture{
 		userID: uuid.New(), repoID: uuid.New(), reviewID: uuid.New(), filedID: uuid.New(),
+		recID:    uuid.New(),
 		category: category, target: "rg", issueIID: 4242,
 	}
 	connID, runID := uuid.New(), uuid.New()
@@ -87,8 +92,8 @@ func seedCloseSync(ctx context.Context, t *testing.T, pool *pgxpool.Pool, catego
 		`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
 		f.reviewID, runID, f.userID)
 	mustExecT(ctx, t, pool,
-		`INSERT INTO review_recommendations (review_id, category, target, rationale_md)
-		 VALUES ($1, $2, $3, 'because')`, f.reviewID, f.category, f.target)
+		`INSERT INTO review_recommendations (id, review_id, category, target, rationale_md)
+		 VALUES ($1, $2, $3, $4, 'because')`, f.recID, f.reviewID, f.category, f.target)
 	// The cached issue — what the poller's sync would have written.
 	mustExecT(ctx, t, pool,
 		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, web_url, forge_updated_at, synced_at)
@@ -188,12 +193,64 @@ func TestFiledIssueCloseAutoDonesOnceLiveDB(t *testing.T) {
 	// The improve_uzi coordinate is out of the self-improvement backlog (#94 Decision 9 —
 	// row-existence in recommendation_dispositions is the exclusion, so the auto-done
 	// keeps the engine from folding an already-handled item into its tracking issue).
+	//
+	// SCOPED TO THIS FIXTURE'S ROW ID, and that is load-bearing rather than tidiness.
+	// ListOpenImproveUziRecommendations selects `WHERE rr.category = 'improve_uzi'` across the
+	// WHOLE TABLE — no user scope, no review scope — and the LiveDB packages share one
+	// database, so anything any other test leaves behind comes back in this result. This
+	// assertion used to filter on `r.Target == f.target`, and `target` is not unique: every
+	// seedCloseSync fixture uses "rg", and so did an unrelated M4 badge fixture, which failed
+	// this test on its first baseline run for reasons entirely unrelated to issue-close sync.
+	// The row's own id is the only value here that cannot collide, which is why the fixture
+	// carries recID at all.
+	//
+	// (The query genuinely has no owner column to scope by — that is PRD #94/#68's design,
+	// not an oversight here — so the id is the fix available to the TEST. Narrowing the query
+	// itself would change behaviour the self-improve engine depends on.)
+	// A DECOY that makes the scoping assertion below discriminating instead of merely
+	// correct: a second, unrelated, still-open improve_uzi recommendation on the SAME target,
+	// under a different review. It is what any future fixture elsewhere in the suite would
+	// look like, seeded deliberately so the hazard is present on EVERY run rather than on the
+	// unlucky ones.
+	//
+	// It is built by hand rather than by seedCloseSync, and the difference is the whole
+	// exclusion rule: seedCloseSync always writes a recommendation_filed_issues row, and
+	// PRD #68 Decision 12 makes the ROW'S EXISTENCE the backlog exclusion (not filed_at) — so
+	// a seedCloseSync decoy is never in the backlog and cannot collide. The precondition
+	// below caught exactly that on the first attempt.
+	decoyRunID, decoyReviewID, decoyRecID := uuid.New(), uuid.New(), uuid.New()
+	mustExecT(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status)
+		 VALUES ($1, $2, $3, 99, 't', 'd', 'completed')`, decoyRunID, f.userID, f.repoID)
+	mustExecT(ctx, t, pool,
+		`INSERT INTO run_reviews (id, target_run_id, user_id, verdict) VALUES ($1, $2, $3, 'issues')`,
+		decoyReviewID, decoyRunID, f.userID)
+	mustExecT(ctx, t, pool,
+		`INSERT INTO review_recommendations (id, review_id, category, target, rationale_md)
+		 VALUES ($1, $2, 'improve_uzi', $3, 'decoy')`, decoyRecID, decoyReviewID, f.target)
+
 	after, err := q.ListOpenImproveUziRecommendations(ctx, 50)
 	if err != nil {
 		t.Fatalf("backlog after: %v", err)
 	}
+	// Precondition, or the assertion below proves nothing: the decoy must actually be IN the
+	// unscoped result, sharing this fixture's target. If it is not, the collision this test
+	// defends against cannot occur and the scoping is untested.
+	var decoyPresent bool
 	for _, r := range after {
-		if r.Target == f.target {
+		if r.ID == decoyRecID {
+			decoyPresent = true
+			if r.Target != f.target {
+				t.Fatalf("fixture broken: decoy target %q != %q, so it cannot collide", r.Target, f.target)
+			}
+		}
+	}
+	if !decoyPresent {
+		t.Fatal("fixture broken: the decoy improve_uzi row is not in the unscoped backlog, " +
+			"so a target-matching assertion would pass here and this test proves nothing")
+	}
+	for _, r := range after {
+		if r.ID == f.recID {
 			t.Fatalf("an auto-done improve_uzi recommendation is still in the self-improve backlog: %+v", r)
 		}
 	}

@@ -3,7 +3,13 @@
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
-**Progress (2026-07-21, late)** — **all seven implementation milestones landed** (M1-M7); M8a docs and M8b e2e remain. **NO MR opened yet.** Work resumes in THIS PRD, not a follow-up. Branch `feature/prd-98-judge-menu` @ `a48c5afe`.
+**Progress (2026-07-21, end of day)** — **FIRST MR MERGED.** [MR !90](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/90) landed on `main` as `8515cfab` with CI green across every stage: all seven implementation milestones (M1-M7) plus M8a's docs half, 95 files, +15,594/−225. The migration shipped as `00081_judge_issue_close_sync.sql`, renumbered above the live head at landing (the draft `00075` collided with a *different* migration already on `main`; the `00076` gap was deliberately not filled, since a free number below the applied head is the boot-refusing case).
+
+**A second branch, `feature/prd-98-followup`, carries the cheap tier of Remaining work** — four items closed there and reviewed, unmerged as of this writing.
+
+**THE PRD REMAINS OPEN.** Work resumes here, not in a follow-up PRD. Eight items remain below, four of them substantial: M8b (e2e), the printed-instruction backstop, seam 6's golden fixture, and widening the query inventory beyond the judge family. **None of the four is cheaper later than now** — they were deferred for scope, not because they are blocked.
+
+**What this PRD does NOT cover, stated because the alternative is a false claim:** no e2e coverage exists for it at all; mock↔server fidelity is not asserted (and the landing merge widened this — `mockApi` now emulates a composite-FK cascade); `OccurrenceFileIssue` is 236 lines with zero tests and is the only forge-writing web path here; and the query inventory test proves someone *declared* where a query is pinned, not that the pin is good. A claim that the judge backlog is covered end to end would be wrong on four counts.
 
 ### RESUME HERE — what is left, in order (updated 2026-07-21, late)
 
@@ -27,10 +33,19 @@ last one. What remains is documentation, one merge hazard that expires, and the 
    `main` and a free number *below* the applied head is exactly the boot-refusing case.
    **The reference sweep was re-run on the MERGED tree and the earlier measurement held:**
    exactly one reference to renumber besides the file itself (M6's draft-number note below).
-   The merge added six further `00075` hits — `runtime.sql.go`, `queries/runtime.sql`,
-   `run_message_instance_integration_test.go`, `specs/ai.md` ×2, `mocks/data.ts` — every one
-   of them naming **main's** `00075`, plus four `prds/done/` + `adr/` hits that are other
-   PRDs' historical drafts. A tree-wide `sed 00075→00081` would have corrupted all ten.
+   The merge brought further `00075` references, **every one of them naming main's**
+   `00075_run_message_instance.sql`: in live code (`runtime.sql.go`, `queries/runtime.sql`,
+   `run_message_instance_integration_test.go`), in `specs/ai.md`, in `mocks/data.ts`, and in a
+   neighbouring migration's own comment (`00077_user_secret_labels.sql`). Alongside them sit
+   the archived PRDs' historical draft numbers — `adr/0042`, `prds/done/42`, `/46`, `/49`, and
+   after the merge `/99` and `/104` too.
+   **Cited as a FILE LIST and a mechanism, not a tally, and that is a correction to what this
+   entry first said.** It read "six further hits … plus four `prds/done/` + `adr/` hits …
+   would have corrupted all ten", which conflated LINE counts with FILE counts and was
+   understated the moment the merge added two more archived files. The durable claim is the
+   classification — *code/spec hits are main's, archived hits are other PRDs' history, exactly
+   one line is ours* — and a blind `sed 00075→00081` corrupts every one of them. The number is
+   whatever the tree holds when you read this; the classification is the finding.
    **Provenance, stated precisely because the timing decides what this is evidence OF:** the
    auditor sent the same seven-file list as a mid-merge warning, and it arrived **after** the
    merge was committed. So this is **two derivations reaching the same answer without reading
@@ -924,7 +939,7 @@ times in one session from comment edits alone; an assertion *count* drifted the 
 Five items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
 **These are PRD #98 work, not a follow-up PRD** — resume here.
 
-- [ ] **An unscoped assertion in an M6 test — a landmine with a measured detonation.**
+- [x] **DONE `0da9186a` (reviewed) — An unscoped assertion in an M6 test — a landmine with a measured detonation.** Fixed by scoping the assertion to the recommendation's row id (the returned row carries no `review_id`, so the id is the only handle), plus a **decoy** row that trips the old assertion. Reviewer measured the discrimination: reverting the fix with the decoy left in place reddens, and the failure names the decoy itself (`RationaleMd:decoy`). Recorded against itself in the commit: the FIRST decoy was never in the backlog at all — `seedCloseSync` always writes a `recommendation_filed_issues` row and #68 Decision 12 makes the row's *existence* the exclusion — and the test's own precondition caught it before any result was claimed.
       `ListOpenImproveUziRecommendations` (selfimprove.sql) selects
       `WHERE rr.category = 'improve_uzi'` across the **whole table** — no user scope, no
       review scope — and `TestFiledIssueCloseAutoDonesOnceLiveDB`
@@ -1076,7 +1091,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       (`sqlc generate` + `go vet`) before being believed; `false::bool` is type-preserving here
       because the projection is already NOT NULL via the cast — the nullability trap in
       `CLAUDE.md` applies to folding a nullable LEFT-JOIN column, which this is not.
-- [ ] **`ListRunInputsForRun` has NO live exercise — found by the query inventory, 2026-07-21.**
+- [x] **DONE `a5235362` + `d5121684` (reviewed) — `ListRunInputsForRun` has NO live exercise — found by the query inventory, 2026-07-21.** The inventory's first find, against a query outside the work that motivated it. Four folds, all RED. The fourth was added after review: the commit claimed the cap taking the oldest *n* was "the strongest property" and **no fold reached it** (`:102` fatals first), so it was asserted, plausible and unmeasured — the fourth fold (`LIMIT` inside a subquery, applied before `ORDER BY`) proved it reachable. Two of the first three folds land on the same assertion (`:96`); noted rather than left implying three independent pins. Known limit recorded at the site: `consumed_at` and `created_at` are unpinnable on this fixture twice over — neither is asserted, and the insert supplies only `(run_id, kind, body)` so both are uniform across all rows.
       `judge.sql`'s `ListRunInputsForRun` is called from exactly one place in production
       (`workersvc/judge_trace.go:89`) and from **no test that touches a database**. Every test
       reaching `JudgeTrace` runs against workersvc's `fakeStore`
@@ -1123,7 +1138,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       test passes for any tree are "the glob found nothing" and "the regex matched nothing",
       and each check catches only its own.
 
-- [ ] **The inbox is the ONLY judge-text renderer with no escaping pin** (M5 audit,
+- [x] **DONE `97bd9528` + `0745c5f1` (audited) — The inbox is the ONLY judge-text renderer with no escaping pin** (M5 audit,
       2026-07-21). `notificationBody` returns `payload.body`, which carries
       `reviewSummaryPreview(sub.SummaryMd)` — scrubbed and capped, but untrusted judge free
       text. React escapes it, so the property HOLDS; nothing asserts it. The other two
@@ -1176,14 +1191,39 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       look, not a defect" — was careful, and it was the compression in between that was
       wrong.)*
 
-- [ ] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/`.** Two
-      instances in this PRD were corrected 2026-07-21 (they cited the checkpoint as
-      authoritative for the pre-MR migration gate — the one item with the worst failure mode on
-      this branch — while line 813 of the same document said the directory is gitignored). The
-      same dangling pointer survives at **`prds/58-hosted-k8s-workers.md:1311`,
-      `prds/done/25-slack-integration.md:118`, `prds/done/39-chat-agent.md:101`, and
-      `specs/ai.md:7931`**. Outside this PRD and outside the freeze — recorded, not touched.
-      The grep that finds the whole class is one string: `agent-team-tasks`.
+- [x] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/` — CLASSIFIED
+      AND CLOSED 2026-07-21.** The sweep found **five** hits, not the four dispatched
+      (`prds/done/39` carries two). Each was classified before being touched, per the rule this
+      PRD's own work put in `.claude/agent-team.md`; **three were left alone deliberately**, and
+      that is the result rather than a shortfall.
+      **Fixed — CURRENT CLAIMS a reader would follow today:**
+      `specs/ai.md` (PRD #83's "Design grounding: <dead path>") — the live decision register,
+      present tense, pointing at a file that cannot be fetched; now says the note did not survive
+      and names `prds/done/83-docker-capable-worker.md` as the surviving record.
+      `prds/done/39-chat-agent.md:101` — the one archived hit that makes a present-tense
+      AUTHORITY claim ("Authoritative Phase-3 wire catalog: <dead path>") with no historical
+      label, while the wire details it defers to are enumerated immediately above it. Annotated,
+      not rewritten: the original sentence stands and a dated parenthetical says the file did not
+      survive and that "authoritative" now names the surviving text.
+      **Left alone — HISTORICAL RECORDS that describe their own mortality:**
+      `prds/58-hosted-k8s-workers.md:1311` sits inside a dated 2026-07-16 log entry whose entire
+      subject IS that the directory is gitignored and the notes die with the worktree — it also
+      records a coder correctly declining to `git add -f` over a deliberate ignore. Rewriting it
+      would erase the reasoning. (This is the one the dispatch expected to be a current claim
+      because #58 is active; the file disagreed.)
+      `prds/done/25-slack-integration.md:118` sits under a heading that literally reads "Original
+      session-1 resume note (historical)".
+      `prds/done/39-chat-agent.md:168` is inside a "Team roster to re-spawn tomorrow" paragraph
+      dated to a day in July — self-evidently a record of a session, not an instruction.
+      **The distinguishing test, since it is the reusable part:** *would a reader today follow
+      this and be misled about where truth lives?* A dated log entry that says the file is gone
+      fails that test harmlessly; an undated "Authoritative: <path>" passes it and misleads.
+      **Earlier in this PRD**, two instances of the same class were corrected inside this file —
+      they cited the checkpoint as authoritative for the pre-MR migration gate, the one item with
+      the worst failure mode on the branch, while another line of the same document said the
+      directory is gitignored. The grep that finds the whole class is one string:
+      `agent-team-tasks`. The dispatched line numbers were already one hit short of what it
+      returns, which is the argument for re-running it rather than inheriting the list.
 
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security

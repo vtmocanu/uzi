@@ -280,6 +280,27 @@ Evidence: the lead quoted an anchor for this very amendment that did not match t
 grep because the sentence wrapped; the coder read the section and landed it correctly instead
 of replying "anchor not found".
 
+**A TRUNCATED VIEW IS NOT THE OUTPUT.** `| head -N` / `| tail -N` produce something that
+looks complete — output that stops at your limit is indistinguishable from output that
+stopped because it ended. Two instances on PRD #98's landing, on the same `00075` query,
+one published (three migrations when the same `--stat` line said six) and one caught by
+re-running unbounded (12 shown, 17 real). Count with `rg -c`, `wc -l` or `--stat`'s own
+summary and reconcile it against the rows you can see; never let a bounded view be the
+basis of a count.
+**What makes this fixable rather than a hazard to be careful about: in both instances the
+disproof was ON SCREEN.** `--stat`'s summary line said six while three rows were visible;
+`rg`'s own counts were available. Unlike the working-tree trap the evidence is right there,
+and `head`/`tail` discard it. That is the third member of this family — the failed grep is
+the EMPTY case, this is the NON-EMPTY-BUT-PARTIAL case, and partial is worse because empty
+at least looks like nothing.
+**The honest asymmetry, recorded because it is what makes this a class rather than one
+person's slip:** one validator PUBLISHED its wrong count; the other caught its own by
+re-running unbounded before quoting numbers, then withheld them anyway because the tree was
+mid-merge. One error and one near-miss, same query, same afternoon — **and a third instance
+in the coder's own PRD text**, which cited *"six … plus four … all ten"* while mixing line
+counts with file counts, and which the merge silently understated by adding two more archived
+files. Three people, one query, one day.
+
 Worked example, both halves from one day: the auditor reported a comment gap at
 `c1fcdfce` that `a2b554a6` had already closed — genuinely stale. Its **fold**
 results from the same run still stood, and note carefully WHAT that took, because the

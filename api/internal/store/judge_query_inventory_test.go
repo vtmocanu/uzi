@@ -163,12 +163,15 @@ var judgeQueryInventory = []queryPin{
 		"direct call, judge_integration_test.go:91"},
 	{"ListToolResultPayloadsForRun", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:84"},
-	{"ListRunInputsForRun", "judge.sql", unpinnedPin,
-		"NO live exercise. Its only production caller is workersvc/judge_trace.go:89, and every " +
-			"test that reaches JudgeTrace runs against workersvc's fakeStore (service_test.go:393), " +
-			"which returns a canned slice — so the SQL itself has never executed under test. The " +
-			"judge's oldest-first input cap rides this query (see follow_up_inputs_integration_test.go:21). " +
-			"Declared rather than fixed because PRD #98's scope is frozen; recorded in the PRD's Remaining Work."},
+	{"ListRunInputsForRun", "judge.sql", "TestListRunInputsForRunLiveDB",
+		"WAS the one UNPINNED row, and this mechanism is how it was found — it named a query " +
+			"nobody was looking at, outside the work that motivated the inventory. Now pinned by " +
+			"judge_trace_inputs_integration_test.go: run scoping, every kind (not just follow_up), " +
+			"oldest-first, and the cap taking the OLDEST n. FOUR folds, each RED, hitting THREE " +
+			"distinct assertions: ORDER BY id DESC and a cap-from-the-wrong-end subquery isolate " +
+			"the order and the cap; a neutered run predicate and a follow_up-only filter both land " +
+			"on the same row-count check. NOT covered, and the fixture cannot cover it: " +
+			"consumed_at and created_at (see the note at the fixture)."},
 	{"UpsertRunReviewWithRecommendations", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:103"},
 	{"GetRunReviewForTarget", "judge.sql", "TestJudgeQueriesLiveDB",

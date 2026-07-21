@@ -136,6 +136,79 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(screen.queryByText("Mark read")).toBeNull();
   });
 
+  // PRD #98 Remaining Work: the inbox was the ONLY judge-text renderer with no escaping pin.
+  // The property already HELD — React escapes it — but nothing asserted it, and the other two
+  // renderers both carry the pin (RunView.test.tsx "renders review free text as escaped text,
+  // never HTML"; Judge.test.tsx "renders markup in the preview as literal characters").
+  //
+  // Why the inbox needed it MORE than the others rather than less: `payload.body` carries
+  // `reviewSummaryPreview(sub.SummaryMd)` — scrubbed and length-capped at ingest, but
+  // untrusted judge free text by the producer's own description — and M5 made this a
+  // first-class judge surface. The pre-flag that produced the other two pins was explicitly
+  // about a future author reaching for a markdown renderer; this was the one place that would
+  // not have failed.
+  //
+  // Same payload as the other two on purpose: one string, three renderers, so a reader can
+  // see they are asserting the same property.
+  it("renders judge free text as escaped text, never HTML", async () => {
+    mockApi.listNotifications.mockResolvedValue({
+      notifications: [
+        aNotif({
+          payload: { title: "Run review ready", body: "<img src=x onerror=alert(1)> **not bold**" },
+        }),
+      ],
+      unread: 1,
+      total: 1,
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
+    );
+
+    // Wait on the TITLE, not on the text under test: the row must be rendered before either
+    // assertion means anything, and awaiting the escaped body would put the text query first
+    // again. A bare `expect(container.querySelector("img")).toBeNull()` with no await ahead of
+    // it passes VACUOUSLY — nothing has rendered yet, so of course there is no <img>.
+    await screen.findByText("Run review ready");
+    // THE SECURITY PROPERTY, ASSERTED FIRST so it is the first red. The markup never became a
+    // real element (no dangerouslySetInnerHTML / markdown parsing on judge output).
+    expect(container.querySelector("img")).toBeNull();
+    // ...and it is present as literal characters. Both halves of the payload are required:
+    // raw HTML breaks the first, a markdown renderer breaks the second.
+    expect(screen.getByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
+  });
+
+  // The GROUPED path renders the same NotificationRow, but M5 is what put judge text behind
+  // an expander, so the surface is asserted where it is actually reachable rather than
+  // inferred from the component being shared.
+  it("escapes judge free text inside an expanded group too", async () => {
+    const evil = "<img src=x onerror=alert(1)> **not bold**";
+    mockApi.listNotifications.mockResolvedValue({
+      notifications: [
+        aNotif({ id: "j1", payload: { title: "Run review ready", body: evil }, created_at: "2026-07-20T12:00:00Z" }),
+        aNotif({ id: "j2", payload: { title: "Run review ready", body: evil }, created_at: "2026-07-20T11:59:00Z" }),
+      ],
+      unread: 2,
+      total: 2,
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("2 reviews ready")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+
+    // Same ordering rule as above, and the same reason for awaiting the title instead.
+    expect((await screen.findAllByText("Run review ready")).length).toBe(2);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getAllByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/).length).toBe(2);
+  });
+
   it("deep-links a judge review into the Judge workbench, anchored to its run", async () => {
     mockApi.listNotifications.mockResolvedValue({ notifications: [aNotif()], unread: 1, total: 1 });
     render(
