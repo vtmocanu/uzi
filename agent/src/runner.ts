@@ -184,6 +184,19 @@ export class RunRunner {
     const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): Promise<void> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
 
+    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
+    // `concat` is order-preserving, so an emitted explanation would queue behind the
+    // poison that tripped it and never land. reportState has bounded retries,
+    // 4xx-fatal semantics, and treats an already-terminal server response as
+    // success, so if the run has already reported terminal this is a safe no-op
+    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
+    // trip path must never block on the network.
+    batcher.onPermanentFailureReport(({ reason }) => {
+      void reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
+        runLog.error("could not report the message-transport failure", { error: errMessage(e) }),
+      );
+    });
+
     let barePath: string | undefined;
     let worktreePath: string | undefined;
     try {

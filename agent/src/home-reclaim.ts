@@ -39,10 +39,16 @@ import { RUN_ID_RE } from "./util.js";
  *  one of these will never resume, so its HOME cannot be wanted again. */
 export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
 
-/** How stale a directory must be before it is even a candidate. An hour is far
- *  longer than the window between creating a HOME and the run row existing, and
- *  short enough that a boot after a crash still reclaims the same day. */
-export const DEFAULT_RECLAIM_MIN_AGE_MS = 60 * 60_000;
+/**
+ * How stale a directory must be before it is even a candidate.
+ *
+ * Sized against `RUN_TIMEOUT` (2h by default, `api/internal/config/config.go:537`) plus an
+ * hour of margin: no run can legitimately outlive its own timeout, so a HOME
+ * untouched for longer than that cannot belong to a run still doing work. This is
+ * belt only — the API's terminal-status check is the actual oracle — but it is the
+ * belt that holds if the status lookup is ever made cheaper or cached.
+ */
+export const DEFAULT_RECLAIM_MIN_AGE_MS = 3 * 60 * 60_000;
 
 /** Cap on directories examined per boot, so a pathological volume cannot turn
  *  startup into an unbounded sequence of API round-trips. The next boot picks up
