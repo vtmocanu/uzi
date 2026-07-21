@@ -1135,14 +1135,44 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       M5 makes the inbox a first-class judge surface — so it is now the obvious next place
       someone does that, and the one place nothing would fail.
 
-- [ ] **The anchored deep-link is the RARER path in practice** (M5 review, 2026-07-21). The
-      group header's "Open Judge" link (`Notifications.tsx`) is a hardcoded `/judge` with no
-      run anchor. Correct in itself — a group spans several runs, so there is no single run to
-      anchor to — but it means the anchored link that Decision 1's `bucket=all` exception
-      exists for is reachable only from an **ungrouped** judge row, and on a busy day every
-      judge row is grouped. **Product question, not a defect**; being raised with the user
-      separately. Recorded so the `bucket=all` exception is re-evaluated against how often its
-      path is actually taken, rather than defended on its original reasoning alone.
+- [ ] **The anchored deep-link's RENDER PATH is rarely exercised in real use — a testing
+      concern, not a product gap** (M5 review, 2026-07-21; **corrected the same day**).
+      **The behaviour is COHERENT and the user ruled ship-as-is.** The three cases line up,
+      and each default is right for what was clicked:
+
+      | clicked | goes to | bucket | why |
+      |---|---|---|---|
+      | ungrouped judge notification | `/judge?run={id}` | `all` | one run; dedup may have settled its coordinate elsewhere, so `todo` could show an empty page |
+      | group header | `/judge` | `todo` | no single run applies — with several reviews waiting the user is working the backlog, not one run's slice |
+      | row inside the expander | `/judge?run={id}` | `all` | per-run, identical to ungrouped |
+
+      A group header **cannot** carry a meaningful anchor: it spans several runs, and
+      anchoring it to (say) the most recent would be arbitrary and would misrepresent what
+      was clicked.
+      **What survives is that a rarely-taken path rots quietly.** If judge notifications
+      typically arrive in bursts and get grouped, the anchored + `bucket=all` path is taken
+      rarely — and its whole reason for existing (avoiding an apparently-empty page on a
+      fresh notification) manifests only in the case nobody routinely hits.
+      **Measured, so the item is actionable rather than a worry:** `notificationLink` itself
+      is covered as a pure function regardless of grouping (`notifications.test.ts`), so the
+      LOGIC is pinned. What is not pinned is the RENDER path — the only test asserting an
+      anchored `href` in the DOM uses a **single ungrouped** judge notification, and the
+      grouping test opens the expander but asserts titles and Mark-read controls, never an
+      `href`. So DOM coverage of the anchored link depends on exactly the configuration that
+      is rare in production. **The item: assert the anchored `href` on a row INSIDE an opened
+      group.** One assertion, in a test that already opens the expander.
+      **User ruling: ship as-is, no product change.** The only alternative considered —
+      defaulting the expander open for small groups (2-3), which puts the anchored rows in
+      front of the user without inventing an anchor for the header — was not taken and is not
+      in scope.
+      *(Provenance, kept because it is the point: this entry first said the anchored path was
+      "reachable only from an ungrouped row", which reads as a defect. False — the expander
+      renders each `NotificationRow`, which carries the per-notification anchored link, so it
+      is one click deeper. The coder wrote that expander and relayed the claim into this file
+      without checking it against its own code; the lead caught it by reading the source
+      rather than re-relaying the report. The reviewer's original framing — "worth a product
+      look, not a defect" — was careful, and it was the compression in between that was
+      wrong.)*
 
 - [ ] **A CLASS of dangling pointers to the gitignored `.claude/agent-team-tasks/`.** Two
       instances in this PRD were corrected 2026-07-21 (they cited the checkpoint as
