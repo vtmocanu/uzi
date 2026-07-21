@@ -980,7 +980,28 @@ function AgentBlock({
             shrink-[20] (E1 follow-up): it yields ~20x faster than the label, which is
             what keeps the lane identifiable at phone widths and also restores full
             labels at 640-768 where the equal-rate version had started truncating. */}
-        {oneLiner && <span className="min-w-0 shrink-[20] truncate text-xs text-muted">{oneLiner}</span>}
+        {/* Hidden below `sm` ONLY when the lane has a label (E1, third pass). Once the
+            one-liner has yielded to the label it usually resolves to exactly 0px, which
+            reads cleanly — but when the flex math lands it between ~1 and ~15px,
+            `truncate` clips MID-GLYPH and leaves a single orphan mark floating between
+            the label and the state word, which reads as a rendering artifact rather
+            than as truncation. MEASURED slivers: 4/56px, 14/94px, and 2/181px rendering
+            a bare `¡`. Confined to the 390–560 band in these fixtures, but it is not
+            width-specific in principle — it is whatever width lands a given lane there.
+            The condition is load-bearing: an UNLABELLED lane's one-liner is its only
+            content and nothing competes with it, so hiding that one would remove real
+            information. Same rule as the pill, one layer further: below `sm` a LABELLED
+            lane shows identity and state, and detail is one tap away. */}
+        {oneLiner && (
+          <span
+            className={cx(
+              "min-w-0 shrink-[20] truncate text-xs text-muted",
+              label && "hidden sm:inline",
+            )}
+          >
+            {oneLiner}
+          </span>
+        )}
         {state && (
           <span className={cx("shrink-0 text-[11px] uppercase tracking-wide", CREW_TONE[state])}>
             {state}
