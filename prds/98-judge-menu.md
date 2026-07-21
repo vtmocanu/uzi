@@ -734,10 +734,87 @@ exactly as #68 already does.
       `TestReviewGroupZeroUpdatedIsNotReportedAsSuccess` pins that instead — and the
       genuine 404 refusal stays covered where it genuinely exists, on the per-run route
       (`TestReviewMutationRefusedForReadOnlyToken`). Depends on M1 + M2.
+## What this PRD learned about pinning SQL, and the evidence for it (2026-07-21)
+
+Recorded here rather than in `.claude/agent-team-tasks/` because **that directory is
+gitignored** (`.gitignore:27`) — rules written there die with the worktree, which is the
+session's own thesis landing on the session. The short, findable form of the two most
+reusable facts is in `CLAUDE.md`'s api section; this is the rationale and the evidence.
+Agent-process rules (citing across a moving tree, instructions expiring) are in
+`.claude/agent-team.md`.
+
+**THE RULE, stated so it names a query SHAPE rather than a file list:** *any LEFT JOIN onto
+a coordinate-keyed side table needs a fixture where two rows in one review share EXACTLY ONE
+half of the coordinate.* A file list catches two of the four sites below; the shape catches
+all four. The failure it prevents is specific and it recurred four times: a fixture whose
+rows differ in *both* halves at once makes every half individually inert, so the weaker
+mutation passes while only the both-halves mutation fails — and a passing weaker mutation
+reads as coverage.
+
+| site | state before this PRD's sweep |
+|---|---|
+| `ListJudgeRecommendationRowsForUser` (backlog) | coordinate halves pinned at `45381961`; **review halves were not** |
+| `ListJudgeTriageRowsForRuns` (`/runs` badge) | **nothing pinned at all** until `2e941ced` |
+| `ListOwnedRecommendationsForCoords` (bulk resolve) | review half pinned; coordinate halves inert; the `f` join never exercised |
+| `ListJudgeTriageRowsForUser` (#94 stats) | every half individually inert; only the both-halves fold caught anything |
+
+**The tenant boundary, and the precise claim.** Neither `recommendation_filed_issues`
+(00071) nor `recommendation_dispositions` (00073) has an owner column. `filed_by_user_id`
+and `set_by_user_id` are `ON DELETE SET NULL` **attribution** pointers — nullable, and NULL
+by design for every M6 auto-done — not ownership. Ownership reaches both tables *only*
+through `review_id → run_reviews.user_id`, and `WHERE rv.user_id = @user_id` scopes `rv`,
+not the joined side table. **The production code is correct**; what was missing was any test
+that could observe a break in it. Do not summarise this as a shipped leak.
+Corollary worth keeping: the natural "hardening", `AND d.set_by_user_id = @user_id`, would
+**silently drop every auto-done**.
+
+**A PRD that makes another PRD's query load-bearing inherits its coverage.** Decision 1 calls
+#94's stats query directly so the nav badge, the page tab and M5's notification are literally
+the same query rather than equal-by-construction. That choice buys the guarantee *and* the
+risk: a broken coordinate half there makes all three consumers read the same wrong number and
+agree perfectly, so the cross-check the design relies on cannot fire. The decision that buys
+the guarantee inherits the obligation to cover it.
+
+**Two mechanisms that turned out to matter more than any individual finding.**
+- **A positive control on every mutation run** — assert the named test appears as
+  `--- PASS`/`--- FAIL` and that `SKIP` is 0. Three agents independently leaned on weaker
+  evidence (exit code, "no failures printed", a contention argument) before this was
+  measured; see `CLAUDE.md` for the measurement. It caught a real dead fold in this sweep,
+  *and* it caught its own regex being wrong first.
+- **Compile the mutation before believing it.** Four separately-prescribed folds this session
+  did not build, one of them prescribed inside the correction of another.
+
+**A fold must be SELECTIVE, not merely discriminating.** A fold that reddens a spread of
+assertions manufactures several confidently-wrong diagnoses along with the true one. Measured:
+`f.filed_at -> now()::timestamptz` reddened every assertion ORing `FiledAt.Valid` in with
+other fields, several blaming join predicates that were never mutated;
+`f.filed_at -> d.set_at` reddened exactly one.
+
+**Cite the assertion, not the line — and not the tally either.** Line numbers drifted three
+times in one session from comment edits alone; an assertion *count* drifted the same way
+(one agent said three, another five, both right for their own tree).
+
 ## Remaining work — OPEN IN THIS PRD after the first MR (2026-07-21)
 
-Four items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
+Five items. All found by execution, all with evidence recorded here or in the M3 checkpoint.
 **These are PRD #98 work, not a follow-up PRD** — resume here.
+
+- [ ] **An unscoped assertion in an M6 test — a landmine with a measured detonation.**
+      `ListOpenImproveUziRecommendations` (selfimprove.sql) selects
+      `WHERE rr.category = 'improve_uzi'` across the **whole table** — no user scope, no
+      review scope — and `TestFiledIssueCloseAutoDonesOnceLiveDB`
+      (`judge_issue_close_livedb_test.go`) iterates that result **filtering only by target**.
+      So any future fixture, in any package, that seeds an *open* `improve_uzi` row on target
+      `rg` fails that test for reasons entirely unrelated to it. **This already cost time on
+      2026-07-21**: it failed the first baseline run of the M4 badge fixture, whose only sin
+      was using `improve_uzi` as its second category. That is the branch's own
+      "scope live-DB assertions to the fixture, never the whole table" rule, violated inside a
+      reviewed-and-audited test. **The fix is to assert on the recommendation's ID**, since
+      the returned row carries no `review_id` to scope by. Not fixed at the time because scope
+      was frozen and the test was a validated artifact; the M4 fixture was moved to an inert
+      category instead, with the reason recorded at the constant. Related, unfixed, same
+      shape: `crossCat` in `TestJudgeBacklogProjectsEveryColumnLiveDB` also seeds an open
+      `improve_uzi` row and avoids the collision **only** because its target is `rg-auto`.
 
 - [ ] **M8b — the e2e leg.** Unblocked since PRD #97 merged and this branch merged `main`
       (`create_run`, `retry_read`, positive controls are all in the tree). Its value is

@@ -123,7 +123,69 @@ decides where the next person spends their time. Re-derive those too.
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
   just passed. `test:api-store-it` now fails on zero-passed or any-skipped for
-  exactly this reason.
+  exactly this reason. **Re-measured on PRD #98 (2026-07-21) because three agents
+  had each leaned on weaker evidence anyway:** with the var unset the sweep exits
+  `0`, both packages print `ok`, and the tally is `RUN=108 PASS=0 SKIP=108`.
+  Exit code and "no failures printed" are *both* satisfiable by a run in which
+  not one assertion executed. Require a **positive control** — the named test
+  appears as `--- PASS`/`--- FAIL`, zero `--- SKIP`, `RUN > 0` — and treat any
+  run failing that as INVALID rather than green. See `CLAUDE.md`'s api section
+  for the operational form.
+
+## Citing and dispatching across a moving tree (CRITICAL)
+
+Several agents commit against one worktree, so **the tree a claim was read from
+may already be gone by the time the claim is acted on.** Two rules, both earned
+on PRD #98 (2026-07-21), both by incidents rather than by argument.
+
+**1. An instruction to change a file is a CLAIM about that file's current
+contents, and it EXPIRES.** Read the file before acting on any dispatch that
+quotes it, names a line number, or says a fix "did not land". Evidence:
+
+- The **team lead** re-dispatched a correction for a superseded comment at
+  `:643`, stating it "is not in your report" — it had landed one commit earlier;
+  the lead had read a stale working tree. The dispatch's own subject was an item
+  that had crossed in flight, and it had itself crossed.
+- The **"fixed container name"** for `e2e/run-store-it.sh`: asserted by an
+  implementer, relayed by the lead as an instruction, and accepted by an auditor
+  **who had the two-line file open earlier in the same session**. Three agents,
+  none of whom opened it. False — the name is `uzi-store-it-$$`.
+
+The mechanism that caught both: **the recipient opened the file before acting**,
+instead of assuming the instructor's read was current. Note the asymmetry that
+makes this a standing rule rather than general care — the instructor is reading a
+tree the recipient is actively changing, so the instructor's read is the one that
+goes stale, and the recipient is the only one positioned to notice. Agreement is
+when a claim gets checked least, and an instruction is agreement's most
+authoritative form.
+
+**2. A LINE NUMBER IS MEANINGLESS WITHOUT A SHA.** `grep -n` answers a question
+about a tree that may not survive the hour. `git show <sha>:<path>` is the only
+citation that crosses a commit boundary, and reviewer, auditor and lead all need
+it when quoting a location. Evidence: **both** of the lead's misfires above, plus
+a reviewer/lead disagreement over `:620` vs `:632` where *both were right for
+their own SHA* and only the unpinned correction was wrong. The structural fix is
+better than the discipline: **cite the assertion by name or message, not by
+line** — comment edits shift line numbers, which bit three times in one session
+even within a single agent's own work.
+
+**3. Before dispatching a recommendation, name the other recommendations
+touching the same file or fixture, and say whether they compose.** Three
+collisions on PRD #98, none of them a wrong claim — each was two *locally
+correct* instructions written against different files at different times and
+never read against each other, and in every case the conflict only appeared when
+someone implemented both. The agent merging several sources into one work list is
+the likeliest producer of this and the least likely to notice it. If you receive
+two instructions that land on one fixture, treat "do these compose?" as part of
+the work.
+
+**4. Compile a fold before you prescribe it.** On PRD #98 the lead prescribed an
+uncompilable mutation **twice — the second time inside the correction of the
+first**, by which point the failure mode was known. The point is not that the
+lead should have been more careful: it is that `sqlc generate` + `go vet` settles
+it in under a minute with no container and no database, so the check costs less
+than the correction. See `CLAUDE.md` for the mechanism (sqlc types by
+expression).
 
 ## Inspiration-first rule
 

@@ -34,13 +34,21 @@ and verify with `... compose config` that the dummy admin is what will seed. Eac
 ```sh
 cd api
 go build ./...
-go test ./...                              # all tests
+go test ./...                              # NOT all tests — see live-DB note below
 go test ./internal/forge -run TestName     # single test
 # after editing internal/store/migrations/ or internal/store/queries/:
 go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
 ```
 
 Migrations are goose SQL files embedded via `go:embed` and run at API boot; there is no separate migration step.
+
+**Live-DB tests (`*LiveDB`) are NOT covered by `go test ./...`.** They skip silently without `UZI_TEST_DATABASE_URL`, and they go RED if you export it for an ordinary run (package binaries race one shared database and truncate mid-flight). Run the ordinary gate with the var UNSET; run the live sweep via `./e2e/run-store-it.sh`, or by hand with `-p 1` — load-bearing, not a speed knob, because without it you get nondeterministic reds that move between runs and look exactly like a regression in whatever you just touched.
+
+**A GREEN from a live-DB suite is not evidence unless the run proves it ran.** Measured 2026-07-21: with `UZI_TEST_DATABASE_URL` unset, the sweep exits 0 and both packages print `ok` while reporting `RUN=108 PASS=0 SKIP=108`. Exit code and "no failures printed" are both satisfiable by a run in which not one assertion executed. Require a positive control: the named test appears as `--- PASS`/`--- FAIL`, zero `--- SKIP` lines, `RUN > 0`. A run failing any of those is INVALID, never green. (A skipped sweep costs ~0.6s per package against 4-20s for a real one, so a sub-second package time is the tell.)
+
+**Mutation-testing a query? Compile the mutation before you believe it.** sqlc types by EXPRESSION, so folding a LEFT-JOIN-nullable column to any non-column expression — `now()`, a string literal, a `CASE` — drops the nullability, breaks every `.Valid` in the tests, and the package stops compiling. Nothing runs, which reads like a failing mutation but is a build error. The real differentiator is whether sqlc can RESOLVE a type for the expression: a bare `now()` it cannot (`interface{}`), `now()::timestamptz` it can. So two shapes work — **another nullable column off the LEFT JOIN** (`f.filed_at -> d.set_at`), or **any expression with an explicit cast to the column's type** (`now()::timestamptz`, `'x'::text`).
+
+**Prefer the neighbour column, and not just because it looks like data.** A cast expression is non-NULL for *every* row, so it reddens every assertion touching that column and their messages then blame predicates that were never mutated; a nullable neighbour is NULL exactly where the join did not match, so it reddens only the assertion you are testing. Measured 2026-07-21: `f.filed_at -> now()::timestamptz` reddened a spread of assertions — several of them blaming join predicates that were never mutated, with the giveaway visible in their own output (`settled=false at=true iid=false url=""`) — while `f.filed_at -> d.set_at` reddened exactly one. (Two agents counted that spread differently, three versus five, and both were right for their own tree: the fixture gained assertions between the runs. An assertion COUNT drifts exactly like a line number, so cite the shape, not the tally.) Four separately-prescribed folds died on the compile step in one session; `sqlc generate` + `go vet` settles it in under a minute with no container and no database.
 
 ### web (Vite + React + TS)
 

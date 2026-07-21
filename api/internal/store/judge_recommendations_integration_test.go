@@ -777,27 +777,31 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// not that it "preserves the type" — the cast does that too. IT IS SELECTIVE. Measured by
 	// the reviewer and re-run here, one fold per run against a fresh database:
 	//
-	//   f.filed_at -> now()::timestamptz   RED at FIVE assertions — this one, the sibling, the
-	//                                      cross-category, the cross-review and the claimed
-	//                                      coordinate. Three of those messages blame a join
-	//                                      half that is untouched, and the giveaway is in
-	//                                      their own output: settled=false at=true iid=false
-	//                                      url="" — only the timestamp moved.
-	//   f.filed_at -> d.set_at             RED at this one ONLY
+	//   f.filed_at -> now()::timestamptz   RED at this assertion AND at every other one that
+	//                                      ORs `FiledAt.Valid` in with other fields — the
+	//                                      sibling, cross-category, cross-review and claimed
+	//                                      coordinates. Several of those messages then blame
+	//                                      a join half that was never mutated, and the
+	//                                      giveaway is in their own output:
+	//                                      settled=false at=true iid=false url="" — only the
+	//                                      timestamp moved.
+	//   f.filed_at -> d.set_at             RED at this assertion ONLY
 	//
-	// `now()::timestamptz` is non-NULL for EVERY row, so it trips every condition that ORs
-	// `FiledAt.Valid` in with other fields. `d.set_at` is NULL for the undisposed rows, so
-	// exactly one assertion moves. A fold that reddens five assertions tells you less than one
-	// that reddens the right one — and worse, it produces four confidently-wrong diagnoses.
+	// `now()::timestamptz` is non-NULL for EVERY row; `d.set_at` is NULL exactly where the
+	// disposition join did not match. So the neighbour column is SELECTIVE and the cast is
+	// not, and a fold that reddens a spread of assertions tells you less than one that
+	// reddens the right one — worse, it manufactures several confidently-wrong diagnoses.
 	//
-	// THE GENERAL RULE, which would have prevented all three mistakes: SQLC TYPES BY
-	// EXPRESSION. Folding a LEFT-JOIN-nullable column to any NON-COLUMN expression drops the
-	// nullability and breaks every `.Valid` in the tests. The only fold shape that works on
-	// such a column is ANOTHER NULLABLE COLUMN OFF A LEFT JOIN — which is also exactly what
-	// "looks like data" asks for, so the two criteria agree rather than compete. And a fold
-	// prescribed in a comment is a BUILD-CHECKABLE claim: `sqlc generate` + `go vet` settles
-	// it in under a minute, with no container and no database. Build it before you prescribe
-	// it.
+	// CITE THE SHAPE, NOT THE TALLY. An earlier version of this comment said "three
+	// assertions", a later one "five"; both were right for their own tree, because the
+	// fixture gained assertions in between. An assertion COUNT drifts exactly like a line
+	// number.
+	//
+	// THE GENERAL RULE is in CLAUDE.md's api section — sqlc types by EXPRESSION, and the
+	// differentiator is whether it can RESOLVE a type, not nullability. TWO shapes compile: a
+	// nullable neighbour column off the LEFT JOIN, or any expression with an EXPLICIT CAST to
+	// the column's type. Prefer the neighbour, for the selectivity reason above. A fold
+	// prescribed in a comment is a BUILD-CHECKABLE claim; build it before you prescribe it.
 	if hand.FiledAt.Valid {
 		t.Errorf("a coordinate with NO filed row anywhere carries filed_at %v — the projection is "+
 			"not reading the joined filed row", hand.FiledAt.Time)
