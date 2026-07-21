@@ -388,10 +388,25 @@ describe("OccurrenceFileIssue — the write is issued through the app's API clie
   //   - owner/admin scoping: covered (NonOwnerNotFound, AdminNonOwnedRepoNotFound, …)
   //   - the write-boundary sanitizer: covered (WriteBoundarySanitizesClientBody,
   //     TitleSanitizedAtPost, EmptyTitleRejected)
-  //   - the forge limiter ON THIS ROUTE: NOT covered anywhere I could find. The only
-  //     PerUserMiddleware assertions in the api suite are chat_test.go's and slack_test.go's,
-  //     each for its own route. That is a real gap, named here rather than papered over by a
-  //     web test that appears to cover it.
+  //   - the forge limiter's MOUNT: not covered — and NOT just on this route.
+  //
+  // That last one is broader than "our route is untested", so state it as the class it is.
+  // Measured at 3194633a (line numbers below belong to that SHA; the SHA is the durable
+  // half, the 13 is that tree's inventory): THIRTEEN routes in handler.go mount
+  // `forgeLimiter.PerUserMiddleware` — :596 /{id}/verify, :598 /{id}/projects, :600 PUT
+  // /{id}, :603 /{id}/privilege-check, :621 /{id}/runs, :636 /{id}/issues/{iid}, :638
+  // …/move, :641 …/prdless, :642 /{id}/sync, :644 POST /{id}/issues, :647 /{id}/ci-fix-runs,
+  // :731 this route, :760 /{id}/proposals/{pid}/confirm. The only `PerUserMiddleware`
+  // occurrences in the entire api test tree are chat_test.go:212 and slack_test.go:322, and
+  // each builds its OWN `chi.NewRouter()` with its own `mw.NewLimiter(1, …)` for its own
+  // route.
+  //
+  // So be precise about what is and is not claimed. The middleware itself IS exercised —
+  // those two prove it answers 429 past the budget. What NOTHING asserts is that any of the
+  // thirteen forge routes actually CARRIES it: deleting a `.With(forgeLimiter…)` from any of
+  // them leaves the api suite and this file green alike. Named here because a web test that
+  // looked like it covered this would be worse than no test; out of scope to fix from web/,
+  // and a Go-side change besides.
   it("POSTs to the recommendation's issue route with the CSRF header and the session cookie", async () => {
     const real = (await vi.importActual<typeof import("../lib/api")>("../lib/api")).api;
     mockApi.fileIssue.mockImplementation(real.fileIssue);
