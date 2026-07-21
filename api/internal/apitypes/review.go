@@ -191,11 +191,38 @@ type JudgeBacklogDTO struct {
 // tell that from "the group is gone", and would make the row vanish mid-interaction —
 // exactly what re-reading at bucket=all exists to prevent. When Truncated is true, treat a
 // missing group as UNKNOWN, not settled.
+// Settled names the coordinates this call actually wrote, as addresses a caller can undo
+// through. It exists because the client CANNOT compute that set (PRD #98 review BLK-UNDO):
+// with scope=open, membership is decided SERVER-SIDE at write time, so any member settled
+// between the client's last read and this write is in the client's view of "open" and
+// outside the action. Undoing from that stale view deletes dispositions the action never
+// created — and for an M6 issue-close auto-done that is IRREVERSIBLE, because
+// close_synced_at is already stamped and the poller is edge-triggered, so the auto-done
+// never re-fires and the set_via='issue_close' provenance is gone.
+//
+// Updated cannot stand in for it: it is a bare count, and a count cannot say WHICH.
 type JudgeDispositionResultDTO struct {
 	Updated   int                           `json:"updated"`
+	Settled   []JudgeSettledMemberDTO       `json:"settled"`
 	Groups    []JudgeRecommendationGroupDTO `json:"groups"`
 	Truncated bool                          `json:"truncated"`
 	Triage    TriageDTO                     `json:"triage"`
+}
+
+// JudgeSettledMemberDTO is one coordinate a bulk disposition wrote, addressed as the
+// (run, recommendation) pair the per-recommendation disposition route takes (PRD #98 review
+// BLK-UNDO). It is an ADDRESS, not a grain: dispositions are keyed on the (review_id,
+// category, target) coordinate, so two recommendations sharing a coordinate share ONE
+// disposition row and either one of them names it. Exactly one member per settled
+// coordinate is returned, so len(Settled) is the coordinate count Updated reports — a
+// consumer that finds them disagreeing has found a bug, not a subtlety.
+//
+// A caller undoes by DELETEing each pair's disposition. Doing so is safe even if the
+// coordinate was settled twice, because that route treats "no disposition" as already-undone
+// rather than an error.
+type JudgeSettledMemberDTO struct {
+	RunID string `json:"run_id"`
+	RecID string `json:"rec_id"`
 }
 
 // JudgeDispositionCoordDTO is one (category, target) coordinate in a bulk group-disposition

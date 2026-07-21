@@ -160,6 +160,32 @@ func TestJudgeBacklogDTOTags(t *testing.T) {
 	assertTags(t, "JudgeBacklogDTO", JudgeBacklogDTO{}, "bucket", "run", "groups", "truncated", "triage")
 }
 
+// The bulk fan-out's reply had NO wire pin at all until PRD #98 review BLK-UNDO, which is
+// why `settled` could be added without anything noticing the shape moved. `settled` is
+// deliberately NOT omitempty: a consumer must be able to distinguish "this call settled
+// nothing" from "this server does not send the field", and an omitted key collapses the two.
+func TestJudgeDispositionResultDTOTags(t *testing.T) {
+	assertTags(t, "JudgeDispositionResultDTO", JudgeDispositionResultDTO{},
+		"updated", "settled", "groups", "truncated", "triage")
+}
+
+func TestJudgeSettledMemberDTOTags(t *testing.T) {
+	assertTags(t, "JudgeSettledMemberDTO", JudgeSettledMemberDTO{}, "run_id", "rec_id")
+}
+
+// An empty fan-out must marshal `settled` as [], never null: the client iterates it to build
+// its undo set, and a null would make "nothing was settled" an error case at every consumer
+// instead of an empty loop.
+func TestJudgeDispositionResultEmptySettledIsArray(t *testing.T) {
+	b, err := json.Marshal(JudgeDispositionResultDTO{Settled: []JudgeSettledMemberDTO{}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"settled":[]`) {
+		t.Errorf("want an empty ARRAY for settled, got: %s", b)
+	}
+}
+
 func TestIssueDraftDTOTags(t *testing.T) {
 	assertTags(t, "IssueDraftDTO", IssueDraftDTO{},
 		"default_repo_id", "title", "description", "labels", "provenance", "default_note")

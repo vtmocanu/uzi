@@ -1104,8 +1104,22 @@ export interface JudgeDispositionCoord {
 // re-renders rather than vanishing. `truncated`: past the cap a settled coordinate can
 // fall outside the read window and have NO group here — treat a missing group as
 // UNKNOWN, not settled.
+// `settled` names the members this call ACTUALLY wrote, as (run, rec) addresses for the
+// per-recommendation disposition route. Undo MUST revert these and never a set the client
+// computed itself: with scope=open, membership is decided server-side at write time, so a
+// member settled since the page last loaded is "open" in the client's view and outside the
+// action. Undoing from that stale view deletes dispositions the action never created — and
+// for an M6 issue-close auto-done that is IRREVERSIBLE (close_synced_at is stamped and the
+// poller is edge-triggered, so it never re-fires and the provenance is gone). `updated` is
+// a bare count and cannot substitute: a count cannot say WHICH.
+export interface JudgeSettledMember {
+  run_id: string;
+  rec_id: string;
+}
+
 export interface JudgeDispositionResult {
   updated: number;
+  settled: JudgeSettledMember[];
   groups: JudgeRecommendationGroup[];
   truncated: boolean;
   triage: TriageCounts;

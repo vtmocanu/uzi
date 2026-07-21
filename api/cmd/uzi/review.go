@@ -338,6 +338,15 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 	if res.Truncated {
 		p.Println("warning: the post-write re-read hit the server's row cap — a group missing from --json output is UNKNOWN, not settled")
 	}
+	// `settled` names the exact (run, rec) coordinates this call wrote, which is what an
+	// agent needs to revert it: `uzi review undo <run-id> <rec-id>` per entry. It is NOT
+	// derivable from anything else the CLI has — with scope=open the server decides
+	// membership at write time, so a client reconstructing the set from `uzi review backlog`
+	// would name members this action never touched (PRD #98 review BLK-UNDO). --json carries
+	// the full list; the human view says how to get it rather than printing N uuid pairs.
+	if n := len(res.Settled); n > 0 && p.Format != uzicli.FormatJSON {
+		p.Printf("to revert: re-run with --json for the %d (run, rec) pair(s), then `uzi review undo <run-id> <rec-id>` for each\n", n)
+	}
 	return nil
 }
 

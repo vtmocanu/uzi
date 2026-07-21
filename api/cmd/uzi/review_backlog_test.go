@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -352,11 +353,13 @@ func TestReviewGroupTruncatedRereadWarns(t *testing.T) {
 }
 
 // The group form's --json emits the server's result DTO whole, so an agent gets updated,
-// truncated, the re-read groups and the recomputed triage from the one round-trip.
+// truncated, the re-read groups, the recomputed triage AND the `settled` undo addresses
+// from the one round-trip.
 func TestReviewGroupJSONEmitsTheResultDTO(t *testing.T) {
 	fc := backlogFake()
 	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
 		Updated:   4,
+		Settled:   []apitypes.JudgeSettledMemberDTO{{RunID: "run-a", RecID: "rec-a"}},
 		Truncated: true,
 		Groups:    []apitypes.JudgeRecommendationGroupDTO{{Category: "install_worker_tool", Target: "rg", Bucket: "done"}},
 		Triage:    apitypes.TriageDTO{Total: 12, Todo: 1},
@@ -372,6 +375,41 @@ func TestReviewGroupJSONEmitsTheResultDTO(t *testing.T) {
 	}
 	if got.Updated != 4 || !got.Truncated || len(got.Groups) != 1 || got.Triage.Todo != 1 {
 		t.Errorf("--json lost part of the result: %+v", got)
+	}
+	// The undo addresses survive the passthrough. Without them an agent cannot revert a
+	// group action at all: with scope=open the server decides membership at write time, so
+	// a set reconstructed from `uzi review backlog` would name members this call never
+	// settled (PRD #98 review BLK-UNDO).
+	want := []apitypes.JudgeSettledMemberDTO{{RunID: "run-a", RecID: "rec-a"}}
+	if !reflect.DeepEqual(got.Settled, want) {
+		t.Errorf("--json settled = %+v, want %+v", got.Settled, want)
+	}
+}
+
+// The human view does not dump uuid pairs, but it must not leave an agent or a user with no
+// route back: a fan-out that settled something says how to obtain the undo addresses.
+func TestReviewGroupHumanPointsAtTheUndoAddresses(t *testing.T) {
+	fc := backlogFake()
+	fc.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated: 2,
+		Settled: []apitypes.JudgeSettledMemberDTO{
+			{RunID: "run-a", RecID: "rec-a"},
+			{RunID: "run-b", RecID: "rec-b"},
+		},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "review", "resolve", "--category", "tests", "--target", "unit")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "to revert") || !strings.Contains(out, "uzi review undo") {
+		t.Errorf("a settling fan-out must point at the undo route:\n%s", out)
+	}
+	// Nothing settled ⇒ no revert advice; there is nothing to revert.
+	fc2 := backlogFake()
+	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 0}
+	out2, _, _ := runCLI(t, fakeEnv(fc2), "review", "resolve", "--category", "tests", "--target", "unit")
+	if strings.Contains(out2, "to revert") {
+		t.Errorf("a no-op fan-out must not offer a revert route:\n%s", out2)
 	}
 }
 

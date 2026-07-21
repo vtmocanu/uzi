@@ -24,6 +24,7 @@ import {
   type JudgeDispositionCoord,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
+  type JudgeSettledMember,
   type Repo,
 } from "../lib/api";
 import {
@@ -51,10 +52,19 @@ import {
 } from "../components/ui";
 import { ChevronDownIcon, ChevronRightIcon, ExternalLinkIcon, ScaleIcon, XIcon } from "../components/icons";
 
-// A member the page can Undo: the (run, rec) it will clear a disposition on. Captured
-// from the OPEN occurrences BEFORE a bulk action (scope=open touches exactly those), so
-// Undo reverts precisely what the action settled.
-type UndoMember = { run_id: string; rec_id: string };
+// A member the page can Undo: the (run, rec) it will clear a disposition on. Taken from the
+// RESPONSE's `settled` list — the members the server actually wrote — never from this page's
+// own view of which occurrences were open.
+//
+// The distinction is not pedantry, it is the difference between a revert and a destructive
+// delete (PRD #98 review BLK-UNDO). scope=open membership is decided SERVER-SIDE at write
+// time; this page's `backlog` is as old as its last load. Any member settled in between is
+// `todo` here and excluded there, so a snapshot-based undo issues deleteDisposition for a
+// disposition this action never created. For an M6 issue-close auto-done that is
+// IRREVERSIBLE: close_synced_at is already stamped, so the edge-triggered poller never
+// re-fires and the set_via='issue_close' provenance is destroyed. The page cannot narrow
+// this itself — `updated` is a bare count, and its own view is the stale thing.
+type UndoMember = JudgeSettledMember;
 
 type Toast = {
   message: string;
@@ -62,6 +72,14 @@ type Toast = {
   // there is nothing to undo (e.g. the action matched no open member).
   undo: UndoMember[];
 };
+
+// UNDO_CONCURRENCY bounds the parallel DELETEs an Undo issues (PRD #98 review N4). Undo is
+// the one path that re-expands a fan-out the server deliberately collapsed to a SINGLE
+// statement: a 100-coordinate action can settle far more members than that, and firing them
+// all at once from the browser is exactly the amplification M2's one-statement write exists
+// to prevent, just moved to the client. Small enough to stay polite, large enough that a
+// realistic undo is not perceptibly serial.
+const UNDO_CONCURRENCY = 6;
 
 export function Judge() {
   const { user } = useAuth();
@@ -153,23 +171,12 @@ export function Judge() {
   // bucket=all re-read (DELIBERATELY not a client-side filter): the acted-on rows RE-RENDER
   // at their new rollup, `triage` is taken from the canonical aggregate in the same
   // round-trip, and — on a truncated page — a coordinate ABSENT from the response is left
-  // as-is (UNKNOWN), never dropped. Undo reverts exactly the members this settled.
+  // as-is (UNKNOWN), never dropped. Undo reverts exactly the members the RESPONSE reports
+  // settling — never a set derived from this page's own (older) view of what was open.
   const dispose = useCallback(
     async (coords: JudgeDispositionCoord[], status: "done" | "dismissed", reason?: "wont_do" | "not_an_issue") => {
       if (coords.length === 0) return;
       setActionErr("");
-      // Snapshot the open members the action will settle, for Undo — read from the CURRENT
-      // groups before the write lands.
-      const current = backlog?.groups ?? [];
-      const byCoord = new Map(current.map((g) => [coordKey(g.category, g.target), g]));
-      const undo: UndoMember[] = [];
-      for (const c of coords) {
-        const g = byCoord.get(coordKey(c.category, c.target));
-        if (!g) continue;
-        for (const occ of g.occurrences) {
-          if (occ.bucket === "todo") undo.push({ run_id: occ.run_id, rec_id: occ.rec_id });
-        }
-      }
       try {
         const res = await api.bulkSetJudgeDisposition(coords, status, reason, "open");
         // Reconcile IN PLACE from res.groups (the bucket=all re-read). Replace each acted-on
@@ -193,10 +200,19 @@ export function Judge() {
           message:
             res.updated === 0
               ? "Nothing to update — those members were already settled."
-              : `${res.updated} ${res.updated === 1 ? "recommendation" : "recommendations"} ${verb}${
+              : // "coordinates", not "recommendations": `updated` counts (review_id,
+                // category, target) TRIPLES, and one review can carry the same coordinate on
+                // two recommendations that share ONE disposition row. So this number can be
+                // lower than the recommendations the group visibly spans, and calling it a
+                // recommendation count states something the user can disprove by expanding
+                // the group. (The CLI's `uzi review resolve --category/--target` says
+                // "member coordinate(s)" for the same reason.)
+                `${res.updated} ${res.updated === 1 ? "coordinate" : "coordinates"} ${verb}${
                   res.truncated ? " (backlog partial — some may be off-page)" : ""
                 }.`,
-          undo: res.updated === 0 ? [] : undo,
+          // Straight from the response: the members the SERVER settled. Never a set derived
+          // from `res.updated` or from this page's occurrences — see UndoMember.
+          undo: res.settled,
         });
       } catch (e) {
         setActionErr(e instanceof ApiError ? e.message : "Could not apply the disposition");
@@ -211,14 +227,43 @@ export function Judge() {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     if (members.length === 0) return;
     setActionErr("");
-    try {
-      // Clear each settled coordinate. deleteDisposition swallows a 404 (already cleared),
-      // so a duplicate member (two recs sharing a coordinate in one review) is a safe no-op.
-      await Promise.all(members.map((m) => api.deleteDisposition(m.run_id, m.rec_id)));
-      await load();
-    } catch (e) {
-      setActionErr(e instanceof ApiError ? e.message : "Could not undo");
+    // Clear each settled coordinate. deleteDisposition swallows a 404 (already cleared), so
+    // a duplicate member (two recs sharing a coordinate in one review) is a safe no-op.
+    //
+    // Two properties this loop has and `Promise.all(members.map(...))` did not (PRD #98
+    // review N4):
+    //
+    //  1. CONCURRENCY IS BOUNDED. Undo re-expands, one request per member, the fan-out the
+    //     server deliberately collapsed into a single statement — so the unbounded form put
+    //     back exactly the amplification M2 removed, on the client side.
+    //  2. PARTIAL FAILURE IS REPORTED HONESTLY. Promise.all rejects on the FIRST failure
+    //     while the remaining requests stay in flight and their outcomes are discarded, so
+    //     the user was told "Could not undo" while an unknown number of members HAD been
+    //     reverted. Undo is a destructive operation; "some of it happened and I will not say
+    //     which" is the one report it must not give. Every member is now attempted and the
+    //     tally is reported.
+    let failed = 0;
+    const queue = [...members];
+    const workers = Array.from({ length: Math.min(UNDO_CONCURRENCY, queue.length) }, async () => {
+      for (let m = queue.shift(); m !== undefined; m = queue.shift()) {
+        try {
+          await api.deleteDisposition(m.run_id, m.rec_id);
+        } catch {
+          failed += 1;
+        }
+      }
+    });
+    await Promise.all(workers);
+    if (failed > 0) {
+      setActionErr(
+        failed === members.length
+          ? "Could not undo — nothing was reverted."
+          : `Partly undone: ${members.length - failed} of ${members.length} reverted, ${failed} failed. Re-check the affected groups.`,
+      );
     }
+    // Reload either way: after a partial failure the page must show what IS true, not the
+    // state either outcome would have implied.
+    await load();
   }, [toast, load]);
 
   const toggleSelect = (key: string) => {
@@ -681,8 +726,10 @@ function MultiSelectBar({
 }
 
 // UndoToast confirms a bulk action and offers a one-click revert. Undo clears exactly the
-// members the action settled (deleteDisposition per member). A role="status" live region so
-// the confirmation is announced.
+// members the SERVER reported settling (the response's `settled` list), one deleteDisposition
+// each, at bounded concurrency — not the members this page believed were open, which is a
+// staler set and can include coordinates the action never touched (see UndoMember). A
+// role="status" live region so the confirmation is announced.
 function UndoToast({ toast, onUndo, onDismiss }: { toast: Toast; onUndo: () => void; onDismiss: () => void }) {
   return (
     <div className="fixed inset-x-0 bottom-20 z-30 flex justify-center px-4">

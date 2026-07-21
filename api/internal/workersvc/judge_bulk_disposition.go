@@ -155,6 +155,12 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	writeCategories := make([]string, 0, len(members))
 	writeTargets := make([]string, 0, len(members))
 	hashes := make([]string, 0, len(members))
+	// The undo addresses for exactly the members this call settles (PRD #98 review
+	// BLK-UNDO). Built in THIS loop rather than by the caller, because this loop IS the
+	// scope decision: it runs against rows read moments ago, and a client's "which members
+	// are open" is necessarily older than that. Appended in lockstep with the write arrays
+	// below, so a member cannot be reported settled without being written.
+	settled := make([]apitypes.JudgeSettledMemberDTO, 0, len(members))
 
 	// SECOND layer against duplicate (review_id, category, target) triples. A single
 	// multi-row ON CONFLICT DO UPDATE raises SQLSTATE 21000 ("cannot affect row a second
@@ -227,6 +233,10 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 		writeCategories = append(writeCategories, rec.Category)
 		writeTargets = append(writeTargets, rec.Target)
 		hashes = append(hashes, RationaleHash(rec.RationaleMd))
+		settled = append(settled, apitypes.JudgeSettledMemberDTO{
+			RunID: rec.RunID.String(),
+			RecID: rec.RecID.String(),
+		})
 	}
 
 	updated := int64(0)
@@ -257,6 +267,10 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	}
 	return apitypes.JudgeDispositionResultDTO{
 		Updated: int(updated),
+		// The addresses the caller undoes through — the members THIS call settled, not the
+		// ones a client believed were open. Nil-safe for a consumer: `settled` is always a
+		// non-nil slice, so an empty fan-out marshals as [] rather than null.
+		Settled: settled,
 		Groups:  groupsForCoords(backlog.Groups, coords),
 		// Carried through: past the cap, a settled coordinate can fall outside the read
 		// window and have no group here. The flag is how a consumer tells that from

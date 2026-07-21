@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -107,6 +108,14 @@ func memberRow(category, target, disposition string, filedSettled bool) store.Li
 func memberRowIn(reviewID uuid.UUID, category, target, disposition string, filedSettled bool) store.ListOwnedRecommendationsForCoordsRow {
 	row := store.ListOwnedRecommendationsForCoordsRow{
 		ReviewID: reviewID,
+		// Distinct per member (PRD #98 review BLK-UNDO). These back the response's `settled`
+		// undo addresses, so a fixture that left them zero would make every member
+		// indistinguishable and no test could tell "reported the right members" from
+		// "reported the right NUMBER of members" — the same class of silently-bounded
+		// fixture as the shared-review limit documented on memberRow above. A test that
+		// needs to name them reads them back off the returned row.
+		RunID:    uuid.New(),
+		RecID:    uuid.New(),
 		Category: category, Target: target, RationaleMd: "because",
 		FiledSettled: filedSettled,
 	}
@@ -366,6 +375,106 @@ func TestBulkDispositionScopeSkipsSettledMembers(t *testing.T) {
 	}
 	if len(st.upserted) != 3 {
 		t.Fatalf("scope=all wrote %d members, want all 3", len(st.upserted))
+	}
+}
+
+// TestBulkDispositionSettledNamesOnlyWhatItWrote is the server half of PRD #98 review
+// BLK-UNDO: the response names the members this call actually settled, so a client undoes
+// exactly those instead of guessing from its own (necessarily older) view of which members
+// were open.
+//
+// The fixture is the discriminating one — a coordinate with an open member, a settled filed
+// member and an already-dismissed member. A client that had loaded the page before those
+// last two were settled would still show them as todo and would undo all three, deleting
+// two dispositions this action never created. The `settled` list must contain ONE entry,
+// naming the open member and neither of the others.
+//
+// Asserting the IDENTITY matters, not just the count: a length-only check passes on a
+// response that names the wrong member, which is precisely the destructive case.
+func TestBulkDispositionSettledNamesOnlyWhatItWrote(t *testing.T) {
+	open := memberRow("improve_uzi", "docs", "", false)
+	filed := memberRow("improve_uzi", "docs", "", true)
+	dismissed := memberRow("improve_uzi", "docs", "dismissed", false)
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{
+		"improve_uzi/docs": {open, filed, dismissed},
+	}}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got apitypes.JudgeDispositionResultDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := []apitypes.JudgeSettledMemberDTO{{RunID: open.RunID.String(), RecID: open.RecID.String()}}
+	if !reflect.DeepEqual(got.Settled, want) {
+		t.Errorf("settled = %+v, want exactly the OPEN member %+v", got.Settled, want)
+	}
+	for _, skipped := range []store.ListOwnedRecommendationsForCoordsRow{filed, dismissed} {
+		for _, s := range got.Settled {
+			if s.RecID == skipped.RecID.String() {
+				t.Errorf("settled names a member scope=open SKIPPED (rec %s) — undoing it would delete a disposition this action never created", s.RecID)
+			}
+		}
+	}
+	// One address per written coordinate: the two counts describe the same set, so a
+	// consumer may rely on them agreeing.
+	if got.Updated != len(got.Settled) {
+		t.Errorf("updated = %d but settled has %d entries; they must describe the same set", got.Updated, len(got.Settled))
+	}
+}
+
+// scope=all settles every member, so `settled` must name all three — the counterpart to the
+// test above, and what proves that list tracks the SCOPE DECISION rather than being a
+// filtered copy of the request.
+func TestBulkDispositionSettledFollowsScopeAll(t *testing.T) {
+	rows := []store.ListOwnedRecommendationsForCoordsRow{
+		memberRow("improve_uzi", "docs", "", false),
+		memberRow("improve_uzi", "docs", "", true),
+		memberRow("improve_uzi", "docs", "dismissed", false),
+	}
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{"improve_uzi/docs": rows}}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done","scope":"all"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200", rec.Code)
+	}
+	var got apitypes.JudgeDispositionResultDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Settled) != len(rows) {
+		t.Fatalf("scope=all settled %d members, want %d", len(got.Settled), len(rows))
+	}
+	byRec := map[string]bool{}
+	for _, s := range got.Settled {
+		byRec[s.RecID] = true
+	}
+	for _, r := range rows {
+		if !byRec[r.RecID.String()] {
+			t.Errorf("scope=all omitted member rec %s from settled", r.RecID)
+		}
+	}
+}
+
+// A fan-out that matches nothing reports an EMPTY settled list, never a null and never a
+// stale one. The client keys "is there anything to undo" off this.
+func TestBulkDispositionSettledEmptyWhenNothingMatched(t *testing.T) {
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{}}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"nope"}],"status":"done"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"settled":[]`) {
+		t.Errorf("want an empty settled ARRAY, got: %s", rec.Body.String())
 	}
 }
 

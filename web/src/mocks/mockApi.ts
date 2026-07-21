@@ -22,6 +22,7 @@ import {
   type JudgeBacklogBucket,
   type JudgeDispositionCoord,
   type JudgeDispositionResult,
+  type JudgeSettledMember,
   type JudgeDispositionScope,
   type JudgeOccurrence,
   type JudgeRecommendationGroup,
@@ -1747,12 +1748,21 @@ export const mockApi = {
     // request names and the scope selects (scope=open → only members the ladder buckets as
     // todo). `updated` counts distinct (review_id, category, target) TRIPLES actually
     // written — so it can be LOWER than the recommendations a group spans.
+    //
+    // `settled` collects an undo ADDRESS per written triple, from the same pass that decides
+    // membership — the mock must model this faithfully, because the whole point of the field
+    // is that it can DIFFER from what a client would compute: a member the scope skips must
+    // not appear here (PRD #98 review BLK-UNDO).
     const writtenTriples = new Set<string>();
+    const settled: JudgeSettledMember[] = [];
     for (const review of reviews) {
       for (const rec of review.recommendations) {
         const key = coordKey(rec.category, rec.target);
         if (!want.has(key)) continue;
         if (scope === "open" && bucketOfRec(review, rec.category, rec.target) !== "todo") continue;
+        if (!writtenTriples.has(`${review.id} ${key}`)) {
+          settled.push({ run_id: review.target_run_id, rec_id: rec.id });
+        }
         const next: Disposition = {
           category: rec.category,
           target: rec.target,
@@ -1775,6 +1785,7 @@ export const mockApi = {
     const groups = backlog.groups.filter((g) => acted.has(coordKey(g.category, g.target)));
     const result: JudgeDispositionResult = {
       updated: writtenTriples.size,
+      settled,
       groups,
       truncated: false,
       triage: backlog.triage,

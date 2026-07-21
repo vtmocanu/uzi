@@ -25,6 +25,8 @@ WITH want AS (
 )
 SELECT DISTINCT ON (rv.id, rr.category, rr.target)
     rv.id                          AS review_id,
+    rv.target_run_id               AS run_id,
+    rr.id                          AS rec_id,
     rr.category                    AS category,
     rr.target                      AS target,
     rr.rationale_md                AS rationale_md,
@@ -49,6 +51,8 @@ type ListOwnedRecommendationsForCoordsParams struct {
 
 type ListOwnedRecommendationsForCoordsRow struct {
 	ReviewID          uuid.UUID   `json:"review_id"`
+	RunID             uuid.UUID   `json:"run_id"`
+	RecID             uuid.UUID   `json:"rec_id"`
 	Category          string      `json:"category"`
 	Target            string      `json:"target"`
 	RationaleMd       string      `json:"rationale_md"`
@@ -130,12 +134,26 @@ type ListOwnedRecommendationsForCoordsRow struct {
 // that has been there longest rather than against whichever row the planner happened to
 // return first. A later re-judge that rewrites either duplicate still flips the flag; what
 // this ordering buys is that it flips for a stable reason.
-// NOTE there is deliberately no rec_id here. It used to be projected and read by nothing,
-// which was not merely dead weight: an unused per-recommendation id is a standing claim
-// that per-recommendation granularity still matters on this path, and that assumption is
-// exactly what made the duplicate-coordinate crash invisible. The write is keyed on the
-// COORDINATE, so the coordinate is what this returns. If a future change needs the
-// recommendation id, it must first answer what it means when two share a coordinate.
+// run_id + rec_id ARE projected (PRD #98 review BLK-UNDO), and the note that used to stand
+// here set the bar for doing so: "if a future change needs the recommendation id, it must
+// first answer what it means when two share a coordinate." Answering it, because the answer
+// is what makes this safe rather than a quiet revert of a deliberate removal:
+//
+//	Two recommendations sharing a coordinate share ONE disposition row, so there is nothing
+//	per-recommendation to express, and this is NOT a return to per-recommendation grain.
+//	The pair is an ADDRESS, not a grain: DELETE /api/runs/{run}/review/recommendations/
+//	{rec}/disposition resolves the rec back to its coordinate and clears that single row,
+//	so ANY member of a coordinate addresses the same disposition. DISTINCT ON still yields
+//	exactly one row per coordinate and the pair it carries is one valid address for it —
+//	deterministic, because the ORDER BY below already fixes which duplicate survives.
+//
+// The earlier removal stays correct on its own terms: an id projected and read by NOTHING
+// is a standing claim that per-recommendation granularity matters, and that claim is what
+// made the duplicate-coordinate crash invisible. What changed is that it now has exactly
+// one reader, for the one thing a coordinate cannot do — name a URL. Undo must clear the
+// dispositions this write actually created, and the caller cannot compute that set itself:
+// scope=open membership is decided HERE, at write time, against rows that may have been
+// settled since the client last read.
 func (q *Queries) ListOwnedRecommendationsForCoords(ctx context.Context, arg ListOwnedRecommendationsForCoordsParams) ([]ListOwnedRecommendationsForCoordsRow, error) {
 	rows, err := q.db.Query(ctx, listOwnedRecommendationsForCoords, arg.UserID, arg.Categories, arg.Targets)
 	if err != nil {
@@ -147,6 +165,8 @@ func (q *Queries) ListOwnedRecommendationsForCoords(ctx context.Context, arg Lis
 		var i ListOwnedRecommendationsForCoordsRow
 		if err := rows.Scan(
 			&i.ReviewID,
+			&i.RunID,
+			&i.RecID,
 			&i.Category,
 			&i.Target,
 			&i.RationaleMd,
