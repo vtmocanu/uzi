@@ -41,6 +41,11 @@ type Client interface {
 	// *ExitError{ExitNotFound}, never another user's steer text.
 	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
 	ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error)
+	// ListSecrets returns the caller's Anthropic tokens as metadata (labels, ids,
+	// default flags — never values): GET /api/me/secrets, RequireUser (PRD #104 D8,
+	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
+	// entry's value appears nowhere — there is no reveal endpoint.
+	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
@@ -441,6 +446,16 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 		return nil, err
 	}
 	return env.Workers, nil
+}
+
+func (c *HTTPClient) ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error) {
+	var env struct {
+		Secrets []apitypes.SecretDTO `json:"secrets"`
+	}
+	if err := c.get(ctx, "/api/me/secrets", &env); err != nil {
+		return nil, err
+	}
+	return env.Secrets, nil
 }
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {

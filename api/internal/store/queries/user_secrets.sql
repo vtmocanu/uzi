@@ -144,11 +144,69 @@ SELECT id FROM user_secrets
 WHERE user_id = @user_id AND kind = @kind AND lower(label) = lower(@label);
 
 -- name: ListUserSecretsMeta :many
--- Metadata-only listing for the current user; never selects ciphertext.
+-- Metadata-only listing for the current user; never selects ciphertext. Retained
+-- for the seed's create-only existence check (it needs only kind); the id-bearing
+-- listing GET /api/me/secrets uses is ListUserSecretsForKind.
 SELECT kind, created_at, updated_at
 FROM user_secrets
 WHERE user_id = $1
 ORDER BY kind;
+
+-- name: ListUserSecretsForKind :many
+-- The user's tokens of one kind, for GET /api/me/secrets (PRD #104 M2). Carries the
+-- id (M1's secretDTO deliberately had none; without it a multi-token list is
+-- indistinguishable rows), the label + is_default the UI renders, and the
+-- timestamps — never the ciphertext. Default first, then by label, so the credential
+-- a user's unbound workers spend against leads the list.
+SELECT id, kind, label, is_default, created_at, updated_at
+FROM user_secrets
+WHERE user_id = @user_id AND kind = @kind
+ORDER BY is_default DESC, lower(label) ASC;
+
+-- name: GetUserSecretForUpdate :one
+-- Lock and read ONE of the user's secrets inside a mutation transaction (PRD #104
+-- M2/D12). FOR UPDATE holds the row until the transaction ends; combined with the
+-- per-(user,kind) advisory lock the mutation takes first, it is what lets
+-- set-default's clear-then-set and delete-default's guard read a stable picture.
+-- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
+SELECT id, kind, label, is_default FROM user_secrets
+WHERE id = @id AND user_id = @user_id
+FOR UPDATE;
+
+-- name: CountUserSecretsForKind :one
+-- How many tokens of a kind the user holds, read inside the mutation transaction
+-- for D6's "is this the last one?" check. Under the advisory lock this count is
+-- stable: no concurrent create can add a row until this transaction commits.
+SELECT count(*) FROM user_secrets
+WHERE user_id = @user_id AND kind = @kind;
+
+-- name: ClearDefaultUserSecret :execrows
+-- Clear the user's current default of a kind (PRD #104 M2). The first half of the
+-- set-default swap and of create-as-default; run under the advisory lock so it
+-- cannot race a concurrent promote into two defaults (which the partial unique index
+-- would reject anyway, but the lock makes the swap atomic rather than a caught
+-- violation). Affects the single default row, or 0 when there is none.
+UPDATE user_secrets SET is_default = false, updated_at = now()
+WHERE user_id = @user_id AND kind = @kind AND is_default;
+
+-- name: SetUserSecretDefault :one
+-- Make ONE secret the user's default (PRD #104 M2). The second half of the swap,
+-- after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
+-- The caller has already verified ownership via GetUserSecretForUpdate under the
+-- lock, so this cannot promote a foreign row.
+UPDATE user_secrets SET is_default = true, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+RETURNING id, kind, label, is_default, created_at, updated_at;
+
+-- name: RenameUserSecret :one
+-- Rename ONE of the user's secrets (PRD #104 M2). Owner-scoped. A label colliding
+-- (case-insensitively) with another of the user's tokens of the kind raises a
+-- unique violation on user_secrets_user_kind_label_key, which the handler maps to a
+-- 409 — renaming does NOT touch is_default, so it needs no lock for the default
+-- invariant (only the label index, which enforces itself).
+UPDATE user_secrets SET label = @label, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+RETURNING id, kind, label, is_default, created_at, updated_at;
 
 -- name: DeleteUserSecret :execrows
 -- Delete ONE secret, keyed on its id (PRD #104 D10) and scoped to its owner. The

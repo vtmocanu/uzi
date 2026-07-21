@@ -91,6 +91,7 @@ uzi worker list
 uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
+uzi token list
 uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
@@ -201,6 +202,11 @@ as inert data.
   do not already own. Two caveats worth knowing: a worker's **chat** runs still
   spend your default token (the binding covers the run lane), and deleting a
   bound token silently returns its workers to the default rather than failing.
+- `uzi token list` — your named Anthropic tokens (id, label, default flag, created
+  date; never the value). It is READ-ONLY here: adding, renaming, set-defaulting and
+  deleting a token are web-only, because they mint or replace a credential and must
+  not be reachable from a CLI token (PRD #104 D8, the same reason `uzi worker` has no
+  `create`). Use the labels this lists as the argument to `uzi worker set-token`.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

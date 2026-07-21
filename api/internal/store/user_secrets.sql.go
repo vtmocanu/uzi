@@ -12,6 +12,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearDefaultUserSecret = `-- name: ClearDefaultUserSecret :execrows
+UPDATE user_secrets SET is_default = false, updated_at = now()
+WHERE user_id = $1 AND kind = $2 AND is_default
+`
+
+type ClearDefaultUserSecretParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+// Clear the user's current default of a kind (PRD #104 M2). The first half of the
+// set-default swap and of create-as-default; run under the advisory lock so it
+// cannot race a concurrent promote into two defaults (which the partial unique index
+// would reject anyway, but the lock makes the swap atomic rather than a caught
+// violation). Affects the single default row, or 0 when there is none.
+func (q *Queries) ClearDefaultUserSecret(ctx context.Context, arg ClearDefaultUserSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearDefaultUserSecret, arg.UserID, arg.Kind)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
 SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
 `
@@ -23,6 +46,26 @@ SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
 // dormant accounts an operator may want to nudge.
 func (q *Queries) CountMasterSealedSecrets(ctx context.Context) (int64, error) {
 	row := q.db.QueryRow(ctx, countMasterSealedSecrets)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUserSecretsForKind = `-- name: CountUserSecretsForKind :one
+SELECT count(*) FROM user_secrets
+WHERE user_id = $1 AND kind = $2
+`
+
+type CountUserSecretsForKindParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+// How many tokens of a kind the user holds, read inside the mutation transaction
+// for D6's "is this the last one?" check. Under the advisory lock this count is
+// stable: no concurrent create can add a row until this transaction commits.
+func (q *Queries) CountUserSecretsForKind(ctx context.Context, arg CountUserSecretsForKindParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countUserSecretsForKind, arg.UserID, arg.Kind)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -138,6 +181,41 @@ func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSe
 		&i.Kind,
 		&i.Ciphertext,
 		&i.SealedWith,
+	)
+	return i, err
+}
+
+const getUserSecretForUpdate = `-- name: GetUserSecretForUpdate :one
+SELECT id, kind, label, is_default FROM user_secrets
+WHERE id = $1 AND user_id = $2
+FOR UPDATE
+`
+
+type GetUserSecretForUpdateParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetUserSecretForUpdateRow struct {
+	ID        uuid.UUID `json:"id"`
+	Kind      string    `json:"kind"`
+	Label     string    `json:"label"`
+	IsDefault bool      `json:"is_default"`
+}
+
+// Lock and read ONE of the user's secrets inside a mutation transaction (PRD #104
+// M2/D12). FOR UPDATE holds the row until the transaction ends; combined with the
+// per-(user,kind) advisory lock the mutation takes first, it is what lets
+// set-default's clear-then-set and delete-default's guard read a stable picture.
+// Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
+func (q *Queries) GetUserSecretForUpdate(ctx context.Context, arg GetUserSecretForUpdateParams) (GetUserSecretForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getUserSecretForUpdate, arg.ID, arg.UserID)
+	var i GetUserSecretForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
 	)
 	return i, err
 }
@@ -292,6 +370,59 @@ func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID)
 	return items, nil
 }
 
+const listUserSecretsForKind = `-- name: ListUserSecretsForKind :many
+SELECT id, kind, label, is_default, created_at, updated_at
+FROM user_secrets
+WHERE user_id = $1 AND kind = $2
+ORDER BY is_default DESC, lower(label) ASC
+`
+
+type ListUserSecretsForKindParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+type ListUserSecretsForKindRow struct {
+	ID        uuid.UUID          `json:"id"`
+	Kind      string             `json:"kind"`
+	Label     string             `json:"label"`
+	IsDefault bool               `json:"is_default"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// The user's tokens of one kind, for GET /api/me/secrets (PRD #104 M2). Carries the
+// id (M1's secretDTO deliberately had none; without it a multi-token list is
+// indistinguishable rows), the label + is_default the UI renders, and the
+// timestamps — never the ciphertext. Default first, then by label, so the credential
+// a user's unbound workers spend against leads the list.
+func (q *Queries) ListUserSecretsForKind(ctx context.Context, arg ListUserSecretsForKindParams) ([]ListUserSecretsForKindRow, error) {
+	rows, err := q.db.Query(ctx, listUserSecretsForKind, arg.UserID, arg.Kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserSecretsForKindRow{}
+	for rows.Next() {
+		var i ListUserSecretsForKindRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Label,
+			&i.IsDefault,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserSecretsMeta = `-- name: ListUserSecretsMeta :many
 SELECT kind, created_at, updated_at
 FROM user_secrets
@@ -305,7 +436,9 @@ type ListUserSecretsMetaRow struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Metadata-only listing for the current user; never selects ciphertext.
+// Metadata-only listing for the current user; never selects ciphertext. Retained
+// for the seed's create-only existence check (it needs only kind); the id-bearing
+// listing GET /api/me/secrets uses is ListUserSecretsForKind.
 func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]ListUserSecretsMetaRow, error) {
 	rows, err := q.db.Query(ctx, listUserSecretsMeta, userID)
 	if err != nil {
@@ -324,6 +457,46 @@ func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]
 		return nil, err
 	}
 	return items, nil
+}
+
+const renameUserSecret = `-- name: RenameUserSecret :one
+UPDATE user_secrets SET label = $1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+RETURNING id, kind, label, is_default, created_at, updated_at
+`
+
+type RenameUserSecretParams struct {
+	Label  string    `json:"label"`
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type RenameUserSecretRow struct {
+	ID        uuid.UUID          `json:"id"`
+	Kind      string             `json:"kind"`
+	Label     string             `json:"label"`
+	IsDefault bool               `json:"is_default"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Rename ONE of the user's secrets (PRD #104 M2). Owner-scoped. A label colliding
+// (case-insensitively) with another of the user's tokens of the kind raises a
+// unique violation on user_secrets_user_kind_label_key, which the handler maps to a
+// 409 — renaming does NOT touch is_default, so it needs no lock for the default
+// invariant (only the label index, which enforces itself).
+func (q *Queries) RenameUserSecret(ctx context.Context, arg RenameUserSecretParams) (RenameUserSecretRow, error) {
+	row := q.db.QueryRow(ctx, renameUserSecret, arg.Label, arg.ID, arg.UserID)
+	var i RenameUserSecretRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const rewrapUserSecret = `-- name: RewrapUserSecret :execrows
@@ -396,6 +569,44 @@ func (q *Queries) RotateUserSecret(ctx context.Context, arg RotateUserSecretPara
 		arg.SealedWith,
 	)
 	var i RotateUserSecretRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Label,
+		&i.IsDefault,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setUserSecretDefault = `-- name: SetUserSecretDefault :one
+UPDATE user_secrets SET is_default = true, updated_at = now()
+WHERE id = $1 AND user_id = $2
+RETURNING id, kind, label, is_default, created_at, updated_at
+`
+
+type SetUserSecretDefaultParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type SetUserSecretDefaultRow struct {
+	ID        uuid.UUID          `json:"id"`
+	Kind      string             `json:"kind"`
+	Label     string             `json:"label"`
+	IsDefault bool               `json:"is_default"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Make ONE secret the user's default (PRD #104 M2). The second half of the swap,
+// after ClearDefaultUserSecret; owner-scoped. Returns metadata for the response.
+// The caller has already verified ownership via GetUserSecretForUpdate under the
+// lock, so this cannot promote a foreign row.
+func (q *Queries) SetUserSecretDefault(ctx context.Context, arg SetUserSecretDefaultParams) (SetUserSecretDefaultRow, error) {
+	row := q.db.QueryRow(ctx, setUserSecretDefault, arg.ID, arg.UserID)
+	var i SetUserSecretDefaultRow
 	err := row.Scan(
 		&i.ID,
 		&i.Kind,

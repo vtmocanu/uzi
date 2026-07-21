@@ -29,30 +29,14 @@ type fakeRLDB struct {
 	// selfRows drives GET /api/me/rate-limits (ListRateLimitsForUser).
 	selfRows []store.ListRateLimitsForUserRow
 	// listRows drives GET /api/admin/rate-limits (ListRateLimits).
-	listRows  []store.ListRateLimitsRow
-	deletedRL bool
-
-	// defaultSecretID answers GetDefaultUserSecretID on the delete path; the zero
-	// value means "no default" (pgx.ErrNoRows), which the delete treats as a no-op.
-	defaultSecretID uuid.UUID
+	listRows []store.ListRateLimitsRow
 }
 
-func (f *fakeRLDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-	if strings.Contains(sql, "DELETE FROM anthropic_rate_limits") {
-		f.deletedRL = true
-	}
+func (f *fakeRLDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
 
-func (f *fakeRLDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
-	switch {
-	case strings.Contains(sql, "SELECT id FROM user_secrets") && strings.Contains(sql, "is_default"):
-		// GetDefaultUserSecretID, used by the delete path.
-		if f.defaultSecretID == uuid.Nil {
-			return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
-		}
-		return fakeScanRow{func(dest ...any) error { *dest[0].(*uuid.UUID) = f.defaultSecretID; return nil }}
-	}
+func (f *fakeRLDB) QueryRow(context.Context, string, ...any) pgx.Row {
 	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 }
 
@@ -403,18 +387,10 @@ func TestAdminRateLimitsVaultLocked(t *testing.T) {
 	}
 }
 
-// D3b: deleting the token also drops the gauge row (belt-and-suspenders over the
-// cascade — see the DeleteRateLimits query comment).
-func TestDeleteTokenDeletesRateLimits(t *testing.T) {
-	db := &fakeRLDB{defaultSecretID: uuid.New()} // a default exists to delete
-	h := &Handler{q: store.New(db)}              // nil vault ⇒ master-box seal path unused on delete
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/api/me/secrets/anthropic_token", nil)
-	h.DeleteAnthropicToken(rec, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsActive: true})))
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("code = %d, want 204", rec.Code)
-	}
-	if !db.deletedRL {
-		t.Fatal("token delete must also DeleteRateLimits (D3b)")
-	}
-}
+// Deleting a token dropping its gauge row is now the DATABASE's job, not the
+// handler's: the ON DELETE CASCADE on anthropic_rate_limits' composite FK (PRD #104
+// M5) drops the row when the token is deleted, so no handler calls DeleteRateLimits
+// on the delete path anymore. That cascade is proven end-to-end in
+// TestRateLimitsPerTokenLiveDB (real Postgres); there is nothing left to assert with
+// a fake DBTX here, and the former TestDeleteTokenDeletesRateLimits was removed
+// rather than left asserting a call the code no longer makes.

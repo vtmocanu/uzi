@@ -169,6 +169,14 @@ func TestReviewNullEnvelope(t *testing.T) {
 	}
 }
 
+func TestSecretDTOTags(t *testing.T) {
+	// PRD #104 M2: the token-list element. It MUST NOT carry any value/ciphertext
+	// field — the pin is here so a future field addition that leaks the secret trips
+	// this test.
+	assertTags(t, "SecretDTO", SecretDTO{},
+		"id", "kind", "label", "is_default", "created_at", "updated_at")
+}
+
 func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",

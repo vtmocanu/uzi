@@ -1,18 +1,22 @@
 package handler
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 	"unicode"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -38,42 +42,103 @@ func (h *Handler) sealUserSecret(userID uuid.UUID, kind string, plaintext []byte
 // is made beyond length + no control/whitespace.
 const maxTokenBytes = 4096
 
-// secretDTO is the metadata-only view of a stored secret. The secret value is
-// never included — there is no reveal endpoint (re-paste to rotate).
-type secretDTO struct {
-	Kind      string    `json:"kind"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+// maxLabelBytes bounds a token label (PRD #104 D7). Mirrors the migration's CHECK
+// (char_length BETWEEN 1 AND 64); the Go validator additionally rejects control
+// characters, which the CHECK does not.
+const maxLabelBytes = 64
+
+// secretMeta builds the metadata-only DTO (apitypes.SecretDTO) for one stored
+// secret. The value appears in no field — there is no reveal endpoint.
+func secretMeta(id uuid.UUID, kind, label string, isDefault bool, created, updated pgtype.Timestamptz) apitypes.SecretDTO {
+	return apitypes.SecretDTO{
+		ID:        id.String(),
+		Kind:      kind,
+		Label:     label,
+		IsDefault: isDefault,
+		CreatedAt: created.Time,
+		UpdatedAt: updated.Time,
+	}
 }
 
-func secretMeta(kind string, created, updated pgtype.Timestamptz) secretDTO {
-	return secretDTO{Kind: kind, CreatedAt: created.Time, UpdatedAt: updated.Time}
-}
-
-// ListMySecrets returns metadata for the current user's stored secrets.
+// ListMySecrets returns metadata for the current user's Anthropic tokens (PRD #104
+// M2): one entry per token, default first, each with its id/label/default flag and
+// timestamps — never the ciphertext.
 func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	rows, err := h.q.ListUserSecretsMeta(r.Context(), user.ID)
+	rows, err := h.q.ListUserSecretsForKind(r.Context(), store.ListUserSecretsForKindParams{
+		UserID: user.ID,
+		Kind:   store.KindAnthropicToken,
+	})
 	if err != nil {
 		slog.Error("list user secrets", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]secretDTO, 0, len(rows))
+	out := make([]apitypes.SecretDTO, 0, len(rows))
 	for _, s := range rows {
-		out = append(out, secretMeta(s.Kind, s.CreatedAt, s.UpdatedAt))
+		out = append(out, secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.CreatedAt, s.UpdatedAt))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"secrets": out})
 }
 
-// PutAnthropicToken stores (or rotates) the current user's Anthropic token,
-// encrypted at rest. The plaintext is never logged, never echoed back, and
-// never appears in any error string.
+// withSecretLock runs fn inside a transaction that first takes the per-(user,kind)
+// advisory lock serializing this user's token mutations (PRD #104 M2/D12). It is
+// what makes create, set-default and delete atomic against each other, so the
+// "exactly one default while any token exists" invariant — which no index can
+// enforce — holds across concurrent requests.
+//
+// With no pool wired (unit tests only; main always wires one) it runs fn directly
+// on h.q with no transaction. That is sound in a test precisely because the lock's
+// only job is serializing CONCURRENT callers, and a single-threaded unit test has
+// none; the concurrency itself is proven by the live-DB tests. This mirrors
+// sealUserSecret's vault-nil fallback.
+func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(q *store.Queries) error) error {
+	if h.pool == nil {
+		return fn(h.q)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	// FIRST statement, before any read the lock protects (the identical placement
+	// rule as the hosted-provision quota lock). Serializes this user's token
+	// mutations until the transaction ends; XACT-scoped, so there is no unlock to
+	// forget.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
+		store.SecretMutationLockClass, secretMutationLockObjID(userID)); err != nil {
+		return err
+	}
+	if err := fn(h.q.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// secretMutationLockObjID derives the objid half of the per-user advisory lock from
+// a user's uuid, exactly as hostedProvisionLockObjID does: a uuid's leading bytes
+// are random, so two users can collide and serialize for a moment — a contention
+// non-event, never a correctness one.
+func secretMutationLockObjID(userID uuid.UUID) int32 {
+	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
+}
+
+// PutAnthropicToken stores (or rotates) the current user's DEFAULT Anthropic token,
+// encrypted at rest (PRD #104 D14 compatibility alias — deprecated in favor of the
+// id-keyed POST/PATCH below). The plaintext is never logged, never echoed back, and
+// never appears in any error string. Marked deprecated via the Deprecation header.
+//
+// It stays a single-statement upsert (UpsertDefaultUserSecret) and does NOT take the
+// mutation lock, because a single INSERT..ON CONFLICT is atomic: it cannot interleave
+// into a two-default state, and the "no default" state it once could 500 on is now
+// unreachable — every mutation that could create it (set-default, delete-default)
+// serializes under the lock and preserves exactly-one-default (M2/D12).
 func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Deprecation", "true")
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
@@ -103,11 +168,7 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	// master box so existing behavior and tests are unchanged.
 	sealed, sealedWith, err := h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(token))
 	if err != nil {
-		if errors.Is(err, vault.ErrLocked) {
-			httpx.JSON(w, http.StatusConflict, map[string]string{
-				"error": "vault is locked; unlock it with your password, then save again",
-				"code":  "vault_locked",
-			})
+		if h.writeVaultLocked(w, err) {
 			return
 		}
 		slog.Error("seal anthropic token", "error", err) // error carries no plaintext
@@ -135,58 +196,407 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	if h.usagePoker != nil {
 		h.usagePoker.Poke(user.ID)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"secret": secretMeta(row.Kind, row.CreatedAt, row.UpdatedAt)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.CreatedAt, row.UpdatedAt)})
 }
 
-// DeleteAnthropicToken removes the current user's Anthropic token. Idempotent:
-// deleting an absent secret still returns 204.
+// DeleteAnthropicToken removes the current user's DEFAULT Anthropic token (PRD #104
+// D14 compatibility alias — deprecated in favor of the id-keyed DELETE below).
+//
+// It 409s for a MULTI-TOKEN user: with several tokens, "delete the default"
+// contradicts D6 (the default cannot be deleted while others exist), so a
+// multi-token user must delete by id. That breaks this route's former
+// unconditional-204 contract, deliberately (D14/R5). A single-token user's delete
+// returns them to the token-less state; a token-less user is the idempotent 204.
+// Runs under the mutation lock so the count-then-delete cannot race a concurrent
+// create into deleting-the-default-while-a-second-token-lands.
 func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	// Deletes the DEFAULT token (PRD #104 D14). Resolve it first: DeleteUserSecret
-	// is id-keyed since D10, because its by-kind form deleted every row of the kind
-	// — harmless while a user could hold only one, a whole-credential-set wipe the
-	// moment they can hold two. No row is the existing idempotent 204.
-	//
-	// Unlike the save path this stays a resolve-then-write pair rather than one
-	// statement: a concurrent delete of the same row degrades to "0 rows", which is
-	// already this route's success case, so there is nothing for a transaction to
-	// protect here. D6's "refuse to delete the default while other tokens exist"
-	// and its FOR UPDATE arrive with M2, which owns the multi-token rules.
-	secretID, err := h.q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
-		UserID: user.ID,
-		Kind:   store.KindAnthropicToken,
-	})
-	switch {
-	case err == nil:
-		if _, derr := h.q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
-			ID:     secretID,
-			UserID: user.ID,
-		}); derr != nil {
-			slog.Error("delete anthropic token", "error", derr)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-			return
+	w.Header().Set("Deprecation", "true")
+
+	var multiToken, deleted bool
+	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		secretID, gerr := q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
+			UserID: user.ID, Kind: store.KindAnthropicToken,
+		})
+		if errors.Is(gerr, pgx.ErrNoRows) {
+			return nil // token-less: idempotent 204, nothing to delete
 		}
-	case errors.Is(err, pgx.ErrNoRows):
-		// No token to delete. Fall through rather than returning: the gauge cleanup
-		// below is exactly what clears a ghost reading left by an earlier partial
-		// delete, so the token-less case is the one that most needs it.
-	default:
-		slog.Error("resolve default anthropic token", "error", err)
+		if gerr != nil {
+			return gerr
+		}
+		n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+			UserID: user.ID, Kind: store.KindAnthropicToken,
+		})
+		if cerr != nil {
+			return cerr
+		}
+		if n > 1 {
+			multiToken = true // 409: a multi-token user deletes by id (D14)
+			return nil
+		}
+		// The sole token (which is the default). Its gauge row goes with it via the
+		// ON DELETE CASCADE (M5); no DeleteRateLimits call needed.
+		if _, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
+			ID: secretID, UserID: user.ID,
+		}); derr != nil {
+			return derr
+		}
+		deleted = true
+		return nil
+	})
+	if err != nil {
+		slog.Error("delete anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Drop the rate-limit gauge row so a token-less user never shows a ghost reading
-	// (PRD #53 D3b). Best-effort: the read endpoints derive no_token from
-	// secret-existence, so even a failed delete here degrades to no_token, never a
-	// stale meter. Idempotent (0 rows when absent).
-	if _, err := h.q.DeleteRateLimits(r.Context(), user.ID); err != nil {
-		slog.Error("delete rate limits on token delete", "error", err)
+	if multiToken {
+		httpx.Error(w, http.StatusConflict,
+			"you have multiple tokens; delete a specific one by id (DELETE /api/me/secrets/anthropic_token/{id})")
+		return
+	}
+	if deleted && h.usagePoker != nil {
+		h.usagePoker.Poke(user.ID)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// CreateAnthropicToken creates a NEW named Anthropic token for the current user
+// (PRD #104 M2). This is the request-body create path: `default` comes from the
+// body, and it is the exact caller the M1 InsertUserSecret hardening protects — a
+// user's FIRST token is forced default whatever the body asks, so a wrong client
+// can never mint an invisible token. A second token is the caller's choice; asking
+// for it as default clears the old default in the same transaction.
+func (h *Handler) CreateAnthropicToken(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req struct {
+		Token   string `json:"token"`
+		Label   string `json:"label"`
+		Default bool   `json:"default"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	token, err := validateAnthropicToken(req.Token)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	label, err := validateSecretLabel(req.Label)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sealed, sealedWith, err := h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(token))
+	if err != nil {
+		if h.writeVaultLocked(w, err) {
+			return
+		}
+		slog.Error("seal anthropic token", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	var row store.InsertUserSecretRow
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		// If the caller wants this the default, clear the current one first — the
+		// insert then sets is_default=true and there is exactly one default at commit.
+		// Under the advisory lock this clear-then-insert cannot interleave with a
+		// concurrent mutation into a two-default or no-default state (D12).
+		if req.Default {
+			if _, cerr := q.ClearDefaultUserSecret(r.Context(), store.ClearDefaultUserSecretParams{
+				UserID: user.ID, Kind: store.KindAnthropicToken,
+			}); cerr != nil {
+				return cerr
+			}
+		}
+		var ierr error
+		row, ierr = q.InsertUserSecret(r.Context(), store.InsertUserSecretParams{
+			UserID:      user.ID,
+			Kind:        store.KindAnthropicToken,
+			Label:       label,
+			WantDefault: req.Default, // first token is forced default by the query regardless
+			Ciphertext:  sealed,
+			SealedWith:  sealedWith,
+		})
+		return ierr
+	})
+	if err != nil {
+		if isLabelCollision(err) {
+			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
+			return
+		}
+		slog.Error("create anthropic token", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// A newly created (or re-defaulted) token changes what the poller should read;
+	// poke so its meter appears within seconds (PRD #53 D3b).
+	if h.usagePoker != nil {
+		h.usagePoker.Poke(user.ID)
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{
+		"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.CreatedAt, row.UpdatedAt),
+	})
+}
+
+// PatchAnthropicToken renames, sets-default, and/or rotates the value of ONE of the
+// user's tokens (PRD #104 M2). All requested changes apply in one transaction under
+// the advisory lock, so a set-default's clear-then-set swap cannot race another
+// mutation. Every field is optional; an id that is not the caller's is a 404.
+func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+		return
+	}
+	var req struct {
+		Label   *string `json:"label"`
+		Default *bool   `json:"default"`
+		Token   *string `json:"token"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate + seal the new value (if any) BEFORE the transaction: sealing needs
+	// no DB, and a locked vault must surface as a 409 without ever opening a tx.
+	var newLabel string
+	if req.Label != nil {
+		newLabel, err = validateSecretLabel(*req.Label)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	var sealed []byte
+	var sealedWith string
+	if req.Token != nil {
+		tok, verr := validateAnthropicToken(*req.Token)
+		if verr != nil {
+			httpx.Error(w, http.StatusBadRequest, verr.Error())
+			return
+		}
+		sealed, sealedWith, err = h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(tok))
+		if err != nil {
+			if h.writeVaultLocked(w, err) {
+				return
+			}
+			slog.Error("seal anthropic token", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	// default=false is refused: there is always a default while any token exists
+	// (D6), so you promote another token, you never un-default this one.
+	if req.Default != nil && !*req.Default {
+		httpx.Error(w, http.StatusBadRequest, "cannot clear the default; set another token as default instead")
+		return
+	}
+
+	var out store.RenameUserSecretRow // id/kind/label/is_default/timestamps, shared shape
+	var found bool
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			if errors.Is(gerr, pgx.ErrNoRows) {
+				return nil // found stays false → 404
+			}
+			return gerr
+		}
+		found = true
+		out = store.RenameUserSecretRow{ID: cur.ID, Kind: cur.Kind, Label: cur.Label, IsDefault: cur.IsDefault}
+
+		if req.Token != nil {
+			if _, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
+				ID: secretID, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+			}); rerr != nil {
+				return rerr
+			}
+		}
+		if req.Label != nil {
+			renamed, rerr := q.RenameUserSecret(r.Context(), store.RenameUserSecretParams{
+				ID: secretID, UserID: user.ID, Label: newLabel,
+			})
+			if rerr != nil {
+				return rerr
+			}
+			out = renamed
+		}
+		if req.Default != nil && *req.Default && !cur.IsDefault {
+			if _, cerr := q.ClearDefaultUserSecret(r.Context(), store.ClearDefaultUserSecretParams{
+				UserID: user.ID, Kind: store.KindAnthropicToken,
+			}); cerr != nil {
+				return cerr
+			}
+			promoted, perr := q.SetUserSecretDefault(r.Context(), store.SetUserSecretDefaultParams{
+				ID: secretID, UserID: user.ID,
+			})
+			if perr != nil {
+				return perr
+			}
+			out = store.RenameUserSecretRow(promoted)
+		}
+		return nil
+	})
+	if err != nil {
+		if isLabelCollision(err) {
+			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
+			return
+		}
+		slog.Error("patch anthropic token", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	// A rotate or a default change alters what the poller should read for this user.
+	if h.usagePoker != nil {
+		h.usagePoker.Poke(user.ID)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.CreatedAt, out.UpdatedAt),
+	})
+}
+
+// DeleteAnthropicTokenByID deletes ONE of the user's tokens by id (PRD #104 M2).
+// D6: the default may NOT be deleted while other tokens exist — promote another
+// first (409). Deleting the LAST token (even though it is the default) is allowed
+// and returns the user to the token-less state. D5: workers/judge bound to the
+// deleted token fall back to their default automatically via the ON DELETE SET NULL
+// FKs, and the token's rate-limit gauge row is dropped by the ON DELETE CASCADE
+// (PRD #104 M5) — no app-level cleanup needed.
+func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+		return
+	}
+
+	var found, refusedDefault bool
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		})
+		if gerr != nil {
+			if errors.Is(gerr, pgx.ErrNoRows) {
+				return nil // found stays false → 404
+			}
+			return gerr
+		}
+		found = true
+		if cur.IsDefault {
+			n, cerr := q.CountUserSecretsForKind(r.Context(), store.CountUserSecretsForKindParams{
+				UserID: user.ID, Kind: store.KindAnthropicToken,
+			})
+			if cerr != nil {
+				return cerr
+			}
+			// The default can be deleted only when it is the LAST token; otherwise the
+			// user would be left with tokens and no default. Under the lock this count is
+			// stable — no concurrent create can slip a second token in after it (D12).
+			if n > 1 {
+				refusedDefault = true
+				return nil
+			}
+		}
+		_, derr := q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{ID: secretID, UserID: user.ID})
+		return derr
+	})
+	if err != nil {
+		slog.Error("delete anthropic token by id", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	if refusedDefault {
+		httpx.Error(w, http.StatusConflict,
+			"cannot delete the default token while other tokens exist; set another token as default first")
+		return
+	}
+	if h.usagePoker != nil {
+		h.usagePoker.Poke(user.ID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// validateSecretLabel trims and checks a token label (PRD #104 D7): non-empty, at
+// most maxLabelBytes, no control characters. Leading/trailing whitespace is trimmed
+// (so the stored value satisfies the migration's `label = btrim(label)` CHECK);
+// interior spaces are allowed (a label is a human name, not a token).
+func validateSecretLabel(raw string) (string, error) {
+	label := strings.TrimSpace(raw)
+	if label == "" {
+		return "", errors.New("label must not be empty")
+	}
+	if len(label) > maxLabelBytes {
+		return "", fmt.Errorf("label must be at most %d bytes", maxLabelBytes)
+	}
+	for _, r := range label {
+		if r == unicode.ReplacementChar || unicode.IsControl(r) {
+			return "", errors.New("label must not contain control characters")
+		}
+	}
+	return label, nil
+}
+
+// writeVaultLocked writes the 409 vault_locked envelope when err is vault.ErrLocked
+// and reports whether it did, so a caller can `if h.writeVaultLocked(w, err) {
+// return }`. The vault is unlocked right after login; a mid-session pod restart is
+// the only way to reach locked, which the SPA turns into an unlock prompt.
+func (h *Handler) writeVaultLocked(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, vault.ErrLocked) {
+		return false
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]string{
+		"error": "vault is locked; unlock it with your password, then save again",
+		"code":  "vault_locked",
+	})
+	return true
+}
+
+// isLabelCollision reports whether err is the unique violation on
+// user_secrets_user_kind_label_key — a duplicate LABEL — as opposed to the other
+// unique index on this table (user_secrets_one_default_key, two defaults).
+//
+// Distinguishing them matters: mapping every 23505 to "that label already exists"
+// would report a default-invariant violation as a naming problem, sending whoever
+// hit it to rename a token that was never the issue. Under the mutation lock a
+// concurrent create cannot produce the default violation (each create clears the
+// old default first, serialized) — so this is defensive, and the point is that if it
+// ever DOES fire the message will be honest instead of misleading.
+func isLabelCollision(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return false
+	}
+	return pgErr.ConstraintName == "user_secrets_user_kind_label_key"
 }
 
 // validateAnthropicToken trims and sanity-checks a pasted token. It makes no

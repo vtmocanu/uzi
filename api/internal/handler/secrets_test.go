@@ -93,7 +93,7 @@ func TestAnthropicTokenNeverLeaks(t *testing.T) {
 
 	// 3. The metadata DTO carries no secret value.
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	b, _ := json.Marshal(secretMeta(store.KindAnthropicToken, now, now))
+	b, _ := json.Marshal(secretMeta(uuid.New(), store.KindAnthropicToken, "default", true, now, now))
 	if strings.Contains(string(b), fixture) {
 		t.Fatal("secret metadata response leaked the token")
 	}
