@@ -39,13 +39,24 @@ What changed, and why each change was forced rather than chosen:
   with its refutation rather than deleted, per the rule that a removed check with no recorded
   reason gets re-added by the next person who reads the PRD's criteria list.
 - **Part B is otherwise unrevised** and awaits pass 3. Do not build from it yet.
+  *(Superseded by v4 below — Part B is now buildable. Kept as the v2 record, not as advice.)*
 
-**v3 (this commit)** — **Part C is new**: the printed-instruction backstop, pass 2 of the
+**v3 (`2639af95`)** — **Part C is new**: the printed-instruction backstop, pass 2 of the
 approved three-way split. Everything in it is measured by execution against `api/cmd/uzi/`,
 not by reading. It supersedes v1's B9/B10, which are marked as such in place. The headline: the
 registry conflates **two kinds** of string — runtime emissions and help references — and the
 "must have been EXECUTED" bar is right for the first and wrong for the second. Four of the
 eight entries' notes misdescribe their own site.
+
+**v4 (this commit)** — **Part B is now v2 and buildable** (pass 3, the last). B8 struck with
+its refutation in place; B6 carries the forge-fake mutator design plus **a correction to v1's
+own stated mechanism** — the fake ignores `updated_after` entirely, so the `updated_at` bump is
+about the fake not lying about the forge, not about making the harness pass. That correction
+exposes a limit worth more than the mutator: **the e2e leg structurally cannot exercise the
+incremental-sync path at all.** B6a makes the positive-controlled negative window concrete (a
+probe edge per window, since an edge is consumed once). B4 is re-priced — Part C's truncation
+row gated on it makes it the **last** block to cut, inverting v1's ordering. Also found:
+`apidelete` is referenced in the harness's own `:235` comment and **never defined**.
 
 **Correction to v1's reporting, recorded because the error was mine.** I attributed the lead's
 stale status read to the persisted-cwd trap in `.claude/agent-team.md`. That was wrong, and the
@@ -490,12 +501,25 @@ which is why they are rules — an error stops you, a false result gets publishe
 
 ## Part B — M8b: the e2e leg in `e2e/run-e2e.sh`
 
-> **PART B IS v1 AND AWAITS PASS 3. Do not build from it yet** — the split the lead approved
-> makes it the third pass, after the backstop. Four follow-ups landed against it and only the
-> B8 refutation below has been folded in. The two findings worth keeping regardless, because
-> nothing has challenged them: the `forge-fake` issue-close mutator does not exist and must
-> bump `updated_at`; and both negative windows need a positive control, because a **crashed
-> poller produces a byte-identical green**.
+> **PART B IS v2 (pass 3) AND IS READY TO BUILD.** B8 is struck with its refutation in place;
+> B6 carries the mutator design, a correction to v1's own mechanism, and the
+> positive-controlled negative window (B6a) made concrete.
+>
+> **Base re-derived before designing, not assumed.** At `2639af95`, `main` is still
+> `ad6c63d9`, and the three in-flight branches were checked by diff rather than by trust:
+> `feature/prd-98-t2-lim` is **one new test file** (`route_limiter_mounts_test.go`, 699 lines,
+> no route changes — the admin CLI-token endpoint the lead mentioned has **not** landed on it
+> yet), `feature/prd-98-t2-web` is the N2 tests plus a small component change, and
+> `feature/prd-98-t2-seam6` touches **only** `web/src/mocks/mockApi.ts`. **Zero migrations on
+> any of them.** So `e2e/run-e2e.sh`, the poller, `forgesvc` and the judge routes are
+> byte-identical across all four branches, and Part B's measurements still hold — established
+> by running the falsification, since an unchanged path only fails to falsify and the
+> environment (the migration set) is the half that moves without appearing in a diff anyone
+> would think to run.
+>
+> **Watch item, not a blocker:** the admin CLI-token inventory endpoint is *being built* on
+> the lim branch. Nothing in Part B touches the admin surface, so it does not interact today —
+> but if that endpoint lands with new routes, re-run the diff above before writing B1-B8.
 
 Conventions matched from the file at `ad6c63d9`, not invented: `say`/`pass`/`fail` (`:192-194`),
 `apiget`/`apipost`/`apipost_code` (`:256-308`), `retry_read` (reads only, `:239`), `create_run`
@@ -549,11 +573,24 @@ because only the third separates SQL's row-level filter from a group-level one:
 
 (c) is the assertion the Go-grouper harness structurally could not make.
 
-**B4 — the row cap cuts BEFORE grouping.** `JudgeBacklogMaxRows = 2000` is a compile-time
-const (MEASURED, `judge_backlog.go:136`) — not env-tunable, so the only way to reach
-`truncated: true` is to seed 2001 rows. One `INSERT … SELECT FROM generate_series` — INFERRED
-sub-second, verify. Assert `truncated == true`, and that a coordinate seeded only in the
-**oldest** review is absent while its group would exist had the cut been post-grouping.
+**B4 — the row cap cuts BEFORE grouping. NOW HAS TWO CONSUMERS.** `JudgeBacklogMaxRows = 2000`
+is a compile-time const (MEASURED, `judge_backlog.go:136`) — not env-tunable, so the only way
+to reach `truncated: true` is to seed 2001 rows. One `INSERT … SELECT FROM generate_series` —
+INFERRED sub-second, verify. Assert `truncated == true`, and that a coordinate seeded only in
+the **oldest** review is absent while its group would exist had the cut been post-grouping.
+
+> **Re-price this block: it is no longer only about proving the cap.** Part C's
+> truncation-remedy row (`uzi review backlog --run <run-id>`, `review.go:403`) is **gated on
+> this seed** — it is the only arrangement in the repo where that printed instruction can be
+> executed at all. So B4 buys two things: the cut-before-grouping property, and the *only*
+> reachable execution of an instruction whose predecessor at the same site **shipped false**.
+> If M8b is ever trimmed for time, B4 is the last block to cut, not the first — which inverts
+> the v1 ordering, where it read as the most expensive block for a single property.
+>
+> Sequencing consequence: **B4's seed must be live when Part C's row runs.** Either the two
+> land together, or Part C's row is written to arm the seed itself. Recommend landing them
+> together and running B4 last in the phase, so the teardown below stays the single owner of
+> the cleanup.
 
 Containment, because 2001 rows would otherwise poison every later backlog read: seed them on a
 **dedicated review**, run this block **last** in the #98 phase, then `DELETE` the review and
@@ -585,11 +622,47 @@ property). *Precondition*: assert that member is settled first.
 analogue exists (`/_e2e/mrs/{iid}/state` → `flip_mr`, `:501`); the issue analogue does not.
 
 Add `POST /_e2e/issues/{iid}/state {state}` mirroring the MR mutator, plus a `close_issue`
-helper. **It must bump `issue.updated_at`**: `IncrementalSync` is high-water-marked on
-`updated_at`, so a close that does not bump it is invisible until the next `FullSync`. With
-`FORGE_RECONCILE_EVERY=2` the reconcile would mask that within ~4s — which is exactly why the
-bug would be invisible *in the harness* while being real against a live forge. Bump it, and
-record that reason in the mutator's comment.
+helper:
+
+```js
+// mirrors the /_e2e/mrs/{iid}/state mutator. Bumps updated_at because a real forge
+// does — see the incremental-sync fidelity note below for why that is about honesty
+// rather than about making this harness pass.
+if (method === "POST" && (m = path.match(/^\/_e2e\/issues\/(\d+)\/state$/))) {
+  const issue = state.issues[Number(m[1])];
+  if (!issue) return send(res, 404, { message: "404 Not found (no such issue)" });
+  const body = await readBody(req);
+  issue.state = body.state === "closed" ? "closed" : "opened";
+  issue.updated_at = new Date().toISOString();
+  persist();
+  log("issue", issue.iid, "state ->", issue.state);
+  return send(res, 200, issue);
+}
+```
+
+> **CORRECTION TO v1, and it is mine.** v1 said the bump was needed because *"a close that
+> does not bump `updated_at` is invisible until the next `FullSync`"*. **That is wrong about
+> this fake.** MEASURED at `2639af95`: `IncrementalSync` passes `UpdatedAfter: &hwm`
+> (`forgesvc/service.go:294-298`) and the GitLab driver does send it (`forge/gitlab.go:257`),
+> but **`forge-fake.mjs` ignores `updated_after` entirely** — its `GET /issues` returns every
+> recorded issue, by deliberate design (*"Keeps a reconcile pass from evicting the cache"*).
+> So in the harness a close is picked up **immediately**, bump or no bump. Against real
+> GitLab, `updated_after=hwm` would **exclude** an unbumped issue and the close would be
+> missed until something else touched it. Bump it because a real forge does — the fake must
+> not lie about the forge — not because the harness needs it.
+
+**The fidelity limit this exposes, which is bigger than the mutator and must be stated in the
+phase's comment.** Because the fake ignores `updated_after`, **the e2e leg structurally cannot
+exercise the incremental-sync path at all.** M6's close-sync rides `IncrementalSync`, so this
+block proves the close→Done edge fires *given the cache was updated* — it does **not** prove
+the real incremental sync would ever observe the close. That is a genuine hole in what the
+harness can say, and it is invisible unless someone reads the fake.
+
+Do **not** close it inside #98 by making the fake honour `updated_after`. That would change
+`GET /issues` semantics for **every** phase that relies on "return all recorded issues", and
+the comment at that handler says the current behaviour is load-bearing for reconcile-eviction.
+It is a real improvement and it needs its own change, its own measurement, and a full harness
+run — raise it separately.
 
 Then, on `$F_IID` (already filed against `$F_REC`):
 
@@ -606,15 +679,84 @@ Then, on `$F_IID` (already filed against `$F_REC`):
   `close_synced_at` **is** stamped — the `ON CONFLICT DO NOTHING` half, where the edge is
   consumed without writing.
 
-> **The strongest design point in B6, and the easiest to omit.** Both negative windows
-> (edge-once, Undo-sticks) assert that *nothing happened during a wait*. A poller that
-> **crashed** after the first edge produces a byte-identical green. A bare `sleep 8` is
-> therefore not evidence — it is the same false-green family as a live-DB suite that ran
-> nothing. **Positive-control the window**: arrange a *second, independent* close edge that
-> must be processed inside the same wait, and assert it landed. Only then does "the disposition
-> did not come back" mean the poller ran and declined, rather than the poller being gone.
-> The harness's existing 2-tick negative window (`:2035-2040`) does not carry this, and it is
-> the pattern this block must improve on rather than copy.
+#### B6a. The positive-controlled negative window — concrete
+
+**The problem, restated so the mechanism is obvious.** Both negative windows (edge-once,
+Undo-sticks) assert that *nothing happened during a wait*. A poller that **crashed** after the
+first edge produces a **byte-identical green**. A bare `sleep 8` is not evidence — it is the
+same false-green family as a live-DB suite that ran nothing, and the harness's existing 2-tick
+window (`:2035-2040`) does not carry a control.
+
+**A negative window needs a PROBE: an independent close edge, armed inside the window, whose
+landing proves the poller ran.** Each window needs its **own** probe, because an edge is
+consumed once and cannot serve two windows.
+
+Fixture: two extra filed coordinates, `probeA` and `probeB`, each on its own issue, each filed
+and settled but **not yet closed** when the block starts. (Both go through the existing #68
+filing path or a direct `recommendation_filed_issues` seed — the harness already does the
+latter for gauge rows.)
+
+```bash
+# ---- window 1: edge-once ------------------------------------------------
+SET_AT_BEFORE="$(disposition_set_at "$F_REVIEW" install_worker_tool jq)"
+close_issue "$PROBE_A_IID"                 # arm the control INSIDE the window
+wait_disposition "$PROBE_A_REVIEW" "$PROBE_A_CAT" "$PROBE_A_TGT" done 20 \
+  || fail "positive control: probeA's close edge was NOT processed — the poller is not running, so the edge-once assertion below would be vacuous"
+[ "$(disposition_set_at "$F_REVIEW" install_worker_tool jq)" = "$SET_AT_BEFORE" ] \
+  || fail "edge-once violated: set_at moved, so the sync re-applied on a later tick"
+pass "edge-once: set_at unchanged across a window in which the poller demonstrably processed another close edge"
+```
+
+and identically for window 2, arming `probeB` after the Undo:
+
+```bash
+# ---- window 2: Undo sticks ----------------------------------------------
+# NB: `apidelete` DOES NOT EXIST — see the note below. Inline curl, per :3843.
+curl -fsS -b "$JAR" -X DELETE "$BASE/api/runs/$J_RUN/review/recommendations/$F_REC/disposition" \
+  -H "X-CSRF-Token: $(csrf)" >/dev/null || fail "the human Undo failed"
+close_issue "$PROBE_B_IID"
+wait_disposition "$PROBE_B_REVIEW" ... done 20 \
+  || fail "positive control: probeB's close edge was NOT processed — 'Undo stuck' below would be vacuous"
+[ "$(disposition_count "$F_REVIEW" install_worker_tool jq)" = 0 ] \
+  || fail "Undo did not stick: the auto-done came back, so close_synced_at is not consuming the edge"
+pass "Undo sticks across a window in which the poller demonstrably processed another close edge"
+```
+
+**Why this is strictly better than a longer sleep**, and the property to state at the site: the
+wait is now bounded **below by observed poller work** rather than by wall-clock optimism. It
+cannot pass while the poller is dead, cannot pass while the poller is merely slow, and it gets
+*faster* than a fixed sleep because `wait_disposition` returns as soon as the probe lands.
+
+**Two ordering constraints, both load-bearing:**
+
+- The probe must be closed **after** the thing under test is arranged (after the `set_at`
+  capture; after the Undo), or its edge may be consumed by a tick that ran before the window
+  opened, and the control would prove nothing about *this* window.
+- The probe must be a coordinate **nothing else asserts on** — otherwise its auto-done
+  perturbs `triage.todo`, which B6's earlier "fell by exactly 1" assertion reads. Use a
+  category outside `improve_uzi` (the unscoped-backlog landmine class) and factor the
+  `triage.todo` assertion to run **before** any probe is armed.
+
+**Helpers this block needs, and one that does not exist.** MEASURED at `2639af95`: **there is
+no `apidelete` function in `run-e2e.sh`.** It is named in the `retry_read` comment at `:235`
+(*"the write helpers (apipost/apiput/apipatch/apidelete, fake_post) … are deliberately NOT
+wrapped"*) but never defined; the harness's single DELETE is an inline
+`curl -fsS -b "$JAR" -X DELETE … -H "X-CSRF-Token: $(csrf)"` at `:3843`. A dangling reference
+to a helper that was never written — the same class as the registry notes in Part C, in the
+harness's own documentation.
+
+**Ruling: define `apidelete` properly** (matching `apipost`/`apiput`, CSRF header included,
+deliberately *not* `retry_read`-wrapped) and use it. That makes the `:235` comment true rather
+than aspirational, and it is three lines. Do **not** rewrite `:3843` to use it in this MR —
+that is an unrelated phase, and touching it is noise a reviewer has to read.
+
+Three more helpers, all following existing patterns:
+
+| helper | shape |
+|---|---|
+| `close_issue IID` | `fake_post "/_e2e/issues/$1/state" '{"state":"closed"}'` — mirrors `flip_mr` (`:501`) |
+| `disposition_set_at REVIEW CAT TGT` | `db_psql "SELECT COALESCE(to_char(set_at,'YYYYMMDDHH24MISSUS'),'') FROM …"` — mirrors `notified_at` (`:3511`), which already uses exactly this to-char trick to make a timestamp shell-comparable |
+| `wait_disposition REVIEW CAT TGT WANT [TIMEOUT]` | `wait_eq` (`:422`) over a `db_psql` status read |
 
 **B7 — the notification deep-links to `/judge?run=`.** **Open the DTO before writing this
 block.** MEASURED that `notificationLink` is a *web* function (`web/src/lib/notifications.ts`,
@@ -778,19 +920,25 @@ precisely what a fake cannot fake.
 
 ### B12. Effort
 
+Revised for pass 3: B8 removed, B6a added, B9/B10 moved to Part C.
+
 | | |
 |---|---|
-| forge-fake `/_e2e/issues/{iid}/state` mutator + `close_issue` helper | 1h |
+| forge-fake `/_e2e/issues/{iid}/state` mutator + `close_issue` | 1h |
+| `apidelete` + `disposition_set_at` + `wait_disposition` helpers | 0.5h |
 | B1-B3 | 2h |
 | B4 (seed, containment, delete-and-recheck control) | 1.5h |
 | B5 | 2h |
-| B6 (the edge/undo/dismissed matrix with real positive controls) | 4h |
+| B6 (the edge/undo/dismissed matrix) | 3h |
+| **B6a (two probe fixtures + both positive-controlled windows)** | **1.5h** |
 | B7 (or its documented drop) | 0.5h |
-| B8 | 1h |
-| B9 instruction rows | 2h |
-| B10 registry change + third test + citation cleanup | 1.5h |
+| ~~B8~~ | **0 — dead** |
+| ~~B9/B10~~ → Part C | — |
 | iteration against a 30-min harness — budget ≥3 full runs | 2× write time |
-| **M8b total** | **~3 days** |
+| **M8b total** | **~2.5 days** |
+
+Down from v1's ~3 days: B8 is gone and B9/B10 moved to Part C, against a smaller addition for
+B6a and the helpers.
 
 ---
 
