@@ -600,3 +600,67 @@ func TestBulkDispositionSettledAddressesAreDistinctPerRunLiveDB(t *testing.T) {
 		t.Fatalf("after undoing ONE of two settled addresses, %d disposition rows remain, want 1", n)
 	}
 }
+
+// ---- 6. the bulk write's rationale_md projection ------------------------------------
+
+// TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB pins the LAST unpinned column on
+// this query: `rr.rationale_md AS rationale_md`, which the fan-out hashes into
+// recommendation_dispositions.rationale_hash — #94 Decision 3's staleness key.
+//
+// Blanking it to ” left the entire Go suite green (measured, PRD #98 review). The reason is
+// the same fake blindness as everywhere else, in a sharper form:
+// judge_bulk_disposition_test.go asserts `got.RationaleHash != workersvc.RationaleHash("because")`,
+// and "because" is what memberRow puts in the FIXTURE — so it compares a hash of the fake's
+// own input against the fake's own input. The query never runs, so no column mapping is
+// observed.
+//
+// Both drift directions are user-visible and neither errors:
+//
+//   - a wrong value at write time makes the coordinate read STALE immediately — the run page
+//     tells the user "the recommendation changed since you resolved it" the instant they
+//     resolve it;
+//   - a value that does NOT track the rationale makes a genuinely-changed recommendation read
+//     as current, so the user never learns their verdict is out of date. That is the stale
+//     flag's entire purpose, silently inverted, and it is the worse direction.
+//
+// The assertion is the property rather than a literal: the stored hash must equal
+// RationaleHash of the recommendation's CURRENT rationale_md, read back from the table. A
+// test spelling "because" here would pass under the blanking exactly as the fake one does —
+// the value has to come from the database.
+func TestBulkDispositionStampsHashOfTheCurrentRationaleLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	rg := [2]string{"install_worker_tool", "rg"}
+
+	userID := bulkFixture(ctx, t, pool, 1, rg)
+	if _, got := doBulk(t, h, store.User{ID: userID},
+		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done"}`); got.Updated != 1 {
+		t.Fatalf("fixture: updated = %d, want 1", got.Updated)
+	}
+
+	var storedHash, currentRationale string
+	if err := pool.QueryRow(ctx,
+		`SELECT d.rationale_hash, rr.rationale_md
+		   FROM recommendation_dispositions d
+		   JOIN run_reviews rv ON rv.id = d.review_id
+		   JOIN review_recommendations rr
+		     ON rr.review_id = d.review_id AND rr.category = d.category AND rr.target = d.target
+		  WHERE rv.user_id = $1`, userID).Scan(&storedHash, &currentRationale); err != nil {
+		t.Fatalf("read back the stamped hash: %v", err)
+	}
+	if currentRationale == "" {
+		t.Fatal("fixture broken: the recommendation has no rationale text, so this proves nothing")
+	}
+
+	want := workersvc.RationaleHash(currentRationale)
+	if storedHash != want {
+		t.Errorf("stamped rationale_hash = %q, want RationaleHash of the recommendation's CURRENT text %q = %q — "+
+			"the write hashed something other than rr.rationale_md, so this coordinate reads STALE the moment it is set",
+			storedHash, currentRationale, want)
+	}
+
+	// And state it the way the user experiences it: freshly disposed is NOT stale.
+	if workersvc.RationaleHash(currentRationale) != storedHash {
+		t.Error("a coordinate a human just marked done already reads as stale")
+	}
+}

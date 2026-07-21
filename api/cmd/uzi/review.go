@@ -362,22 +362,35 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 		// something they are not looking at.
 		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled; re-check with `uzi review backlog --bucket all`")
 	}
-	// `settled` names the exact (run, rec) coordinates this call wrote — the ONLY way to
-	// revert it. It is not derivable from anything else: with scope=open the server decides
-	// membership at write time, so a set reconstructed from `uzi review backlog` would name
-	// members this action never touched (PRD #98 review BLK-UNDO).
+	// `settled` names the exact (run, rec) coordinates this call wrote — the ONLY correct
+	// basis for a revert. Be precise about what is and is not recoverable, because the loose
+	// version of this sentence is what let a false claim sit here for two passes:
+	//
+	//   * the PAIRS are recoverable — JudgeOccurrenceDTO carries run_id and rec_id, so
+	//     `uzi review backlog --bucket all --json` lists every one of them;
+	//   * WHICH SUBSET THIS CALL SETTLED is not, ever, after the fact;
+	//   * and only the second supports a correct revert. Undoing the visible ones is
+	//     precisely the destructive delete BLK-UNDO removed — with scope=open the server
+	//     decides membership at WRITE time, so the visible set includes members this action
+	//     never touched, and clearing them destroys an M6 auto-done irreversibly.
 	//
 	// The pairs are PRINTED, as runnable commands. This line used to say "re-run with --json
-	// for the N pairs", which is advice that CANNOT WORK, measured failing end to end against
-	// a real database:
+	// for the N pairs", and that was wrong twice over:
+	//
+	//  1. It recommended a WRITE as a way to read. A re-run re-executes
+	//     PUT /disposition — a fan-out across every member coordinate. That it is a no-op
+	//     today is a coincidence of current state, not a property of the command: scope=open
+	//     finds nothing left open only because the first call settled it. If the M6 sync
+	//     re-opened a coordinate in between, the re-run would settle members the first call
+	//     never touched, with nothing recording that it had.
+	//  2. It did not work anyway. Measured end to end against a real database:
 	//
 	//	FIRST  call: updated=2 settled=2
 	//	SECOND call: updated=0 settled=0
 	//
-	// because the CLI sends no scope, the server defaults to `open`, and after the first call
-	// those members are `done` — so a re-run selects nothing and returns an empty list. Once
-	// this command has run without --json the pairs are UNRECOVERABLE, which is precisely why
-	// they must go on screen now rather than be pointed at.
+	// So the honest form is PROSPECTIVE, and printing the pairs is the strongest version of
+	// it: the caller needs no second invocation at all, and the line points at neither a
+	// write nor `uzi review backlog` (whose pairs are the wrong ones — see above).
 	//
 	// Everything is listed, never a capped sample: an omitted pair is a member the user
 	// cannot revert, so truncating would recreate the same unrecoverability in smaller print.

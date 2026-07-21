@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -466,4 +467,65 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	if hand.FiledSettled {
 		t.Error("the unfiled row reports filed_settled=true")
 	}
+
+	// 8. rec_id — THE ONE THAT WRITES, and the reason these three were worth a second pass.
+	//
+	// Every other column pinned here is a display or attribution error when it drifts. rec_id
+	// is what OccurrenceFileIssue hands the #68 draft/file endpoints as `recId`, and what
+	// deleteDisposition(run_id, rec_id) uses for Undo — so a folded or cross-wired rec_id
+	// files an issue against the WRONG recommendation and undoes the WRONG one. Both are
+	// writes, one of them to the forge, and both are silent.
+	//
+	// Read back from the table rather than spelled: the assertion is that the projection
+	// returns THE recommendation row's own id for its own coordinate.
+	autoRecID := recIDFor(ctx, t, pool, autoRev.reviewID, cat, autoTarget)
+	handRecID := recIDFor(ctx, t, pool, handRev.reviewID, cat, handTarget)
+	if auto.RecID != autoRecID {
+		t.Errorf("rec_id = %s, want the recommendation row's own id %s — a wrong rec_id FILES and UNDOES against another recommendation",
+			auto.RecID, autoRecID)
+	}
+	if hand.RecID != handRecID {
+		t.Errorf("rec_id = %s, want %s", hand.RecID, handRecID)
+	}
+	// Distinct per row, and never the review id — the two folds that would otherwise satisfy
+	// a laxer assertion (a constant, or rv.id cross-wired into this column).
+	if auto.RecID == hand.RecID {
+		t.Errorf("both rows carry rec_id %s — the column is folded to a constant", auto.RecID)
+	}
+	if auto.RecID == auto.ReviewID {
+		t.Errorf("rec_id equals review_id (%s) — the review id is cross-wired into the recommendation column", auto.RecID)
+	}
+
+	// 9. review_id — the coordinate's identity half; dispositions are keyed on it.
+	if auto.ReviewID != autoRev.reviewID {
+		t.Errorf("review_id = %s, want %s", auto.ReviewID, autoRev.reviewID)
+	}
+	if hand.ReviewID != handRev.reviewID {
+		t.Errorf("review_id = %s, want %s", hand.ReviewID, handRev.reviewID)
+	}
+	if auto.ReviewID == hand.ReviewID {
+		t.Errorf("both rows carry review_id %s — the column is folded", auto.ReviewID)
+	}
+
+	// 10. filed_at — the filed chip's timestamp, and what filed_settled is derived from.
+	if !auto.FiledAt.Valid {
+		t.Error("the filed+settled row carries a NULL filed_at")
+	}
+	if hand.FiledAt.Valid {
+		t.Errorf("the UNFILED row carries filed_at %v — the column is not row-scoped", hand.FiledAt.Time)
+	}
+}
+
+// recIDFor reads a recommendation's own id straight from the table, so the rec_id assertion
+// above compares the projection against the database rather than against a value the test
+// also chose.
+func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uuid.UUID, category, target string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM review_recommendations WHERE review_id = $1 AND category = $2 AND target = $3`,
+		reviewID, category, target).Scan(&id); err != nil {
+		t.Fatalf("read rec id for %s/%s: %v", category, target, err)
+	}
+	return id
 }
