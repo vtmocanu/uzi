@@ -375,12 +375,22 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	//                                              "both of the above fire together", and they
 	//                                              do not: neither runs.
 	//   drop `AND d.target = rr.target`      RED  — "the undisposed sibling inherited a
-	//                                              disposition", AND the cross-review one,
-	//                                              whose message blames the REVIEW_ID half that
-	//                                              was never mutated (handRev's own disposition
-	//                                              reaches its rg-auto coordinate once the
-	//                                              target half is gone — a true detection with a
-	//                                              mis-tuned message)
+	//                                              disposition", AND the cross-review one. That
+	//                                              second message USED TO blame the REVIEW_ID
+	//                                              half, which this fold never touches; it now
+	//                                              names both candidates and points at the
+	//                                              discriminator below.
+	//   drop `AND d.review_id = rv.id`       RED  — the cross-review disposition assertion, and
+	//                                              THAT ONE ONLY. Measured, not reasoned: the
+	//                                              sibling stays clean because it shares autoRev
+	//                                              and needs no cross-review match. So the pair
+	//                                              is separable — target reddens BOTH, review_id
+	//                                              reddens ONE — which is exactly what lets that
+	//                                              assertion's message stop guessing. (The
+	//                                              inherited values differ too: `issue_close`/
+	//                                              `done` from autoRev under this fold, versus
+	//                                              ``/`dismissed` from handRev's own under the
+	//                                              target fold.)
 	//   drop `AND d.category = rr.category`  RED  — "the cross-category coordinate inherited a
 	//                                              disposition", that one ONLY
 	//   `f.filed_at` -> `d.set_at`           RED  — "carries filed_at …", that one ONLY
@@ -752,11 +762,30 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 			crossReview.FiledSettled, crossReview.FiledAt.Valid, crossReview.FiledIssueIid.Valid,
 			crossReview.FiledIssueUrl.String)
 	}
+	// 🔴 THIS MESSAGE MUST NOT NAME A SINGLE HALF, and the reason is measured rather than
+	// cautious. It used to end "the disposition join's REVIEW_ID half is gone" — and dropping
+	// `AND d.target = rr.target` fires it, with review_id untouched. The detection is right and
+	// that diagnosis was wrong: handRev owns its OWN disposition (on cat/rg-hand), so once the
+	// target half goes, this coordinate inherits it WITHOUT any cross-review match. A reader
+	// sent to the tenant boundary would be debugging a predicate nobody had touched.
+	//
+	// The discriminator is the sibling assertion above, which is why the message points at it
+	// instead of guessing: the target half reddens BOTH; the review_id half reddens only this
+	// one, because the sibling shares autoRev and needs no cross-review match to stay clean.
+	//
+	// Its filed-link twin above is deliberately left naming REVIEW_ID: handRev owns no filed
+	// row at all, so no coordinate-half fold can reach it and review_id really is the only
+	// explanation — verified, not assumed, across all six join folds. That asymmetry is the
+	// whole lesson: the same sentence is precise on one join and false on the other, and only
+	// the fixture says which.
 	if crossReview.SetVia.Valid || crossReview.DispositionStatus.Valid {
-		t.Errorf("a coordinate identical to autoRev's disposed one but in ANOTHER review inherited its "+
-			"disposition (set_via=%q status=%q) — the disposition join's REVIEW_ID half is gone. That "+
-			"half is the ONLY tenant boundary on recommendation_dispositions, so another user settling "+
-			"their copy of a shared coordinate would drop this one out of todo",
+		t.Errorf("a coordinate identical to autoRev's disposed one but in ANOTHER review inherited a "+
+			"disposition (set_via=%q status=%q) — the disposition join is matching across a boundary it "+
+			"must not. EITHER the REVIEW_ID half is gone (the ONLY tenant boundary on "+
+			"recommendation_dispositions, so another user settling their copy of a shared coordinate "+
+			"would drop this one out of todo) OR the TARGET half is, which lets handRev's own "+
+			"disposition reach this coordinate without leaving the review. Check the undisposed "+
+			"sibling's assertion to tell them apart: the target half reddens both, review_id only this",
 			crossReview.SetVia.String, crossReview.DispositionStatus.String)
 	}
 

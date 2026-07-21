@@ -87,7 +87,7 @@ import (
 // inventoryQueryFiles and nothing else. Re-derive the coverage arithmetic rather than
 // trusting a sentence — `grep -c '^-- name: ' queries/*.sql` gives the per-file counts and
 // `ls queries/*.sql | wc -l` the denominator. Measured at `ad6c63d9`: 290 queries across 28
-// files repo-wide, of which this file declares eight files. (The number this paragraph
+// files repo-wide; this file declares 46 of them across ten files. (The number this paragraph
 // carried before was 276, written weeks of merges earlier and never re-derived; it is quoted
 // here only to make the point that the figure drifts and the command does not.)
 //
@@ -99,7 +99,7 @@ import (
 // finished honestly.
 //
 // FILES ARE PICKED BY RISK — a query whose drift is SILENT AND USER-VISIBLE beats one whose
-// drift reddens instantly. The three added after the judge family, with the reason each was
+// drift reddens instantly. The files added after the judge family, with the reason each was
 // picked ahead of larger files:
 //
 //   review_issues.sql (5)  — the WRITE half of the coordinate the judge family reads. It is
@@ -113,12 +113,26 @@ import (
 //   cli_tokens.sql (6)     — the bearer-credential path. Owner scoping here is the whole
 //     authorization boundary for the CLI, and a lost predicate is a cross-user token read or
 //     revoke that returns 200.
+//   notifications.sql (8)  — every row a user's inbox renders, all owner-scoped. Drift here is
+//     silent and permanently visible: a wrong unread badge is the bug a user reports and nobody
+//     can reproduce.
+//   agent_memory.sql (6)   — user+repo scoped reads plus an eviction that DELETES, so a lost
+//     predicate either leaks another tenant's notes into a prompt or destroys the wrong rows.
 //
 // Left for later, with the reason, so the next person does not re-derive the triage:
 // runtime.sql (65), users.sql (21), user_secrets.sql (18) and slack.sql (18) are all higher
 // risk than some of the above and too large to investigate honestly in one sitting; forge.sql
-// (31) likewise. notifications.sql (8) and agent_memory.sql (6) are the best next candidates
-// on size-versus-risk.
+// (31) likewise. Best next candidates on size-versus-risk: user_vaults.sql (3) and
+// settings.sql (3) are small enough to finish properly; skills.sql (13) and chat.sql (16) are
+// the largest that still look tractable.
+//
+// WHAT THE LAST TWO FILES CHANGED ABOUT HOW TO READ THIS TABLE. agent_memory.sql came out with
+// six pins and NO declared gaps, and that is worth as much as a file full of gaps: it makes the
+// table a distribution rather than a list of complaints, and it is the control on the process —
+// a widening exercise that only ever finds holes is one nobody should trust. notifications.sql
+// came out the other way, and the split inside it is the finding: the WRITE path (insert,
+// count, prune) is live-pinned and the entire READ path is not, which no per-file summary would
+// have surfaced.
 //
 // WHY DECLARED AND NOT INFERRED. A prototype that infers pinning by scanning Test*LiveDB
 // function bodies for the query name was measured against this same tree, and it is wrong in
@@ -215,7 +229,13 @@ import (
 // copy-aside now. Both are the standing rule that a VERIFICATION step needs its own positive
 // control, failing inside the controls written to enforce it.
 //
-// If you change the matching below, re-run them.
+// If you change the matching below, re-run them — and when you do, A CONTROL RUN MUST ASSERT
+// `build-failed=no` AND THE PRESENCE OF `--- FAIL`, not merely a non-zero exit. This is the
+// requirement, stated in the tree, because the fix that produced it lived only in a scratch
+// script and in prose: nothing here forces the next person to check, and a mutation that
+// breaks the build exits non-zero and reads exactly like a control that fired. Two of the
+// controls above "passed" that way before anyone looked. A run that cannot distinguish
+// "the check caught it" from "the package did not compile" has not run a control.
 // ---------------------------------------------------------------------------------------
 
 // unpinnedPin is the sentinel for "no test executes this query, and here is why".
@@ -256,6 +276,8 @@ var inventoryQueryFiles = []string{
 	"review_issues.sql",
 	"selfimprove.sql",
 	"cli_tokens.sql",
+	"notifications.sql",
+	"agent_memory.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -357,12 +379,12 @@ var queryInventory = []queryPin{
 			"re-judge with the same id, which is the whole reason the link lives in its own table. " +
 			"NOT covered: the ORDER BY (settled first, NULLS LAST) — every fixture has one row"},
 	{"SweepStrandedRecommendationClaims", "review_issues.sql", "TestRecommendationFiledIssuesLiveDB",
-		"direct call, :195. 🔴 THE ASSERTION IS TABLE-WIDE (`swept != 1`) and this query has no " +
-			"scope argument beyond the cutoff, so the pin holds only while no OTHER fixture leaves a " +
-			"claim older than one minute in the shared live database. Measured 2026-07-21: it " +
-			"reported swept=23 against want 1 on a database that had accumulated claims across " +
-			"repeated runs. A green here is partly a statement about the rest of the suite — which " +
-			"is the standing 'scope live-DB assertions to the fixture' rule, unfixed, named"},
+		"direct call. The table-wide `swept != 1` this row used to flag is FIXED: it now asserts " +
+			"three fixture-scoped facts (stranded row reaped, FRESH claim survives, settled row " +
+			"untouched) with `swept >= 1` kept only as a floor. Folded both directions — `<`->`>` " +
+			"reddens the reap check, an always-true cutoff reddens the survives check, each alone. " +
+			"NOT covered: `filed_at IS NULL` in isolation, which the settled-row check reaches only " +
+			"because that row is also filing_since NULL"},
 
 	// ── selfimprove.sql — the engine that opens runs against uzi's own repo ────────────
 	{"ListOpenImproveUziRecommendations", "selfimprove.sql", "TestRecommendationFiledIssuesLiveDB",
@@ -427,6 +449,68 @@ var queryInventory = []queryPin{
 			"`WHERE user_id = @user_id` is the only thing keeping one user's token list " +
 			"(token_prefix, last_used_at, last_used_ip — the whole forensic surface) out of " +
 			"another's, and losing it returns 200"},
+	// ── notifications.sql — the inbox. THE WRITE PATH IS PINNED; THE READ PATH IS NOT ───
+	// The shape is worth seeing before the rows: one live test covers insert/count/prune, and
+	// the entire LIST + MARK-READ half — every query the user's inbox actually renders from —
+	// has never touched a database. handler/notifications_test.go looks like coverage and is
+	// fake-store throughout, so the owner predicates below are pinned only by a fake that takes
+	// the scoping as a parameter.
+	{"PruneNotificationsForUser", "notifications.sql", "TestNotificationsPruneLiveDB",
+		"direct call through the prune helper, notifications_integration_test.go:64, driven by " +
+			"several subtests. Discriminating: under-cap keeps everything, over-cap deletes exactly " +
+			"the excess, and one user's prune leaves another user's rows untouched"},
+	{"InsertNotification", "notifications.sql", "TestNotificationsPruneLiveDB",
+		"direct call, :157 — the 'write-seam round-trip' subtest, NOT mere fixture setup: it " +
+			"inserts four, asserts the count reads four, prunes to two, and asserts the rows were " +
+			"genuinely removed"},
+	{"CountNotificationsForUser", "notifications.sql", "TestNotificationsPruneLiveDB",
+		"direct call, :164 and :170, asserted on both sides of a prune in the same subtest"},
+	{"ListNotificationsForUser", "notifications.sql", unpinnedPin,
+		"No live test executes it. The only caller is handler/notifications.go:162, and " +
+			"handler/notifications_test.go is fake-store — TestListNotificationsOwnScope asserts the " +
+			"owner scoping against a fake that receives user_id as a parameter and therefore cannot " +
+			"be wrong about where it came from. This is the query the inbox page renders from"},
+	{"CountUnreadNotificationsForUser", "notifications.sql", unpinnedPin,
+		"No live test executes it. Callers are handler/notifications.go:134 and :192 only. It " +
+			"drives the unread BADGE, so drift is silent and permanently visible — a stuck count is " +
+			"the kind of bug a user reports and nobody can reproduce"},
+	{"MarkNotificationRead", "notifications.sql", unpinnedPin,
+		"No live test executes it. handler/notifications_test.go:332-363 drives the handler " +
+			"against a fake, including TestMarkNotificationReadCrossUserDenied — so the cross-user " +
+			"denial that matters is asserted where the SQL is not. Its `user_id = @user_id` is what " +
+			"stops one user marking another's notification read"},
+	{"ListAllNotifications", "notifications.sql", unpinnedPin,
+		"No live test executes it. Caller is handler/notifications.go:142, the ADMIN all-users " +
+			"view — the one read deliberately NOT owner-scoped, which is exactly why its pagination " +
+			"and ordering going wrong would be invisible rather than caught by a scoping assertion"},
+	{"CountAllNotifications", "notifications.sql", unpinnedPin,
+		"No live test executes it. Caller is handler/notifications.go:148, the admin view's total"},
+
+	// ── agent_memory.sql — pinned end to end, recorded because a table of gaps is not the ──
+	// point. One live test covers all six with discriminating assertions in both directions;
+	// nothing here is a declared gap, and that is a result worth having in the same list.
+	{"InsertAgentMemory", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, agent_memory_integration_test.go:71/:86/:92 — three entries across two users " +
+			"and two repos, which is what makes the scoping assertions below able to fail"},
+	{"ListAgentMemoryForUserRepo", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, :98. Asserts EXACTLY the (u1,r1) entry comes back — so a lost user half or " +
+			"repo half admits a neighbouring row and the length check fires. Also the read-back for " +
+			"the eviction window at :134"},
+	{"ListAgentMemoryForUser", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, :106: exactly 2 entries (both of u1's repos, none of u2's), plus a per-row " +
+			"assertion that repo_name is non-empty, which is the only thing pinning the repos JOIN"},
+	{"CountAgentMemoryForRun", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, :81"},
+	{"EvictAgentMemoryOverCap", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, :131. The strongest pin in this file: 25 rows with hand-stamped created_at, " +
+			"keep 20, and the assertion names the WINDOW (newest m24, oldest survivor m05) rather " +
+			"than the count — so evicting the wrong end, or the right count from the wrong order, " +
+			"both fail"},
+	{"DeleteAgentMemory", "agent_memory.sql", "TestAgentMemoryLiveDB",
+		"direct call, :147 and :154 — owner scoping in BOTH directions: a foreign user's delete " +
+			"affects 0 rows, then the owner's delete of that SAME id affects 1, which proves the 0 " +
+			"was the predicate and not a missing row"},
+
 	{"TouchCLIToken", "cli_tokens.sql", unassertedPin,
 		"EXECUTES on every accepted Bearer request in the CLI live-DB suite " +
 			"(middleware/cli_auth.go:92), so it is not UNPINNED — but nothing anywhere asserts " +
