@@ -349,17 +349,47 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// the assertions had nothing to discriminate. The fix is in the fixture, not the
 	// assertions.
 	//
-	// MEASURED, one fold per run against a FRESH database (PRD #98, 2026-07-21). Each line
-	// mutates ListJudgeRecommendationRowsForUser — THE FIRST QUERY BODY in
-	// judge_recommendations.sql, at its lines 69 and 71 — regenerated through sqlc, and each
-	// names the assertion that caught it:
+	// MEASURED, one fold per run against a FRESH database, RE-DERIVED IN FULL at `ad6c63d9`
+	// (2026-07-21) rather than carried forward — the landing merge put four new migrations
+	// (00078-00081) ahead of ours, so every earlier fold on this fixture had run against DDL
+	// the suite no longer applies. Each line mutates ListJudgeRecommendationRowsForUser — THE
+	// FIRST QUERY BODY in judge_recommendations.sql, at its lines 61, 64, 69 and 71 —
+	// regenerated through sqlc, `go vet` clean, the change confirmed present in BOTH the .sql
+	// and the .sql.go by `git diff --numstat` before each run and gone after. Every run
+	// carried its own positive control: RUN=1, SKIP=0, and the named test appearing as
+	// --- PASS / --- FAIL. Each line names the assertion that caught it, by MESSAGE:
 	//
-	//   drop `AND f.target = rr.target`      RED  — the sibling's filed-link assertion
-	//   drop `AND f.category = rr.category`  RED  — the cross-category coordinate's, below
-	//   drop BOTH coordinate halves          RED  — both of the above fire together
-	//   drop `AND d.target = rr.target`      RED  — the sibling's disposition assertion
-	//   drop `AND d.category = rr.category`  RED  — the cross-category disposition assertion
-	//   `f.filed_at` -> `d.set_at`           RED  — the no-filed-row filed_at assertion
+	//   drop `AND f.target = rr.target`      RED  — "sharing autoRev AND its category" (the
+	//                                              sibling below), and that one ONLY
+	//   drop `AND f.category = rr.category`  RED  — "sharing autoRev AND its target" (the
+	//                                              cross-category coordinate), that one ONLY
+	//   drop BOTH coordinate halves          RED  — "two backlog rows share the coordinate":
+	//                                              the DUPLICATE-COORDINATE Fatalf at the map
+	//                                              build, NOT either assertion above. With
+	//                                              both halves gone the join runs on review_id
+	//                                              alone, autoRev holds two filed rows, and
+	//                                              every autoRev coordinate matches both — a
+	//                                              fan-out, which fatals before any filed-link
+	//                                              assertion executes. Recorded because the
+	//                                              previous version of this table claimed
+	//                                              "both of the above fire together", and they
+	//                                              do not: neither runs.
+	//   drop `AND d.target = rr.target`      RED  — "the undisposed sibling inherited a
+	//                                              disposition", AND the cross-review one,
+	//                                              whose message blames the REVIEW_ID half that
+	//                                              was never mutated (handRev's own disposition
+	//                                              reaches its rg-auto coordinate once the
+	//                                              target half is gone — a true detection with a
+	//                                              mis-tuned message)
+	//   drop `AND d.category = rr.category`  RED  — "the cross-category coordinate inherited a
+	//                                              disposition", that one ONLY
+	//   `f.filed_at` -> `d.set_at`           RED  — "carries filed_at …", that one ONLY
+	//   `(f.filed_at IS NOT NULL)::bool`
+	//     -> `(f.id IS NOT NULL)::bool`      RED  — "a coordinate that is only CLAIMED …", the
+	//                                              claimed coordinate's assertion. This one was
+	//                                              ASSERTED by the claim-row comment below and
+	//                                              had never been folded on this body; it is
+	//                                              measured now.
 	//
 	// SCOPE — READ THIS BEFORE CONCLUDING "THE COORDINATE PREDICATE IS PINNED". The SAME two
 	// three-part joins appear a SECOND time in that file, on ListJudgeTriageRowsForRuns (M4's
@@ -373,13 +403,22 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// unpinned: dropping BOTH coordinate halves off its `f` join, and separately off its `d`
 	// join, each left the ENTIRE live-DB suite green.
 	// TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB at the end of this file now covers
-	// it — read ITS verification-status block before treating that query as pinned, because
-	// it was written without a database slot and its folds are still owed.
+	// it, and its folds HAVE since been run — this sentence used to end "its folds are still
+	// owed", which stopped being true when they landed and which nothing would ever have
+	// flagged. Read its own block for the results rather than this pointer to it.
 	//
 	// PROVENANCE OF THE "was GREEN" CLAIMS, because they are not all the same strength: the
 	// category-half GREEN was measured here, on this fixture with the sibling but before the
 	// fourth coordinate. The target-half and both-halves GREENs are INHERITED from the M3
 	// checkpoint's earlier sweep and were not re-run against the pre-fix tree.
+	//
+	// WHY THE TABLE ABOVE WAS RE-DERIVED RATHER THAN TRUSTED, since it had been measured
+	// carefully twice: a fixture row added AFTER it — the claimed coordinate, which arrived in a
+	// later commit for an unrelated property — silently moved where two of these folds land.
+	// Nothing in the table's own text was edited when that row arrived, and nothing could have
+	// noticed: the folds still went RED, so no gate could see that the assertion being credited
+	// had stopped executing. That is the whole argument for re-folding rather than inheriting.
+	// A fold result is a claim about a fixture AND a schema, and both move underneath it.
 	const unfiledInAutoRev = "rg-unfiled-sibling"
 	mustExec(ctx, t, pool,
 		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
@@ -447,6 +486,38 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// then SettleRecommendationFiledIssue stamps filed_* on forge success. So a row that
 	// EXISTS but is not settled is a documented, reachable, in-flight state.
 	//
+	// 🔴 IT SITS UNDER ITS OWN THIRD CATEGORY, AND THAT IS LOAD-BEARING — DO NOT MOVE IT INTO
+	// cat OR otherCat. It carries the fixture's SECOND recommendation_filed_issues row, and
+	// keeping that row in a category no other coordinate uses is what keeps the two filed rows
+	// from colliding under a folded join. Measured 2026-07-21 at this tree, one fold per run
+	// against a fresh database; both alternatives were run, not reasoned:
+	//
+	//   claim under cat (where it was):  `drop AND f.target = rr.target` reddens at the
+	//     DUPLICATE-COORDINATE t.Fatalf, not at the sibling's filed-link assertion below. Two f
+	//     rows then share (autoRev, cat), so the fold leaves the join running on the non-unique
+	//     (review_id, category) prefix, rg-auto matches BOTH, and the map build fatals with
+	//     "the fixture is ambiguous" — a message that blames the FIXTURE for a broken production
+	//     join, while the assertion written for that fold never executes. A red naming the wrong
+	//     thing is not the same pin, and an assertion behind an earlier Fatalf is documentation
+	//     rather than a gate.
+	//   claim under otherCat:  the fold reaches the sibling's assertion, but ALSO reddens the
+	//     cross-category one — whose message then blames the CATEGORY half, which was never
+	//     mutated. Not a false positive: the cross-category coordinate really does inherit this
+	//     claim row under that fold. The mechanism is filed_issue_url being `NOT NULL DEFAULT ''`
+	//     (00071:43), so `FiledIssueUrl.Valid` is TRUE for a bare claim row and that assertion
+	//     therefore detects ANY f match rather than a settled one. Same lesson as the cast fold
+	//     recorded further down: a fold that reddens a spread tells you less than one that
+	//     reddens the right assertion.
+	//
+	// A third category makes the target-half fold reach exactly the sibling's assertion and
+	// nothing else. Its own purpose is unaffected: it pins filed_settled's SOURCE, which is
+	// about filed_at vs row-existence and never about the coordinate.
+	//
+	// NOT improve_uzi, for the reason the badge fixture at the end of this file spells out —
+	// that is the one category with a second, table-wide consumer
+	// (ListOpenImproveUziRecommendations, selfimprove.sql), so an open improve_uzi row here can
+	// fail an M6 test in another package.
+	//
 	// It pins the derived boolean's SOURCE. `filed_settled` is
 	// `(f.filed_at IS NOT NULL)::bool`, and the natural wrong implementation is "did the LEFT
 	// JOIN match?" — `(f.id IS NOT NULL)` or `(f.review_id IS NOT NULL)`. Every OTHER f row in
@@ -462,14 +533,15 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// projection is correct only BECAUSE of that writer invariant — an instance of "state the
 	// invariant where it is enforced" — and a fixture contriving filed_at NULL with a non-NULL
 	// iid would pin an unreachable state. Named here so the next reader does not go build it.
+	const claimCat = "adjust_template"
 	const claimedTarget = "rg-mid-filing"
 	mustExec(ctx, t, pool,
 		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
-		 VALUES ($1, $2, $3, 'because', 'medium')`, autoRev.reviewID, cat, claimedTarget)
+		 VALUES ($1, $2, $3, 'because', 'medium')`, autoRev.reviewID, claimCat, claimedTarget)
 	mustExec(ctx, t, pool,
 		`INSERT INTO recommendation_filed_issues (id, review_id, category, target, filed_by_user_id, filing_since)
 		 VALUES ($1, $2, $3, $4, $5, now())`,
-		uuid.New(), autoRev.reviewID, cat, claimedTarget, owner)
+		uuid.New(), autoRev.reviewID, claimCat, claimedTarget, owner)
 
 	// The filed link + the cached CLOSED issue that makes it an M6 close edge.
 	filedID := uuid.New()
@@ -691,7 +763,7 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// THE DERIVED BOOLEAN'S SOURCE. A claimed-but-not-filed coordinate HAS an f row, so
 	// "the LEFT JOIN matched" and "filed_at is set" disagree here and nowhere else in this
 	// fixture. filed_settled must follow filed_at, not row existence.
-	claimed := at("the claimed-but-not-filed coordinate", autoRev.reviewID, cat, claimedTarget)
+	claimed := at("the claimed-but-not-filed coordinate", autoRev.reviewID, claimCat, claimedTarget)
 	if claimed.FiledSettled {
 		t.Error("a coordinate that is only CLAIMED (filing_since set, filed_at still NULL) reports " +
 			"filed_settled=true — filed_settled is testing whether the filed row EXISTS rather than " +
@@ -855,8 +927,11 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 // The pairs are deliberately NOT uniform. A fixture whose rows all look alike is what made
 // both of the holes this branch just closed invisible, twice, one level down each time.
 //
-// ✅ MEASURED 2026-07-21. Seven folds of THIS query body, one mutation per run, each against
-// a FRESH database. Every run additionally asserted the POSITIVE CONTROL — that this test
+// ✅ MEASURED 2026-07-21. Every fold in the table below is of THIS query body, one mutation
+// per run, each against a FRESH database. (The count is deliberately not stated: an earlier
+// version of this line said "Seven folds" above a table of EIGHT rows, which is the same
+// defect as a bare suite tally — the rows are the claim, a number over them is a second,
+// unchecked copy of it.) Every run additionally asserted the POSITIVE CONTROL — that this test
 // actually appeared as RUN and PASS/FAIL, and that the suite's SKIP count was 0 — because a
 // live-DB test that silently skips looks exactly like a green. Every mutation was confirmed
 // present in BOTH the .sql and the regenerated .sql.go before the run and gone from both
@@ -871,6 +946,13 @@ func recIDFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uu
 //	drop `d.review_id = rv.id`                    RED — row-count fan-out, then more
 //	`d.status` -> `d.dismiss_reason`              RED at the runDT/runDC VALUE assertions
 //	`(f.filed_at ...)` -> `(f.id IS NOT NULL)`    RED at the runCL claimed assertion
+//
+// 🟡 BOUND, because the table above is the strongest-looking artifact in this file and its
+// binding is the thing a reader will not check: it was measured on the BRANCH, before the
+// landing merge put migrations 00078-00081 ahead of ours. It has NOT been re-run against the
+// merged schema. The sibling table on the M1 body was re-derived at `ad6c63d9` for exactly
+// that reason and every fold still reddened — which is evidence that re-folding is worth the
+// minutes, NOT evidence that this one is fine. Re-fold before citing it.
 //
 // 🔴 THE TWO review_id RESULTS ARE AN ACCIDENT OF THIS FIXTURE — DO NOT TIDY IT AWAY. They
 // redden only because runFT/runFC both hold a filed row on the SAME coordinate (catA,tgt1),
