@@ -2,13 +2,18 @@ package workersvc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The escapes are built by concatenation so the six-character sequence is never a
@@ -312,4 +317,79 @@ func FuzzSanitizePayloadJSON(f *testing.F) {
 			t.Fatalf("not idempotent: a second pass changed the output (counts %+v)\n  out:  %q\n  out2: %q", c2, out, out2)
 		}
 	})
+}
+
+// captureLogs swaps the default slog handler for the duration of one test and
+// returns what was written. The strip log is the mechanism behind PRD #108's
+// count-and-log requirement, so it is behaviour and gets asserted like behaviour.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// Every message that was ALTERED AND STORED must appear in the log. That is the
+// requirement's real content: "so a NUL-emitting tool stays visible" is worthless
+// if the batch most worth understanding is the one that reports least.
+//
+// The trap this guards is structural rather than logical. The natural place for
+// the logging is the validation loop, which already holds run id, seq and kind —
+// but that loop returns on the FIRST invalid message, so any strips in messages
+// after it would go unreported while earlier ones were logged: the report would
+// be a prefix of the batch, silently. Sanitation therefore runs as its own pass
+// AFTER validation has accepted the whole batch.
+func TestAppendMessagesLogsEveryStrippedMessage(t *testing.T) {
+	buf := captureLogs(t)
+	fs := &fakeStore{}
+	svc := New(fs, nil, Params{})
+
+	// Messages 1 and 3 carry poison, 2 is clean. A report that is a prefix of the
+	// batch would name 1 and not 3.
+	err := svc.AppendMessages(context.Background(), store.Worker{}, uuid.New(), []IncomingMessage{
+		{Seq: 1, Kind: "text", Payload: []byte(`{"t":"a` + escNUL + `b"}`)},
+		{Seq: 2, Kind: "text", Payload: []byte(`{"t":"clean"}`)},
+		{Seq: 3, Kind: "tool_result", Payload: []byte(`{"t":"c` + escHiSurr + `d"}`)},
+	})
+	if err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	logged := buf.String()
+	if n := strings.Count(logged, "sanitized unstorable bytes"); n != 2 {
+		t.Fatalf("%d strip log lines, want exactly 2 (messages 1 and 3; message 2 was clean)\n%s", n, logged)
+	}
+	for _, want := range []string{"seq=1", "seq=3", "kind=text", "kind=tool_result",
+		"payload_nul_dropped=1", "payload_unpaired_surrogates_replaced=1"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the strip log is missing %q — an operator cannot locate the emitter without it\n%s", want, logged)
+		}
+	}
+	if strings.Contains(logged, "seq=2") {
+		t.Errorf("a clean message was logged as stripped\n%s", logged)
+	}
+}
+
+// The other half of the same invariant: a batch REJECTED by validation stores
+// nothing, so it must launder nothing and report nothing. A log line here would
+// claim bytes were dropped from a message that was never written.
+func TestAppendMessagesLogsNothingWhenTheBatchIsRejected(t *testing.T) {
+	buf := captureLogs(t)
+	fs := &fakeStore{}
+	svc := New(fs, nil, Params{})
+
+	err := svc.AppendMessages(context.Background(), store.Worker{}, uuid.New(), []IncomingMessage{
+		{Seq: 1, Kind: "text", Payload: []byte(`{"t":"a` + escNUL + `b"}`)},
+		{Seq: 2, Kind: "", Payload: []byte(`{"t":"x"}`)}, // invalid: no kind
+	})
+	if !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("err = %v, want ErrInvalidMessage", err)
+	}
+	if len(fs.insertedMessages) != 0 {
+		t.Fatalf("%d messages were inserted despite the batch being rejected", len(fs.insertedMessages))
+	}
+	if strings.Contains(buf.String(), "sanitized unstorable bytes") {
+		t.Errorf("a rejected batch reported a strip; nothing was stored, so nothing was laundered\n%s", buf.String())
+	}
 }

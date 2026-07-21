@@ -45,9 +45,11 @@ import (
 //	jsonb, a raw 0xff byte ................ SQLSTATE 22021 invalid byte sequence for encoding "UTF8"
 //	text  (agent_label), a raw NUL byte ... SQLSTATE 22021 invalid byte sequence for encoding "UTF8"
 //
-// all four surfacing as HTTP 500. A batch over the 1 MiB body cap is a 400
-// instead — the second poison trigger, and the class change that disarms a
-// "same error each time" guard.
+// all four surfacing as HTTP 500. A batch over the 1 MiB body cap was a 400 —
+// the second poison trigger, and the class change that disarms a "same error
+// each time" guard. It is a 413 as of M2's follow-up: the worker answers oversize
+// by splitting and poison by bisecting, and it could not tell the two apart while
+// they shared a status code and a generic body.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
@@ -433,21 +435,34 @@ func TestWorkerMessagesOversizedBatchIsADifferentClassLiveDB(t *testing.T) {
 	}
 
 	rec := f.post(t, body)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("POST /messages with a %d-byte body (over the 1 MiB DecodeJSON cap): status = %d, want 400 — %s",
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("POST /messages with a %d-byte body (over the 1 MiB cap): status = %d, want 413 — %s",
 			len(body), rec.Code, f.diagnose(t, body))
 	}
-	// And the class really is different: nothing landed, and the same batch under
-	// the cap is a plain 204. Without this half, "400" alone would be consistent
-	// with the route rejecting the SHAPE rather than the SIZE.
+	// The body must be uzi's own prose. net/http's MaxBytesError.Error() is the
+	// fixed literal "http: request body too large", pinned by Hyrum's law in the
+	// stdlib; echoing it would couple this wire contract to a stdlib constant.
+	if strings.Contains(rec.Body.String(), "http:") {
+		t.Errorf("the 413 body echoes the net/http error string: %s", rec.Body.String())
+	}
+	// 413 must be DISTINGUISHABLE from the 400 the poison path returns, which is
+	// the entire reason it exists: the worker answers one by splitting and the
+	// other by bisecting, and it cannot tell them apart from a shared 400 without
+	// prose-matching an error string. Assert the separation, not just the code.
+	poison := []byte(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":"unclosed`)
+	if rec := f.post(t, poison); rec.Code != http.StatusBadRequest {
+		t.Errorf("a MALFORMED (not oversized) body: status = %d, want 400 — if this is also 413 then the "+
+			"two causes are still indistinguishable and the split is decorative", rec.Code)
+	}
+	// Nothing landed, and the same shape under the cap is a plain 204. Without this
+	// half, the 413 would be consistent with the route rejecting the SHAPE rather
+	// than the SIZE, and this test would not be measuring the cap at all.
 	if n := f.lastSeq(t); n != 0 {
-		t.Errorf("runs.last_seq = %d after a rejected oversized batch, want 0 — the batch must be all-or-nothing", n)
+		t.Errorf("runs.last_seq = %d after a rejected oversized batch, want 0", n)
 	}
 	small := []byte(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"t":"small"}}]}`)
 	if rec := f.post(t, small); rec.Code != http.StatusNoContent {
-		t.Fatalf("the same message shape UNDER the cap: status = %d, want 204 — the 400 above would then "+
-			"be about the batch's shape, not its size, and this test would not be measuring the cap at all",
-			rec.Code)
+		t.Fatalf("the same message shape UNDER the cap: status = %d, want 204", rec.Code)
 	}
 }
 
@@ -541,5 +556,111 @@ func TestWorkerMessagesNumericOverflowIsAResidual500LiveDB(t *testing.T) {
 	}
 	if n := f.lastSeq(t); n != 0 {
 		t.Errorf("runs.last_seq = %d after a rejected batch, want 0", n)
+	}
+}
+
+// foldingStore fails a chosen store call OTHER than the insert, so the narrowness
+// of the unstorable classification can be exercised. The insert itself always
+// succeeds here.
+type foldingStore struct {
+	workersvc.Store
+	lastSeqErr error
+}
+
+func (s *foldingStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
+	return store.Run{}, nil
+}
+
+func (s *foldingStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (int64, error) {
+	return 1, nil
+}
+
+func (s *foldingStore) UpdateRunLastSeq(context.Context, store.UpdateRunLastSeqParams) (int64, error) {
+	return 0, s.lastSeqErr
+}
+
+// THE narrowness guard. 400 on this route tells the worker "this batch is
+// permanently poisoned, stop retrying it", and only the INSERT's rejection is
+// evidence for that. A 22P05 raised anywhere else concerns a value the worker did
+// not send — UpdateRunLastSeq takes the run id and an int — so reporting it as
+// the batch's fault makes the worker drop messages that were never the problem.
+//
+// This is the test that fails if the classifier is ever moved back out to the
+// function boundary, where it cannot tell the two apart.
+func TestWorkerMessagesUnstorableOutsideTheInsertStays500(t *testing.T) {
+	h := &Handler{wsvc: workersvc.New(
+		&foldingStore{lastSeqErr: &pgconn.PgError{Code: "22P05", Message: "boom"}},
+		newHandlerTestBox(t), workersvc.Params{})}
+	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages",
+		strings.NewReader(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"t":"clean"}}]}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", uuid.New().String())
+	ctx := context.WithValue(mw.ContextWithWorker(req.Context(), store.Worker{ID: uuid.New(), UserID: uuid.New()}), chi.RouteCtxKey, rctx)
+	rec := httptest.NewRecorder()
+	h.WorkerRunMessages(rec, req.WithContext(ctx))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("a 22P05 raised by UpdateRunLastSeq (not by the insert): status = %d, want 500 — the "+
+			"batch's own messages were accepted, so telling the worker they are permanently poisoned "+
+			"makes it drop data that was never at fault", rec.Code)
+	}
+}
+
+// A partially-applied batch must leave runs.last_seq at what ACTUALLY landed.
+//
+// The insert loop is not transactional, so [good, good, poison] commits the first
+// two. If the high-water mark stays behind them, the resumed worker restarts from
+// the stale value and re-emits those seq numbers carrying DIFFERENT content; the
+// idempotent insert answers rows == 0, the server reads a re-delivery, and the new
+// content is silently dropped. The poison here is the measured jsonb numeric
+// overflow, which is the only unstorable payload that survives sanitation.
+func TestWorkerMessagesPartialBatchAdvancesLastSeqLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"messages":[` +
+		`{"seq":1,"kind":"text","agent":"lead","payload":{"t":"one"}},` +
+		`{"seq":2,"kind":"text","agent":"lead","payload":{"t":"two"}},` +
+		`{"seq":3,"kind":"text","agent":"lead","payload":{"n":1e1000000}}]}`)
+
+	if rec := f.post(t, body); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("a batch whose third message the database refuses: status = %d, want 500 — %s",
+			rec.Code, f.diagnose(t, body))
+	}
+	// The first two really did commit: that is what makes the stale mark harmful
+	// rather than merely untidy, so assert it rather than assume it.
+	for _, seq := range []int{1, 2} {
+		if _, ok := f.storedPayloadField(t, seq, "t"); !ok {
+			t.Fatalf("seq %d is absent — the insert loop is transactional after all, and this test is "+
+				"measuring something other than a partial apply", seq)
+		}
+	}
+	if _, ok := f.storedPayloadField(t, 3, "n"); ok {
+		t.Error("the poisoned seq 3 was persisted; the database was supposed to refuse it")
+	}
+	if n := f.lastSeq(t); n != 2 {
+		t.Errorf("runs.last_seq = %d, want 2 — it must advance to the last seq that actually landed. "+
+			"Left at 0, the worker resumes from before seq 1, re-emits 1 and 2 with different content, "+
+			"and the idempotent insert silently discards it", n)
+	}
+}
+
+// agent had NO cap before PRD #108 M2 — not "truncated but not stripped" like its
+// two siblings, but wholly unbounded into an unbounded text column, on the same
+// untrusted route and repeated on every frame of an invocation.
+func TestWorkerMessagesAgentIsCappedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	long := strings.Repeat("a", 500)
+	body := []byte(`{"messages":[{"seq":1,"kind":"text","agent":"` + long + `","payload":{"t":"x"}}]}`)
+
+	if rec := f.post(t, body); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 — an over-long agent is truncated, never rejected: a rejected "+
+			"batch is a lost message and this field is attribution. %s", rec.Code, f.diagnose(t, body))
+	}
+	got, ok := f.storedColumn(t, 1, "agent")
+	if !ok {
+		t.Fatal("no agent persisted")
+	}
+	if len(got) != 64 {
+		t.Errorf("persisted agent is %d bytes, want 64 (agenttmpl.MaxNameLen) — an untrusted "+
+			"worker field reached an unbounded text column", len(got))
 	}
 }

@@ -1023,6 +1023,22 @@ func decodePackageList(raw []byte) []string {
 const (
 	maxAgentLabelRunes    = 80
 	maxAgentInstanceRunes = 128 // an SDK `toolu_*` id is ~30; this is headroom, not a fit
+	// maxAgentRunes caps the THIRD worker-controlled attribution field, which had
+	// no cap at all until PRD #108 M2 — not "truncated but not stripped" like the
+	// two above, but wholly unbounded into an unbounded `text` column
+	// (00020_workers_runs.sql), on the same untrusted route and with the same
+	// per-frame repetition.
+	//
+	// The number is not new: agenttmpl.MaxNameLen is the existing authority on how
+	// long an agent name may be, mirrored by the worker's AGENT_NAME_MAX_LEN, and
+	// `agent` is exactly a subagent name. Reusing it means there is one cap to
+	// change rather than two to keep in step. It is a BYTE bound there and a rune
+	// bound here — legitimate names are [a-z0-9-] so the two coincide, and for a
+	// hostile non-ASCII value this admits at most 4x, which still bounds it.
+	//
+	// Truncate, never reject, for the reason spelled out above: a rejected batch is
+	// a lost message and this field is attribution.
+	maxAgentRunes = agenttmpl.MaxNameLen
 )
 
 // truncateRunes caps s at n runes, cutting on a rune boundary so the result is
@@ -1061,41 +1077,61 @@ type IncomingMessage struct {
 // (run_id, seq)) and advances the run's last_seq high-water mark. The worker
 // must own the run.
 //
-// Every store error it returns passes through classifyStoreError, so a rejection
-// that can never succeed on retry surfaces as ErrUnstorableMessage (→ 400) rather
-// than as a bare error the handler answers 500 to. That wrapper sits on the
-// OUTERMOST return rather than on each call site on purpose: the payload is not
-// the only unstorable sink on this path — foldRunUsage inserts a model name taken
-// from the same worker-controlled payload — and a future sink added inside here
-// is classified without anyone remembering to.
+// ONLY the InsertRunMessage error is eligible for the ErrUnstorableMessage (→
+// 400) classification, and that narrowness is the point rather than an oversight.
+// This function returns store errors from three places — the insert,
+// UpdateRunLastSeq and foldRunUsage — and 400 on this route tells the worker
+// "this batch is permanently poisoned, stop retrying it". Only the insert's error
+// is evidence for that claim. A 22P02 raised by the usage fold would be a fault
+// in a server-side value (the run's own session_id rides that insert), and
+// reporting it as the batch's fault makes the worker drop messages that were
+// never the problem: data loss from a misattributed error. The narrow shape has
+// in-repo precedent in handler/secrets.go's constraint-name check, for the same
+// reason.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
-	return classifyStoreError(s.appendMessages(ctx, wkr, runID, msgs))
-}
-
-func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return err
 	}
 	// Validate the whole batch before persisting any of it: a single invalid
-	// message rejects the batch with nothing written (all-or-nothing), so a
-	// [valid, valid, invalid] batch never leaves the first two half-persisted.
+	// message rejects the batch with nothing written, so a [valid, valid, invalid]
+	// batch never leaves the first two half-persisted.
 	//
-	// The same pass CAPS the two PRD #99 attribution fields and SANITIZES the four
-	// worker-controlled sinks (PRD #108 M2). It writes through the index (not a
-	// range copy) on purpose, so the capped and sanitized values are what the
-	// insert, the WS broadcast and the usage fold all see — otherwise the stored
-	// row and the live frame would disagree, and the fold would still be reading
-	// the unstorable bytes.
-	var maxSeq int32
+	// That all-or-nothing property is TRUE OF VALIDATION AND FALSE OF THE STORE.
+	// The insert loop below is not transactional, so a batch whose third message
+	// the database refuses leaves the first two committed. This comment used to
+	// claim the batch was all-or-nothing outright; that was unreachable in practice
+	// before PRD #108 and is routine after it, and it is about to be load-bearing
+	// for the worker's bisection, so it is corrected here rather than left to
+	// mislead. Idempotency on (run_id, seq) is what keeps the partial apply benign:
+	// any regrouping or re-post converges. Making it genuinely transactional needs
+	// a Store interface change (the generated queries take no tx) and is deferred
+	// to Phase 2, which has its own reason to care — its "max(seq) has not
+	// advanced" guard reads the column this path leaves behind.
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
-		// Strictly AFTER the json.Valid check: the scanner presumes well-formed
-		// JSON, and today's invalid-JSON→400 arm must keep answering first.
+	}
+	// SECOND pass for sanitation, separate from validation on purpose. The
+	// count-and-log requirement (PRD #108 Risk 3) exists so a future NUL-emitting
+	// tool stays visible, and folding it into the loop above would report only up
+	// to the first invalid message — the batches most worth understanding are
+	// exactly the ones that would go unreported. Split this way, a batch rejected
+	// by validation logs nothing (nothing was laundered, because nothing is
+	// stored) and a batch that proceeds logs every message it altered.
+	//
+	// It writes through the index (not a range copy), so the capped and sanitized
+	// values are what the insert, the WS broadcast and the usage fold all see —
+	// otherwise the stored row and the live frame would disagree, and the fold
+	// would still be reading the unstorable bytes.
+	for i := range msgs {
+		m := &msgs[i]
 		var c stripCounts
+		// Strictly AFTER the json.Valid check above: the scanner presumes
+		// well-formed JSON, and today's invalid-JSON→400 arm must keep answering
+		// first.
 		m.Payload, c = sanitizePayloadJSON(m.Payload)
 		var nAgent, nInstance, nLabel int
 		m.Agent, nAgent = stripNUL(m.Agent)
@@ -1103,9 +1139,6 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 		m.AgentLabel, nLabel = stripNUL(m.AgentLabel)
 		c.textNUL = nAgent + nInstance + nLabel
 		if c.any() {
-			// PRD #108 Risk 3: sanitation that hides a real bug is its own defect —
-			// a future NUL-emitting tool would never be investigated. Logged per
-			// message, at the granularity needed to find the emitter.
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
 				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,
 				"payload_nul_dropped", c.payloadNUL,
@@ -1113,14 +1146,17 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 				"payload_invalid_utf8_replaced", c.payloadBadUTF8,
 				"text_column_nul_dropped", c.textNUL)
 		}
-		// Strip BEFORE truncating, so the rune cap is counted over the NUL-free
+		// Strip BEFORE truncating, so each rune cap is counted over the NUL-free
 		// string the row will actually hold.
+		m.Agent = truncateRunes(m.Agent, maxAgentRunes)
 		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
 		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
-		if m.Seq > maxSeq {
-			maxSeq = m.Seq
-		}
 	}
+	// maxStored is the high-water mark of what ACTUALLY reached the table,
+	// including rows the insert deduplicated (rows == 0 means this (run_id, seq)
+	// was already persisted by an earlier delivery — stored is stored).
+	var maxStored int32
+	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
 		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
@@ -1133,7 +1169,25 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			Payload:       []byte(m.Payload),
 		})
 		if err != nil {
-			return err
+			insertErr = classifyStoreError(err)
+			// The one diagnostic line for this event, emitted HERE because this is
+			// the only place that holds the seq and kind alongside the SQLSTATE. The
+			// code only, never pgErr.Message: for 22P02 and 22021 that text quotes a
+			// fragment of the offending value (measured: `invalid byte sequence for
+			// encoding "UTF8": 0xff`), which is worker-controlled bytes in a log line.
+			var pgErr *pgconn.PgError
+			code := ""
+			if errors.As(err, &pgErr) {
+				code = pgErr.Code
+			}
+			if errors.Is(insertErr, ErrUnstorableMessage) {
+				slog.Warn("workersvc: message permanently unstorable",
+					"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind, "sqlstate", code)
+			}
+			break
+		}
+		if m.Seq > maxStored {
+			maxStored = m.Seq
 		}
 		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
 		// broadcast genuinely new messages so a retry never double-emits over WS.
@@ -1141,10 +1195,24 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
-	if maxSeq > run.LastSeq {
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxSeq}); err != nil {
+	// Advance the high-water mark to what landed, BEFORE propagating any insert
+	// error. Leaving it stale is not cosmetic: on resume the worker restarts from
+	// runs.last_seq and re-emits those seq numbers carrying DIFFERENT content, the
+	// idempotent insert answers rows == 0, the server reads that as a re-delivery,
+	// and the new content is silently dropped and never broadcast. That was
+	// unreachable before PRD #108 (a failing insert was the anomaly) and is routine
+	// after it, which is why it is fixed here rather than left to the transaction
+	// Phase 2 will consider.
+	if maxStored > run.LastSeq {
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
+			if insertErr != nil {
+				return insertErr // the insert failure is the more informative of the two
+			}
 			return err
 		}
+	}
+	if insertErr != nil {
+		return insertErr
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must

@@ -331,7 +331,30 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Messages []workersvc.IncomingMessage `json:"messages"`
 	}
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	// DecodeJSONLimited, not DecodeJSON: this is the one route whose client is a
+	// machine that must decide whether to retry (PRD #108 M2). DecodeJSON's
+	// io.LimitReader truncates silently, so an oversize batch arrives as malformed
+	// JSON and the api literally cannot say "too large" — it would be a THIRD
+	// unrelated cause answered 400 through the same generic body, leaving the
+	// worker to tell "split and retry" from "bisect out the poison" by
+	// prose-matching an error string across a version skew.
+	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// 413 is a SPLIT-AND-RETRY signal, never a poison verdict: a healthy,
+			// chatty run that merely rode out a transient outage grows its batch
+			// across the cap, and failing it for that would be the mirror-image bug.
+			// The worker's own byte cap (batcher.ts) is below this one, so reaching
+			// here means an un-updated worker — which now gets a truthful answer
+			// instead of an ambiguous one.
+			//
+			// The body is uzi's own prose, never err.Error(): that string is the
+			// fixed net/http literal "http: request body too large", pinned by
+			// Hyrum's law in the stdlib, and echoing it would couple our wire
+			// contract to a stdlib constant. err.Limit is likewise never disclosed.
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "this batch is too large; split it and retry")
+			return
+		}
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -346,12 +369,20 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			// never succeed on retry. 400 IS the fix — the status code is the retry
 			// contract, and answering 500 here is what turned one poisoned payload
 			// into a 27-minute, 239-message wedge (the batcher treats any throw as
-			// retryable and re-posts the identical batch at ~2 Hz). Logged at WARN,
-			// not ERROR: after sanitation this should be unreachable, so each one is
-			// a real signal about a byte pattern nothing strips yet — but it is a
-			// client fault, and a 4xx does not page anyone.
-			slog.Warn("worker run messages: permanently unstorable batch rejected",
-				"run_id", runID.String(), "worker_id", wkr.ID.String(), "error", err)
+			// retryable and re-posts the identical batch at ~2 Hz).
+			//
+			// Deliberately NOT logged here, and not because it does not matter:
+			// workersvc already emitted one WARN carrying run id, seq, kind and the
+			// SQLSTATE at the failing insert, which is the only place the seq and
+			// kind exist. A second line here would add a run id this route can
+			// already be grepped by and duplicate the event at whatever rate the
+			// worker retries — while the `default:` arm below deliberately keeps
+			// ERROR with the full error, because a genuine 500 is an operator's
+			// problem and there is no seq to attach to it.
+			//
+			// The body carries no SQLSTATE and nothing derived from the database
+			// error: it is returned to an untrusted worker, and 22P02/22021 messages
+			// quote a fragment of the offending value.
 			httpx.Error(w, http.StatusBadRequest, "a message in this batch cannot be stored and will never succeed; do not retry it unchanged")
 		default:
 			slog.Error("worker run messages", "error", err)
