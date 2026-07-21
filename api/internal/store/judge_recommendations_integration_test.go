@@ -777,16 +777,18 @@ func TestJudgeBacklogProjectsEveryColumnLiveDB(t *testing.T) {
 	// not that it "preserves the type" — the cast does that too. IT IS SELECTIVE. Measured by
 	// the reviewer and re-run here, one fold per run against a fresh database:
 	//
-	//   f.filed_at -> now()::timestamptz   RED here AND at the sibling and cross-category
-	//                                      assertions, whose messages then blame the filed
-	//                                      join's TARGET/CATEGORY half while the join is
-	//                                      untouched (settled=false at=true iid=false url="")
-	//   f.filed_at -> d.set_at             RED here ONLY
+	//   f.filed_at -> now()::timestamptz   RED at FIVE assertions — this one, the sibling, the
+	//                                      cross-category, the cross-review and the claimed
+	//                                      coordinate. Three of those messages blame a join
+	//                                      half that is untouched, and the giveaway is in
+	//                                      their own output: settled=false at=true iid=false
+	//                                      url="" — only the timestamp moved.
+	//   f.filed_at -> d.set_at             RED at this one ONLY
 	//
-	// `now()::timestamptz` is non-NULL for EVERY row, so it trips those two conditions as
-	// well — they OR `FiledAt.Valid` in with three other fields. `d.set_at` is NULL for the
-	// undisposed rows, so exactly one assertion moves. A fold that reddens four assertions
-	// tells you less than one that reddens the right one.
+	// `now()::timestamptz` is non-NULL for EVERY row, so it trips every condition that ORs
+	// `FiledAt.Valid` in with other fields. `d.set_at` is NULL for the undisposed rows, so
+	// exactly one assertion moves. A fold that reddens five assertions tells you less than one
+	// that reddens the right one — and worse, it produces four confidently-wrong diagnoses.
 	//
 	// THE GENERAL RULE, which would have prevented all three mistakes: SQLC TYPES BY
 	// EXPRESSION. Folding a LEFT-JOIN-nullable column to any NON-COLUMN expression drops the
@@ -1070,6 +1072,19 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
 		 VALUES ($1, $2, $3, 'stranger rationale', 'high')`, strangerRev, catA, tgt1)
 
+	// A SEVENTH run: the CALLER'S OWN, deliberately NOT passed in @run_ids. The stranger above
+	// pins the OWNER predicate only — measured: dropping `AND rv.target_run_id = ANY(@run_ids)`
+	// alone left the whole suite GREEN, because every one of the caller's runs was already
+	// being requested, so an unfiltered read returned the identical set. The two predicates
+	// need separate rows to be separately observable.
+	//
+	// Not cosmetic: this query is @lim-bounded, so a read that ignores the page returns every
+	// run the caller has ever had and the LIMIT then cuts arbitrary rows — including rows for
+	// runs that ARE on the requested page, which understates their badges. A wrong number, and
+	// the query's own ORDER BY comment makes exactly this argument about truncation.
+	unrequestedRun, unrequestedRev := newRun()
+	rec(unrequestedRev, catA, tgt1)
+
 	rows, err := q.ListJudgeTriageRowsForRuns(ctx, store.ListJudgeTriageRowsForRunsParams{
 		UserID: owner,
 		RunIds: []uuid.UUID{runFT, runFC, runDT, runDC, runCL, strangerRun},
@@ -1242,10 +1257,19 @@ func TestJudgeRunTodoTriageRowsAreCoordinateScopedLiveDB(t *testing.T) {
 	// from assertion 0's loop.
 	if tl := got[strangerRun]; tl != nil {
 		t.Errorf("another user's run came back with %d rows (filed=%d disposed=%d) despite being "+
-			"only a spoofed id in @run_ids — either `WHERE rv.user_id = @user_id` is gone, in which "+
-			"case this caller's badge counts another tenant's recommendations, or the run_ids filter "+
-			"is. The query's own comment claims exactly this cannot happen",
-			tl.rows, tl.filed, tl.disposed)
+			"only a spoofed id in @run_ids — `WHERE rv.user_id = @user_id` is gone, so this caller's "+
+			"badge counts another tenant's recommendations. The query's own comment claims exactly "+
+			"this cannot happen", tl.rows, tl.filed, tl.disposed)
+	}
+
+	// 9. THE PAGE PREDICATE, which the stranger cannot observe: this run is the caller's OWN,
+	// so the owner predicate admits it, and only `AND rv.target_run_id = ANY(@run_ids)` keeps
+	// it out. Also asserted directly rather than through at(), for the same reason.
+	if tl := got[unrequestedRun]; tl != nil {
+		t.Errorf("a run the caller owns but did NOT request came back with %d rows — "+
+			"`AND rv.target_run_id = ANY(@run_ids)` is gone, so this @lim-bounded read returns every "+
+			"run the caller has ever had and the LIMIT then cuts arbitrary rows, understating the "+
+			"badges of runs that ARE on the page", tl.rows)
 	}
 }
 
