@@ -208,7 +208,20 @@ func TestJudgeSettledMemberDTOTags(t *testing.T) {
 
 // An empty fan-out must marshal `settled` as [], never null: the client iterates it to build
 // its undo set, and a null would make "nothing was settled" an error case at every consumer
-// instead of an empty loop.
+// instead of an empty loop. Concretely, `undo: res.settled` → null → UndoToast reading
+// `toast.undo.length` → TypeError on any zero-updated dismiss.
+//
+// READ THIS BEFORE PRUNING EITHER TEST. What follows is a property of encoding/json, NOT of
+// the code that builds the response: it marshals a HAND-BUILT struct whose Settled is
+// already `[]JudgeSettledMemberDTO{}`, so it cannot fail for the reason its name gives
+// (PRD #98 review). Proven: making `settled` a nil slice in the service leaves this test
+// GREEN and reddens handler.TestBulkDispositionSettledEmptyWhenNothingMatched with
+// `{"settled":null}`.
+//
+// THE HANDLER TEST IS THE REAL GUARD. This one is kept as the documented statement of the
+// wire contract — the place a reader looks for what the field must encode as — and is
+// deliberately NOT the thing standing between the codebase and that TypeError. Do not delete
+// the handler test on the theory that the wire pin covers it; it is the other way round.
 func TestJudgeDispositionResultEmptySettledIsArray(t *testing.T) {
 	b, err := json.Marshal(JudgeDispositionResultDTO{Settled: []JudgeSettledMemberDTO{}})
 	if err != nil {
@@ -216,6 +229,15 @@ func TestJudgeDispositionResultEmptySettledIsArray(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"settled":[]`) {
 		t.Errorf("want an empty ARRAY for settled, got: %s", b)
+	}
+	// And the failure mode itself, so the CONTRAST is on the page rather than implied: a nil
+	// slice encodes as null, which is exactly what the service must never produce.
+	nilB, err := json.Marshal(JudgeDispositionResultDTO{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(nilB), `"settled":null`) {
+		t.Errorf("expected a NIL slice to encode as null (the state the service must avoid), got: %s", nilB)
 	}
 }
 

@@ -247,6 +247,60 @@ describe("Judge — a dismiss RE-RENDERS the row from the response, never a clie
     expect(within(toast).queryByText("Undo")).toBeNull();
   });
 
+  // N4's OTHER half: the concurrency bound. Both validators found it unasserted —
+  // `UNDO_CONCURRENCY = MAX_SAFE_INTEGER` left all 845 tests green — so the amplification
+  // argument (undo re-expanding, one request per member, the fan-out M2 deliberately
+  // collapsed into a single statement) was stated and not defended.
+  //
+  // Measuring peak in-flight is the only assertion that can see it: wrap the mock to count
+  // on entry and decrement on resolve, and never let the peak exceed the bound. 24 members
+  // against a bound of 6, so an unbounded implementation peaks at 24 and fails loudly.
+  it("never exceeds the undo concurrency bound", async () => {
+    const settled = Array.from({ length: 24 }, (_, i) => ({ run_id: `run-${i}`, rec_id: `rec-${i}` }));
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [group()],
+        triage: { total: 24, todo: 24, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 24,
+      settled,
+      groups: [group({ bucket: "done", open_count: 0 })],
+      truncated: false,
+      triage: { total: 24, todo: 0, filed: 0, done: 24, dismissed: 0, false_positives: 0 },
+    });
+
+    let inFlight = 0;
+    let peak = 0;
+    mockApi.deleteDisposition.mockImplementation(() => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // Resolve on a later microtask so overlapping calls are actually observable — an
+      // already-resolved promise would let each await unwind before the next begins and the
+      // peak would read 1 no matter what the code does.
+      return new Promise<null>((resolve) =>
+        setTimeout(() => {
+          inFlight -= 1;
+          resolve(null);
+        }, 0),
+      );
+    });
+
+    renderJudge();
+    await waitFor(() => expect(screen.getByText("api/internal/poller")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
+    const toast = await screen.findByRole("status");
+    fireEvent.click(within(toast).getByText("Undo"));
+
+    await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledTimes(settled.length));
+    expect(peak).toBeLessThanOrEqual(6);
+    // Control: with 24 members and a bound of 6 the work really was concurrent, so a peak of
+    // 1 would mean this measured a fully serial implementation and proves nothing about the
+    // bound.
+    expect(peak).toBeGreaterThan(1);
+  });
+
   // Partial failure is reported honestly (PRD #98 review N4). The previous Promise.all form
   // rejected on the FIRST failure with the rest still in flight, so the user was told
   // "Could not undo" while an unknown number of members HAD been reverted. Undo is

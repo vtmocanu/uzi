@@ -40,6 +40,13 @@ describe("coordKey (PRD #68/#94/#98)", () => {
   // members contain no space, so the split point is unambiguous however the arbitrary
   // `target` is spelled. Pinning the enum is therefore the real guard; asserting a
   // general non-collision would be asserting something false.
+  // NOTE WHICH SIDE THIS PINS: RECOMMENDATION_LABELS is the TS MIRROR of the category enum,
+  // not the database's own CHECK constraint (00059_run_reviews.sql). So a seventh DB category
+  // containing a space, added without updating this union, would slip past this test. That is
+  // a real gap and a small one: recommendationLabel already falls back to humanising an
+  // unknown category, so the display side degrades gracefully, and the server's CHECK is the
+  // thing that actually decides what categories exist. Recorded so a reader does not mistake
+  // this for a guarantee about the DB.
   it("keeps the categories space-free — the precondition the separator rests on", () => {
     for (const category of Object.keys(RECOMMENDATION_LABELS)) {
       expect(category).not.toMatch(/\s/);

@@ -484,3 +484,119 @@ func TestBulkDispositionRejectsBodyCoordinateLiveDB(t *testing.T) {
 		t.Fatalf("disposition rows = %v, want exactly the resolved install_worker_tool/rg coordinate", rows)
 	}
 }
+
+// ---- 5. the settled projection is a WORKING ADDRESS ---------------------------------
+
+// TestBulkDispositionSettledIsAWorkingUndoAddressLiveDB pins the one property of
+// `settled` that no fake can hold: that the (run_id, rec_id) pair it returns actually
+// RESOLVES — that the query put target_run_id in run_id and rr.id in rec_id, and not the
+// other way round.
+//
+// This test exists because swapping those two aliases in judge_bulk_disposition.sql and
+// regenerating leaves the ENTIRE Go suite green (measured, PRD #98 BLK-UNDO audit). Every
+// other `settled` test runs against bulkStore, whose rows are `RunID: uuid.New(), RecID:
+// uuid.New()` — a fake cannot observe which COLUMN landed in which FIELD, because it never
+// ran the query. The file header already made this argument for the owner predicate; it is
+// equally true of the projection.
+//
+// The production failure is a SILENT SUCCESS, which is why a no-op is not harmless here.
+// Undo would DELETE /api/runs/<recUUID>/review/recommendations/<runUUID>/disposition;
+// resolveOwnedRecommendation finds no run with that id; ErrRunNotFound becomes a 404; the
+// web client correctly swallows 404 as "already undone" (the right behaviour for its
+// intended case); `failed` stays 0; the honest-partial-failure reporter therefore says
+// nothing; load() refreshes — and the user is told the undo succeeded while nothing was
+// reverted. The direction is fail-safe (a no-op, never a wrong deletion), but the report is
+// a lie either way.
+//
+// So the assertion is end to end and on the DATABASE: settle a coordinate, feed the pair
+// STRAIGHT from res.Settled into the same DeleteDisposition the client calls, and require
+// the row to be gone. Nothing here is spelled by hand — a test that reconstructed the pair
+// from the fixture would pass under the swap exactly as the fakes do.
+func TestBulkDispositionSettledIsAWorkingUndoAddressLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	rg := [2]string{"install_worker_tool", "rg"}
+
+	userID := bulkFixture(ctx, t, pool, 2, rg)
+	_, got := doBulk(t, h, store.User{ID: userID},
+		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done"}`)
+	if got.Updated != 2 {
+		t.Fatalf("fixture: updated = %d, want 2 (one per run)", got.Updated)
+	}
+	if len(got.Settled) != got.Updated {
+		t.Fatalf("settled has %d entries for %d updated coordinates — they must describe the same set",
+			len(got.Settled), got.Updated)
+	}
+	if before := dispositionRowsFor(ctx, t, pool, userID); before["install_worker_tool/rg"] != "done" {
+		t.Fatalf("fixture: disposition did not land, rows = %v", before)
+	}
+
+	// Undo through EVERY returned address, exactly as the client does. Parsing is part of
+	// the contract: these ship as strings and the route parses them as uuids.
+	for i, m := range got.Settled {
+		runID, err := uuid.Parse(m.RunID)
+		if err != nil {
+			t.Fatalf("settled[%d].run_id %q does not parse as a uuid: %v", i, m.RunID, err)
+		}
+		recID, err := uuid.Parse(m.RecID)
+		if err != nil {
+			t.Fatalf("settled[%d].rec_id %q does not parse as a uuid: %v", i, m.RecID, err)
+		}
+		if err := h.wsvc.DeleteDisposition(ctx, userID, runID, recID); err != nil {
+			// The swapped-alias failure lands exactly here, as ErrRunNotFound → the 404 the
+			// client swallows.
+			t.Fatalf("settled[%d] (run=%s rec=%s) is not a resolvable undo address: %v — "+
+				"if this is ErrRunNotFound, the query's run_id/rec_id projection is swapped and "+
+				"every Undo is a silent no-op", i, m.RunID, m.RecID, err)
+		}
+	}
+
+	// Ground truth: the rows are gone. Scoped to this fixture's user, never table-wide —
+	// the LiveDB runner shares one database and sibling fixtures accumulate.
+	if after := dispositionRowsFor(ctx, t, pool, userID); len(after) != 0 {
+		t.Fatalf("after undoing every settled address, %d disposition row(s) remain: %v", len(after), after)
+	}
+}
+
+// The pair must address the coordinate the write TOUCHED, not merely some row of the
+// caller's. With two runs sharing a coordinate, undoing the first returned address must
+// clear exactly one review's disposition and leave the other standing — so a projection that
+// returned a constant, or the same run twice, fails here even though every id resolves.
+func TestBulkDispositionSettledAddressesAreDistinctPerRunLiveDB(t *testing.T) {
+	h, pool, _ := bulkDispositionLiveDB(t)
+	ctx := context.Background()
+	rg := [2]string{"install_worker_tool", "rg"}
+
+	userID := bulkFixture(ctx, t, pool, 2, rg)
+	_, got := doBulk(t, h, store.User{ID: userID},
+		`{"items":[{"category":"install_worker_tool","target":"rg"}],"status":"done"}`)
+	if len(got.Settled) != 2 {
+		t.Fatalf("settled = %d entries, want 2", len(got.Settled))
+	}
+	if got.Settled[0].RunID == got.Settled[1].RunID {
+		t.Fatalf("both settled addresses name the same run (%s) — the fan-out spans two runs",
+			got.Settled[0].RunID)
+	}
+	if got.Settled[0].RecID == got.Settled[1].RecID {
+		t.Fatalf("both settled addresses name the same recommendation (%s)", got.Settled[0].RecID)
+	}
+
+	runID := uuid.MustParse(got.Settled[0].RunID)
+	recID := uuid.MustParse(got.Settled[0].RecID)
+	if err := h.wsvc.DeleteDisposition(ctx, userID, runID, recID); err != nil {
+		t.Fatalf("undo of the first settled address failed: %v", err)
+	}
+
+	// One review's row cleared, the other untouched: count the rows directly, since
+	// dispositionRowsFor keys by coordinate and both reviews share one.
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM recommendation_dispositions d
+		   JOIN run_reviews rv ON rv.id = d.review_id
+		  WHERE rv.user_id = $1`, userID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("after undoing ONE of two settled addresses, %d disposition rows remain, want 1", n)
+	}
+}
