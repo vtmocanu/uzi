@@ -266,11 +266,25 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     // The three run ids DIFFER on purpose. With one shared id, folding every member's anchor
     // to the group's first row would satisfy a per-row assertion unchanged; distinct ids are
     // what make these three lines discriminate.
+    //
+    // Queried by SCOPED row rather than by index into `getAllByText`. The unscoped
+    // `getByText("· Open in Judge")` idiom the ungrouped test uses THROWS here (three
+    // matches), and the obvious repair — taking `[0]` — re-tests one row while reading as
+    // coverage of all three.
     const rowLink = (title: string) =>
       within(screen.getByText(title).closest("li")!).getByText("· Open in Judge").closest("a");
+    // Every member row carries one, so no row is silently link-less.
+    expect(screen.getAllByText("· Open in Judge")).toHaveLength(3);
     expect(rowLink("review one")?.getAttribute("href")).toBe("/judge?run=run-one");
     expect(rowLink("review two")?.getAttribute("href")).toBe("/judge?run=run-two");
     expect(rowLink("review three")?.getAttribute("href")).toBe("/judge?run=run-three");
+    // The distinctness property spelled out. It is strictly WEAKER than the three lines
+    // above (differing-but-wrong satisfies it, and they would already catch a constant), so
+    // it adds no discrimination — it is here to state the property those three lines depend
+    // on, so a later edit that collapses the fixture back to one shared run id has to walk
+    // past a line naming what that would destroy.
+    const hrefs = screen.getAllByText("· Open in Judge").map((el) => el.closest("a")?.getAttribute("href"));
+    expect(new Set(hrefs).size).toBe(3);
     // …and the HEADER deliberately carries NO anchor: it spans several runs, so anchoring it
     // to any one of them would misrepresent what was clicked. Header → `/judge` (todo bucket),
     // row → `/judge?run={id}` (all bucket): the two are different claims and this pins both.
