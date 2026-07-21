@@ -103,12 +103,12 @@ func AnthropicToken(ctx context.Context, q SecretStore, sealer VaultSealer, cfg 
 	// same shape 00077 backfills onto pre-existing rows, so a seeded deployment and
 	// an upgraded one are indistinguishable from here on (PRD #104 M1).
 	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
-		UserID:     user.ID,
-		Kind:       store.KindAnthropicToken,
-		Label:      store.LabelDefaultSecret,
-		IsDefault:  true,
-		Ciphertext: sealed,
-		SealedWith: store.SealedWithDEK,
+		UserID:      user.ID,
+		Kind:        store.KindAnthropicToken,
+		Label:       store.LabelDefaultSecret,
+		WantDefault: true,
+		Ciphertext:  sealed,
+		SealedWith:  store.SealedWithDEK,
 	}); err != nil {
 		return fmt.Errorf("seed anthropic token: store: %w", err)
 	}

@@ -4,13 +4,45 @@
 -- to match how it produced @ciphertext. Returns metadata only (never the
 -- ciphertext) so callers cannot accidentally serialize it.
 --
--- A plain INSERT since PRD #104 D10: the old form was an upsert keyed on
+-- An INSERT rather than an upsert since PRD #104 D10: the old form was keyed on
 -- ON CONFLICT (user_id, kind), which named the very unique index 00077 drops, and
 -- which encoded the retired assumption that a user has at most one secret per kind.
--- The caller must name a label and decide is_default; there is no implicit
--- "replace whatever was there".
+-- The caller names a label and there is no implicit "replace whatever was there".
+--
+-- @want_default IS A REQUEST, NOT A GUARANTEE — read this before calling, and note
+-- the parameter is deliberately not named is_default. A user's FIRST secret of a
+-- kind is forced to is_default regardless of what the caller asks for, because a
+-- first token that is not the default is INVISIBLE:
+-- the four existence gates (anthropic_rate_limits.sql's has_token and
+-- UserHasAnthropicToken, autopilot.sql's has_anthropic_token, and the seed's
+-- ListUserSecretsMeta) are EXISTS queries with no is_default filter, while every
+-- resolution path is by-kind AND is_default. Such a row makes the UI say "Set" and
+-- the gates green-light runs that then fail on credential-unavailable, with nothing
+-- logged as wrong.
+--
+--   @want_default | user has no row of this kind | user already has one
+--   --------------|------------------------------|----------------------
+--   false         | forced TRUE (bug prevented)  | stays false
+--   true          | TRUE                         | unique violation, loudly
+--
+-- So a caller can be silently overridden on exactly one case, and never on the case
+-- that matters to a multi-token surface: every non-first row is the caller's
+-- decision, which is all M2 needs to own set-default. Verified against Postgres 17
+-- with 00077's indexes in place.
+--
+-- This does NOT replace D12's transaction. It converts one silent failure into
+-- either the right answer or a loud one; serialising the set-default swap and the
+-- delete-default check is a different job, and still M2's.
 INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
-VALUES ($1, $2, $3, $4, $5, $6)
+VALUES (@user_id, @kind, @label,
+        -- Scoped to (user_id, kind), never to user_id alone: the partial unique
+        -- index this defends is per-(user_id, kind), and under D9's future
+        -- 'openai_token' kind a user-scoped test would create their first openai
+        -- token non-default merely because they hold an anthropic one — the exact
+        -- invisible-token bug, one kind over.
+        @want_default::boolean
+            OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind),
+        @ciphertext, @sealed_with)
 RETURNING id, kind, label, is_default, created_at, updated_at;
 
 -- name: RotateUserSecret :one
@@ -36,12 +68,28 @@ RETURNING id, kind, label, is_default, created_at, updated_at;
 -- user's default of this kind" whatever that row happens to be labelled. Only the
 -- value moves on conflict; an existing default keeps its label.
 --
--- Reachable failure, and it is the correct one: a user who already holds a
--- NON-default secret labelled 'default' plus a differently-labelled default (only
--- possible once M2 can create and re-point tokens) makes this INSERT collide with
--- the label index, which is not the arbiter, so it raises a unique violation rather
--- than silently rotating the wrong credential. Such a user is a multi-token user
--- and is expected to use the id-keyed routes.
+-- What does NOT happen, because it is the obvious guess and it is wrong: a user
+-- holding a non-default row labelled 'default' PLUS a differently-labelled default
+-- does not collide with the label index. Postgres resolves the arbiter first during
+-- speculative insertion, finds the conflict, takes DO UPDATE, and never inserts a
+-- tuple — so the label index is never consulted. Measured on Postgres 17 with
+-- 00077's indexes: with (console-key, is_default) + (default, not default), this
+-- statement returns label='console-key' carrying the new value and leaves the row
+-- labelled 'default' untouched. Correct under D14 — console-key IS the default.
+--
+-- What DOES raise is the mirror image: a row labelled 'default' exists and NOTHING
+-- is is_default. There is no arbiter conflict, so the insert proceeds into the
+-- label index and hits:
+--
+--   ERROR: duplicate key value violates unique constraint "user_secrets_user_kind_label_key"
+--
+-- which surfaces as a 500 from PutAnthropicToken. That is D12's "tokens exist with
+-- no default" state. It is UNREACHABLE in M1 — every create path forces the first
+-- token default and nothing can clear the flag — and becomes reachable the moment
+-- M2 ships set-default or delete-default. M2's FOR UPDATE transaction is what has
+-- to make it unreachable again; until then this comment is the warning. (A
+-- no-default user whose rows are all labelled something else is fine: the insert
+-- simply creates a new default labelled 'default'.)
 INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
 VALUES ($1, $2, 'default', true, $3, $4)
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE

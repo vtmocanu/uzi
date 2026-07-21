@@ -60,7 +60,7 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	}
 	mkSecret := func(user uuid.UUID, label string, isDefault bool) uuid.UUID {
 		row, serr := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
-			UserID: user, Kind: store.KindAnthropicToken, Label: label, IsDefault: isDefault,
+			UserID: user, Kind: store.KindAnthropicToken, Label: label, WantDefault: isDefault,
 			Ciphertext: []byte("ct-" + label), SealedWith: store.SealedWithMaster,
 		})
 		if serr != nil {

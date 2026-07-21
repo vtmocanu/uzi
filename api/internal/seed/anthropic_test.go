@@ -32,7 +32,7 @@ func (s *fakeSecretStore) ListUserSecretsMeta(context.Context, uuid.UUID) ([]sto
 }
 func (s *fakeSecretStore) InsertUserSecret(_ context.Context, arg store.InsertUserSecretParams) (store.InsertUserSecretRow, error) {
 	s.inserted = &arg
-	return store.InsertUserSecretRow{Kind: arg.Kind, Label: arg.Label, IsDefault: arg.IsDefault}, nil
+	return store.InsertUserSecretRow{Kind: arg.Kind, Label: arg.Label, IsDefault: arg.WantDefault}, nil
 }
 
 // fakeSealer stands in for the vault: it DEK-seals with a recognizable prefix so
@@ -95,7 +95,7 @@ func TestAnthropicTokenSeedsWhenAbsent(t *testing.T) {
 	if st.inserted.Label != store.LabelDefaultSecret {
 		t.Fatalf("seeded secret label = %q, want %q", st.inserted.Label, store.LabelDefaultSecret)
 	}
-	if !st.inserted.IsDefault {
+	if !st.inserted.WantDefault {
 		t.Fatal("the seeded token must be the user's default, else nothing resolves it")
 	}
 }

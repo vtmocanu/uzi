@@ -373,6 +373,21 @@ func TestLazyRewrapOnUnlock(t *testing.T) {
 // survive an unlock with their own original plaintext. Asserting on the plaintexts
 // (not just on distinct ciphertexts) is what makes the clobber unmissable — the
 // buggy path leaves two rows that both open, but to the SAME secret.
+//
+// If you are bisecting and landed on the commit that introduced this test: yes, it
+// stages a shape the live schema still forbids here. `UNIQUE (user_id, kind)` does
+// not drop until migration 00077 in the NEXT commit, so at this commit no database
+// would accept these two rows. That is deliberate and harmless — a fake store is a
+// model, and this one models the post-00077 world so the correctness fix can land
+// and be proven before the schema change that makes it reachable. The test that
+// runs against real SQL is TestUserSecretsRewrapLiveDB, which arrives with the
+// migration.
+//
+// This test is also NOT independently falsifiable: reverting the production fix
+// changes the generated types, so a pre-fix tree fails to COMPILE here rather than
+// going red. Its job is to prove vault.go threads the id through the real
+// rewrapMasterSecrets loop; the evidentiary weight for the bug itself belongs to
+// the live-DB test.
 func TestRewrapPreservesSiblingSecretsOfSameKind(t *testing.T) {
 	v, master, st := newTestVaultWithStore(t)
 	ctx := context.Background()
