@@ -307,7 +307,14 @@ const RATIONALE_PREVIEW_MAX = 280;
 function rationalePreview(s: string): string {
   const runes = Array.from(s);
   if (runes.length <= RATIONALE_PREVIEW_MAX) return s;
-  return runes.slice(0, RATIONALE_PREVIEW_MAX).join("").replace(/[\s]+$/, "") + "…";
+  // The character class is SPELLED OUT to match Go's TrimRight cutset " \t\r\n" exactly,
+  // and it is a SEPARATE divergence from the rune count above — switching to Array.from
+  // does nothing for it. JS `\s` is much wider than that cutset: it also matches U+00A0
+  // (NBSP), U+FEFF, U+2028, U+2029, U+000B, U+000C and the U+2000-U+200A run. Measured:
+  // with rune 280 padded to each of NBSP / U+FEFF / U+2028, the server KEEPS the character
+  // and `\s` stripped it, so the two previews differed by one rune with no cut-position
+  // disagreement at all. Pinned by fixtures/judge-fidelity, case preview-trim-boundary.
+  return runes.slice(0, RATIONALE_PREVIEW_MAX).join("").replace(/[ \t\r\n]+$/, "") + "…";
 }
 
 const BUCKET_RANK: Record<string, number> = { dismissed: 3, done: 2, filed: 1, todo: 0 };
