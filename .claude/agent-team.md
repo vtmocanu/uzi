@@ -131,6 +131,37 @@ decides where the next person spends their time. Re-derive those too.
   appears as `--- PASS`/`--- FAIL`, zero `--- SKIP`, `RUN > 0` — and treat any
   run failing that as INVALID rather than green. See `CLAUDE.md`'s api section
   for the operational form.
+  **The positive control catches TWO of the three false-green mechanisms, not
+  three, and the distinction is load-bearing.** It catches the skipped suite and
+  the run that never happened. It **cannot** catch a mutation that silently
+  failed to apply, and no property of the *run* can: the suite genuinely runs,
+  every assertion genuinely executes, the control passes cleanly, and the result
+  is green because the code under test was never mutated. Only comparing the
+  TREE sees that one — which is why "assert the mutation actually applied" is a
+  **separate** standing rule below and must stay one. A reader who believes the
+  control covers all three will drop the tree comparison as duplicated effort,
+  and that is the one of the three that has already produced a false green here.
+- **A fixture whose users or runs DELIBERATELY SHARE coordinate strings pins the
+  `review_id` join halves FOR FREE — and "tidying" it silently deletes that
+  coverage.** The pinning comes from the row-count guards (`rows != 2`,
+  `got N rows want 2`), not from any assertion written for it: with shared
+  coordinates, dropping a `review_id` half lets rows from *other* reviews attach,
+  and the count guard fires. Giving each user or run its own distinct coordinate
+  strings looks like tidying and removes the cross-match entirely. Three fixtures
+  on PRD #98 depend on this accident (the badge test, the fourth site's
+  coordinate test, and the cross-review coordinate in the big backlog test); two
+  carry a local do-not-tidy note, but **the property is the durable statement and
+  a local note on two of three is how the third gets tidied.**
+  **Cite the MECHANISM, never the tally.** At the fourth site, dropping either
+  `review_id` half reddens with *"userFT: got 5 rows, want exactly 2"* — and the
+  finding is that side rows from OTHER USERS' reviews attached, i.e. a
+  cross-TENANT match caught by a guard written for something else. The `5`
+  depends on what else the shared database holds; the cross-tenant attach does
+  not. Corroborated independently by `TestBulkDispositionFansOutAcrossRunsLiveDB`
+  failing with `triage = {Total:12}` against `want 6` — the #94 stats endpoint,
+  the `triage.todo` consumer, reading visibly inflated counts under the same
+  fold. Same reason assertion *counts* are not citable: a tally drifts exactly
+  like a line number.
 
 ## Citing and dispatching across a moving tree (CRITICAL)
 
@@ -158,6 +189,39 @@ tree the recipient is actively changing, so the instructor's read is the one tha
 goes stale, and the recipient is the only one positioned to notice. Agreement is
 when a claim gets checked least, and an instruction is agreement's most
 authoritative form.
+
+**1b. A MEASUREMENT'S SHELF LIFE IS SET BY WHAT IT MEASURED — and getting this
+wrong is what makes rule 1 too expensive to keep.**
+
+- A claim about a **COMMENT** expires on the next commit that touches that
+  comment, which on a branch doing comment corrections is roughly every commit.
+  One expired *within a single commit* on PRD #98. Re-read HEAD immediately
+  before sending.
+- A claim about a **QUERY'S BEHAVIOUR** expires only when the QUERY, the FIXTURE
+  or the ASSERTIONS change. `git diff <measured-sha>..HEAD -- <those paths>`
+  settles it in seconds, and a **comment-only diff means the result STANDS**.
+
+Worked example, both halves from one day: the auditor reported a comment gap at
+`c1fcdfce` that `a2b554a6` had already closed — genuinely stale. Its **fold**
+results from the same run still stood, because
+`git diff c1fcdfce..HEAD -- api/internal/store/recommendation_dispositions_integration_test.go`
+was comment-only: no SQL, no fixture row, no assertion changed.
+
+**The point of the entry is the cost.** Without the split, the honest response to
+"your tree was stale" is to re-run eleven folds that nothing invalidated — and a
+rule expensive enough to get abandoned protects nothing.
+
+**1c. WHEN AN INSTRUCTION SAYS "VERBATIM", IT BINDS THE CLAIM AND NOT THE
+EXAMPLES.** A claim generalises; an example is a measurement with a shelf life,
+and copying one forward unexamined is how a warning ends up illustrated by
+something that stopped being true. Evidence, and it is the sharpest instance on
+this branch because the sentence's own subject was claims outrunning execution:
+the lead relayed "ship the auditor's honest limit verbatim", and by the time it
+reached the coder **both of that limit's examples were false** — the two queries
+it named as declared-but-unfolded had since been folded. The author caught its
+own decay and supplied a past-tense rewrite. Ship the claim verbatim; restate the
+examples as **dated history** ("as of <date>, before X landed, …"), which cannot
+expire and reads as evidence rather than assertion.
 
 **2. A LINE NUMBER IS MEANINGLESS WITHOUT A SHA.** `grep -n` answers a question
 about a tree that may not survive the hour. `git show <sha>:<path>` is the only

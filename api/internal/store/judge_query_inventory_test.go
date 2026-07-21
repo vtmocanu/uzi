@@ -15,18 +15,36 @@ import (
 // ---------------------------------------------------------------------------------------
 // THE JUDGE-FAMILY QUERY INVENTORY (PRD #98).
 //
-// WHAT THIS PROVES, AND ITS HONEST LIMIT — read this before trusting a green from it:
+// WHAT THIS TEST CANNOT DO, stated here because a passing test is the most credible
+// artifact there is and this one is easy to over-read. It cannot prove a query is WELL
+// pinned. It proves only that someone has DECLARED where a query is pinned. What it
+// catches is "nobody has thought about this query at all" — an absence, which is the
+// thing attention is worst at — and nothing more.
 //
-//	IT PROVES ONLY THAT SOMEONE HAS DECLARED WHERE A QUERY IS PINNED, NOT THAT THE PIN IS
-//	GOOD.
+// The evidence that a declaration can be green while the pin is worthless is this PRD's
+// own history, and both instances were caught by FOLDING, never by a declaration:
+// ListJudgeTriageRowsForRuns would have declared PINNED while no fold had ever been run
+// against its test, and ListJudgeTriageRowsForUser would have declared PINNED while all
+// four of its coordinate halves were individually inert — dropping any one of them left
+// the entire live-DB suite green, measured four times. Both are now genuinely pinned.
+// Neither was fixed by this mechanism, and neither would have been.
 //
-// That sentence is the whole boundary and it is deliberately at the top, because a passing
-// test is the most credible artifact in this repo and this one is the best-disguised proxy
-// yet built here. Nothing below executes a query, folds a predicate, or measures isolation.
-// A row naming a test that merely *touches* the query is as green as a row naming a test
-// that reddens when the query is mutated, and this file cannot tell them apart. The
-// mutation folds recorded in prds/98-judge-menu.md are what tell them apart; this is the
-// index of where to look, not the evidence.
+// (The suite tally from that measurement — 126 pass / 0 fail — is deliberately bound to
+// the tree it ran on, 2026-07-21 morning, and is not repeated as a live figure: it is 129
+// at this commit. A tally drifts exactly like a line number, so the mechanism is the claim
+// and the number is not.)
+//
+// Everything above is past tense on purpose. The auditor's original wording made those two
+// claims in the PRESENT — and both stopped being true within the day, inside the very
+// sentence warning against claims outrunning what was executed. Do not reintroduce a
+// present-tense claim about any query's pin quality here; it will be stale by the review
+// wave. The durable half is "declared, not good" and "an absence, and nothing more".
+//
+// Concretely, in this file's own terms: nothing below executes a query, folds a predicate,
+// or measures isolation, so a row naming a test that merely *touches* the query is as green
+// as a row naming a test that reddens when the query is mutated. The mutation folds recorded
+// in prds/98-judge-menu.md are what tell those apart; this is the index of where to look,
+// not the evidence.
 //
 // WHAT IT DOES CATCH — the one thing an index can catch, and the reason it is worth having:
 // a query that ARRIVES (or is renamed) with nobody having thought about coverage. That case
@@ -48,27 +66,38 @@ import (
 //
 // WHY DECLARED AND NOT INFERRED. A prototype that infers pinning by scanning Test*LiveDB
 // function bodies for the query name was measured against this same tree, and it is wrong in
-// BOTH directions on the 17 queries here — which is why the table below is hand-written:
+// BOTH directions on the 17 queries here — three distinct mechanisms, which is why the table
+// below is hand-written:
 //
-//  1. FALSE NEGATIVE, indirection. ListOwnedRecommendationsForCoords and
-//     UpsertDispositionsForResolvedCoords appear in NO test source at all. They are reached
-//     only through workersvc from a handler test, so an inferring rule reports them as
-//     uncovered when they are among the most heavily exercised queries in the family. That
-//     is the mechanism behind the 48 repo-wide queries the prototype classified as
-//     "named in tests but no LiveDB caller".
-//  2. FALSE NEGATIVE, helper indirection — a SECOND and distinct mechanism.
+//  1. FALSE NEGATIVE, cross-package indirection. ListOwnedRecommendationsForCoords and
+//     UpsertDispositionsForResolvedCoords appear in NO test source at all. The handler's
+//     LiveDB tests drive them through workersvc, so the query name never occurs in this
+//     package's test source, and an inferring rule reports them as uncovered when they are
+//     among the most heavily exercised queries in the family. That is the mechanism behind
+//     the 48 repo-wide queries the prototype classified as "named in tests but no LiveDB
+//     caller".
+//  2. FALSE NEGATIVE, helper hiding — same package, same file, and a distinct mechanism.
 //     ListDispositionsForReview is called at recommendation_dispositions_integration_test.go
 //     :262, inside the package-level helper listDispositions (declared :260), which
-//     TestRecommendationDispositionsLiveDB calls at :225. The call is in the file but not in
-//     any test function's body, so a body scan misses it and a whole-file scan would instead
-//     credit every test in the file.
-//  3. FALSE POSITIVE. CreateJudgeRun's first inferred pinner is
+//     TestRecommendationDispositionsLiveDB calls at :225. The prototype slices source between
+//     each test function's start and end offsets, so a call in a package-level helper is
+//     outside every slice it looks at. A whole-file scan would instead credit every test in
+//     the file. (Found while writing this table; verified at HEAD by the auditor, who had not
+//     seen it — it is the cheapest of the three to check, because it lives in one file.)
+//  3. FALSE POSITIVE — the opposite direction. CreateJudgeRun's first inferred pinner is
 //     TestClaimRunDockerRepoAllowlistLiveDB, which uses it as fixture setup for an unrelated
-//     property. The name appearing in a body says nothing about what is asserted.
+//     property. A real call and a useless pin: the name appearing in a body says nothing
+//     about what is asserted.
 //
 // An inferring rule therefore gets argued down on the day it lands, and its verdicts have to
 // be overridden by hand anyway — at which point the hand-written table is the mechanism and
 // the inference is decoration.
+//
+// DO NOT "FIX" THE INFERENCE BY RESOLVING HELPERS TRANSITIVELY. It is the obvious response to
+// (2) and it is a trap: every increment of cleverness buys a new class of false positive, and
+// none of it touches (3) at all, which is a judgement about whether a pin is MEANINGFUL and
+// is not recoverable from the call graph. The declaration table works precisely because it
+// stops trying to infer.
 //
 // This test needs no database and must NOT be named *LiveDB: it is static analysis, so it
 // runs in the ordinary `go test ./...` gate where an arriving query is actually noticed.
