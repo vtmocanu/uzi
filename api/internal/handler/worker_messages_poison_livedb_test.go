@@ -450,3 +450,96 @@ func TestWorkerMessagesOversizedBatchIsADifferentClassLiveDB(t *testing.T) {
 			rec.Code)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The 400 arm itself (PRD #108 M2b). No live database: after sanitation the
+// known triggers no longer reach Postgres, so the only honest way to exercise
+// this arm is to inject the rejection the classifier is built to recognise.
+// ---------------------------------------------------------------------------
+
+// unstorableStore fails every insert with a fixed error. It overrides exactly the
+// two methods AppendMessages reaches before that error, so anything else it is
+// asked for panics rather than quietly returning a zero value.
+type unstorableStore struct {
+	workersvc.Store
+	insertErr error
+}
+
+func (u *unstorableStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
+	return store.Run{}, nil
+}
+
+func (u *unstorableStore) InsertRunMessage(context.Context, store.InsertRunMessageParams) (int64, error) {
+	return 0, u.insertErr
+}
+
+func postToFakeStore(t *testing.T, insertErr error) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{wsvc: workersvc.New(&unstorableStore{insertErr: insertErr}, newHandlerTestBox(t), workersvc.Params{})}
+	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages",
+		strings.NewReader(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"t":"clean"}}]}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", uuid.New().String())
+	ctx := context.WithValue(mw.ContextWithWorker(req.Context(), store.Worker{ID: uuid.New(), UserID: uuid.New()}), chi.RouteCtxKey, rctx)
+	rec := httptest.NewRecorder()
+	h.WorkerRunMessages(rec, req.WithContext(ctx))
+	return rec
+}
+
+// THE load-bearing fix. 500 means "try again", and the batcher believes it: a
+// permanent failure answered 500 is what turned one poisoned payload into a
+// 27-minute wedge. Each of the three enumerated SQLSTATEs must reach 400.
+func TestWorkerMessagesUnstorableStoreErrorReturns400(t *testing.T) {
+	for _, code := range []string{"22P05", "22P02", "22021"} {
+		rec := postToFakeStore(t, &pgconn.PgError{Code: code, Message: "boom"})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("SQLSTATE %s: status = %d, want 400 — the worker reads 5xx as retryable and "+
+				"will re-post this identical batch forever", code, rec.Code)
+		}
+	}
+}
+
+// The mirror-image bug, and the worse one: a transient failure answered 400 fails
+// a healthy run that would have succeeded on the next attempt. These must all
+// stay on the retry path.
+func TestWorkerMessagesTransientStoreErrorStays500(t *testing.T) {
+	for _, code := range []string{"08006", "53300", "40P01", "57014", "23503", "22003"} {
+		rec := postToFakeStore(t, &pgconn.PgError{Code: code, Message: "boom"})
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("SQLSTATE %s: status = %d, want 500 — classifying a retryable failure as permanent "+
+				"kills healthy runs, which is strictly worse than the bug being fixed", code, rec.Code)
+		}
+	}
+	// A non-Postgres error — context.Canceled from a worker that hung up mid-batch
+	// is the realistic one — has no SQLSTATE to consult and must never be permanent.
+	if rec := postToFakeStore(t, errors.New("context canceled")); rec.Code != http.StatusInternalServerError {
+		t.Errorf("a non-Postgres store error: status = %d, want 500", rec.Code)
+	}
+}
+
+// A MEASURED residual, pinned so it is visible in the suite rather than only in a
+// report. jsonb stores numbers as `numeric`, so a literal past numeric's exponent
+// range (measured: 1e1000000, SQLSTATE 22003 "value overflows numeric format")
+// is permanently unstorable, survives every class the sanitizer strips, and is
+// NOT in the enumerated 400 set — so it still answers 500 and a worker still
+// retries it forever.
+//
+// That is a deliberate scope decision, not an oversight: 22003 also covers
+// genuinely re-shapeable failures, and the PRD enumerates exactly three codes.
+// This test asserts TODAY'S behaviour so that changing it is a decision someone
+// makes, with this test's failure as the prompt — and so the residual cannot be
+// mistaken for "the class is closed".
+func TestWorkerMessagesNumericOverflowIsAResidual500LiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"n":1e1000000}}]}`)
+
+	rec := f.post(t, body)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("a jsonb numeric overflow: status = %d, want 500 — if this is now 400, the enumerated "+
+			"SQLSTATE set was widened past the PRD's three (22P05/22P02/22021) and this residual is "+
+			"closed; delete this test and say so in the PRD. %s", rec.Code, f.diagnose(t, body))
+	}
+	if n := f.lastSeq(t); n != 0 {
+		t.Errorf("runs.last_seq = %d after a rejected batch, want 0", n)
+	}
+}

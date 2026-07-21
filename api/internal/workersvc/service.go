@@ -65,6 +65,17 @@ var (
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
 	ErrInvalidMessage   = errors.New("invalid run message")
+	// ErrUnstorableMessage is a batch the DATABASE refused for a reason that can
+	// never succeed on retry (PRD #108 M2) → 400, joining ErrInvalidMessage.
+	//
+	// The status code is the retry contract, and this is the load-bearing half of
+	// the fix. A permanent failure returned as 500 is what converted one bad
+	// payload into a 27-minute, 239-message wedge: the worker's batcher treats any
+	// throw as retryable and re-posts the identical batch at ~2 Hz. With this,
+	// incomplete sanitation degrades to "that batch is rejected and the run fails
+	// with a clear reason" instead of "the run wedges silently" — which is why the
+	// PRD is not titled "strip NUL bytes".
+	ErrUnstorableMessage = errors.New("run message cannot be stored")
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
@@ -1049,7 +1060,19 @@ type IncomingMessage struct {
 // AppendMessages persists a worker's batched messages (idempotent on
 // (run_id, seq)) and advances the run's last_seq high-water mark. The worker
 // must own the run.
+//
+// Every store error it returns passes through classifyStoreError, so a rejection
+// that can never succeed on retry surfaces as ErrUnstorableMessage (→ 400) rather
+// than as a bare error the handler answers 500 to. That wrapper sits on the
+// OUTERMOST return rather than on each call site on purpose: the payload is not
+// the only unstorable sink on this path — foldRunUsage inserts a model name taken
+// from the same worker-controlled payload — and a future sink added inside here
+// is classified without anyone remembering to.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
+	return classifyStoreError(s.appendMessages(ctx, wkr, runID, msgs))
+}
+
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return err
@@ -1058,16 +1081,40 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// message rejects the batch with nothing written (all-or-nothing), so a
 	// [valid, valid, invalid] batch never leaves the first two half-persisted.
 	//
-	// The same pass CAPS the two PRD #99 attribution fields. It writes through the
-	// index (not a range copy) on purpose, so the capped value is what the insert,
-	// the WS broadcast and the usage fold all see — otherwise the stored row and
-	// the live frame would disagree.
+	// The same pass CAPS the two PRD #99 attribution fields and SANITIZES the four
+	// worker-controlled sinks (PRD #108 M2). It writes through the index (not a
+	// range copy) on purpose, so the capped and sanitized values are what the
+	// insert, the WS broadcast and the usage fold all see — otherwise the stored
+	// row and the live frame would disagree, and the fold would still be reading
+	// the unstorable bytes.
 	var maxSeq int32
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
+		// Strictly AFTER the json.Valid check: the scanner presumes well-formed
+		// JSON, and today's invalid-JSON→400 arm must keep answering first.
+		var c stripCounts
+		m.Payload, c = sanitizePayloadJSON(m.Payload)
+		var nAgent, nInstance, nLabel int
+		m.Agent, nAgent = stripNUL(m.Agent)
+		m.AgentInstance, nInstance = stripNUL(m.AgentInstance)
+		m.AgentLabel, nLabel = stripNUL(m.AgentLabel)
+		c.textNUL = nAgent + nInstance + nLabel
+		if c.any() {
+			// PRD #108 Risk 3: sanitation that hides a real bug is its own defect —
+			// a future NUL-emitting tool would never be investigated. Logged per
+			// message, at the granularity needed to find the emitter.
+			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
+				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,
+				"payload_nul_dropped", c.payloadNUL,
+				"payload_unpaired_surrogates_replaced", c.payloadSurrogate,
+				"payload_invalid_utf8_replaced", c.payloadBadUTF8,
+				"text_column_nul_dropped", c.textNUL)
+		}
+		// Strip BEFORE truncating, so the rune cap is counted over the NUL-free
+		// string the row will actually hold.
 		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
 		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
 		if m.Seq > maxSeq {

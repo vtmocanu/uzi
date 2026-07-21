@@ -341,6 +341,18 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
+		case errors.Is(err, workersvc.ErrUnstorableMessage):
+			// PRD #108 M2: the database refused this batch for a reason that can
+			// never succeed on retry. 400 IS the fix — the status code is the retry
+			// contract, and answering 500 here is what turned one poisoned payload
+			// into a 27-minute, 239-message wedge (the batcher treats any throw as
+			// retryable and re-posts the identical batch at ~2 Hz). Logged at WARN,
+			// not ERROR: after sanitation this should be unreachable, so each one is
+			// a real signal about a byte pattern nothing strips yet — but it is a
+			// client fault, and a 4xx does not page anyone.
+			slog.Warn("worker run messages: permanently unstorable batch rejected",
+				"run_id", runID.String(), "worker_id", wkr.ID.String(), "error", err)
+			httpx.Error(w, http.StatusBadRequest, "a message in this batch cannot be stored and will never succeed; do not retry it unchanged")
 		default:
 			slog.Error("worker run messages", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
