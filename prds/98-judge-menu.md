@@ -696,13 +696,68 @@ exactly as #68 already does.
       ladder; Decision 7); `RunListItem` type + the one-grammar per-row badge.
       Independent of the endpoints (own join) — starts immediately. (The strip
       *removal* is M3's, so the aggregate is never homeless.)
-- [ ] **M5 — Notification retarget + inbox grouping (web + api)**: `reviewDeepLink`
+- [x] **M5 — Notification retarget + inbox grouping (web + api)** — DONE: `reviewDeepLink`
       → `/judge?run=` (one-liner); the inbox link retarget as a
-      **`kind==='judge_review'` guard** (not a one-liner — `Notifications.tsx:59`
-      links `/runs/${run_id}` for any kind, Decision 4); web inbox grouping of
+      **`kind==='judge_review'` guard** (not a one-liner — `Notifications.tsx` linked
+      `/runs/${run_id}` for any kind, Decision 4); web inbox grouping of
       consecutive judge rows (Decision 5). **No Slack digest** — Slack DMs keep their
       one-per-review cadence, only the link changes. **Depends on M3** (deep-links
       `/judge` + its `?run=` filter) — Phase 3, not Phase 1.
+      **What landed, and the reasoning that is not visible from the diff:**
+      - The link lives in ONE pure function, `notificationLink(kind, runID)` in
+        `web/src/lib/notifications.ts`, so the guard is unit-testable away from a render.
+        **The gate is the NON-judge case**, and the test enumerates five kinds rather than
+        one: the judge row lands on `/judge` under both the correct guard and the
+        unconditional URL change, so a test that checks only the judge row passes under
+        exactly the bug the guard exists for. A single non-judge case would also be
+        satisfied by a guard spelt `kind !== 'run_failed'`.
+      - **The API side is a plain URL change and that asymmetry is deliberate**, recorded at
+        `reviewDeepLink` itself: it is called from exactly one place, the judge review
+        notification, so it is judge-only by construction. The web surface renders EVERY
+        kind, which is what makes the same edit a guard there. `reviewDeepLink` had **no
+        test at all** before this; it has one now, covering the anchor, the trailing-slash
+        base and the empty base (no link rather than a broken one).
+      - **The third `triage.todo` consumer reads the value, it does not poll for it.**
+        `JudgeTodoContext` gained a READ side (`JudgeTodoValueContext` / `useJudgeTodo`).
+        Polling `/me/judge/stats` from the inbox is a defensible reading of "read the
+        canonical count" and it is wrong for the BLK-BADGE reason: a shared SOURCE without
+        shared PROPAGATION is exactly the configuration in which the nav badge read 3 while
+        the tab read 0. The value is `number | null`; `null` (no provider) renders **no
+        number**, because a displayed 0 is the claim "nothing left to triage" and a
+        provider-less component has not been told that.
+      - **Grouping is a pure partition** (`groupNotifications`), asserted as such: every row
+        appears exactly once, in order, so read-state, ids and offset paging are untouched.
+        A run of ONE stays a plain row. An unparseable timestamp **breaks** the run — `NaN >
+        window` is false, so the arithmetic alone would fold an unknown-age row in silently.
+      - **Demo fixture: one non-judge row added to `data.ts`, placed BETWEEN two judge rows.**
+        It renders all three inbox states at once (an ungrouped judge row with its `/judge`
+        link, a non-judge row with its `/runs` link, and a grouped pair). Before it, demo
+        mode showed only the group — and the grouping is precisely what would have hidden
+        the retarget from anyone looking at the demo.
+      - **`mockApi.notifications.test.ts` was rewritten to DERIVE from the fixture.** Adding
+        that one demo row turned five of its six tests red, none for a reason about mockApi:
+        they had snapshotted the fixture's ids and counts. The property is the mock's
+        semantics (own-scoping, newest-first, offset paging, unread bookkeeping); the
+        fixture's shape never was, and pinning it made `data.ts` unable to gain a row.
+      - **Two existing tests changed meaning and were moved off `judge_review`**: the inbox's
+        "renders a run deep link" case and its paging case. The first had become a test of
+        the judge path wearing the generic path's name; the second was asserting on 30
+        rows that now collapse into one header, so it was measuring the grouping instead of
+        the paging.
+      - **`navBadgeText()`'s selector had to be anchored** (`/^Judge/`): the group header
+        carries its own "Open Judge" link, so the old substring match found two links and
+        threw. Same shape as the repo's `role="status"` ambiguity trap, in a new place.
+      **Negative controls, each RED then restored green:** (1) header renders `items.length`
+      instead of the canonical count → 3 of the together-mount tests fail; (2) the
+      notification holds a frozen copy (the own-poll shape) → the post-dispose agreement test
+      fails while the other two pass, which is what proves that assertion is load-bearing
+      rather than riding its neighbours; (3) `notificationLink` written as the unconditional
+      `/judge?run=` URL change → the non-judge gate fails in both the lib and the page suite,
+      and **no judge-row assertion moves**.
+      **Also corrected in the same commit:** `specs/ai.md` said the recommendation free text
+      "stays on the run page behind the deep link" — true until this milestone moved the
+      link. And `judge_notify_test.go` asserted the old `/runs/` URL; it was found by the
+      suite, not by a grep for `reviewDeepLink`, because it pins the literal string.
 - [x] **M6 — Filed→Done sync (api/poller) — the migration** — DONE `d6a8545c`
       (migration `00075`, draft number — renumber on the landing rebase); review wave
       dispatched.: add `set_via` on

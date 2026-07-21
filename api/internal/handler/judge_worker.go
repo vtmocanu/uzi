@@ -311,16 +311,25 @@ func recommendationCategories(recs []workersvc.ReviewRecommendation) []string {
 	return cats
 }
 
-// reviewDeepLink builds the run-page deep link from the operator-set public base URL
+// reviewDeepLink builds the Slack DM's deep link from the operator-set public base URL
 // and the target run UUID. Both are server-controlled; no LLM text is ever
 // interpolated. An empty base (unset, or the settings lookup failed) yields "" so the
 // notification simply carries no link.
+//
+// It points at the Judge workbench anchored to this run (PRD #98 M5, Decision 4), not at
+// the run page. The DM's CADENCE is deliberately unchanged — one per review, un-batched,
+// no Slack digest (Decision 5, user-decided); only the destination moves.
+//
+// This function is judge-only by construction — it is called from exactly one place, the
+// judge review notification — which is why it is a plain URL change here and a
+// kind-conditional guard in the web inbox (see web/src/lib/notifications.ts, where the
+// same link is computed for a surface that renders EVERY kind).
 func reviewDeepLink(baseURL string, targetID uuid.UUID) string {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		return ""
 	}
-	return baseURL + "/runs/" + targetID.String()
+	return baseURL + "/judge?run=" + targetID.String()
 }
 
 // validateAndScrubReview is the review ingest gate (Decision 5, audit C1/L4): reject a

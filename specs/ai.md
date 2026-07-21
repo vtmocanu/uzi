@@ -5572,7 +5572,10 @@ with the review/audit findings folded in.
   given; the *producer* is responsible for scrubbing. The judge producer (`buildReviewNotification`,
   `api/internal/handler/judge_worker.go`) ships the verdict + a re-scrubbed 280-rune-capped summary preview + the
   recommendation count and category list — recommendation `target`/`rationale` free text is **never** copied into the
-  notification; it stays on the run page behind the deep link (implementation note 4). Slack delivery of the same
+  notification; it stays behind the deep link (implementation note 4). **Corrected 2026-07-21 (PRD #98 M5): that link
+  is `/judge?run={target}`, not `/runs/{target}`** — the free text now lives behind the Judge workbench anchored to the
+  run, in both the in-app inbox and the Slack DM. The *cadence* is unchanged (one DM per review, no digest); only the
+  destination moved, and the payload is byte-for-byte what it was. Slack delivery of the same
   payload is a **real notifier extension**, not a new string: the notifier was structurally run-state-only
   (`stateEvent{runID,status}` → `GetSlackRunContext` → "run on repo#iid"), so a new event variant + render path was
   required (↳review N6). Every judge free-text field passes `EscapeMrkdwn` + `ScrubSecrets` on the Slack leg too;

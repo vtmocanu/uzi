@@ -16,7 +16,7 @@ import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
-import { JudgeTodoContext } from "./JudgeTodoContext";
+import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
 import {
   ActivityIcon,
   BellIcon,
@@ -643,7 +643,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
               any page. Self-gates — renders nothing while unlocked. */}
           <VaultLockedBanner />
-          <JudgeTodoContext.Provider value={setJudgeTodo}>{children}</JudgeTodoContext.Provider>
+          {/* Both halves of the one canonical to-triage number (PRD #98). The setter is
+              how the Judge page keeps it fresh after a dispose; the value is how the judge
+              notification in the inbox reads the SAME number the nav badge above is
+              rendering, rather than polling for its own copy. */}
+          <JudgeTodoContext.Provider value={setJudgeTodo}>
+            <JudgeTodoValueContext.Provider value={judgeTodo}>{children}</JudgeTodoValueContext.Provider>
+          </JudgeTodoContext.Provider>
         </div>
       </main>
     </div>

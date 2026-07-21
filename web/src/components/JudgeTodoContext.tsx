@@ -25,3 +25,26 @@ export const JudgeTodoContext = createContext<(todo: number) => void>(() => {});
 export function useSetJudgeTodo(): (todo: number) => void {
   return useContext(JudgeTodoContext);
 }
+
+// The READ side of the same channel (PRD #98 M5). The judge notification is the THIRD
+// consumer of `triage.todo`, after the nav badge and the Judge page's To-triage tab, and
+// the PRD's success criterion is that all three show the same number.
+//
+// It reads the value AppShell already holds rather than issuing its own /me/judge/stats
+// call, and the difference is not a saved round-trip — it is the BLK-BADGE lesson applied
+// before it can recur. Two components reading the same endpoint at different moments are a
+// shared SOURCE without shared PROPAGATION, which is exactly the configuration that let the
+// nav badge read 3 while the tab read 0: a dispose updates the number in memory and nothing
+// re-fires a poll keyed on the pathname. One in-memory value, published by the same setter
+// the Judge page already calls, makes agreement structural instead of coincidental.
+//
+// NULL means "no provider" — rendered outside an AppShell, which every notification unit
+// test that is not the together-mount does. Callers must render nothing rather than
+// substitute 0: a displayed 0 is the claim "you have nothing to triage", and this component
+// has not been told that. A default of 0 would make the together-mount test the only thing
+// standing between a provider-less render and a confidently wrong inbox-zero.
+export const JudgeTodoValueContext = createContext<number | null>(null);
+
+export function useJudgeTodo(): number | null {
+  return useContext(JudgeTodoValueContext);
+}

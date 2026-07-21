@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter } from "react-router-dom";
 import { AppShell } from "../components/AppShell";
 import { Judge } from "./Judge";
+import { Notifications } from "./Notifications";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -33,6 +34,9 @@ vi.mock("../lib/api", () => ({
     unreadNotificationCount: vi.fn().mockResolvedValue({ count: 0 }),
     getJudgeStats: vi.fn(),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
+    // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
+    listNotifications: vi.fn(),
+    markNotificationRead: vi.fn(),
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     version: vi.fn().mockResolvedValue({ version: "9.9.9-test" }),
   },
@@ -86,7 +90,37 @@ beforeEach(() => {
     truncated: false,
     triage: triage(3),
   });
+  mockApi.listNotifications.mockResolvedValue({
+    notifications: judgePings(),
+    unread: 2,
+    total: 2,
+  });
 });
+
+// Two consecutive judge pings, so the inbox renders the GROUP header — which is where the
+// canonical to-triage number appears (Decision 5). A single ping renders no header and the
+// third consumer would not be on screen at all.
+const judgePings = () =>
+  [
+    {
+      id: "ntf-1",
+      kind: "judge_review",
+      payload: { title: "Run review ready", body: "" },
+      run_id: "run-1",
+      review_id: "rev-1",
+      read_at: null,
+      created_at: "2026-07-20T12:00:00Z",
+    },
+    {
+      id: "ntf-2",
+      kind: "judge_review",
+      payload: { title: "Run review ready", body: "" },
+      run_id: "run-2",
+      review_id: "rev-2",
+      read_at: null,
+      created_at: "2026-07-20T11:59:00Z",
+    },
+  ] as unknown as Awaited<ReturnType<typeof api.listNotifications>>["notifications"];
 
 afterEach(() => {
   cleanup();
@@ -105,7 +139,11 @@ function renderJudgeInShell() {
 }
 
 function navBadgeText() {
-  return screen.getByRole("link", { name: /Judge/ }).textContent ?? "";
+  // ANCHORED. `/Judge/` was unambiguous until the inbox joined the render: the judge
+  // notification group header carries its own "Open Judge" link, so a substring match finds
+  // two links and throws. This is the repo's role-selector-ambiguity trap in a new place —
+  // the fix is a selector that can only mean the nav item, not a narrower render.
+  return screen.getByRole("link", { name: /^Judge/ }).textContent ?? "";
 }
 
 function tabText() {
@@ -208,6 +246,86 @@ describe("Judge nav badge vs the To-triage tab (PRD #98 review BLK-BADGE)", () =
 
     await waitFor(() => expect(tabText()).toContain("5"));
     await waitFor(() => expect(navBadgeText()).toContain("5"));
+  });
+});
+
+// ---- the THIRD consumer (PRD #98 M5) --------------------------------------------------
+
+// The PRD's success criterion is that the nav badge, the Judge page's To-triage tab and the
+// judge NOTIFICATION show the same number. Two of the three were already proven to agree
+// above; this mounts all three at once, which is the only configuration in which the
+// property is observable — mounted apart they have always all been correct, and that is
+// exactly how the badge/tab drift survived a whole milestone before BLK-BADGE found it.
+//
+// Rendering Judge and Notifications as siblings is deliberately NOT a real route. It is the
+// assertion vehicle: three consumers, one shell, one number. A router-faithful version would
+// unmount one page to reach the other and could never compare them.
+//
+// WHAT MAKES THIS DISCRIMINATING: `getJudgeStats` is mocked to return 3 FOREVER. So an
+// implementation where the notification polls the canonical endpoint for its own copy —
+// which is a defensible-looking reading of "read the canonical count" — renders 3 after a
+// dispose that took the real number to 0, and this test fails. Sharing the SOURCE is not
+// enough; the number has to share the PROPAGATION channel too. That is BLK-BADGE's finding,
+// applied to the third consumer before it could reproduce it.
+describe("nav badge vs To-triage tab vs the judge notification (PRD #98 M5)", () => {
+  function renderAllThree() {
+    return render(
+      <MemoryRouter initialEntries={["/judge"]}>
+        <AppShell>
+          <Judge />
+          <Notifications />
+        </AppShell>
+      </MemoryRouter>,
+    );
+  }
+
+  function notificationTodoText() {
+    return screen.getByText(/to triage/).textContent ?? "";
+  }
+
+  it("all three agree on first load", async () => {
+    renderAllThree();
+    await waitFor(() => expect(navBadgeText()).toContain("3"));
+    expect(tabText()).toContain("3");
+    await waitFor(() => expect(notificationTodoText()).toContain("3"));
+  });
+
+  it("all three still agree after a disposition drops the count to zero", async () => {
+    mockApi.bulkSetJudgeDisposition.mockResolvedValue({
+      updated: 3,
+      settled: [
+        { run_id: "run-1", rec_id: "rec-1" },
+        { run_id: "run-2", rec_id: "rec-2" },
+        { run_id: "run-3", rec_id: "rec-3" },
+      ],
+      groups: [{ ...group(), bucket: "done" as const, open_count: 0 }],
+      truncated: false,
+      triage: triage(0),
+    });
+
+    renderAllThree();
+    await waitFor(() => expect(notificationTodoText()).toContain("3"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Mark done/ }));
+
+    await waitFor(() => expect(tabText()).toContain("0"));
+    await waitFor(() => expect(navBadgeText()).not.toContain("3"));
+    // The notification is the assertion this file was extended for. It renders 0 rather
+    // than dropping the number, because "nothing left to triage" is the inbox-zero the
+    // Judge page treats as a first-class state (Decision 8), not an absence.
+    await waitFor(() => expect(notificationTodoText()).toContain("0"));
+    expect(notificationTodoText()).not.toContain("3");
+    // ...and it never polled for its own copy — the count came down the context.
+    expect(mockApi.getJudgeStats).toHaveBeenCalledTimes(1);
+  });
+
+  it("the notification shows the canonical count, not a tally of the pings it is grouping", async () => {
+    // The group holds 2 pings while the canonical to-triage count is 3. An implementation
+    // that labelled its own group size "to triage" would render 2 and this fails — the same
+    // proxy-for-property substitution the "seen in N runs" rule forbids on the Judge page.
+    renderAllThree();
+    await waitFor(() => expect(screen.getByText("2 reviews ready")).toBeTruthy());
+    expect(notificationTodoText()).toContain("3");
   });
 });
 

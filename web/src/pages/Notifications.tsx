@@ -13,9 +13,12 @@ import { Alert, Badge, Button, cx, EmptyState, ListSkeleton, PageHeader } from "
 import { BellIcon } from "../components/icons";
 import {
   emitNotificationsChanged,
+  groupNotifications,
   notificationBody,
+  notificationLink,
   notificationTitle,
 } from "../lib/notifications";
+import { useJudgeTodo } from "../components/JudgeTodoContext";
 
 // PAGE_SIZE matches the API's default page; Load-more fetches the next page.
 const PAGE_SIZE = 30;
@@ -32,6 +35,7 @@ function NotificationRow({
   onMarkRead: (id: string) => void;
 }) {
   const unread = !n.read_at;
+  const link = notificationLink(n.kind, n.run_id);
   return (
     <li
       className={cx(
@@ -55,9 +59,12 @@ function NotificationRow({
           <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             {n.owner && <span>{n.owner.display_name ?? n.owner.email}</span>}
             <span>{new Date(n.created_at).toLocaleString()}</span>
-            {n.run_id && (
-              <Link to={`/runs/${n.run_id}`} className="font-medium text-brand hover:text-brand-hover">
-                · Open run
+            {/* Kind-conditional (PRD #98 M5, Decision 4) — see notificationLink for why
+                this is a guard and not a URL edit. A judge ping opens the cross-run
+                workbench anchored to its run; every other kind still opens the run. */}
+            {link && (
+              <Link to={link} className="font-medium text-brand hover:text-brand-hover">
+                {n.kind === "judge_review" ? "· Open in Judge" : "· Open run"}
               </Link>
             )}
           </p>
@@ -74,6 +81,62 @@ function NotificationRow({
           )}
         </div>
       </div>
+    </li>
+  );
+}
+
+// JudgeGroupRow collapses a run of consecutive judge pings into one expandable header
+// (PRD #98 M5, Decision 5). Render-only: the member rows are the same <NotificationRow>s,
+// with the same ids and the same per-row Mark read — nothing about read-state or paging
+// changes, and expanding shows exactly what the ungrouped inbox showed.
+//
+// The header carries the ONE canonical to-triage number, read from AppShell's value rather
+// than counted from these rows. Counting them would be a different quantity wearing the same
+// label: this group holds N *pings*, some of whose recommendations are already triaged, and
+// the whole point of the single canonical number is that the nav badge, the Judge page's
+// To-triage tab and this header cannot disagree. `null` (no provider) renders no number at
+// all rather than a 0 nobody supplied.
+function JudgeGroupRow({
+  items,
+  canMarkRead,
+  onMarkRead,
+}: {
+  items: Notification[];
+  canMarkRead: (n: Notification) => boolean;
+  onMarkRead: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const judgeTodo = useJudgeTodo();
+  const unreadCount = items.filter((n) => !n.read_at).length;
+  return (
+    <li className="rounded-lg border border-edge bg-raised/40">
+      <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+        >
+          {unreadCount > 0 && (
+            <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand" />
+          )}
+          <span className="truncate text-sm font-medium text-fg">{items.length} reviews ready</span>
+          {unreadCount > 0 && <Badge tone="brand">{unreadCount} unread</Badge>}
+        </button>
+        <div className="flex shrink-0 items-center gap-2 text-xs text-faint">
+          {judgeTodo !== null && <span>{judgeTodo} to triage</span>}
+          <Link to="/judge" className="font-medium text-brand hover:text-brand-hover">
+            Open Judge
+          </Link>
+        </div>
+      </div>
+      {open && (
+        <ul className="space-y-2 px-3 pb-3">
+          {items.map((n) => (
+            <NotificationRow key={n.id} n={n} canMarkRead={canMarkRead(n)} onMarkRead={onMarkRead} />
+          ))}
+        </ul>
+      )}
     </li>
   );
 }
@@ -205,9 +268,23 @@ export function Notifications() {
           ) : (
             <>
               <ul className="space-y-2">
-                {items.map((n) => (
-                  <NotificationRow key={n.id} n={n} canMarkRead={canMark(n)} onMarkRead={markRead} />
-                ))}
+                {groupNotifications(items).map((g) =>
+                  g.kind === "judge_group" ? (
+                    <JudgeGroupRow
+                      key={`judge-group-${g.items[0].id}`}
+                      items={g.items}
+                      canMarkRead={canMark}
+                      onMarkRead={markRead}
+                    />
+                  ) : (
+                    <NotificationRow
+                      key={g.item.id}
+                      n={g.item}
+                      canMarkRead={canMark(g.item)}
+                      onMarkRead={markRead}
+                    />
+                  ),
+                )}
               </ul>
               {items.length < total && (
                 <div className="flex justify-center pt-1">

@@ -210,6 +210,24 @@ export const mockNotifications: MockNotification[] = [
     owner_display_name: mockAdmin.display_name,
   },
   {
+    // A NON-judge row (PRD #98 M5). It is here so demo mode renders every state the inbox
+    // now has: this row deep-links to /runs/{id} while its judge neighbours deep-link to
+    // /judge?run={id}, and by sitting BETWEEN ntf-1 and ntf-2 it also breaks the judge run
+    // — leaving one ungrouped judge row above it and a grouped pair below. Without it the
+    // demo showed exactly one of the three states, and the grouping is what would have
+    // hidden the retarget from anyone looking.
+    id: "ntf-mr",
+    user_id: mockAdmin.id,
+    kind: "mr_merged",
+    payload: { title: "Merge request merged", body: "!42 — add rg to the worker image" },
+    run_id: "run-done",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(20),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
     id: "ntf-2",
     user_id: mockAdmin.id,
     kind: "judge_review",
