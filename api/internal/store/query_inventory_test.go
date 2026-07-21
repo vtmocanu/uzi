@@ -187,6 +187,19 @@ import (
 //	5. an EXERCISED-UNASSERTED row with a blank reason    -> "with no reason"
 //	6. declaredGap narrowed back to unpinnedPin only      -> "is not a test function"
 //	7. a covered file's whole `-- name:` spelling breaks  -> "yielded 0 query names"
+//	8. `../handler` dropped from inventoryPackages        -> "is not a test function" on the
+//	   SIX truthful pins whose tests live there (4 in cli_tokens.sql, 2 in
+//	   judge_bulk_disposition.sql), each carrying the extend-the-package remedy
+//
+// Control 8 is the one that proves the package scan spans BOTH entries, and it needs its two
+// halves stated together or it proves less than it looks: the GREEN half is the ordinary
+// baseline (those six rows pass with `../handler` present), the RED half is dropping the entry
+// and watching the SAME six rows fail. Both on one tree. Note what would NOT have worked — a
+// bogus pin naming a nonexistent test in `../handler`, which is control 2: that goes red with
+// or without the second entry, because a name absent from a scanned package and a name in an
+// unscanned one are indistinguishable to this check. A control has to fire against the body
+// you are asking about; the same trap the M4 fold table records for byte-identical query
+// bodies, in a different costume.
 //
 // Control 6 is the one worth understanding rather than counting: it proves the third sentinel
 // is WIRED, not merely declared. Without it, a declaredGap that had silently dropped
@@ -249,10 +262,27 @@ var inventoryQueryFiles = []string{
 // parsed for the declared test function names. A pin living outside these fails with a
 // message saying so rather than silently passing.
 //
-// NOT widened alongside inventoryQueryFiles, and that is checked rather than assumed: every
-// pin below lives in internal/store or internal/handler. The store-layer queries reached only
-// through middleware (cli_tokens.sql) are still pinned by handler tests, because those drive
-// the REAL router — middleware included — rather than calling handlers directly.
+// NOT widened alongside inventoryQueryFiles, and that is MEASURED rather than assumed. At
+// `041c5291`, `rg -l 'func Test.*LiveDB\(' internal/ cmd/ | xargs -n1 dirname | sort -u`
+// returns exactly two directories — internal/store (27 files) and internal/handler (9) — so
+// there is no live-DB test anywhere else for a pin to name. Re-run that command rather than
+// trusting this sentence; it is the whole justification for the list being two entries long.
+//
+// 🔴 THE DAY THAT STOPS BEING TRUE, EXTEND THIS LIST — DO NOT WRITE A SENTINEL ROW. A live-DB
+// test landing in internal/poller, internal/forgesvc, internal/workersvc or cmd/uzi makes a
+// TRUTHFUL pin fail the existence check below, and the cheapest way out is to record the query
+// as a declared gap, which is a lie that reads as an audit — the exact failure this file
+// exists to prevent. The failure message names this remedy FIRST for that reason.
+//
+// The reason this list was NOT pre-extended: the check that would prove an extension works is
+// "a truthful pin naming a real test in the newly-covered package goes green", and with no
+// live-DB test in any other package there is no truthful pin to write. Extending now would
+// mean inventing a row to justify the extension — the same failure, arrived at from the
+// opposite direction. Add the package when the row that needs it exists, in that commit.
+//
+// The store-layer queries reached only through middleware (cli_tokens.sql) are pinned by
+// handler tests, because those drive the REAL router — middleware included — rather than
+// calling handlers directly. That is why widening to cli_tokens.sql needed no new package.
 var inventoryPackages = []string{".", "../handler"}
 
 // queryInventory is the declaration. Every row was verified by opening the call site named in
@@ -544,8 +574,17 @@ func TestQueryInventoryIsDeclared(t *testing.T) {
 			continue
 		}
 		if _, ok := funcs[p.pin]; !ok {
-			t.Errorf("%s/%s is pinned to %q, which is not a test function in %v. It was renamed or "+
-				"deleted; re-point the row, or set it to UNPINNED with the reason.",
+			// Remedy ORDER is deliberate. The obvious escape from this failure is to relabel the
+			// row as a declared gap, and that is the one wrong answer: a truthful pin whose test
+			// simply lives in a package this scan does not read would be recorded as uncovered,
+			// which is a lie that reads as an audit. So the message offers the two honest fixes
+			// first and the sentinel last, with the condition on it.
+			t.Errorf("%s/%s is pinned to %q, which is not a test function in %v.\n"+
+				"  1. If that test EXISTS but lives elsewhere, add its package to inventoryPackages "+
+				"— do NOT downgrade a real pin to a sentinel to make this pass.\n"+
+				"  2. If it was renamed, re-point the row.\n"+
+				"  3. Only if NO test exercises the query, use UNPINNED (or EXERCISED-UNASSERTED if "+
+				"something runs it without asserting) with the reason.",
 				p.file, p.query, p.pin, inventoryPackages)
 		}
 	}
