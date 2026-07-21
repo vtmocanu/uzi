@@ -311,26 +311,44 @@ seals it with the same key before it reaches Postgres, so a DB dump alone
 never yields a plaintext secret, and rotating the key invalidates every
 stored secret across every feature at once, not just one.
 
-The API around it is deliberately minimal: `PUT /api/me/secrets/anthropic_token`
-writes or rotates the caller's own secret, `DELETE` on the same path removes
-it, and `GET /api/me/secrets` (and every other read) returns **metadata
-only** (`kind`, `created_at`, `updated_at`); there is no reveal endpoint, and
-no admin path to another user's secret value. See
-[docs/anthropic-token.md](docs/anthropic-token.md) for the user-facing flow.
+The API around it is deliberately minimal, and **every read is metadata only**:
+`GET /api/me/secrets` returns `id`, `kind`, `label`, `is_default` and
+timestamps, never a value. There is no reveal endpoint and no admin path to
+another user's secret value.
+
+Since PRD #104 a user may hold **several named credentials of one kind**, so
+the write surface is id-keyed: `POST /api/me/secrets/anthropic_token` creates
+a named token, `PATCH …/{id}` renames, re-defaults or replaces one value, and
+`DELETE …/{id}` removes one. The original kind-path routes survive as
+deprecated compatibility aliases over the caller's *default* token (`PUT`
+rotates-or-creates it; `DELETE` removes it, and 409s once more than one token
+exists, because the path no longer names a single row). Exactly one token per
+`(user, kind)` is the default — a partial unique index plus a per-user
+advisory lock around every mutation, since no index can enforce "at least
+one". Workers and the judge lane may each *bind* a token, resolved per claim
+so a rebind lands on the next claim with no restart; the binding is a
+composite FK on `(user_id, id)`, which makes cross-user binding
+unspellable rather than merely rejected. Every write path stays cookie-only:
+a Bearer-reachable mint would let a stolen CLI token replace a user's
+credentials. See [docs/anthropic-token.md](docs/anthropic-token.md) for the
+user-facing flow and `prds/104-named-anthropic-tokens.md` for the rationale.
 
 ## Claude rate-limit visibility (PRD #53)
 
 A background engine (`api/internal/usagepoller`, cloned from the same
 `Boot`+`Run`+ticker shape as the self-improvement engine) ticks on
-`UZI_USAGE_POLL_INTERVAL` and, for each user holding an Anthropic token it
-can currently open, asks Anthropic for that account's 5-hour/7-day
+`UZI_USAGE_POLL_INTERVAL` and, for each Anthropic token it can currently
+open, asks Anthropic for that account's 5-hour/7-day
 rate-limit windows — Anthropic's free usage endpoint first, falling back to
 a 1-token header probe only when the endpoint refuses the credential — and
-upserts one gauge row per user (`anthropic_rate_limits`, no history, D4).
+upserts one gauge row per **token** (`anthropic_rate_limits`, keyed on
+`user_secret_id` since PRD #104, no history, D4). Per token rather than per
+user because that is the unit Anthropic actually caps: two credentials are
+two independent budgets, and one merged bar would describe neither.
 Two read endpoints (`GET /api/me/rate-limits`, self-scoped; `GET
-/api/admin/rate-limits`, every user) serve the same frozen DTO, and the SPA
-renders it as meters in three places: a Settings card, a sidebar
-micro-meter, and an Admin → Rate limits table. See
+/api/admin/rate-limits`, every user) serve the same frozen DTO — an array of
+per-token readings — and the SPA renders them as meters in three places: a
+Settings card, a sidebar micro-meter, and an Admin → Rate limits table. See
 [prds/53-rate-limits.md](prds/53-rate-limits.md) (especially its Design
 Decisions) for the full rationale, including the vault-locked staleness
 rule and the failure/backoff semantics; user-facing behavior is in
@@ -391,7 +409,13 @@ construction and could otherwise forge its own rate-limit key. See
 above) throughout: it decrypts a user's Anthropic token and forge bot PAT and
 hands both to the worker **only inside a run's claim response**
 (`POST /api/worker/runs/claim`) — never persisted server-side in plaintext,
-never logged (the same redaction discipline as the forge integration).
+never logged (the same redaction discipline as the forge integration). *Which*
+Anthropic credential is resolved per claim in one place
+(`workersvc.claimSecretID`): a `self_improve` run follows the owner's
+judge-lane binding, any other run-lane claim follows the claiming worker's
+binding, and the chat lane always resolves the owner's default. Because the
+token rides the claim rather than the worker, re-pointing a worker is
+complete server-side — no restart, no re-minted join token.
 
 ### Run lifecycle
 

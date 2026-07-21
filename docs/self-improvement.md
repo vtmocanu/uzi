@@ -26,7 +26,14 @@ Open **Admin → Instance settings → Self-improvement**:
 ## Whose token, and what "standing" means
 
 The job runs on **the enabling admin's own Anthropic token** — not a shared
-instance token. This is a **standing consent**, not a one-time spend: while
+instance token. If that admin holds several named tokens, the job follows the
+**judge-lane** token (**Settings → Run judge → Token the judge spends**), not
+the binding of whichever worker picks the run up: self-improvement is uzi
+reviewing and improving itself, so it bills alongside the retrospectives
+rather than alongside your product work. Left unset, it is your default token.
+See [Anthropic tokens](./anthropic-token.md).
+
+This is a **standing consent**, not a one-time spend: while
 that admin stays logged in (so their vault stays unlocked), the job runs
 unattended on its schedule and produces autonomous code changes, cycle after
 cycle, until disabled. If the admin's vault is locked at tick time, that cycle

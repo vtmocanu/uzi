@@ -78,7 +78,8 @@ uzi run follow-up <id> [--message <text>]
 uzi run inputs <id> [--json]
 uzi review show <id> | resolve <id> <rec> | dismiss <id> <rec> --reason wont-do|not-an-issue
 uzi review undo <id> <rec> | stats [--json]
-uzi worker list | rm <id>
+uzi token list
+uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
 uzi skill status | install [--force] | install-hook | uninstall-hook
@@ -92,6 +93,9 @@ A few worth knowing:
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
+- **`token` is list-only, and `worker set-token` is the one write near it.**
+  See [Anthropic tokens](#anthropic-tokens) below for why the split falls
+  exactly there.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in
@@ -161,6 +165,45 @@ token owner's *own* tally, but the read-only ceiling still holds for writes:
 **own** runs, though, a `uza_` token can triage same as any owner — the
 ceiling blocks reaching into someone else's review, not every write
 everywhere.
+
+## Anthropic tokens
+
+You can hold several named [Anthropic credentials](./anthropic-token.md) and
+point individual workers at them. The CLI can **read** that set and **move a
+worker between its members** — it cannot change the set itself:
+
+```sh
+uzi token list                                 # labels, default flag, timestamps
+uzi worker set-token <worker-id> console-key   # bind a worker to a named token
+uzi worker set-token <worker-id> --default     # clear the binding
+```
+
+`set-token` takes a **label** (the name from `token list`), not an id, and
+takes effect on that worker's next claim — no restart and no re-minted join
+token. Passing both a label and `--default`, or neither, is a usage error
+(exit 2) rather than a guess; an unknown label is refused rather than stored.
+A bound worker's **chat** runs still spend your default token: the binding
+covers the run lane only.
+
+**Adding, renaming, re-defaulting and deleting a token are web-only, and
+that is a security boundary rather than an unfinished feature.** A CLI token
+is a bearer credential — a stolen `uzc_` is meant to be able to read and to
+drive runs, but never to *replace the credentials it runs on*. If token
+writes were reachable over Bearer auth, an attacker holding a leaked `uzc_`
+could swap a user's Anthropic credential for their own and quietly redirect
+every future run's spend. That is exactly the escalation the split prevents,
+and it is the same reasoning that keeps `worker create` out of the CLI.
+`set-token` sits on the allowed side because it mints nothing and hands back
+no credential: it re-points a worker between tokens the caller already owns.
+
+**Driving the API directly?** The old kind-path routes still work as
+deprecated aliases over your *default* token: `PUT
+/api/me/secrets/anthropic_token` rotates-or-creates it, and `DELETE
+/api/me/secrets/anthropic_token` removes it. The DELETE alias now answers
+**409** once you hold more than one token, because "delete the anthropic
+token" stopped naming one row — delete by id instead
+(`DELETE /api/me/secrets/anthropic_token/{id}`). All of these are cookie-only,
+for the reason above.
 
 ## Agents: `--json` and exit codes
 

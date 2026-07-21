@@ -18,7 +18,12 @@ In uzi, open **Settings → Workers** and register a worker (give it a name, e.g
 
 ## 2. Anthropic credential
 
-The worker runs agents against your own Anthropic credential, which must already be saved in uzi: see [Anthropic token](./anthropic-token.md). It's decrypted server-side and handed to the worker only inside a run's claim response, never stored on the worker beyond that run.
+The worker runs agents against your own Anthropic credential, which must already be saved in uzi: see [Anthropic tokens](./anthropic-token.md). It's decrypted server-side and handed to the worker only inside a run's claim response, never stored on the worker beyond that run.
+
+**Which credential, if you have several.** By default a worker spends your default token. To point it at a different one, use the picker on its row in **Settings → Workers**, or `uzi worker set-token <worker-id> <label>`. Because the token rides each claim rather than the worker, a rebind takes effect on that worker's **next claim** — no restart, no re-issued join token, nothing to change in your `.env`. Two caveats worth knowing before you rely on it:
+
+- A bound worker's **chat** runs still spend your *default* token; the binding covers the run lane (issue, autopilot, and CI-fix runs).
+- Deleting the token a worker is bound to does not break the worker: it silently falls back to your default from the next claim.
 
 ## 3. Run the worker
 
@@ -170,9 +175,12 @@ Raising the cap is an informed trade-off, not a free speedup:
   requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 1)
   alongside any cap above 1 so an innocent sibling isn't failed outright by another
   run's crash.
-- **One Anthropic token, N runs.** Every slot shares your Anthropic token, so a
-  higher cap multiplies 429 pressure on it — the SDK's own retry/backoff is the
-  only mitigation today.
+- **One Anthropic token, N runs.** Every slot on a worker shares that worker's
+  credential, so a higher cap multiplies 429 pressure on it — the SDK's own
+  retry/backoff is the only mitigation today. Binding two *workers* to two
+  different tokens does split the pressure between them; binding cannot split
+  it *within* one worker, and uzi never fails a throttled run over to another
+  credential on its own.
 - **Same-repo runs still serialize.** Two concurrent runs against the same repo
   queue behind each other at the git layer — correct, just not actually parallel.
 

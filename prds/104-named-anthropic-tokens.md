@@ -171,6 +171,30 @@ would have to survive requeue-to-another-worker, which conflicts with the
 worker-affinity rule in `runs.worker_id` (`AffinityCutoff` in the claim queries).
 
 **D2 — An explicit `is_default` flag, not "oldest wins".**
+
+> **`user_secrets_one_default_key` is a security-relevant control, not just a
+> data-integrity nicety.** Recorded after M2, because what leans on it changed.
+> It was introduced here as "at most one default" — a schema property. It is now
+> also the thing standing between the **unlocked** compat alias
+> (`UpsertDefaultUserSecret`, D14) and a two-default state. Two distinct
+> mechanisms keep that alias safe, and only one of them is the index:
+>
+> - **The index rejects the only shape that could ADD a default.** The alias
+>   always inserts `is_default = true` with an `ON CONFLICT … WHERE is_default`
+>   arbiter, so the sole path to a second default is the arbiter missing the
+>   existing one — which the partial unique index refuses before commit.
+> - **The statement shape means it can never SUBTRACT one.** The alias writes
+>   `is_default = false` nowhere. *Verified 2026-07-21:* `ClearDefaultUserSecret`
+>   is the only query in the schema that writes `false`, and it runs under the
+>   D12 advisory lock. **No index enforces this half** — it is a property of the
+>   SQL text alone.
+>
+> Consequences: any future change to this index, to the alias's arbiter, or one
+> that gives the alias any `is_default = false` path must be treated as touching
+> a control. The last of those would break the second half **without the index
+> noticing**, and `TestAliasVsLockedMutationsInvariantLiveDB` would only catch it
+> in the narrow case where the user ends at zero tokens with a default
+> outstanding.
 Exactly one row per `(user_id, kind)` carries `is_default = true`, enforced by a
 partial unique index. The existing token migrates to `label = 'default'`,
 `is_default = true`. Rationale: "oldest wins" changes silently when you delete a

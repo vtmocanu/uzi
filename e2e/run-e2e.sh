@@ -3652,4 +3652,122 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+# ---------------------------------------------------------------------------
+# PRD #104: a worker's token binding reaches the CLAIM PAYLOAD, and a rebind takes
+# effect on the very next claim with no restart.
+#
+# This is the one assertion no lower layer can make. The unit and live-DB tests prove
+# the resolver picks the right secret id; what they cannot show is that the id turns
+# into the right *plaintext* on the wire, through the real router, the real vault, and
+# the real worker-Bearer auth — which is the whole product claim ("worker alpha spends
+# console-key").
+#
+# It runs LAST and drives the claim endpoint with curl instead of the agent container,
+# for two reasons that are not laziness:
+#   - the claim payload is the only place the token is legible, and the agent
+#     deliberately never writes it anywhere (the secret-hygiene phase above asserts
+#     exactly that), so a container-side observation is impossible BY DESIGN;
+#   - both claims must come from ONE worker with nothing restarted in between, which
+#     is the property under test. A second container would test two workers instead.
+# The live agent is stopped first: it shares the admin's queue and would otherwise
+# claim these runs itself. Nothing follows this phase, so the stop is free.
+say "PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim"
+login
+"${COMPOSE[@]}" stop agent >/dev/null 2>&1 || true
+
+# A SECOND credential with a DISTINCT value — distinct is the whole test: the two
+# claims below are told apart by which plaintext came back, so equal values would
+# make both assertions pass vacuously.
+DUMMY_ANTHROPIC_2="sk-ant-e2e-dummy-second-do-not-use-111111"
+[ "$DUMMY_ANTHROPIC_2" != "$DUMMY_ANTHROPIC" ] || fail "the two e2e token fixtures must differ or the binding assertions are vacuous"
+apipost /api/me/secrets/anthropic_token \
+  "{\"token\":\"$DUMMY_ANTHROPIC_2\",\"label\":\"console-key\"}" >/dev/null \
+  || fail "could not create the second named Anthropic token"
+apiget /api/me/secrets \
+  | jq -e '[.secrets[] | select(.kind == "anthropic_token")]
+           | length == 2 and ([.[] | select(.is_default)] | length == 1)' >/dev/null \
+  || fail "expected exactly two anthropic tokens with exactly one default after the create"
+pass "the admin now holds two named tokens, exactly one of them default"
+
+# A fresh worker, minted but never containerized. It authenticates with its join
+# token like any worker; the api cannot tell the difference, which is the point.
+BINDW="$(apipost /api/workers '{"name":"e2e-binding-worker"}')"
+BINDW_ID="$(printf '%s' "$BINDW" | jq -r '.worker.id')"
+BINDW_TOKEN="$(printf '%s' "$BINDW" | jq -r '.token')"
+{ [ -n "$BINDW_ID" ] && [ "$BINDW_ID" != null ] && [ -n "$BINDW_TOKEN" ] && [ "$BINDW_TOKEN" != null ]; } \
+  || fail "could not mint the binding-test worker"
+
+# claim_token — POST a claim as the binding-test worker and print ONLY the delivered
+# Anthropic plaintext. The payload carries a decrypted credential, so it is never
+# echoed, never logged, and never written to disk: the value crosses into a shell
+# variable and is compared there. A 204 (idle) yields an empty body and an empty
+# result, which the callers below fail on explicitly rather than silently matching "".
+claim_token() {
+  curl -fsS -X POST "$BASE/api/worker/runs/claim" -H "Authorization: Bearer $BINDW_TOKEN" \
+    | jq -r '.anthropic_oauth_token // empty'
+}
+# queue_run DESC — an issue + a run for it, ready to be claimed. Prints the run id.
+queue_run() {
+  local iid
+  iid="$(apipost "/api/repos/$REPO_ID/issues" \
+    "{\"title\":\"E2E binding $1\",\"description\":\"implements prds/104-named-anthropic-tokens.md\"}" \
+    | jq -r '.card.iid')"
+  # A `local x="$(...)"` assignment swallows the substitution's exit status, so check
+  # the value rather than trusting set -e to have aborted.
+  case "$iid" in ''|null) echo "queue_run: could not create the '$1' issue" >&2; return 1 ;; esac
+  create_run "$REPO_ID" "$iid"
+}
+
+# (a) UNBOUND → the owner's default token.
+RUN_B1="$(queue_run unbound)" || fail "binding phase: could not queue the unbound-claim run"
+GOT1="$(claim_token)"
+[ -n "$GOT1" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B1 — the assertion would be vacuous"
+[ "$GOT1" = "$DUMMY_ANTHROPIC" ] \
+  || fail "an UNBOUND worker's claim did not carry the default token (it carried some other credential)"
+pass "unbound worker: the claim payload carries the owner's DEFAULT token"
+
+# (b) REBIND, with nothing restarted. The worker is not a container here, so there is
+# nothing to restart even in principle — which is exactly the property being asserted:
+# the credential rides the claim, not the worker, so a server-side rebind is complete.
+apipatch "/api/workers/$BINDW_ID" '{"anthropic_token":"console-key"}' \
+  | jq -e '.worker.anthropic_secret_label == "console-key"' >/dev/null \
+  || fail "PATCH /api/workers/{id} did not report the worker bound to console-key"
+RUN_B2="$(queue_run bound)" || fail "binding phase: could not queue the bound-claim run"
+GOT2="$(claim_token)"
+[ -n "$GOT2" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B2 — the assertion would be vacuous"
+[ "$GOT2" != "$GOT1" ] || fail "the claim payload did NOT change after the rebind — the binding never reached the claim"
+[ "$GOT2" = "$DUMMY_ANTHROPIC_2" ] \
+  || fail "a worker bound to 'console-key' did not receive that token's value"
+pass "after the rebind the very next claim carries 'console-key' instead — no restart, no re-minted join token"
+
+# (c) CLEAR → back to the default. The three-way field (absent / null / label) is what
+# makes this expressible at all; null is the only spelling of "use my default again".
+apipatch "/api/workers/$BINDW_ID" '{"anthropic_token":null}' \
+  | jq -e '.worker.anthropic_secret_label == null' >/dev/null \
+  || fail "PATCH with a null anthropic_token did not clear the worker's binding"
+RUN_B3="$(queue_run cleared)" || fail "binding phase: could not queue the cleared-claim run"
+GOT3="$(claim_token)"
+[ -n "$GOT3" ] || fail "the binding-test worker claimed nothing (204) for run $RUN_B3 — the assertion would be vacuous"
+[ "$GOT3" = "$DUMMY_ANTHROPIC" ] \
+  || fail "clearing the binding did not return the worker to the owner's default token"
+pass "clearing the binding (anthropic_token: null) returns the next claim to the default token"
+
+# (d) D5, live: deleting a bound token unbinds its workers instead of failing them.
+# The composite FK's ON DELETE SET NULL is what does this, and getting the Postgres 15
+# column-list syntax wrong would have nulled workers.user_id instead — so assert BOTH
+# halves: the binding is gone AND the worker still belongs to its owner.
+apipatch "/api/workers/$BINDW_ID" '{"anthropic_token":"console-key"}' >/dev/null \
+  || fail "could not re-bind the worker before the delete-unbinds assertion"
+CONSOLE_ID="$(apiget /api/me/secrets | jq -r '.secrets[] | select(.label == "console-key") | .id')"
+[ -n "$CONSOLE_ID" ] || fail "could not resolve the console-key token id"
+curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/anthropic_token/$CONSOLE_ID" \
+  -H "X-CSRF-Token: $(csrf)" >/dev/null || fail "deleting the bound token failed"
+apiget /api/workers \
+  | jq -e --arg id "$BINDW_ID" '.workers[] | select(.id == $id)
+      | .anthropic_secret_id == null and .anthropic_secret_label == null' >/dev/null \
+  || fail "deleting a bound token did not unbind its worker (D5)"
+[ "$(db_psql "SELECT user_id IS NOT NULL FROM workers WHERE id = '$BINDW_ID'")" = t ] \
+  || fail "deleting a bound token nulled workers.user_id — the composite FK's SET NULL is missing its column list"
+pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user_id intact"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
