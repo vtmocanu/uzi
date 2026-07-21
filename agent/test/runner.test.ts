@@ -14,7 +14,6 @@ import { GitCache } from "../src/git.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { encodeCwd } from "../src/sdk-session.js";
 import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
@@ -1174,11 +1173,11 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     });
   }
 
-  /** Plant a transcript where the CLI would look for it: the project dir the run's
-   *  own clone path encodes to. Planting it anywhere else is invisible to the CLI, and
-   *  the preflight is scoped to match — see sdk-session.ts. */
-  function plantTranscript(runHome: string, iid: number, sessionId: string): void {
-    const dir = path.join(runHome, ".claude", "projects", encodeCwd(worktreeDirFor(iid)));
+  /** Plant a transcript under this run's HOME. The preflight globs the HOME's project
+   *  dirs (sdk-session.ts), so the exact dir name does not matter — a per-run HOME holds
+   *  only this run's own, so any project dir stands in for it. */
+  function plantTranscript(runHome: string, sessionId: string): void {
+    const dir = path.join(runHome, ".claude", "projects", "-data-runner-repo-issue-x");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
@@ -1209,7 +1208,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     const seen: RunContext[] = [];
     const claim = gitlabClaim(71, { session_id: SID });
     try {
-      plantTranscript(path.join(homeRoot, claim.run_id), 71, SID);
+      plantTranscript(path.join(homeRoot, claim.run_id), SID);
       await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
       assert.strictEqual(seen[0]?.sessionId, SID, "a resolvable session must still resume");
       const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
@@ -1262,7 +1261,7 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       // remembers its own work and needs no warning.
       const kept: RunContext[] = [];
       const keptClaim = gitlabClaim(73, { session_id: SID });
-      plantTranscript(path.join(homeRoot, keptClaim.run_id), 73, SID);
+      plantTranscript(path.join(homeRoot, keptClaim.run_id), SID);
       await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(keptClaim);
       assert.strictEqual(kept[0]?.priorWork, undefined, "a live resume needs no prior-work warning");
 

@@ -204,22 +204,21 @@ export class RunRunner {
       // continuing without the earlier context beats losing the run, but only if the
       // feed admits the context is gone rather than quietly re-treading ground.
       //
-      // Checked against the CLONE PATH because a transcript is filed per cwd, not per
-      // HOME. That path is deterministic and worker-independent (`runner/<repoDir>/
-      // issue-<iid>`, git.ts), so it is the same string on whichever worker claims the
-      // run — the HOME is the only half that moves.
+      // The check globs this HOME's project dirs rather than computing the one the cwd
+      // encodes to (sdk-session.ts explains why the computed path would false-absent on
+      // a symlinked data dir). A per-run HOME holds exactly one project dir — this run's
+      // own clone — so the glob is precise here regardless.
       //
       // Only when this run HAS a private HOME: the stub executor has none (main.ts),
       // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
       // untouched by construction rather than by an executor-kind check here.
       let sessionId = claim.session_id ?? undefined;
       let resumeDropped = false;
-      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, runnerClone.path, sessionId, runLog))) {
+      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, sessionId, runLog))) {
         resumeDropped = true;
         sessionId = undefined;
         runLog.warn("resume session transcript is not resolvable here; starting a fresh SDK session", {
           run_home: runHome,
-          cwd: runnerClone.path,
         });
         batcher.emit({
           kind: "status",

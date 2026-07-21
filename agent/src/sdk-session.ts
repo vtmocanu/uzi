@@ -6,51 +6,73 @@
 //
 //     $HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl
 //
-// where <encoded-cwd> is the ABSOLUTE cwd with every non-alphanumeric character
-// replaced by `-`. All of this is empirically pinned against
-// @anthropic-ai/claude-agent-sdk 0.3.201 (see ASSUMPTIONS below), because it is the
-// CLI's private on-disk layout, not a documented contract.
+// Verified empirically against @anthropic-ai/claude-agent-sdk 0.3.201 in both
+// directions: an empty HOME yields `{"type":"result","subtype":"error_during_execution",
+// ..., "errors":["No conversation found with session ID: …"]}` on exit 1 with
+// `duration_api_ms: 0` (no request is made, so nothing is spent); planting a real
+// transcript at exactly that path gets the same invocation past resolution and on to
+// the API. So the file's presence IS the resume precondition, and its absence is
+// knowable before we spend a turn discovering it.
 //
-// Why the check exists: the run lane pins a per-run HOME (`agent-home/<runId>`,
+// Why that matters here: the run lane pins a per-run HOME (`agent-home/<runId>`,
 // main.ts) that lives on the CLAIMING worker's own data volume. A requeued run whose
-// affinity grace lapsed can be claimed by a DIFFERENT worker, where that HOME has never
-// existed — the claim still carries the session id, but the transcript it names does
-// not exist there. It is NOT only a cross-worker bug: a session is filed per cwd, so
-// the same HOME on the same machine fails just as hard if the cwd differs, and a worker
-// returning on a fresh volume under its own identity loses everything. That breadth is
-// why this is worker-side rather than something the server could decide from worker ids.
+// affinity grace has lapsed can be claimed by a DIFFERENT worker, where that HOME has
+// never existed — the claim still carries the session id, but the transcript it names
+// does not exist on this machine. Same for a worker that came back on a fresh volume
+// (`docker compose down -v`, a pod restarted onto empty storage) under its OWN
+// identity, which is why this check is worker-side rather than a claim-time decision
+// the server could make from worker ids alone.
 //
-// Scope matters as much as existence. The CLI's lookup is NOT a scan of every project
-// dir: it looks in the encoded-cwd dir (plus, for TRUNCATED encodings, prefix-sharing
-// siblings, and a git-worktree fallback). A transcript sitting in some other project
-// dir is invisible to the CLI. So this check is deliberately scoped the same way — an
-// earlier draft of it globbed every project dir, which could answer "present" for a
-// file the CLI would never find, keep the resume, and leave the run dying exactly as it
-// does today. Over-broad here is not "safely conservative"; it silently un-fixes the bug.
+// ── Why this GLOBS every project dir instead of computing the one right dir ──────────
 //
-// FAIL-OPEN, with a deliberate and asymmetric cut line: "the file is not there"
-// (ENOENT/ENOTDIR) is a FACT and drops the resume; anything we merely could not
-// determine — an unreadable dir, a session id we cannot parse, a cwd whose encoding we
-// cannot reproduce — KEEPS the resume and leaves the CLI to produce its own loud
-// failure. Keeping a dead resume costs the run but is visible; dropping a live one
-// discards recoverable context, which is the failure class this fix exists to prevent.
+// The obvious implementation is to reproduce `<encoded-cwd>` and stat one file. It is
+// the wrong one, and the reason is measured, not assumed. `<encoded-cwd>` is NOT the cwd
+// string: the CLI resolves the cwd through realpath FIRST, then encodes (every
+// non-alphanumeric → `-`, truncating long paths with a base36 hash). Proven against the
+// real CLI with a symlinked cwd — a transcript under `encoded(realpath)` resolves; the
+// same transcript under `encoded(the symlink path)` gives "No conversation found". So a
+// single-path check that encodes the raw cwd would look at a directory that never exists
+// whenever ANY component of the worker's data path is a symlink, return "absent", and
+// SILENTLY DISCARD A LIVE SESSION — the precise failure this whole check exists to
+// prevent. The CLI's lookup also has fallbacks (prefix-sibling dirs, a `git worktree
+// list` pass) that widen the same gap.
 //
-// ASSUMPTIONS — version-coupled to @anthropic-ai/claude-agent-sdk 0.3.201, verified by
-// running the shipped CLI directly (2026-07-21). If a bump changes any of them this
-// preflight degrades toward answering "resolvable" more often, i.e. back toward today's
-// loud failure — never toward a silent fresh start. `sdk-session.test.ts` pins each:
-//   1. The transcript path is `$HOME/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
-//      Planting a real transcript there got `--resume` past resolution and on to the
-//      API; an empty HOME produced `No conversation found with session ID: …` on exit 1
-//      with `duration_api_ms: 0` — resolution is local and spends nothing.
-//   2. The encoding replaces every non-alphanumeric character with `-`.
-//   3. The lookup is SCOPED: the same transcript placed in an unrelated project dir,
-//      and in a dir sharing a long prefix, both failed to resolve.
-//   4. Truncation boundary: an encoding of 200 characters or fewer is used verbatim; at
-//      201+ the CLI truncates to 200 and appends `-` plus a 6-character base36 hash.
-//      We do not reproduce that hash — a >200 encoding fails open instead.
+// The glob is a strict SUPERSET of the CLI's candidate dirs, so it can never produce a
+// false absent. Its only possible error is a false PRESENT — a transcript for some other
+// cwd under this HOME — whose consequence is merely that the resume is kept and the run
+// hits today's loud failure: the bug is not fixed for that case, but nothing new breaks.
+// That asymmetry (false present harmless, false absent destructive) is the whole design.
+//
+// And the false present is UNREACHABLE in both lanes, because each lane's cwd is
+// invariant for the life of a session, so a HOME only ever accumulates the ONE project
+// dir belonging to its session(s):
+//   - Run lane: HOME is per-run (`agent-home/<runId>`) and the cwd is that run's own
+//     clone (`runner/<repoDir>/issue-<iid>`, one dir). One session, one project dir.
+//   - Chat lane: the cwd is the baked source snapshot `UZI_SRC_DIR` (`/opt/uzi-src`) —
+//     `main.ts` builds ChatExecutor with no `srcDir` override, so `chat-executor.ts`
+//     defaults it, and EVERY chat session on the worker runs under that identical cwd.
+//     So the shared chat HOME holds exactly one project dir too, not "a handful".
+// (An earlier version of this comment claimed the chat HOME holds "a handful" of project
+// dirs. That was false — chat's cwd is constant — and that false line is what made a
+// single-path narrowing look safe. It is not. Do not narrow this to one path.)
+//
+// FAIL-OPEN on top of all that, cut deliberately: "the directory or file is not there"
+// (ENOENT/ENOTDIR) is a FACT and drops the resume; "I could not look" (EACCES, EIO,
+// anything else) keeps it, leaving the CLI to produce today's loud failure.
+//
+// VERSION-COUPLED to @anthropic-ai/claude-agent-sdk 0.3.201: the transcript LAYOUT
+// (`$HOME/.claude/projects/<dir>/<session-id>.jsonl`) is the CLI's private on-disk
+// format, not a documented contract. The glob depends only on the `.jsonl`-named-by-
+// session-id leaf and the two-level projects/<dir> nesting — NOT on the encoding rule,
+// which is exactly why globbing survives an encoding change. A layout change would make
+// this find nothing and fail OPEN (degrade toward today's loud failure), never toward a
+// silent fresh start — but nothing in CI would notice it had stopped firing, so an SDK
+// bump needs this re-verified. The layout, the local pre-network resolution, and the
+// realpath-before-encode behaviour were each established independently by researcher-105
+// (shipped bundle + live harness) and by this author (direct CLI runs), so the claims
+// above are corroborated, not single-sourced.
 
-import { access } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 
@@ -60,34 +82,29 @@ import type { Logger } from "./log.js";
  *  session id we can look up, and is never joined onto a path. */
 const SESSION_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Longest encoding the CLI stores verbatim (assumption 4). Past this it truncates and
- *  appends a hash we deliberately do not reimplement. */
-const MAX_VERBATIM_ENCODED_LEN = 200;
-
-/** The CLI's project-dir name for a cwd: every non-alphanumeric character becomes `-`
- *  (assumption 2). Exported so the test can pin the rule against the real layout. */
-export function encodeCwd(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
-}
-
-/** ENOENT/ENOTDIR are the two ways the filesystem says "not there"; everything else is
- *  a failure to look, which must not be read as an answer. */
+/** ENOENT/ENOTDIR are the two ways the filesystem says "not there"; everything else
+ *  is a failure to look, which must not be read as an answer. */
 function isNotFound(err: unknown): boolean {
   const code = (err as { code?: unknown } | null)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
 /**
- * Can the CLI still resolve `sessionId` for a session recorded at `cwd` under `homeDir`?
+ * Can the CLI still resolve `sessionId` under `homeDir`?
  *
- * `true` means resume it — the transcript is there, or we could not tell and refuse to
- * guess. `false` means it is definitively absent and the caller must drop the resume
- * AND say so, because a silent fresh start is a worse failure than the loud one it
- * replaces.
+ * `true` means resume it (the transcript is there, or we could not tell and refuse to
+ * guess). `false` means the transcript is definitively absent and the caller must drop
+ * the resume — and SAY it did, because a silent fresh start is a worse failure than
+ * the loud one it replaces.
+ *
+ * The lookup globs every project dir rather than recomputing the cwd encoding — see the
+ * header for why that superset is deliberate (the CLI encodes realpath(cwd), so a
+ * single computed path false-absents on any symlinked data dir) and why the false
+ * present it admits is unreachable (each lane's cwd is invariant, so a HOME holds one
+ * project dir).
  */
 export async function sessionTranscriptResolvable(
   homeDir: string,
-  cwd: string,
   sessionId: string,
   log?: Logger,
 ): Promise<boolean> {
@@ -96,23 +113,25 @@ export async function sessionTranscriptResolvable(
     log?.warn("session id is not UUID-shaped; not checking the transcript, leaving the resume as-is");
     return true;
   }
-  const encoded = encodeCwd(cwd);
-  if (encoded.length > MAX_VERBATIM_ENCODED_LEN) {
-    // Past the boundary the dir name carries a hash of the CLI's own making. Guessing
-    // it wrong would mean discarding a live session; let the CLI answer instead.
-    log?.warn("cwd encodes past the CLI's verbatim length; not checking the transcript, leaving the resume as-is", {
-      encoded_length: encoded.length,
-    });
-    return true;
-  }
+  const projectsDir = path.join(homeDir, ".claude", "projects");
+  let entries;
   try {
-    await access(path.join(homeDir, ".claude", "projects", encoded, `${sessionId}.jsonl`));
-    return true;
+    entries = await readdir(projectsDir, { withFileTypes: true });
   } catch (err) {
-    if (isNotFound(err)) return false;
-    log?.warn("could not stat the session transcript; leaving the resume as-is", {
-      error: String((err as Error)?.message ?? err),
-    });
+    if (isNotFound(err)) return false; // no projects dir at all ⇒ no transcript here
+    log?.warn("could not read the SDK projects dir; leaving the resume as-is", { error: String((err as Error)?.message ?? err) });
     return true;
   }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      await access(path.join(projectsDir, entry.name, `${sessionId}.jsonl`));
+      return true;
+    } catch (err) {
+      if (isNotFound(err)) continue;
+      log?.warn("could not stat a session transcript; leaving the resume as-is", { error: String((err as Error)?.message ?? err) });
+      return true;
+    }
+  }
+  return false;
 }

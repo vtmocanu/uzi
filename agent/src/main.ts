@@ -5,7 +5,7 @@ import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
-import { ChatExecutor, UZI_SRC_DIR, type ChatExecutorLike } from "./chat-executor.js";
+import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
@@ -162,18 +162,14 @@ async function main(): Promise<void> {
     idleTimeoutMs: config.chatIdleTimeoutMs,
     pollMs: config.chatPollMs,
   }, config.workerToken, {
-    // Issue #105: where a Continue's transcript would have to live, so the runner can
-    // tell a resumable session from one written on another worker. BOTH halves: a
-    // transcript is filed under <HOME>/.claude/projects/<encoded cwd>/, and the chat
-    // executor's cwd is the baked source snapshot, not a clone. Omitted for the stub
-    // (it persists no real SDK session) — the same discriminator the run lane gets for
-    // free from the stub's absent per-run HOME above.
-    //
-    // These two values must match what `makeChatExecutor` above actually runs with: the
-    // HOME it is constructed with, and its `srcDir` (defaulted to UZI_SRC_DIR here — if
-    // a future caller overrides `srcDir`, pass the SAME value here). A mismatch would
-    // look in the wrong project dir and report a live session as lost.
-    ...(config.executor === "stub" ? {} : { sdkSession: { homeDir: sdkHomeRoot, cwd: UZI_SRC_DIR } }),
+    // Issue #105: the HOME a Continue's transcript would have to live under, so the
+    // runner can tell a resumable session from one written on another worker. The check
+    // globs this HOME's project dirs (sdk-session.ts), so only the HOME is passed — the
+    // chat executor's cwd is invariant (the baked source snapshot), so the shared chat
+    // HOME holds exactly one project dir. Omitted for the stub (it persists no real SDK
+    // session) — the same discriminator the run lane gets for free from the stub's
+    // absent per-run HOME above.
+    ...(config.executor === "stub" ? {} : { sdkHomeDir: sdkHomeRoot }),
   });
 
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
