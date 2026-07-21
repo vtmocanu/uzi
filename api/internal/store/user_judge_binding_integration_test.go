@@ -137,7 +137,7 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	// point of the feature is that retrospectives can bill a different account from
 	// the runs they review, so this asserts they do not collide.
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: owner, Name: "alpha", TokenHash: []byte{0xbb, 0x01},
+		UserID: owner, Name: "alpha", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
 	})
 	if err != nil {

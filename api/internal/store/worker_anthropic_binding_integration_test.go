@@ -37,6 +37,15 @@ import (
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres
 // (./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix).
+// tokenHash returns a unique 32-byte token_hash for a test worker. workers.token_hash
+// is globally UNIQUE (00020), so a hardcoded constant collides on a re-used DB
+// (KEEP_STACK); every LiveDB test derives uniqueness from uuid.New(), and this
+// matches that.
+func tokenHash() []byte {
+	a, b := uuid.New(), uuid.New()
+	return append(a[:], b[:]...)
+}
+
 func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -73,7 +82,7 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	strangerToken := mkSecret(stranger, "default", true)
 
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: owner, Name: "alpha", TokenHash: []byte{0xaa, 0x01},
+		UserID: owner, Name: "alpha", TokenHash: tokenHash(),
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
@@ -148,13 +157,13 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 
 	// --- The mint-time binding takes the same FK path ---
 	if _, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: owner, Name: "beta", TokenHash: []byte{0xaa, 0x02},
+		UserID: owner, Name: "beta", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
 	}); err == nil {
 		t.Fatal("minting a worker already bound to another user's secret must be refused by the FK")
 	}
 	minted, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: owner, Name: "gamma", TokenHash: []byte{0xaa, 0x03},
+		UserID: owner, Name: "gamma", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
 	})
 	if err != nil {
