@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -114,7 +115,10 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row, err := h.q.UpsertUserSecret(r.Context(), store.UpsertUserSecretParams{
+	// Rotates the user's DEFAULT token, or creates their first one labelled
+	// 'default' (PRD #104 D14 — this kind-path route is a compatibility alias over
+	// the default; M2 adds the id-keyed routes and deprecates this one).
+	row, err := h.q.UpsertDefaultUserSecret(r.Context(), store.UpsertDefaultUserSecretParams{
 		UserID:     user.ID,
 		Kind:       store.KindAnthropicToken,
 		Ciphertext: sealed,
@@ -142,11 +146,36 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	if _, err := h.q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
+	// Deletes the DEFAULT token (PRD #104 D14). Resolve it first: DeleteUserSecret
+	// is id-keyed since D10, because its by-kind form deleted every row of the kind
+	// — harmless while a user could hold only one, a whole-credential-set wipe the
+	// moment they can hold two. No row is the existing idempotent 204.
+	//
+	// Unlike the save path this stays a resolve-then-write pair rather than one
+	// statement: a concurrent delete of the same row degrades to "0 rows", which is
+	// already this route's success case, so there is nothing for a transaction to
+	// protect here. D6's "refuse to delete the default while other tokens exist"
+	// and its FOR UPDATE arrive with M2, which owns the multi-token rules.
+	secretID, err := h.q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
 		UserID: user.ID,
 		Kind:   store.KindAnthropicToken,
-	}); err != nil {
-		slog.Error("delete anthropic token", "error", err)
+	})
+	switch {
+	case err == nil:
+		if _, derr := h.q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
+			ID:     secretID,
+			UserID: user.ID,
+		}); derr != nil {
+			slog.Error("delete anthropic token", "error", derr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	case errors.Is(err, pgx.ErrNoRows):
+		// No token to delete. Fall through rather than returning: the gauge cleanup
+		// below is exactly what clears a ghost reading left by an earlier partial
+		// delete, so the token-less case is the one that most needs it.
+	default:
+		slog.Error("resolve default anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

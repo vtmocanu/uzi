@@ -2581,9 +2581,12 @@ SECRET_KEY_B64="$(docker inspect "$("${COMPOSE[@]}" ps -q api)" --format '{{rang
 [ -n "$SECRET_KEY_B64" ] || fail "could not read the api container's UZI_SECRET_KEY"
 LEGACY_HEX="$(master_seal_hex 'sk-ant-e2e-legacy-master-000000')"
 [ -n "$LEGACY_HEX" ] || fail "could not master-seal a legacy ciphertext"
-db_psql "INSERT INTO user_secrets (user_id, kind, ciphertext, sealed_with)
-         VALUES ('$U2ID', 'anthropic_token', decode('$LEGACY_HEX','hex'), 'master')
-         ON CONFLICT (user_id, kind) DO UPDATE SET ciphertext = decode('$LEGACY_HEX','hex'), sealed_with = 'master'" >/dev/null
+# label/is_default and the conflict target both moved in migration 00077 (PRD #104):
+# UNIQUE (user_id, kind) is gone, so the arbiter is now the partial unique index
+# "this user's DEFAULT secret of this kind" — spelled by repeating its predicate.
+db_psql "INSERT INTO user_secrets (user_id, kind, label, is_default, ciphertext, sealed_with)
+         VALUES ('$U2ID', 'anthropic_token', 'default', true, decode('$LEGACY_HEX','hex'), 'master')
+         ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE SET ciphertext = decode('$LEGACY_HEX','hex'), sealed_with = 'master'" >/dev/null
 [ "$(sealed_of user2@uzi.e2e)" = master ] || fail "could not stage a master-sealed row for user2"
 [ "$(apiget /api/admin/vault-migration | jq -r '.master_sealed')" -ge 1 ] \
   || fail "admin migration count did not see the master-sealed row"

@@ -127,17 +127,23 @@ func (f *fakeUpsertDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Ro
 
 type fakeUpsertRow struct{}
 
+// Scan fills whichever of the RETURNING columns the caller asked for, by type
+// rather than by a fixed arity: UpsertDefaultUserSecret returns
+// (id, kind, label, is_default, created_at, updated_at) since PRD #104 M1, and
+// pinning the shape here would make this leak test fail for a reason that has
+// nothing to do with leaking.
 func (fakeUpsertRow) Scan(dest ...any) error {
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	if len(dest) == 3 {
-		if p, ok := dest[0].(*string); ok {
+	for _, d := range dest {
+		switch p := d.(type) {
+		case *string:
 			*p = store.KindAnthropicToken
-		}
-		if p, ok := dest[1].(*pgtype.Timestamptz); ok {
+		case *pgtype.Timestamptz:
 			*p = now
-		}
-		if p, ok := dest[2].(*pgtype.Timestamptz); ok {
-			*p = now
+		case *uuid.UUID:
+			*p = uuid.New()
+		case *bool:
+			*p = true
 		}
 	}
 	return nil

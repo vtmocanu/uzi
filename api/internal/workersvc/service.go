@@ -241,6 +241,7 @@ type Store interface {
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
+	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
@@ -671,16 +672,31 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
-// openAnthropic opens the owner's decrypted Anthropic token — the one secret both
-// the run lane and the chat lane deliver. The vault-dispatch logic (dek needs
-// unlock, legacy master opens regardless, nil vault → master box) lives in
-// secretopen, shared with the rate-limit poller (PRD #53); this method maps its
-// sentinels back to workersvc's domain errors, preserving the exact prior
-// behavior: a lock surfaces as errVaultLocked (requeue, never fail), and a
-// missing/undecryptable token as errCredentialUnavailable with its original
-// failure-reason text (which never includes secret bytes).
-func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, error) {
-	tok, err := secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+// openAnthropic opens the decrypted Anthropic token for one run — the one secret
+// the run lane, the judge lane and the chat lane all deliver, and the ONE place
+// credential resolution happens. The vault-dispatch logic (dek needs unlock,
+// legacy master opens regardless, nil vault → master box) lives in secretopen,
+// shared with the rate-limit poller (PRD #53); this method maps its sentinels back
+// to workersvc's domain errors, preserving the exact prior behavior: a lock
+// surfaces as errVaultLocked (requeue, never fail), and a missing/undecryptable
+// token as errCredentialUnavailable with its original failure-reason text (which
+// never includes secret bytes).
+//
+// secretID is the binding-else-default seam (PRD #104 M1): nil resolves the user's
+// default token, non-nil resolves that specific credential. All three lanes pass
+// nil today; M3 threads a worker's anthropic_secret_id through it and M4 the
+// judge lane's, so neither has to restructure this function — which is what keeps
+// them file-disjoint, and what keeps resolution in one place instead of three
+// copies drifting apart (R4). A bound id that is not the caller's is ErrNoSecret,
+// i.e. errCredentialUnavailable, never another user's credential (D11).
+func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) ([]byte, error) {
+	var tok []byte
+	var err error
+	if secretID != nil {
+		tok, err = secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, *secretID)
+	} else {
+		tok, err = secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+	}
 	switch {
 	case err == nil:
 		return tok, nil
@@ -720,7 +736,9 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	anthropic, err := s.openAnthropic(ctx, run.UserID)
+	// nil: the run lane resolves the owner's default token. M3 replaces this with
+	// the claiming worker's binding when it has one (PRD #104 D1).
+	anthropic, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		return nil, err
 	}

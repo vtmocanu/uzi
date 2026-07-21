@@ -404,6 +404,8 @@ type UserSecret struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 	SealedWith string             `json:"sealed_with"`
+	Label      string             `json:"label"`
+	IsDefault  bool               `json:"is_default"`
 }
 
 type UserVault struct {

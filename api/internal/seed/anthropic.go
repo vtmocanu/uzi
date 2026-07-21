@@ -27,7 +27,7 @@ const maxAnthropicTokenBytes = 4096
 type SecretStore interface {
 	GetUserByEmail(ctx context.Context, email string) (store.User, error)
 	ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]store.ListUserSecretsMetaRow, error)
-	UpsertUserSecret(ctx context.Context, arg store.UpsertUserSecretParams) (store.UpsertUserSecretRow, error)
+	InsertUserSecret(ctx context.Context, arg store.InsertUserSecretParams) (store.InsertUserSecretRow, error)
 }
 
 // VaultSealer is the subset of *vault.Vault the seed needs: it seals the seeded
@@ -97,9 +97,16 @@ func AnthropicToken(ctx context.Context, q SecretStore, sealer VaultSealer, cfg 
 		return fmt.Errorf("seed anthropic token: seal: %w", err)
 	}
 
-	if _, err := q.UpsertUserSecret(ctx, store.UpsertUserSecretParams{
+	// A plain insert, not an upsert: the create-only check above already returned
+	// for a user who has any token of this kind, so there is nothing to conflict
+	// with. It seeds the operator's token as the DEFAULT, labelled 'default' — the
+	// same shape 00077 backfills onto pre-existing rows, so a seeded deployment and
+	// an upgraded one are indistinguishable from here on (PRD #104 M1).
+	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
 		UserID:     user.ID,
 		Kind:       store.KindAnthropicToken,
+		Label:      store.LabelDefaultSecret,
+		IsDefault:  true,
 		Ciphertext: sealed,
 		SealedWith: store.SealedWithDEK,
 	}); err != nil {
