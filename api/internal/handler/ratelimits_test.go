@@ -21,14 +21,20 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// fakeRLDB is a store.DBTX that answers the rate-limit read queries from fixed
-// in-memory results, so the handlers run end to end without a database. It also
-// records whether the D3b DeleteRateLimits ran.
+// fakeRLDB is a store.DBTX answering the rate-limit read queries from fixed
+// in-memory results, so the handlers run end to end without a database. Since #104
+// M5 both /me and /admin return per-TOKEN rows (a Query, not a QueryRow), so the
+// fixtures are per-token; it also records whether the D3b DeleteRateLimits ran.
 type fakeRLDB struct {
-	hasToken  bool
-	getRow    *store.AnthropicRateLimit // nil ⇒ pgx.ErrNoRows (no reading yet)
+	// selfRows drives GET /api/me/rate-limits (ListRateLimitsForUser).
+	selfRows []store.ListRateLimitsForUserRow
+	// listRows drives GET /api/admin/rate-limits (ListRateLimits).
 	listRows  []store.ListRateLimitsRow
 	deletedRL bool
+
+	// defaultSecretID answers GetDefaultUserSecretID on the delete path; the zero
+	// value means "no default" (pgx.ErrNoRows), which the delete treats as a no-op.
+	defaultSecretID uuid.UUID
 }
 
 func (f *fakeRLDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
@@ -40,18 +46,26 @@ func (f *fakeRLDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.Command
 
 func (f *fakeRLDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
 	switch {
-	case strings.Contains(sql, "SELECT EXISTS") && strings.Contains(sql, "user_secrets"):
-		return fakeScanRow{func(dest ...any) error { *dest[0].(*bool) = f.hasToken; return nil }}
-	case strings.Contains(sql, "FROM anthropic_rate_limits") && strings.Contains(sql, "WHERE user_id"):
-		if f.getRow == nil {
+	case strings.Contains(sql, "SELECT id FROM user_secrets") && strings.Contains(sql, "is_default"):
+		// GetDefaultUserSecretID, used by the delete path.
+		if f.defaultSecretID == uuid.Nil {
 			return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 		}
-		return fakeScanRow{scanRateLimit(*f.getRow)}
+		return fakeScanRow{func(dest ...any) error { *dest[0].(*uuid.UUID) = f.defaultSecretID; return nil }}
 	}
 	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 }
 
-func (f *fakeRLDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+func (f *fakeRLDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	// The two list queries differ by their column count; dispatch on which one the
+	// caller asked for so the right scanner runs.
+	if strings.Contains(sql, "FROM user_secrets s") && strings.Contains(sql, "WHERE s.user_id") {
+		scans := make([]func(...any) error, 0, len(f.selfRows))
+		for _, r := range f.selfRows {
+			scans = append(scans, scanSelfRateLimit(r))
+		}
+		return &fakeNotifRows{scans: scans}, nil
+	}
 	scans := make([]func(...any) error, 0, len(f.listRows))
 	for _, r := range f.listRows {
 		scans = append(scans, scanListRateLimit(r))
@@ -59,15 +73,17 @@ func (f *fakeRLDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error
 	return &fakeNotifRows{scans: scans}, nil
 }
 
-func scanRateLimit(r store.AnthropicRateLimit) func(dest ...any) error {
+func scanSelfRateLimit(r store.ListRateLimitsForUserRow) func(dest ...any) error {
 	return func(dest ...any) error {
-		*dest[0].(*uuid.UUID) = r.UserID
-		*dest[1].(*pgtype.Int2) = r.FiveHourPct
-		*dest[2].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[3].(*pgtype.Int2) = r.SevenDayPct
-		*dest[4].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[5].(*pgtype.Text) = r.Source
-		*dest[6].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[0].(*uuid.UUID) = r.UserSecretID
+		*dest[1].(*string) = r.Label
+		*dest[2].(*bool) = r.IsDefault
+		*dest[3].(*pgtype.Int2) = r.FiveHourPct
+		*dest[4].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[5].(*pgtype.Int2) = r.SevenDayPct
+		*dest[6].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[7].(*pgtype.Text) = r.Source
+		*dest[8].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -77,13 +93,15 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = r.UserID
 		*dest[1].(*string) = r.Email
 		*dest[2].(*pgtype.Text) = r.DisplayName
-		*dest[3].(*bool) = r.HasToken
-		*dest[4].(*pgtype.Int2) = r.FiveHourPct
-		*dest[5].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[6].(*pgtype.Int2) = r.SevenDayPct
-		*dest[7].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[8].(*pgtype.Text) = r.Source
-		*dest[9].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[3].(*pgtype.UUID) = r.UserSecretID
+		*dest[4].(*pgtype.Text) = r.Label
+		*dest[5].(*pgtype.Bool) = r.IsDefault
+		*dest[6].(*pgtype.Int2) = r.FiveHourPct
+		*dest[7].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[8].(*pgtype.Int2) = r.SevenDayPct
+		*dest[9].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[10].(*pgtype.Text) = r.Source
+		*dest[11].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -91,9 +109,15 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 func pgInt2(v int16) pgtype.Int2          { return pgtype.Int2{Int16: v, Valid: true} }
 func pgTs(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
 func pgTxt(s string) pgtype.Text          { return pgtype.Text{String: s, Valid: true} }
-func okRow(u uuid.UUID, synced time.Time) *store.AnthropicRateLimit {
-	return &store.AnthropicRateLimit{
-		UserID:           u,
+func pgUUIDv(u uuid.UUID) pgtype.UUID      { return pgtype.UUID{Bytes: u, Valid: true} }
+func pgBool(b bool) pgtype.Bool           { return pgtype.Bool{Bool: b, Valid: true} }
+
+// okSelfRow is a token with a reading, for /me.
+func okSelfRow(secretID uuid.UUID, label string, isDefault bool, synced time.Time) store.ListRateLimitsForUserRow {
+	return store.ListRateLimitsForUserRow{
+		UserSecretID:     secretID,
+		Label:            label,
+		IsDefault:        isDefault,
 		FiveHourPct:      pgInt2(55),
 		FiveHourResetsAt: pgTs(time.Unix(1784000000, 0)),
 		SevenDayPct:      pgInt2(10),
@@ -112,13 +136,38 @@ func rlReq(user uuid.UUID, admin bool) *http.Request {
 	return req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: user, IsAdmin: admin, IsActive: true}))
 }
 
-func decodeMap(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+// selfTokens decodes {"tokens": [...]} from a /me response.
+func selfTokens(t *testing.T, rec *httptest.ResponseRecorder) []struct {
+	SecretID  string `json:"secret_id"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"is_default"`
+	Limits    struct {
+		Status   string           `json:"status"`
+		Source   string           `json:"source"`
+		Stale    *bool            `json:"stale"`
+		SyncedAt string           `json:"synced_at"`
+		FiveHour *json.RawMessage `json:"five_hour"`
+	} `json:"limits"`
+} {
 	t.Helper()
-	var m map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+	var body struct {
+		Tokens []struct {
+			SecretID  string `json:"secret_id"`
+			Label     string `json:"label"`
+			IsDefault bool   `json:"is_default"`
+			Limits    struct {
+				Status   string           `json:"status"`
+				Source   string           `json:"source"`
+				Stale    *bool            `json:"stale"`
+				SyncedAt string           `json:"synced_at"`
+				FiveHour *json.RawMessage `json:"five_hour"`
+			} `json:"limits"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
 	}
-	return m
+	return body.Tokens
 }
 
 // --- /api/me/rate-limits ---
@@ -132,97 +181,93 @@ func TestSelfRateLimitsRequireAuth(t *testing.T) {
 	}
 }
 
+// A token-less user gets an empty tokens array — the client's no_token signal.
 func TestSelfRateLimitsNoToken(t *testing.T) {
-	u := uuid.New()
-	h := rlHandler(&fakeRLDB{hasToken: false}, 5*time.Minute)
+	h := rlHandler(&fakeRLDB{selfRows: nil}, 5*time.Minute)
 	rec := httptest.NewRecorder()
-	h.SelfRateLimits(rec, rlReq(u, false))
-
-	m := decodeMap(t, rec)
-	if m["status"] != "no_token" {
-		t.Fatalf("status = %v, want no_token", m["status"])
-	}
-	// Status-only: no window/source/synced_at/stale keys.
-	for _, k := range []string{"five_hour", "seven_day", "source", "synced_at", "stale"} {
-		if _, present := m[k]; present {
-			t.Errorf("no_token response leaked key %q: %v", k, m)
-		}
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
+	if got := selfTokens(t, rec); len(got) != 0 {
+		t.Fatalf("token-less user returned %d tokens, want an empty array", len(got))
 	}
 }
 
+// A token with no reading yet is listed as `unavailable`, not omitted.
 func TestSelfRateLimitsUnavailable(t *testing.T) {
-	u := uuid.New()
-	// Token held, but no gauge row yet (ErrNoRows) ⇒ unavailable.
-	h := rlHandler(&fakeRLDB{hasToken: true, getRow: nil}, 5*time.Minute)
+	secretID := uuid.New()
+	rows := []store.ListRateLimitsForUserRow{{UserSecretID: secretID, Label: "default", IsDefault: true /* SyncedAt invalid */}}
+	h := rlHandler(&fakeRLDB{selfRows: rows}, 5*time.Minute)
 	rec := httptest.NewRecorder()
-	h.SelfRateLimits(rec, rlReq(u, false))
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
 
-	m := decodeMap(t, rec)
-	if m["status"] != "unavailable" {
-		t.Fatalf("status = %v, want unavailable", m["status"])
+	tokens := selfTokens(t, rec)
+	if len(tokens) != 1 {
+		t.Fatalf("got %d tokens, want 1", len(tokens))
 	}
-	for _, k := range []string{"five_hour", "seven_day", "source", "synced_at", "stale"} {
-		if _, present := m[k]; present {
-			t.Errorf("unavailable response leaked key %q", k)
-		}
+	if tokens[0].Limits.Status != "unavailable" {
+		t.Fatalf("status = %q, want unavailable", tokens[0].Limits.Status)
+	}
+	if tokens[0].Label != "default" || !tokens[0].IsDefault {
+		t.Errorf("token metadata lost: %+v", tokens[0])
+	}
+	// unavailable carries no window/source/stale.
+	if tokens[0].Limits.FiveHour != nil || tokens[0].Limits.Stale != nil {
+		t.Errorf("unavailable leaked ok-only fields: %+v", tokens[0].Limits)
 	}
 }
 
-func TestSelfRateLimitsOK(t *testing.T) {
-	u := uuid.New()
-	h := rlHandler(&fakeRLDB{hasToken: true, getRow: okRow(u, time.Now())}, 5*time.Minute)
+// One reading per token, default first, each carrying its own label + reading.
+func TestSelfRateLimitsMultipleTokens(t *testing.T) {
+	def, console := uuid.New(), uuid.New()
+	rows := []store.ListRateLimitsForUserRow{
+		okSelfRow(def, "default", true, time.Now()),
+		okSelfRow(console, "console-key", false, time.Now()),
+	}
+	h := rlHandler(&fakeRLDB{selfRows: rows}, 5*time.Minute)
 	rec := httptest.NewRecorder()
-	h.SelfRateLimits(rec, rlReq(u, false))
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
 
-	m := decodeMap(t, rec)
-	if m["status"] != "ok" || m["source"] != "usage_endpoint" {
-		t.Fatalf("status/source = %v/%v", m["status"], m["source"])
+	tokens := selfTokens(t, rec)
+	if len(tokens) != 2 {
+		t.Fatalf("got %d tokens, want 2", len(tokens))
 	}
-	if m["stale"] != false {
-		t.Errorf("stale = %v, want false (fresh reading)", m["stale"])
+	if tokens[0].Label != "default" || !tokens[0].IsDefault {
+		t.Errorf("first token = %+v, want the default", tokens[0])
 	}
-	if _, ok := m["synced_at"].(string); !ok {
-		t.Errorf("synced_at should be an ISO string, got %v", m["synced_at"])
+	if tokens[1].Label != "console-key" || tokens[1].IsDefault {
+		t.Errorf("second token = %+v, want console-key non-default", tokens[1])
 	}
-	five := m["five_hour"].(map[string]any)
-	if five["pct"].(float64) != 55 {
-		t.Errorf("five_hour.pct = %v, want 55", five["pct"])
-	}
-	if _, ok := five["resets_at"].(float64); !ok {
-		t.Errorf("five_hour.resets_at should be an epoch number, got %v", five["resets_at"])
-	}
-	seven := m["seven_day"].(map[string]any)
-	if _, present := seven["resets_at"]; !present || seven["resets_at"] != nil {
-		t.Errorf("seven_day.resets_at should be present and null, got %v (present=%v)", seven["resets_at"], present)
-	}
-	// No internal fields leak.
-	if _, bad := m["is_admin"]; bad {
-		t.Error("response must not carry is_admin")
+	for _, tk := range tokens {
+		if tk.Limits.Status != "ok" || tk.Limits.Source != "usage_endpoint" {
+			t.Errorf("token %s status/source = %s/%s", tk.Label, tk.Limits.Status, tk.Limits.Source)
+		}
+		if tk.SecretID == "" {
+			t.Errorf("token %s missing secret_id", tk.Label)
+		}
 	}
 }
 
 func TestSelfRateLimitsStale(t *testing.T) {
-	u := uuid.New()
 	// synced 20m ago with a 5m interval (3× = 15m) ⇒ stale.
-	h := rlHandler(&fakeRLDB{hasToken: true, getRow: okRow(u, time.Now().Add(-20*time.Minute))}, 5*time.Minute)
+	rows := []store.ListRateLimitsForUserRow{okSelfRow(uuid.New(), "default", true, time.Now().Add(-20*time.Minute))}
+	h := rlHandler(&fakeRLDB{selfRows: rows}, 5*time.Minute)
 	rec := httptest.NewRecorder()
-	h.SelfRateLimits(rec, rlReq(u, false))
-	if decodeMap(t, rec)["stale"] != true {
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
+	tokens := selfTokens(t, rec)
+	if tokens[0].Limits.Stale == nil || !*tokens[0].Limits.Stale {
 		t.Fatal("reading older than 3× interval should be stale")
 	}
 }
 
 func TestSelfRateLimitsPollerDisabledAlwaysStale(t *testing.T) {
-	u := uuid.New()
-	// Poller disabled (interval 0): a just-synced row is still served, always stale.
-	h := rlHandler(&fakeRLDB{hasToken: true, getRow: okRow(u, time.Now())}, 0)
+	rows := []store.ListRateLimitsForUserRow{okSelfRow(uuid.New(), "default", true, time.Now())}
+	h := rlHandler(&fakeRLDB{selfRows: rows}, 0) // poller disabled
 	rec := httptest.NewRecorder()
-	h.SelfRateLimits(rec, rlReq(u, false))
-	m := decodeMap(t, rec)
-	if m["status"] != "ok" {
-		t.Fatalf("status = %v, want ok (rows still served when poller off)", m["status"])
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
+	tokens := selfTokens(t, rec)
+	if tokens[0].Limits.Status != "ok" {
+		t.Fatalf("status = %q, want ok (rows still served when poller off)", tokens[0].Limits.Status)
 	}
-	if m["stale"] != true {
+	if tokens[0].Limits.Stale == nil || !*tokens[0].Limits.Stale {
 		t.Fatal("with the poller disabled every reading is stale")
 	}
 }
@@ -246,16 +291,32 @@ func TestAdminRateLimitsRequiresAdmin(t *testing.T) {
 	}
 }
 
-func TestAdminRateLimitsShape(t *testing.T) {
-	okUser, noTokUser, unavailUser := uuid.New(), uuid.New(), uuid.New()
+// TestAdminRateLimitsGroupsByUserThenToken: the fold collapses consecutive rows for
+// one user into one entry with a tokens array; a token-less user is one row with a
+// NULL secret id and an empty tokens array; a multi-token user gets several.
+func TestAdminRateLimitsGroupsByUserThenToken(t *testing.T) {
+	multiUser, noTokUser, unavailUser := uuid.New(), uuid.New(), uuid.New()
+	tokA, tokB, tokC := uuid.New(), uuid.New(), uuid.New()
+	now := time.Now()
 	rows := []store.ListRateLimitsRow{
+		// multiUser holds two tokens, one with a reading and one without.
 		{
-			UserID: okUser, Email: "a@x", DisplayName: pgTxt("Ana"), HasToken: true,
-			FiveHourPct: pgInt2(90), SevenDayPct: pgInt2(30),
-			Source: pgTxt("header_probe"), SyncedAt: pgTs(time.Now()),
+			UserID: multiUser, Email: "a@x", DisplayName: pgTxt("Ana"),
+			UserSecretID: pgUUIDv(tokA), Label: pgTxt("default"), IsDefault: pgBool(true),
+			FiveHourPct: pgInt2(90), SevenDayPct: pgInt2(30), Source: pgTxt("header_probe"), SyncedAt: pgTs(now),
 		},
-		{UserID: noTokUser, Email: "b@x", HasToken: false},                         // no token
-		{UserID: unavailUser, Email: "c@x", HasToken: true /* SyncedAt invalid */}, // token, no reading
+		{
+			UserID: multiUser, Email: "a@x", DisplayName: pgTxt("Ana"),
+			UserSecretID: pgUUIDv(tokB), Label: pgTxt("console"), IsDefault: pgBool(false),
+			// SyncedAt invalid ⇒ unavailable.
+		},
+		// A token-less user: one row, NULL secret id.
+		{UserID: noTokUser, Email: "b@x"},
+		// A user with a token but no reading yet.
+		{
+			UserID: unavailUser, Email: "c@x",
+			UserSecretID: pgUUIDv(tokC), Label: pgTxt("default"), IsDefault: pgBool(true),
+		},
 	}
 	h := rlHandler(&fakeRLDB{listRows: rows}, 5*time.Minute)
 	rec := httptest.NewRecorder()
@@ -266,41 +327,65 @@ func TestAdminRateLimitsShape(t *testing.T) {
 
 	var body struct {
 		Users []struct {
-			ID          string `json:"id"`
 			Email       string `json:"email"`
 			Name        string `json:"name"`
 			VaultLocked bool   `json:"vault_locked"`
-			Limits      struct {
-				Status string `json:"status"`
-				Source string `json:"source"`
-			} `json:"limits"`
+			Tokens      []struct {
+				Label  string `json:"label"`
+				Limits struct {
+					Status string `json:"status"`
+				} `json:"limits"`
+			} `json:"tokens"`
 		} `json:"users"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
 	if len(body.Users) != 3 {
-		t.Fatalf("got %d users, want 3 (every user incl. no_token)", len(body.Users))
+		t.Fatalf("got %d users, want 3 (multi, no_token, unavailable)", len(body.Users))
 	}
-	byEmail := map[string]string{}
+	byEmail := map[string]int{}
 	for _, u := range body.Users {
-		byEmail[u.Email] = u.Limits.Status
-		if u.VaultLocked { // nil vault ⇒ vaultUnlocked=true ⇒ not locked
+		byEmail[u.Email] = len(u.Tokens)
+		if u.VaultLocked {
 			t.Errorf("%s vault_locked = true with no vault wired", u.Email)
 		}
 	}
-	if byEmail["a@x"] != "ok" || byEmail["b@x"] != "no_token" || byEmail["c@x"] != "unavailable" {
-		t.Fatalf("statuses = %v, want a=ok b=no_token c=unavailable", byEmail)
+	if byEmail["a@x"] != 2 {
+		t.Fatalf("multi-token user has %d tokens, want 2", byEmail["a@x"])
 	}
-	if body.Users[0].Name != "Ana" {
-		t.Errorf("users[0].name = %q, want Ana", body.Users[0].Name)
+	if byEmail["b@x"] != 0 {
+		t.Fatalf("token-less user has %d tokens, want 0 (empty array = no_token)", byEmail["b@x"])
+	}
+	if byEmail["c@x"] != 1 {
+		t.Fatalf("token-with-no-reading user has %d tokens, want 1", byEmail["c@x"])
+	}
+	// Ana's two token statuses.
+	for _, u := range body.Users {
+		if u.Email != "a@x" {
+			continue
+		}
+		if u.Name != "Ana" {
+			t.Errorf("name = %q, want Ana", u.Name)
+		}
+		st := map[string]string{}
+		for _, tk := range u.Tokens {
+			st[tk.Label] = tk.Limits.Status
+		}
+		if st["default"] != "ok" || st["console"] != "unavailable" {
+			t.Errorf("Ana token statuses = %v, want default=ok console=unavailable", st)
+		}
 	}
 }
 
 // vault_locked reflects the live vault: a user whose DEK is not cached reads locked.
 func TestAdminRateLimitsVaultLocked(t *testing.T) {
 	u := uuid.New()
-	rows := []store.ListRateLimitsRow{{UserID: u, Email: "a@x", HasToken: true, SyncedAt: pgTs(time.Now()), FiveHourPct: pgInt2(1), SevenDayPct: pgInt2(1), Source: pgTxt("usage_endpoint")}}
+	rows := []store.ListRateLimitsRow{{
+		UserID: u, Email: "a@x",
+		UserSecretID: pgUUIDv(uuid.New()), Label: pgTxt("default"), IsDefault: pgBool(true),
+		SyncedAt: pgTs(time.Now()), FiveHourPct: pgInt2(1), SevenDayPct: pgInt2(1), Source: pgTxt("usage_endpoint"),
+	}}
 	h := rlHandler(&fakeRLDB{listRows: rows}, 5*time.Minute)
 	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
 	h.vault = vault.New(box, nil) // empty cache ⇒ every user is locked
@@ -313,15 +398,16 @@ func TestAdminRateLimitsVaultLocked(t *testing.T) {
 		} `json:"users"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
-	if !body.Users[0].VaultLocked {
+	if len(body.Users) != 1 || !body.Users[0].VaultLocked {
 		t.Fatal("a user with no cached DEK should read vault_locked=true")
 	}
 }
 
-// D3b: deleting the token also drops the gauge row.
+// D3b: deleting the token also drops the gauge row (belt-and-suspenders over the
+// cascade — see the DeleteRateLimits query comment).
 func TestDeleteTokenDeletesRateLimits(t *testing.T) {
-	db := &fakeRLDB{}
-	h := &Handler{q: store.New(db)} // nil vault ⇒ master-box seal path unused on delete
+	db := &fakeRLDB{defaultSecretID: uuid.New()} // a default exists to delete
+	h := &Handler{q: store.New(db)}              // nil vault ⇒ master-box seal path unused on delete
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/api/me/secrets/anthropic_token", nil)
 	h.DeleteAnthropicToken(rec, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsActive: true})))

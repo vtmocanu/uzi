@@ -17,22 +17,33 @@ import (
 
 // --- fakes ---
 
+// fakeStore models each user as holding ONE token whose secret id EQUALS the user
+// id — a legal simplification that keeps the single-token tests' by-user assertions
+// readable (got(u), got=upserts[secretID]). The genuinely per-token behaviour, where
+// one user holds several tokens with distinct ids, has its own test
+// (TestPerTokenBackoffIsolation) that does not use this helper.
 type fakeStore struct {
-	rows []store.ListUsersWithAnthropicTokenRow
+	rows []store.ListAnthropicTokensToPollRow
 
 	mu      sync.Mutex
-	upserts map[uuid.UUID]store.UpsertRateLimitsParams
+	upserts map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
 }
 
 func newFakeStore(users ...uuid.UUID) *fakeStore {
-	rows := make([]store.ListUsersWithAnthropicTokenRow, 0, len(users))
+	rows := make([]store.ListAnthropicTokensToPollRow, 0, len(users))
 	for _, u := range users {
-		rows = append(rows, store.ListUsersWithAnthropicTokenRow{UserID: u, Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK})
+		rows = append(rows, store.ListAnthropicTokensToPollRow{
+			ID: u, UserID: u, Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK,
+		})
 	}
 	return &fakeStore{rows: rows, upserts: map[uuid.UUID]store.UpsertRateLimitsParams{}}
 }
-func (f *fakeStore) ListUsersWithAnthropicToken(context.Context) ([]store.ListUsersWithAnthropicTokenRow, error) {
+func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
 	return f.rows, nil
+}
+func (f *fakeStore) GetDefaultUserSecretID(_ context.Context, arg store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
+	// secret id == user id in this fake, so the user's default is the user id.
+	return arg.UserID, nil
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
 	return store.GetUserSecretCiphertextRow{Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK}, nil
@@ -40,13 +51,13 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.upserts[arg.UserID] = arg
+	f.upserts[arg.UserSecretID] = arg
 	return nil
 }
-func (f *fakeStore) got(u uuid.UUID) (store.UpsertRateLimitsParams, bool) {
+func (f *fakeStore) got(secretID uuid.UUID) (store.UpsertRateLimitsParams, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v, ok := f.upserts[u]
+	v, ok := f.upserts[secretID]
 	return v, ok
 }
 func (f *fakeStore) count() int {
@@ -326,11 +337,9 @@ func TestPokeIgnoresBackoff(t *testing.T) {
 	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) { return reading(5, 5, anthropic.SourceUsageEndpoint), nil }}
 	e, _ := newEngine(t, st, op, cl, true)
 
-	e.setBackoff(u) // pretend a prior refusal armed the backoff
-	// Mirror the poke path: ignoreBackoff + a single-user lookup-open.
-	e.pollUser(context.Background(), u, true, func() ([]byte, error) {
-		return op.Open(context.Background(), u, store.KindAnthropicToken)
-	})
+	e.setBackoff(u) // pretend a prior refusal armed the backoff (secret id == user id here)
+	// The real poke path: resolve the user's default token, then poll it ignoring backoff.
+	e.pokeUser(context.Background(), u)
 
 	if _, ok := st.got(u); !ok {
 		t.Error("poke should poll despite the backoff")
@@ -346,4 +355,130 @@ func TestPokeNonBlocking(t *testing.T) {
 	for i := 0; i < pokeBuffer+10; i++ {
 		e.Poke(uuid.New()) // must not block or panic past the buffer
 	}
+}
+
+// multiTokenStore models one user holding SEVERAL tokens with distinct secret ids,
+// which the single-token fakeStore cannot express. It is the fixture for the one
+// property M5's per-token repoint exists to provide.
+type multiTokenStore struct {
+	rows []store.ListAnthropicTokensToPollRow
+
+	mu      sync.Mutex
+	upserts map[uuid.UUID]store.UpsertRateLimitsParams // keyed by user_secret_id
+}
+
+func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnthropicTokensToPollRow, error) {
+	return m.rows, nil
+}
+func (m *multiTokenStore) GetDefaultUserSecretID(context.Context, store.GetDefaultUserSecretIDParams) (uuid.UUID, error) {
+	return m.rows[0].ID, nil
+}
+func (m *multiTokenStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
+	return store.GetUserSecretCiphertextRow{Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK}, nil
+}
+func (m *multiTokenStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upserts[arg.UserSecretID] = arg
+	return nil
+}
+func (m *multiTokenStore) got(secretID uuid.UUID) (store.UpsertRateLimitsParams, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.upserts[secretID]
+	return v, ok
+}
+
+// TestPerTokenPolledIndependently: a user with three tokens produces THREE gauge
+// rows in one tick, each keyed by its own secret id and carrying its own reading.
+// Under the pre-M5 per-user gauge this was impossible — three tokens raced one row.
+func TestPerTokenPolledIndependently(t *testing.T) {
+	user := uuid.New()
+	tokA, tokB, tokC := uuid.New(), uuid.New(), uuid.New()
+	st := &multiTokenStore{
+		rows: []store.ListAnthropicTokensToPollRow{
+			{ID: tokA, UserID: user, Ciphertext: []byte("a"), SealedWith: store.SealedWithMaster},
+			{ID: tokB, UserID: user, Ciphertext: []byte("b"), SealedWith: store.SealedWithMaster},
+			{ID: tokC, UserID: user, Ciphertext: []byte("c"), SealedWith: store.SealedWithMaster},
+		},
+		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
+	}
+	// A distinct reading per token, so a row written against the wrong id would show.
+	pctByCipher := map[string]int{"a": 11, "b": 22, "c": 33}
+	cl := &fakeClient{usage: func(tok []byte) (anthropic.Reading, error) {
+		p := pctByCipher[string(tok)]
+		return reading(p, p, anthropic.SourceUsageEndpoint), nil
+	}}
+	// passthroughOpener returns the ciphertext as the token, so the client tells them apart.
+	e := New(st, passthroughOpener{}, cl, time.Minute, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	e.Boot(context.Background())
+
+	for id, want := range map[uuid.UUID]int{tokA: 11, tokB: 22, tokC: 33} {
+		got, ok := st.got(id)
+		if !ok {
+			t.Fatalf("token %s got no gauge row — a user's tokens are not polled independently", id)
+		}
+		if int(got.FiveHourPct.Int16) != want {
+			t.Errorf("token %s pct = %d, want %d (a reading landed on the wrong token's row)", id, got.FiveHourPct.Int16, want)
+		}
+		if got.UserID != user {
+			t.Errorf("token %s row user_id = %v, want %v", id, got.UserID, user)
+		}
+	}
+	if len(st.upserts) != 3 {
+		t.Fatalf("wrote %d gauge rows, want 3 (one per token)", len(st.upserts))
+	}
+}
+
+// TestPerTokenBackoffIsolation: one refusing credential must NOT silence its owner's
+// other tokens. This is the exact case the feature exists for — a throttled
+// subscription alongside a working console key — and under the pre-M5 per-USER
+// backoff, backing off the user would have skipped every token they hold.
+func TestPerTokenBackoffIsolation(t *testing.T) {
+	user := uuid.New()
+	bad, good := uuid.New(), uuid.New()
+	st := &multiTokenStore{
+		rows: []store.ListAnthropicTokensToPollRow{
+			{ID: bad, UserID: user, Ciphertext: []byte("bad"), SealedWith: store.SealedWithMaster},
+			{ID: good, UserID: user, Ciphertext: []byte("good"), SealedWith: store.SealedWithMaster},
+		},
+		upserts: map[uuid.UUID]store.UpsertRateLimitsParams{},
+	}
+	cl := &fakeClient{usage: func(tok []byte) (anthropic.Reading, error) {
+		if string(tok) == "bad" {
+			return anthropic.Reading{}, httpErr(429) // definitive refusal → backoff
+		}
+		return reading(7, 7, anthropic.SourceUsageEndpoint), nil
+	}}
+	e := New(st, passthroughOpener{}, cl, time.Minute, false /* probe off → refusal arms backoff */,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	e.tickAll(context.Background())
+
+	// The good token got its reading despite its sibling refusing.
+	if _, ok := st.got(good); !ok {
+		t.Fatal("the working token was not polled — a sibling's refusal silenced it")
+	}
+	if _, ok := st.got(bad); ok {
+		t.Error("the refusing token must not have written a row")
+	}
+	// Backoff is per-token: the bad one is backed off, the good one is not.
+	if !e.inBackoff(bad) {
+		t.Error("the refusing token should be backed off")
+	}
+	if e.inBackoff(good) {
+		t.Error("the working token must NOT be backed off — backoff is per-token, not per-user")
+	}
+}
+
+// passthroughOpener returns the ciphertext verbatim as the token, so a per-token
+// test's client can tell the tokens apart by their bytes.
+type passthroughOpener struct{}
+
+func (passthroughOpener) Open(_ context.Context, _ uuid.UUID, _ string) ([]byte, error) {
+	return []byte("default"), nil
+}
+func (passthroughOpener) OpenSealed(_ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
+	return ciphertext, nil
 }

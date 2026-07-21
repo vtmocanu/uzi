@@ -51,6 +51,7 @@ type AgentTemplateAllocation struct {
 }
 
 type AnthropicRateLimit struct {
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	UserID           uuid.UUID          `json:"user_id"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`

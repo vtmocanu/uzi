@@ -154,6 +154,17 @@ milestone that can create a second row.
 **D1 — Binding reaches workers and the judge lane, not repos or runs.**
 A worker names a token; the judge lane names a token; everything else (chat,
 autopilot, CI-fix, which rides the run lane) resolves the user's default.
+
+*Amended during M4: there are **three** resolution rules, not two.* A
+`self_improve` run is repo-ful and therefore rides the **ordinary run lane**
+(`assembleClaim`, not `assembleJudgeClaim`, which forks only on
+`run.Kind == RunKindJudge`), so "self-improve follows the judge binding" — stated
+in M4 below as though it were free — required an explicit branch. Without it a
+self-improve run would have followed the *claiming worker's* binding while
+appearing handled, and no test would have asked. All three rules live in
+`claimSecretID` so R4's "resolution lives in one place" still holds. The original
+two-item phrasing named neither self-improve nor CI-fix explicitly; a future rule
+must be added there and nowhere else.
 Per-repo and per-run pinning are deliberately excluded: they multiply the
 resolution matrix without a demonstrated need, and per-run pinning in particular
 would have to survive requeue-to-another-worker, which conflicts with the
@@ -390,6 +401,14 @@ Phase 2 (parallel, all depend only on M1):
 
 Phase 3 (needs M2/M3/M4/M5 API shapes):
 
+> **Carry-forward from the M3/M4 audit (LOW):** `workerDTOFromWorker` renders a
+> bound worker with an id and a *null* label unless the caller passes the
+> just-resolved label. Every current caller does, so it is a sharp edge, not a
+> defect — but M6's picker must render from a source that always carries the
+> label (the list path's joined `workerDTOFromRow` does; the create/rebind
+> response needs the label threaded, or the UI must re-fetch). Do not render a
+> binding as "spends: (none)" when it is actually bound.
+
 - [ ] **M6 — Web UI.** Settings → Anthropic token becomes a token **list**
       (label, set date, default badge, per-token meters, add/rename/set-default/
       delete with the D5 affected-workers warning); `WorkersSettings.tsx` grows a
@@ -404,6 +423,14 @@ Phase 3 (needs M2/M3/M4/M5 API shapes):
       unaffected (any-row semantics) — no change expected, assert it.
 
 Phase 4 (last):
+
+> **Carry-forward from the M3/M4 audit (LOW):** the judge lane's two writes — the
+> `enabled` flag and the token binding — are deliberately non-transactional
+> (independent settings, both user-visible and re-doable). It is the one place in
+> the M3/M4 diff where a half-applied pair is observable if a request fails
+> between the two statements. M7's `docs/judge.md` should state that enabling the
+> judge and choosing its token are separate saves, so a partial failure leaves a
+> visible, correctable state rather than a silent one.
 
 - [ ] **M7 — Docs and specs.** `docs/anthropic-token.md` rewritten around
       multiple named tokens (its line 45, "it overwrites the old one", is *made
@@ -458,11 +485,28 @@ Phase 4 (last):
   per user per tick; per-token makes it N. Keep the fail-closed and locked-vault
   skips, and measure before M5 is done.
 - **R4 — Resolution-order bugs are silent and expensive.** A wrong fallback
-  spends the wrong account and nothing errors. Mitigation: resolution lives in
-  the one M1 helper (not three copies — today all three lanes already share
-  `openAnthropic`, and that property must be preserved, not broken by M3/M4),
-  table-driven tests over the (worker bound? judge bound? default exists?)
-  matrix, and the resolved label logged (label, never value) on every claim.
+  spends the wrong account and nothing errors. Mitigation, as *built* through M4
+  (refined from the original "one function" wording, which the M3/M4 review
+  showed was imprecise): the credential **open** is genuinely one function
+  (`openAnthropic`, three call sites — run `service.go:802`, judge `judge.go:172`,
+  chat `chat.go:177` with explicit nil). The binding **selection** is not one
+  function — it is `claimSecretID` (worker rule + self_improve→judge rule) plus
+  `assembleJudgeClaim`'s direct `judgeSecretID` call plus chat's nil — but the
+  guarantee that matters holds: **each of the three selection rules is expressed
+  exactly once, and self_improve and judge share `judgeSecretID` so they cannot
+  drift apart.** That is R4's real property (no divergent copies of a rule), not
+  "resolution in a single function". Backed by table-driven tests over the
+  (worker bound? judge bound? default exists?) matrix and the resolved label
+  logged (label, never value) on every claim.
+
+  *Note on symmetry, from the review:* "a failed read of the binding fails the
+  claim" is strictly true only for the **judge** lane (`judgeSecretID` at
+  `judge.go:140` propagates a lookup error, pinned by
+  `TestJudgeBindingLookupErrorFailsClaim`). The **worker** lane has no such read
+  to fail — `workerSecretID` reads `AnthropicSecretID` off the already-claimed
+  worker row, so there is no separate lookup. Not a gap; the two lanes are
+  asymmetric by construction, and a future reader should not expect an M3
+  read-failure path that cannot exist.
 - **R5 — D14's alias behavior change.** `DELETE /api/me/secrets/anthropic_token`
   starts returning 409 for multi-token users. Low blast radius (the web UI moves
   to the id routes in M6) but it is a contract change and belongs in the docs

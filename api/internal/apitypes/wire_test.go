@@ -240,9 +240,14 @@ func TestRateLimitDTOTags(t *testing.T) {
 		"status", "five_hour", "seven_day", "source", "synced_at", "stale")
 }
 
+func TestTokenRateLimitDTOTags(t *testing.T) {
+	assertTags(t, "TokenRateLimitDTO", TokenRateLimitDTO{},
+		"secret_id", "label", "is_default", "limits")
+}
+
 func TestAdminRateLimitRowDTOTags(t *testing.T) {
 	assertTags(t, "AdminRateLimitRowDTO", AdminRateLimitRowDTO{},
-		"id", "email", "name", "vault_locked", "limits")
+		"id", "email", "name", "vault_locked", "tokens")
 }
 
 // TestAgentMemoryWriteRequestTags pins the worker save body: exactly {title, body}
