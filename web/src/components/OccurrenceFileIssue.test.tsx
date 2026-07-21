@@ -404,30 +404,42 @@ describe("OccurrenceFileIssue — the write is issued through the app's API clie
   //   - the forge limiter's MOUNT: not covered — and the gap is far wider than this route.
   //
   // THE DURABLE CLAIM IS THE MECHANISM; the numbers below are one tree's inventory, measured
-  // at 40e96a4c (line numbers belong to that SHA):
+  // against api/ as of 4c87d0f1 (line numbers belong to that SHA):
   //
-  // (a) MOUNT vs BEHAVIOUR. handler.go carries 24 per-user limiter mounts across five
-  //     limiter instances — forge 13, chat 3, auth 3, slackDM 2, hosted 2, judge 1. (A bare
-  //     grep says 27; :399, :456 and :618 are comments.) The only `PerUserMiddleware`
-  //     assertions in the entire api test tree are chat_test.go:212 and slack_test.go:322.
-  //     Deleting ALL 13 `.With(forgeLimiter…)` wrappers leaves `go vet` clean and
-  //     `go test ./...` at zero failures against an equally green baseline — re-run here,
-  //     not inherited. (The auditor separately deleted the 8 chat/slackDM/hosted/judge
-  //     mounts with the same result, so 21 of the 24 are proven unasserted; the remaining 3
-  //     are authLimiter, covered by e2e/run-e2e.sh's repeated-login 429, not by Go.)
+  // (a) MOUNT vs BEHAVIOUR — and the answer is 24 of 24, not a subset. handler.go carries
+  //     24 per-user limiter mounts across SIX limiter instances: forge 13, auth 3, chat 3,
+  //     hosted 2, slackDM 2, judge 1. (A bare grep says 27; :399, :456 and :618 are
+  //     comments.) Stripping ALL 24 `.With(<x>Limiter.PerUserMiddleware)` wrappers leaves
+  //     `go vet` clean and `go test ./...` at zero failures across 41 packages, against an
+  //     equally green baseline — re-run here, not inherited. Every per-user limiter mount in
+  //     this codebase is unasserted.
   //
-  // (b) NEITHER ASSERTION IS ON A forgeLimiter ROUTE AT ALL. chat_test.go's
-  //     `/{id}/continue` rides chatLimiter (handler.go:759) and slack_test.go's `/test-dm`
-  //     rides slackDMLimiter (:467). So `forgeLimiter` — the instance guarding all 13 forge
-  //     routes, including this one — has ZERO assertions of any kind. What those two prove
-  //     is that the shared TYPE `mw.Limiter.PerUserMiddleware` 429s past its budget, through
-  //     two other instances. Do not read "the middleware is exercised" as "forgeLimiter is".
-  //     Worse, each hand-writes its own `chi.NewRouter()` and CONSTRUCTS the very `.With(…)`
-  //     it then observes working — a tautology with respect to the mount, so those two
-  //     routes' own mounts are unasserted too, and both suites stayed green when they were
-  //     deleted.
+  // (b) THE AUTH CARVE-OUT THAT LOOKS LIKE COVERAGE IS A DIFFERENT METHOD. It is tempting to
+  //     except authLimiter, because e2e/run-e2e.sh hammers `POST /api/auth/login` and asserts
+  //     a 429. But login is mounted `authLimiter.Middleware` (handler.go:275) — the IP-keyed
+  //     method. The three PerUserMiddleware auth mounts are `/cli/approve` (:300),
+  //     `/vault/unlock` (:403) and `/vault/passphrase` (:406). One limiter object, two
+  //     methods, DISJOINT mount sets, so that 429 closes none of the 24. handler.go:396-400
+  //     says as much in prose — the per-user key space is "not the login route's key space" —
+  //     which is precisely why an e2e run against login cannot speak for it.
+  //     Worth naming, because it is the sharpest instance and it sits in the half that was
+  //     nearly written off as covered: `/vault/unlock` and `/vault/passphrase` are the
+  //     brute-force controls on a PASSPHRASE endpoint, and nothing asserts either route
+  //     carries a limiter at all.
   //
-  // (c) WHY NOTHING CATCHES IT. review_issue_livedb_test.go calls `h.FileIssue(rr, req)` as
+  // (c) NEITHER EXISTING ASSERTION IS ON A forgeLimiter ROUTE. The only `PerUserMiddleware`
+  //     assertions in the entire api test tree are chat_test.go:212 and slack_test.go:322;
+  //     `/{id}/continue` rides chatLimiter (handler.go:759) and `/test-dm` rides
+  //     slackDMLimiter (:467). So `forgeLimiter` — the instance guarding all 13 forge routes,
+  //     including this one — has ZERO assertions of any kind. What those two prove is that
+  //     the shared TYPE `mw.Limiter.PerUserMiddleware` 429s past its budget (chat_test.go:209
+  //     with a budget of 1, slack_test.go:315 with 2), through two other instances. Do not
+  //     read "the middleware is exercised" as "forgeLimiter is". Worse, each hand-writes its
+  //     own `chi.NewRouter()` and CONSTRUCTS the very `.With(…)` it then observes working — a
+  //     tautology with respect to the mount, so those two routes' own mounts are unasserted
+  //     too, and both suites stayed green when they were stripped.
+  //
+  // (d) WHY NOTHING CATCHES IT. review_issue_livedb_test.go calls `h.FileIssue(rr, req)` as
   //     a plain function and never constructs a router (zero `Routes()` / `chi.NewRouter`
   //     hits in that file), so no middleware chain executes and it could not observe a
   //     missing `.With(…)` even in principle. And `chi.Walk` appears NOWHERE under api/, so
