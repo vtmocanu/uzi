@@ -41,14 +41,32 @@ has had.
 quoted it — the branch's own lesson, applied to the lead. A "validated" label is an assertion like
 any other, and this one was written from memory of dispatches rather than from `git rev-list`.)*
 
-**IN FLIGHT, NOT VALIDATED — three coders were mid-task when the session ended:**
-- **`t2-seam6`** — seam 6 golden fixture + the two-part mock fix (`Array.from` AND the trim set,
-  separately) + the demo-truncation dev toggle. Design is fully ruled in Part A.
-- **`t2-cli`** — the backstop's executing half (Part C). **M8b (Part B) has NOT been started** and
-  goes to this same worktree afterwards: both live in `e2e/run-e2e.sh` and one writer per file is
-  the only safe arrangement. Part C's truncation-remedy row is gated on B4's 2001-row seed, so
-  **B4 lands last and the two land together.**
-- **`t2-lim`** — the admin CLI-token inventory (new product code) plus two queued test items.
+**LANDED AT SESSION END BUT ⚠️ WHOLLY UNVALIDATED — no reviewer or auditor pass on ANY of the
+commits below.** All pushed. Verified against the tree, not from the coders' reports:
+
+- **`t2-seam6` @ `37c4dd98`** — 6 commits, 9 files, **+5172/−69**. Seam 6 appears *complete*:
+  `edc8e585` trims with Go's cutset, `c96e0f49` extracts the grouper to the server's layer,
+  `70c1e301` adds the golden fixture (`fixtures/judge-fidelity/{cases,expected}.json` + README),
+  `5429ebe9` the sort-tiebreak case, `71cc2a63` the demo-truncation toggle. **Both halves of the
+  mock fix are in** — `Array.from(s)` for the rune count *and* a spelled-out cutset class, with a
+  comment stating they are separate divergences. That was the thing most likely to land half-done;
+  it did not.
+- **`t2-cli` @ `4b94f714`** — the backstop split by kind and executed in e2e. **M8b (Part B) is
+  still NOT started** and belongs in this same worktree: both live in `e2e/run-e2e.sh` and one
+  writer per file is the only safe arrangement. Part C's truncation-remedy row is gated on B4's
+  2001-row seed, so **B4 lands last and the two land together.**
+- **`t2-lim` @ `8ce7ba50`** — 5 commits, 14 files, +1378. `c309e8a0` is the **admin CLI-token
+  inventory (new product code)**; `537394fc` records the `/repos/{id}/sync` mutation in the file;
+  `8ce7ba50` pins which config field each limiter is constructed from — **i.e. the construction
+  residual described above may now be closed.** That parse was dispatched with a condition: measure
+  the false-positive risk of a legitimate rename *before* landing. **Confirm that condition was met
+  before trusting it** — the SHA landing is not evidence the control was run.
+
+**So the validation debt is the whole story on resume.** Three branches carrying ~8,400 insertions
+have had **no review and no audit**, including new product code (an admin endpoint) and a new
+public artifact directory (`fixtures/`). The wave's own repeated lesson is that the implementation
+was sound and the certifying layer was not — and right now there is no certifying layer at all for
+this tier.
 
 **The design is COMPLETE**: `prds/98-judge-menu-m8-design.md` on `feature/prd-98-t2-fid` @
 `2befec6f` covers Part A (seam 6), Part B v2 (M8b) and Part C (backstop), all rulings folded in.
