@@ -81,3 +81,34 @@ describe("loadConfig WORKER_MAX_CONCURRENT_RUNS (PRD #42 Decision 3)", () => {
     assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "2.5" })).maxConcurrentRuns, 1);
   });
 });
+
+// PRD #108 M6: UZI_HOME_RECLAIM gates a DESTRUCTIVE startup sweep and ships ON, so
+// its polarity is the whole point — a default-on safety feature that a deployment
+// can disable without meaning to is worse than no kill switch at all.
+describe("loadConfig UZI_HOME_RECLAIM (PRD #108 M6)", () => {
+  it("defaults ON when unset", () => {
+    assert.strictEqual(loadConfig(baseEnv()).homeReclaimEnabled, true);
+  });
+
+  it("treats SET-BUT-EMPTY as unset, not as off", () => {
+    // The finding this test exists for. `parseBool` accepts only 1|true|yes, so an
+    // empty value would read as "off" — and empty is exactly how the var arrives
+    // from a compose `${UZI_HOME_RECLAIM:-}` or a Helm value defaulting to "".
+    // That would silently disable the sweep on every deployment that merely
+    // mentions the variable.
+    assert.strictEqual(loadConfig(baseEnv({ UZI_HOME_RECLAIM: "" })).homeReclaimEnabled, true);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_HOME_RECLAIM: "   " })).homeReclaimEnabled, true);
+  });
+
+  it("turns OFF only on an explicit falsy value", () => {
+    for (const v of ["0", "false", "no", "off", "FALSE", " Off "]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_HOME_RECLAIM: v })).homeReclaimEnabled, false, `value ${JSON.stringify(v)}`);
+    }
+  });
+
+  it("stays ON for the affirmative spellings", () => {
+    for (const v of ["1", "true", "yes", "TRUE", " On "]) {
+      assert.strictEqual(loadConfig(baseEnv({ UZI_HOME_RECLAIM: v })).homeReclaimEnabled, true, `value ${JSON.stringify(v)}`);
+    }
+  });
+});
