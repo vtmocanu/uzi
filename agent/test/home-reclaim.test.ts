@@ -5,7 +5,12 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { nullLogger } from "./helpers.js";
-import { reclaimStrandedRunHomes, TERMINAL_RUN_STATUSES } from "../src/home-reclaim.js";
+import {
+  reclaimStrandedRunHomes,
+  DEFAULT_RECLAIM_MIN_AGE_MS,
+  DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES,
+  TERMINAL_RUN_STATUSES,
+} from "../src/home-reclaim.js";
 import { restoreTreeWritability } from "../src/rmtree.js";
 
 /**
@@ -99,6 +104,33 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
     const summary = await reclaimStrandedRunHomes(root, async () => undefined, nullLogger());
     assert.ok(fs.existsSync(dir));
     assert.strictEqual(summary.skippedStatusUnknown, 1);
+  });
+
+  // The SHIPPED age floor had no coverage: every other test either passes an
+  // explicit minAgeMs or leans on a 24h-old fixture, so the default itself was
+  // never exercised and could have been any value at all.
+  it("uses the shipped age floor by default — just under is skipped, just over is examined", async () => {
+    const justUnder = new Date(Date.now() - (DEFAULT_RECLAIM_MIN_AGE_MS - 60_000));
+    const justOver = new Date(Date.now() - (DEFAULT_RECLAIM_MIN_AGE_MS + 60_000));
+    const young = makeHome(RUN_A, justUnder);
+    const oldEnough = makeHome(RUN_B, justOver);
+
+    const asked: string[] = [];
+    const summary = await reclaimStrandedRunHomes(
+      root,
+      async (id) => {
+        asked.push(id);
+        return "completed";
+      },
+      nullLogger(),
+      // No minAgeMs override — the point is the default.
+    );
+
+    assert.ok(fs.existsSync(young), "a HOME younger than the floor is left alone");
+    assert.strictEqual(fs.existsSync(oldEnough), false, "one older than it is reclaimed");
+    assert.deepStrictEqual(asked, [RUN_B], "and the young one costs no api round-trip");
+    assert.strictEqual(summary.skippedTooRecent, 1);
+    assert.strictEqual(summary.removed, 1);
   });
 
   it("skips a recently-modified HOME even when the api reports it terminal", async () => {
@@ -197,12 +229,16 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
         throw new Error("connect ETIMEDOUT 10.0.0.1:8080");
       },
       nullLogger(),
-      { maxConsecutiveFailures: 3 },
+      // No override: this must exercise the SHIPPED bail, not a number the test made up.
     );
 
-    assert.strictEqual(asked, 3, `must stop after 3 failures, made ${asked} round-trips against 20 candidates`);
+    assert.strictEqual(
+      asked,
+      DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES,
+      `must stop after ${DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES} failures, made ${asked} round-trips against 20 candidates`,
+    );
     assert.strictEqual(summary.stoppedEarly, "api_unreachable");
-    assert.strictEqual(summary.unexamined, 17, "and it reports how much it did not get to");
+    assert.strictEqual(summary.unexamined, 20 - DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, "and it reports how much it did not get to");
     assert.strictEqual(summary.removed, 0);
     assert.strictEqual(fs.readdirSync(root).length, 20, "nothing is deleted when the api cannot be reached");
   });
@@ -219,7 +255,6 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
         return "completed";
       },
       nullLogger(),
-      { maxConsecutiveFailures: 3 },
     );
     assert.strictEqual(summary.stoppedEarly, undefined, "a single failure must not abandon the sweep");
     assert.strictEqual(summary.examined, 3);

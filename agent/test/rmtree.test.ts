@@ -112,31 +112,69 @@ describe("rmTreeForce (PRD #108 M6)", () => {
     await rmTreeForce(path.join(root, "never-existed"));
   });
 
-  it("never follows a symlink out of the tree while restoring permissions", async () => {
+  it("never follows a symlink out of the tree while restoring permissions", async (t) => {
+    // This test was VACUOUS until 2026-07-21 and the fixture is the whole point.
+    //
+    // The original built a tree with NO read-only directory inside `root`, so
+    // rmTreeForce's fast-path `fs.rm` SUCCEEDED and `restoreTreeWritability` — the
+    // only thing that chmods, and therefore the only thing that could follow a
+    // symlink — never ran at all. Every assertion below passed without the code
+    // under test executing. Proven by mutation, not by reading: deliberately
+    // dropping O_NOFOLLOW and descending into symlink entries left all four tests
+    // in this file GREEN.
+    //
+    // So the read-only directory below is LOAD-BEARING. It forces the fast path to
+    // fail with EACCES, which is the only way the permission-restoring walk runs
+    // and the only way this test can observe the guard it claims to test.
+    if (asRoot) {
+      t.skip("running as uid 0 — root bypasses the 0555 fixture, so the walk would not be forced");
+      return;
+    }
     const root = await mktmp();
     const outside = await mktmp();
     try {
       const keep = path.join(outside, "keep");
       await fs.mkdir(keep, { recursive: true });
       await fs.writeFile(path.join(keep, "precious"), "do not touch\n", "utf8");
-      await fs.chmod(keep, 0o555);
 
       const home = path.join(root, "home");
-      await fs.mkdir(home, { recursive: true });
+      // The read-only directory that forces the walk. Without this the fast path
+      // succeeds and nothing below is exercised.
+      const readOnly = path.join(home, "go", "pkg", "mod", "example.com", "dep@v1.0.0");
+      await fs.mkdir(readOnly, { recursive: true });
+      await fs.writeFile(path.join(readOnly, "dep_test.go"), "package dep\n", "utf8");
       await fs.symlink(keep, path.join(home, "escape"), "dir");
+      // chmod last, so a later mkdir cannot undo it.
+      await fs.chmod(keep, 0o555);
+      await fs.chmod(readOnly, 0o555);
+      await assertReadOnlyDir(readOnly);
+      await assertReadOnlyDir(keep);
+
+      // Drive the walk DIRECTLY rather than through rmTreeForce. The guard lives in
+      // restoreTreeWritability, so calling it is what makes this test about the
+      // guard; going through rmTreeForce would leave the assertions hostage to
+      // whether the fast path happened to fail. (A destructive premise-check does
+      // not work here either: `fs.rm` removes what it reaches before it fails, and
+      // the symlink is one of those things — it would delete the very entry this
+      // test exists to observe.)
+      await restoreTreeWritability(root);
+
+      // POSITIVE CONTROL, non-destructive: the walk really ran, proven by its own
+      // effect INSIDE the tree. Without this the mode assertion below is free.
+      const walked = (await fs.lstat(readOnly)).mode & 0o700;
+      assert.strictEqual(walked, 0o700, "restoreTreeWritability must have widened the read-only dir it walked");
+
+      // The guard: the symlink's TARGET, outside the tree, is untouched.
+      assert.strictEqual(
+        ((await fs.lstat(keep)).mode & 0o777).toString(8),
+        "555",
+        "the symlink target's mode is untouched — the walk must not chmod through a symlink",
+      );
 
       await rmTreeForce(root);
 
       assert.strictEqual(await exists(root), false, "the tree itself is removed");
       assert.ok(await exists(path.join(keep, "precious")), "the symlink target's contents survive");
-      if (!asRoot) {
-        const st = await fs.lstat(keep);
-        assert.strictEqual(
-          (st.mode & 0o777).toString(8),
-          "555",
-          "the symlink target's mode is untouched — the walk must not chmod through a symlink",
-        );
-      }
     } finally {
       await forceCleanup(root);
       await forceCleanup(outside);

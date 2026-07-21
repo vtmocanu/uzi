@@ -29,9 +29,29 @@ import { RUN_ID_RE } from "./util.js";
  *    → the run may still resume into this HOME, skip.
  *
  * A requeued run reads `queued`, and a run live on ANOTHER worker sharing the
- * volume reads `running` — both non-terminal, both skipped. A terminal run never
- * resumes (`runner.ts` removes the HOME itself on terminal), so a directory that
- * survives beside a terminal status is by definition strandage.
+ * volume reads `running` — both non-terminal, both skipped.
+ *
+ * **What "terminal" does and does not mean.** It means the SERVER considers the run
+ * over. It does NOT mean a process stopped writing, and an earlier version of this
+ * comment claimed it did ("a terminal run never resumes, so a directory that
+ * survives beside a terminal status is by definition strandage"). That was false,
+ * and it mattered because — per `DEFAULT_RECLAIM_MIN_AGE_MS` below — the status
+ * check is the only guard left past `minAgeMs`. Terminal state can be stamped
+ * server-side while a worker is still executing:
+ *
+ *  - `SweepRunningTimeout` (`api/internal/store/queries/runtime.sql`) sets
+ *    `status = 'failed'` for a run past `RUN_TIMEOUT` and enqueues **no** stop
+ *    verdict; there is no worker state poll, so the worker keeps running and keeps
+ *    writing into this HOME while the row reads `failed`.
+ *  - `FailRunsOfStaleWorkersOverCap` does the same for a worker that stopped
+ *    heartbeating but is alive — a network partition, not a dead process.
+ *
+ * So a sibling worker booting in that window can delete a HOME an SDK is actively
+ * using. The consequence is bounded rather than absent: the run is already terminal
+ * server-side, so that worker's output is doomed regardless and nothing the product
+ * keeps is lost — the damage is an obscure ENOENT during its teardown. Stated
+ * plainly because the guarantee this sweep actually offers is "the server says it
+ * is over", and a future reader must not upgrade that to "nothing is writing".
  */
 
 /** Run statuses a run never leaves (`runs.status` CHECK, migration `00020`:
@@ -78,12 +98,12 @@ export const DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES = 3;
  * common outage; this bounds every other slow shape (a very large volume, an api
  * that is slow but not failing) so startup can never be held hostage by cleanup.
  */
-export const DEFAULT_RECLAIM_DEADLINE_MS = 60_000;
+const DEFAULT_RECLAIM_DEADLINE_MS = 60_000;
 
 /** Cap on directories examined per boot, so a pathological volume cannot turn
  *  startup into an unbounded sequence of API round-trips. The next boot picks up
  *  where this one stopped (the removed ones are gone). */
-export const DEFAULT_RECLAIM_MAX_ENTRIES = 500;
+const DEFAULT_RECLAIM_MAX_ENTRIES = 500;
 
 /**
  * Resolve a run's status. Resolving to `undefined` — or throwing — both mean
