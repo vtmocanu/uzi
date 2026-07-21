@@ -538,3 +538,291 @@ describe("ActivityFeed accessibility (preserved)", () => {
     expect(container.querySelector('[role="log"]')?.getAttribute("aria-live")).toBe("off");
   });
 });
+
+// ── PRD #99 — instance lanes (M5) ─────────────────────────────────────────────
+// Every test above builds messages with `m()`, which hardcodes agent_instance and
+// agent_label to null — so the whole instance-keyed path was invisible to the suite:
+// MEASURED at M5, making laneKeyOf ignore agent_instance (Problem 2 verbatim — two
+// parallel coders merging into one lane) left all 816 tests green, and swapping the
+// plain `{label}` render for <Markdown> left all 30 ActivityFeed tests green. Nothing
+// below may use `m()`; a By-agent assertion that does not supply a non-null instance
+// id is vacuous by construction.
+function mi(
+  seq: number,
+  agent: string,
+  agent_instance: string | null,
+  agent_label: string | null,
+  over: { kind?: string; payload?: unknown; created_at?: string } = {},
+): RunMessage {
+  const {
+    kind = "text",
+    payload = { text: `msg ${seq}` },
+    created_at = "2026-07-04T00:00:00.000Z",
+  } = over;
+  return { seq, kind, agent, agent_instance, agent_label, payload, created_at };
+}
+
+// Two parallel coder invocations, NON-ADJACENT (a reviewer frame between them). The
+// non-adjacency is load-bearing: two contiguous coder frames render as one block even
+// under the pre-#99 consecutive-author grouping, so they cannot catch the merge bug.
+function twoParallelCoders(): RunMessage[] {
+  return [
+    mi(1, "lead", null, null),
+    mi(2, "coder", "toolu_A", "API wiring"),
+    mi(3, "reviewer", "toolu_R", "audit unit A"),
+    mi(4, "coder", "toolu_B", "web gate UX"),
+    mi(5, "coder", "toolu_A", "API wiring"),
+  ];
+}
+
+// Lane titles carry the Expand/Collapse verb, which flips with the auto-expand rule
+// (terminal or single-actor). Match on the tail so a test states the LANE, not its
+// expansion state.
+const laneTitles = (r: { getAllByRole: (...a: never[]) => HTMLElement[] }): string[] =>
+  (r.getAllByRole as unknown as (role: string, o: object) => HTMLElement[])("button", {
+    name: /activity$/,
+  }).map((b) => (b.getAttribute("aria-label") ?? "").replace(/^(Expand|Collapse) | activity$/g, ""));
+
+describe("ActivityFeed instance lanes (PRD #99)", () => {
+  it("splits two parallel same-role invocations into two lanes titled by their task", () => {
+    const r = renderFeed(twoParallelCoders(), { status: "running", health: "ok" });
+    // The whole point of the PRD: `coder` appears twice, distinctly labelled, never
+    // merged into one block.
+    expect(r.getByRole("button", { name: /coder · API wiring activity$/ })).toBeTruthy();
+    expect(r.getByRole("button", { name: /coder · web gate UX activity$/ })).toBeTruthy();
+    // Four actors → four lanes: lead, coder/A, reviewer, coder/B. A merge collapses
+    // this to three, which is the mutation this test exists to fail.
+    expect(laneTitles(r).sort()).toEqual([
+      "coder · API wiring",
+      "coder · web gate UX",
+      "lead",
+      "reviewer · audit unit A",
+    ]);
+  });
+
+  it("coalesces an instance's NON-ADJACENT later turns back into its own lane", () => {
+    // seq 2 and seq 5 are the same invocation with a reviewer frame between them, so
+    // the lane holds both — the fix for Problem 1's repeated near-empty bars.
+    const r = renderFeed(twoParallelCoders(), { status: "completed" });
+    const lane = r.getByRole("button", { name: /coder · API wiring activity$/ }).closest("div")
+      ?.parentElement;
+    expect(lane?.textContent).toContain("msg 2");
+    expect(lane?.textContent).toContain("msg 5");
+    // …and the OTHER coder's message is not in it.
+    expect(lane?.textContent).not.toContain("msg 4");
+  });
+
+  it("keys the lane with || not ?? — an empty-string instance falls back to the ROLE", () => {
+    // "" cannot reach the browser (the API stores it as SQL NULL) but the type admits
+    // it, and `??` would keep it as a key, splitting one role into two lanes for a
+    // value that means absence. This is the only fixture in the suite that can tell
+    // `||` from `??`.
+    const r = renderFeed(
+      [mi(1, "coder", "", null), mi(2, "coder", null, null)],
+      { status: "running", health: "ok" },
+    );
+    expect(laneTitles(r)).toEqual(["coder"]);
+  });
+
+  it("titles a lane from its first NON-LEAD role, so a replay-shaped opener does not win", () => {
+    // An SDK replay frame carries parent_tool_use_id but no subagent_type, and the
+    // worker's `subagent_type ?? "lead"` stores the literal "lead" on it. A lane can
+    // therefore OPEN lead-looking and hold a coder's work (Decision 8).
+    const r = renderFeed(
+      [mi(1, "lead", "toolu_C", null), mi(2, "coder", "toolu_C", "web gate UX")],
+      { status: "running", health: "ok" },
+    );
+    expect(laneTitles(r)).toEqual(["coder · web gate UX"]);
+    // Testing `agent != null` instead would NOT discriminate: the absent field is
+    // already collapsed to "lead" upstream and never arrives as null.
+    expect(r.queryByRole("button", { name: /^(Expand|Collapse) lead/ })).toBeNull();
+  });
+
+  it("keeps an all-`lead` lane titled lead — a repo may ship .claude/agents/lead.md", () => {
+    // agent_instance != null does NOT imply agent != "lead": a repo-authored `lead`
+    // registers as an ordinary invocable subagent (no lead filter in
+    // subagentsFromTemplates), so two parallel invocations of it are two real lanes.
+    // A "first non-lead role, else bust" rule breaks exactly here, and so does the
+    // write-side guard that Decision 8 declined twice.
+    const r = renderFeed(
+      [
+        mi(1, "lead", "toolu_L1", "shard 1"),
+        mi(2, "lead", "toolu_L2", "shard 2"),
+        mi(3, "lead", "toolu_L1", "shard 1"),
+      ],
+      { status: "running", health: "ok" },
+    );
+    expect(laneTitles(r).sort()).toEqual(["lead · shard 1", "lead · shard 2"]);
+  });
+
+  it("takes the label from the first frame carrying one, independently of the role", () => {
+    // laneLabel is a SEPARATE scan from laneRole (Decision 1/3): agent_label can be
+    // absent for reasons that have nothing to do with the role, so a labelless opening
+    // frame must not cost the lane its title.
+    const r = renderFeed(
+      [mi(1, "coder", "toolu_A", null), mi(2, "coder", "toolu_A", "web gate UX")],
+      { status: "running", health: "ok" },
+    );
+    expect(laneTitles(r)).toEqual(["coder · web gate UX"]);
+  });
+
+  it("renders a labelless lane as the bare role — no `·` suffix, no placeholder", () => {
+    const r = renderFeed([mi(1, "reviewer", "toolu_R", null)], { status: "running", health: "ok" });
+    expect(laneTitles(r)).toEqual(["reviewer"]);
+  });
+
+  it("coalesces a legacy NULL-instance run into one lane per ROLE ([C3])", () => {
+    // leadWorkerLead() is nine messages of lead/worker/lead built with `m()` — every
+    // instance NULL, i.e. a pre-migration run. By-agent must show two lanes, not the
+    // four blocks the pre-#99 consecutive-author grouping produced.
+    const r = renderFeed(leadWorkerLead(), { status: "running", health: "ok" });
+    expect(laneTitles(r).sort()).toEqual(["lead", "worker"]);
+  });
+});
+
+describe("ActivityFeed lane dots + role rollup (PRD #99)", () => {
+  it("pulses exactly ONE lane — the active INSTANCE, not the active role", () => {
+    // Scoped to role="log" (ActivityFeed.tsx's only one) so the rollup strip's own
+    // chips cannot be counted as lane dots. Keyed by role instead of lane, both coder
+    // lanes would pulse.
+    const { container } = renderFeed(twoParallelCoders(), { status: "running", health: "ok" });
+    const log = container.querySelector('[role="log"]');
+    expect(log).not.toBeNull();
+    expect(log?.querySelectorAll(".animate-pulse").length).toBe(1);
+    // …and it is the newest message's lane (seq 5 → toolu_A), not the other coder's.
+    expect(container.querySelector('[title="coder · API wiring: working"]')).not.toBeNull();
+    expect(container.querySelector('[title="coder · web gate UX: working"]')).toBeNull();
+  });
+
+  it("shows NO strip for a small By-agent crew — the collapsed lanes ARE the roster", () => {
+    const { container } = renderFeed(
+      [mi(1, "lead", null, null), mi(2, "coder", "toolu_A", "x"), mi(3, "reviewer", "toolu_R", "y")],
+      { status: "running", health: "ok" },
+    );
+    expect(container.querySelector('[aria-label="Crew"]')).toBeNull();
+  });
+
+  it("shows the rollup once a role is DOUBLED, counting instances regardless of state", () => {
+    // Corrected at M4: the trigger is the instance count, not liveness — a completed
+    // run with two coder lanes still rolls up.
+    const { container, getByRole } = renderFeed(twoParallelCoders(), { status: "completed" });
+    expect(container.querySelector('[aria-label="Crew"]')).not.toBeNull();
+    expect(getByRole("button", { name: "Jump to coder activity (2 instances, done)" })).toBeTruthy();
+  });
+
+  it("shows the rollup once lanes OVERFLOW the glance threshold, with no role doubled", () => {
+    // Seven single-instance roles: no role is doubled, so only the >6 arm can fire.
+    const roles = ["lead", "coder", "reviewer", "tester", "auditor", "architect", "documenter"];
+    const { container } = renderFeed(
+      roles.map((role, i) => mi(i + 1, role, `toolu_${i}`, null)),
+      { status: "running", health: "ok" },
+    );
+    expect(container.querySelector('[aria-label="Crew"]')).not.toBeNull();
+  });
+
+  it("gives a doubled role the WORST state of its instances, not the first or the last", () => {
+    // Lane order is A, B, C and the worst state sits in the MIDDLE, so "take the first"
+    // and "take the last" both produce `idle` while worst-wins produces `stalled`.
+    // Attention priority: stalled > waiting > working > idle > done.
+    const now = Date.now();
+    const old = new Date(now - 120_000).toISOString();
+    const fresh = new Date(now - 500).toISOString();
+    const { getByTitle, queryByTitle } = renderFeed(
+      [
+        mi(1, "coder", "toolu_A", "A", { created_at: old }),
+        mi(2, "coder", "toolu_B", "B", { created_at: old }),
+        mi(3, "coder", "toolu_C", "C", { created_at: old }),
+        mi(4, "coder", "toolu_B", "B", { created_at: fresh }), // newest → B is the live lane
+      ],
+      { status: "running", health: "looping" },
+    );
+    expect(getByTitle("coder ×3: stalled")).toBeTruthy();
+    expect(queryByTitle("coder ×3: idle")).toBeNull();
+    expect(queryByTitle("coder ×3: done")).toBeNull();
+  });
+
+  it("keeps the Timeline jump strip, which groups by ROLE and never mentions instances", () => {
+    selectTimelineView();
+    const { container, getByRole } = renderFeed(twoParallelCoders(), {
+      status: "running",
+      health: "ok",
+    });
+    expect(container.querySelector('[aria-label="Crew"]')).not.toBeNull();
+    // Timeline's chip is per-role with no instance count — the pre-#99 shape.
+    expect(getByRole("button", { name: /^Jump to coder activity \((working|waiting|idle)\)$/ })).toBeTruthy();
+  });
+});
+
+describe("ActivityFeed lane label is untrusted-ish text (PRD #99 Decision 7)", () => {
+  // The label is model-authored prose. It renders PLAIN — never through <Markdown> —
+  // and the assertions below deliberately carry BOTH an HTML and a markdown vector: a
+  // markdown renderer escapes the raw <img> while still parsing **bold** and the link,
+  // so an angle-bracket-only check would pass against the very sink Decision 7 exists
+  // to forbid. The `strong` and `a` assertions are the load-bearing ones.
+  //
+  // The payload is 43 runes, under the 48-rune layout clamp, so all three vectors reach
+  // the DOM intact. (The lead's longer draft clamped mid-link, which would have made the
+  // `a` assertion vacuous — MEASURED, hence the shortened link.)
+  const HOSTILE = '<img src=x onerror=alert(1)> **b** [l](j:1)';
+
+  // Rendered through the REAL By-agent view, not the block in isolation: isolation can
+  // miss the actual sink. Scoped to the lane HEADER because the collapsed body is still
+  // in the DOM and message text DOES render through <Markdown> (RunEvent.tsx:741), which
+  // would otherwise supply a false-positive <strong>.
+  function hostileHeader(): HTMLElement {
+    const r = renderFeed(
+      [
+        mi(1, "coder", "toolu_A", HOSTILE, { payload: { text: "plain body" } }),
+        mi(2, "reviewer", "toolu_R", "safe", { payload: { text: "plain body" } }),
+      ],
+      { status: "running", health: "ok" },
+    );
+    const header = r
+      .getByRole("button", { name: new RegExp("coder · " + HOSTILE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " activity$") })
+      .parentElement;
+    if (!header) throw new Error("lane header not found");
+    return header;
+  }
+
+  it("renders the label plain: no img, no strong, no anchor", () => {
+    const header = hostileHeader();
+    expect(header.querySelector("img")).toBeNull();
+    expect(header.querySelector("strong")).toBeNull();
+    expect(header.querySelector("a")).toBeNull();
+  });
+
+  it("keeps the raw markup as INERT TEXT", () => {
+    const header = hostileHeader();
+    expect(header.textContent).toContain("<img src=x");
+    expect(header.textContent).toContain("**b**");
+    expect(header.textContent).toContain("[l](j:1)");
+  });
+
+  it("puts the CLAMPED label — not the raw one — in the title and aria-label", () => {
+    // A 65-rune label with a distinctive tail. The layout clamp (48) must apply to the
+    // accessible name and the tooltip too, or the a11y surface leaks the unclamped
+    // model text that the visible one refuses to show.
+    const LONG = "lane grouping and the conditional role rollup for PRD ninety-nine";
+    const { container, getByRole } = renderFeed(
+      [mi(1, "coder", "toolu_A", LONG), mi(2, "reviewer", "toolu_R", "safe")],
+      { status: "running", health: "ok" },
+    );
+    const aria = getByRole("button", { name: /coder · lane grouping/ }).getAttribute("aria-label") ?? "";
+    // The tail check comes FIRST deliberately: vitest truncates a long string in its
+    // own failure output with an ellipsis, so a failing `toContain("…")` prints a
+    // message that appears to contradict itself. The tail assertion fails legibly.
+    expect(aria).not.toContain("ninety-nine");
+    expect(aria).toContain("…");
+
+    const dot = container.querySelector('[title^="coder · lane grouping"]');
+    expect(dot).not.toBeNull();
+    expect(dot?.getAttribute("title")).toContain("…");
+    expect(dot?.getAttribute("title")).not.toContain("ninety-nine");
+
+    // The visible label and the accessible name must agree — a disagreement between
+    // them is the signal, so assert both carry the SAME clamped string.
+    const visible = container.querySelector(".font-mono")?.textContent ?? "";
+    expect(visible.endsWith("…")).toBe(true);
+    expect(aria).toContain(visible);
+  });
+});

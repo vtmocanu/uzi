@@ -1227,6 +1227,19 @@ echo "$MSGS" | jq -e '.messages | (length > 0) and ([.[].seq] == [range(1; lengt
   || fail "run_messages seq is not a gapless 1..N sequence (across the restart)"
 pass "run_messages seq is gapless 1..$(echo "$MSGS" | jq '.messages | length') across the restart"
 
+# PRD #99: the LEGACY shape. This run is the ordinary (non-interleave) stub, which
+# emits no subagent attribution at all — exactly what every pre-migration row looks
+# like. Both columns must be PRESENT on the wire and explicitly `null`, never absent
+# and never "": MessageDTO's tags are not omitempty precisely so the browser's
+# RunMessage can require the fields, which is what makes deleting the carry in
+# applyFrame a compile error instead of a silent loss of lane identity. Under By-agent
+# such a run coalesces into one lane per ROLE — the intended Problem-1 fix.
+echo "$MSGS" | jq -e '.messages | (length > 0) and all(has("agent_instance") and has("agent_label"))' >/dev/null \
+  || fail "REST messages must always carry both attribution keys (they are not omitempty)"
+echo "$MSGS" | jq -e '.messages | all(.agent_instance == null and .agent_label == null)' >/dev/null \
+  || fail "a legacy (no-subagent) run must carry NULL for both attribution columns, never \"\""
+pass "PRD #99: legacy run carries both attribution keys, both null -> role-coalesced lanes"
+
 # PRD #40: the API folds the terminal result frame's usage onto the run, aggregates
 # it into /api/usage, and keeps the per-agent row in the stream (the three surfaces
 # M4 renders from). That PROPERTY is what PRD #40 owns and it holds under either
@@ -3110,6 +3123,42 @@ echo "$MSGS_IL" | jq -e '
   || fail "interleaved frames do not carry strictly-increasing distinct seqs"
 pass "per-agent attribution intact after round-trip: $SCRIPTED_IL"
 
+# --- PRD #99: per-INSTANCE attribution on the same interleaved stream ----------
+# The lanes are drawn in the browser, which this harness does not run; what it CAN
+# prove is the wire contract they are built from, and that contract is the whole
+# feature. NO new frames were needed: PRD #99 M2 added the two columns to the
+# EXISTING six, so EXPECT_IL above is untouched and stays frozen.
+#
+# An exact vector, mirroring EXPECT_IL's style, so a reorder/relabel/drop all fail
+# with the actual value printed.
+ATTR_IL="$(echo "$MSGS_IL" | jq -c '[.messages | sort_by(.seq)[] | select(.payload.step != null) | [.agent, .agent_instance, .agent_label]]')"
+EXPECT_ATTR_IL='[["lead",null,null],["coder","stub-inst-a","API wiring"],["reviewer","stub-inst-rev-a","audit unit A"],["coder","stub-inst-b","web gate UX"],["reviewer","stub-inst-rev-b","audit unit B"],["lead",null,null]]'
+[ "$ATTR_IL" = "$EXPECT_ATTR_IL" ] \
+  || fail "PRD #99 attribution altered through persistence (got $ATTR_IL, want $EXPECT_ATTR_IL)"
+pass "PRD #99: both attribution columns round-trip verbatim on every scripted frame"
+
+# The load-bearing PROPERTY, stated independently of the literal above so it survives
+# a future fixture edit: the two same-role `coder` frames carry DIFFERENT non-null
+# instance ids. Equal ids — or null ones — are Problem 2 verbatim (the two parallel
+# coders merge into one garbled lane), and every other assertion in this phase still
+# passes in that state, which is exactly why this one is written separately.
+echo "$MSGS_IL" | jq -e '
+  [.messages[] | select(.payload.step != null and .agent == "coder")] as $c
+  | ($c | length) == 2
+    and ($c[0].agent_instance != null) and ($c[1].agent_instance != null)
+    and ($c[0].agent_instance != $c[1].agent_instance)
+    and ($c[0].agent_label != $c[1].agent_label)' >/dev/null \
+  || fail "the two parallel coder frames lost their DISTINCT instance ids/labels (Problem 2: they would merge into one lane)"
+pass "PRD #99: two parallel coder invocations stay distinguishable -> two labelled lanes, no merged coder block"
+
+# The lead is the parentless actor: both columns null on the interleaved stream too,
+# so it falls back to a role-keyed lane beside the two instance-keyed ones.
+echo "$MSGS_IL" | jq -e '
+  [.messages[] | select(.payload.step != null and .agent == "lead")]
+  | (length == 2) and all(.agent_instance == null and .agent_label == null)' >/dev/null \
+  || fail "the scripted lead frames should carry NULL for both attribution columns"
+pass "PRD #99: lead frames carry NULL instance + label (the role-fallback lane)"
+
 # (3) Reconnect replay: REST `?after=<seq>` from a pivot INSIDE the interleave returns
 #     exactly the tail (same seqs, same order) — the same interleaved order a WS
 #     reconnect would replay. Pivot = the seq of scripted step 2 (the first `coder`),
@@ -3119,9 +3168,13 @@ PIVOT_IL="$(echo "$MSGS_IL" | jq '[.messages[] | select(.payload.step == 2)][0].
 REPLAY_IL="$(apiget "/api/runs/$RUN_IL/messages?after=$PIVOT_IL")"
 echo "$REPLAY_IL" | jq -e --argjson p "$PIVOT_IL" '.messages | (length > 0) and all(.seq > $p)' >/dev/null \
   || fail "replay ?after=$PIVOT_IL returned a message with seq <= pivot"
-# The replay is byte-identical to the tail of the full stream (seq/agent/kind/payload, in order).
-FULL_TAIL_IL="$(echo "$MSGS_IL" | jq -c --argjson p "$PIVOT_IL" '[.messages | sort_by(.seq)[] | select(.seq > $p) | {seq, agent, kind, payload}]')"
-REPLAY_LIST_IL="$(echo "$REPLAY_IL" | jq -c '[.messages | sort_by(.seq)[] | {seq, agent, kind, payload}]')"
+# The replay is byte-identical to the tail of the full stream (seq/agent/kind/payload,
+# in order). PRD #99 added agent_instance/agent_label to the projection: without them a
+# replay that dropped the lane identity matched the tail anyway, so a reconnect could
+# silently re-place every subagent message into the NULL-instance role lane and this
+# assertion would still pass.
+FULL_TAIL_IL="$(echo "$MSGS_IL" | jq -c --argjson p "$PIVOT_IL" '[.messages | sort_by(.seq)[] | select(.seq > $p) | {seq, agent, agent_instance, agent_label, kind, payload}]')"
+REPLAY_LIST_IL="$(echo "$REPLAY_IL" | jq -c '[.messages | sort_by(.seq)[] | {seq, agent, agent_instance, agent_label, kind, payload}]')"
 [ "$FULL_TAIL_IL" = "$REPLAY_LIST_IL" ] || fail "replay ?after=$PIVOT_IL did not match the tail of the full stream"
 # And specifically: the interleaved order of the scripted frames after the pivot is preserved.
 echo "$REPLAY_IL" | jq -e '
