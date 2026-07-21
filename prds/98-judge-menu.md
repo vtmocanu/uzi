@@ -3,7 +3,16 @@
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
-**Progress (2026-07-21)** — 6 of 8 milestones landed, **MR opened with the PRD still open**. Work resumes in THIS PRD, not a follow-up.
+**Progress (2026-07-21, session end)** — 6 of 8 milestones landed. **NO MR opened yet.** Work resumes in THIS PRD, not a follow-up. Branch `feature/prd-98-judge-menu` @ `a5b65617`, 35 commits.
+
+### RESUME HERE — the four things to do next, in order
+
+1. **Finish the in-flight fixture fix (BLOCKING, partly written and uncommitted).** Two test files are dirty in the worktree: `api/internal/handler/judge_bulk_disposition_livedb_test.go` and `api/internal/store/judge_recommendations_integration_test.go`. **Three parts:** (a) give `bulkFixture` **two recommendations with different rationale texts** — today it writes `'because'` on every row, so folding `rr.rationale_md → 'because'::text` passes **and nothing in the live-DB suite catches it**; (b) add an **unfiled coordinate inside `autoRev`** — today `autoRev`/`handRev` are different reviews, so `f.review_id = rv.id` alone separates them and the filed-issues join's **coordinate predicate is unpinned by anything**; (c) **fix the assertion wording** — `judge_recommendations_integration_test.go:514` fails with *"the column is not row-scoped"* but fires on a wrong **value**; real row-scoping stays green. Without (c) the fix closes the holes and leaves the misleading label pointing at them. **Acceptance: both folds must redden after the fix.**
+2. **M5** — the notification retarget. Land the **third `triage.todo` consumer** as it is written: the notification must read the canonical count, not re-derive it, and one test must mount nav badge + tab + notification **together** (mounted apart they have always all been correct — that is how the earlier badge/tab drift survived a whole milestone).
+3. **M8a docs** — `docs/judge.md`, `docs/cli.md`, `specs/ai.md`. **Do not describe deferred work as shipped**: no e2e coverage exists, mock↔server fidelity is not asserted, and `OccurrenceFileIssue` has no tests.
+4. **Then the MR** — after a review pass, and with the **migration re-check run fresh** (see the PRE-MR GATE in the checkpoint; it expires and its failure mode is every upgraded instance refusing to boot).
+
+**Handoff document:** `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` — branch state, standing rules with the incident behind each, the docker safety rule about the user's real stack, the projection-pin criterion, and the pre-MR gate.
 
 - **Done, reviewed + audited**: M1 (`0874d3f6`), M2 (`30204a61`, later collapsed to one atomic statement), M6 (`d6a8545c`), M4 (`1da5ac32`), M3 (`c629ce28`), M7 (`de2d8de3`). Plus a merge of `origin/main` (`ad5abca1`, 38 commits — PRD #97 landed, which unblocked M8b).
 - **In this MR**: M5, M8a docs, and the last open Blocking (a measured-false CLI instruction).
@@ -813,8 +822,13 @@ Four items. All found by execution, all with evidence recorded here or in the M3
       measurement: only the *minimal type-preserving* fold is a valid test here — two earlier
       attempts changed the generated Go type or perturbed an unrelated test, so a green from
       a non-minimal fold proves nothing.)
-      **Honest count for the MR: 14 of 16 projections pinned with VERIFIED isolation.** Two
-      are asserted but not exercised, and **both have the same root cause: every fixture row
+      **Honest count for the MR: 15 of 16 projections pinned with VERIFIED isolation, plus
+      one unpinned JOIN predicate that is not a projection at all.** The `filed_at`
+      *projection* IS isolated (folding `f.filed_at → now()` reddens via the unfiled-row
+      absence check); what is unpinned is the filed-issues join's **coordinate predicate**,
+      which affects the row-scoping of the four columns riding it. The one unisolated
+      projection is `rationale_md`, and **nothing in the live-DB suite catches its fold** —
+      no incidental coverage. **Both remaining gaps share one root cause: every fixture row
       carries identical values.** `bulkFixture` hardcodes `'because'` as the rationale on
       every row, so folding `rr.rationale_md → 'because'::text` collapses the stored hash and
       the read-back value to the same thing and the test **goes green** (measured). And
