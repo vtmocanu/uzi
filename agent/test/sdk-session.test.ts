@@ -1,14 +1,20 @@
-// Issue #105: the resume preflight. These pin the FAIL-OPEN cut line, which is the
-// whole safety argument — "the file is not there" (ENOENT/ENOTDIR) is an answer and
-// drops the resume, anything else is a failure to look and must keep it, because a
-// spurious "absent" silently discards a good session.
+// Issue #105: the resume preflight. Two properties are pinned here, both load-bearing.
 //
-// The path layout asserted here (`$HOME/.claude/projects/<encoded-cwd>/<sid>.jsonl`)
-// was verified against the real CLI shipped with @anthropic-ai/claude-agent-sdk
-// 0.3.201, in both directions: an empty HOME makes `--resume` fail locally with
-// "No conversation found with session ID: …" (exit 1, duration_api_ms 0 — it never
-// reaches the API), and planting a transcript at exactly that path gets the same
-// invocation past resolution and on to an auth failure.
+// SUPERSET (the glob is deliberately broader than the CLI's own lookup): the check finds
+// a transcript in ANY project dir, and through a SYMLINKED one — so it can never produce
+// a FALSE ABSENT, the one destructive error. The CLI encodes realpath(cwd), so a single
+// computed dir would false-absent on any symlinked data dir; the glob's only possible
+// error is a harmless false present. See the sdk-session.ts header for the full argument.
+//
+// FAIL-OPEN cut line: "the file is not there" (ENOENT/ENOTDIR) is an answer and drops the
+// resume; anything else (unreadable dir, unparseable id) is a failure to look and keeps
+// it, because a spurious absent silently discards a good session.
+//
+// The path layout (`$HOME/.claude/projects/<dir>/<sid>.jsonl`) was verified against the
+// real CLI shipped with @anthropic-ai/claude-agent-sdk 0.3.201: an empty HOME makes
+// `--resume` fail locally with "No conversation found with session ID: …" (exit 1,
+// duration_api_ms 0 — it never reaches the API), and planting a transcript at that path
+// gets the same invocation past resolution and on to an auth failure.
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -66,6 +72,20 @@ describe("sessionTranscriptResolvable (issue #105)", () => {
     fs.mkdirSync(projects, { recursive: true });
     fs.writeFileSync(path.join(projects, `${SID}.jsonl`), "{}\n"); // not inside a project dir
     assert.equal(await sessionTranscriptResolvable(home, SID), false);
+  });
+
+  it("finds a transcript through a SYMLINKED project dir (no isDirectory filter)", async () => {
+    // A Dirent for a symlink-to-dir has isDirectory() === false. An isDirectory()
+    // guard would skip it and answer absent — a false absent, the one destructive
+    // error. This is why the loop carries no such guard. The realpath finding proves
+    // symlinked path components exist in this environment, so this is not academic.
+    const projects = path.join(home, ".claude", "projects");
+    const realDir = path.join(home, "real-project-dir");
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.writeFileSync(path.join(realDir, `${SID}.jsonl`), "{}\n");
+    fs.mkdirSync(projects, { recursive: true });
+    fs.symlinkSync(realDir, path.join(projects, "-a-symlinked-project-dir"));
+    assert.equal(await sessionTranscriptResolvable(home, SID), true);
   });
 
   it("FAILS OPEN on a session id that is not UUID-shaped (never joins it onto a path)", async () => {
