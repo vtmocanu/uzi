@@ -440,6 +440,20 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/95-activity-pane-v2.md`. R
   - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
 - Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
 
+## Feature #102 — Board v2: column rename, label chips, manual order, non-PRD issues
+
+Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/102-board-v2.md`.
+
+- The implicit no-label column is called `Backlog`, not `Open`. Display only; it is not a forge label. [user 2026-07-20]
+- The seeded `Upcoming` column label is renamed `Planned` and seeds first, before In Progress: Backlog | Planned | In Progress | Human Review | Later. Existing boards are not migrated automatically. [user 2026-07-20]
+- Cards show their other labels (e.g. `bug`) as chips. Workflow labels (`PRD`, `PRDLESS`, autopilot) and the card's own column label are not shown. [user 2026-07-20]
+- Cards can be hand-ordered within a column. The order is shared between users, and is uzi's own, not stored on the forge. [user 2026-07-20]
+- A per-user toggle shows open issues that lack the `PRD` label, so the board can be used to see untriaged work. Off by default. [user 2026-07-20]
+  - Non-PRD cards are visually distinct and cannot start runs.
+  - They move between columns like any other card (including into In Progress).
+  - A `Promote` action adds the `PRD` label, making the card a normal one.
+- Authorized behavior change: the board can also DISPLAY open issues without the `PRD` label (opt-in, off by default); agents still work only `PRD`-labeled issues. [user 2026-07-20, narrows the Feature #2 line "Board/agents work only issues carrying the `PRD` label"]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

@@ -122,6 +122,15 @@ const state = {
   forgejoVersion: "16.0.0+gitea-1.22.0",
 };
 
+// PRD #97 M1 — git smart-HTTP request telemetry (NOT persisted; ephemeral per
+// container life). The default harness pushes to the SAME bare via a local-path
+// insteadOf rewrite, and forge-fake's /gitroot bare IS that same host dir — so
+// "the branch is on the bare" cannot by itself distinguish a smart-HTTP push from a
+// local one. This counts the Basic-authenticated push/fetch requests that actually
+// reached this endpoint, giving the harness a POSITIVE control that the worker's
+// git-over-HTTPS Basic push traversed forge-fake (exposed on /_e2e/state).
+const gitStats = { receivePackPosts: 0, uploadPackPosts: 0 };
+
 function persist() {
   try {
     fs.writeFileSync(
@@ -378,6 +387,11 @@ function handleGit(req, res, url) {
     log("git 401", req.method, url.pathname);
     return;
   }
+  // PRD #97 M1: past the Basic gate — record the push/fetch so the harness can assert
+  // the worker's authenticated git-over-HTTPS op actually reached forge-fake (the
+  // local-path bare is the same host dir, so this counter is the only transport signal).
+  if (req.method === "POST" && /\/git-receive-pack$/.test(url.pathname)) gitStats.receivePackPosts++;
+  if (req.method === "POST" && /\/git-upload-pack$/.test(url.pathname)) gitStats.uploadPackPosts++;
   // Map any /<ns…>/<repo>.git/<rest> onto the single bare repo GIT_ROOT/repo.git.
   const rest = url.pathname.replace(/^.*?\.git/, "");
   const cgi = spawn(GIT_HTTP_BACKEND, [], {
@@ -465,6 +479,7 @@ const server = https.createServer(
         labelEvents: state.labelEvents,
         project: PROJECT,
         projects: PROJECTS,
+        gitStats,  // PRD #97 M1: smart-HTTP push/fetch counters (positive transport control)
       });
     }
     if (method === "GET" && (path === "/_e2e/health" || path === "/")) {

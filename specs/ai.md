@@ -5710,9 +5710,15 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
 - The stub executor (`agent/src/executor.ts`) emits a synthetic per-agent `coder` message with
   per-call usage + a terminal `result` frame with fixed cumulative usage/modelUsage on every run (no
   sentinel), since the isolated stack has no SDK. `./e2e/run-e2e.sh` asserts the usage folds onto the
-  run (`run.usage`), aggregates into `/api/usage`, and keeps the per-agent coder row in the stream —
-  the three surfaces M4 renders. Live-credential firm-up (verdict b + strip==list-row across a
-  requeue boundary) is the recorded residual.
+  run (`run.usage`) and keeps the per-agent coder row in the stream. Live-credential firm-up
+  (verdict b + strip==list-row across a requeue boundary) is the recorded residual.
+- **Correction (2026-07-20, PRD #97 M4).** This bullet used to add "aggregates into `/api/usage`"
+  as a third e2e-asserted surface. That leg was DROPPED from the harness: `SelfUsage`'s rollup is
+  proven exactly (not with the harness's `>=`) against a live Postgres by
+  `api/internal/store/run_usage_integration_test.go` TestUsageRollupsLiveDB — per-run MAX-per-model,
+  the 7-day window, `run_count` excluding pre-feature runs, per-user isolation — and that runs in CI
+  on every MR (`test:api-store-it`), whereas the e2e is local-only. `/api/usage` is still one of the
+  three surfaces M4 renders; it is just no longer one of the three the e2e asserts.
 
 ## 227. M3 read-API shape — window, counts, placement, and the self-reported-trust caveat
 
