@@ -588,6 +588,21 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   `STATEMENT:` echo **over**-counts by double-counting errors. Each needs its own guard, and a tally
   that matches your expectation is not thereby correct: it may be two errors, or the wrong one
   cancelling.
+  **"We got lucky" was half wrong, and the other half is the operationally useful part.** When the
+  `STATEMENT:` defect was found, both the finder and the lead called the fact that no published
+  figure moved *"luck, not method"*. Measured afterwards: of 52 inventory rows, only **seven** quote
+  a count at all — four quote `0` (**structurally immune**, since an over-count cannot fabricate a
+  zero), two sit on non-error paths the defect cannot reach, and one is explicitly labelled
+  *reasoned* rather than measured. **That is method, not luck.** What *was* luck is only the
+  non-zero side: nothing stopped a row from quoting an inflated count; the ten inflated queries
+  simply happened not to be quoted.
+  **Why the distinction earns its place: it gives you a re-check list.** If a fourth failure mode
+  turns up, **only rows quoting a NON-ZERO count need revisiting** — two, derivable without a sweep
+  — instead of all fifty-two. A "we got lucky" framing yields no such list and implies the whole
+  artifact is suspect.
+  Corollary for authoring: **never let a reasoned number sit in the same column as measured ones.**
+  A single "reasoned: 1 execution" row in a file whose entire thesis is that reasoning was replaced
+  by observation is the one row a reader will misread as observed.
   **The one reading no over-count can fake is a ZERO** — which is fortunate, because "this query has
   never executed" is the claim these tallies are usually load-bearing for. The corollary is the
   practical rule: **verifying the CAPTURE matters more than verifying any tally.** Confirm the log
