@@ -287,13 +287,27 @@ function computeTriage(): TriageCounts {
   return total;
 }
 
-// RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280) so the mock's
-// preview truncation matches. Counted in code units here (the demo text is ASCII); the
-// server counts runes.
+// RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280), and the count
+// is in RUNES — Array.from iterates code points, exactly as Go's []rune(s) does in
+// workersvc.rationalePreview. `s.length` / `s.slice` count UTF-16 code units, which is a
+// different number for anything outside the BMP.
+//
+// This was a live divergence, not a hypothetical, and it produced THREE distinct defects
+// (measured against the Go implementation, PRD #98 seam 6):
+//   1. a different answer to "was this cut" — at 200 rocket emoji the server returns the
+//      string whole and the code-unit mock truncated it;
+//   2. a different cut LENGTH when both cut — at 300 emoji the server yields 281 runes and
+//      the code-unit mock yielded 141;
+//   3. a LONE SURROGATE when the cut landed mid-pair — precisely the broken glyph
+//      judge_backlog.go:64-67 says the rune count exists to prevent.
+// Pinned by fixtures/judge-fidelity, cases preview-multibyte-cut and
+// preview-multibyte-no-cut; the second is the one that can tell this version from the
+// code-unit one, because past 280 runes both cut in the same place.
 const RATIONALE_PREVIEW_MAX = 280;
 function rationalePreview(s: string): string {
-  if (s.length <= RATIONALE_PREVIEW_MAX) return s;
-  return s.slice(0, RATIONALE_PREVIEW_MAX).replace(/[\s]+$/, "") + "…";
+  const runes = Array.from(s);
+  if (runes.length <= RATIONALE_PREVIEW_MAX) return s;
+  return runes.slice(0, RATIONALE_PREVIEW_MAX).join("").replace(/[\s]+$/, "") + "…";
 }
 
 const BUCKET_RANK: Record<string, number> = { dismissed: 3, done: 2, filed: 1, todo: 0 };
