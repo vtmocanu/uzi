@@ -139,10 +139,14 @@ describe("describeStatus", () => {
       <RunEventRow msg={msg({ seq: 273, kind: "status", payload })} live={false} />,
     );
     expect(container.textContent).toContain("message dropped: payload rejected by the api");
-    // The size marker (a 413 at size 1) takes the same path.
+    // The size marker (a 413 at size 1, or the emit-time cap) takes the same path.
+    // Pinned as the whole string, not a substring: a partial match would still pass
+    // if the renderer truncated or reordered the line.
     expect(
-      describeStatus({ text: "message too large to deliver: the api cannot accept a message this large (kind tool_result, 1048577 bytes)" }),
-    ).toContain("message too large to deliver");
+      describeStatus({
+        text: "message too large to deliver: the api cannot accept a message this large (kind tool_result, 1048577 bytes)",
+      }),
+    ).toBe("message too large to deliver: the api cannot accept a message this large (kind tool_result, 1048577 bytes)");
     // Belt: even if a future worker mints the marker WITHOUT a text field, the
     // unknown-event fallback still renders something rather than nothing.
     expect(describeStatus({ event: "message_dropped" })).toBe("status: message_dropped");
