@@ -19,6 +19,52 @@ last observed tip, not a guarantee about now.
 | `feature/prd-98-t2-seam6` | — | seam 6 implementation, in progress. |
 | `feature/prd-98-t2-cli` | — | M8b. **Not started** — blocked on the backstop design pass. |
 
+### RESUME HERE (session end, 2026-07-21 late) — what is done, what is in flight
+
+**FULLY VALIDATED (reviewer + auditor, 0 Blocking each), unmerged:**
+`t2-web` @ `abf039e4` · `t2-lim` @ `b72b921b`.
+
+**⚠️ `tier2` @ `f04f3a30` IS *NOT* FULLY REVIEWED — and I recorded it as validated before checking.**
+The reviewer approved `528360d4`; **three code commits have landed since and only one was ever
+dispatched to it**: `ba3f2cd9` (the widening to ten files, +220), `536f9730` (**the
+`CountActiveSelfImproveRuns` blocking fix**, +128) and `321a25b2` (`user_vaults`/`settings`, +95).
+Real unreviewed delta: **three commits, four files, +380/−49** — against a dispatch of mine that
+called it a "small delta, one file at +95".
+**The blocking fix is the part that matters.** I told the reviewer I would "send the fix SHA
+separately" and never did, so the resolution of the one finding that gated this branch has had an
+**auditor** verification but **no review** — and it is the row where the state choice (`UNPINNED`
+vs `EXERCISED-UNASSERTED` vs `PINNED`) is the entire question.
+**On resume: review `528360d4..f04f3a30` as one range** (skipping `aaba8992`/`f04f3a30`, which are
+lead-authored docs). Reviewing `321a25b2` alone would credit the other two with a review neither
+has had.
+*(Caught by the reviewer checking the range against the branch before acting on a dispatch that
+quoted it — the branch's own lesson, applied to the lead. A "validated" label is an assertion like
+any other, and this one was written from memory of dispatches rather than from `git rev-list`.)*
+
+**IN FLIGHT, NOT VALIDATED — three coders were mid-task when the session ended:**
+- **`t2-seam6`** — seam 6 golden fixture + the two-part mock fix (`Array.from` AND the trim set,
+  separately) + the demo-truncation dev toggle. Design is fully ruled in Part A.
+- **`t2-cli`** — the backstop's executing half (Part C). **M8b (Part B) has NOT been started** and
+  goes to this same worktree afterwards: both live in `e2e/run-e2e.sh` and one writer per file is
+  the only safe arrangement. Part C's truncation-remedy row is gated on B4's 2001-row seed, so
+  **B4 lands last and the two land together.**
+- **`t2-lim`** — the admin CLI-token inventory (new product code) plus two queued test items.
+
+**The design is COMPLETE**: `prds/98-judge-menu-m8-design.md` on `feature/prd-98-t2-fid` @
+`2befec6f` covers Part A (seam 6), Part B v2 (M8b) and Part C (backstop), all rulings folded in.
+**Read it before resuming any of the three in-flight branches** — it is the specification, and
+three places in it are known to be under-specified in practice: `expected.json` authoring for cases
+8-10 (the answer depends on the mock fix being *both* changes), `UNKNOWN` classification in the AST
+classifier (fail-closed is deliberate; widening the emitter list is a real decision, not a
+nuisance), and B6a's probe placement (a probe landing before its window opens is **the constraint
+biting, not flakiness**).
+
+**Four follow-ups raised to the user, none of them this PRD's to close:** the limiter posture on
+24 unasserted mounts (test now landed; the *construction* residual and the two unlimited
+credential-minting routes remain), `forge-fake`'s `updated_after` fidelity, the `user_vaults.sql`
+zero-execution convergence, and the wider rate-limit posture on `POST /api/me/cli-tokens/` and
+`POST /api/workers/`.
+
 **Two items of NEW scope the user added mid-wave, neither in the original PRD:**
 1. **A route mount-table test.** It began as "our route's limiter is untested" and generalised three
    times under measurement to **all 24 per-user limiter mounts across six limiters, none asserted** —
@@ -1507,9 +1553,30 @@ observe a missing mount even in principle. The only tests that build the real ro
 no route-table snapshot exists or could be trivially derived. And the only 429 assertion in
 `e2e/run-e2e.sh` (`:1850-1871`, PRD #58's XFF forgery) is on `authLimiter.Middleware` at
 `/api/auth/login` — an **IP-keyed** mount, not a per-user one, so it closes none of the 24.
-Not fixed here: a Go-side change across the whole limiter surface, and folding it into a
-test-quality tier for the judge menu would be scope creep into a security surface deserving its
-own change. **The counts are `ad6c63d9`'s inventory, not constants; the durable claims are
+**CLOSED IN THIS WAVE (`feature/prd-98-t2-lim`) — and closing it surfaced a SECOND, live
+production hole that nothing could see.** `api/internal/handler/route_limiter_mounts_test.go`
+walks the real `Routes(...)` table and pins, per route, **which limiter instance** is mounted —
+identity by *driving* each middleware with a distinct budget, because `reflect` tags all 24 mounts
+**equal** (8 instances collapse to 1 code pointer; a bound-method value's pointer is the
+receiver-independent wrapper). It enumerates all 141 routes, so a route added *without* a limiter
+fails as unlisted.
+**The second hole, found by running the positive control on a fix rather than trusting its
+framing:** the *signature*-reorder gap everyone assumed was open turned out already caught, while
+swapping two **arguments at main's call site** (`cmd/server/main.go:566`, signature untouched)
+**built clean and passed the entire suite** while forge routes ran on the auth budget in
+production. Two `go/ast` parses now pin signature order and call-site order; measured, the
+call-site swap makes exactly one test in the whole api suite fail.
+**THE RESIDUAL IS REAL AND REMAINS OPEN — measured, not reasoned.** Swapping the budgets at
+*construction* (`main.go:483-484`), so `authLimiter` is built with the forge budget and vice versa,
+**names untouched**: `BUILD OK`, `go test ./...` exit 0, 41 packages, zero failures. Every link the
+branch pins holds — budget→name, name→signature, signature→call — and the server still runs forge
+routes on the auth budget. **The chain is pinned from the mount inward and unpinned at its source.**
+The shape is the lesson: *each of these tests pins a correspondence between two NAMES, and the one
+thing no name-correspondence can see is whether a name was bound to the right value in the first
+place.*
+Not fixed here beyond that: the wider posture change (adding limiters to unlimited routes) is a
+Go-side change across the whole limiter surface, and folding it into a test-quality tier for the
+judge menu would be scope creep into a security surface deserving its own change. **The counts are `ad6c63d9`'s inventory, not constants; the durable claims are
 mount-vs-behaviour, the direct-function-call blindness, and that the only two assertions are
 tautological with respect to the mount they construct.** Raised to the user for a follow-up issue.
 
