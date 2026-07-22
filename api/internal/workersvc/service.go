@@ -1106,15 +1106,24 @@ type IncomingMessage struct {
 //     Read this as a CLEARED suspect, not a live hazard: it is written out because
 //     it is the call that looks most dangerous and the check is what makes the
 //     placement defensible, not because it can currently produce these codes.
-//     `model` IS worker-controlled (a JSON object key out of the payload) and is
-//     safe only because sanitation writes through the index in a pass that
-//     completes before foldRunUsage iterates msgs, so the name it inserts is
-//     already clean — pinned by TestWorkerMessagesUsageFoldSeesSanitizedModelNames-
-//     LiveDB, which reddens if that ordering inverts. `session_id` comes from the
-//     runs row, so Postgres already accepted it. `run_id` is a uuid. The token
-//     columns are bigint and take an int64, which always fits. `cost_usd` is
-//     numeric(12,6) and numericUSD clamps to that domain (its own comment names
-//     22003 as the poison-loop trigger it exists to prevent).
+//     `model` IS worker-controlled (a JSON object key out of the payload), and
+//     `session_id` is too (the worker reports it; the runs row only relays it), so
+//     BOTH are handled on TWO axes, not one. Byte VALIDITY: sanitation writes
+//     through the index in a pass that completes before foldRunUsage iterates msgs,
+//     so the model name the fold inserts is already NUL-free — pinned by
+//     TestWorkerMessagesUsageFoldSeesSanitizedModelNamesLiveDB, which reddens if
+//     that ordering inverts. LENGTH: both are members of run_usage's composite PK,
+//     whose btree index entry caps at 2704 bytes, so foldRunUsage caps each with
+//     truncateRunes before the upsert (maxUsageSessionRunes) — without which an over-long
+//     value raises SQLSTATE 54000, which is NOT in unstorableSQLSTATEs and would
+//     wedge the run one sink over (pinned by the UsageFoldCapsOversized*LiveDB
+//     tests). `session_id`'s earlier acceptance into the runs row is not evidence
+//     here: that column is unindexed `text`, and acceptance there says nothing
+//     about indexability inside this composite PK — which is why relaying it is not
+//     on its own sufficient. `run_id` is a uuid. The token columns are bigint and
+//     take an int64, which always fits. `cost_usd` is numeric(12,6) and numericUSD
+//     clamps to that domain (its own comment names 22003 as the poison-loop trigger
+//     it exists to prevent).
 //
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
