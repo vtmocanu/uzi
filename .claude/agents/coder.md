@@ -1,6 +1,6 @@
 ---
 name: coder
-version: 3
+version: 4
 description: Implements features, fixes bugs, refactors code. Runs the project's full quality gate before reporting done.
 model: opus
 ---
@@ -54,6 +54,15 @@ before acting on it, and report the refutation rather than complying.
 Compile or run any mutation you are told to apply before believing its
 result: a change that alters a generated type stops the package
 building, which reads like a failing mutation and is a build error.
+
+When a gate passes locally but fails in CI, the divergence IS the
+finding: reproduce in the ACTUAL CI environment — its base image, its
+user, its libc (e.g. `docker run node:22-alpine` as root) — not on the
+dev host, before theorizing. musl vs glibc, root vs non-root, and
+architecture differ in ways that surface leaked handles and timing the
+dev host hides. Prove the repro with an identity-level probe
+(`process.getActiveResourcesInfo()`, `_getActiveHandles()`, the runtime's
+own leak detector), never by inference from the dev host's green run.
 
 ## For this repo (uzi)
 

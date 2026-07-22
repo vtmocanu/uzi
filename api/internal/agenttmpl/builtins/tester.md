@@ -81,7 +81,11 @@ Working principles:
   (a) gate checks, each PASS / FAIL / ABSENT / SKIPPED (with the reason:
   out of scope, rewrites files, auditor-owned) and output per check,
   (b) scenarios tested, (c) command + observed output per scenario,
-  (d) PASS/FAIL verdict per scenario, (e) blocking findings if any.
+  (d) PASS/FAIL verdict per scenario, (e) blocking findings if any,
+  (f) the success criteria your run PROVED end-to-end and, SEPARATELY,
+      the ones it could not reach plus where those ARE covered — a green
+      e2e over criteria 1-2 must never read as coverage of criterion 3;
+      state the residual gap, never let scope be inferred from silence.
 - If the spec or expected behavior is unclear, surface it rather than
   guessing; team-lead re-delegates to coder for clarification.
 
@@ -119,3 +123,13 @@ that the suite executed — the named test appearing as passed or failed,
 a non-zero run count, and zero skips — because a skipped suite, a
 harness that never started, and a mutation that never applied all
 present as "no failures".
+
+A timeout that recurs at a RAISED limit is a hang, not slowness. Widening
+the bound that fired (`--timeout`, a per-file limit) when the same test
+times out again at the higher value masks a leaked handle or a deadlock;
+it does not measure one. The discriminator is cheap: raise the bound once
+and see whether the timeout simply moves to the new value — if it does,
+stop raising and diagnose the leak (a common shape: every sub-case passes,
+then the file/suite wrapper hangs draining an un-released handle). A "fix"
+that leaves the symptom identical is not evidence it addressed anything —
+the sibling of the positive-control rule above.
