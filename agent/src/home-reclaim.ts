@@ -106,8 +106,17 @@ const DEFAULT_RECLAIM_DEADLINE_MS = 60_000;
 const DEFAULT_RECLAIM_MAX_ENTRIES = 500;
 
 /**
- * Resolve a run's status. Resolving to `undefined` — or throwing — both mean
- * "unknown", and both make the sweep skip.
+ * Resolve a run's status. Both "no status" outcomes make the sweep SKIP, but they
+ * are DISTINCT for the consecutive-failure bail (PRD #108 B2/B3):
+ *
+ *  - returning `undefined` means the API ANSWERED not-found (a 404 — the run is
+ *    gone). A definite answer: it skips, does NOT count toward the bail, and resets
+ *    the streak.
+ *  - THROWING means the call could not be made or answered (api down, 5xx, timeout)
+ *    — a could-not-ask, which skips AND counts toward the bail.
+ *
+ * The main.ts wrapper enforces this contract: it maps getChatRun's 404 to
+ * `undefined` and lets every other error propagate.
  */
 export type RunStatusLookup = (runId: string) => Promise<string | undefined>;
 
@@ -215,27 +224,45 @@ export async function reclaimStrandedRunHomes(
       continue;
     }
 
+    // Two "not terminal, so skip" outcomes that must be treated DIFFERENTLY for the
+    // BAIL (PRD #108 B2/B3). A THROW is a could-not-ask: the call itself failed (api
+    // down, 5xx, timeout), which counts toward the consecutive-failure bail. A
+    // RETURNED undefined is the api ANSWERING not-found (a 404 — the run's row is
+    // gone), which is a definite answer: it skips, but it must never bail a sweep
+    // against a healthy api, and it RESETS the streak. 404s are likelier here than
+    // anywhere, because the sweep targets the oldest stranded HOMEs — exactly the
+    // ones whose run rows have since been deleted.
     let status: string | undefined;
+    let couldNotAsk = false;
     try {
       status = await statusOf(entry.name);
     } catch {
-      status = undefined; // api unreachable, 5xx, 404, timeout — all "unknown"
+      couldNotAsk = true;
     }
-    if (status === undefined) {
+    if (couldNotAsk) {
       summary.skippedStatusUnknown += 1;
       consecutiveFailures += 1;
-      // BAIL OUT. With the api unreachable every remaining candidate resolves to
-      // "unknown" and skips, so the rest of the sweep can reclaim nothing and only
-      // spends time the worker needs to register, recover its orphaned runs and
-      // start heartbeating. Against a HANGING api each of those costs a full HTTP
-      // timeout, which is how a cleanup pass turns into hours of blocked startup.
+      // BAIL OUT on a STREAK of genuine call failures — not on 404s. With the api
+      // unreachable every remaining candidate resolves the same way, so the rest of
+      // the sweep can reclaim nothing and only spends time the worker needs to
+      // register, recover its orphaned runs and start heartbeating. Against a HANGING
+      // api each of those costs a full HTTP timeout, which is how a cleanup pass turns
+      // into hours of blocked startup. Now that only could-not-ask counts, the label
+      // names what it measures: the api genuinely could not be reached.
       if (consecutiveFailures >= maxConsecutiveFailures) {
         summary.stoppedEarly = "api_unreachable";
         break;
       }
       continue;
     }
+    // The api answered — a 404 is still an answer, so the streak resets here.
     consecutiveFailures = 0;
+    if (status === undefined) {
+      // Not-found: skip (a 404 is *probably* a garbage HOME, but "probably" is not
+      // the standard for a delete), but it is NOT an outage and never bails.
+      summary.skippedStatusUnknown += 1;
+      continue;
+    }
     if (!TERMINAL_RUN_STATUSES.has(status)) {
       summary.skippedNotTerminal += 1;
       continue;

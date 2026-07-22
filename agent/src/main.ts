@@ -1,7 +1,7 @@
 import path from "node:path";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
-import { WorkerClient } from "./client.js";
+import { WorkerClient, RequestError } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
@@ -214,9 +214,23 @@ async function main(): Promise<void> {
   // reclaimed anyway, and a worker restarting while the api is unhealthy is a
   // CORRELATED failure, not an exotic one — they roll together.
   if (config.homeReclaimEnabled) {
-    await reclaimStrandedRunHomes(sdkHomeRoot, async (runId) => (await client.getChatRun(runId)).status, log).catch(
-      (err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }),
-    );
+    await reclaimStrandedRunHomes(
+      sdkHomeRoot,
+      async (runId) => {
+        try {
+          return (await client.getChatRun(runId)).status;
+        } catch (err) {
+          // A 404 is the API ANSWERING not-found — the run's row is gone, which is
+          // exactly what the oldest stranded HOMEs look like. Return undefined so the
+          // sweep SKIPS without counting it toward the outage bail; let every other
+          // error (down / 5xx / timeout) propagate as a genuine could-not-ask that
+          // DOES count (PRD #108 B2/B3, home-reclaim.ts RunStatusLookup contract).
+          if (err instanceof RequestError && err.status === 404) return undefined;
+          throw err;
+        }
+      },
+      log,
+    ).catch((err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }));
   }
 
   await worker.run(controller.signal);

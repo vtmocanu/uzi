@@ -106,6 +106,51 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
     assert.strictEqual(summary.skippedStatusUnknown, 1);
   });
 
+  it("a STREAK of 404s never bails — a healthy api answering not-found is not an outage", async () => {
+    // The measured bug (PRD #108 B2/B3): the sweep targets the OLDEST stranded
+    // HOMEs, exactly the ones whose run rows were deleted, so a 404 is likelier here
+    // than anywhere. Conflating "the api answered not-found" with "the api could not
+    // be reached" bailed the sweep on three 404s from a perfectly healthy api and,
+    // because readdir order is stable, stuck it at zero every boot. A 404 arrives as
+    // a RETURNED undefined (the main.ts wrapper maps it), distinct from a THROW.
+    for (let i = 0; i < 20; i++) {
+      makeHome(`4d4762cf-0000-4000-8000-${String(i).padStart(12, "0")}`);
+    }
+    let asked = 0;
+    const summary = await reclaimStrandedRunHomes(
+      root,
+      async () => {
+        asked += 1;
+        return undefined; // the api ANSWERED not-found — not an outage
+      },
+      nullLogger(),
+    );
+    assert.strictEqual(summary.stoppedEarly, undefined, "a healthy api that 404s must never bail the sweep");
+    assert.strictEqual(asked, 20, "every candidate is examined — 404s do not count toward the bail");
+    assert.strictEqual(summary.skippedStatusUnknown, 20);
+    assert.strictEqual(summary.removed, 0);
+  });
+
+  it("a 404 streak does not mask a real outage that follows it", async () => {
+    // The distinction must be live in BOTH directions: 404s reset the streak, so a
+    // could-not-ask streak still bails even when 404s preceded it.
+    for (let i = 0; i < 20; i++) {
+      makeHome(`4d4762cf-0000-4000-8000-${String(i).padStart(12, "0")}`);
+    }
+    let n = 0;
+    const summary = await reclaimStrandedRunHomes(
+      root,
+      async () => {
+        n += 1;
+        if (n <= 2) return undefined; // two not-founds first
+        throw new Error("connect ETIMEDOUT 10.0.0.1:8080"); // then a real outage
+      },
+      nullLogger(),
+    );
+    assert.strictEqual(summary.stoppedEarly, "api_unreachable", "a genuine could-not-ask streak still bails");
+    assert.strictEqual(n, 2 + DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, "the 404s reset the streak, then the throws bail");
+  });
+
   // The SHIPPED age floor had no coverage: every other test either passes an
   // explicit minAgeMs or leans on a 24h-old fixture, so the default itself was
   // never exercised and could have been any value at all.
