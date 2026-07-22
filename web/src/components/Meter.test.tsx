@@ -28,13 +28,15 @@ describe("clampPct", () => {
 
 describe("MeterTrack", () => {
   it("renders an accessible progressbar whose tone/width/valuenow agree on one rounded int", () => {
-    render(<MeterTrack label="5-hour window" fillPct={94.99} valueText="95%" />);
+    render(<MeterTrack label="5-hour window" fillPct={84.99} valueText="85%" />);
     const bar = screen.getByRole("progressbar", { name: "5-hour window" });
-    // 94.99 rounds to 95 → danger, and the number the reader hears matches the fill.
-    expect(bar.getAttribute("aria-valuenow")).toBe("95");
-    expect(bar.getAttribute("aria-valuetext")).toBe("95%");
+    // Raw 84.99 would be warn (< 85), but MeterTrack rounds first: 84.99 → 85 →
+    // danger, so the color matches the number the reader hears (mirrors the
+    // toneFor docstring's 84.99→85 example).
+    expect(bar.getAttribute("aria-valuenow")).toBe("85");
+    expect(bar.getAttribute("aria-valuetext")).toBe("85%");
     const fill = bar.firstChild as HTMLElement;
-    expect(fill.style.width).toBe("95%");
+    expect(fill.style.width).toBe("85%");
     expect(fill.className).toMatch(/bg-danger/);
   });
 

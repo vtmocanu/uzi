@@ -207,6 +207,40 @@ describe("RateLimitAnnouncer (aria-live)", () => {
     expect(region()).toBe(announced); // not re-fired
   });
 
+  it("announces the ≥95 emergency even when it steps straight through from ok", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed ok — first read never announces
+    expect(region()).toBe("");
+
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
+    await flush(60_000); // ok → danger jump that also crosses 95
+    // The critical-crossing branch wins over the plain tone step-up: we get the
+    // emergency wording, NOT "5-hour window at 97%".
+    expect(region()).toMatch(/^5-hour window nearly out at 97%/);
+  });
+
+  it("re-arms silently after dropping below 95", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed ok — silent
+    expect(region()).toBe("");
+
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
+    await flush(60_000); // crosses 95 → emergency fires once
+    expect(region()).toMatch(/nearly out at 97%/);
+    const emergency = region();
+
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerBandReading));
+    await flush(60_000); // worst window back in the 85–94 danger band (88%)
+    // Dropping below 95 announces nothing — it silently re-arms the emergency ref.
+    expect(region()).toBe(emergency);
+
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
+    await flush(60_000); // crosses 95 again → emergency fires AGAIN (ref re-armed)
+    expect(region()).toMatch(/^5-hour window nearly out at 97%/);
+  });
+
   it("stays silent on the first read even when already in danger", async () => {
     mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
     render(<RateLimitAnnouncer />);
