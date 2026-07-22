@@ -186,6 +186,50 @@ func TestASecondReconcileTreatsAlreadyExistsAsSuccess(t *testing.T) {
 	assertNoSecretReads(t, client)
 }
 
+// BUG 3 (issue #114): the PVC create is GATED on the observed flag, exactly as the
+// Deployment is gated on obs.HasDeployment. The bug was an UNCONDITIONAL create every
+// ~10s reconcile tick: k8s charges the ResourceQuota's used.requests.storage at
+// admission for each create and does NOT decrement it when storage then rejects the
+// create AlreadyExists (upstream #119593), so the redundant charges out-raced the
+// quota-controller resync and pinned the quota at its hard limit until genuinely-new
+// workers were refused their PVCs. Given both PVCs already observed, a reconcile must
+// issue ZERO pvc creates.
+//
+// Positive control: delete the obs.HasDataPVC/HasNixPVC gate in reconcileWorker and this
+// goes RED (two pvc creates reach the apiserver).
+func TestReconcileDoesNotRecreateAlreadyObservedPVCs(t *testing.T) {
+	existing := deployedWorker("w1", 0, "h")
+	m, client := newMat(t, existing, pvcFor("w1", "data"), pvcFor("w1", "nix"))
+
+	// Steady state: the pod already holds its token, so join_token is nil (write no
+	// Secret). The PVCs and Deployment were seen by the last Observe.
+	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: nil}
+	observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, SpecHash: "h", HasDataPVC: true, HasNixPVC: true}}
+
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var pvcCreates []string
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "persistentvolumeclaims" || a.GetVerb() != "create" {
+			continue
+		}
+		c, ok := a.(k8stesting.CreateAction)
+		if !ok {
+			t.Fatalf("a create verb on persistentvolumeclaims was not a CreateAction: %T", a)
+		}
+		pvcCreates = append(pvcCreates, c.GetObject().(*corev1.PersistentVolumeClaim).Name)
+	}
+	if len(pvcCreates) != 0 {
+		t.Fatalf("a reconcile of a worker whose PVCs are already observed issued pvc create(s) %v; want ZERO. "+
+			"An unconditional create every tick re-charges the ResourceQuota (used.requests.storage) at admission "+
+			"and k8s never decrements it on the AlreadyExists rejection (upstream #119593), pinning the quota at its "+
+			"hard limit until new workers are refused. The create must be gated on obs.HasDataPVC/HasNixPVC.", pvcCreates)
+	}
+	assertNoSecretReads(t, client)
+}
+
 // Decision 11: a worker we provisioned that the api no longer wants is torn down —
 // every object, BY NAME. Deleting the Secret by name is what keeps the no-list rule
 // affordable: the name is reachable from the id we recovered off the Deployment's

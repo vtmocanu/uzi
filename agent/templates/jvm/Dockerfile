@@ -189,6 +189,23 @@ RUN command -v agent-browser \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
     && rm -rf /tmp/uzi-chromium-buildcheck
 
+# BUG 1 (issue #114) store-perm normalization — MIRRORED from templates/base (jvm is NOT
+# `FROM base`; keep in lockstep). MUST run AFTER the build guard above, not after the earlier
+# `chown -R worker:runner /nix`. Root cause: the guard's `--dump-dom` launch runs chromium AS
+# ROOT, and chromium creates its bundled `libexec/chromium/extensions` dir INSIDE its own
+# read-only (0555) nix store path — a write only root's CAP_DAC_OVERRIDE permits — as
+# `root:root 0700`. That happens after the chown, so the chown never covers it (the parent
+# `.../libexec/chromium` is worker:runner 0555 from the chown; only this guard-created child is
+# root:root — verified live in a 0.11.0 pod). The `seed-nix` init container runs NON-ROOT (uid
+# 10001) and tars the store; it cannot open a root:root 0700 dir → tar fails →
+# Init:CrashLoopBackOff. Normalize the whole store world-traversable/readable here, where the
+# dir now exists. `a+rX` only ADDS bits (read for all; search/execute for dirs and already-
+# executable files) so it cannot strip a needed perm; the store is already world-readable
+# (0555/0444) by nix default, so in practice this only reopens the guard-created 0700 dirs.
+# Safe: the toolchain store holds no secrets. As root here, busybox `chmod -R` does not hit the
+# un-chmodable-root abort the non-root seed would.
+RUN chmod -R a+rX /nix
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 
