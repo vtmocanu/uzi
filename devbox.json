@@ -8,7 +8,17 @@
   // editing it can't even `ruby -c` syntax-check it before shipping (judge rec, run
   // e2d7427b). ruby is genuinely repo-specific (only formula-shipping repos need it),
   // so it lives here as tier-2 rather than in the baked worker image.
+  //
+  // openssl: this repo's e2e harness (e2e/run-e2e.sh) generates a self-signed cert for
+  // the forge-fake step; without openssl a run touching e2e can only `bash -n` the
+  // scenario, not execute it (judge rec, run dd06c0ed). Left UNPINNED (bare) — the
+  // openssl CLI's patch version is irrelevant to `req`/`rand`, unlike ruby's
+  // version-sensitive formula syntax; the admin tool_allowlist entry is bare too, so a
+  // pinned `openssl@x` here would be REJECTED (toolprofile.Allowed requires exact
+  // version match when the rule pins). Repo-specific (only e2e-with-TLS repos need it),
+  // so tier-2, not the baked image.
   "packages": [
-    "ruby@3.3"
+    "ruby@3.3",
+    "openssl"
   ]
 }
