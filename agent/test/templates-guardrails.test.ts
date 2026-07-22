@@ -436,8 +436,11 @@ describe("devbox-global default toolchain manifest", () => {
   // openssl is a baked base crypto/TLS CLI (cert gen / `openssl rand` / hashing), promoted
   // from tier-2 (run dd06c0ed) so its absence can't silently ship a worker that 127s any
   // repo's e2e/cert step.
-  it("lists openssl (baked crypto/TLS CLI, run dd06c0ed)", () => {
-    assert.match(manifest, /"openssl"/, "manifest must list openssl");
+  it("lists openssl.bin (baked crypto/TLS CLI, run dd06c0ed)", () => {
+    // MUST be the `.bin` output — bare `openssl` installs only libs/man (no CLI), so the
+    // build guard's `command -v openssl` 127s. See the manifest comment.
+    assert.match(manifest, /"openssl\.bin"/, "manifest must list openssl.bin (the CLI-bearing output)");
+    assert.doesNotMatch(manifest, /"openssl"\s*[,\]]/, "must NOT list bare openssl (installs no CLI)");
   });
   // PRD #87: the browser for the web-ux role rides this SAME shared toolchain, so a drop can't
   // silently ship a worker without a browser or its fonts (which would render every screenshot
@@ -453,7 +456,7 @@ describe("devbox-global default toolchain manifest", () => {
     const revMatch = /github:NixOS\/nixpkgs\/([0-9a-f]{40})#go\b/.exec(lock);
     assert.ok(revMatch, "lock must pin go at a concrete nixpkgs rev to anchor the toolchain pin");
     const rev = revMatch![1];
-    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts", "openssl"]) {
+    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts", "openssl.bin"]) {
       assert.match(
         lock,
         new RegExp(`github:NixOS/nixpkgs/${rev}#${pkg}\\b`),

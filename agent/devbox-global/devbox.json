@@ -51,6 +51,14 @@
   // in the baked toolchain rather than as tier-2 so its absence never surfaces a silent
   // exit 127 to an agent in ANY repo. Its closure is small and largely already present
   // via the other packages' deps, so it adds negligible image weight.
+  //
+  // NOTE: it MUST be `openssl.bin`, not bare `openssl`. nixpkgs splits openssl into
+  // outputs and its outputsToInstall is [bin, man] with NO `out`, so `devbox global
+  // install` of bare `openssl` lands only libs/man and `command -v openssl` 127s — the
+  // build guard then fails (proven: MR !103 pipeline 19969, build:agent). The `.bin`
+  // output carries the `openssl` CLI; verified `devbox install` at the pinned rev puts
+  // /opt/uzi-toolchain/bin/openssl on PATH. (gcc/go/python3 don't hit this — their CLI
+  // is in `out`, which IS installed.)
   "packages": [
     "go",
     "gcc",
@@ -59,6 +67,6 @@
     "chromium",
     "fontconfig",
     "dejavu_fonts",
-    "openssl"
+    "openssl.bin"
   ]
 }

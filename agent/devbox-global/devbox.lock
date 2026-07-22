@@ -12,6 +12,6 @@
     "chromium": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#chromium", "source": "nixpkg" },
     "fontconfig": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#fontconfig", "source": "nixpkg" },
     "dejavu_fonts": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#dejavu_fonts", "source": "nixpkg" },
-    "openssl": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#openssl", "source": "nixpkg" }
+    "openssl.bin": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#openssl.bin", "source": "nixpkg" }
   }
 }
