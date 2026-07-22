@@ -150,6 +150,13 @@ type TombstoneEvent = "message_dropped" | "message_truncated";
  * data rather than a routing decision.
  */
 function tombstone(item: Buffered, event: TombstoneEvent, reason: string, redactText: TextRedactor): Buffered {
+  // Already a tombstone → return it unchanged. A marker that is re-buffered and then
+  // grouped with following messages can escape the `batch.length === 1` guard in
+  // handleFailure and reach here a second time; re-tombstoning it would overwrite the
+  // ORIGINAL kind/size (the only forensic content a tombstone carries) with this
+  // marker's own — "status", a few hundred bytes — losing what was lost. Idempotent
+  // by construction (PRD #108 B5).
+  if (item.tombstoned) return item;
   const originalKind = item.msg.kind;
   const text =
     event === "message_dropped"
