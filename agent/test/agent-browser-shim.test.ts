@@ -145,6 +145,52 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
   });
 
+  it("defaults XDG_CONFIG_HOME/XDG_CACHE_HOME to a writable dir under TMPDIR and creates them (crashpad rc=133 fix)", async () => {
+    // Chromium 150 traps rc=133 at the crashpad handler (BEFORE the SUID check, so --no-sandbox
+    // can't help) when it can't create its crashpad DB under a non-writable $HOME/.config — the
+    // image bakes /home/worker/.config root-owned, not writable by uid 10001. The shim points
+    // the XDG base dirs at a writable location regardless of inherited HOME. mkdir needs a real
+    // PATH (the production runner PATH always has /bin); the stub keeps the run browser-free
+    // WITHOUT leaking a host browser, since AGENT_BROWSER_EXECUTABLE_PATH short-circuits the
+    // PATH probe before any chromium on /usr/bin could match.
+    const xdgTmp = path.join(tmp, "xdg-tmpdir");
+    fs.mkdirSync(xdgTmp);
+    const envDump = path.join(tmp, "xdg-dump");
+    writeExec(recorder, `#!/bin/sh\n{ echo "CFG=$XDG_CONFIG_HOME"; echo "CACHE=$XDG_CACHE_HOME"; } > "${envDump}"\nexit 0\n`);
+    const res = await runShim(["open", "about:blank"], {
+      PATH: `${emptyBin}:/usr/bin:/bin`,
+      TMPDIR: xdgTmp,
+      AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
+      AGENT_BROWSER_SHIM_TARGET: recorder,
+    });
+    assert.equal(res.code, 0);
+    const dump = fs.readFileSync(envDump, "utf8");
+    const cfg = path.join(xdgTmp, "uzi-agent-browser", "config");
+    const cache = path.join(xdgTmp, "uzi-agent-browser", "cache");
+    assert.ok(dump.includes(`CFG=${cfg}`), `XDG_CONFIG_HOME must default under TMPDIR; got: ${dump}`);
+    assert.ok(dump.includes(`CACHE=${cache}`), `XDG_CACHE_HOME must default under TMPDIR; got: ${dump}`);
+    assert.ok(fs.existsSync(cfg), "the config dir must be created (best-effort mkdir)");
+    assert.ok(fs.existsSync(cache), "the cache dir must be created (best-effort mkdir)");
+    writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
+  });
+
+  it("respects an explicit XDG_CONFIG_HOME/XDG_CACHE_HOME (defaults never clobber intent)", async () => {
+    const envDump = path.join(tmp, "xdg-dump2");
+    writeExec(recorder, `#!/bin/sh\n{ echo "CFG=$XDG_CONFIG_HOME"; echo "CACHE=$XDG_CACHE_HOME"; } > "${envDump}"\nexit 0\n`);
+    const res = await runShim(["open", "about:blank"], {
+      PATH: emptyBin,
+      AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
+      XDG_CONFIG_HOME: "/custom/cfg",
+      XDG_CACHE_HOME: "/custom/cache",
+      AGENT_BROWSER_SHIM_TARGET: recorder,
+    });
+    assert.equal(res.code, 0);
+    const dump = fs.readFileSync(envDump, "utf8");
+    assert.match(dump, /CFG=\/custom\/cfg\b/, "an explicit XDG_CONFIG_HOME must win over the default");
+    assert.match(dump, /CACHE=\/custom\/cache\b/, "an explicit XDG_CACHE_HOME must win over the default");
+    writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
+  });
+
   it("degrades cleanly when a browser resolves but the baked CLI is absent (never crashes the run)", async () => {
     const res = await runShim(["open", "about:blank"], {
       PATH: emptyBin,

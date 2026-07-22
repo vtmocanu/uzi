@@ -39,6 +39,21 @@ REAL="${AGENT_BROWSER_SHIM_TARGET:-/app/node_modules/.bin/agent-browser}"
 : "${FONTCONFIG_FILE:=/etc/fonts/fonts.conf}"
 export AGENT_BROWSER_EXECUTABLE_PATH AGENT_BROWSER_ARGS AGENT_BROWSER_IDLE_TIMEOUT_MS FONTCONFIG_FILE
 
+# Crashpad needs a WRITABLE config/cache dir, independent of --no-sandbox. Chromium 150 traps
+# rc=133 (SIGTRAP) at the crashpad handler — BEFORE the SUID check, so --no-sandbox does NOT
+# fix it — when it cannot create its crashpad DB: the image bakes $HOME/.config
+# (/home/worker/.config) root:worker 0755, which the non-root runner uid (10001) cannot write.
+# Point the XDG base dirs at a guaranteed-writable location under TMPDIR (the runner's own 0700
+# tmp under the uid split, else /tmp) so the launch is robust to WHATEVER $HOME agent-browser
+# inherits — this closes the crash even for a direct/non-SDK/compose invocation that keeps the
+# image HOME, not only the SDK path where sdk-env.ts happens to repoint HOME to a writable dir.
+# Only-if-unset so an explicit caller value wins; the mkdir is best-effort (dir may pre-exist
+# or TMPDIR may be read-only — chromium still self-creates under a writable XDG root).
+: "${XDG_CONFIG_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/config}"
+: "${XDG_CACHE_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/cache}"
+export XDG_CONFIG_HOME XDG_CACHE_HOME
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+
 # A browser is reachable if the prebaked executable resolves, OR a chrome/chromium is on
 # PATH (auto-discovery), OR the invocation explicitly names a browser/endpoint — never
 # shadow a valid remote (--cdp) or explicit (--executable-path/--provider/--engine) call.
