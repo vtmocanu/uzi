@@ -173,13 +173,17 @@ ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
 COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 
 # Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the
-# baked CLI is missing, OR an exit-bounded headless Chromium launch fails. `timeout` turns a
-# hung launch into a build failure; --dump-dom actually starts Chromium (unlike --version).
+# baked CLI is missing OR cannot RUN, OR an exit-bounded headless Chromium launch fails. The
+# `agent-browser --version` step runs the CLI end-to-end through the shim and exercises the
+# real native musl binary (a file-check alone would miss an unrunnable wrapper — e.g.
+# engines.node>=24 vs node:22-alpine, or a failed native-binary postinstall). `timeout` turns
+# a hung launch into a build failure; --dump-dom actually starts Chromium (unlike --version).
 # CAVEAT: runs in the BUILDER (root, no cap_drop), so it validates the binary + shared libs,
 # NOT the runtime hardening posture — only M7 does that. MIRRORED from base.
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
+    && timeout 30 agent-browser --version >/dev/null \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
