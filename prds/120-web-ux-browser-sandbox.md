@@ -1,7 +1,7 @@
 # PRD #120: web-ux browser reliability — stop runs fighting the SUID sandbox & SPA navigation after PRD #87
 
 **GitLab Issue**: [#120](https://gitlab.example.com/vtmocanu/uzi/-/issues/120)
-**Status**: Draft (created 2026-07-22)
+**Status**: Draft (created 2026-07-22; revised same day after a fable adversarial review that verified all 8 load-bearing claims against code/git/live state — calibrated toward Hypothesis A as the strong prior, added the deploy-lag hedge, and recorded that the #87 builtin shares the repo template's missing `--no-sandbox` note; see the Decision Log)
 **Priority**: Medium
 
 ## Problem
@@ -9,7 +9,7 @@
 PRD #87 (v0.11.0) prebaked chromium into the worker image and standardized the
 launch flags centrally: `AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"`
 plus a crash-close shim on `PATH` ahead of the real `agent-browser` CLI
-(`agent/templates/base/Dockerfile`, mirrored in `templates/jvm`). The intent was
+(`agent/templates/base/Dockerfile`, mirrored in `agent/templates/jvm`). The intent was
 that every web-ux browser launch gets `--no-sandbox` (mandatory under the PRD #51
 hardening: unprivileged uid + `cap_drop:ALL` + `no-new-privileges` make Chromium's
 setuid sandbox impossible) without any agent having to know that.
@@ -41,7 +41,11 @@ tar: store/…-chromium-unwrapped-150.0.7871.128/libexec/chromium/extensions: Ca
 — leaving it offline/mid-failed-upgrade for ~14 minutes. That `seed-nix` perm bug
 was fixed in **v0.11.1 / issue #114** (`be9a45a3` normalize `/nix` store perms
 after the browser build guard). The run started at 15:05 UTC, ~2h after v0.11.1
-was released (13:03 UTC).
+was released (13:03 UTC) — but a **release commit time is not an
+image-on-worker time**: Harbor publish + ArgoCD sync + the controller's
+Deployment roll all add lag, so "~2h after release" does **not** prove the worker
+was actually running v0.11.1 at 15:05. That gap is exactly why Hypothesis A stays
+live.
 
 So there are two live hypotheses and the fix depends on which is true:
 
@@ -61,13 +65,26 @@ So there are two live hypotheses and the fix depends on which is true:
   - The run used `agent_source: repo`, so it ran the **repo** web-ux agent
     (`.claude/agents/web-ux.md`), not the PRD #87 **builtin** (roster
     ten→eleven, commit `30b06b94`). The repo template has SPA-nav guidance
-    (lines ~60-66) but **no `--no-sandbox` note at all**, and the SPA guidance
-    still did not prevent the empty-body hard-navs — so the guidance is either not
-    reaching the agent or not actionable enough.
+    (lines ~58-61) but **no `--no-sandbox` note at all** — and **neither does the
+    #87 builtin itself** (`api/internal/agenttmpl/builtins/web-ux.md`: SPA
+    guidance at line 57, zero mentions of the sandbox). So *whichever* source a
+    run uses, the shipping template never tells the agent about `--no-sandbox`.
+    The SPA guidance also did not prevent the empty-body hard-navs — so it is
+    either not reaching the agent or not actionable enough.
 
-The investigation's first job is to decide A vs B on a **current** v0.11.x worker;
-the hardening then closes whichever gap is real (and adds the cheap belt-and-
-suspenders regardless).
+**The code makes A the strong prior.** On a healthy v0.11.x image a CLI-following
+agent essentially cannot miss `--no-sandbox`: the shim is the only
+PATH-resolvable `agent-browser` entry (the real bin at `/app/node_modules/.bin`
+is off `PATH`) and it sets `AGENT_BROWSER_ARGS` unconditionally-if-unset, and the
+web-ux template directs the agent to use the `agent-browser` CLI. So repeated
+SUID aborts near-require either an unhealthy / pre-#87 / rolled-back image (A) or
+the agent shelling `chromium` directly (which the judge summary does not
+evidence) — B is hard to reach for a CLI-following agent. M1 still decides A vs B
+on a **current** v0.11.x worker, but the likely outcome is that this PRD
+collapses to **M3 + M5** after M1 (a possibility M1 already licenses). Note the
+run-time image tag is probably **not recoverable retroactively** (a worker
+self-reports a frozen version string, and k8s events expire), so M1 is
+necessarily a **fresh reproduction**, not forensics on the 07-22 run.
 
 ## Solution Overview
 
@@ -102,11 +119,16 @@ efficiency + reliability fix, so Medium priority.
   shim, and whether SPA routes load. Record the verdict (Hypothesis A vs B) with
   evidence. If purely A (stale image, already fixed by #114), narrow the remaining
   milestones to M3/M5 and say so in the Decision Log.
-- [ ] **M2 — Guarantee `--no-sandbox` on every web-ux browser launch.** Close the
+- [ ] **M2 — Guarantee `--no-sandbox` on every browser launch.** Close the
   delivery gap found in M1 so a web-ux run cannot end up on the setuid-sandbox
   path — regardless of shim vs bare CLI vs direct chromium. Include a fail-closed
   check (a launch missing `--no-sandbox` should fail loudly in test, not silently
-  abort at run time).
+  abort at run time). Make the guarantee **agent-agnostic**: it must cover any
+  agent that launches chromium, not only the web-ux agent going through the
+  `agent-browser` shim — e.g. a coder rasterizing an SVG→PNG via a headless
+  chromium screenshot. (That capability is why the dedicated-rasterizer rec from
+  run 0ab992db was dismissed `wont-do`: chromium now covers SVG→PNG faithfully,
+  but only once this guarantee reaches non-web-ux launches too.)
 - [ ] **M3 — web-ux template hardening.** Add the `--no-sandbox` note, reinforce
   SPA in-app navigation, and fix the `resize` vs `set viewport` guidance in the
   web-ux agent template(s).
@@ -148,7 +170,9 @@ efficiency + reliability fix, so Medium priority.
 - **PRD #87** (v0.11.0) — prebaked chromium + `agent-browser` shim + `--no-sandbox`
   env; the web-ux builtin.
 - **Issue #114** (v0.11.1, `be9a45a3`) — `seed-nix` `/nix` perm normalization after
-  the browser build guard (the stuck-upgrade root cause for worker `8e1fef71`).
+  the browser build guard (the stuck-upgrade root cause for worker `8e1fef71`);
+  v0.11.1 also carried the browser crashpad-XDG fix, part of the same
+  browser-reliability surface (the shim's XDG stanza) this PRD touches.
 - **PRD #113** — worker upgrade/version health; documents the `8e1fef71` stuck
   upgrade this run rode on.
 - **PRD #92** — version-aware `/nix` reseed + stable toolchain path (the "workers
@@ -165,3 +189,16 @@ efficiency + reliability fix, so Medium priority.
   (chromium screenshot covers it), dismissed; `node_modules` prewarm + pre-scan
   `node_modules/.bin` false-positives → a separate future PRD. This PRD is the
   investigate-and-fix one (chromium/web-ux browser reliability).
+- 2026-07-22 — Fable adversarial review verified all 8 load-bearing claims
+  CONFIRMED against code, git, and live run/review state (incl. the sparse-env +
+  shim mechanism, the `8e1fef71`↔#113/#114 link, and that `resize` vs `set
+  viewport` is a real agent-browser distinction). Verdict: revise (light), no
+  rethink. Applied: (1) calibrated the Problem section so Hypothesis A (stale /
+  pre-#87 / rolled-back image) is the strong prior — on a healthy image the shim
+  makes B hard to reach for a CLI-following agent, so the PRD likely collapses to
+  M3+M5 after M1; (2) added the release-time≠image-on-worker-time hedge and noted
+  M1 is a fresh reproduction (run-time image tag not recoverable retroactively);
+  (3) recorded that the #87 **builtin** shares the repo template's missing
+  `--no-sandbox` note; (4) path/line nits. Also added the M2 agent-agnostic
+  `--no-sandbox` clause so the SVG→PNG rasterization use case (dismissed
+  dedicated-rasterizer rec, run 0ab992db) is covered for non-web-ux launches too.
