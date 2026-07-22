@@ -284,9 +284,33 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		}
 	}
 
-	// The PVCs. Same create/AlreadyExists shape, and never patched: PVC specs are
-	// near-immutable, so a size change is delete + reprovision, not a live edit.
+	// The PVCs. Same create/AlreadyExists shape as the Deployment below, and never
+	// patched: PVC specs are near-immutable, so a size change is delete + reprovision,
+	// not a live edit.
+	//
+	// Gate the create on the observed flag (issue #114 BUG 3), exactly as the Deployment
+	// does with obs.HasDeployment. An UNCONDITIONAL create every ~10s tick charged the
+	// ResourceQuota's `used.requests.storage` at admission for each PVC, and k8s does NOT
+	// decrement it when storage then rejects the create AlreadyExists (upstream #119593):
+	// the redundant charges out-raced the quota-controller resync and pinned the quota at
+	// its hard limit, so genuinely-new workers were then refused their PVCs. Observe
+	// populates HasDataPVC/HasNixPVC every tick by listing the namespace, so once a PVC is
+	// seen we skip re-issuing its create. The AlreadyExists tolerance is retained for the
+	// observe→create race (a PVC created since the last Observe, so its flag is still
+	// false) — the gate removes the steady-state churn, the tolerance covers the window.
+	// Teardown deletes the PVCs, so a reprovisioned worker observes the flag false again
+	// and recreates — the delete+reprovision semantics are preserved.
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
+		switch pvc.Name {
+		case dataPVCName(w.ID):
+			if obs.HasDataPVC {
+				continue
+			}
+		case nixPVCName(w.ID):
+			if obs.HasNixPVC {
+				continue
+			}
+		}
 		_, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
