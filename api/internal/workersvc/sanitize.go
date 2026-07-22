@@ -62,6 +62,12 @@ var replacementEscape = []byte(`\` + `ufffd`)
 // sanitizePayloadJSON rewrites the three unstorable patterns inside a payload's
 // JSON string literals, leaving every other byte alone.
 //
+// The returned slice is READ-ONLY to the caller. On the fast path it is `p` itself
+// (only the slow path allocates a fresh array), so the two return paths are
+// indistinguishable at the call site — and a caller that mutated the result would,
+// on exactly the healthy-batch path, be mutating its own input. No caller mutates
+// it today: AppendMessages hands it straight to the insert and the WS broadcast.
+//
 // It is a state scanner rather than a decode/walk/re-encode, and NOT because
 // "byte fidelity is preserved end to end" — it is not: payload is jsonb, which
 // normalizes key order, whitespace and duplicate keys, so the REST replay path
