@@ -1503,7 +1503,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	sessionID := textParam(req.SessionID)
+	sessionID := stripNULParam(req.SessionID)
 	var rows int64
 	switch req.State {
 	case "running":
@@ -1523,11 +1523,11 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
-			PlanMd: textParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: textParam(req.MrWebURL), SessionID: sessionID,
+			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
@@ -2585,6 +2585,27 @@ func sanitizeFailureReason(s *string) pgtype.Text {
 	}
 	clean, _ := stripNUL(*s)
 	clean = truncateRunes(clean, maxFailureReasonRunes)
+	return pgText(clean)
+}
+
+// stripNULParam is textParam with NUL removed, for the OTHER worker-controlled text
+// fields on the /state path that reach a plain `text` column: session_id, plan_md,
+// branch, mr_web_url (PRD #108 A4b). A NUL in any of them raises 22021 exactly as it
+// does in jsonb, 500s the transition, and — on awaiting_approval/completed/failed —
+// the run's new state never lands. M2 sanitized /messages; failure_reason got A4;
+// these are the rest of the class on /state.
+//
+// Deliberately NO length cap, unlike sanitizeFailureReason and run_usage's
+// composite-PK keys: plan_md is model prose that is legitimately long, and none of
+// these columns is an index key (00020_workers_runs.sql; no index references
+// session_id or branch), so a cap would be lossy data loss for no storability gain.
+// A NUL-only value strips to "", which pgText maps to NULL — for session_id that is
+// its documented "no change" sentinel, which is the right outcome for garbage input.
+func stripNULParam(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean, _ := stripNUL(*s)
 	return pgText(clean)
 }
 

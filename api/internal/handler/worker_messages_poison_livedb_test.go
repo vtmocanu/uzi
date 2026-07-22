@@ -930,6 +930,84 @@ func TestWorkerRunStateFailureReasonNulIsStrippedLiveDB(t *testing.T) {
 	}
 }
 
+// stateColumn reads one runs column back for the fixture's run.
+func (f poisonFixture) stateColumn(t *testing.T, column string) (string, bool) {
+	t.Helper()
+	var v *string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT `+column+` FROM runs WHERE id = $1`, f.runID).Scan(&v); err != nil {
+		t.Fatalf("read runs.%s: %v", column, err)
+	}
+	if v == nil {
+		return "", false
+	}
+	return *v, true
+}
+
+// plan_md is the realistic sibling of failure_reason (PRD #108 A4b): model prose on
+// the approval-gate path. A NUL there 22021s the awaiting_approval report, so the
+// gate state never lands and the run stalls. Unlike failure_reason it takes NO cap —
+// a plan is legitimately long and plan_md is not an index key — so this is
+// strip-only.
+//
+// Unfixed, this returns 500 (SQLSTATE 22021) and the approval gate never opens.
+func TestWorkerRunStatePlanMdNulIsStrippedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"status":"awaiting_approval","plan_md":"# Plan a` + poisonNulEsc + `b"}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	rec := f.postState(t, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /state awaiting_approval with a u0000 escape in plan_md: status = %d, want 200 — a NUL "+
+			"there 22021s the gate report, so the approval state never lands", rec.Code)
+	}
+	got, ok := f.stateColumn(t, "plan_md")
+	if !ok {
+		t.Fatal("plan_md was not persisted")
+	}
+	if want := "# Plan ab"; got != want {
+		t.Errorf("runs.plan_md = %q (% x), want %q — the NUL must be stripped, the rest left intact", got, got, want)
+	}
+}
+
+// branch and mr_web_url ride the `completed` terminal report; a NUL in either 22021s
+// it, and the terminal state (with its MR evidence) never lands. Strip-only.
+func TestWorkerRunStateCompletedTextNulIsStrippedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"status":"completed","branch":"agent/issue-1a` + poisonNulEsc + `b",` +
+		`"mr_web_url":"https://forge.e2e/g/r/-/merge_requests/7a` + poisonNulEsc + `b"}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	rec := f.postState(t, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /state completed with a u0000 escape in branch/mr_web_url: status = %d, want 200 — a NUL "+
+			"in either 22021s the terminal report, so the run never records completion", rec.Code)
+	}
+	if got, _ := f.stateColumn(t, "branch"); got != "agent/issue-1ab" {
+		t.Errorf("runs.branch = %q, want %q — the NUL must be stripped from branch", got, "agent/issue-1ab")
+	}
+	if got, _ := f.stateColumn(t, "mr_web_url"); got != "https://forge.e2e/g/r/-/merge_requests/7ab" {
+		t.Errorf("runs.mr_web_url = %q, want the NUL stripped", got)
+	}
+}
+
+// session_id rides EVERY /state branch (COALESCE'd in); a NUL there 22021s whatever
+// transition carried it. Strip-only — runs.session_id is unindexed; run_usage's
+// composite-PK copy is separately capped at the fold (A1).
+func TestWorkerRunStateSessionIDNulIsStrippedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"status":"running","session_id":"sess-a` + poisonNulEsc + `b"}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	rec := f.postState(t, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /state running with a u0000 escape in session_id: status = %d, want 200", rec.Code)
+	}
+	if got, _ := f.stateColumn(t, "session_id"); got != "sess-ab" {
+		t.Errorf("runs.session_id = %q, want %q — the NUL must be stripped from session_id", got, "sess-ab")
+	}
+}
+
 // The 500 arm logs the WRAPPED error, and its safety rests on a stdlib detail
 // rather than on anything this file does: slog special-cases values implementing
 // `error` and renders them via Error(). pgconn.PgError.Error() emits only
