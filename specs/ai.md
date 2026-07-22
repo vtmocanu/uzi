@@ -9878,13 +9878,18 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
   strip protects only workers already running the patched image. The worker
   (`agent/src/sanitize.ts`) applies the identical strip too, but strictly as
   defense in depth.
-- **D2 — strip `\u0000` and unpaired surrogates in the payload AND the sibling
-  text columns; never broaden to the control class.** Sink-driven: this content
-  renders in a React component that escapes it, not a terminal table (PRD #90's
-  `sanitizeMemoryField`, which strips the wider class, has the opposite sink).
-  The scope is FOUR worker-controlled text columns, not one payload field —
-  `kind`, `agent`, `agent_instance`, `agent_label` — corrected post-implementation
-  on two counts: `agent` had no length cap at all before this phase (not merely
+- **D2 — the payload gets NUL + unpaired-surrogate + invalid-UTF-8 handling; the
+  sibling text columns get NUL-strip ONLY — never broaden either to the wider
+  control class.** The asymmetry is measured, not stylistic: `encoding/json`'s
+  string decoder already folds an unpaired surrogate escape and raw invalid
+  UTF-8 to U+FFFD before the value exists as a Go string, so nothing but a NUL
+  ever reaches a text column. Deliberately never widened to control characters
+  or ANSI escapes on either sink: this content renders in a React component
+  that escapes it, not a terminal table (PRD #90's `sanitizeMemoryField`, which
+  strips the wider class, has the opposite sink). The scope is FOUR
+  worker-controlled text columns, not one payload field — `kind`, `agent`,
+  `agent_instance`, `agent_label` — corrected post-implementation on two
+  counts: `agent` had no length cap at all before this phase (not merely
   unstripped like its siblings), and `kind` is a fourth column the first draft
   never listed.
 - **D3 — permanent failures return 400, from an ENUMERATED SQLSTATE set, never a
@@ -9903,7 +9908,7 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
   strictly worse than the bug being fixed. The blocking order is: byte/message
   cap → split → exponential backoff → bisect + tombstone → 4xx-fatal
   classification → breaker.
-- **The `/state` silent-strip decision.** `failure_reason` (A4) and its three
+- **The `/state` silent-strip decision.** `failure_reason` (A4) and its four
   siblings (`session_id`/`plan_md`/`branch`/`mr_web_url`, A4b) get the same
   NUL-strip as `/messages`, but SILENTLY — no count-and-log, unlike `/messages`'
   Risk-3-driven visibility requirement. Deliberate, not an inconsistency:
