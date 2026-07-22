@@ -80,6 +80,33 @@ spec:
       ports:
         - protocol: TCP
           port: {{ include "uzi.workerAPIPort" . }}
+    {{- if .Values.workers.networkPolicy.allowWebService }}
+    # The in-cluster uzi web Service (PRD #87 §5 / M5). A browser-capable worker
+    # running `web-ux` drives uzi's OWN web UI; the two rules above allow only DNS
+    # and the api, so without this the browser cannot reach it. Selector-based for
+    # the SAME reason the api rule is: an FQDN ANNP cannot match an in-cluster
+    # Service — AntreaProxy rewrites the ClusterIP to a pod IP before enforcement
+    # (see the api-rule comment above). Off by default; opted into per-cluster via
+    # workers.networkPolicy.allowWebService.
+    #
+    # Scoped to the web component in THIS namespace, on the web pod's CONTAINER port
+    # (8080, web-deployment.yaml) — NOT the Service port (web.service.port = 80):
+    # the policy is enforced on the post-DNAT packet, whose destination is the pod
+    # IP:8080. The selectorLabels + component:web sit in ONE `to` entry, which is an
+    # AND — a second entry would be an OR (every pod in the namespace, or this
+    # component in every namespace).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
     {{- with .Values.workers.networkPolicy.extraEgress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
