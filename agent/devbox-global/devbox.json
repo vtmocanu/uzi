@@ -42,6 +42,23 @@
   //     wire FONTCONFIG_FILE at /opt/uzi-toolchain/share/fonts and pre-warm the cache.
   // agent-browser itself is NOT a nix package — it is the pinned npm CLI in
   // agent/package.json (baked by `npm ci`), never installed per-run.
+  //
+  // `openssl` is a broadly-useful base crypto/TLS CLI (cert generation, `openssl rand`,
+  // hashing, PEM/DER) that many repos' test harnesses and scripts reach for — the same
+  // "every worker should have it" class as go/python3, NOT a repo-specific extra like a
+  // Homebrew formula's ruby. It was first surfaced by uzi's own e2e harness
+  // (e2e/run-e2e.sh forge-fake self-signed cert; judge rec, run dd06c0ed) but lives here
+  // in the baked toolchain rather than as tier-2 so its absence never surfaces a silent
+  // exit 127 to an agent in ANY repo. Its closure is small and largely already present
+  // via the other packages' deps, so it adds negligible image weight.
+  //
+  // NOTE: it MUST be `openssl.bin`, not bare `openssl`. nixpkgs splits openssl into
+  // outputs and its outputsToInstall is [bin, man] with NO `out`, so `devbox global
+  // install` of bare `openssl` lands only libs/man and `command -v openssl` 127s — the
+  // build guard then fails (proven: MR !103 pipeline 19969, build:agent). The `.bin`
+  // output carries the `openssl` CLI; verified `devbox install` at the pinned rev puts
+  // /opt/uzi-toolchain/bin/openssl on PATH. (gcc/go/python3 don't hit this — their CLI
+  // is in `out`, which IS installed.)
   "packages": [
     "go",
     "gcc",
@@ -49,6 +66,7 @@
     "python3Packages.pip",
     "chromium",
     "fontconfig",
-    "dejavu_fonts"
+    "dejavu_fonts",
+    "openssl.bin"
   ]
 }

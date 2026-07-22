@@ -168,8 +168,8 @@ ENV PATH="/opt/uzi-toolchain/bin:${PATH}"
 # PRD #92 M1 fail-closed guard (the "UNVERIFIED" stanza never had one): a broken toolchain
 # fails the BUILD here (resolving against /opt/uzi-toolchain/bin) instead of shipping a
 # silent 127 to every subagent at run time.
-RUN command -v python3 && command -v go && command -v gcc && command -v pip \
-    && go version && python3 --version && gcc --version && pip --version
+RUN command -v python3 && command -v go && command -v gcc && command -v pip && command -v openssl \
+    && go version && python3 --version && gcc --version && pip --version && openssl version
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
