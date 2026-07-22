@@ -245,6 +245,36 @@ describe("MessageBatcher bisection + tombstone (PRD #108 M3)", () => {
   });
 });
 
+describe("MessageBatcher tombstone attribution (PRD #108 B4)", () => {
+  it("carries agent_instance and agent_label onto the tombstone, keeping it in its lane", async () => {
+    // A tombstoned SUBAGENT frame must stay in its lane: RunEvent groups on
+    // agent_instance, so a marker that dropped them would render in the top-level
+    // stream — the loss shown, but not where it happened.
+    const POISON = 2;
+    const { client, landed } = scriptedApi((msgs) =>
+      msgs.some((m) => m.seq === POISON && (m.payload as { event?: string }).event === undefined) ? 400 : undefined,
+    );
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    batcher.emit({ kind: "text", agent: "coder", payload: { text: "clean" } });
+    batcher.emit({
+      kind: "tool_result",
+      agent: "coder",
+      agentInstance: "toolu_SUB",
+      agentLabel: "web gate UX",
+      payload: { text: "poison" },
+    });
+    batcher.emit({ kind: "text", agent: "coder", payload: { text: "after" } });
+    await batcher.close();
+
+    const marker = landed.find((m) => m.seq === POISON)!;
+    assert.ok(marker, "the poisoned subagent frame must still land as a tombstone");
+    assert.strictEqual((marker.payload as { event?: string }).event, "message_dropped");
+    assert.strictEqual(marker.agent_instance, "toolu_SUB", "the tombstone stays in the subagent lane");
+    assert.strictEqual(marker.agent_label, "web gate UX");
+  });
+});
+
 describe("MessageBatcher breaker (PRD #108 M3)", () => {
   for (const status of [401, 403, 404]) {
     it(`${status} trips immediately, with no bisection`, async () => {

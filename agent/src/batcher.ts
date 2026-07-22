@@ -169,7 +169,13 @@ function tombstone(item: Buffered, event: TombstoneEvent, reason: string, redact
     // anyway so a future edit that interpolates payload content cannot open a hole.
     payload: { text: redactText(text), event, reason, kind: originalKind, bytes: item.bytes },
   };
+  // Carry the whole attribution triple, not just `agent`. Without agent_instance and
+  // agent_label the marker leaves the subagent lane it belongs to (RunEvent groups on
+  // agent_instance) and renders in the top-level stream — so the loss is shown, but
+  // not where it happened. These are already scrubbed on the original frame at emit().
   if (item.msg.agent !== undefined) msg.agent = item.msg.agent;
+  if (item.msg.agent_instance !== undefined) msg.agent_instance = item.msg.agent_instance;
+  if (item.msg.agent_label !== undefined) msg.agent_label = item.msg.agent_label;
   return { msg, bytes: messageBytes(msg), tombstoned: true };
 }
 
