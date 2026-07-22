@@ -179,6 +179,75 @@ RUN command -v python3 && command -v go && command -v gcc && command -v pip \
 COPY agent/package.json agent/package-lock.json ./
 RUN npm ci --omit=dev
 
+# --- PRD #87: prebaked browser (chromium + agent-browser) for the web-ux role -----------
+# The browser rides the SHARED devbox-global toolchain (chromium + fontconfig + dejavu_fonts
+# in agent/devbox-global/devbox.json — the owner's chosen delivery), so it is already
+# realized into /opt/uzi-toolchain by the stanza above; agent-browser is the pinned npm CLI
+# baked by `npm ci` above. This block wires the four things devbox.json cannot express: font
+# discovery, the M4 launch ENV, the M1 crash-close shim, and a fail-closed build guard.
+# MIRRORED in templates/jvm (jvm is NOT `FROM base` — no ENV inheritance); keep in lockstep.
+#
+# Fonts: a nix Chromium closure ships NO fonts, so every screenshot renders tofu without a
+# font pkg + a fontconfig that can find it. Point fontconfig at the STABLE toolchain font dir
+# (#92 handle — never a rolling /nix/store path) via a minimal self-contained config, and
+# pre-warm the cache at build time (as root, so the runtime runner uid never needs to write
+# it; fc-cache is best-effort — libfontconfig reads the config regardless). UNVERIFIED
+# without an image build: legible-vs-tofu is only provable by M7's screenshot.
+RUN mkdir -p /etc/fonts /var/cache/fontconfig \
+    && printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
+      '<fontconfig>' \
+      '  <dir>/opt/uzi-toolchain/share/fonts</dir>' \
+      '  <cachedir>/var/cache/fontconfig</cachedir>' \
+      '</fontconfig>' > /etc/fonts/fonts.conf
+ENV FONTCONFIG_FILE=/etc/fonts/fonts.conf
+RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f || true; fi
+
+# M4 runtime ENV (the actual M0 fix): devbox.json puts chromium on PATH but cannot express
+# launch flags. Point agent-browser at the prebaked chromium via the STABLE
+# /opt/uzi-toolchain/bin handle (#92 — a raw /nix/store path rolls per rebuild); force
+# --no-sandbox (mandatory under the PRD #51 hardening: unprivileged uid + cap_drop:ALL +
+# no-new-privileges make Chromium's setuid sandbox impossible) and --disable-dev-shm-usage
+# (compose sets no shm_size => 64MB /dev/shm); AGENT_BROWSER_IDLE_TIMEOUT_MS closes an idle
+# daemon so a wedged one can't silently no-op corrected launch options (M0 secondary).
+# agent-browser 0.32.3 reads all three env vars (== --executable-path / --args / idle
+# timeout). NOTE: the SDK hands the agent a SPARSE env (agent/src/sdk-env.ts REPLACES the
+# subprocess env), so these baked vars do NOT reach the agent's Bash tool by themselves —
+# the shim below re-establishes them for the agent-browser process. They are kept here for
+# the worker/build context, the build guard, and as the documented contract. MIRRORED in jvm.
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/uzi-toolchain/bin/chromium
+ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
+ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
+
+# M1 crash-close shim on PATH ahead of the real CLI: a browser-driving agent that finds no
+# runnable browser exits cleanly (exit 0 + a clear message) instead of a raw Chromium SUID
+# abort (M0), keyed on the missing-browser FAILURE not the role name. /usr/local/bin is on
+# PATH; the real npm bin (/app/node_modules/.bin/agent-browser) is NOT, so a bare
+# `agent-browser` always hits the shim, which execs the real CLI by absolute path (no PATH
+# recursion) when a browser resolves and injects the M4 launch config the sparse SDK env
+# would otherwise drop. Root-owned 0755. MIRRORED in jvm.
+COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
+
+# Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the
+# baked CLI is missing OR cannot RUN, OR an exit-bounded headless Chromium launch fails — so a
+# broken browser/font/lib set is caught here, not shipped as a run-time crash. The
+# `agent-browser --version` step runs the CLI end-to-end through the shim and exercises the
+# real native musl binary (a file-check alone would miss an unrunnable wrapper — e.g.
+# engines.node>=24 vs node:22-alpine, or a failed native-binary postinstall). `timeout` turns
+# a hung launch into a build failure; --dump-dom actually starts Chromium (unlike a bare
+# --version). CAVEAT: this runs in the BUILDER (root, no cap_drop, builder /dev), so it
+# validates the binary + shared libs, NOT the runtime hardening posture — only M7 does that.
+# MIRRORED in jvm.
+RUN command -v agent-browser \
+    && command -v chromium \
+    && [ -x /app/node_modules/.bin/agent-browser ] \
+    && timeout 30 agent-browser --version >/dev/null \
+    && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
+        --headless --no-sandbox --disable-dev-shm-usage \
+        --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
+    && rm -rf /tmp/uzi-chromium-buildcheck
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 

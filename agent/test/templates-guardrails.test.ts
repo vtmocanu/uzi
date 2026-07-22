@@ -149,6 +149,59 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         );
       }
     });
+
+    it(`${name}: wires the PRD #87 browser (shim + M4 launch ENV + fail-closed guard) in lockstep`, () => {
+      // The browser rides the shared toolchain, so EVERY template must carry the same runtime
+      // wiring. jvm is NOT `FROM base` and does NOT inherit ENV, so forgetting this block on
+      // jvm re-creates the M0 SUID abort on every jvm worker — pin it as an invariant here.
+
+      // M1 crash-close shim baked onto PATH (/usr/local/bin, ahead of the un-PATH'd npm bin).
+      assert.match(
+        text,
+        /COPY --chmod=0755 agent\/bin\/agent-browser \/usr\/local\/bin\/agent-browser/,
+        `${name}/Dockerfile must bake the agent-browser crash-close shim onto PATH (M1)`,
+      );
+
+      // M4 launch ENV: executable path pinned to the STABLE /opt/uzi-toolchain handle (never a
+      // rolling /nix/store path), --no-sandbox mandatory + --disable-dev-shm-usage, idle timeout.
+      assert.match(
+        text,
+        /ENV AGENT_BROWSER_EXECUTABLE_PATH=\/opt\/uzi-toolchain\/bin\/chromium/,
+        `${name}/Dockerfile must point AGENT_BROWSER_EXECUTABLE_PATH at the stable toolchain handle (M4)`,
+      );
+      assert.doesNotMatch(
+        text,
+        /ENV AGENT_BROWSER_EXECUTABLE_PATH=[^\n]*\/nix\/store/,
+        `${name}/Dockerfile must NOT point AGENT_BROWSER_EXECUTABLE_PATH at a rolling /nix/store path`,
+      );
+      assert.match(
+        text,
+        /ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"/,
+        `${name}/Dockerfile must force --no-sandbox (mandatory) + --disable-dev-shm-usage (M4)`,
+      );
+      assert.match(
+        text,
+        /ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=\d+/,
+        `${name}/Dockerfile must set a stale-daemon idle timeout (M4)`,
+      );
+
+      // Fonts: fontconfig config so screenshots render glyphs, not tofu.
+      assert.match(text, /ENV FONTCONFIG_FILE=/, `${name}/Dockerfile must set FONTCONFIG_FILE so fonts resolve`);
+
+      // Fail-closed build guard: agent-browser resolves AND an exit-bounded headless launch.
+      // A bare `--version` would never start Chromium, so require the real headless launch
+      // wrapped in `timeout` (a hung browser must FAIL the build, not hang the CI job).
+      assert.match(text, /command -v agent-browser\b/, `${name}/Dockerfile must assert agent-browser resolves at build (M3)`);
+      // The launch is `timeout N "$AGENT_BROWSER_EXECUTABLE_PATH" \ --headless --no-sandbox …`
+      // (the flags wrap onto a continuation line), so check the pieces, not one flat line.
+      assert.match(
+        text,
+        /timeout \d+ "\$AGENT_BROWSER_EXECUTABLE_PATH"/,
+        `${name}/Dockerfile must exit-bound the headless Chromium launch with 'timeout' (M3)`,
+      );
+      assert.match(text, /--headless\b/, `${name}/Dockerfile build guard must launch Chromium headless (M3)`);
+      assert.match(text, /--dump-dom/, `${name}/Dockerfile build guard must actually launch Chromium (--dump-dom), not a bare --version`);
+    });
   }
 });
 
@@ -358,10 +411,33 @@ function parseStringList(text: string, anchor: RegExp): string[] {
 // it carries `//` comments — so JSON.parse would reject it).
 describe("devbox-global default toolchain manifest", () => {
   const manifest = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.json"), "utf8");
+  const lock = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.lock"), "utf8");
   it("lists go + python3 + pip", () => {
     assert.match(manifest, /"go"/, "manifest must list go");
     assert.match(manifest, /"python3"/, "manifest must list python3");
     assert.match(manifest, /python3Packages\.pip|"pip"/, "manifest must list pip");
+  });
+  // PRD #87: the browser for the web-ux role rides this SAME shared toolchain, so a drop can't
+  // silently ship a worker without a browser or its fonts (which would render every screenshot
+  // as tofu). chromium is the browser; fontconfig + a font package make text legible.
+  it("lists chromium + fontconfig + a font package (PRD #87)", () => {
+    assert.match(manifest, /"chromium"/, "manifest must list chromium (the web-ux browser)");
+    assert.match(manifest, /"fontconfig"/, "manifest must list fontconfig");
+    assert.match(manifest, /"dejavu_fonts"|"liberation_ttf"/, "manifest must list a font package (else screenshots are tofu)");
+  });
+  // Every manifest package must be pinned in the sibling lock at the SAME nixpkgs rev (the
+  // pin the Dockerfiles COPY in before `devbox global install`); an unpinned package floats.
+  it("pins every browser package in devbox.lock at the toolchain nixpkgs rev", () => {
+    const revMatch = /github:NixOS\/nixpkgs\/([0-9a-f]{40})#go\b/.exec(lock);
+    assert.ok(revMatch, "lock must pin go at a concrete nixpkgs rev to anchor the toolchain pin");
+    const rev = revMatch![1];
+    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts"]) {
+      assert.match(
+        lock,
+        new RegExp(`github:NixOS/nixpkgs/${rev}#${pkg}\\b`),
+        `devbox.lock must pin ${pkg} at the same rev (${rev}) as the rest of the toolchain`,
+      );
+    }
   });
 });
 

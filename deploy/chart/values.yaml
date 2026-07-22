@@ -552,6 +552,15 @@ workers:
       namespace: kube-system
       podSelector:
         k8s-app: kube-dns
+    # Allow workers to reach uzi's OWN in-cluster web Service (PRD #87 §5 / M5). A
+    # browser-capable worker running `web-ux` drives uzi's web UI, which this floor
+    # otherwise denies (it allows only DNS + the api). Selector-based, NOT an FQDN
+    # rule: Antrea's FQDN ANNP cannot match an in-cluster Service — AntreaProxy
+    # rewrites the ClusterIP to a pod IP BEFORE policy enforcement (the same reason
+    # the api allow above is selector-based). OFF by default so a cluster opts in
+    # explicitly; dev-cluster turns it on. TIGHT by construction — the web component
+    # in the release namespace, on the web pod port only (worker-networkpolicy.yaml).
+    allowWebService: false
     # Extra egress rules, appended verbatim. For a cluster that needs an in-cluster
     # destination the two rules above do not cover (a substituter mirror, a proxy).
     extraEgress: []

@@ -27,7 +27,7 @@ additionally publish a **Global** one for everyone. `lead` and
 
 ## Builtin roles
 
-uzi seeds ten builtin templates:
+uzi seeds eleven builtin templates:
 
 | Name | What it does |
 |---|---|
@@ -41,6 +41,7 @@ uzi seeds ten builtin templates:
 | `fact-checker` | Adversarially verifies factual claims against authoritative sources. |
 | `spec-keeper` | Keeps `specs/` in sync with implementation work. |
 | `researcher` | Investigates the codebase or external sources to gather context; reports findings only. |
+| `web-ux` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
 
 The `lead` is the orchestrator: the main agent thread. It runs on `opus`
 by default unless you set a personal override in

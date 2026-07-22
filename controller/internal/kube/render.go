@@ -431,9 +431,10 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 // RenderPVCs builds the /data and /nix claims.
 //
 // Two volumes, pointing opposite ways for opposite reasons. /data is the clone
-// cache + per-run workspaces and varies by size. /nix is FLAT (4Gi) and persists
-// because the store is an expensive INTERNET fetch (measured: 209 MB baked -> 1,703
-// MB provisioned in 10m53s), and Decision 9 rolls every worker on every release —
+// cache + per-run workspaces and varies by size. /nix is FLAT (20Gi, PRD #87 bump
+// for the prebaked Chromium closure) and persists because the store is an expensive
+// INTERNET fetch (measured: 209 MB baked pre-#87 -> ~2.6 GiB baked with Chromium),
+// and Decision 9 rolls every worker on every release —
 // so not persisting it would pay that cost per worker per release.
 //
 // Never patched. PVC specs are near-immutable and a size change is delete +

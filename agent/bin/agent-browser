@@ -1,0 +1,89 @@
+#!/bin/sh
+# PRD #87 — name-agnostic browser crash-close shim + launch-config injector for the
+# `agent-browser` CLI. Baked at /usr/local/bin/agent-browser (on the image PATH) in BOTH
+# worker templates; the real npm bin at /app/node_modules/.bin/agent-browser is NOT on the
+# image PATH, so a bare `agent-browser` from the agent always hits this shim first.
+#
+# It does two things the bare CLI cannot do on its own in the hardened worker:
+#
+#  M1 (crash-close, keyed on the FAILURE not the role name): a browser-driving agent (the
+#  agent-team `web-ux` role, or ANY user role that shells out to agent-browser) that finds
+#  NO runnable browser exits cleanly (exit 0 + a clear message) instead of letting Chromium
+#  abort with the raw SUID-sandbox FATAL (M0). Because it keys on "no browser resolves", it
+#  protects any browser-driving role, not just the literal name `web-ux`.
+#
+#  M4 (launch config, the actual M0 fix): the worker hands the SDK a SPARSE, allowlisted env
+#  — agent/src/sdk-env.ts REPLACES the subprocess environment entirely — so the AGENT_BROWSER_*
+#  / FONTCONFIG_FILE ENV baked in the Dockerfile do NOT reach the agent's Bash tool. This
+#  shim, which DOES run on the agent PATH, re-establishes them as DEFAULTS (respecting any
+#  value the caller already set) right before exec, so agent-browser launches the prebaked
+#  Chromium with --no-sandbox (mandatory under the PRD #51 hardening: unprivileged uid +
+#  cap_drop: ALL + no-new-privileges make Chromium's setuid sandbox impossible) and
+#  --disable-dev-shm-usage (compose sets no shm_size => 64MB /dev/shm), renders with real
+#  fonts (FONTCONFIG_FILE), and auto-closes an idle daemon so a wedged daemon can't silently
+#  no-op corrected launch options (M0 secondary). Delivering these via the shim scopes them
+#  to the agent-browser process (and its Chromium child) rather than widening the
+#  deliberately-minimal agent env, and needs no change to sdk-env.ts.
+set -eu
+
+# The baked real CLI. AGENT_BROWSER_SHIM_TARGET is set ONLY by this shim's own unit test;
+# production images never set it, so the target is fixed to the npm bin.
+REAL="${AGENT_BROWSER_SHIM_TARGET:-/app/node_modules/.bin/agent-browser}"
+
+# M4 launch config as defaults (image constants; a raw /nix/store path would roll per
+# rebuild, so point at the stable /opt/uzi-toolchain handle — PRD #92). Assigned only when
+# unset, so an explicit caller value always wins.
+: "${AGENT_BROWSER_EXECUTABLE_PATH:=/opt/uzi-toolchain/bin/chromium}"
+: "${AGENT_BROWSER_ARGS:=--no-sandbox,--disable-dev-shm-usage}"
+: "${AGENT_BROWSER_IDLE_TIMEOUT_MS:=60000}"
+: "${FONTCONFIG_FILE:=/etc/fonts/fonts.conf}"
+export AGENT_BROWSER_EXECUTABLE_PATH AGENT_BROWSER_ARGS AGENT_BROWSER_IDLE_TIMEOUT_MS FONTCONFIG_FILE
+
+# Crashpad needs a WRITABLE config/cache dir, independent of --no-sandbox. Chromium 150 traps
+# rc=133 (SIGTRAP) at the crashpad handler — BEFORE the SUID check, so --no-sandbox does NOT
+# fix it — when it cannot create its crashpad DB: the image bakes $HOME/.config
+# (/home/worker/.config) root:worker 0755, which the non-root runner uid (10001) cannot write.
+# Point the XDG base dirs at a guaranteed-writable location under TMPDIR (the runner's own 0700
+# tmp under the uid split, else /tmp) so the launch is robust to WHATEVER $HOME agent-browser
+# inherits — this closes the crash even for a direct/non-SDK/compose invocation that keeps the
+# image HOME, not only the SDK path where sdk-env.ts happens to repoint HOME to a writable dir.
+# Only-if-unset so an explicit caller value wins; the mkdir is best-effort (dir may pre-exist
+# or TMPDIR may be read-only — chromium still self-creates under a writable XDG root).
+: "${XDG_CONFIG_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/config}"
+: "${XDG_CACHE_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/cache}"
+export XDG_CONFIG_HOME XDG_CACHE_HOME
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+
+# A browser is reachable if the prebaked executable resolves, OR a chrome/chromium is on
+# PATH (auto-discovery), OR the invocation explicitly names a browser/endpoint — never
+# shadow a valid remote (--cdp) or explicit (--executable-path/--provider/--engine) call.
+browser_reachable() {
+  if [ -x "${AGENT_BROWSER_EXECUTABLE_PATH}" ]; then
+    return 0
+  fi
+  for b in chromium chromium-browser google-chrome google-chrome-stable chrome; do
+    if command -v "$b" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  for a in "$@"; do
+    case "$a" in
+      --executable-path|--executable-path=*|--cdp|--cdp=*|--provider|--provider=*|--engine|--engine=*|-p)
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if browser_reachable "$@"; then
+  if [ -x "$REAL" ]; then
+    exec "$REAL" "$@"
+  fi
+  # A browser resolves but the baked CLI is absent — a broken image the M3 fail-closed
+  # build guard is meant to reject; degrade rather than crash the run.
+  echo "agent-browser: browser present but the baked agent-browser CLI is missing at $REAL — skipping browser validation" >&2
+  exit 0
+fi
+
+echo "agent-browser: no browser in this runtime — skipping browser validation" >&2
+exit 0

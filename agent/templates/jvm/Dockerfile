@@ -129,6 +129,66 @@ RUN command -v python3 && command -v go && command -v gcc && command -v pip \
 COPY agent/package.json agent/package-lock.json ./
 RUN npm ci --omit=dev
 
+# --- PRD #87: prebaked browser (chromium + agent-browser) for the web-ux role -----------
+# MIRRORED from templates/base (jvm is NOT `FROM base` — no ENV inheritance; forgetting this
+# block would leave jvm workers with the browser binary but no launch flags and re-create the
+# M0 SUID abort on every jvm worker). Keep in LOCKSTEP with base. The browser rides the SHARED
+# devbox-global toolchain (chromium + fontconfig + dejavu_fonts in
+# agent/devbox-global/devbox.json), already realized into /opt/uzi-toolchain by the stanza
+# above; agent-browser is the pinned npm CLI baked by `npm ci`. This block wires font
+# discovery, the M4 launch ENV, the M1 crash-close shim, and a fail-closed build guard.
+#
+# Fonts: a nix Chromium closure ships NO fonts, so screenshots render tofu without a font pkg
+# + a fontconfig that can find it. Point fontconfig at the STABLE toolchain font dir (#92
+# handle) via a minimal self-contained config and pre-warm the cache at build time (as root;
+# fc-cache best-effort — libfontconfig reads the config regardless). UNVERIFIED without an
+# image build: legible-vs-tofu is only provable by M7's screenshot. See templates/base.
+RUN mkdir -p /etc/fonts /var/cache/fontconfig \
+    && printf '%s\n' \
+      '<?xml version="1.0"?>' \
+      '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">' \
+      '<fontconfig>' \
+      '  <dir>/opt/uzi-toolchain/share/fonts</dir>' \
+      '  <cachedir>/var/cache/fontconfig</cachedir>' \
+      '</fontconfig>' > /etc/fonts/fonts.conf
+ENV FONTCONFIG_FILE=/etc/fonts/fonts.conf
+RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f || true; fi
+
+# M4 runtime ENV (the M0 fix): chromium via the STABLE /opt/uzi-toolchain/bin handle (#92 —
+# never a raw /nix/store path), --no-sandbox (mandatory under PRD #51 hardening) +
+# --disable-dev-shm-usage (64MB /dev/shm), and an idle timeout so a wedged daemon self-closes.
+# The SDK hands the agent a SPARSE env (sdk-env.ts REPLACES it), so these baked vars do NOT
+# reach the agent's Bash tool alone — the shim below re-establishes them; kept here for the
+# worker/build context, the build guard, and the documented contract. MIRRORED from base.
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/uzi-toolchain/bin/chromium
+ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
+ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
+
+# M1 crash-close shim on PATH ahead of the real CLI: a browser-driving agent that finds no
+# runnable browser exits cleanly (exit 0 + message) instead of a raw Chromium SUID abort (M0),
+# keyed on the missing-browser FAILURE not the role name. /usr/local/bin is on PATH; the real
+# npm bin (/app/node_modules/.bin/agent-browser) is NOT, so a bare `agent-browser` hits the
+# shim, which execs the real CLI by absolute path when a browser resolves and injects the M4
+# launch config the sparse SDK env drops. Root-owned 0755. MIRRORED from base.
+COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
+
+# Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the
+# baked CLI is missing OR cannot RUN, OR an exit-bounded headless Chromium launch fails. The
+# `agent-browser --version` step runs the CLI end-to-end through the shim and exercises the
+# real native musl binary (a file-check alone would miss an unrunnable wrapper — e.g.
+# engines.node>=24 vs node:22-alpine, or a failed native-binary postinstall). `timeout` turns
+# a hung launch into a build failure; --dump-dom actually starts Chromium (unlike --version).
+# CAVEAT: runs in the BUILDER (root, no cap_drop), so it validates the binary + shared libs,
+# NOT the runtime hardening posture — only M7 does that. MIRRORED from base.
+RUN command -v agent-browser \
+    && command -v chromium \
+    && [ -x /app/node_modules/.bin/agent-browser ] \
+    && timeout 30 agent-browser --version >/dev/null \
+    && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
+        --headless --no-sandbox --disable-dev-shm-usage \
+        --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
+    && rm -rf /tmp/uzi-chromium-buildcheck
+
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
 

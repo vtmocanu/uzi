@@ -11,13 +11,13 @@ import (
 // read-only context-gathering roles the product previously lacked). This is the
 // single source of truth: builtins are the embedded builtins/*.md files, no
 // longer mirrored from .claude/agents/. Keep this list sorted — Builtins() returns
-// its slice sorted by name and TestBuiltinsSetIsExactlyTen compares index-for-index.
+// its slice sorted by name and TestBuiltinsSetIsExactlyEleven compares index-for-index.
 var builtinNames = []string{
 	"architect", "auditor", "coder", "documenter", "fact-checker",
-	"lead", "researcher", "reviewer", "spec-keeper", "tester",
+	"lead", "researcher", "reviewer", "spec-keeper", "tester", "web-ux",
 }
 
-func TestBuiltinsSetIsExactlyTen(t *testing.T) {
+func TestBuiltinsSetIsExactlyEleven(t *testing.T) {
 	got := Builtins()
 	if len(got) != len(builtinNames) {
 		t.Fatalf("got %d builtins, want %d", len(got), len(builtinNames))

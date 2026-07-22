@@ -301,8 +301,8 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 		if got := data.Spec.Resources.Requests.Storage().String(); got != tc.data {
 			t.Errorf("size %q: /data = %s, want %s", tc.size, got, tc.data)
 		}
-		if got := nix.Spec.Resources.Requests.Storage().String(); got != "4Gi" {
-			t.Errorf("size %q: /nix = %s, want the flat 4Gi", tc.size, got)
+		if got := nix.Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+			t.Errorf("size %q: /nix = %s, want the flat 20Gi", tc.size, got)
 		}
 		for _, p := range pvcs {
 			if p.Spec.AccessModes[0] != corev1.ReadWriteOnce {
