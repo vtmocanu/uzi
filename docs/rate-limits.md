@@ -37,10 +37,13 @@ other meters keep reading normally.
 
 ## Reading a meter
 
-A bar fills as you approach the limit and shifts color as it gets tight —
-the same green/amber/red language used elsewhere in uzi for "resource
-nearly exhausted". The **reset countdown** ("resets in 1h 23m") counts down
-to when that window clears, independent of the other one.
+A bar fills as you approach the limit and shifts color early — the same
+green/amber/red language used elsewhere in uzi for "resource nearly
+exhausted", but tuned to give you a heads-up well before things get tight.
+Amber is your cue to pace yourself or switch to another token; red means
+a window is genuinely close to its cap. The **reset countdown** ("resets
+in 1h 23m") counts down to when that window clears, independent of the
+other one.
 
 ## How fresh is this?
 

@@ -68,7 +68,7 @@ describe("rowState — the five row states", () => {
     ["no token", { status: "no_token" }, false, "no_token"],
     ["unavailable", { status: "unavailable" }, false, "unavailable"],
     ["stale reading", ok(31, 12, { stale: true }), true, "stale"],
-    ["live, both low", ok(8, 47), false, "live_ok"],
+    ["live, both low", ok(8, 27), false, "live_ok"],
     ["live, one window in warn band", ok(62, 83), false, "live_warn"],
     ["live, one window in danger band", ok(97, 71), false, "live_danger"],
   ];
@@ -83,9 +83,12 @@ describe("statusBadge", () => {
     expect(statusBadge({ status: "unavailable" }, false)).toMatchObject({ tone: "neutral", label: "no reading yet" });
     expect(statusBadge(ok(31, 12, { stale: true }), true)).toMatchObject({ tone: "neutral", label: "🔒 vault locked" });
     expect(statusBadge(ok(31, 12, { stale: true }), false)).toMatchObject({ tone: "neutral", label: "stale" });
-    expect(statusBadge(ok(8, 47), false)).toMatchObject({ tone: "ok", label: "Live", dot: true });
+    expect(statusBadge(ok(8, 27), false)).toMatchObject({ tone: "ok", label: "Live", dot: true });
     // A warn window stays "Live" (the bar carries the amber), not an escalated pill.
     expect(statusBadge(ok(62, 83), false)).toMatchObject({ tone: "ok", label: "Live" });
+    // An 85–94 danger-band window paints a red bar (danger tone) but the pill stays
+    // a green "Live" — the badge stays decoupled at ≥95, and no window here is ≥95.
+    expect(statusBadge(ok(88, 76), false)).toMatchObject({ tone: "ok", label: "Live" });
     expect(statusBadge(ok(97, 71), false)).toMatchObject({ tone: "danger", label: "5h nearly out" });
     expect(statusBadge(ok(71, 97), false)).toMatchObject({ tone: "danger", label: "7d nearly out" });
     expect(statusBadge(ok(96, 99), false)).toMatchObject({ tone: "danger", label: "5h & 7d nearly out" });
@@ -118,7 +121,7 @@ describe("sortAdminRows", () => {
   it("orders danger → warn → ok → stale → unavailable → no_token", () => {
     const users = [
       row("6", "irina", { status: "no_token" }),
-      row("3", "vlad", ok(8, 47)),
+      row("3", "vlad", ok(8, 27)),
       row("1", "ana", ok(97, 71)),
       row("5", "dana", { status: "unavailable" }),
       row("2", "radu", ok(62, 83)),
@@ -135,7 +138,7 @@ describe("sortAdminRows", () => {
   });
 
   it("tie-breaks two live-ok rows by 5h% desc", () => {
-    const users = [row("a", "low", ok(10, 20)), row("b", "high", ok(40, 5))];
+    const users = [row("a", "low", ok(10, 20)), row("b", "high", ok(35, 5))];
     expect(sortAdminRows(users).map((u) => u.name)).toEqual(["high", "low"]);
   });
 });

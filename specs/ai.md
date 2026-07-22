@@ -9939,3 +9939,42 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
 
 See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
 for the incident, the full Decision Log, and the Phase 1 progress record.
+
+## 366. PRD #115 — meter tone thresholds move to warn ≥40 / danger ≥85; badge and SR announcement decoupled from the tone at 95
+
+Supersedes **Decision 6's NUMBERS ONLY** (PRD #49/#53, `toneFor` at 80/95). The
+unified-visual-vocabulary PRINCIPLE of Decision 6 is retained in full.
+
+- **One shared `toneFor`, new bands warn ≥40 / danger ≥85** (`web/src/components/Meter.tsx`).
+  Still a single function painting BOTH the Claude 5h/7d rate-limit meters AND the
+  worker CPU/mem/disk resource gauges (`WorkerStats`) — the same atom, per Decision 6.
+  Rationale: warn earlier so a user has runway to slow down or switch tokens before
+  a rate-limit budget is nearly gone. *Tradeoff accepted*: a worker at 40% CPU now
+  reads amber and at 85% reads red; busy workers sit amber/red as their steady state
+  (`stats_cpu_pct` is percent-of-a-core, routinely ≥100% under compile). Rejected a
+  dedicated `toneForRateLimit` that would have spared the gauges — keeping one
+  vocabulary was judged more valuable than sparing the gauge repaint.
+- **Admin badge decoupled from the danger tone.** The "N nearly out" escalation in
+  `statusBadge` (`web/src/lib/rateLimits.ts`) stays at **≥95%**, no longer coincident
+  with the danger tone (now 85%). The 85–94% band therefore shows a **red bar with a
+  green "Live" pill** (deliberate disagreement, not the old empty-label bug), enforced
+  by an empty-`which` guard in the `live_danger` case that returns the green "Live"
+  badge when no window is ≥95%. `rowState`/sort ranking unchanged (danger still sorts
+  first, now from 85%).
+- **Dedicated ≥95% screen-reader announcement** (`RateLimitAnnouncer`,
+  `web/src/components/RateLimitMeters.tsx`). The announcer fires on a `toneFor`
+  step-up, so its warn/danger steps moved to 40/85 automatically; but the 95%
+  "nearly out" moment would otherwise carry no SR signal (the tone no longer changes
+  at 95). Added an explicit ≥95 announcement, tracked by its own one-shot ref (seeded
+  silently on first read so it never re-fires on the 30s clock tick), distinct in
+  wording from the tone step-up message — SR users get the emergency signal sighted
+  users get from the pill.
+- **Untouched by design.** Frozen mockup legends (`prds/mockups/53-…html` lines
+  146/218, `54-ui-polish-mock.html` line 183) still show the old 80/95 language and
+  are left as-is — superseded historical artifacts, not linter-checked. The CLI
+  (`api/cmd/uzi/admin.go`) is unaffected: it prints raw integer percentages with no
+  threshold coloring. Tailwind `--ok/--warn/--danger` color VALUES unchanged; only the
+  numeric breakpoints that select among them moved.
+
+See [prds/115-meter-color-thresholds.md](../prds/115-meter-color-thresholds.md) for
+the Locked Decisions, user journey, and the full test re-pin inventory.

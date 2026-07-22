@@ -114,14 +114,26 @@ describe("WorkerStatGauges", () => {
     expect(screen.getByText("640%")).toBeTruthy();
   });
 
-  it("applies the danger tone to bars at/above 95%", () => {
+  it("applies the danger tone to bars at/above 85%", () => {
     render(
       <WorkerStatGauges
-        worker={aWorker({ stats_cpu_pct: 96, stats_mem_bytes: 8160437862, stats_mem_limit_bytes: 8589934592, stats_source: "cgroup" })}
+        worker={aWorker({ stats_cpu_pct: 90, stats_mem_bytes: 7554662400, stats_mem_limit_bytes: 8589934592, stats_source: "cgroup" })}
       />,
     );
+    // ~88% memory (7554662400/8589934592) and 90% cpu — both in the new ≥85 danger band.
     expect((screen.getByRole("progressbar", { name: "CPU" }).firstChild as HTMLElement).className).toMatch(/bg-danger/);
     expect((screen.getByRole("progressbar", { name: "Memory" }).firstChild as HTMLElement).className).toMatch(/bg-danger/);
+  });
+
+  it("applies the warn tone to a bar in the 40–84 band", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({ stats_cpu_pct: 50, stats_mem_bytes: 1, stats_mem_limit_bytes: 2, stats_source: "cgroup" })}
+      />,
+    );
+    const cpuBar = screen.getByRole("progressbar", { name: "CPU" }).firstChild as HTMLElement;
+    expect(cpuBar.className).toMatch(/bg-warn/);
+    expect(cpuBar.className).not.toMatch(/bg-danger/);
   });
 });
 

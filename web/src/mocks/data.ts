@@ -153,18 +153,21 @@ function okReading(
 }
 
 // The signed-in demo user's own readings (Settings card + sidebar). Since PRD #104
-// this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 47%,
-// both green, "Live"), and the console key is busier so the two meter pairs are
-// visibly different rather than duplicates.
-export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 47, 2 * D + 4 * H);
+// this is ONE READING PER TOKEN: the default matches mockup frame A (8% / 27%,
+// both green under the PRD #115 bands, "Live"), and the console key is busier so
+// the two meter pairs are visibly different rather than duplicates.
+export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
 
 export const mockMyTokenRateLimits: TokenRateLimits[] = [
   { secret_id: "sec-default", label: "default", is_default: true, limits: mockMyRateLimits },
   {
+    // 34% / 22% — busier than the default but still both green under the #115
+    // bands, so vlad reads "Live" on both tokens (mockup frame A) and is the
+    // admin table's live_ok row.
     secret_id: "sec-console",
     label: "console-key",
     is_default: false,
-    limits: okReading(64, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
+    limits: okReading(34, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
   },
 ];
 
@@ -205,6 +208,9 @@ export const mockAdminRateLimits: AdminRateLimitUser[] = [
   { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, tokens: mockMyTokenRateLimits },
   { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, tokens: tokenised(okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3)) },
   { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, tokens: tokenised(okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1)) },
+  // sorin demonstrates the new PRD #115 85–94 danger band: 5h at 88% paints a red
+  // bar (danger tone ≥85) but the status pill stays a green "Live" because no
+  // window has crossed 95 (the badge stays decoupled at ≥95).
   { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, tokens: tokenised(okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4)) },
   { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, tokens: tokenised(okReading(31, 0, 12, 0, 180, "header_probe", true)) },
   { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, tokens: tokenised({ status: "unavailable" }) },

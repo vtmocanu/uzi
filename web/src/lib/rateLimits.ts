@@ -144,10 +144,13 @@ export interface StatusBadge {
 }
 
 // statusBadge maps a row to its status pill. A live reading is a green "Live";
-// only a ≥95% (danger) window escalates the pill to "5h nearly out" / "7d nearly
-// out" / "5h & 7d nearly out" (a warn window keeps "Live" — the bar carries the
-// amber). A stale row is a neutral pill: "vault locked" when the vault is the
-// cause (Decision 3), else "stale". vaultLocked has no bearing on a live row.
+// only a ≥95% window escalates the pill to "5h nearly out" / "7d nearly out" /
+// "5h & 7d nearly out" (a warn window keeps "Live" — the bar carries the amber).
+// The pill stays decoupled at ≥95 even though the danger TONE now steps at 85:
+// an 85–94 danger-band row paints a red bar (via the danger tone) but keeps a
+// green "Live" pill because no window has crossed 95 (Decision 3). A stale row is
+// a neutral pill: "vault locked" when the vault is the cause (Decision 3), else
+// "stale". vaultLocked has no bearing on a live row.
 export function statusBadge(limits: MyRateLimits, vaultLocked: boolean): StatusBadge {
   switch (rowState(limits)) {
     case "no_token":
@@ -165,6 +168,7 @@ export function statusBadge(limits: MyRateLimits, vaultLocked: boolean): StatusB
         ok.five_hour.pct >= 95 ? "5h" : null,
         ok.seven_day.pct >= 95 ? "7d" : null,
       ].filter(Boolean);
+      if (which.length === 0) return { tone: "ok", label: "Live", dot: true };
       return { tone: "danger", label: `${which.join(" & ")} nearly out`, dot: true };
     }
   }
