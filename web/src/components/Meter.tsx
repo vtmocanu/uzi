@@ -1,7 +1,7 @@
 // Shared utilization meter (PRD #53). The track/fill atom and the tone
 // thresholds were LIFTED out of WorkerStats' private Bar (PRD #49) so the worker
 // resource gauges and the Claude rate-limit meters speak one visual language
-// (Decision 6): ok < 80% ≤ warn < 95% ≤ danger. WorkerStats now composes
+// (Decision 6): ok < 40% ≤ warn < 85% ≤ danger. WorkerStats now composes
 // MeterTrack; the rate-limit surfaces (Settings card, sidebar micro-meter, admin
 // table) reuse the same atom with their own surrounding layout.
 
@@ -9,13 +9,13 @@ import { cx } from "./ui";
 
 export type MeterTone = "ok" | "warn" | "danger";
 
-// toneFor is the single threshold vocabulary (Decision 6): warn ≥80%, danger
-// ≥95%. It keys off the SAME rounded integer the bar width uses, so a 94.99% that
-// rounds to "95%" is danger, not warn — the colour can never disagree with the
+// toneFor is the single threshold vocabulary (Decision 6): warn ≥40%, danger
+// ≥85%. It keys off the SAME rounded integer the bar width uses, so a 84.99% that
+// rounds to "85%" is danger, not warn — the colour can never disagree with the
 // number the label shows.
 export function toneFor(pct: number): MeterTone {
-  if (pct >= 95) return "danger";
-  if (pct >= 80) return "warn";
+  if (pct >= 85) return "danger";
+  if (pct >= 40) return "warn";
   return "ok";
 }
 

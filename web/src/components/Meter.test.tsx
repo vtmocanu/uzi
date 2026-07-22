@@ -6,14 +6,13 @@ import { MeterTrack, clampPct, toneFor } from "./Meter";
 afterEach(cleanup);
 
 describe("toneFor thresholds (PRD #53 / #49 Decision 6)", () => {
-  it("is ok below 80, warn at 80–94, danger at 95+", () => {
+  it("is ok below 40, warn at 40–84, danger at 85+", () => {
     expect(toneFor(0)).toBe("ok");
-    expect(toneFor(79)).toBe("ok");
-    expect(toneFor(79.9)).toBe("ok");
-    expect(toneFor(80)).toBe("warn");
-    expect(toneFor(94)).toBe("warn");
-    expect(toneFor(94.9)).toBe("warn");
-    expect(toneFor(95)).toBe("danger");
+    expect(toneFor(39)).toBe("ok");
+    expect(toneFor(40)).toBe("warn");
+    expect(toneFor(84)).toBe("warn");
+    expect(toneFor(84.9)).toBe("warn");
+    expect(toneFor(85)).toBe("danger");
     expect(toneFor(100)).toBe("danger");
     expect(toneFor(6400)).toBe("danger");
   });

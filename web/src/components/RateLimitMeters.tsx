@@ -190,10 +190,18 @@ const TONE_RANK: Record<MeterTone, number> = { ok: 0, warn: 1, danger: 2 };
 // useMyRateLimits(60s) read so it is independent of whether the meters are on
 // screen. useNow keeps it re-rendering on the 30s clock like the card; the
 // effect keys off the reading, so a bare clock tick never re-announces.
+//
+// Since PRD #115 the danger TONE steps at 85, so crossing 95 no longer changes
+// the tone and would otherwise go unannounced. A dedicated ≥95 "nearly out"
+// emergency announcement (Decision 3) fires the moment the worst window crosses
+// 95 — a distinct, more urgent message than the tone step-up — so the badge's
+// 95% "nearly out" moment keeps a screen-reader signal. A second ref tracks the
+// critical state; dropping back below 95 clears it silently.
 export function RateLimitAnnouncer() {
   const { tokens } = useMyRateLimits(60_000);
   useNow();
   const lastTone = useRef<MeterTone | null>(null);
+  const wasCritical = useRef<boolean | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -204,19 +212,33 @@ export function RateLimitAnnouncer() {
     // holds three tokens and cannot tell which is throttling.
     const worstToken = worstTokenReading(tokens);
     const limits = worstToken?.limits;
-    // Only a live, non-stale reading transitions the ref (Decision 3).
+    // Only a live, non-stale reading transitions the refs (Decision 3).
     if (!limits || limits.status !== "ok" || limits.stale) return;
     const worst = worstWindow(limits);
     const tone = toneFor(worst.pct);
+    const critical = worst.pct >= 95;
     const prev = lastTone.current;
+    const prevCritical = wasCritical.current;
     lastTone.current = tone;
-    // First read seeds the ref (prev === null) and never announces; announce only
-    // when the tone rose above the last seen one.
-    if (prev === null || TONE_RANK[tone] <= TONE_RANK[prev]) return;
+    wasCritical.current = critical;
+    // First read seeds BOTH refs (prev === null) and never announces.
+    if (prev === null) return;
     const countdown = formatCountdown(worst.resets_at);
     // The label is named only when the user holds more than one token, so a
     // single-token user hears exactly what they heard before this feature.
     const which = tokens.length > 1 && worstToken ? `${worstToken.label} ` : "";
+    // ≥95 emergency takes priority: the tone no longer steps at 95, so this is the
+    // only signal for the badge's "nearly out" moment. A distinct wording marks it
+    // apart from the tone step-up. Dropping below 95 clears the ref silently.
+    if (critical && !prevCritical) {
+      setMessage(
+        `${which}${worst.label} window nearly out at ${worst.pct}%` +
+          (countdown ? `, resets in ${countdown}` : ""),
+      );
+      return;
+    }
+    // Otherwise announce only when the tone rose above the last seen one.
+    if (TONE_RANK[tone] <= TONE_RANK[prev]) return;
     setMessage(
       `${which}${worst.label} window at ${worst.pct}%` + (countdown ? `, resets in ${countdown}` : ""),
     );

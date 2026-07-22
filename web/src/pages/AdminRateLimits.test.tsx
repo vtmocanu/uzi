@@ -46,7 +46,7 @@ function row(name: string, limits: MyRateLimits, vault_locked = false): AdminRat
 
 const USERS = [
   row("irina", { status: "no_token" }),
-  row("vlad", ok(8, 47)),
+  row("vlad", ok(8, 27)),
   row("ana", ok(97, 71)),
   row("dana", { status: "unavailable" }),
   row("radu", ok(62, 83)),
@@ -74,8 +74,22 @@ describe("AdminRateLimits", () => {
     expect(screen.getAllByText("Live")).toHaveLength(2); // vlad + radu (warn stays Live)
   });
 
+  it("paints an 85–94 danger-band row's bar red while its badge stays Live (PRD #115)", async () => {
+    // sorin's worst window is 88%: danger TONE (≥85) but not ≥95, so the bar goes
+    // red via the danger fill while the status pill stays a green "Live" — the
+    // badge stays decoupled at ≥95.
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("sorin", ok(88, 76))] });
+    render(<AdminRateLimits />);
+    const sorin = (await screen.findByText("sorin")).closest("tr")!;
+    const bar5h = within(sorin).getByRole("progressbar", { name: "5-hour window" })
+      .firstChild as HTMLElement;
+    expect(bar5h.className).toMatch(/bg-danger/);
+    expect(within(sorin).getByText("Live")).toBeTruthy();
+    expect(within(sorin).queryByText(/nearly out/)).toBeNull();
+  });
+
   it("renders a faint 'no name' placeholder for a user with an empty name (PRD #54)", async () => {
-    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("", ok(8, 47))] });
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("", ok(8, 27))] });
     render(<AdminRateLimits />);
     await screen.findByText("no name");
     // The placeholder must be the first div's textContent (the sort test reads the

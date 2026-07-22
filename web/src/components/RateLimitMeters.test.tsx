@@ -20,7 +20,7 @@ const nowSecs = Math.floor(Date.now() / 1000);
 const okReading: MyRateLimits = {
   status: "ok",
   five_hour: { pct: 8, resets_at: nowSecs + 5000 },
-  seven_day: { pct: 47, resets_at: nowSecs + 200_000 },
+  seven_day: { pct: 27, resets_at: nowSecs + 200_000 },
   source: "usage_endpoint",
   synced_at: new Date(Date.now() - 2 * 60_000).toISOString(),
   stale: false,
@@ -29,6 +29,14 @@ const warnReading: MyRateLimits = {
   ...okReading,
   five_hour: { pct: 62, resets_at: nowSecs + 5000 },
   seven_day: { pct: 83, resets_at: nowSecs + 200_000 },
+};
+// A danger-TONE reading (88 ≥ 85) that has NOT crossed 95 — the badge stays
+// "Live" but the bar goes red, and the announcer steps the tone without the
+// dedicated ≥95 emergency signal.
+const dangerBandReading: MyRateLimits = {
+  ...okReading,
+  five_hour: { pct: 88, resets_at: nowSecs + 5000 },
+  seven_day: { pct: 71, resets_at: nowSecs + 200_000 },
 };
 const dangerReading: MyRateLimits = {
   ...okReading,
@@ -59,7 +67,7 @@ describe("RateLimitCard (Settings)", () => {
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
     expect(screen.getByText("8%")).toBeTruthy();
-    expect(screen.getByText("47%")).toBeTruthy();
+    expect(screen.getByText("27%")).toBeTruthy();
     expect(screen.getByText("Live")).toBeTruthy();
     // Countdown is rendered client-side from the epoch (Decision 7).
     expect(screen.getAllByText(/resets in/).length).toBeGreaterThan(0);
@@ -177,9 +185,26 @@ describe("RateLimitAnnouncer (aria-live)", () => {
     await flush(); // seed at warn, silent (first read)
     expect(region()).toBe("");
 
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerBandReading));
+    await flush(60_000); // → danger tone (5h at 88%), still below the 95 emergency
+    expect(region()).toMatch(/^5-hour window at 88%, resets in /);
+  });
+
+  it("fires the dedicated ≥95 emergency announcement when the worst window crosses 95", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerBandReading));
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed at danger tone (88%) but NOT critical — silent first read
+    expect(region()).toBe("");
+
     mockApi.getMyRateLimits.mockResolvedValue(tokens(dangerReading));
-    await flush(60_000); // → danger (5h at 97%)
-    expect(region()).toMatch(/^5-hour window at 97%, resets in /);
+    await flush(60_000); // 5h crosses 95 → dedicated emergency, distinct wording
+    expect(region()).toMatch(/^5-hour window nearly out at 97%/);
+    const announced = region();
+    const calls = mockApi.getMyRateLimits.mock.calls.length;
+
+    await flush(30_000); // a bare useNow clock tick, no new poll
+    expect(mockApi.getMyRateLimits.mock.calls.length).toBe(calls); // no extra fetch
+    expect(region()).toBe(announced); // not re-fired
   });
 
   it("stays silent on the first read even when already in danger", async () => {
