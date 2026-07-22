@@ -296,8 +296,19 @@ export class MessageBatcher {
     // sees the same bytes the server will.
     const counts = emptyCounts();
     const sanitized = sanitizePayload(msg.payload, counts);
-    const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: this.redact(sanitized) };
-    if (msg.agent !== undefined) out.agent = msg.agent;
+    // `kind` and `agent` are worker-side vocabularies, not model output, but redaction
+    // lives ONLY in the worker (the api never redacts), so an unscrubbed value reaches
+    // Postgres, the /api/ws frame, the browser and `uzi run logs` in the clear. Scrub
+    // both the same way agent_instance/agent_label are below — sanitize then redact —
+    // so the treatment is symmetric and a future kind/agent source cannot re-open the
+    // hole (PRD #108 B6). The kind cast is safe: kind is a closed vocabulary, so
+    // scrubbing a legitimate value never changes it.
+    const out: OutgoingMessage = {
+      seq: this.seq,
+      kind: this.redactText(sanitizeText(msg.kind, counts)) as OutgoingMessage["kind"],
+      payload: this.redact(sanitized),
+    };
+    if (msg.agent !== undefined) out.agent = this.redactText(sanitizeText(msg.agent, counts));
     // PRD #99: copied the same way as `agent` — present only when the frame had
     // them, so the API's pgText("") maps absence to SQL NULL rather than "".
     // Both go through redactText: they are top-level siblings of the payload, so
