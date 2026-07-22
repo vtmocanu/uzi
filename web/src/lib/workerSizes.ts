@@ -29,8 +29,8 @@ export type WorkerSize = (typeof WORKER_SIZES)[number];
  * choosing a CEILING ("will my build fit?"), while the request is a scheduling
  * detail they cannot observe. The UI says "up to" for exactly this reason.
  *
- * `/nix` is deliberately absent: it is a flat 4Gi on every size (measured
- * byte-identical across templates), so it cannot inform a choice between them.
+ * `/nix` is deliberately absent: it is a flat 20Gi on every size (PRD #87 sized
+ * it for the prebaked Chromium closure), so it cannot inform a choice between them.
  */
 export type WorkerSizeSpec = {
   readonly cpuLimit: string;

@@ -126,17 +126,24 @@ var sizes = map[string]Size{
 }
 
 // nixSize is FLAT across every size and every template, which is why it sits
-// outside the table (Decision 7's own later correction). Measured: the image's
-// baked store is byte-identical between `base` and `jvm` (209 MB / 74 store paths —
-// the JDK ships via apk to /usr/lib/jvm, never through nix), and provisioning the
-// full tier-1 allowlist grows it to 1,703 MB / 1,205 store paths worst case. 4Gi is
-// ~2.4x headroom over that; 8Gi would be mostly waste, and storage is the binding
-// fleet constraint (20 x `m` = 10 CPU / 40Gi requested but 280Gi of PVC).
+// outside the table (Decision 7's own later correction). Baseline (pre-#87): the
+// base/jvm baked store was byte-identical at 209 MB / 74 store paths (the JDK ships
+// via apk to /usr/lib/jvm, never through nix), and a full tier-1 provision grew it
+// to 1,703 MB worst case — 4Gi gave ~2.4x headroom there.
+//
+// PRD #87 prebakes a Chromium + fonts closure into the shared devbox toolchain,
+// which takes the baked store to ~2.6 GiB (the chromium closure alone is ~648 MiB,
+// measured 2026-07-22 from the built image). At the old 4Gi that left only ~1.4 GiB
+// for per-run growth, and nix has no auto-GC (a long-lived worker's store only grows
+// into this fixed volume), so the margin was thin. Bumped to 20Gi (owner-directed,
+// PRD #87) for comfortable per-run headroom above the browser-inflated baseline.
+// This is a deliberate per-worker PVC-size increase — storage is the binding fleet
+// constraint, and the owner accepted the cost for reliable nix-package space.
 //
 // Residual, documented rather than built: nix has no auto-GC, so a long-lived
 // worker's store only grows into this fixed volume. `nix store gc` lives in agent/,
 // so v1's remedy is delete + reprovision.
-var nixSize = resource.MustParse("4Gi")
+var nixSize = resource.MustParse("20Gi")
 
 // templateImages maps a worker template to its published image's NAME component.
 // The full reference is <repo>/<name>:<tag>, where repo and tag come from the
