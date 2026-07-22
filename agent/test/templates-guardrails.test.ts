@@ -201,6 +201,22 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       );
       assert.match(text, /--headless\b/, `${name}/Dockerfile build guard must launch Chromium headless (M3)`);
       assert.match(text, /--dump-dom/, `${name}/Dockerfile build guard must actually launch Chromium (--dump-dom), not a bare --version`);
+
+      // BUG 1 (issue #114): the build guard launches chromium AS ROOT, which creates its
+      // bundled `libexec/chromium/extensions` dir root:root 0700 inside the read-only nix
+      // store — AFTER `chown -R worker:runner /nix` — and the non-root (uid 10001) seed-nix
+      // tar then CrashLoops on it. The store-perm normalization MUST exist and MUST come
+      // AFTER the guard's chromium launch (placing it at the earlier chown is a no-op: the
+      // dir does not exist yet). Pin BOTH the presence and that ordering.
+      assert.match(
+        text,
+        /chmod -R a\+rX \/nix/,
+        `${name}/Dockerfile must normalize /nix store perms with 'chmod -R a+rX /nix' (BUG 1 seed-nix fix)`,
+      );
+      assert.ok(
+        text.indexOf("chmod -R a+rX /nix") > text.search(/timeout \d+ "\$AGENT_BROWSER_EXECUTABLE_PATH"/),
+        `${name}/Dockerfile must run the /nix store-perm chmod AFTER the build-guard chromium launch (the guard, running as root, is what creates the root:root 0700 dir — normalizing before it is a no-op)`,
+      );
     });
   }
 });
