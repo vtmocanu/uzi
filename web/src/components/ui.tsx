@@ -119,8 +119,8 @@ export function Input({ className = "", ...props }: InputHTMLAttributes<HTMLInpu
   return <input className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
-export function Select(props: SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select className={INPUT_CLASS} {...props} />;
+export function Select({ className = "", ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
+  return <select className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
 export function Textarea({ className = "", ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {

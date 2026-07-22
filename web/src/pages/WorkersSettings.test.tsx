@@ -596,6 +596,11 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     renderPage();
     await screen.findByText("laptop");
     const picker = await screen.findByLabelText("Anthropic token for laptop");
+    // The picker MUST carry the shared field styling, not just its own h-8 sizing —
+    // this guards against a refactor silently re-stripping the base class.
+    expect(picker.className).toContain("h-8");
+    expect(picker.className).toContain("bg-raised");
+    expect(picker.className).toContain("border-edge");
     fireEvent.change(picker, { target: { value: "console-key" } });
     await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", "console-key"));
     // The announcement says WHEN it takes effect — a user who expects to restart
