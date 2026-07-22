@@ -16,6 +16,7 @@ import {
   type DetectedRepoAgents,
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
+import { rmTreeForce } from "./rmtree.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, ForgejoClient, type ForgeClient } from "./forge.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
@@ -182,6 +183,19 @@ export class RunRunner {
     let observedSessionId: string | undefined;
     const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): Promise<void> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
+
+    // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
+    // `concat` is order-preserving, so an emitted explanation would queue behind the
+    // poison that tripped it and never land. reportState has bounded retries,
+    // 4xx-fatal semantics, and treats an already-terminal server response as
+    // success, so if the run has already reported terminal this is a safe no-op
+    // rather than a second, racing terminal report. Fire-and-forget: the batcher's
+    // trip path must never block on the network.
+    batcher.onPermanentFailureReport(({ reason }) => {
+      void reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
+        runLog.error("could not report the message-transport failure", { error: errMessage(e) }),
+      );
+    });
 
     let barePath: string | undefined;
     let worktreePath: string | undefined;
@@ -452,10 +466,16 @@ export class RunRunner {
       // Remove this run's private HOME (agent-home/<runId>, Decision 5). The SDK
       // session transcript under it is only needed to resume, and a terminal run
       // never resumes. A concurrent sibling's HOME is a distinct dir, untouched.
+      //
+      // rmTreeForce, not fs.rm (PRD #108 M6): the Go module cache under this HOME
+      // writes its package directories mode 0555, and `force: true` suppresses
+      // ENOENT — not the EACCES that unlinking inside a read-only directory
+      // raises. Every Go-touching run stranded its module cache (167.3 MB
+      // measured for one run). Still best-effort and still swallowing its own
+      // error: this is a `finally`, and a cleanup that threw would convert a
+      // completed run into a failed one, which is strictly worse than a leak.
       if (runHome) {
-        await fs
-          .rm(runHome, { recursive: true, force: true })
-          .catch((e) => runLog.warn("run HOME cleanup failed", { error: errMessage(e) }));
+        await rmTreeForce(runHome).catch((e) => runLog.warn("run HOME cleanup failed", { error: errMessage(e) }));
       }
     }
   }

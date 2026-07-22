@@ -177,6 +177,18 @@ export class ChatRunner {
     const reportState = (body: StateRequest): Promise<void> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
 
+    // PRD #108 M3: the chat lane builds the SAME MessageBatcher against the SAME
+    // endpoint as the run lane, so it inherits the byte cap, the split, the backoff
+    // and the breaker for free — but the breaker's report is injected, so it must be
+    // wired HERE too or a wedged chat trips silently. This closure differs from the
+    // run lane's in one way that matters: it carries `session_id`, so a Continue
+    // still resumes the right SDK session after a transport failure.
+    batcher.onPermanentFailureReport(({ reason }) => {
+      void reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
+        runLog.error("could not report the message-transport failure", { error: errMessage(e) }),
+      );
+    });
+
     try {
       runLog.info("chat claimed", {
         resume_of: claim.resume_of_run_id ?? null,

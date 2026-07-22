@@ -65,6 +65,17 @@ var (
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
 	ErrInvalidMessage   = errors.New("invalid run message")
+	// ErrUnstorableMessage is a batch the DATABASE refused for a reason that can
+	// never succeed on retry (PRD #108 M2) → 400, joining ErrInvalidMessage.
+	//
+	// The status code is the retry contract, and this is the load-bearing half of
+	// the fix. A permanent failure returned as 500 is what converted one bad
+	// payload into a 27-minute, 239-message wedge: the worker's batcher treats any
+	// throw as retryable and re-posts the identical batch at ~2 Hz. With this,
+	// incomplete sanitation degrades to "that batch is rejected and the run fails
+	// with a clear reason" instead of "the run wedges silently" — which is why the
+	// PRD is not titled "strip NUL bytes".
+	ErrUnstorableMessage = errors.New("run message cannot be stored")
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
@@ -1012,6 +1023,32 @@ func decodePackageList(raw []byte) []string {
 const (
 	maxAgentLabelRunes    = 80
 	maxAgentInstanceRunes = 128 // an SDK `toolu_*` id is ~30; this is headroom, not a fit
+	// maxAgentRunes caps the THIRD worker-controlled attribution field, which had
+	// no cap at all until PRD #108 M2 — not "truncated but not stripped" like the
+	// two above, but wholly unbounded into an unbounded `text` column
+	// (00020_workers_runs.sql), on the same untrusted route and with the same
+	// per-frame repetition.
+	//
+	// The number is not new: agenttmpl.MaxNameLen is the existing authority on how
+	// long an agent name may be, mirrored by the worker's AGENT_NAME_MAX_LEN, and
+	// `agent` is exactly a subagent name. Reusing it means there is one cap to
+	// change rather than two to keep in step. It is a BYTE bound there and a rune
+	// bound here — legitimate names are [a-z0-9-] so the two coincide, and for a
+	// hostile non-ASCII value this admits at most 4x, which still bounds it.
+	//
+	// Truncate, never reject, for the reason spelled out above: a rejected batch is
+	// a lost message and this field is attribution.
+	maxAgentRunes = agenttmpl.MaxNameLen
+	// maxKindRunes caps `kind`, which f2ddb5ce NUL-stripped but left uncapped — so
+	// it was the last worker-controlled text column with no length bound, on the
+	// same untrusted route and with the same per-frame repetition that justified
+	// capping `agent`. It also rides two log lines per message, so an unbounded kind
+	// is an unbounded log WRITE on top of an unbounded column; the cap is applied
+	// before those lines read it. 64 is comfortably above the whole SDK-frame
+	// vocabulary (`tool_result`, `plan_revising`, … all under 14) while bounding a
+	// hostile value; the column is bare `text NOT NULL` (00020_workers_runs.sql), so
+	// the number is a policy choice, not a schema fit (PRD #108 A3).
+	maxKindRunes = 64
 )
 
 // truncateRunes caps s at n runes, cutting on a rune boundary so the result is
@@ -1049,31 +1086,152 @@ type IncomingMessage struct {
 // AppendMessages persists a worker's batched messages (idempotent on
 // (run_id, seq)) and advances the run's last_seq high-water mark. The worker
 // must own the run.
+//
+// ONLY the InsertRunMessage error is eligible for the ErrUnstorableMessage (→
+// 400) classification, and that narrowness is the point rather than an oversight.
+// This function returns store errors from three places — the insert,
+// UpdateRunLastSeq and foldRunUsage — and 400 on this route tells the worker
+// "this batch is permanently poisoned, stop retrying it". Only the insert's error
+// is evidence for that claim. Reporting a failure from elsewhere as the batch's
+// fault makes the worker drop messages that were never the problem: data loss
+// from a misattributed error. The narrow shape has in-repo precedent in
+// handler/secrets.go's constraint-name check, for the same reason.
+//
+// 🔴 THE ASSUMPTION THIS RESTS ON, AND WHEN IT BREAKS:
+//
+//	EVERY worker-controlled value that reaches the store on this path does so
+//	through the sanitized InsertRunMessage.
+//
+// If you add a store call here that writes a worker-controlled value, or add such
+// a value to one of the two existing calls, THAT VALUE IS NO LONGER COVERED —
+// silently. It gets a 500, the worker retries it forever, and this PRD's exact
+// wedge reappears in a new location with no signal. Revisit this placement in the
+// same change, and extend the audit below rather than assuming it still holds.
+//
+// The audit as it stands, per non-insert call:
+//
+//   - UpdateRunLastSeq — takes the run id and an int32 seq. No worker text.
+//   - foldRunUsage → UpsertRunUsage — every column it writes, checked one by one
+//     because "I cannot think of a case" is not the same as "there is no case".
+//     Read this as a CLEARED suspect, not a live hazard: it is written out because
+//     it is the call that looks most dangerous and the check is what makes the
+//     placement defensible, not because it can currently produce these codes.
+//     `model` IS worker-controlled (a JSON object key out of the payload), and
+//     `session_id` is too (the worker reports it; the runs row only relays it), so
+//     BOTH are handled on TWO axes, not one. Byte VALIDITY: sanitation writes
+//     through the index in a pass that completes before foldRunUsage iterates msgs,
+//     so the model name the fold inserts is already NUL-free — pinned by
+//     TestWorkerMessagesUsageFoldSeesSanitizedModelNamesLiveDB, which reddens if
+//     that ordering inverts. LENGTH: both are members of run_usage's composite PK,
+//     whose btree index entry caps at 2704 bytes, so foldRunUsage caps each with
+//     truncateRunes before the upsert (maxUsageSessionRunes) — without which an over-long
+//     value raises SQLSTATE 54000, which is NOT in unstorableSQLSTATEs and would
+//     wedge the run one sink over (pinned by the UsageFoldCapsOversized*LiveDB
+//     tests). `session_id`'s earlier acceptance into the runs row is not evidence
+//     here: that column is unindexed `text`, and acceptance there says nothing
+//     about indexability inside this composite PK — which is why relaying it is not
+//     on its own sufficient. `run_id` is a uuid. The token columns are bigint and
+//     take an int64, which always fits. `cost_usd` is numeric(12,6) and numericUSD
+//     clamps to that domain (its own comment names 22003 as the poison-loop trigger
+//     it exists to prevent).
+//
+// A broader wrap was considered and rejected: with the above holding it catches
+// nothing extra, while reintroducing exactly the misattribution this narrowness
+// exists to prevent.
 func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return err
 	}
 	// Validate the whole batch before persisting any of it: a single invalid
-	// message rejects the batch with nothing written (all-or-nothing), so a
-	// [valid, valid, invalid] batch never leaves the first two half-persisted.
+	// message rejects the batch with nothing written, so a [valid, valid, invalid]
+	// batch never leaves the first two half-persisted.
 	//
-	// The same pass CAPS the two PRD #99 attribution fields. It writes through the
-	// index (not a range copy) on purpose, so the capped value is what the insert,
-	// the WS broadcast and the usage fold all see — otherwise the stored row and
-	// the live frame would disagree.
-	var maxSeq int32
+	// That all-or-nothing property is TRUE OF VALIDATION AND FALSE OF THE STORE.
+	// The insert loop below is not transactional, so a batch whose third message
+	// the database refuses leaves the first two committed. This comment used to
+	// claim the batch was all-or-nothing outright; that was unreachable in practice
+	// before PRD #108 and is routine after it, and it is about to be load-bearing
+	// for the worker's bisection, so it is corrected here rather than left to
+	// mislead. Idempotency on (run_id, seq) is what keeps the partial apply benign:
+	// any regrouping or re-post converges. Making it genuinely transactional needs
+	// a Store interface change (the generated queries take no tx) and is deferred
+	// to Phase 2, which has its own reason to care — its "max(seq) has not
+	// advanced" guard reads the column this path leaves behind.
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
-		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
-		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
-		if m.Seq > maxSeq {
-			maxSeq = m.Seq
+		// A kind of nothing but NUL escapes passes the emptiness check above — it is
+		// non-empty on the wire — and would then strip to "" in the sanitation pass,
+		// which `text NOT NULL` accepts happily. Check the POST-STRIP value HERE, in
+		// the validation pass, rather than after stripping: an empty kind is exactly
+		// what that check exists to reject, and rejecting it here keeps both batch
+		// invariants intact — nothing is written, and nothing is logged as laundered.
+		// The double stripNUL costs one strings.Count on the fast path.
+		if stripped, _ := stripNUL(m.Kind); stripped == "" {
+			return ErrInvalidMessage
 		}
 	}
+	// SECOND pass for sanitation, separate from validation on purpose. The
+	// count-and-log requirement (PRD #108 Risk 3) exists so a future NUL-emitting
+	// tool stays visible, and folding it into the loop above would report only up
+	// to the first invalid message — the batches most worth understanding are
+	// exactly the ones that would go unreported. Split this way, a batch rejected
+	// by validation logs nothing (nothing was laundered, because nothing is
+	// stored) and a batch that proceeds logs every message it altered.
+	//
+	// It writes through the index (not a range copy), so the capped and sanitized
+	// values are what the insert, the WS broadcast and the usage fold all see —
+	// otherwise the stored row and the live frame would disagree, and the fold
+	// would still be reading the unstorable bytes.
+	for i := range msgs {
+		m := &msgs[i]
+		var c stripCounts
+		// Strictly AFTER the json.Valid check above: the scanner presumes
+		// well-formed JSON, and today's invalid-JSON→400 arm must keep answering
+		// first.
+		m.Payload, c = sanitizePayloadJSON(m.Payload)
+		// FOUR text sinks, not three. `kind` is worker-supplied and lands in a bare
+		// `text NOT NULL` column whose vocabulary lives in a COMMENT with no CHECK
+		// constraint (00020_workers_runs.sql), and it decodes into a Go string exactly
+		// like the other three — so a u0000 escape becomes a real 0x00 and Postgres
+		// answers 22021. Ordinary tool output cannot produce it (kind comes from a
+		// fixed SDK-frame vocabulary), so this needs a hostile or buggy worker — which
+		// is precisely the threat model that produced sanitizeSelfReported on this
+		// same route. Stripped BEFORE the log below, so the log line reports a clean
+		// kind rather than smuggling the NUL into the operator's terminal.
+		var nKind, nAgent, nInstance, nLabel int
+		m.Kind, nKind = stripNUL(m.Kind)
+		m.Agent, nAgent = stripNUL(m.Agent)
+		m.AgentInstance, nInstance = stripNUL(m.AgentInstance)
+		m.AgentLabel, nLabel = stripNUL(m.AgentLabel)
+		c.textNUL = nKind + nAgent + nInstance + nLabel
+		// Cap `kind` HERE, before the warn log below echoes it (and the second log on
+		// a permanently-unstorable insert): an unbounded kind is an unbounded log
+		// write, not only an unbounded column. Capped after the strip so the cap
+		// counts runes the row will actually hold; `agent` is capped further down.
+		m.Kind = truncateRunes(m.Kind, maxKindRunes)
+		if c.any() {
+			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
+				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,
+				"payload_nul_dropped", c.payloadNUL,
+				"payload_unpaired_surrogates_replaced", c.payloadSurrogate,
+				"payload_invalid_utf8_replaced", c.payloadBadUTF8,
+				"text_column_nul_dropped", c.textNUL)
+		}
+		// Strip BEFORE truncating, so each rune cap is counted over the NUL-free
+		// string the row will actually hold.
+		m.Agent = truncateRunes(m.Agent, maxAgentRunes)
+		m.AgentInstance = truncateRunes(m.AgentInstance, maxAgentInstanceRunes)
+		m.AgentLabel = truncateRunes(m.AgentLabel, maxAgentLabelRunes)
+	}
+	// maxStored is the high-water mark of what ACTUALLY reached the table,
+	// including rows the insert deduplicated (rows == 0 means this (run_id, seq)
+	// was already persisted by an earlier delivery — stored is stored).
+	var maxStored int32
+	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
 		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
@@ -1086,7 +1244,27 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			Payload:       []byte(m.Payload),
 		})
 		if err != nil {
-			return err
+			// The ONLY classified error on this path. See the tripwire on
+			// AppendMessages before widening this to another store call.
+			insertErr = classifyStoreError(err)
+			// The one diagnostic line for this event, emitted HERE because this is
+			// the only place that holds the seq and kind alongside the SQLSTATE. The
+			// code only, never pgErr.Message: for 22P02 and 22021 that text quotes a
+			// fragment of the offending value (measured: `invalid byte sequence for
+			// encoding "UTF8": 0xff`), which is worker-controlled bytes in a log line.
+			var pgErr *pgconn.PgError
+			code := ""
+			if errors.As(err, &pgErr) {
+				code = pgErr.Code
+			}
+			if errors.Is(insertErr, ErrUnstorableMessage) {
+				slog.Warn("workersvc: message permanently unstorable",
+					"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind, "sqlstate", code)
+			}
+			break
+		}
+		if m.Seq > maxStored {
+			maxStored = m.Seq
 		}
 		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
 		// broadcast genuinely new messages so a retry never double-emits over WS.
@@ -1094,10 +1272,24 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
-	if maxSeq > run.LastSeq {
-		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxSeq}); err != nil {
+	// Advance the high-water mark to what landed, BEFORE propagating any insert
+	// error. Leaving it stale is not cosmetic: on resume the worker restarts from
+	// runs.last_seq and re-emits those seq numbers carrying DIFFERENT content, the
+	// idempotent insert answers rows == 0, the server reads that as a re-delivery,
+	// and the new content is silently dropped and never broadcast. That was
+	// unreachable before PRD #108 (a failing insert was the anomaly) and is routine
+	// after it, which is why it is fixed here rather than left to the transaction
+	// Phase 2 will consider.
+	if maxStored > run.LastSeq {
+		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
+			if insertErr != nil {
+				return insertErr // the insert failure is the more informative of the two
+			}
 			return err
 		}
+	}
+	if insertErr != nil {
+		return insertErr
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
@@ -1140,6 +1332,31 @@ type resultModelUsage struct {
 	CostUSD                  float64 `json:"costUSD"`
 }
 
+// run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in
+// the index); session_id and model are BOTH unbounded worker-controlled text
+// (00062_run_usage.sql). A btree index entry is capped at 2704 bytes on an 8 KiB
+// page (BTMaxItemSize); exceeding it raises SQLSTATE 54000, which — unlike the
+// 22xxx codes InsertRunMessage can raise (sanitize.go) — is NOT in
+// unstorableSQLSTATEs, so it would fall through to a 500 and the worker's batcher
+// would retry the batch forever (PRD #108 A1). So both columns are length-capped
+// before the upsert, exactly as `agent` is (c88cfea8), NOT merely NUL-stripped.
+//
+// The arithmetic, worst case: each rune is at most 4 UTF-8 bytes, so 200+200 runes
+// is at most 1600 bytes of key data; add the uuid run_id (16), the index tuple
+// header (~8) and two varlena headers with alignment (~12) and the entry is ~1636
+// bytes — over 1000 bytes clear of the 2704 limit. A real model id (`claude-opus-
+// 4-8` and the like, ~35 bytes) and a UUID session id (36) sit far under either
+// cap, so only a garbled or hostile worker is ever truncated.
+//
+// Truncate, never reject: session_id and model are a grouping key, not content,
+// and truncateRunes is deterministic, so the same input always folds to the same
+// capped key. Two distinct over-long values could then collide onto one key, which
+// the GREATEST merge in UpsertRunUsage absorbs — the right trade for hostile input.
+const (
+	maxUsageSessionRunes = 200
+	maxUsageModelRunes   = 200
+)
+
 // foldRunUsage upserts run_usage for every delivered result frame in the batch
 // (PRD #40 Decision 2). It is called with ALL delivered messages, not just the
 // newly-inserted ones, so a seq-deduped re-delivery re-runs the fold — the
@@ -1165,6 +1382,10 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	if run.SessionID.Valid {
 		sessionID = run.SessionID.String
 	}
+	// Cap the composite-PK text columns before any upsert (see maxUsageSessionRunes
+	// for the 54000/2704-byte reasoning). session_id is capped once here; model is
+	// capped per-frame inside the loop, since each frame carries its own.
+	sessionID = truncateRunes(sessionID, maxUsageSessionRunes)
 	for _, m := range msgs {
 		// Result frames are only ever kind status (success) or error; skip the
 		// rest without paying an unmarshal for every text/tool_use message.
@@ -1182,6 +1403,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 			if model == "" {
 				continue
 			}
+			model = truncateRunes(model, maxUsageModelRunes)
 			if err := s.q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -1281,7 +1503,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	sessionID := textParam(req.SessionID)
+	sessionID := stripNULParam(req.SessionID)
 	var rows int64
 	switch req.State {
 	case "running":
@@ -1301,16 +1523,16 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
-			PlanMd: textParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: textParam(req.MrWebURL), SessionID: sessionID,
+			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: textParam(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			FailureReason: sanitizeFailureReason(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
 		return store.Run{}, false, ErrInvalidState
@@ -2339,6 +2561,52 @@ func textParam(s *string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgText(*s)
+}
+
+// maxFailureReasonRunes bounds the worker-reported failure reason before it lands
+// in runs.failure_reason. The worker already slices to 512 (reportState), but the
+// API does not take its word for the length any more than for the content — this is
+// generous headroom over that slice while still bounding a hostile or buggy worker.
+const maxFailureReasonRunes = 2048
+
+// sanitizeFailureReason maps the worker's failure reason onto the nullable
+// runs.failure_reason column, stripping NUL and capping the length first.
+//
+// This is the /messages sanitation (M2) applied to its sibling route (PRD #108 A4).
+// A NUL in a `text` column raises 22021 exactly as it does in `jsonb`, and this one
+// is worse-placed: it rides `failed` — the run's TERMINAL report — so a 22021 there
+// 500s, reportState's bounded retries exhaust, and the terminal state never lands,
+// leaving the run to the server-side sweeper. The breaker's own permanent-failure
+// report travels this exact field, so a poisoned run reporting its own poison could
+// fail to record that it failed.
+func sanitizeFailureReason(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean, _ := stripNUL(*s)
+	clean = truncateRunes(clean, maxFailureReasonRunes)
+	return pgText(clean)
+}
+
+// stripNULParam is textParam with NUL removed, for the OTHER worker-controlled text
+// fields on the /state path that reach a plain `text` column: session_id, plan_md,
+// branch, mr_web_url (PRD #108 A4b). A NUL in any of them raises 22021 exactly as it
+// does in jsonb, 500s the transition, and — on awaiting_approval/completed/failed —
+// the run's new state never lands. M2 sanitized /messages; failure_reason got A4;
+// these are the rest of the class on /state.
+//
+// Deliberately NO length cap, unlike sanitizeFailureReason and run_usage's
+// composite-PK keys: plan_md is model prose that is legitimately long, and none of
+// these columns is an index key (00020_workers_runs.sql; no index references
+// session_id or branch), so a cap would be lossy data loss for no storability gain.
+// A NUL-only value strips to "", which pgText maps to NULL — for session_id that is
+// its documented "no change" sentinel, which is the right outcome for garbage input.
+func stripNULParam(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean, _ := stripNUL(*s)
+	return pgText(clean)
 }
 
 func int8Param(v *int64) pgtype.Int8 {

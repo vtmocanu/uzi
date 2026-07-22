@@ -38,6 +38,14 @@ export interface Config {
    */
   stubPlanGate: boolean;
   /**
+   * PRD #108 M6: sweep `agent-home/<runId>` trees stranded by the old cleanup once
+   * at startup. On by default — the leak is on every fleet volume already and the
+   * sweep deletes only run ids the API positively reports terminal. `UZI_HOME_RECLAIM=0`
+   * turns it off, because a destructive startup sweep an operator cannot disable is
+   * a bad thing to ship even when its guards are right.
+   */
+  homeReclaimEnabled: boolean;
+  /**
    * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
    * shipping compose default is a read-only secret mount the entrypoint forces to
    * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
@@ -172,6 +180,22 @@ function parseBool(v: string | undefined): boolean {
 }
 
 /**
+ * Like `parseBool` but for a flag that ships ON: absent OR empty means the
+ * default. Only an explicit falsy value turns it off.
+ *
+ * The empty case is the one that matters. A compose `${VAR:-}` or a Helm value
+ * defaulting to `""` delivers a set-but-empty variable, and under `parseBool` that
+ * reads as "off" — silently disabling a default-ON feature that nobody asked to
+ * disable. Kept separate from `parseBool` rather than changing it, because the
+ * default-OFF flags want the opposite treatment: for those, empty genuinely is off.
+ */
+function parseBoolDefaultTrue(v: string | undefined): boolean {
+  const s = v?.trim().toLowerCase();
+  if (s === undefined || s === "") return true;
+  return !(s === "0" || s === "false" || s === "no" || s === "off");
+}
+
+/**
  * Resolve the worker join token. UZI_WORKER_TOKEN_FILE (a path) is preferred: it is
  * the STRUCTURAL /proc hardening (PRD #46 M6) — delivering the token via a file rather
  * than an env var keeps it out of every process's `/proc/<pid>/environ`. Under the
@@ -215,6 +239,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
     stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
+    // Default ON, so unset means enabled — hence the explicit check rather than
+    // parseBool, whose false-by-default is the wrong way round here.
+    //
+    // EMPTY counts as unset, and that is the load-bearing half. parseBool accepts
+    // only 1|true|yes, so `UZI_HOME_RECLAIM=""` would otherwise read as "off" and
+    // silently disable a default-ON safety feature — and empty is exactly how the
+    // value arrives from a compose `${UZI_HOME_RECLAIM:-}` or a Helm value that
+    // defaults to `""`. Set-but-empty means "the deployment mentions this var and
+    // expressed no opinion", which is the default, not the opposite of it.
+    homeReclaimEnabled: parseBoolDefaultTrue(env.UZI_HOME_RECLAIM),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),

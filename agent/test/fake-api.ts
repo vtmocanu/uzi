@@ -69,6 +69,16 @@ export class FakeApi {
 
   async listen(): Promise<string> {
     await new Promise<void>((resolve) => this.server.listen(0, "127.0.0.1", resolve));
+    // unref the listening handle so it never keeps the test PROCESS alive on its own.
+    // Every test drives this server through an awaited client call, so the run's own
+    // pending work holds the loop open while a test is in flight; once the tests
+    // finish, the server must not be what keeps the file wrapper from draining.
+    // Without this, node's server handle lingered after close() on musl/alpine (CI,
+    // node:22-alpine, root) and the whole runner.test.ts file timed out at the
+    // per-file --test-timeout — even though every subtest passed (a leaked-handle
+    // hang, not a slow test). afterEach still close()s each server; this is the
+    // belt-and-braces that makes draining deterministic across platforms.
+    this.server.unref();
     const { port } = this.server.address() as AddressInfo;
     return `http://127.0.0.1:${port}`;
   }

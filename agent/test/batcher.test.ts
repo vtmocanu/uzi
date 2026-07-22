@@ -177,4 +177,53 @@ describe("MessageBatcher scrubs the PRD #99 top-level fields", () => {
     assert.equal(sent[0]?.agent_instance, "toolu_A");
     assert.equal(sent[0]?.agent_label, "web gate UX");
   });
+
+  // PRD #108 B6: `agent` and `kind` are scrubbed too. Redaction lives only in the
+  // worker (the api never redacts), so an unscrubbed value here reaches Postgres,
+  // the WS frame, the browser and `uzi run logs` in the clear.
+  it("redacts a secret that leaked into agent", async () => {
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(
+      client, "run-1", 0, 0, logger, makeRedactor([secret]), makeTextRedactor([secret]),
+    );
+
+    batcher.emit({ kind: "text", agent: `coder-${secret}`, payload: { text: "x" } });
+    await batcher.close();
+
+    assert.ok(!(sent[0]?.agent ?? "").includes(secret), "the secret must not survive in agent");
+    assert.ok((sent[0]?.agent ?? "").includes("***REDACTED***"), "the secret is replaced by the redaction marker");
+  });
+
+  it("redacts a secret that leaked into kind", async () => {
+    // The kind scrub path is byte-identical to agent's (redactText∘sanitizeText), so
+    // this is covered transitively — but pin the symmetry DIRECTLY so a future
+    // refactor cannot diverge the two silently. A secret in kind is off-vocabulary (a
+    // hostile/buggy worker), so the cast mirrors what such a frame would carry.
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(
+      client, "run-1", 0, 0, logger, makeRedactor([secret]), makeTextRedactor([secret]),
+    );
+
+    batcher.emit({ kind: `text-${secret}` as OutgoingMessage["kind"], agent: "coder", payload: { text: "x" } });
+    await batcher.close();
+
+    const kind = String(sent[0]?.kind ?? "");
+    assert.ok(!kind.includes(secret), "the secret must not survive in kind");
+    assert.ok(kind.includes("***REDACTED***"), "the secret is replaced by the redaction marker");
+  });
+
+  it("leaves a legitimate kind untouched — scrubbing a closed vocabulary is a no-op", async () => {
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(
+      client, "run-1", 0, 0, logger, makeRedactor([secret]), makeTextRedactor([secret]),
+    );
+
+    batcher.emit({ kind: "tool_result", agent: "coder", payload: { text: "x" } });
+    await batcher.close();
+
+    assert.equal(sent[0]?.kind, "tool_result", "a real kind must pass through the scrub unchanged");
+  });
 });

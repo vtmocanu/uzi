@@ -331,7 +331,30 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Messages []workersvc.IncomingMessage `json:"messages"`
 	}
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	// DecodeJSONLimited, not DecodeJSON: this is the one route whose client is a
+	// machine that must decide whether to retry (PRD #108 M2). DecodeJSON's
+	// io.LimitReader truncates silently, so an oversize batch arrives as malformed
+	// JSON and the api literally cannot say "too large" — it would be a THIRD
+	// unrelated cause answered 400 through the same generic body, leaving the
+	// worker to tell "split and retry" from "bisect out the poison" by
+	// prose-matching an error string across a version skew.
+	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// 413 is a SPLIT-AND-RETRY signal, never a poison verdict: a healthy,
+			// chatty run that merely rode out a transient outage grows its batch
+			// across the cap, and failing it for that would be the mirror-image bug.
+			// The worker's own byte cap (batcher.ts) is below this one, so reaching
+			// here means an un-updated worker — which now gets a truthful answer
+			// instead of an ambiguous one.
+			//
+			// The body is uzi's own prose, never err.Error(): that string is the
+			// fixed net/http literal "http: request body too large", pinned by
+			// Hyrum's law in the stdlib, and echoing it would couple our wire
+			// contract to a stdlib constant. err.Limit is likewise never disclosed.
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "this batch is too large; split it and retry")
+			return
+		}
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -341,7 +364,43 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidMessage):
 			httpx.Error(w, http.StatusBadRequest, "each message needs a positive seq, a kind, and a JSON payload")
+		case errors.Is(err, workersvc.ErrUnstorableMessage):
+			// PRD #108 M2: the database refused this batch for a reason that can
+			// never succeed on retry. 400 IS the fix — the status code is the retry
+			// contract, and answering 500 here is what turned one poisoned payload
+			// into a 27-minute, 239-message wedge (the batcher treats any throw as
+			// retryable and re-posts the identical batch at ~2 Hz).
+			//
+			// Deliberately NOT logged here, and not because it does not matter:
+			// workersvc already emitted one WARN carrying run id, seq, kind and the
+			// SQLSTATE at the failing insert, which is the only place the seq and
+			// kind exist. A second line here would add a run id this route can
+			// already be grepped by and duplicate the event at whatever rate the
+			// worker retries — while the `default:` arm below deliberately keeps
+			// ERROR with the full error, because a genuine 500 is an operator's
+			// problem and there is no seq to attach to it.
+			//
+			// The body carries no SQLSTATE and nothing derived from the database
+			// error: it is returned to an untrusted worker, and 22P02/22021 messages
+			// quote a fragment of the offending value.
+			httpx.Error(w, http.StatusBadRequest, "a message in this batch cannot be stored and will never succeed; do not retry it unchanged")
 		default:
+			// This logs the WRAPPED error, which for a store failure is a
+			// *pgconn.PgError — safe for a NON-OBVIOUS reason, because the obvious
+			// "improvement" breaks it.
+			//
+			// slog special-cases values implementing `error` and renders err.Error(),
+			// and PgError.Error() emits only Severity + Message + SQLSTATE. Its
+			// Detail/Where/File/Hint fields — which for 22P02 and 22021 quote the
+			// offending value, i.e. worker-controlled payload bytes — never reach the
+			// line. Keep the error attached AS an error: passing it as a plain value
+			// ("pg", *pgErr) makes slog marshal the struct field by field and the
+			// poison lands in the log.
+			//
+			// TestWorkerMessagesLogDoesNotLeakPgErrorFields holds this, rather than
+			// this comment holding it — a comment cannot stop the change it warns
+			// about. It runs both the JSON and text handlers, because the property
+			// belongs to how the error is ATTACHED, not to which handler is wired.
 			slog.Error("worker run messages", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
