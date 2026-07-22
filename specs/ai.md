@@ -9868,3 +9868,69 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
   hold: each was folded on a fresh database with a positive control, and both
   copies of the filed-issues join — the M1 read's and the bulk resolve's — redden
   when their coordinate half is dropped.
+
+## 365. PRD #108 Phase 1 — server-side sanitation is the mechanism, the status code is the retry contract (D1-D4, plus the `/state` silent-strip decision)
+
+- **D1 — sanitize server-side; worker-side is an optimization, not the fix.**
+  `workersvc.AppendMessages` is the authoritative choke point, by the same
+  reasoning `sanitizeSelfReported` already applies to a worker's self-reported
+  register fields: a worker is untrusted input on this route, and a worker-only
+  strip protects only workers already running the patched image. The worker
+  (`agent/src/sanitize.ts`) applies the identical strip too, but strictly as
+  defense in depth.
+- **D2 — strip `\u0000` and unpaired surrogates in the payload AND the sibling
+  text columns; never broaden to the control class.** Sink-driven: this content
+  renders in a React component that escapes it, not a terminal table (PRD #90's
+  `sanitizeMemoryField`, which strips the wider class, has the opposite sink).
+  The scope is FOUR worker-controlled text columns, not one payload field —
+  `kind`, `agent`, `agent_instance`, `agent_label` — corrected post-implementation
+  on two counts: `agent` had no length cap at all before this phase (not merely
+  unstripped like its siblings), and `kind` is a fourth column the first draft
+  never listed.
+- **D3 — permanent failures return 400, from an ENUMERATED SQLSTATE set, never a
+  `22*` range match.** `22P05`/`22P02`/`22021`/`22003` — four, not the PRD's
+  original three; `22003` (numeric overflow) was added because a legal-but-
+  unstorable JSON number (`{"n":1e1000000}`) survives sanitation untouched and is
+  exactly as permanent as the other three, a new one-message data-loss class the
+  original Success Criteria did not name. Classification is deliberately
+  statement-level (only the insert's own error is eligible), so a coincidental
+  same-class error from an unrelated fold (`foldRunUsage`) is never misreported
+  as "this batch is poisoned" — which would drop messages that were never the
+  problem.
+- **D4 — bound the batch before any 4xx becomes fatal.** Shipping "never retry a
+  4xx" without the byte cap + split first would convert a transient outage into a
+  failed healthy run once its retried buffer grew past the server's 1 MiB cap —
+  strictly worse than the bug being fixed. The blocking order is: byte/message
+  cap → split → exponential backoff → bisect + tombstone → 4xx-fatal
+  classification → breaker.
+- **The `/state` silent-strip decision.** `failure_reason` (A4) and its three
+  siblings (`session_id`/`plan_md`/`branch`/`mr_web_url`, A4b) get the same
+  NUL-strip as `/messages`, but SILENTLY — no count-and-log, unlike `/messages`'
+  Risk-3-driven visibility requirement. Deliberate, not an inconsistency:
+  `/messages`' payload is genuine tool output where a NUL is expected untrusted
+  content worth surfacing (a headless Chromium's stderr — this PRD's own
+  incident); `/state`'s fields are worker/forge/git-minted (a branch name, an MR
+  URL, a session id), so a NUL there is already anomalous rather than routine,
+  and logging every strip would mostly report a signal with no distinct action.
+  `failure_reason` additionally carries the batcher's own breaker-trip report, so
+  this path must keep working even when the run reporting through it is itself
+  the poisoned one.
+- **Corrections to the PRD's first draft, applied in place rather than left
+  standing:** the breaker trips on a ~10-minute unbroken-failure DURATION plus
+  the permanent-class list (401/403/404, a rejected tombstone, an exhausted
+  bisect budget), never on "N consecutive same-batch failures" — after this
+  phase a 5xx here means a genuine transient, so a tight count would fail
+  healthy runs through an ordinary API restart; the isolated poison message is
+  TOMBSTONED under its original seq, never dropped — a drop breaks
+  `runStream.ts`'s seq-contiguity invariant and freezes the live view
+  permanently, trading a server-side wedge for a client-side one.
+- **A second poison-pill class, closed the same session (A1).** `run_usage`'s
+  composite primary key `(run_id, session_id, model)` has both columns
+  worker-controlled and untouched by the payload sanitizer (no escapes, no
+  invalid bytes — just length); an over-long value overflows a btree index entry
+  and raises `54000`, outside the enumerated set above. `foldRunUsage` now caps
+  both at 200 runes before the upsert — a cap, not a code, since the error is
+  raised by a different call than the one D3's classifier inspects.
+
+See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
+for the incident, the full Decision Log, and the Phase 1 progress record.
