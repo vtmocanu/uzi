@@ -532,10 +532,22 @@ export class MessageBatcher {
           });
           return batch.slice(lo);
         }
-        // Permanent, or a 413 saying this window is still too big to post: either
-        // way the answer is on the left. A 413 costs no budget — it is a size
-        // signal, not evidence about the payload.
-        if (verdict === "oversize") posts -= 1;
+        if (verdict === "oversize") {
+          // A 413 is a SIZE signal, NOT evidence about the payload — so it must not
+          // narrow the poison window. `hi = mid` on a 413 would eventually tombstone
+          // whatever seq lands at `lo`, which need not be the poison at all: measured,
+          // it tombstoned a CLEAN seq and wrote "payload rejected by the api" — a false
+          // statement — into the run's permanent history, worse than the loss itself.
+          // Abandon the search exactly like a transient and hand the window back; the
+          // OUTER oversize arm splits it, and everything before `lo` is already
+          // persisted (PRD #108 B1).
+          this.log.warn("bisection abandoned on an oversize (413) verdict; the outer arm will re-split", {
+            run_id: this.runId,
+            error: errMessage(err),
+          });
+          return batch.slice(lo);
+        }
+        // Permanent: the poison is on the left.
         hi = mid;
       }
     }

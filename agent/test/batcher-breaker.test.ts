@@ -275,6 +275,46 @@ describe("MessageBatcher tombstone attribution (PRD #108 B4)", () => {
   });
 });
 
+describe("MessageBatcher oversize during bisection (PRD #108 B1)", () => {
+  it("a 413 mid-bisection never tombstones a clean message; the outer arm re-splits", async () => {
+    // The freak case the arm exists for: local accounting under-counted, so a
+    // sub-batch of the bisection draws a 413 even though the full batch drew a 400.
+    // Poison is seq 4; a 413 answers the FIRST left-half probe [1,2]. The unfixed
+    // bisect narrowed on that size signal (`hi = mid`) and tombstoned seq 2 — a CLEAN
+    // message — with "payload rejected by the api", a false statement in the run's
+    // permanent history. The fix abandons the search and lets the size machinery split.
+    let probed = false;
+    const { client, landed } = scriptedApi((msgs) => {
+      const seqs = msgs.map((m) => m.seq).join(",");
+      if (seqs === "1,2" && !probed) {
+        probed = true; // the under-count fires exactly once, on the first probe
+        return 413;
+      }
+      return msgs.some((m) => m.seq === 4 && (m.payload as { event?: string }).event === undefined) ? 400 : undefined;
+    });
+    const { logger } = recordingLogger();
+    const batcher = new MessageBatcher(client, RUN, 0, 5, logger);
+    fill(batcher, 4);
+    await batcher.close();
+
+    assert.deepStrictEqual(
+      landed.map((m) => m.seq).sort((a, b) => a - b),
+      [1, 2, 3, 4],
+      "every seq still lands, contiguous",
+    );
+    const tombstones = landed.filter((m) => (m.payload as { event?: string }).event === "message_dropped");
+    assert.strictEqual(tombstones.length, 1, "exactly one tombstone — the unfixed code produced two");
+    assert.strictEqual(tombstones[0]?.seq, 4, "and it is the real poison (seq 4), never the clean seq 2");
+    const two = landed.find((m) => m.seq === 2)!;
+    assert.strictEqual(
+      (two.payload as { event?: string }).event,
+      undefined,
+      "seq 2 lands CLEAN — the api never rejected it, so no tombstone may claim it did",
+    );
+    assert.strictEqual(batcher.isTripped(), false);
+  });
+});
+
 describe("MessageBatcher breaker (PRD #108 M3)", () => {
   for (const status of [401, 403, 404]) {
     it(`${status} trips immediately, with no bisection`, async () => {
