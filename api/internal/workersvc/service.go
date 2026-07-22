@@ -1308,6 +1308,31 @@ type resultModelUsage struct {
 	CostUSD                  float64 `json:"costUSD"`
 }
 
+// run_usage's PK is (run_id, session_id, model). run_id is a uuid (16 bytes in
+// the index); session_id and model are BOTH unbounded worker-controlled text
+// (00062_run_usage.sql). A btree index entry is capped at 2704 bytes on an 8 KiB
+// page (BTMaxItemSize); exceeding it raises SQLSTATE 54000, which — unlike the
+// 22xxx codes InsertRunMessage can raise (sanitize.go) — is NOT in
+// unstorableSQLSTATEs, so it would fall through to a 500 and the worker's batcher
+// would retry the batch forever (PRD #108 A1). So both columns are length-capped
+// before the upsert, exactly as `agent` is (c88cfea8), NOT merely NUL-stripped.
+//
+// The arithmetic, worst case: each rune is at most 4 UTF-8 bytes, so 200+200 runes
+// is at most 1600 bytes of key data; add the uuid run_id (16), the index tuple
+// header (~8) and two varlena headers with alignment (~12) and the entry is ~1636
+// bytes — over 1000 bytes clear of the 2704 limit. A real model id (`claude-opus-
+// 4-8` and the like, ~35 bytes) and a UUID session id (36) sit far under either
+// cap, so only a garbled or hostile worker is ever truncated.
+//
+// Truncate, never reject: session_id and model are a grouping key, not content,
+// and truncateRunes is deterministic, so the same input always folds to the same
+// capped key. Two distinct over-long values could then collide onto one key, which
+// the GREATEST merge in UpsertRunUsage absorbs — the right trade for hostile input.
+const (
+	maxUsageSessionRunes = 200
+	maxUsageModelRunes   = 200
+)
+
 // foldRunUsage upserts run_usage for every delivered result frame in the batch
 // (PRD #40 Decision 2). It is called with ALL delivered messages, not just the
 // newly-inserted ones, so a seq-deduped re-delivery re-runs the fold — the
@@ -1333,6 +1358,10 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	if run.SessionID.Valid {
 		sessionID = run.SessionID.String
 	}
+	// Cap the composite-PK text columns before any upsert (see maxUsageSessionRunes
+	// for the 54000/2704-byte reasoning). session_id is capped once here; model is
+	// capped per-frame inside the loop, since each frame carries its own.
+	sessionID = truncateRunes(sessionID, maxUsageSessionRunes)
 	for _, m := range msgs {
 		// Result frames are only ever kind status (success) or error; skip the
 		// rest without paying an unmarshal for every text/tool_use message.
@@ -1350,6 +1379,7 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 			if model == "" {
 				continue
 			}
+			model = truncateRunes(model, maxUsageModelRunes)
 			if err := s.q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,

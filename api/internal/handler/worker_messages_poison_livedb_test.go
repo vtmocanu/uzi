@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -603,6 +605,114 @@ func TestWorkerMessagesUsageFoldSeesSanitizedModelNamesLiveDB(t *testing.T) {
 		t.Errorf("run_usage.model = %q (% x), want %q — foldRunUsage read the payload as it arrived "+
 			"rather than as sanitation left it, so run_usage.model is a second unstorable sink on this "+
 			"path and the strip is not covering it", model, model, want)
+	}
+}
+
+// The SECOND poison pill on this route (PRD #108 A1), and the one the M2 sanitizer
+// does NOT close: run_usage's PK is (run_id, session_id, model), both session_id
+// and model unbounded worker-controlled text. A btree index entry caps at 2704
+// bytes; an over-long model or session_id raises SQLSTATE 54000, which is NOT in
+// unstorableSQLSTATEs, so foldRunUsage returns it, the handler's default arm answers
+// 500, and the batcher retries the identical batch forever — the incident's exact
+// shape, one sink over. The payload is valid UTF-8 with no escapes, so the sanitizer
+// leaves it untouched; only the fold's rune cap closes it.
+//
+// INCOMPRESSIBLE data is mandatory. `strings.Repeat("m", 3000)` does NOT reproduce:
+// pglz compresses the repeated run and the stored index entry stays under 2704, so a
+// test built on a repeated character wrongly concludes there is no bug. These
+// fixtures use crypto/rand hex, which does not compress.
+//
+// Two vectors, because they enter through different columns: an oversized MODEL (a
+// JSON object key out of the payload) and an oversized SESSION_ID (reported by the
+// worker on a state transition, relayed by the runs row). The positive control on
+// the fix is the assertion that the row PERSISTED capped: unfixed, the POST is 500
+// and nothing lands; fixed, it is 204 and run_usage holds the truncated key.
+func incompressible(t *testing.T, runes int) string {
+	t.Helper()
+	// hex over crypto/rand: each rune is one ASCII byte (so runes == bytes here),
+	// and the bytes are random, so pglz cannot shrink the index entry the way it
+	// shrinks a repeated character. 3000 runes is well over the 200-rune cap and,
+	// uncompressed, well over the 2704-byte btree limit.
+	b := make([]byte, (runes+1)/2)
+	if _, err := crand.Read(b); err != nil {
+		t.Fatalf("crypto/rand: %v", err)
+	}
+	return hex.EncodeToString(b)[:runes]
+}
+
+// storedUsage reads back the single run_usage row this run folded, so the assertion
+// holds the VALUE Postgres actually stored (capped) rather than what was sent.
+func (f poisonFixture) storedUsage(t *testing.T) (sessionID, model string, ok bool) {
+	t.Helper()
+	err := f.pool.QueryRow(context.Background(),
+		`SELECT session_id, model FROM run_usage WHERE run_id = $1`, f.runID).Scan(&sessionID, &model)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return "", "", false
+	case err != nil:
+		t.Fatalf("read run_usage for run %s: %v", f.runID, err)
+	}
+	return sessionID, model, true
+}
+
+// Vector 1: an oversized MODEL name. Unfixed, foldRunUsage's UpsertRunUsage raises
+// 54000 and the handler answers 500; fixed, the fold caps the model to
+// maxUsageModelRunes and the row lands.
+func TestWorkerMessagesUsageFoldCapsOversizedModelLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	model := "claude-" + incompressible(t, 3000)
+	body := []byte(`{"messages":[{"seq":1,"kind":"status","agent":"lead","payload":{` +
+		`"event":"result","modelUsage":{"` + model + `":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}}}}]}`)
+	if utf8.RuneCountInString(model) <= 2704 {
+		t.Fatalf("the oversized model is only %d runes; it must exceed the 2704-byte btree cap to reproduce", utf8.RuneCountInString(model))
+	}
+
+	rec := f.post(t, body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("a result frame with a %d-rune model: status = %d, want 204 — an over-long model must be "+
+			"capped before the upsert, not 500'd into a retry-forever wedge. %s",
+			utf8.RuneCountInString(model), rec.Code, f.diagnose(t, body))
+	}
+	_, gotModel, ok := f.storedUsage(t)
+	if !ok {
+		t.Fatal("the handler answered 204 but no run_usage row exists — the fold never persisted the capped row")
+	}
+	if n := utf8.RuneCountInString(gotModel); n != 200 {
+		t.Errorf("run_usage.model is %d runes, want 200 (maxUsageModelRunes) — an unbounded worker field "+
+			"reached a composite-PK btree column", n)
+	}
+	if want := model[:200]; gotModel != want {
+		t.Errorf("run_usage.model = %q, want the first 200 runes %q — truncateRunes must cut on a rune boundary, not mangle it", gotModel, want)
+	}
+}
+
+// Vector 2: an oversized SESSION_ID with a NORMAL model. The worker reports the
+// session id on a state transition; here it is seeded onto the run row directly, the
+// same value foldRunUsage relays into the PK. Unfixed, 54000 → 500; fixed, capped.
+func TestWorkerMessagesUsageFoldCapsOversizedSessionIDLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	sessionID := incompressible(t, 3000)
+	if _, err := f.pool.Exec(context.Background(),
+		`UPDATE runs SET session_id = $1 WHERE id = $2`, sessionID, f.runID); err != nil {
+		t.Fatalf("seed oversized session_id: %v", err)
+	}
+	body := []byte(`{"messages":[{"seq":1,"kind":"status","agent":"lead","payload":{` +
+		`"event":"result","modelUsage":{"claude-opus-4-8":{"inputTokens":10,"outputTokens":5,"costUSD":0.01}}}}]}`)
+
+	rec := f.post(t, body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("a result frame under a %d-rune session_id: status = %d, want 204 — an over-long session_id "+
+			"must be capped before the upsert. %s", utf8.RuneCountInString(sessionID), rec.Code, f.diagnose(t, body))
+	}
+	gotSession, gotModel, ok := f.storedUsage(t)
+	if !ok {
+		t.Fatal("the handler answered 204 but no run_usage row exists — the fold never persisted the capped row")
+	}
+	if n := utf8.RuneCountInString(gotSession); n != 200 {
+		t.Errorf("run_usage.session_id is %d runes, want 200 (maxUsageSessionRunes)", n)
+	}
+	if gotModel != "claude-opus-4-8" {
+		t.Errorf("run_usage.model = %q, want the normal model untouched — only the oversized column is capped", gotModel)
 	}
 }
 
