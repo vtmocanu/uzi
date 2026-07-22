@@ -49,8 +49,14 @@ export AGENT_BROWSER_EXECUTABLE_PATH AGENT_BROWSER_ARGS AGENT_BROWSER_IDLE_TIMEO
 # image HOME, not only the SDK path where sdk-env.ts happens to repoint HOME to a writable dir.
 # Only-if-unset so an explicit caller value wins; the mkdir is best-effort (dir may pre-exist
 # or TMPDIR may be read-only — chromium still self-creates under a writable XDG root).
-: "${XDG_CONFIG_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/config}"
-: "${XDG_CACHE_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser/cache}"
+#
+# UID-SCOPE the base dir (issue #114 BUG 2a): the fail-closed build guard runs this shim as
+# ROOT (uid 0) at image-build time, so an un-scoped `${TMPDIR:-/tmp}/uzi-agent-browser` would be
+# created root:root and BAKED into the image; the runtime runner (uid 10001) then cannot write
+# it and chromium's crashpad DB creation fails. Keying the dir on `$(id -u)` gives build (0) and
+# runtime (10001) disjoint paths, so the baked root-owned dir is never the one the runner uses.
+: "${XDG_CONFIG_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser-$(id -u)/config}"
+: "${XDG_CACHE_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser-$(id -u)/cache}"
 export XDG_CONFIG_HOME XDG_CACHE_HOME
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
 

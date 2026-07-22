@@ -145,7 +145,7 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
   });
 
-  it("defaults XDG_CONFIG_HOME/XDG_CACHE_HOME to a writable dir under TMPDIR and creates them (crashpad rc=133 fix)", async () => {
+  it("defaults XDG_CONFIG_HOME/XDG_CACHE_HOME to a UID-SCOPED writable dir under TMPDIR and creates them (crashpad rc=133 fix)", async () => {
     // Chromium 150 traps rc=133 at the crashpad handler (BEFORE the SUID check, so --no-sandbox
     // can't help) when it can't create its crashpad DB under a non-writable $HOME/.config — the
     // image bakes /home/worker/.config root-owned, not writable by uid 10001. The shim points
@@ -153,6 +153,11 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     // PATH (the production runner PATH always has /bin); the stub keeps the run browser-free
     // WITHOUT leaking a host browser, since AGENT_BROWSER_EXECUTABLE_PATH short-circuits the
     // PATH probe before any chromium on /usr/bin could match.
+    //
+    // Issue #114 BUG 2a: the default dir is UID-SCOPED (`uzi-agent-browser-$(id -u)`) so the
+    // root (uid 0) build-guard invocation and the runtime uid never collide on one baked
+    // root-owned dir. The shim runs here under the TEST process uid, so that is the expected
+    // scope suffix.
     const xdgTmp = path.join(tmp, "xdg-tmpdir");
     fs.mkdirSync(xdgTmp);
     const envDump = path.join(tmp, "xdg-dump");
@@ -165,10 +170,11 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     });
     assert.equal(res.code, 0);
     const dump = fs.readFileSync(envDump, "utf8");
-    const cfg = path.join(xdgTmp, "uzi-agent-browser", "config");
-    const cache = path.join(xdgTmp, "uzi-agent-browser", "cache");
-    assert.ok(dump.includes(`CFG=${cfg}`), `XDG_CONFIG_HOME must default under TMPDIR; got: ${dump}`);
-    assert.ok(dump.includes(`CACHE=${cache}`), `XDG_CACHE_HOME must default under TMPDIR; got: ${dump}`);
+    const uid = process.getuid!();
+    const cfg = path.join(xdgTmp, `uzi-agent-browser-${uid}`, "config");
+    const cache = path.join(xdgTmp, `uzi-agent-browser-${uid}`, "cache");
+    assert.ok(dump.includes(`CFG=${cfg}`), `XDG_CONFIG_HOME must default under a uid-scoped dir in TMPDIR; got: ${dump}`);
+    assert.ok(dump.includes(`CACHE=${cache}`), `XDG_CACHE_HOME must default under a uid-scoped dir in TMPDIR; got: ${dump}`);
     assert.ok(fs.existsSync(cfg), "the config dir must be created (best-effort mkdir)");
     assert.ok(fs.existsSync(cache), "the cache dir must be created (best-effort mkdir)");
     writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
