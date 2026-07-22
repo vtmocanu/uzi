@@ -59,10 +59,11 @@ func DecodeJSON(r *http.Request, dst any) error {
 // folding a third unrelated cause into the same 400.
 //
 // It exists as a SIBLING rather than as a change to DecodeJSON deliberately.
-// DecodeJSON has 57 non-test call sites; leaving it alone makes "no other route's
-// behaviour changed" true by construction instead of true because someone checked
-// 57 places, and it keeps this diff inside the small-files premise Phase 1 rests
-// on.
+// DecodeJSON is the decoder for nearly every other JSON route in the tree; leaving
+// it alone makes "no other route's behaviour changed" true by construction instead
+// of true because someone re-checked every one of its call sites, and it keeps this
+// diff inside the small-files premise Phase 1 rests on. (Deliberately no count here:
+// a tally drifts exactly like a line number — cite the shape, not the number.)
 //
 // w is REQUIRED and must be the real ResponseWriter, not nil. Passing nil does
 // not panic — MaxBytesReader's exceed path type-asserts w and a nil interface
