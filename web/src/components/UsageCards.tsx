@@ -66,8 +66,8 @@ export function YourUsageCard({ usage }: { usage: SelfUsage }) {
             Across <span className="tabular-nums text-muted">{usage.run_count}</span> run{usage.run_count === 1 ? "" : "s"}, all
             time · <span className="tabular-nums text-muted">{formatTokens(last7.total)}</span> tok /{" "}
             <span className="tabular-nums text-muted">{money(last7.cost)}</span> in the last 7 days ·{" "}
-            <Link to="/runs" className="text-info hover:underline">
-              see per-run detail →
+            <Link to="/runs" className="text-info hover:underline whitespace-nowrap">
+              see per-run detail{"\u00A0"}→
             </Link>
           </p>
         </>

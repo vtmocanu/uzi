@@ -52,6 +52,22 @@ describe("YourUsageCard", () => {
     expect(container.textContent).toContain("—");
     expect(container.textContent).not.toContain("$0.00");
   });
+
+  it("keeps the 'see per-run detail →' arrow glued to 'detail' (no orphaned arrow)", () => {
+    const usage: SelfUsage = {
+      lifetime: bundle(1_000_000, 0, 200_000, 1.23),
+      last_7_days: bundle(100_000, 0, 50_000, 0.5),
+      run_count: 3,
+    };
+    const { container } = wrap(<YourUsageCard usage={usage} />);
+    const link = container.querySelector('a[href="/runs"]');
+    expect(link).toBeTruthy();
+    // (a) whitespace-nowrap prevents the link itself from wrapping.
+    expect(link?.className).toContain("whitespace-nowrap");
+    // (b) positive pin: the arrow stays glued to "detail" by a genuine non-breaking
+    // space — assert via the \u00A0 escape (not a literal glyph) so it stays greppable.
+    expect(link?.textContent).toMatch(/detail\u00A0→/);
+  });
 });
 
 describe("FactoryTotalCard + PerUserUsageTable", () => {
