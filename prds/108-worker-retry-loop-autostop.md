@@ -1,7 +1,7 @@
 # PRD #108: Poison-pill message batches — classify permanent failures, auto-stop confirmed retry loops, and stop leaking run HOMEs
 
 **GitLab Issue**: [#108](https://gitlab.example.com/vtmocanu/uzi/-/issues/108)
-**Status**: **Phase 1 implemented, not yet fully validated** (see "Phase 1 progress" below). Created 2026-07-21; **revised the same day after a fable adversarial review that verified every citation against the code** — three findings changed the design rather than the wording, and four claims in the first draft were measured FALSE; each is corrected in place with the correction left visible. Implementation then falsified **six more** of this document's own claims; those corrections are applied in place below (M9a, 2026-07-22).
+**Status**: **Phase 1 shipped** — validated end-to-end (e2e) and merged to `main` via MR !95 (`0ae7420a`) on 2026-07-22; v0.10.1 release + dev-cluster deploy underway. Phase 2 (M4/M5 detection + auto-stop) remains open (see "Phase 1 progress" below). Created 2026-07-21; **revised the same day after a fable adversarial review that verified every citation against the code** — three findings changed the design rather than the wording, and four claims in the first draft were measured FALSE; each is corrected in place with the correction left visible. Implementation then falsified **six more** of this document's own claims; those corrections are applied in place below (M9a, 2026-07-22).
 **Priority**: High. A run wedges with no product-surface symptom: it reads `running`, spends nothing, produces nothing, holds a run slot, and pins a worker in a ~2 Hz loop against the API. **Bounded, not unbounded** — `RUN_TIMEOUT` (default 2h, `config.go:537`) would have failed it around 20:25. Observed cost on 2026-07-21: 27 minutes and 239 lost messages; worst case without intervention is 2 hours of a held slot and a hot loop. This PRD targets ~2 minutes.
 **Depends on**: **one migration** — `runs.stop_kind` is `CHECK (stop_kind IN ('cancelled','plan_rejected'))` (`00050_run_stop_kind.sql:25`), so a distinguishable auto-stop outcome cannot be expressed today. *(The first draft said "nothing new"; that was wrong and is why this line is explicit.)* Touches PRD #4's worker message path, PRD #47's RunHealth detector, PRD #42/#58's per-run `$HOME`.
 **Related**: PRD #87 (the run that surfaced this — its Chromium spike produced the first NUL bytes any uzi worker has emitted). PRD #99 (rewrote `workersvc` message handling in the same release; see the honesty note in M0).
@@ -140,7 +140,7 @@ Measured leftover: **167.3 MB for one run** (`/data` at 219 MB of 19.5 GB — no
 
 ### Phase 1 progress — 2026-07-21
 
-**5 of 5 milestones implemented and gated (M9a lands 2026-07-22 as docs-only, no code change). Implementation is NOT the same as validated — see the gaps below.**
+**5 of 5 milestones implemented, gated, validated end-to-end, and merged to `main` via MR !95 on 2026-07-22 (M9a landed the same day, docs-only). The checkpoint gaps below are now closed.**
 
 Branch `feature/prd-108-phase1`, 16 commits from `893fe7eb`. Two tracks (`api/**` and `agent/**`) built in parallel worktrees and merged twice with no conflicts.
 
@@ -155,12 +155,12 @@ Gates on the merged tip: api `go vet` + `go test ./...` clean (var unset), live 
 
 **M1's version question is answered: both v0.9.0 (`89a76017`) and v0.10.0 (`1a3c5494`) reproduce identically** — status 500, SQLSTATE 22P05, 0 rows persisted, measured in separate detached worktrees against separate databases. M0's "Postgres behaviour, not a uzi regression" is confirmed; PRD #99's rewrite did not introduce it.
 
-**What is NOT done, stated plainly because the checkboxes above cannot say it:**
+**Checkpoint gaps — all now closed (updated 2026-07-22):**
 
 - **M9a is DONE (2026-07-22).** ARCHITECTURE.md, `docs/configuration.md`, `.env.example`, `specs/ai.md`, and `CHANGELOG.md` are written; the PRD corrections queued below are applied in place in this same pass.
 - **Review is COMPLETE: 13 of 13 commits**, across three passes (M6, Track A, Track B), plus the merge commit itself — verified rather than assumed, by diffing the merged tree against both branch tips (empty both ways) and confirming the two change lists are disjoint. **Audit is now COMPLETE for both tracks**: the auditor has since finished Track B's previously-unaudited halves (`worker_protocol.go`, `sanitize.go`, and its 107 lines of new tests), run its gates, and exercised the N3 log-leak security test green — see `f2ddb5ce`'s status below.
-- **Nothing has exercised the real runtime path.** No e2e run. Every green above is unit or integration level — and this PRD exists because of a failure that appeared only in production.
-- **No MR opened.**
+- **The real runtime path is now exercised (2026-07-22).** `./e2e/run-e2e.sh` passed 182/0 and the live-DB sweep 161/161/0/0; criteria 1 & 2 were proven **end-to-end over the network** (nginx → api → real Postgres): a NUL payload → 204, persisted sanitized, the run continues; `{"n":1e1000000}` → 400, zero rows — each with a positive control on the same database. Residual gap, unit-covered rather than driven through the stub e2e: the client-side bisect/tombstone/breaker and the Go-`0555` HOME-leak trigger (a stub executor runs no `go` and emits no real poison).
+- **Merged.** MR !95 → `main` (`0ae7420a`) on 2026-07-22, CI green — after fixing a CI-only `runner.test.ts` hang (an un-`unref()`'d FakeApi test-server handle lingering on musl/alpine; test-only, not a product bug). Released as v0.10.1; ArgoCD deploy to dev-cluster underway.
 
 **Three milestones shipped beyond their written scope**, so the checkbox text above no longer describes what landed:
 
