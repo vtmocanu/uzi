@@ -1532,7 +1532,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: textParam(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			FailureReason: sanitizeFailureReason(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
 		return store.Run{}, false, ErrInvalidState
@@ -2561,6 +2561,31 @@ func textParam(s *string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgText(*s)
+}
+
+// maxFailureReasonRunes bounds the worker-reported failure reason before it lands
+// in runs.failure_reason. The worker already slices to 512 (reportState), but the
+// API does not take its word for the length any more than for the content — this is
+// generous headroom over that slice while still bounding a hostile or buggy worker.
+const maxFailureReasonRunes = 2048
+
+// sanitizeFailureReason maps the worker's failure reason onto the nullable
+// runs.failure_reason column, stripping NUL and capping the length first.
+//
+// This is the /messages sanitation (M2) applied to its sibling route (PRD #108 A4).
+// A NUL in a `text` column raises 22021 exactly as it does in `jsonb`, and this one
+// is worse-placed: it rides `failed` — the run's TERMINAL report — so a 22021 there
+// 500s, reportState's bounded retries exhaust, and the terminal state never lands,
+// leaving the run to the server-side sweeper. The breaker's own permanent-failure
+// report travels this exact field, so a poisoned run reporting its own poison could
+// fail to record that it failed.
+func sanitizeFailureReason(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	clean, _ := stripNUL(*s)
+	clean = truncateRunes(clean, maxFailureReasonRunes)
+	return pgText(clean)
 }
 
 func int8Param(v *int64) pgtype.Int8 {

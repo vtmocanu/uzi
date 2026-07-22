@@ -891,6 +891,45 @@ func TestWorkerMessagesKindOfOnlyNULsIsRejectedLiveDB(t *testing.T) {
 	}
 }
 
+// postState drives the REAL /state handler with these exact body bytes, the way
+// the router + RequireWorker would — the sibling of post() for the state route.
+func (f poisonFixture) postState(t *testing.T, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/state", bytes.NewReader(body))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", f.runID.String())
+	ctx := context.WithValue(mw.ContextWithWorker(req.Context(), f.wkr), chi.RouteCtxKey, rctx)
+	rec := httptest.NewRecorder()
+	f.h.WorkerRunState(rec, req.WithContext(ctx))
+	return rec
+}
+
+// failure_reason on /state is the same unstorable class as the /messages text
+// columns, one route over, and worse-placed: it rides the `failed` TERMINAL report,
+// so an unfixed NUL 500s, reportState's bounded retries exhaust, and the run never
+// records that it failed (PRD #108 A4). M2 sanitized /messages only.
+//
+// Unfixed, this returns 500 (SQLSTATE 22021) and the terminal state never lands.
+func TestWorkerRunStateFailureReasonNulIsStrippedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	body := []byte(`{"status":"failed","failure_reason":"boom a` + poisonNulEsc + `b"}`)
+	requireFixtureIsHostile(t, body, poisonNulEsc)
+
+	rec := f.postState(t, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /state failed with a u0000 escape in failure_reason: status = %d, want 200 — a NUL there "+
+			"22021s the TERMINAL report, so reportState's retries exhaust and the run never records its failure", rec.Code)
+	}
+	var reason string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT failure_reason FROM runs WHERE id = $1`, f.runID).Scan(&reason); err != nil {
+		t.Fatalf("read runs.failure_reason: %v", err)
+	}
+	if want := "boom ab"; reason != want {
+		t.Errorf("runs.failure_reason = %q (% x), want %q — the NUL must be stripped from failure_reason too", reason, reason, want)
+	}
+}
+
 // The 500 arm logs the WRAPPED error, and its safety rests on a stdlib detail
 // rather than on anything this file does: slog special-cases values implementing
 // `error` and renders them via Error(). pgconn.PgError.Error() emits only
