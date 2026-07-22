@@ -1039,6 +1039,16 @@ const (
 	// Truncate, never reject, for the reason spelled out above: a rejected batch is
 	// a lost message and this field is attribution.
 	maxAgentRunes = agenttmpl.MaxNameLen
+	// maxKindRunes caps `kind`, which f2ddb5ce NUL-stripped but left uncapped — so
+	// it was the last worker-controlled text column with no length bound, on the
+	// same untrusted route and with the same per-frame repetition that justified
+	// capping `agent`. It also rides two log lines per message, so an unbounded kind
+	// is an unbounded log WRITE on top of an unbounded column; the cap is applied
+	// before those lines read it. 64 is comfortably above the whole SDK-frame
+	// vocabulary (`tool_result`, `plan_revising`, … all under 14) while bounding a
+	// hostile value; the column is bare `text NOT NULL` (00020_workers_runs.sql), so
+	// the number is a policy choice, not a schema fit (PRD #108 A3).
+	maxKindRunes = 64
 )
 
 // truncateRunes caps s at n runes, cutting on a rune boundary so the result is
@@ -1198,6 +1208,11 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		m.AgentInstance, nInstance = stripNUL(m.AgentInstance)
 		m.AgentLabel, nLabel = stripNUL(m.AgentLabel)
 		c.textNUL = nKind + nAgent + nInstance + nLabel
+		// Cap `kind` HERE, before the warn log below echoes it (and the second log on
+		// a permanently-unstorable insert): an unbounded kind is an unbounded log
+		// write, not only an unbounded column. Capped after the strip so the cap
+		// counts runes the row will actually hold; `agent` is capped further down.
+		m.Kind = truncateRunes(m.Kind, maxKindRunes)
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
 				"run_id", runID.String(), "seq", m.Seq, "kind", m.Kind,

@@ -851,6 +851,27 @@ func TestWorkerMessagesNulEscapeInKindLiveDB(t *testing.T) {
 	}
 }
 
+// `kind` was NUL-stripped by f2ddb5ce but left uncapped — the last uncapped
+// worker-controlled text column, and one this route logs twice per message, so an
+// unbounded kind is an unbounded log write too (PRD #108 A3). Like `agent`, it is
+// truncated, never rejected: a rejected batch is a lost message.
+func TestWorkerMessagesKindIsCappedLiveDB(t *testing.T) {
+	f := newPoisonFixture(t)
+	long := strings.Repeat("k", 500)
+	body := []byte(`{"messages":[{"seq":1,"kind":"` + long + `","agent":"lead","payload":{"t":"x"}}]}`)
+
+	if rec := f.post(t, body); rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 — an over-long kind is truncated, never rejected. %s", rec.Code, f.diagnose(t, body))
+	}
+	got, ok := f.storedColumn(t, 1, "kind")
+	if !ok {
+		t.Fatal("no kind persisted")
+	}
+	if utf8.RuneCountInString(got) != 64 {
+		t.Errorf("persisted kind is %d runes, want 64 (maxKindRunes) — an uncapped worker field reached a text column and two log lines", utf8.RuneCountInString(got))
+	}
+}
+
 // A kind of NOTHING BUT NUL escapes is the ordering trap: it is non-empty on the
 // wire, so it passes the emptiness check, and would then strip to "" — which
 // `text NOT NULL` accepts happily, persisting a message with no kind at all.
