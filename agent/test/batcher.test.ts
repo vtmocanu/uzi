@@ -195,6 +195,25 @@ describe("MessageBatcher scrubs the PRD #99 top-level fields", () => {
     assert.ok((sent[0]?.agent ?? "").includes("***REDACTED***"), "the secret is replaced by the redaction marker");
   });
 
+  it("redacts a secret that leaked into kind", async () => {
+    // The kind scrub path is byte-identical to agent's (redactText∘sanitizeText), so
+    // this is covered transitively — but pin the symmetry DIRECTLY so a future
+    // refactor cannot diverge the two silently. A secret in kind is off-vocabulary (a
+    // hostile/buggy worker), so the cast mirrors what such a frame would carry.
+    const { logger } = recordingLogger();
+    const { client, sent } = fakeClient();
+    const batcher = new MessageBatcher(
+      client, "run-1", 0, 0, logger, makeRedactor([secret]), makeTextRedactor([secret]),
+    );
+
+    batcher.emit({ kind: `text-${secret}` as OutgoingMessage["kind"], agent: "coder", payload: { text: "x" } });
+    await batcher.close();
+
+    const kind = String(sent[0]?.kind ?? "");
+    assert.ok(!kind.includes(secret), "the secret must not survive in kind");
+    assert.ok(kind.includes("***REDACTED***"), "the secret is replaced by the redaction marker");
+  });
+
   it("leaves a legitimate kind untouched — scrubbing a closed vocabulary is a no-op", async () => {
     const { logger } = recordingLogger();
     const { client, sent } = fakeClient();
