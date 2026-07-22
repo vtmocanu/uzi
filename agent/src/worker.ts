@@ -38,7 +38,7 @@ export class Worker {
 
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
-    // A worker whose `/nix` store is missing the baked go/python3/gcc/pip (a stale seed
+    // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
     // after an image roll — see PRD #92 root cause) must FAIL REGISTRATION visibly, not
     // retry forever (the toolchain won't appear by retrying) or emit silent 127s to
     // subagents mid-run. THROW so it propagates to main.ts's fatal handler (exit 1) and

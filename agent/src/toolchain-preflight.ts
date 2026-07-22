@@ -4,21 +4,22 @@ import { runnerPath } from "./runner-uid.js";
 
 // PRD #92 M3 — boot-time toolchain preflight (the runtime analogue of the M1/M2 build
 // assertion). A worker whose `/nix` store is missing the baked toolchain (go/python3/
-// gcc/pip) must FAIL REGISTRATION visibly instead of surfacing `command not found`
+// gcc/pip/openssl) must FAIL REGISTRATION visibly instead of surfacing `command not found`
 // (exit 127) to subagents mid-run. Root cause (see PRD #92): the `seed-nix` init
 // container tars the image's `/nix` into the per-worker PVC exactly once, so a worker
 // rolled onto a toolchain-changing image runs against a store that never re-seeded —
 // its PATH points at a profile hash the stale store lacks.
 //
-// The check resolves the four tools against `runnerPath(env)` (UZI_RUNNER_PATH || PATH),
+// The check resolves the five tools against `runnerPath(env)` (UZI_RUNNER_PATH || PATH),
 // NOT `process.env.PATH`: under the PRD #51 A1 split the worker's own PATH is
 // deliberately stripped of `/nix`, and the full image PATH (incl. `/nix`) is handed to
 // the runner via UZI_RUNNER_PATH — so checking process.env.PATH would false-fail on
 // every correctly-hardened worker. On a #58 single-uid start UZI_RUNNER_PATH is unset
 // and runnerPath() falls back to the (unstripped) worker PATH, so the same check holds.
 
-/** The baked worker toolchain every subagent depends on (PRD #83/#89). */
-export const REQUIRED_TOOLS = ["python3", "go", "gcc", "pip"] as const;
+/** The baked worker toolchain every subagent depends on (PRD #83/#89; openssl added
+ *  as a broadly-used base crypto/TLS CLI, judge rec run dd06c0ed). */
+export const REQUIRED_TOOLS = ["python3", "go", "gcc", "pip", "openssl"] as const;
 
 /** The stable, immutable toolchain handle baked by M1 (`/opt/uzi-toolchain` → the
  *  realized devbox global profile in the store). If this dereference fails the store is

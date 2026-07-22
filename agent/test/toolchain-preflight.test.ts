@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { toolchainPreflight, REQUIRED_TOOLS } from "../src/toolchain-preflight.js";
 
-// PRD #92 M3 — the boot toolchain preflight is a pure function: it resolves the four
-// baked tools (python3/go/gcc/pip) against runnerPath(env) (UZI_RUNNER_PATH || PATH) and
+// PRD #92 M3 — the boot toolchain preflight is a pure function: it resolves the five
+// baked tools (python3/go/gcc/pip/openssl) against runnerPath(env) (UZI_RUNNER_PATH || PATH) and
 // asserts the stable `/opt/uzi-toolchain` handle dereferences. These tests are hermetic:
 // a temp bin dir holds executable stubs, and the stable-path arg is overridden to a temp
 // symlink so the suite never depends on the host having `/opt/uzi-toolchain`.

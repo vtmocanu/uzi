@@ -433,6 +433,12 @@ describe("devbox-global default toolchain manifest", () => {
     assert.match(manifest, /"python3"/, "manifest must list python3");
     assert.match(manifest, /python3Packages\.pip|"pip"/, "manifest must list pip");
   });
+  // openssl is a baked base crypto/TLS CLI (cert gen / `openssl rand` / hashing), promoted
+  // from tier-2 (run dd06c0ed) so its absence can't silently ship a worker that 127s any
+  // repo's e2e/cert step.
+  it("lists openssl (baked crypto/TLS CLI, run dd06c0ed)", () => {
+    assert.match(manifest, /"openssl"/, "manifest must list openssl");
+  });
   // PRD #87: the browser for the web-ux role rides this SAME shared toolchain, so a drop can't
   // silently ship a worker without a browser or its fonts (which would render every screenshot
   // as tofu). chromium is the browser; fontconfig + a font package make text legible.
@@ -443,11 +449,11 @@ describe("devbox-global default toolchain manifest", () => {
   });
   // Every manifest package must be pinned in the sibling lock at the SAME nixpkgs rev (the
   // pin the Dockerfiles COPY in before `devbox global install`); an unpinned package floats.
-  it("pins every browser package in devbox.lock at the toolchain nixpkgs rev", () => {
+  it("pins every add-on package in devbox.lock at the toolchain nixpkgs rev", () => {
     const revMatch = /github:NixOS\/nixpkgs\/([0-9a-f]{40})#go\b/.exec(lock);
     assert.ok(revMatch, "lock must pin go at a concrete nixpkgs rev to anchor the toolchain pin");
     const rev = revMatch![1];
-    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts"]) {
+    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts", "openssl"]) {
       assert.match(
         lock,
         new RegExp(`github:NixOS/nixpkgs/${rev}#${pkg}\\b`),
