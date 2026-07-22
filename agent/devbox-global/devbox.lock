@@ -8,6 +8,9 @@
     "go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#go", "source": "nixpkg" },
     "gcc": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#gcc", "source": "nixpkg" },
     "python3": { "plugin_version": "0.0.5", "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3", "source": "nixpkg" },
-    "python3Packages.pip": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3Packages.pip", "source": "nixpkg" }
+    "python3Packages.pip": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3Packages.pip", "source": "nixpkg" },
+    "chromium": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#chromium", "source": "nixpkg" },
+    "fontconfig": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#fontconfig", "source": "nixpkg" },
+    "dejavu_fonts": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#dejavu_fonts", "source": "nixpkg" }
   }
 }

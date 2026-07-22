@@ -27,10 +27,28 @@
   // tests run `-race`), and python C-extension wheels need one too. Delivered through the
   // SAME nix/devbox path as go so cgo links against the matching toolchain (an apk/musl
   // gcc would mismatch nix-glibc go). Validate `cgo`/`-race` in the built image.
+  //
+  // PRD #87 — the browser for the `web-ux` role rides this SAME shared toolchain (the
+  // owner's chosen delivery), so it lands in every worker image (base + jvm) with one
+  // manifest edit and no dedicated image variant:
+  //   * `chromium` — the headless browser agent-browser drives (mainProgram `chromium`,
+  //     so it resolves at /opt/uzi-toolchain/bin/chromium; AGENT_BROWSER_EXECUTABLE_PATH
+  //     in both Dockerfiles points there). Prebuilt in cache.nixos.org on x86_64-linux at
+  //     the pinned rev (chromium-150.0.7871.128, narinfo HTTP 200), so CI's amd64-only
+  //     kaniko build substitutes it rather than compiling Chromium from source.
+  //   * `fontconfig` + `dejavu_fonts` — a nix Chromium closure ships NO fonts, so without
+  //     a font package + a fontconfig that can find it every screenshot (the role's whole
+  //     evidence artifact) renders tofu. Both prebuilt at the pinned rev. The Dockerfiles
+  //     wire FONTCONFIG_FILE at /opt/uzi-toolchain/share/fonts and pre-warm the cache.
+  // agent-browser itself is NOT a nix package — it is the pinned npm CLI in
+  // agent/package.json (baked by `npm ci`), never installed per-run.
   "packages": [
     "go",
     "gcc",
     "python3",
-    "python3Packages.pip"
+    "python3Packages.pip",
+    "chromium",
+    "fontconfig",
+    "dejavu_fonts"
   ]
 }
