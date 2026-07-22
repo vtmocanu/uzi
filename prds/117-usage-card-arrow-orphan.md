@@ -23,7 +23,7 @@ to the next line together, and the arrow can never separate from `detail`:
 1. Add **`whitespace-nowrap`** to the `<Link>` in `YourUsageCard` — the link
    never breaks internally; it wraps as one block.
 2. Belt-and-suspenders: replace the space before the arrow with a **non-breaking
-   space** (` `) so the arrow stays glued to `detail` even if the nowrap
+   space**, written in JSX as the explicit escape `{"\u00A0"}` (never a literal invisible glyph), so the arrow stays glued to `detail` even if the nowrap
    class is ever dropped or overridden.
 
 The link text is short (`see per-run detail →`, ~20 chars) and the card is
@@ -54,7 +54,7 @@ Single file, one component.
 - **`web/src/components/UsageCards.tsx`** — `YourUsageCard`, the kicker `<p>`
   (currently lines ~65–72). Add `whitespace-nowrap` to the `<Link to="/runs">`
   className (alongside `text-info hover:underline`) and set the label to
-  `see per-run detail{" "}→` so the space before the glyph is non-breaking.
+  `see per-run detail{"\u00A0"}→` so the space before the glyph is non-breaking.
   This is the **only** arrow-suffixed link in the file — `FactoryTotalCard` and
   `PerUserUsageTable` have no such link, so no other card needs the change.
 - **CLI** — no change. This is a web-only rendering concern; `api/cmd/uzi/` has
@@ -71,8 +71,11 @@ Single file, one component.
 - [ ] **M1 — Fix + test.** Apply `whitespace-nowrap` + NBSP to the `YourUsageCard`
   link. Add a `web/src/components/UsageCards.test.tsx` assertion that the
   rendered link element (a) carries the `whitespace-nowrap` class and (b) its
-  text has no plain space immediately before `→` (i.e. contains the NBSP form).
-  `npm test` + `npm run typecheck` green.
+  `textContent` **matches `/detail\u00A0→/`** — a *positive* pin asserting the
+  arrow is glued to `detail` by a non-breaking space. (Positive, not "no plain
+  space before `→`": a negative pin can pass vacuously if the label text later
+  changes, whereas the positive form fails loudly the moment the escape is
+  dropped.) `npm test` + `npm run typecheck` green.
 - [ ] **M2 — Verify in-app + mock fidelity.** Confirm in mock mode at a narrow
   width that the arrow no longer orphans (the whole link wraps together). Apply
   the same `white-space: nowrap` to the mock's `.faux` link (or note it left
@@ -83,7 +86,7 @@ Single file, one component.
 - **Regression surface is effectively nil.** One className + one whitespace
   character in one component; no API, DTO, or state change. The test in M1 pins
   the fix so a future refactor of the kicker can't silently reintroduce the split.
-- **NBSP in source readability.** Written as `{" "}` (not a literal
+- **NBSP in source readability.** Written as `{"\u00A0"}` (not a literal
   invisible glyph) so it's greppable and obvious in review.
 
 ## Success criteria
