@@ -145,7 +145,7 @@ describe("SDK honors a swapped agents map + repo-sourced prompt on a RESUMED tur
       //    made an SDK bump look like a resume regression (it was not).
       const resumeIdx = fake.spawnArgs.findIndex((a) => a === "--resume" || a.startsWith("--resume="));
       assert.ok(resumeIdx >= 0, "spawn args must carry --resume");
-      const resumeArg = fake.spawnArgs[resumeIdx];
+      const resumeArg = fake.spawnArgs[resumeIdx] ?? "";
       const resumeValue =
         resumeArg === "--resume" ? fake.spawnArgs[resumeIdx + 1] : resumeArg.slice("--resume=".length);
       assert.equal(resumeValue, "plan-turn-session-id");
