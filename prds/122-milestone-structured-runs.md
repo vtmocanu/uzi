@@ -290,7 +290,9 @@ hook, so it can never reach a signal tool.
 - `api/internal/workersvc/health.go` — clamp the "slow" threshold against the per-run timeout, not the global one (Decision 5b)
 - `api/internal/apitypes/run.go` — DTO
 - `web/src/pages/RunView.tsx`, `Dashboard.tsx`, `RunsList.tsx` + tests; `web/src/mocks/{data,mockApi,engine}.ts`
-- `api/internal/slacksvc/notifier.go` — root-line counter + per-completion thread line, deduped on the completed-set with the existing gate-generation guard (M4)
+- `api/internal/slacksvc/notifier.go` — root-line counter + thread line on count-advance (M4)
+- `api/internal/store/queries/slack.sql` (+ sqlc regen) — extend `GetSlackRunContext` with the milestone columns; new "last-notified count" column on `slack_run_messages` + a generation-guarded setter modelled on `SetSlackRunGateGen` (M4)
+- one migration for that `slack_run_messages` column (M4; folds into M1's migration if landed together)
 - `api/cmd/uzi/` — CLI parity (repo convention: a run-DTO change must not update only the web)
 - `docs/configuration.md` — budget semantics; `specs/ai.md` — append-only decision record
 
@@ -331,21 +333,30 @@ hook, so it can never reach a signal tool.
       the existing run stream with no new endpoint.
 - [ ] **M4 — Slack milestone progress**: a run that is linked to Slack (PRD #25)
       shows its milestone progress there, in the surface the owner actually
-      watches. Two edits to the existing per-run Slack message
-      (`api/internal/slacksvc/notifier.go`): the root status line gains the
-      compact counter (`▶ running · M3/7`, the same in-place edit `statusLabel`
-      already re-renders on every state event), and a threaded line is posted each
-      time the completed set GROWS ("✓ M2 done · working M3"). Deduped on the
-      completed-set size with the same generation-guard pattern the gate already
-      uses (`GateGeneration`/`SetSlackRunGateGen`), so a milestone line is posted
-      once, never re-broadcast on every `running` report. Wiring note: milestone
-      progress rides `running` reports, which are NOT status transitions, so the
-      notifier must be driven off the milestone-set change, not off status alone —
-      this is the one non-trivial part. Best-effort and self-degrading exactly
-      like every other Slack surface: an unlinked or opted-out user gets nothing
-      and the run is unaffected (`handleNotify` drops silently on `ErrNoRows`).
-      **Verified**: a linked run posts each milestone completion once and only
-      once; an unlinked run behaves exactly as today.
+      watches. In the notifier (`api/internal/slacksvc/notifier.go`, inside the
+      existing run-state `handle`, alongside `handleGate`): the root status line
+      gains a compact counter (`▶ running · 3/7`, the same in-place edit
+      `statusLabel` already re-renders on every state event), and a threaded line
+      is posted when the completed count advances (`✓ 3/7 · working M5`).
+      **Scope beyond notifier.go** (this is more than two edits): `GetSlackRunContext`
+      (`slack.sql:97`) must be extended to select the milestone columns (it selects
+      none today) + sqlc regen; and dedup needs a NEW append-only column on
+      `slack_run_messages` (a "last-notified completed count") plus a
+      generation-guarded setter — **modelled on** `SetSlackRunGateGen`
+      (`slack.sql:146`) but distinct from it: `gate_generation` is the PLAN gate's
+      own counter, actively read/written by `handleGate`, and cannot be reused.
+      Without the new column a redelivered `running` event re-posts the line. The
+      milestone label is rendered through `EscapeMrkdwn` + `ScrubSecrets` like
+      every other field (`renderRoot`), so no new untrusted surface reaches Slack.
+      Wiring note, corrected: `PublishState`/`notify` already fire on **every**
+      applied `SetState` including each `running` report (`service.go:1549-1553`),
+      so `handle` runs on every report and reads fresh milestone data — the block
+      just needs its own dedup on the completed count, not off status. Best-effort
+      and self-degrading: an unlinked or opted-out user gets nothing and the run
+      is unaffected (`handle` drops silently on `ErrNoRows`, `notifier.go:285`).
+      **Verified**: a linked run reflects each completion in its thread exactly
+      once and never re-broadcasts on a repeated `running` report; an unlinked run
+      behaves exactly as today.
 - [ ] **M5 — CLI parity**: `uzi` run show/list surface the same milestone
       progress as the web, per the repo's "new functionality ⇒ check the CLI"
       convention. **Verified**: `uzi run show <id> --json` carries the milestone
@@ -401,8 +412,12 @@ hook, so it can never reach a signal tool.
 - Milestone progress never regresses in the UI, even when a state report is lost
   or duplicated.
 - The web and `uzi` CLI show the same milestone state.
-- A run linked to Slack posts each milestone completion to its thread once and
-  only once, and an unlinked run behaves exactly as today.
+- A run linked to Slack reflects each completion in its thread exactly once and
+  never re-broadcasts on a repeated `running` report; when two milestones
+  complete in one turn the count advances correctly (a `+2` jump is not lost),
+  and an unlinked run behaves exactly as today. Note the dedup is on the completed
+  COUNT, so the guarantee is "every advance is shown once, none missed", not "one
+  separate line per id" — the count-based rendering (`3/7`) makes that honest.
 - After M6: a worker pod killed mid-run, re-claimed by the same worker, resumes
   with the checkpointed commits present rather than re-doing them.
 - After M6: **no new credential is exposed** — the checkpoint path passes no PAT
@@ -493,10 +508,11 @@ hook, so it can never reach a signal tool.
   diverged from origin ⇒ origin wins and the notice is emitted; stale ref from an
   abandoned attempt behaves as the settled lifecycle says.
 - Web tests for the three surfaces plus the NULL-milestone fallback.
-- Slack notifier tests (matching `notifier_notify_test.go`): a milestone
-  completion posts one thread line; a repeated `running` report with an unchanged
-  completed set posts nothing (dedup); an unlinked/opted-out user gets nothing and
-  the run is unaffected.
+- Slack notifier tests (matching `notifier_notify_test.go`): a count-advancing
+  report posts one thread line; a repeated `running` report with an unchanged
+  completed count posts nothing (dedup on the new column); a `+2` advance in one
+  turn posts one line and does not lose the jump; an unlinked/opted-out user gets
+  nothing and the run is unaffected.
 - Live-DB tests where the union semantics are the point, run per the CLAUDE.md
   live-DB rules (`./e2e/run-store-it.sh`, positive control required — a `PASS=0`
   sweep is not evidence).
@@ -550,3 +566,14 @@ hook, so it can never reach a signal tool.
   durability/push milestones shifted M5→M6, M6→M7, M7→M8. A scope boundary was
   recorded at the same time (Out of Scope): run-plan milestones are not
   `prds/*.md` checkboxes, and uzi does not edit PRD files to track progress.
+- **2026-07-24 — opus re-review of the M4 insertion, verified against code.**
+  Renumbering passed clean (every impl ref shifted, every illustrative ref left
+  alone, list gapless). Two under-scopings were corrected in M4: it is more than
+  two edits to `notifier.go` — `GetSlackRunContext` selects no milestone column
+  today and dedup needs a NEW `slack_run_messages` column (the gate's
+  `gate_generation` is plan-specific and cannot be reused, only mirrored); and
+  "each completion once and only once" was false under parallel completion, since
+  a count-based dedup coalesces a `+2` jump — resolved by choosing count-based
+  rendering (`3/7`) and softening the criterion. Also corrected: `PublishState`
+  fires on every `running` report (`service.go:1549`), so the notifier wiring is
+  smaller than first written, not larger.
