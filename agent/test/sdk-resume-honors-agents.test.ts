@@ -138,8 +138,17 @@ describe("SDK honors a swapped agents map + repo-sourced prompt on a RESUMED tur
       assert.ok(init, "the SDK must write an initialize control_request to the CLI");
 
       // 1. Resume IS on the command line — this is genuinely a resumed turn.
-      assert.ok(fake.spawnArgs.includes("--resume"), "spawn args must carry --resume");
-      assert.equal(fake.spawnArgs[fake.spawnArgs.indexOf("--resume") + 1], "plan-turn-session-id");
+      //    The SDK has spelled this both ways: two args (`--resume <id>`, CLI
+      //    2.1.201 and earlier) and one (`--resume=<id>`, 2.1.219+). What this
+      //    test cares about is that the session id reaches the CLI at all, so
+      //    assert the PAIRING and accept either spelling — pinning the arg shape
+      //    made an SDK bump look like a resume regression (it was not).
+      const resumeIdx = fake.spawnArgs.findIndex((a) => a === "--resume" || a.startsWith("--resume="));
+      assert.ok(resumeIdx >= 0, "spawn args must carry --resume");
+      const resumeArg = fake.spawnArgs[resumeIdx];
+      const resumeValue =
+        resumeArg === "--resume" ? fake.spawnArgs[resumeIdx + 1] : resumeArg.slice("--resume=".length);
+      assert.equal(resumeValue, "plan-turn-session-id");
 
       // 2. …yet the SWAPPED agents map is transmitted: exactly the selected repo
       //    subagents, and NOT the excluded one.
