@@ -62,7 +62,7 @@ amnesia. `git.ts:139-145` says this plainly; #110's summary did not.
 What genuinely is already mitigated: work from a *completed* prior run is pushed
 and reused via `priorCommits` (`git.ts:288-299`, `runner.ts:258`,
 `prompt.ts:167-176`). So the residual loss is **any** mid-implement interruption,
-not only the different-worker case — which is what M5 addresses, and why the
+not only the different-worker case — which is what M6 addresses, and why the
 Risks gate must measure interrupted runs rather than cross-worker hand-offs.
 
 ## Solution Overview
@@ -91,9 +91,9 @@ off that structure.
   the completed set, so an amnesiac lead is told "M1–M3 are committed, start at
   M4" instead of today's vague "the branch carries N commits".
 
-Phasing is deliberate: **M1–M4 deliver the progress feature with no new security
-surface**; M5–M6 add durability using no credential; M7 (origin push at
-checkpoints) is deferred and gated on evidence.
+Phasing is deliberate: **M1–M5 deliver the progress feature with no new security
+surface** (including Slack, M4, and CLI, M5); M6–M7 add durability using no
+credential; M8 (origin push at checkpoints) is deferred and gated on evidence.
 
 ## Design Decisions
 
@@ -175,7 +175,7 @@ worker's bare, already hardened by six B2 invariants, and takes no PAT. It moves
 the agent's commits from the ephemeral runner clone onto the `/data` PVC
 (`controller/internal/kube/render.go:442`), which survives a pod kill and
 re-attaches to the same worker. This is the entire durability mechanism for
-M5 — no push, no CI trigger, no branch at origin, no new secret exposure.
+M6 — no push, no CI trigger, no branch at origin, no new secret exposure.
 
 **8. The reap is what makes a checkpoint safe, and it is why PRD #110's
 conclusion does not apply here.** #110 closed because a mid-run push happens
@@ -188,12 +188,12 @@ git run. That restores the **temporal closure** #110 said a checkpoint could not
 have. Stated honestly: the residual risk (a `setsid` double-fork escaping the
 group kill) is **identical to today's end-of-run push**, not new. If
 `killAgentTree` is trusted there, it is trusted here; if it is not, uzi has a
-bug today. Note this argument is what unblocks M7 in principle — M5/M6 do not
+bug today. Note this argument is what unblocks M8 in principle — M6/M7 do not
 need it at all, since they use no credential.
 
-One honest qualifier, for M7 only: the risk *class* is identical, the *exposure
-count* is not. Today a run has exactly one reap→push window; M7 would give it
-one per milestone, with the agent re-spawned between them. The M7 security review
+One honest qualifier, for M8 only: the risk *class* is identical, the *exposure
+count* is not. Today a run has exactly one reap→push window; M8 would give it
+one per milestone, with the agent re-spawned between them. The M8 security review
 must weigh N windows, not one.
 
 **9. The clone seed must prefer the checkpointed ref — under a rule that is
@@ -207,7 +207,7 @@ is ahead" is too loose to implement safely:
 - **The rule.** Compute the base as today (origin branch if present, else the
   default branch). Prefer the tracking ref **only when it is a strict descendant
   of that base** (`git merge-base --is-ancestor <base> <tracking>`). In the
-  primary M5 case the branch was never pushed, so the comparison is against the
+  primary M6 case the branch was never pushed, so the comparison is against the
   default branch, not a nonexistent origin ref.
 - **On divergence, origin wins, loudly.** If a human pushed to the branch after a
   checkpoint, the two have diverged and "ahead" is undefined. Take origin and
@@ -223,7 +223,7 @@ is ahead" is too loose to implement safely:
   successful push the tracking ref equals origin and is inert; the open decision
   is **keep or delete on terminal failure**, and it is a product decision (does an
   abandoned attempt's work deserve to be inherited?), not an implementation
-  detail. M5 must settle it explicitly.
+  detail. M6 must settle it explicitly.
 
 **10. The boundary is model-cooperative, and the iteration boundary stays the
 fallback.** `checkpoint` ends a turn the same way `submit_plan` does today: the
@@ -241,7 +241,7 @@ the lead cannot see coming. It is also unnecessary: the fetch-back carries no
 credential (Decision 7), so the reap there buys consistency, not security. So the
 fallback checkpoint fetch-backs **without** reaping, and the reap happens only
 where the lead declared a milestone complete and therefore expects a boundary.
-(M7, which does carry a credential, must reap at every checkpoint including the
+(M8, which does carry a credential, must reap at every checkpoint including the
 fallback — another reason it is a separate decision.)
 
 **11. Milestone state rides the claim.** `ClaimResponse` carries the frozen list
@@ -290,6 +290,7 @@ hook, so it can never reach a signal tool.
 - `api/internal/workersvc/health.go` — clamp the "slow" threshold against the per-run timeout, not the global one (Decision 5b)
 - `api/internal/apitypes/run.go` — DTO
 - `web/src/pages/RunView.tsx`, `Dashboard.tsx`, `RunsList.tsx` + tests; `web/src/mocks/{data,mockApi,engine}.ts`
+- `api/internal/slacksvc/notifier.go` — root-line counter + per-completion thread line, deduped on the completed-set with the existing gate-generation guard (M4)
 - `api/cmd/uzi/` — CLI parity (repo convention: a run-DTO change must not update only the web)
 - `docs/configuration.md` — budget semantics; `specs/ai.md` — append-only decision record
 
@@ -328,14 +329,31 @@ hook, so it can never reach a signal tool.
       human approves what they are approving. Mocks + tests updated. NULL
       milestones render today's badge. **Verified**: progress updates live over
       the existing run stream with no new endpoint.
-- [ ] **M4 — CLI parity**: `uzi` run show/list surface the same milestone
+- [ ] **M4 — Slack milestone progress**: a run that is linked to Slack (PRD #25)
+      shows its milestone progress there, in the surface the owner actually
+      watches. Two edits to the existing per-run Slack message
+      (`api/internal/slacksvc/notifier.go`): the root status line gains the
+      compact counter (`▶ running · M3/7`, the same in-place edit `statusLabel`
+      already re-renders on every state event), and a threaded line is posted each
+      time the completed set GROWS ("✓ M2 done · working M3"). Deduped on the
+      completed-set size with the same generation-guard pattern the gate already
+      uses (`GateGeneration`/`SetSlackRunGateGen`), so a milestone line is posted
+      once, never re-broadcast on every `running` report. Wiring note: milestone
+      progress rides `running` reports, which are NOT status transitions, so the
+      notifier must be driven off the milestone-set change, not off status alone —
+      this is the one non-trivial part. Best-effort and self-degrading exactly
+      like every other Slack surface: an unlinked or opted-out user gets nothing
+      and the run is unaffected (`handleNotify` drops silently on `ErrNoRows`).
+      **Verified**: a linked run posts each milestone completion once and only
+      once; an unlinked run behaves exactly as today.
+- [ ] **M5 — CLI parity**: `uzi` run show/list surface the same milestone
       progress as the web, per the repo's "new functionality ⇒ check the CLI"
       convention. **Verified**: `uzi run show <id> --json` carries the milestone
       fields and the human output shows the same state the web does.
 
 **Phase 2 — durability (still no credential).**
 
-- [ ] **M5 — Checkpoint boundary + local fetch-back**: new `checkpoint` signal
+- [ ] **M6 — Checkpoint boundary + local fetch-back**: new `checkpoint` signal
       tool; on it the executor ends the turn, the runner calls `killAgentTree()`,
       the worker rejects a no-op checkpoint (tip unmoved / tree dirty, Decision
       6) and otherwise fetch-backs into the bare on the PVC (Decision 7); the
@@ -349,8 +367,8 @@ hook, so it can never reach a signal tool.
       before it can claim anything, so with more than one worker per user the 2m
       `WORKER_AFFINITY_GRACE` can expire and a different worker takes the run onto
       a different PVC, where the checkpoint is invisible. Extending the grace when
-      a checkpoint exists is a cheap follow-up, not part of M5.
-- [ ] **M6 — Resume precision**: the claim carries the frozen list + completed
+      a checkpoint exists is a cheap follow-up, not part of M6.
+- [ ] **M7 — Resume precision**: the claim carries the frozen list + completed
       set; the planning prompt for a dropped-resume run names what is already
       committed by milestone instead of by commit count (Decision 11); the issue
       #105 feed notice is updated to match. **Verified**: a run resumed after a
@@ -359,12 +377,12 @@ hook, so it can never reach a signal tool.
 
 **Phase 3 — deferred, gated on evidence.**
 
-- [ ] **M7 — Origin push at checkpoints (DEFERRED)**: push the branch to origin
+- [ ] **M8 — Origin push at checkpoints (DEFERRED)**: push the branch to origin
       at each checkpoint so work survives a **different** worker re-claiming the
       run. Blocked on: (a) the `requeue_count` measurement in Risks showing this
       actually happens, (b) an explicit security review of Decision 8, (c) a
       decision on CI-trigger suppression (`-o ci.skip`) so N checkpoints do not
-      fire N pipelines. **Not** to be started with M5.
+      fire N pipelines. **Not** to be started with M6.
 
 ## Success Criteria
 
@@ -383,9 +401,11 @@ hook, so it can never reach a signal tool.
 - Milestone progress never regresses in the UI, even when a state report is lost
   or duplicated.
 - The web and `uzi` CLI show the same milestone state.
-- After M5: a worker pod killed mid-run, re-claimed by the same worker, resumes
+- A run linked to Slack posts each milestone completion to its thread once and
+  only once, and an unlinked run behaves exactly as today.
+- After M6: a worker pod killed mid-run, re-claimed by the same worker, resumes
   with the checkpointed commits present rather than re-doing them.
-- After M5: **no new credential is exposed** — the checkpoint path passes no PAT
+- After M6: **no new credential is exposed** — the checkpoint path passes no PAT
   to any subprocess, and the run still pushes exactly once, at the end.
 - The plan gate shows the milestone breakdown, so the human approves the
   decomposition and not just the prose.
@@ -404,13 +424,21 @@ hook, so it can never reach a signal tool.
   here means several subagents inside one turn on one working tree; nothing in
   this PRD creates a second checkout, a second branch, or a merge.
 - **Any change to the end-of-run push + MR path.**
+- **Editing PRD or issue markdown as milestones progress.** These milestones are
+  the lead's own implementation-plan breakdown for the forge issue it is working,
+  reported over the API wire and stored on the `runs` row — they are NOT the
+  `- [ ]` checkboxes in a `prds/*.md` file. uzi never writes a PRD file to track
+  its own progress; the run's milestone state lives on the run and is shown in
+  the web/CLI/Slack. (If a lead edits a PRD file, it is because that edit is part
+  of the issue's actual work — an ordinary commit on the branch, gated by the
+  same review and MR as any other change, not a progress-tracking side effect.)
 
 ## Risks
 
 - **Breadth, not depth.** Seven touchpoints across three languages must land
   together or the feature half-works. Each individually follows a working
   precedent (`iteration_count` is the exact template for the wire, PRD #41 for
-  the gate-loop change), but the coordination is the real cost. Mitigation: M1–M4
+  the gate-loop change), but the coordination is the real cost. Mitigation: M1–M5
   are individually shippable and each is useful alone.
 - **The budget change touches a safety mechanism.** `RUN_MAX_ITERATIONS` and the
   wall clock exist to bound cost and stop runaway runs. Scaling them by a
@@ -423,15 +451,16 @@ hook, so it can never reach a signal tool.
 - **A progress UI that overstates certainty.** "M4 ✓" is a self-report
   (Decision 6). Mitigation: the two cheap machine checks, plus copy that says
   "reported complete", plus the existing MR/CI as the real verification.
-- **M5's benefit must be measured, but against the right population.** An
-  earlier draft of this PRD (following #110) proposed gating M5 on how many
-  requeues landed on a *different* worker. That gate is wrong: as Problem §3 now
-  records, a **same-worker** requeue destroys the attempt's commits too, so the
-  cross-worker filter would exclude precisely the events M5 fixes. **Measure
-  instead**: `runs.requeue_count > 0` (the column exists, migration `00020`;
-  exposed on the DTO at `apitypes/run.go:32`) restricted to runs interrupted
-  after the plan gate — i.e. those that had reached the implement phase and had
-  commits to lose. If *that* is near zero, Phase 1 is the whole feature.
+- **M6's benefit must be measured, but against the right population.** An
+  earlier draft of this PRD (following #110) proposed gating durability work on
+  how many requeues landed on a *different* worker. That gate is wrong: as
+  Problem §3 now records, a **same-worker** requeue destroys the attempt's
+  commits too, so the cross-worker filter would exclude precisely the events M6
+  fixes. **Measure instead**: `runs.requeue_count > 0` (the column exists,
+  migration `00020`; exposed on the DTO at `apitypes/run.go:32`) restricted to
+  runs interrupted after the plan gate — i.e. those that had reached the
+  implement phase and had commits to lose. If *that* is near zero, Phase 1 (the
+  progress feature, M1–M5) is the whole feature and Phase 2–3 should be dropped.
 - **Prompt compliance.** The lead must both emit a sensible milestone list and
   call `checkpoint` at the right time. Mitigation: both degrade to today's
   behavior when absent (Decisions 4 and 10) — the feature fails off, never
@@ -441,7 +470,7 @@ hook, so it can never reach a signal tool.
 
 - None blocking. PRD #41's gate loop must keep working across the freeze point
   (Decision 2); the #105 resume path is improved, not replaced.
-- M7 additionally depends on the Decision 8 security review and, if that review
+- M8 additionally depends on the Decision 8 security review and, if that review
   goes the other way, on the k8s two-container uid split that PRD #110 names as
   its revisit condition.
 
@@ -464,13 +493,17 @@ hook, so it can never reach a signal tool.
   diverged from origin ⇒ origin wins and the notice is emitted; stale ref from an
   abandoned attempt behaves as the settled lifecycle says.
 - Web tests for the three surfaces plus the NULL-milestone fallback.
+- Slack notifier tests (matching `notifier_notify_test.go`): a milestone
+  completion posts one thread line; a repeated `running` report with an unchanged
+  completed set posts nothing (dedup); an unlinked/opted-out user gets nothing and
+  the run is unaffected.
 - Live-DB tests where the union semantics are the point, run per the CLAUDE.md
   live-DB rules (`./e2e/run-store-it.sh`, positive control required — a `PASS=0`
   sweep is not evidence).
 - e2e (`./e2e/run-e2e.sh`) with the stub executor extended to submit milestones
   and checkpoint, so the whole wire is exercised without a live SDK.
 - Manual: on dev-cluster (the primary runtime), run a multi-milestone PRD issue
-  and kill the worker pod mid-run to confirm the M5 claim.
+  and kill the worker pod mid-run to confirm the M6 claim.
 
 ## Decision Log
 
@@ -504,9 +537,16 @@ hook, so it can never reach a signal tool.
   changed the document materially: the wall-clock scaling needs a **server**
   change nobody had scoped, because the sweeper — not the worker — is the
   enforcement (Decision 5b, M2 rescoped); the loss model in Problem §3 was
-  inherited from #110 and was **wrong**, which makes M5 more valuable and the
+  inherited from #110 and was **wrong**, which makes M6 more valuable and the
   original measurement gate a filter on the wrong population (Risks rewritten);
   Decision 9's "prefer when ahead" was too loose to implement and had no ref
   lifecycle at all; and Phase 1's one real security surface — server-side
   validation of worker-reported milestone data — was unstated (Decision 12).
   Decisions 2, 6, 8, 10b and 13 gained the paragraph each was missing.
+- **2026-07-24 — Slack milestone progress added as M4 (non-optional), at the
+  owner's direction.** It rides M1–M3's data, lands in Phase 1 (no new security
+  surface), and reuses the existing per-run Slack message plus the gate's
+  generation-guard dedup pattern. The former CLI milestone shifted M4→M5, and the
+  durability/push milestones shifted M5→M6, M6→M7, M7→M8. A scope boundary was
+  recorded at the same time (Out of Scope): run-plan milestones are not
+  `prds/*.md` checkboxes, and uzi does not edit PRD files to track progress.
