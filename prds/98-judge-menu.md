@@ -1117,11 +1117,47 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       shape: `crossCat` in `TestJudgeBacklogProjectsEveryColumnLiveDB` also seeds an open
       `improve_uzi` row and avoids the collision **only** because its target is `rg-auto`.
 
-- [ ] **M8b — the e2e leg.** Unblocked since PRD #97 merged and this branch merged `main`
-      (`create_run`, `retry_read`, positive controls are all in the tree). Its value is
-      **entirely in assertions fakes structurally cannot make** — a happy-path walkthrough
-      would duplicate coverage that already exists three times over. It is the natural home
-      for the two mechanisms below.
+- [x] **M8b — the e2e leg. BUILT 2026-07-25 as B4′ + B6′ only.** Unblocked since PRD #97
+      merged and this branch merged `main` (`create_run`, `retry_read`, positive controls are
+      all in the tree). Its stated value was **entirely in assertions fakes structurally
+      cannot make** — and by the time it was built, most of Part B's blocks were no longer
+      that. The alternative had stopped being a fake: it was a **live-DB test running the
+      real SQL against a real Postgres**, and `tier2` plus the merged `#94`/`#98` work carries
+      a lot of them. The user ruled the scope down to duplicate removal (NOT a time trim —
+      the duplication postdates the 2026-07-21 "do not trim M8b" ruling).
+
+      **A property asserted twice is not covered twice; it is covered once and paid for
+      twice, and the second copy is the one that rots when the first is edited.** So the
+      dropped blocks are RECORDED here by test function name rather than repeated in the
+      harness. Every name below was verified to exist at `b93cefc5` before being written
+      down — the point of naming a pin is that the next reader can open it, and a pin that
+      names a function nobody can find is worse than no pin at all.
+
+      | block | what it wanted to assert | where it is ACTUALLY pinned |
+      |---|---|---|
+      | **B1** dedup grouping on the wire | one coordinate across two runs collapses to one group | the grouper in **both** runtimes by the seam-6 golden fixture (`fixtures/judge-fidelity/`), and the SQL join spine by `TestJudgeBacklogProjectsEveryColumnLiveDB` (`internal/store/judge_recommendations_integration_test.go`) |
+      | **B2** `occurrences > run_count` | the same coordinate twice on one review | grouper half: the seam-6 fixture's `occurrences-exceed-run-count` case, both runtimes. Bulk half: `TestBulkDispositionHandlesDuplicateCoordinateLiveDB`. **The read-path gap was real and is now closed inside B4′** — the `b4-dup` coordinate, seeded twice on one review, asserted as 2 occurrences behind 1 run against the live query |
+      | **B3** the `?run=` anchor semi-join | owner scoping, other-run occurrences kept, an owner-scoped anchor | `TestJudgeBacklogRunAnchorLiveDB` makes all three, **including B3(c) verbatim** — its own assertion message reads *"(the anchor selects coordinates, it does not trim occurrences)"*. Made one layer down, more cheaply and more precisely than the wire could |
+      | **B5** group Dismiss fans out, `scope=open` | wire-level fan-out | `TestBulkDispositionScopeLiveDB`, `TestBulkDispositionFansOutAcrossRunsLiveDB`, `TestBulkDispositionFiledMemberIsNotOpenLiveDB`, `TestBulkDispositionSettledAddressesAreDistinctPerRunLiveDB` (`internal/handler/judge_bulk_disposition_livedb_test.go`) |
+      | **B6 matrix** close→Done once, Undo sticks, dismissed not overwritten | the whole behaviour matrix | the six `TestFiledIssueClose*LiveDB` — `AutoDonesOnce`, `UndoSticks`, `DoesNotOverwriteDismissed`, `ReopenDoesNotReopen`, `IsRepoScoped`, `SkipsUnsettledAndOrphaned` (`internal/handler/judge_issue_close_livedb_test.go`) |
+      | **B6a** positive-controlled negative windows | made B6's windows non-vacuous | existed only to serve windows that are dropped. **Its loss has a cost and it is paid, not ignored:** with no probe fixture left, B6′'s wait carries the discrimination in its FAILURE MESSAGE instead — it reads the issue cache and the edge stamp at timeout and says which of the two causes it is |
+      | **B7** notification deep-link | client-side link building | `notificationLink` in `web/src/lib/notifications.ts`, unit-covered; `run_id` on the `judge_review` notification already asserted in the #46 phase |
+      | **B8** no token spend | — | `TestDispositionTouchesStoreOnly` and `TestBulkDispositionTouchesStoreOnly`, positive store-call ALLOWLISTS. **Structurally stronger than any e2e before/after count**, which could only ever catch a write that happened to land. See the Success Criteria note below: this property is NOT "proven by the M8 e2e leg" and never could be |
+
+      **What genuinely was e2e-only, and is what got built:**
+      - **B4′** — the row cap. `JudgeBacklogMaxRows` is a compile-time const (2000) with no
+        env override, the largest `Lim` any live-DB test passes is 1000, and the tree's one
+        cap assertion feeds a **fake store** 2001 rows — which proves the service's slice and
+        says nothing about the query's `LIMIT`. Built with three reviews at three ages so the
+        `ORDER BY rv.updated_at DESC` cut is observable: `truncated` true, the oldest review's
+        coordinate **absent**, and — after the bulk review is deleted — `truncated` false and
+        that coordinate **back**. Both directions, because a flag is satisfiable by a flip
+        over complete data.
+      - **B6′** — the poller wiring leg. All six `TestFiledIssueClose*LiveDB` call
+        `SyncFiledIssueCloses` **directly**; the poller's own call site is covered only by
+        `TestSyncFiledIssueClosesWiring` (`internal/forgesvc/judge_issue_close_test.go`),
+        against a **fake store**. Nothing in the repo ran the poller, so the chain
+        close → cache → tick → disposition was unpinned end to end.
 - [ ] **The printed-instruction backstop.** Three instructions existed in the CLI, **none had
       ever been executed, and two were false** (the revert hint, fixed; the truncation
       remedy, fixed). A string that tells a user what to do is an assertion nothing

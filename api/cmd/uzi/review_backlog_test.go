@@ -183,9 +183,23 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 		t.Errorf("the read-path warning still names --bucket, which cannot reach the cut:\n%s", out)
 	}
 
-	// The post-write path.
+	// The post-write path. THE FIXTURE NOW CARRIES SETTLED MEMBERS, and that is a fix rather
+	// than a detail: it used to set only Updated:2 with an empty Settled, and the old code
+	// printed its remedy anyway — because the remedy was a LITERAL `uzi review backlog --run
+	// <run-id>` that needed no data to render. A test whose fixture cannot distinguish "the
+	// remedy names a real run" from "the remedy names a placeholder" was pinning the string,
+	// not the behaviour. Three members across TWO runs, one run deliberately repeated, so
+	// the dedup is exercised too.
 	fc2 := backlogFake()
-	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 2, Truncated: true}
+	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated:   3,
+		Truncated: true,
+		Settled: []apitypes.JudgeSettledMemberDTO{
+			{RunID: "run-aaa", RecID: "rec-1"},
+			{RunID: "run-aaa", RecID: "rec-2"},
+			{RunID: "run-bbb", RecID: "rec-3"},
+		},
+	}
 	out2, _, code2 := runCLI(t, fakeEnv(fc2), "review", "resolve", "--category", "tests", "--target", "unit")
 	if code2 != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code2)
@@ -193,10 +207,47 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 	if strings.Contains(out2, "--bucket all") {
 		t.Errorf("the post-write warning still names the remedy that cannot work:\n%s", out2)
 	}
-	for _, want := range []string{"--json on THIS call", "--run"} {
-		if !strings.Contains(out2, want) {
-			t.Errorf("the post-write warning is missing %q:\n%s", want, out2)
+	if !strings.Contains(out2, "--json on THIS call") {
+		t.Errorf("the post-write warning is missing %q:\n%s", "--json on THIS call", out2)
+	}
+	// THE RUN ID IS SUBSTITUTED, NOT A PLACEHOLDER. This is the assertion the old fixture
+	// could not make and the reason the printed text changed at all: `<run-id>` in the
+	// OUTPUT is a template, and a template cannot be executed verbatim by the user it is
+	// printed for or by the e2e row that lifts it.
+	if strings.Contains(out2, "<run-id>") {
+		t.Errorf("the remedy still prints the <run-id> PLACEHOLDER rather than substituting a real "+
+			"run id — nothing can run that verbatim:\n%s", out2)
+	}
+	// One line per DISTINCT settled run, in first-appearance order. The count matters: the
+	// e2e row asserts it before executing anything, and a duplicate would make that
+	// assertion either fail or (if relaxed) satisfiable by output nobody checked.
+	remedies := []string{}
+	for _, line := range strings.Split(out2, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "uzi review backlog --run ") {
+			remedies = append(remedies, strings.TrimSpace(line))
 		}
+	}
+	want := []string{"uzi review backlog --run run-aaa", "uzi review backlog --run run-bbb"}
+	if !reflect.DeepEqual(remedies, want) {
+		t.Errorf("remedy lines = %q, want %q (one per DISTINCT settled run, first-appearance order)\n%s",
+			remedies, want, out2)
+	}
+
+	// A truncated write that settled NOTHING must print no command at all. The template form
+	// printed one regardless, which is how an unrunnable instruction reaches a user in the
+	// one state where it is also useless — there is no run to anchor on.
+	fc3 := backlogFake()
+	fc3.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 0, Truncated: true}
+	out3, _, code3 := runCLI(t, fakeEnv(fc3), "review", "resolve", "--category", "tests", "--target", "unit")
+	if code3 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code3)
+	}
+	if strings.Contains(out3, "uzi review backlog --run") {
+		t.Errorf("a truncated write that settled nothing still printed a --run remedy, which can only "+
+			"be a placeholder — there is no run id to name:\n%s", out3)
+	}
+	if !strings.Contains(out3, "row cap") {
+		t.Errorf("the truncation warning itself must survive even when nothing was settled:\n%s", out3)
 	}
 }
 

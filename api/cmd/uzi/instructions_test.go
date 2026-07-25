@@ -288,17 +288,32 @@ var knownInstructions = []knownInstruction{
 			"the harness's enabled repo id, not that it exited 0.",
 	},
 	{
-		command:  "uzi review backlog --run <run-id>",
-		evidence: evidenceNotExecuted,
-		reason: "Reachable, but only from a TRUNCATED backlog: the remedy is printed on the " +
-			"post-write re-read's `truncated` flag, and JudgeBacklogMaxRows is a compile-time " +
-			"const, so the only arrangement that reaches it is a 2001-row seed. That seed is " +
-			"PRD #98 M8b's (Part B/B4) and is not designed yet. Executing this against an " +
-			"untruncated backlog would assert nothing about the remedy — it would be `backlog " +
-			"--run` working, which TestReviewBacklogRunAnchorForwarded already pins.",
-		note: "RUNTIME: the post-write truncation remedy (runGroupDisposition, review.go). " +
+		command:  "uzi review backlog --run",
+		evidence: evidenceE2E,
+		where:    "printed-instruction row: uzi review backlog --run",
+		// THE ENTRY TEXT CHANGED WITH THE PRINTED TEXT, and that is the point rather than a
+		// side effect. It used to read `uzi review backlog --run <run-id>`, matching a
+		// LITERAL the CLI printed — `<run-id>` was a placeholder in the emitted output, not
+		// a value substituted at emit time, so "executed verbatim" was undefined for it by
+		// construction. The user approved changing the OUTPUT (PRD #98 M8b): the remedy is
+		// now one runnable line per settled run, through a real format verb, so the lifted
+		// candidate is `uzi review backlog --run %s` and this entry is its command PREFIX.
+		//
+		// It still attributes correctly against the sibling HELP entry: `uzi review backlog`
+		// is a word-boundary prefix of this one, so most-specific-wins routes the runtime
+		// candidate here and the flag-usage candidates there. Without this entry the two
+		// kinds collapse onto one entry and TestInstructionEvidenceIsWellFormed reddens —
+		// measured, not assumed, while making this change.
+		note: "RUNTIME: the post-write truncation remedy (runGroupDisposition, review.go), one " +
+			"line per run the write settled. EXECUTED in e2e against a 2001-row seed — the only " +
+			"arrangement that can reach `truncated` at all, since JudgeBacklogMaxRows is a " +
+			"compile-time const with no env override. The row lifts every printed line from " +
+			"that command's own stdout, asserts the COUNT first, runs each verbatim, and " +
+			"asserts the OUTCOME: the anchored re-read comes back NOT truncated. " +
 			"TestReviewTruncationWarningsNameAWorkingRemedy pins that it names --run and NOT " +
-			"--bucket, whose uselessness here was measured by lowering the cap to 2.",
+			"--bucket (whose uselessness here was measured by lowering the cap to 2), that the " +
+			"run id is SUBSTITUTED rather than a placeholder, and that a call settling nothing " +
+			"prints no command at all rather than an unrunnable one.",
 	},
 	{
 		command:  "uzi login",
@@ -671,6 +686,38 @@ func TestRegisteredInstructionsAreStillPrinted(t *testing.T) {
 // inventory test carries, and it is stated here rather than left for a reader to discover.
 func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 	found := liftAll(t)
+
+	// REGISTRY WELL-FORMEDNESS, before anything is attributed. Both checks guard the ONE
+	// place the most-specific-wins tie-break can be silent (architect's ruling 1.3), and
+	// neither fires today — measured while adding them.
+	//
+	// A DUPLICATE `command` is the single exception to "longest wins is never ambiguous":
+	// two entries whose command strings are byte-equal have equal length, attribute()'s
+	// strict `>` keeps the FIRST, and the loser surfaces only through
+	// TestRegisteredInstructionsAreStillPrinted as "no lifted candidate matches any more —
+	// remove the entry". That diagnosis is wrong in the way that costs the most time: the
+	// code is not gone, a duplicate ate it.
+	//
+	// SURROUNDING WHITESPACE breaks matchesCommand outright. `entry+" "` on an entry that
+	// already ends in a space needs two spaces in the candidate, so every candidate for that
+	// entry silently stops matching — which presents as the same wrong diagnosis.
+	seenCommand := map[string]int{}
+	for i, k := range knownInstructions {
+		if strings.TrimSpace(k.command) != k.command {
+			t.Errorf("knownInstructions[%d] command %q carries surrounding whitespace. matchesCommand "+
+				"appends a single space to test the word boundary, so this entry can never match any "+
+				"candidate — and it would report as 'no lifted candidate matches any more', which names "+
+				"the wrong cause.", i, k.command)
+		}
+		if first, dup := seenCommand[k.command]; dup {
+			t.Errorf("knownInstructions[%d] duplicates the command of entry %d (%q). attribute() picks the "+
+				"LONGEST match with a strict >, so equal-length entries silently resolve to the first and "+
+				"the second reports as 'no lifted candidate matches any more' — the code is not gone, a "+
+				"duplicate ate it. Merge them, or make the texts distinguishable.", i, first, k.command)
+			continue
+		}
+		seenCommand[k.command] = i
+	}
 
 	// Derived kind per entry, from the candidates attributed to it.
 	//
