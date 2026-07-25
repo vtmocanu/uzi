@@ -590,6 +590,54 @@ func TestAutoStopARequeuedRunDoesNotCarryTheDeadAttemptsStreak(t *testing.T) {
 	}
 }
 
+func TestAutoStopARequeuedRunDoesNotInheritTheEscalationClock(t *testing.T) {
+	// The WORSE half of the same defect, and it needs its own case because it lands
+	// on a different arm. If a stop verdict was already enqueued before the worker
+	// died, stopReqAt is retained across the requeue — so by the time the run is
+	// re-claimed it is ALREADY older than autoStopEscalateAfter, and the escalation
+	// arm fires on the first tick: straight to FailRunAutoStop, no verdict, no grace.
+	// The fresh attempt is terminated server-side before it can act.
+	//
+	// The framing worth keeping: an operator upgrades the worker image to fix the
+	// wedge, the run is requeued onto a 0.10.1+ worker that would split, bisect and
+	// succeed — and the stale streak kills it first. The fix that made the upgrade
+	// worth doing is what the kill lands on.
+	//
+	// stopReqAt is a field ON the fail entry, so evicting the entry clears it. That is
+	// why one evict closes both halves; this test is what stops someone "optimising"
+	// evict into a streak-only reset and silently re-opening this one.
+	f := newAutoStopFixture(t)
+	if n := f.sweep(t); n != 1 {
+		t.Fatalf("staging: first sweep stopped = %d, want 1 (this is what sets stopReqAt)", n)
+	}
+	if f.svc.persistFail.stats(f.wedged).stopReqAt.IsZero() {
+		t.Fatal("staging: stopReqAt was never set, so this test cannot exercise the escalation arm at all")
+	}
+	verdictsBefore := len(f.fs.verdicts)
+
+	r := f.fs.runs[f.wedged]
+	r.Status = "queued" // the requeue
+	f.fs.runs[f.wedged] = r
+	f.sweep(t)
+	if got := f.svc.persistFail.stats(f.wedged); !got.stopReqAt.IsZero() {
+		t.Fatalf("stopReqAt survived the requeue (%v): the re-claimed run is already past the escalation window and dies on the first tick", got.stopReqAt)
+	}
+
+	// Re-claimed by a new worker, heartbeating freshly, well past autoStopEscalateAfter.
+	r.Status = "running"
+	f.fs.runs[f.wedged] = r
+	f.advanceWithHealthyPeer(autoStopEscalateAfter * 2)
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("stopped = %d, want 0", n)
+	}
+	if len(f.fs.failCalls) != 0 {
+		t.Fatalf("FailRunAutoStop called %d times on a freshly re-claimed run: the escalation skips the verdict entirely, so this is a server-side termination with no grace at all", len(f.fs.failCalls))
+	}
+	if len(f.fs.verdicts) != verdictsBefore {
+		t.Fatalf("verdicts went %d → %d: the new attempt was sent the dead attempt's stop", verdictsBefore, len(f.fs.verdicts))
+	}
+}
+
 func TestSweepClearsTheStreakWhenItGrantsAFreshAttempt(t *testing.T) {
 	// The immediate half of the same rule, at the two sweep sites that hand a run
 	// back to the queue. The evaluator's eviction is the catch-all (bounded by one

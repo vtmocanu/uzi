@@ -398,7 +398,13 @@ cannot run. A `none (gap)` slot that has been raised once gets a `noted` marker
 appended here; roles report a gap only when its line carries no marker.
 
 ```
-format         none (gap)          # gofmt -l ./api reports 26 drifted files
+format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it
+                                   # for the current list. Do NOT record a count here:
+                                   # it read 26, then 25, and a stale tally invites the
+                                   # truncated-view error it already caused (a filtered
+                                   # 4-file view reported as the whole list, 2026-07-25).
+                                   # The check that matters is `comm -12` between
+                                   # gofmt -l and your commit's file list being EMPTY.
 lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
 typecheck      cd web && npm run typecheck
                cd agent && npm run typecheck
