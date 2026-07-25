@@ -1312,11 +1312,13 @@ fi
 # after submit). Landing M2 here keeps the proven M1 → main-reject git-probes → PRD #95
 # sequence intact between M2 and PRD #95.
 #
-# --- Leg 1: live /api/ws frame assertion -------------------------------------
-# /api/ws authenticates via the session JWT cookie (uzi_auth), NOT a bearer token —
-# it is a GET upgrade behind RequireAuth (handler.go: the cookie-only tail), with an
-# Origin==Host same-origin check (CSWSH defense) and per-run owner/admin authz in
-# ServeWS (ws.go). No new tooling (fable review): the agent container's Node 22 has a
+# --- Leg 1: live /api/ws frame assertion, COOKIE half ------------------------
+# /api/ws accepts EITHER the session JWT cookie (uzi_auth) or a Bearer CLI token: it is a
+# GET upgrade behind RequireUser (handler.go, mounted with the run reads since PRD #112
+# M1), with an Origin==Host same-origin check (CSWSH defense) and per-run owner/admin
+# authz in ServeWS (ws.go). This leg drives the COOKIE half — the browser's path, and the
+# one the same-origin check exists for; leg 3 below drives the Bearer half on the same
+# route. No new tooling (fable review): the agent container's Node 22 has a
 # global WebSocket that honours a {headers} option, so we plumb the admin jar's cookie
 # into the upgrade and reach the api directly at ws://api:8080 (UZI_API_URL) — the SAME
 # WS server the browser hits through nginx, so this proves the api hub→client wire, not
@@ -1349,8 +1351,9 @@ RUN_WS="$(create_run "$REPO_ID" "$IID_WS")" || fail "ws-leg run was not created"
 wait_status "$RUN_WS" awaiting_approval
 
 # NEGATIVE control FIRST (run still parked, so a valid run id — the ONLY rejection reason
-# is the missing cookie): a no-cookie upgrade must be refused (RequireAuth 401s before any
-# upgrade), proving the auth gate is real and the positive assertion non-vacuous.
+# is the missing cookie): a no-cookie upgrade must be refused. With no Authorization header
+# RequireUser dispatches to its unmodified RequireAuth cookie path, which 401s before any
+# upgrade — proving the auth gate is real and the positive assertion non-vacuous.
 WS_NEG_PROBE='const wsurl=process.argv[1], origin=process.argv[2];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Origin:origin}});ws.addEventListener("open",()=>finish(1,"OPENED_WITHOUT_COOKIE"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
 if NEG_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WS_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WS" "$WS_ORIGIN")"; then
   pass "no-cookie /api/ws upgrade is rejected ($NEG_OUT) — the WS auth gate is real"
@@ -1428,6 +1431,58 @@ wait_status "$RUN_CLI" awaiting_approval
 uzi_cli run approve "$RUN_CLI" >/dev/null || fail "uzi run approve failed (exit $?)"
 wait_status "$RUN_CLI" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve route/DTO intact)"
+
+# --- Leg 3: the same /api/ws over a Bearer CLI token (PRD #112 M1) -----------
+# M1 moved /ws out of the cookie-only tail into a RequireUser mount, so the headless
+# `uzi tui` can subscribe with the $UZI_TOKEN minted above instead of a browser session.
+# Leg 1 proves the COOKIE half of that mount still works; this proves the BEARER half on
+# the same wire, and it is the only place the two credential classes are exercised
+# against one route end to end.
+#
+# NO Origin header is set, and that omission IS the mechanism under test (PRD #112 D2):
+# coder/websocket's authenticateOrigin returns nil for an empty Origin
+# (v1.8.14 accept.go:228-232), so a browser-less client passes the unchanged same-origin
+# Accept with nothing skipped — no InsecureSkipVerify, no OriginPatterns widening. Node's
+# global WebSocket sends no Origin unless one is passed in {headers} (verified on node 22
+# and 26), so this probe is genuinely the browser-less shape; if a future runtime starts
+# sending one, the upgrade 403s and the diagnostic below prints that status rather than a
+# bare timeout.
+#
+# Own run, own approval, like leg 1: the frame is live-only (no replay), so the probe must
+# be subscribed BEFORE the run resumes — it subscribes first and approves from inside the
+# socket's open handler. The approve rides the SAME Bearer token (POST /api/runs/{id}/inputs
+# is RequireUser and takes no CSRF on the bearer path), so one credential drives both the
+# subscribe and the steer.
+say "PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_message frame"
+
+IID_WSB="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E ws bearer","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+{ [ -n "$IID_WSB" ] && [ "$IID_WSB" != null ]; } || fail "could not create the Bearer /api/ws issue"
+RUN_WSB="$(create_run "$REPO_ID" "$IID_WSB")" || fail "bearer-ws-leg run was not created"
+wait_status "$RUN_WSB" awaiting_approval
+
+# NEGATIVE control FIRST (run still parked, so a valid run id — the ONLY rejection reason
+# is the junk credential): a bogus Bearer must be refused. Without this the positive
+# assertion below would also pass against a route that admits anything.
+WSB_NEG_PROBE='const wsurl=process.argv[1];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Authorization:"Bearer uzc_not-a-real-token"}});ws.addEventListener("open",()=>finish(1,"OPENED_WITH_BOGUS_BEARER"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
+if NEGB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WSB")"; then
+  pass "bogus-Bearer /api/ws upgrade is rejected ($NEGB_OUT) — the RequireUser bearer gate is real"
+else
+  fail "bogus-Bearer /api/ws upgrade was NOT rejected (probe: ${NEGB_OUT:-<none>}) — the bearer auth gate is broken/vacuous"
+fi
+
+# POSITIVE: subscribe with the uzc_ token and no Origin, approve on open over the same
+# token, assert a run_message frame.
+WSB_PROBE='const wsurl=process.argv[1], token=process.argv[2], approveUrl=process.argv[3];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const auth="Bearer "+token;const ws=new WebSocket(wsurl,{headers:{Authorization:auth}});ws.addEventListener("open",()=>{ fetch(approveUrl,{method:"POST",headers:{"Content-Type":"application/json","Authorization":auth},body:JSON.stringify({kind:"approve_plan",body:""})}).then(r=>{ if(!r.ok) finish(3,"APPROVE_STATUS="+r.status); }).catch(e=>finish(2,"APPROVE_ERR="+e.message)); });ws.addEventListener("message",(ev)=>{ let f; try{ f=JSON.parse(ev.data); }catch(e){ return; } if(f.type==="message"&&f.seq>0){ finish(0,"FRAME type=message seq="+f.seq+(f.agent?(" agent="+f.agent):"")+" kind="+(f.kind||"")); } });ws.addEventListener("error",(e)=>{ fetch(wsurl.replace(/^ws/,"http"),{headers:{Authorization:auth}}).then(r=>finish(5,"WS_ERR http_probe_status="+r.status+" msg="+((e&&e.message)||""))).catch(err=>finish(5,"WS_ERR msg="+((e&&e.message)||"")+" (diag_fetch_failed="+err.message+")")); });setTimeout(()=>finish(6,"TIMEOUT no live /api/ws run_message frame over Bearer"),25000);'
+if WSB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_PROBE" \
+    "$WS_API/api/ws?run=$RUN_WSB" "$UZI_TOKEN_VAL" "$WS_API/api/runs/$RUN_WSB/inputs")"; then
+  pass "live /api/ws frame received over a Bearer uzc_ token, no Origin sent: $WSB_OUT"
+else
+  fail "no live /api/ws run_message frame over Bearer (probe: ${WSB_OUT:-<none>}) — /ws is back in the cookie-only tail (http_probe_status=401), the origin gate rejected a no-Origin client (403), or per-run authz refused the owner (404)"
+fi
+# The probe's Bearer approve drove the run: confirm it advances to completed.
+wait_status "$RUN_WSB" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "the Bearer-WS-triggered approve drove RUN_WSB to completed"
 
 # =============================================================================
 # PRD #97 M1 — git-over-HTTPS Basic-auth push (on EVERY default run) + the

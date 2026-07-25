@@ -606,13 +606,23 @@ nothing, unlike a design where the socket itself is the only record. The
 socket is a live cache and reconnect-convenience layer, **never** the source
 of truth.
 
-The `/api/ws` endpoint authenticates with the same session cookie as the rest
-of the browser API (not the worker's Bearer token) and enforces two rules
-that are load-bearing, not incidental: **Origin validation** on the upgrade
-(the standard CSWSH defense for cookie-authenticated WebSockets) and a
-**per-run authorization check on subscribe** — the same owner-or-admin rule
-REST enforces, checked again here since a WS subscription is a second entry
-point into the same data.
+The `/api/ws` endpoint sits behind `RequireUser`, the same dual guard the run
+read routes use: a browser session cookie **or** a user-scoped CLI token
+(`uzc_`/`uza_`), so the headless `uzi` client can follow a run without a
+browser (PRD #112 M1; the worker's own `uzw_` join token is a different
+credential class and never reaches here). It enforces two rules that are
+load-bearing, not incidental: **Origin validation** on the upgrade (the
+standard CSWSH defense) and a **per-run authorization check on subscribe** —
+the same owner-or-admin rule REST enforces, checked again here since a WS
+subscription is a second entry point into the same data.
+
+Admitting a Bearer token did **not** require relaxing the origin rule, and
+that is the whole reason the change was a route move rather than a new
+`Accept` option. A browser-less client sends no `Origin` at all, which
+`coder/websocket` passes by design; a cross-site browser page cannot attach an
+`Authorization` header, so it can only present the ambient cookie, sends its
+own foreign `Origin`, and is still rejected. The cookie path is byte-identical
+to what it was before.
 
 The run view's activity pane (crew roster, collapsed-by-default logs, the
 steer queue) is a pure client derivation over this stream plus `run.health`

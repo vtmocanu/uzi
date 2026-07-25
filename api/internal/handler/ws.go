@@ -23,19 +23,39 @@ const wsWriteTimeout = 10 * time.Second
 // silently dead peer.
 const wsPingInterval = 30 * time.Second
 
-// ServeWS upgrades a browser to a WebSocket subscribed to one run's live events.
-// It runs inside the session-authenticated group, so the JWT cookie is already
-// validated. Two authorization rules the PRD makes mandatory are enforced here:
+// ServeWS upgrades a caller to a WebSocket subscribed to one run's live events.
+//
+// It runs inside a RequireUser group (PRD #112 M1), so the credential is EITHER a
+// validated session JWT cookie OR a user-scoped CLI token (uzc_/uza_) — the same
+// dual guard the run READ routes use. RequireUser dispatches on credential
+// presence at parse time and populates the IDENTICAL context user either way,
+// which is why nothing below branches on which one arrived: an auth-type branch
+// here would be a second copy of that dispatch predicate, free to drift from it.
+// Two authorization rules the PRD makes mandatory are enforced here:
 //
 //   - Origin validation on the upgrade. coder/websocket's default Accept checks
-//     Origin == Host (same-origin), which is what defends a cookie-authenticated
-//     socket against cross-site WebSocket hijacking. We rely on it explicitly by
-//     NOT setting InsecureSkipVerify and NOT widening OriginPatterns; behind nginx
-//     the browser origin and the API host are the same.
+//     Origin == Host (same-origin). We rely on it explicitly by NOT setting
+//     InsecureSkipVerify and NOT widening OriginPatterns; behind nginx the browser
+//     origin and the API host are the same. This one unchanged rule covers both
+//     credential paths — see below.
 //   - Per-run authorization on subscribe. The ?run=<id> must be a run the user
 //     owns, or the user must be an admin — identical to what the REST endpoints
 //     enforce (GetRunForViewer). A denied subscribe fails the handshake before any
 //     upgrade, so a non-owner never opens the socket.
+//
+// Why the same-origin rule still holds now that Bearer is admitted, in two
+// independent halves:
+//
+//   - A browser-less client sends NO Origin header, and coder/websocket's
+//     authenticateOrigin returns nil for an empty Origin (v1.8.14 accept.go:228-232,
+//     reached from accept.go:116-117 whenever InsecureSkipVerify is false). Its own
+//     Dial never sets one. So a Bearer upgrade passes the default check unmodified:
+//     nothing has to be skipped to let the CLI in.
+//   - A cross-site browser page CANNOT attach an Authorization header (the browser
+//     WebSocket API forbids custom headers), so it can only present the ambient
+//     cookie. It therefore stays on the cookie path, sends its own foreign Origin,
+//     and is still rejected — the cross-site WebSocket hijacking defense the cookie
+//     needs is byte-for-byte what it was before the route moved.
 //
 // The socket is a live channel only: every frame it carries was already persisted
 // to run_messages (messages) or applied to runs (state) before the hub was poked,
