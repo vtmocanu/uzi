@@ -1174,7 +1174,16 @@ type appendObservation struct {
 //
 // It re-checks ownership ITSELF — the one recording hook not already below
 // runOwnedByWorker — because an unowned record is a cross-tenant kill primitive.
-// One indexed query on a rare path. Best-effort: a lookup failure records nothing.
+// Best-effort: a lookup failure records nothing.
+//
+// COST, stated for the case that is not benign. This arm previously did zero
+// database work; it now does one indexed lookup. Rare for the incident's own
+// shape (a 413 means a worker already past the 1 MiB cap), but a worker holding a
+// valid join token can POST oversized bodies as fast as it likes, so this is one
+// GetRunOwnedByWorker per such request — on a path that exists because the
+// database is already under stress. The alternative was leaving both the flag and
+// the kill blind in the incident's own steady state, which is worse; naming the
+// cost is not the same as calling it free.
 func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID uuid.UUID) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {

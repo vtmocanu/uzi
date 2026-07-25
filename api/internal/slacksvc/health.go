@@ -10,6 +10,13 @@ import (
 // framing off the enum WITHOUT importing workersvc's detector constants — the
 // detector owns the reason TEXT (it travels in the PublishHealth event and the
 // health_reason column); slacksvc owns the Slack-facing wording keyed off the enum.
+//
+// ONE EXCEPTION since PRD #108 M4, spelled out here rather than only at its site
+// four lines below, because this is the paragraph a reader hits first: `looping`
+// now carries two causes and the enum alone cannot tell them apart, so
+// healthNudgeHead compares the reason against ONE mirrored constant
+// (reasonPersistFailing). Everything else still keys off the enum, and the
+// exception degrades to the enum-keyed wording if the mirror ever drifts.
 const (
 	healthStalled       = "stalled"
 	healthLooping       = "looping"
@@ -32,7 +39,10 @@ const (
 //
 // Why it is safe: a miss (workersvc rewords, this constant does not) degrades to
 // the generic looping head, which is the behaviour before this existed. Pinned from
-// the workersvc side by TestReasonPersistFailingMatchesSlackMirror.
+// BOTH sides, because a one-sided pin would catch only one drift direction and the
+// other one fails silently: TestReasonPersistFailingIsMirroredBySlack in
+// workersvc/persistfail_test.go, and TestReasonPersistFailingMirrorsWorkersvc in
+// health_nudge_head_test.go beside this file. Both carry the literal.
 const reasonPersistFailing = "the agent's updates can't be saved, so it keeps resending them"
 
 // isHealthFlaggableStatus mirrors the server's flaggable set (Decision 3): the root

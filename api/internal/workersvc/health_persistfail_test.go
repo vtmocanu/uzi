@@ -111,14 +111,21 @@ func TestHealthPersistFailingBeatsToolLoopingAndSkipsItsQuery(t *testing.T) {
 		t.Fatalf("control: ListRunToolWindow called %d times, want 1", queriesBefore)
 	}
 
+	// The stored row deliberately stays at health=ok for the second pass.
+	//
+	// It used to be staged as looping/reasonLooping, which SHADOWED the priority
+	// diagnostic below: with the arm demoted the target is identical to the stored
+	// value, SetRunHealth no-ops, and `changed = 0` trips the Fatalf here — so the
+	// carefully-worded reason message never executed and the fold reddened for the
+	// wrong stated cause. Leaving the row at ok makes BOTH orderings write exactly
+	// once, which turns the reason below into the discriminator it was written as.
+	// (.claude/agent-team.md: an assertion behind an earlier Fatalf is documentation,
+	// not a gate.)
 	fs.writes = nil
-	r.Health = healthLooping
-	r.HealthReason = pgText(reasonLooping)
-	fs.active = []store.ListActiveRunsForHealthRow{r}
 	wedge(svc, r.ID, persistFlagStreak, persistFlagWindow+time.Second)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
-		t.Fatalf("changed = %d, want 1: the reason must move even though the enum does not", n)
+		t.Fatalf("changed = %d, want 1: both arms write on this pass, so a count other than 1 means the detector did not run at all", n)
 	}
 	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonPersistFailing {
 		t.Fatalf("health_reason = %q, want %q: the persistence arm must be checked ABOVE the tool-window arm, or a run that is both repeating a call AND failing to persist reports the repeat and hides the wedge",

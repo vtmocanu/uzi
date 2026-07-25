@@ -23,12 +23,29 @@ package workersvc
 // ownership check runs. IF YOU ADD A THIRD RECORDING HOOK WITHOUT THAT CHECK,
 // YOU HAVE ADDED A CROSS-TENANT KILL PRIMITIVE.
 //
-// 🔴 THE KEYS ARE WORKER-SUPPLIED. usagepoller's backoff map (the shape this
-// mirrors, engine.go) is keyed by ids the server derived from rows it selected,
-// so it is bounded by real data. These keys arrive as chi.URLParam on a route a
-// worker calls, so an unknown run id would mint an entry that "evict on terminal
-// state" can never reach. Hence the cap and the TTL below: they are the memory
-// bound, and they are load-bearing rather than hygiene.
+// 🔴 WHAT BOUNDS THESE MAPS — and it is the ownership gate, not the cap.
+//
+// This block used to say the keys were worker-supplied, so an unknown run id
+// would mint an unreachable entry, so the cap was load-bearing. THAT WAS FALSE and
+// two validators found it independently. The keys arrive as chi.URLParam, but only
+// recordFailure mints, and both of its production callers sit BELOW the ownership
+// gate (AppendMessages' default arm requires obs.resolved; NoteOversizeBatch
+// returns on any runOwnedByWorker error). An unknown run id gives
+// pgx.ErrNoRows → ErrRunNotOwned and records nothing. So these keys ARE
+// server-derived from rows it selected — the same property usagepoller's backoff
+// map has, not the contrast this once claimed.
+//
+// What each mechanism actually covers:
+//
+//   - the OWNERSHIP GATE bounds the key space to runs really claimed by the
+//     caller's own workers. It is the memory bound. Weakening it re-opens both
+//     the unbounded-growth and the cross-tenant-kill vectors at once.
+//   - the TTL covers the one case eviction cannot reach: a run whose worker
+//     vanished without the run ever reaching terminal.
+//   - the CAP is defense in depth. Its residual threat model is one legitimate
+//     user holding more than persistFailMaxEntries concurrently-failing OWNED
+//     runs — closer to hygiene than to a security control. Do not cite it as the
+//     thing that stops a hostile worker; the gate above does that.
 //
 // 🔴 THE SAFETY DOES NOT REST ON EVICTION. Every write M5 performs is
 // status-scoped in SQL (AND status NOT IN ('completed','failed','cancelled')), so
@@ -52,16 +69,34 @@ import (
 const persistFailTTL = 10 * time.Minute
 
 // persistFailMaxEntries caps each map. A single-replica api runs tens of active
-// runs, so this is ~two orders of magnitude of headroom over reality and is here
-// only to bound a worker minting run ids. At the cap a NEW entry is refused while
-// existing entries keep counting: refusing to start a streak DELAYS a kill, which
-// is the fail-safe direction, whereas evicting to make room would let a hostile
-// worker clear a genuine run's streak.
+// runs, so this is ~two orders of magnitude of headroom over reality. Defense in
+// depth behind the ownership gate (see the header) rather than the memory bound
+// itself. At the cap a NEW entry is refused while existing entries keep counting:
+// refusing to start a streak DELAYS a kill, which is the fail-safe direction,
+// whereas evicting to make room would let a worker clear a genuine run's streak.
 const persistFailMaxEntries = 4096
 
 // persistFailCapWarnEvery rate-limits the at-capacity warning. At the incident's
 // ~2 Hz an unthrottled line is 7,200 log writes an hour.
 const persistFailCapWarnEvery = time.Minute
+
+// The two maps, as throttle slots. The at-capacity warning is throttled PER MAP:
+// a single shared timestamp meant a lastOK cap event inside the same minute as a
+// fail one was suppressed and never appeared at all, so an operator could watch
+// `map=fail` indefinitely while lastOK was also saturated. This is the
+// observability guard on a guard that disarms silently — it must not itself be lossy.
+const (
+	persistMapFail = iota
+	persistMapLastOK
+	persistMapCount
+)
+
+func persistMapName(slot int) string {
+	if slot == persistMapLastOK {
+		return "lastOK"
+	}
+	return "fail"
+}
 
 // persistFailKind classifies WHY an AppendMessages attempt failed. The PRD's
 // "same error class each time" guard is implemented as a streak RESET on a change
@@ -181,8 +216,31 @@ type persistFailTracker struct {
 	// exists — "active" is not "succeeding", and a neighbour mid-long-build appends
 	// nothing. Only recordSuccess writes this map, which is what enforces that.
 	lastOK map[uuid.UUID]time.Time
-	// capWarnAt rate-limits the at-capacity warning.
-	capWarnAt time.Time
+	// capWarnAt rate-limits the at-capacity warning, one slot per map.
+	capWarnAt [persistMapCount]time.Time
+}
+
+// capWarning is what a locked section hands back so the log line can be emitted
+// AFTER the mutex is released.
+//
+// This mutex is on the hot path of every successful append, so a slog.Warn taken
+// under it means a blocked stderr — a full pipe to a log collector — stalls every
+// in-flight /messages goroutine. The once-a-minute throttle bounds the exposure to
+// one stall per minute rather than one per request, which is what keeps this small;
+// it is still the wrong place to do I/O.
+type capWarning struct {
+	warn    bool
+	slot    int
+	entries int
+	runID   uuid.UUID
+}
+
+func (c capWarning) emit() {
+	if !c.warn {
+		return
+	}
+	slog.Warn("workersvc: persistence-failure tracker is at capacity; this run is NOT being tracked",
+		"map", persistMapName(c.slot), "entries", c.entries, "cap", persistFailMaxEntries, "run_id", c.runID.String())
 }
 
 func newPersistFailTracker() *persistFailTracker {
@@ -196,14 +254,18 @@ func newPersistFailTracker() *persistFailTracker {
 // set. Both halves matter: the delete is the ordinary recovery path, and the
 // lastOK write is the only evidence M5's G4 will accept that the write path works.
 func (t *persistFailTracker) recordSuccess(runID uuid.UUID, now time.Time) {
+	t.applySuccess(runID, now).emit()
+}
+
+func (t *persistFailTracker) applySuccess(runID uuid.UUID, now time.Time) capWarning {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.fail, runID)
 	if _, ok := t.lastOK[runID]; !ok && len(t.lastOK) >= persistFailMaxEntries {
-		t.warnAtCapLocked(now, "lastOK")
-		return
+		return t.noteAtCapLocked(persistMapLastOK, len(t.lastOK), runID, now)
 	}
 	t.lastOK[runID] = now
+	return capWarning{}
 }
 
 // recordFailure advances (or restarts) the run's streak.
@@ -215,16 +277,19 @@ func (t *persistFailTracker) recordSuccess(runID uuid.UUID, now time.Time) {
 // the streak count and the sustained-duration window always describe the same
 // episode.
 func (t *persistFailTracker) recordFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time) {
+	t.applyFailure(runID, kind, lastSeq, now).emit()
+}
+
+func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time) capWarning {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.fail[runID]
 	if !ok {
 		if len(t.fail) >= persistFailMaxEntries {
-			t.warnAtCapLocked(now, "fail")
-			return
+			return t.noteAtCapLocked(persistMapFail, len(t.fail), runID, now)
 		}
 		t.fail[runID] = &persistFailEntry{kind: kind, streak: 1, firstAt: now, lastAt: now, lastSeq: lastSeq}
-		return
+		return capWarning{}
 	}
 	if e.kind != kind || e.lastSeq != lastSeq {
 		e.kind = kind
@@ -232,10 +297,11 @@ func (t *persistFailTracker) recordFailure(runID uuid.UUID, kind persistFailKind
 		e.streak = 1
 		e.firstAt = now
 		e.lastAt = now
-		return
+		return capWarning{}
 	}
 	e.streak++
 	e.lastAt = now
+	return capWarning{}
 }
 
 // evict drops a run's streak. Called when the run is observed terminal — a
@@ -370,15 +436,19 @@ func (t *persistFailTracker) prune(now time.Time) {
 	}
 }
 
-// warnAtCapLocked emits the at-capacity warning at most once per
-// persistFailCapWarnEvery. Called with mu held. Worth a line at all because a
-// capped tracker is a SILENTLY DISARMED guard, which looks exactly like a healthy
-// fleet — the same failure direction the values.yaml singleton comment warns about.
-func (t *persistFailTracker) warnAtCapLocked(now time.Time, which string) {
-	if !t.capWarnAt.IsZero() && now.Sub(t.capWarnAt) < persistFailCapWarnEvery {
-		return
+// noteAtCapLocked decides whether the at-capacity warning is due for this map,
+// stamping the per-map throttle when it is. Called with mu held; the caller emits
+// the line after unlocking (see capWarning).
+//
+// Worth a line at all because a capped tracker is a SILENTLY DISARMED guard, which
+// looks exactly like a healthy fleet — the same failure direction the values.yaml
+// singleton comment warns about. It carries the map, the live entry count and the
+// run it refused, so the line is actionable rather than merely alarming.
+func (t *persistFailTracker) noteAtCapLocked(slot, entries int, runID uuid.UUID, now time.Time) capWarning {
+	at := t.capWarnAt[slot]
+	if !at.IsZero() && now.Sub(at) < persistFailCapWarnEvery {
+		return capWarning{}
 	}
-	t.capWarnAt = now
-	slog.Warn("workersvc: persistence-failure tracker is at capacity; new runs are not being tracked",
-		"map", which, "cap", persistFailMaxEntries)
+	t.capWarnAt[slot] = now
+	return capWarning{warn: true, slot: slot, entries: entries, runID: runID}
 }

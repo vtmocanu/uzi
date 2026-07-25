@@ -231,8 +231,21 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	//
 	// Bonus worth keeping: returning here skips the per-tick ListRunToolWindow query
 	// for exactly the runs whose message stream is broken.
-	if fs := s.persistFail.stats(r.ID); fs.streak >= persistFlagStreak &&
-		!fs.firstAt.IsZero() && now.Sub(fs.firstAt) >= persistFlagWindow {
+	//
+	// NO CLASS NARROWING HERE, and that is deliberate — autoStopKillableKinds narrows
+	// only the KILL (PRD #108 §16). The flag is early warning and any repeated
+	// persistence failure is worth warning about. The consequence, stated so nobody
+	// meets it by surprise: a fault lasting >= persistFlagWindow that hits
+	// run_messages inserts specifically will flag EVERY actively-appending run
+	// `looping` and nudge each owner, subject to PRD #47's cooldown. A whole-database
+	// outage does not reach this — SetRunHealth fails too, and detectRunHealth logs
+	// and skips.
+	// No IsZero guard on firstAt: `streak >= persistFlagStreak` already implies an
+	// entry exists, and recordFailure sets firstAt on every path that creates or
+	// resets one. It was here and it was INERT — measured by folding it to `true`,
+	// which left the whole suite green. An inert conjunct in a kill's ancestry reads
+	// as a guard and defends nothing.
+	if fs := s.persistFail.stats(r.ID); fs.streak >= persistFlagStreak && now.Sub(fs.firstAt) >= persistFlagWindow {
 		return healthLooping, reasonPersistFailing
 	}
 

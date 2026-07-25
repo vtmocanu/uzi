@@ -163,11 +163,16 @@ func TestPersistFailPruneDropsOnlyStaleEntries(t *testing.T) {
 }
 
 func TestPersistFailCapRefusesNewEntriesAndKeepsCountingExistingOnes(t *testing.T) {
-	// The keys arrive as chi.URLParam on a worker-callable route, so an unknown run
-	// id would mint an entry that "evict on terminal state" can never reach. At the
-	// cap a NEW entry is refused and existing ones keep counting: refusing to START
-	// a streak delays a kill (fail-safe), whereas evicting to make room would hand a
-	// hostile worker a way to CLEAR a genuine run's streak.
+	// The cap is DEFENSE IN DEPTH, not the memory bound. This comment used to say the
+	// keys were worker-supplied so an unknown run id would mint an unreachable entry;
+	// that was false, and two validators found it independently. Only recordFailure
+	// mints, and both production callers sit below the ownership gate, so an unknown
+	// run id records nothing. The cap's residual threat model is one legitimate user
+	// holding more than persistFailMaxEntries concurrently-failing OWNED runs.
+	//
+	// What it must still get right: at the cap a NEW entry is refused and existing
+	// ones keep counting. Refusing to START a streak delays a kill (fail-safe), while
+	// evicting to make room would hand a worker a way to CLEAR a genuine run's streak.
 	tr := newPersistFailTracker()
 	genuine := uuid.New()
 	tr.recordFailure(genuine, persistFailUnstorable, testSeq, t0)
@@ -187,6 +192,40 @@ func TestPersistFailCapRefusesNewEntriesAndKeepsCountingExistingOnes(t *testing.
 	}
 }
 
+func TestPersistFailCapWarningIsThrottledPerMapNotGlobally(t *testing.T) {
+	// A single shared timestamp meant a lastOK cap event inside the same minute as a
+	// fail one was suppressed and never appeared AT ALL — an operator could watch
+	// `map=fail` indefinitely while lastOK was equally saturated. This is the
+	// observability guard on a guard that disarms silently; it must not itself drop
+	// events for a different map.
+	tr := newPersistFailTracker()
+	id := uuid.New()
+
+	first := tr.noteAtCapLocked(persistMapFail, persistFailMaxEntries, id, t0)
+	if !first.warn || first.slot != persistMapFail {
+		t.Fatalf("first fail-map cap event = %+v, want a warning", first)
+	}
+	// Same map, same minute: throttled.
+	if again := tr.noteAtCapLocked(persistMapFail, persistFailMaxEntries, id, t0.Add(time.Second)); again.warn {
+		t.Fatal("a second fail-map cap event one second later warned again; the throttle is not applied")
+	}
+	// DIFFERENT map, same instant: must still warn.
+	other := tr.noteAtCapLocked(persistMapLastOK, persistFailMaxEntries, id, t0.Add(time.Second))
+	if !other.warn {
+		t.Fatal("a lastOK cap event inside the fail map's throttle window was suppressed — that is the exact event an operator would never see")
+	}
+	if other.slot != persistMapLastOK || persistMapName(other.slot) != "lastOK" {
+		t.Fatalf("cap event names map %q, want lastOK", persistMapName(other.slot))
+	}
+	// And the throttle still expires.
+	if later := tr.noteAtCapLocked(persistMapFail, persistFailMaxEntries, id, t0.Add(persistFailCapWarnEvery+time.Second)); !later.warn {
+		t.Fatal("the fail-map throttle never expires, so a persistent cap condition goes silent forever")
+	}
+	if first.entries != persistFailMaxEntries || first.runID != id {
+		t.Fatalf("cap event = %+v, want the live entry count and the refused run id: a line that says only 'at capacity' is alarming rather than actionable", first)
+	}
+}
+
 func TestPersistFailTrackerSerializesConcurrentWriters(t *testing.T) {
 	// The lock is LOAD-BEARING, not decoration. AppendMessages runs on N parallel
 	// chi handler goroutines while the sweeper reads the same maps, so this drives
@@ -202,6 +241,12 @@ func TestPersistFailTrackerSerializesConcurrentWriters(t *testing.T) {
 	// makes the failure legible when it fires. Stated rather than claimed, because a
 	// test that only "passes under -race" would be decoration and this one has to be
 	// the thing standing between N handler goroutines and a corrupted kill counter.
+	//
+	// -race IS ENFORCED: `test:api` in .gitlab-ci.yml runs `go test -race ./...`.
+	// It did not until PRD #108's review pointed out that the only -race job was
+	// `-run 'LiveDB$'` over store/handler — wrong packages and filtered — so this
+	// paragraph described a guarantee CI was not providing. If you drop that flag,
+	// drop these three sentences with it.
 	const writers, perWriter = 16, 64
 
 	tr := newPersistFailTracker()
