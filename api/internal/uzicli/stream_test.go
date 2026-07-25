@@ -253,8 +253,9 @@ func TestStreamRunDecodesEveryFrameType(t *testing.T) {
 // -------------------------------------------------------------------------
 
 func TestStreamRunSendsBearerOnTheAuthorizationHeader(t *testing.T) {
+	const token = "uzc_secret-token"
 	srv := newStreamServer(t)
-	c := srv.client("uzc_secret-token")
+	c := srv.client(token)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -269,8 +270,9 @@ func TestStreamRunSendsBearerOnTheAuthorizationHeader(t *testing.T) {
 	if len(auth) != 1 {
 		t.Fatalf("server saw %d dials, want 1", len(auth))
 	}
-	if auth[0] != "Bearer uzc_secret-token" {
-		t.Errorf("dial Authorization = %q, want %q", auth[0], "Bearer uzc_secret-token")
+	wantAuth := "Bearer " + token
+	if auth[0] != wantAuth {
+		t.Errorf("dial Authorization = %q, want %q", auth[0], wantAuth)
 	}
 	if subproto[0] != "" {
 		t.Errorf("dial Sec-WebSocket-Protocol = %q, want empty — the credential must never ride the subprotocol, which is the one handshake header a cross-site browser page can set", subproto[0])

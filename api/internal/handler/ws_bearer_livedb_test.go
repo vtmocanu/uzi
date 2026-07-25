@@ -219,15 +219,17 @@ func TestWSCookieForeignOriginStillRejectedLiveDB(t *testing.T) {
 	// the absent-Origin case the CLI relies on. It parses to a URL with no host and is
 	// rejected at accept.go:256-258; if it were treated as empty, the whole CSWSH
 	// defense would be one sandbox attribute away from bypass.
+	const nullOrigin = "null"
 	nul, resp, err := websocket.Dial(ctx, wsLiveDBURL(srv, runID), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Cookie": []string{cookie}, "Origin": []string{"null"}},
+		HTTPHeader: http.Header{"Cookie": []string{cookie}, "Origin": []string{nullOrigin}},
 	})
 	if err == nil {
 		wsCloseNow(nul)
-		t.Fatal("a cookie upgrade carrying Origin: null was ACCEPTED — a sandboxed iframe would reach the socket; \"null\" must not be treated as the absent-Origin exemption the browser-less client uses")
+		t.Fatalf("a cookie upgrade carrying Origin: %s was ACCEPTED — a sandboxed iframe would reach the socket; %q must not be treated as the absent-Origin exemption the browser-less client uses",
+			nullOrigin, nullOrigin)
 	}
 	if got := wsHandshakeStatus(resp); got != http.StatusForbidden {
-		t.Errorf("Origin: null cookie upgrade was refused with status %d, want 403 from the origin check", got)
+		t.Errorf("Origin: %s cookie upgrade was refused with status %d, want 403 from the origin check", nullOrigin, got)
 	}
 }
 

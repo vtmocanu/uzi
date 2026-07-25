@@ -161,9 +161,10 @@ func TestProvenanceBoxOwnsTheChromeAroundSpoofableText(t *testing.T) {
 // D7 names only sanitizeTTY, and a raw newline in a cell breaks the rail's alignment.
 func TestRendererPlainFoldsWhitespaceForCells(t *testing.T) {
 	r, _ := newTUIRenderer(80, true)
-	got := r.Plain("line one\nline two\twith a tab", 100)
+	const in = "line one\nline two\twith a tab"
+	got := r.Plain(in, 100)
 	if strings.ContainsAny(got, "\n\t") {
-		t.Errorf("Plain(%q) = %q, want newlines and tabs folded — sanitizeTTY keeps both, so a cell needs cellText on top of it", "line one\nline two\twith a tab", got)
+		t.Errorf("Plain(%q) = %q, want newlines and tabs folded — sanitizeTTY keeps both, so a cell needs cellText on top of it", in, got)
 	}
 	if n := len([]rune(r.Plain(strings.Repeat("x", 200), 20))); n > 20 {
 		t.Errorf("Plain did not clamp to the requested rune budget: got %d runes", n)

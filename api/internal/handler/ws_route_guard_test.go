@@ -153,9 +153,13 @@ func TestWSRouteRejectsUncredentialedUpgrade(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("malformed-cookie GET /api/ws = %d, want 401\nbody: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "invalid or expired session") {
-		t.Errorf("malformed-cookie refusal body = %s, want the auth middleware's \"invalid or expired session\" — anything else (notably \"authentication required\") means /ws is mounted with NO auth guard and is being saved only by ServeWS's own context check",
-			strings.TrimSpace(rec.Body.String()))
+	// One definition of the expected string. Written twice — once in the check, once
+	// in the message — editing one silently desyncs them, and the message would then
+	// name a string the check never looked for.
+	const wantMiddlewareRefusal = "invalid or expired session"
+	if !strings.Contains(rec.Body.String(), wantMiddlewareRefusal) {
+		t.Errorf("malformed-cookie refusal body = %s, want the auth middleware's %q — anything else (notably \"authentication required\") means /ws is mounted with NO auth guard and is being saved only by ServeWS's own context check",
+			strings.TrimSpace(rec.Body.String()), wantMiddlewareRefusal)
 	}
 }
 

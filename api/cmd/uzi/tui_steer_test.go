@@ -116,6 +116,9 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	fake := &uzicli.FakeClient{}
 	m := ownerModel(t, fake, runID, ownedRun(runID))
 
+	// The typed body is a value, not a phrase: keep ONE definition so a message can
+	// never name text the test did not type.
+	const wantBody = "hi there"
 	m = press(t, m, "f")
 	if m.detail.steer.mode != steerTyping {
 		t.Fatal("f did not open the follow-up input")
@@ -123,8 +126,8 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	for _, k := range []string{"h", "i", keySpaceName, "t", "h", "e", "r", "e"} {
 		m = press(t, m, k)
 	}
-	if m.detail.steer.input != "hi there" {
-		t.Fatalf("typed input = %q, want %q", m.detail.steer.input, "hi there")
+	if m.detail.steer.input != wantBody {
+		t.Fatalf("typed input = %q, want %q", m.detail.steer.input, wantBody)
 	}
 	// Lane-navigation keys must NOT fire while typing — "h" and "l" are lane keys.
 	if m.detail.laneIdx != 0 {
@@ -142,8 +145,8 @@ func TestSteerFollowUpSubmits(t *testing.T) {
 	if msg.kind != kindFollowUp {
 		t.Errorf("submitted kind = %q, want %q", msg.kind, kindFollowUp)
 	}
-	if fake.LastInputBody != "hi there" {
-		t.Errorf("SubmitRunInput got body %q, want %q", fake.LastInputBody, "hi there")
+	if fake.LastInputBody != wantBody {
+		t.Errorf("SubmitRunInput got body %q, want %q", fake.LastInputBody, wantBody)
 	}
 	// An EMPTY follow-up submits nothing — otherwise a stray enter queues a blank
 	// steer the lead has to drain.
