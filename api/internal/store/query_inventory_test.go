@@ -87,9 +87,16 @@ import (
 // inventoryQueryFiles and nothing else. Re-derive the coverage arithmetic rather than
 // trusting a sentence — `grep -c '^-- name: ' queries/*.sql` gives the per-file counts and
 // `ls queries/*.sql | wc -l` the denominator. Measured at `ad6c63d9`: 290 queries across 28
-// files repo-wide; this file declares 52 of them across twelve files. (The number this paragraph
+// files repo-wide; this file declared 52 of them across twelve files. (The number that paragraph
 // carried before was 276, written weeks of merges earlier and never re-derived; it is quoted
 // here only to make the point that the figure drifts and the command does not.)
+// **It drifted again, exactly as predicted: the table holds FIFTY-THREE rows today** — the
+// wave-3 integration merge added ListAllCLITokensForAdmin. The `ad6c63d9` figures are left as
+// the receipt of that sweep rather than overwritten, because rewriting them would erase a
+// measurement someone took; the live count is stated beside them so a reader who counts the
+// rows does not conclude the record is wrong. Same treatment as control 8's "SIX truthful
+// pins" below. If you are reading this and the count is again not 53, that is the point of
+// the command in the sentence above, not an error in it.
 //
 // 🔴 HOW TO ESTABLISH THAT A QUERY RUNS: OBSERVE IT, DO NOT REASON ABOUT IT. Every row here
 // was first written by reading call sites, and that method PUT A FALSEHOOD IN THIS FILE —
@@ -137,9 +144,12 @@ import (
 // and sanity-check the capture with `grep -c -- '-- name:'` before trusting a zero — a zero from
 // a broken capture is indistinguishable from a zero from a query nobody calls.
 //
-// EXECUTION COUNTS FOR ALL 46 ROWS, measured this way on one whole-sweep run (RUN=141 PASS=141
-// FAIL=0 SKIP=0). Bound to that run, not offered as constants — they move with the fixtures, and
-// the ZEROES are the load-bearing part:
+// EXECUTION COUNTS FOR ALL 46 ROWS THE TABLE HELD AT THAT SWEEP, measured this way on one
+// whole-sweep run (RUN=141 PASS=141 FAIL=0 SKIP=0). Bound to that run, not offered as constants —
+// they move with the fixtures, and the ZEROES are the load-bearing part. **"ALL" was a
+// completeness claim and it expired: the table holds 53 rows today**, so the seven added since
+// carry their own evidence in their own `why` and are NOT in the list below. Read this as the
+// receipt of one sweep, never as a census of the current table:
 //
 //	0  CreateSelfImproveRun, MarkImproveUziRecommendationsAddressed  (selfimprove.sql)
 //	0  ListCLITokens                                                 (cli_tokens.sql)
@@ -547,7 +557,15 @@ var queryInventory = []queryPin{
 			"RESPONSE BYTES, not the DTO's shape: plaintext token, the base64 of its sha256 (what a " +
 			"[]byte token_hash marshals to if the projection regains the column), and the literal " +
 			"`token_hash` / `\"token\"` keys are each asserted absent — a struct-field check would pass " +
-			"against a handler that re-marshalled the store row. owner_email pins the users JOIN, and " +
+			"against a handler that re-marshalled the store row. owner_email pins the users JOIN to the " +
+			"OWNER, not merely to the presence of an address: the assertion is an EQUALITY against the " +
+			"deterministic `cli-<user-uuid>@e2e` cliSeedUser writes, so a wrongly-attributed row reddens. " +
+			"That clause first landed on the strength of a shape check (`!= \"\" && contains \"@\"`) and " +
+			"WAS FALSE — folding this query's JOIN to `ON true` vetted clean, turned 10 rows into 40 and " +
+			"still passed, because every seeded address has the same shape. Re-folded after the equality " +
+			"landed (5d5d0be4 + the fix): RED at that assertion, reporting a token under a different " +
+			"human's address. Note what still does NOT fire under that fold — `len(got) != len(fixtures)` " +
+			"stays green, because the duplicated rows collapse in the id-keyed map. Also: " +
 			"revoked-sorts-last is asserted PAIRWISE WITHIN THE FIXTURE rather than table-wide, so the " +
 			"shared live database's other rows may interleave without touching it"},
 	// ── notifications.sql — the inbox. THE WRITE PATH IS PINNED; THE READ PATH IS NOT ───

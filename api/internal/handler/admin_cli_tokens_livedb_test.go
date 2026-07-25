@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -117,9 +118,24 @@ func TestAdminCLITokenInventoryIsFactoryWideAndLeaksNoCredentialLiveDB(t *testin
 		if row.UserID != f.owner.String() {
 			t.Errorf("token %s: user_id = %q, want %q", f.id, row.UserID, f.owner)
 		}
-		if row.OwnerEmail == "" || !strings.Contains(row.OwnerEmail, "@") {
-			t.Errorf("token %s: owner_email = %q, want the joined users.email — without it an admin "+
-				"has ids and cannot name a human", f.id, row.OwnerEmail)
+		// THE JOIN, pinned to the OWNER rather than to the shape of an address.
+		//
+		// This assertion used to read `== "" || !strings.Contains(row.OwnerEmail, "@")`, and
+		// that pinned nothing: cliSeedUser writes `cli-<uuid>@e2e` for EVERY user, so any
+		// human's address satisfies a shape check. MEASURED at 5d5d0be4 — folding
+		// `JOIN users u ON u.id = t.user_id` to `ON true` in cli_tokens.sql.go vetted clean and
+		// this test still passed, while the same fold turned 10 rows into 40 and reported a
+		// token under a DIFFERENT human's email. A cross-join is the failure this column exists
+		// to make impossible, and the shape check could not see it.
+		//
+		// cliSeedUser builds the address deterministically from the user id, so the expected
+		// value is derivable here without a second query — which is what makes this a pin on
+		// the JOIN PREDICATE rather than on the presence of a column.
+		wantEmail := fmt.Sprintf("cli-%s@e2e", f.owner)
+		if row.OwnerEmail != wantEmail {
+			t.Errorf("token %s: owner_email = %q, want %q — the users JOIN attributed this token to "+
+				"the wrong human (or dropped its predicate); without a correct address an admin has "+
+				"ids and cannot name anyone", f.id, row.OwnerEmail, wantEmail)
 		}
 		if row.Scope != f.scope {
 			t.Errorf("token %s: scope = %q, want %q", f.id, row.Scope, f.scope)
