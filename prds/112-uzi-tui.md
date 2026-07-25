@@ -88,10 +88,32 @@ Three views, one app:
    recommendations with disposition keys (resolve / dismiss / undo), reusing the
    `api/cmd/uzi/review.go` logic and `SetDisposition`/`DeleteDisposition`.
 
-The **only** backend change is M1: `/api/ws` today is cookie-only
-(`handler.go:764-767`, "Cookie-only tail"); open it to a Bearer CLI token so the
-headless TUI can subscribe. Everything else is client-side, on APIs that already
-exist.
+The **only** backend change is M1: `/api/ws` today is cookie-only (the "Cookie-only
+tail" group comment sits at `handler.go:735-736`, not `764-767` as an earlier
+draft of this line had it — `766-767` is the route mount itself); open it to a
+Bearer CLI token so the headless TUI can subscribe. Everything else is
+client-side, on APIs that already exist.
+
+## Inspiration
+
+**Added retroactively — this PRD shipped without the inspiration-first check
+CLAUDE.md requires, and it's added here now that the check has been done.**
+`inspiration/` holds three submodules; a terminal UI for uzi is the first
+feature in this repo's history that's actually comparable to one of them.
+
+- **`dot-agent-deck`** is the closest prior art in *purpose* — a terminal
+  dashboard for watching agent runs — but it's **Rust + ratatui**, not Bubble
+  Tea. There is no Go code, no Elm-architecture `Update`/`View` split, and no
+  library dependency to inherit; what's worth taking from it is architecture
+  and UX only, not a stack. It treats subagent start/stop as an informational
+  log line, with **no per-subagent lane at all** — every agent's activity
+  interleaves into one stream. `uzi tui`'s lane rail (one row per
+  `agent_instance`, keyed and labelled, D5) is the place this PRD goes
+  further, and it's able to precisely because PRD #99 gives every message a
+  real invocation id and task label to key a lane on; deck has no equivalent
+  data to build one from.
+- **`bottega`** and **`multica`** have no terminal UI of any kind — nothing
+  in either to match or beat here.
 
 ## Design Decisions
 
@@ -136,10 +158,23 @@ dependency source:
 Because of this there is **no auth-type detection in `ServeWS`** (which would
 duplicate `RequireUser`'s dispatch predicate and risk drift — a real hole the
 review flagged) and **no `InsecureSkipVerify` anywhere**. Per-run authz is
-unchanged: `GetRunForViewer(user.ID, user.IsAdmin, runID)` (`ws.go:55-60`)
-resolves owner-or-admin identically for cookie and token identities, because
-`RequireUser` and `RequireAuth` populate the same `user`. One hub, one authz path,
-one unchanged origin rule.
+unchanged: `GetRunForViewer(user.ID, user.IsAdmin, runID)` (`ws.go:55-60`) runs
+the identical call for either credential.
+
+**Corrected during implementation (`middleware/cli_auth.go:85-87`):** this
+paragraph originally claimed `RequireUser` and `RequireAuth` resolve
+owner-or-admin *identically* for cookie and token identities. That's false —
+`RequireUser` clears `user.IsAdmin` on any token whose scope isn't
+`admin_ro`, so the same admin's session cookie and default-scope `uzc_` token
+reach different branches of `GetRunForViewer`. Same context key, same
+`store.User` type, same authz call — but the *reach* is narrowed for a
+non-admin-scoped token, never widened, which is exactly the direction that's
+safe and needed no code change. The `[a]` admin board (M3) depends on this:
+it's why a `uzc_` token is cleanly refused the factory-wide view even when
+its owner is an admin in the database (`uzi whoami` over a `uzc_` token
+likewise reports `is_admin: false` for the same reason — see `docs/cli.md`).
+One hub, one authz path, one unchanged origin rule — narrowed by token
+scope, not duplicated by transport.
 
 **D3 — Board updates on a `ListRuns` poll; only the drilled-in run opens a WS.**
 `/api/ws` is per-run (`?run=<id>`). Opening N sockets to keep a board's
@@ -161,24 +196,64 @@ agents. This is called out so nobody reads "steer agents" into the run-detail
 view and expects to whisper to `coder` alone.
 
 **D5 — Agent-lane status is inferred client-side from the frame stream, best
-effort, never authoritative.** A lane's dot is derived from the frames seen for
-that `agent_instance`: last frame was a tool call still open → *running <tool>*;
-a text/thinking frame → *thinking*; a subagent-result/terminal frame → *done*; no
-frame within an idle window → *idle*. The run's own `status`/`health` (from the
-`state`/`health` frames and `GetRun`) drive the run-level chip. The lane status is
-a display heuristic over an append-only message log, not a field the server
-guarantees; it must degrade gracefully (unknown → a neutral dot) and never block
-rendering on a frame it cannot classify.
+effort, never authoritative.** The run's own `status`/`health` (from the
+`state`/`health` frames and `GetRun`) drive the run-level chip; a lane's own dot
+is a display heuristic over an append-only message log, not a field the server
+guarantees, and must degrade gracefully (unknown → a neutral dot) rather than
+block rendering on a frame it cannot classify.
 
-**Do not invent this from scratch — inherit the web's proven logic.** The lane key
-is `agent_instance || agent || "lead"` (mirror `web/src/lib/runStream.ts:78`), and
-the status classification should port `ActivityFeed`'s (`agentOneLiner`
-~`web/src/components/ActivityFeed.tsx:280`; lane-state kinds at `:591-608`) rather
-than a parallel table. In particular it must carry the **resumed-subagent edge
-case** the web already handles (`ActivityFeed.tsx:61-116`): on SDK replay a
-subagent frame can arrive with `agent == "lead"` and no `subagent_type`, and must
-**not** be mislabeled as the orchestrator's own lane. Settle the final table in M3
-against real captured frames and this parity source, not in the abstract.
+**Corrected during implementation.** This section named the wrong file for the
+lane key, described the wrong function for the dot, and undercounted the state
+ladder by one. Verified against `origin/main`:
+
+- **The lane key is `web/src/components/ActivityFeed.tsx:77-79`**, not
+  `web/src/lib/runStream.ts:78` (that line is `refreshRun: boolean;` —
+  `runStream.ts` has no lane logic at all). `laneKeyOf(m) = m.agent_instance ||
+  m.agent || LEAD`; the `||` (never `??`) is load-bearing, since an
+  empty-string instance must fall through to the role rather than survive as
+  a key of its own.
+- **The dot and the transcript's one-liner text are two separate pure
+  functions, and the paragraph above conflated them.** Its prose ("last frame
+  was a tool call still open → running…") describes `agentOneLiner`
+  (`ActivityFeed.tsx:279-310`), which produces the one-liner TEXT. The DOT is
+  `crewStateFor` (`:209-245`), which takes **no frame kind as input at all** —
+  only `run.status`, `run.health`, whether the lane is the active actor, and
+  recency. Both got ported; they are not the same function.
+- **There are five states, not four: `working | stalled | waiting | idle |
+  done`.** The list above omitted `stalled` — the PRD #47 health integration,
+  and the only state that means "look at this now." Precedence, worst-first:
+  1. `run.status ∈ {completed, failed, cancelled}` → `done`.
+  2. `run.status == awaiting_approval` or `run.health == waiting_worker` →
+     `waiting`, dominating every lane, not just the active one.
+  3. The active actor and `run.health ∈ {stalled, slow, looping}` → `stalled`.
+  4. The active actor otherwise → `working`.
+  5. A non-active lane younger than 45s → `waiting`; older → `idle`.
+  A rolled-up dot (e.g. a per-role summary) takes the group's *worst* state,
+  never the newest.
+
+  Three traps the ported source's own comments call out, all load-bearing:
+  the **active** lane trusts `run.health`, never the recency timer — the
+  server's own stall flag defaults to 300s, so a healthy tool call running
+  45s-300s must still read `working`, not flip to `idle`; "active" for lane
+  purposes means `run.status ∈ {running, claimed}`, **including `claimed`**,
+  not `running` alone (a running-only test exists too, but it drives the tool
+  spinner, not the dot — get this wrong and every lane of a claimed run reads
+  `idle`); and the rollup is worst-state-wins, not newest-wins.
+
+**Do not invent this from scratch — inherit the web's proven logic**, now
+ported (not merely referenced): the lane key above, `crewStateFor`'s ladder,
+and the **resumed-subagent edge case** (`ActivityFeed.tsx:61-116`): on SDK
+replay a subagent frame can arrive with `agent == "lead"` and no
+`subagent_type`, and must **not** collapse into the orchestrator's own lane.
+A lane's role is titled from its first frame naming a *non-lead* role, not
+its first frame outright — testing "is `agent` non-null" would not catch
+this, since the field is already collapsed to the literal string `"lead"`
+upstream, never to null. The lane label is a separate, independent field
+(first frame carrying one wins; absent renders no placeholder), clamped at
+**80 runes** to match the server's storage cap — not the web's 48 UTF-16
+code units, whose own comment admits it can split an astral pair. That's a
+defect in the source being ported, not a contract, so the Go port clamps on
+runes instead of copying it.
 
 **D6 — Reuse `uzicli.Client` and the existing command logic; add exactly one
 client method.** Board/detail/steer/review are all existing calls:
@@ -198,15 +273,55 @@ or action. Same rule for issue titles/descriptions and `agent_label` shown in th
 lanes.
 
 **And strip terminal control bytes — Glamour does not do this for you.** The CLI
-already has the discipline: `sanitizeTTY` strips C0/C1 control and raw ESC
-sequences from every untrusted string bound for a TTY (`api/cmd/uzi/run.go:468-478`,
-applied today to health/failure reasons, review text, table cells). The TUI
+already has the discipline: `sanitizeTTY` strips terminal control characters
+from every untrusted string bound for a TTY (`api/cmd/uzi/run.go:468-478` at
+draft time; `478-485` on the tree M3 actually landed on — re-derive the line
+before citing it), applied today to health/failure reasons, review text,
+table cells. The TUI
 renders a **live transcript** of attacker-influenceable content — tool output,
 repo file contents, `agent_label` — straight to the terminal, and a raw `ESC[`
 sequence in that stream can move the cursor, recolor, or spoof the frame. Every
 string the TUI draws (transcript lines, tool output, lane labels, issue text) must
 pass through `sanitizeTTY` (or an equivalent) **before** Glamour, not instead of
 it. This is a hard requirement of M3/M4, not a nicety.
+
+**Corrected during implementation — three things this section understated.**
+
+1. **`sanitizeTTY` alone is the wrong unit for a fixed-width cell.** It
+   deliberately spares `\t`/`\n` — correct for a scrolling transcript, wrong
+   for a table row or a lane-rail line, where a raw newline breaks column
+   alignment. Fixed-width cells (the board's rows, the lane rail, the review
+   overlay's headers) go through a second pair: `compactText` (folds
+   `\t`/`\n`, caps length) and `cellText` (`sanitizeTTY` + `compactText`
+   composed). `sanitizeTTY` is necessary but not sufficient for that half of
+   the UI, and this section named only it.
+2. **The render order is a functional requirement, not only a security one —
+   and that turned out to be measurable, not just argued.** Glamour *emits*
+   the ANSI escapes that make styled markdown work; sanitizing after it
+   strips Glamour's own styling along with anything hostile. Measured on the
+   shipped renderer (glamour v2.0.1): `sanitizeTTY → Glamour` yields output
+   carrying 426 escape sequences with correct styling; reversed, it yields
+   **zero** escapes and prints literal `[38;5;39;1m##` garbage on screen.
+   Getting the order backwards breaks the screen outright rather than
+   opening a silent hole, which is what makes it a regression test
+   (`TestTUIRenderOrderIsSanitizeThenGlamour`) rather than a review note.
+3. **`sanitizeTTY` grew a second half during M3: Unicode format-character
+   (`Cf`) stripping, plus DEL.** The predicate this section described (C0
+   below `0x20` except tab/newline, plus the `0x80`-`0x9F` C1 range) let DEL
+   (`0x7f`) through and could never catch `Cf` at all — that needs a category
+   predicate, not a codepoint range. It now uses `unicode.IsControl`
+   (subsumes the old C0/C1 ranges and covers DEL) plus
+   `unicode.In(r, unicode.Cf)`, deliberately converged on the same pair
+   `workersvc.hasUnsafeChar` already used
+   (`api/internal/workersvc/agent_selection.go:236-240`), so the CLI and the
+   server settle on one predicate rather than two free to drift apart. The
+   `Cf` half matters most for a bidi override (`U+202A`-`U+202E`): unlike a
+   plain control byte, it visually *reorders* text, so an agent label or a
+   judge's `target` could be made to read as something it isn't — exactly the
+   spoof a fixed-width rail invites. **Combining marks are category `Mn`, not
+   `Cf`, and stay out of scope here**: "Zalgo" text is a grapheme-width
+   problem, not a control-stripping one, and needs a width-aware layout to
+   fix, not a stripper.
 
 **D8 — TUI is additive; the plain commands stay.** `uzi tui` is a new subcommand;
 `--json` and every scriptable verb are untouched. The TUI degrades to a clear
@@ -219,11 +334,27 @@ Two degradations the review surfaced that are **not optional**:
 - **An admin watching someone else's run is observe-only.** Subscribe is
   owner-or-admin, but the steer surface is owner-only: `ListRunInputs` 404s a
   non-owner incl. `admin_ro` (`handler.go:698-702`) and `SubmitRunInput` is
-  owner-scoped (`workersvc/service.go:2018`). So when the `[a]` admin board opens a
+  owner-scoped (`workersvc/service.go:2018` — **corrected**: `:2018` is
+  `createRun`; the write is `SubmitInput` at `:2239`). So when the `[a]` admin board opens a
   run the caller does not own, the run detail must render **read-only** (transcript
   + lanes + review), suppressing the steer bar and the queued/delivered indicator
   rather than showing controls that 404. M3/M4 must gate the steer surface on
   ownership, not on visibility.
+
+  **The "gate on ownership" mechanism above was, as stated, unimplementable —
+  discovered during M4, corrected there.** Nothing on the wire carries an
+  owner to compare against: `RunDTO` has no user id at all, and
+  `RunListItemDTO` carries only `OwnerEmail`, which is `omitempty` and
+  populated on the **admin** list only — so a client-side `run.UserID ==
+  caller.ID` check, which this section implicitly assumed, cannot be
+  computed from anything the TUI has. What shipped asks the server instead,
+  using the endpoint that shares the write's own predicate: `ListFollowUpInputs`
+  resolves ownership with `s.GetRun(ctx, userID, runID)`
+  (`service.go:2128-2132`), and `SubmitInput`'s first statement
+  (`service.go:2239`) is the identical call. So probing `RunInputs` and
+  reading its 404 is not an approximation of "may this caller steer" — it's
+  the same predicate the write will evaluate, evaluated by the same code,
+  not a second copy of the rule that's free to drift from it.
 - **Chat runs are watch-only in the TUI (or out of scope).** They are excluded
   from the board (kind filter above), and a chat follow-up is a forge-minting,
   chat-limited action that rides the cookie-only `/chats` surface
@@ -235,7 +366,7 @@ Two degradations the review surfaced that are **not optional**:
 
 **Phase 1 — the live channel (backend, its own MR; prerequisite for realtime detail)**
 
-- [ ] **M1 — `/api/ws` accepts a Bearer CLI token (a route move, `AcceptOptions{}`
+- [x] **M1 — `/api/ws` accepts a Bearer CLI token (a route move, `AcceptOptions{}`
       untouched).** Move the `/ws` route out of the cookie-only tail into a
       `RequireUser` mount (session OR `uzc_`/`uza_` token). **Do not** change
       `websocket.Accept`'s options — the CLI sends no Origin and already passes the
@@ -258,7 +389,7 @@ Two degradations the review surfaced that are **not optional**:
       (`e2e/run-e2e.sh:1300-1316`) gains a Bearer WS subscribe assertion so the new
       auth path is exercised end to end.
 
-- [ ] **M2 — `StreamRun` on `uzicli.Client`.** Add `StreamRun(ctx, runID)` that
+- [x] **M2 — `StreamRun` on `uzicli.Client`.** Add `StreamRun(ctx, runID)` that
       dials `/api/ws?run=<id>` with the `Authorization: Bearer` header via
       `coder/websocket`, decodes each frame into the `hub.Event` shape
       (`type ∈ message|state|health|input`, plus `seq/kind/agent/agent_instance/
@@ -275,7 +406,7 @@ Two degradations the review surfaced that are **not optional**:
 
 **Phase 2 — the TUI (depends on M2 for realtime; board can start on the poll)**
 
-- [ ] **M3 — `uzi tui` board + run-detail with agent lanes (read-only first).**
+- [x] **M3 — `uzi tui` board + run-detail with agent lanes (read-only first).**
       The Bubble Tea app: board (`ListRuns` poll, `[a]` admin toggle gated on
       `uza_`, `[/]` filter, `[enter]` open, `[q]` quit) and run detail (replay via
       `GetRun`+`RunLogs`, live via `StreamRun`, left-rail agent lanes keyed on
@@ -290,7 +421,20 @@ Two degradations the review surfaced that are **not optional**:
       tested as a pure function (the `review.go`/`boardColumns` discipline: logic
       in a testable helper, not tangled in the update loop).
 
-- [ ] **M4 — Steering + review overlay (the mutations).** Steer bar: `follow_up`
+  **Corrected during implementation:** quit shipped gated on confirmation for
+  both `[q]` and `ctrl+c` (a second `ctrl+c` quits at once) rather than a bare
+  `[q]` — a stray keystroke must not drop a watched run. Lane switching
+  shipped as `[tab]`/`h`/`l` (or `←`/`→`); `j`/`k` (and `↑`/`↓`) scroll the
+  selected lane's transcript instead — the PRD's `[tab]`/`j`/`k` conflated
+  the two. The modules landed as `charm.land/bubbletea/v2 v2.0.8`,
+  `charm.land/lipgloss/v2 v2.0.5`, `charm.land/bubbles/v2 v2.1.1`,
+  `charm.land/glamour/v2 v2.0.1` (a fork move, not the `github.com/
+  charmbracelet/*` v1 import paths named above); measured cost to `api/go.sum`:
+  129 → 182 lines. **There is no Go symbol named `boardColumns`** — that
+  discipline reference is `web/src/lib/boardColumns.ts` (TypeScript); the Go
+  analogue D6 means is `approveSelection` (`api/cmd/uzi/run.go:346`).
+
+- [x] **M4 — Steering + review overlay (the mutations).** Steer bar: `follow_up`
       text input, `[a]pprove`/`[r]eject` at a plan gate, `[x]` cancel, all via
       `SubmitRunInput`; queued/delivered indicator from `RunInputs`; the input
       steer-queue change reflected live off the `input` frame. Review overlay:
@@ -300,7 +444,17 @@ Two degradations the review surfaced that are **not optional**:
       asks for confirmation before firing. `entry: uzi tui` (board) and `uzi tui
       <run>` (straight into one run's lanes).
 
-- [ ] **M5 — Docs + SKILL + specs/ai.md.** `docs/cli.md` gains a `uzi tui`
+  **Corrected during implementation:** approve/reject shipped as `[y]`/`[n]`,
+  not `[a]`/`[r]` — `[a]` doubling as the board's admin toggle *and* approve
+  would put "approve a plan" one keystroke from `[x]` cancel-a-live-run, and
+  `[r]` is refresh everywhere else in the app. `[f]` starts a follow-up and
+  `[v]` opens/closes the review overlay; neither was named above. The steer
+  bar is additionally gated on **ownership**, not merely on the run loading —
+  see the corrected D8 below; an admin watching someone else's run and any
+  `kind=chat` run render read-only, with the reason shown in place of the
+  bar.
+
+- [x] **M5 — Docs + SKILL + specs/ai.md.** `docs/cli.md` gains a `uzi tui`
       section (views, keybindings, the admin toggle, the WS/Bearer note, the
       run-level-steering scope). The shipped agent skill
       (`api/internal/uzicli/skill/SKILL.md`) gets a `uzi tui` entry — but framed
@@ -311,12 +465,36 @@ Two degradations the review surfaced that are **not optional**:
       convention, the specs/ai.md items may land per milestone rather than all at
       once.
 
+  **Status: complete.** The SKILL.md entry actually landed in M3, not here — see
+  the blocking structural note above; `TestSkillMatchesCommandTree` requires every
+  runnable command documented in the same milestone that makes it runnable.
+  `docs/cli.md` and `CHANGELOG.md` landed with the documenter's pass;
+  `specs/ai.md` followed as the spec-keeper's write and the two are committed
+  together so M5 is one commit.
+
+  `specs/ai.md` claimed **§368-§372**, not §367-§371: §367 was already taken by
+  PRD #108 Phase 2, uncommitted in a sibling worktree when the numbers were
+  checked (2026-07-25). The file is append-at-tail and its numbers collide the
+  way goose migration numbers do, so the check has to cover every unmerged
+  branch's working tree, not just its tip. The five sections are the Bearer-WS
+  route move (D1/D2, plus R6 and the supersede of §279's `/api/ws` line), the
+  hub's seq-less drop hole and the `Kind`-open/`Status`-closed split (M2), the
+  `package main` layout (M3), terminal safety (D7), and the lane/steer
+  decisions (D4/D5/D8). §279's `/api/ws` line is superseded by a pointer from
+  §368, **not** edited in place — it is the record of a decision that was true
+  when it was made.
+
 - [ ] **M6 — Verified on k8s.** The board, a run drill-in with live lanes, a
       follow-up, a plan-gate approve, and a cancel all behave against a real run
       on **dev-cluster** (per CLAUDE.md, k8s is the primary validation target, not
       compose), with a `uzc_` token for own-runs and a `uza_` token for the admin
       board. The compose path (`docker compose` + `./e2e/run-e2e.sh`) still works
       as the laptop dev loop.
+
+  **Deferred out of this branch, explicitly, not silently dropped.** M6
+  needs a deployed image and live `uzc_`/`uza_` tokens on dev-cluster, both
+  post-merge. It cannot be done from a pre-merge branch and is called out as
+  outstanding in the MR rather than checked off or quietly skipped.
 
 ## Parallelization
 
@@ -329,11 +507,27 @@ Two degradations the review surfaced that are **not optional**:
 | 2 | M5 | M3, M4 | `docs/cli.md`, `api/internal/uzicli/skill/SKILL.md`, `specs/ai.md` |
 | 2 | M6 | M4 | — (validation) |
 
+**Corrected during implementation — the Files column's `api/cmd/uzi/tui/*`
+package was never buildable, and R3's mitigation below inherited the same
+error.** All 27 files in `api/cmd/uzi/` are `package main` (Go forbids
+importing a main package from a subpackage), and D6/D7 both mandate reusing
+roughly two dozen unexported helpers that already live there — `sanitizeTTY`,
+`compactText`, `cellText`, `capCell`, `shortInstanceID`, `runTitle`, `relAge`,
+the disposition/short-id resolution in `review.go`, the roster selection in
+`run.go` — none of which a subpackage could reach. It shipped as
+`api/cmd/uzi/tui_*.go`, in `package main`, file-level separation instead of
+package-level. That is a tradeoff worth recording honestly rather than
+re-describing as the original plan: D6/D7 hold *by construction* now (the
+helpers are simply reachable, so "the TUI and the plain commands cannot
+drift" needs no discipline to keep true), at the cost of the TUI having no
+package boundary of its own — see R3, also corrected below.
+
 M1 is a small, security-sensitive backend MR that lands on its own so a reviewer
 reasons about the origin-gate change in isolation (not buried in a UI diff). M2
 is a self-contained client method, testable against a fake before M1 is live. M3
-and M4 are one contributor's sequential work in a new `api/cmd/uzi/tui/` package
-and would conflict if split across agents. The board portion of M3 can be
+and M4 are one contributor's sequential work in `api/cmd/uzi/tui_*.go`
+(not a separate package — see above) and would conflict if split across
+agents. The board portion of M3 can be
 prototyped on the 2s REST poll before M1/M2 land and swapped to `StreamRun` when
 ready (D3/D8).
 
@@ -370,6 +564,16 @@ ready (D3/D8).
   strictly additive (D8), isolated in its own `api/cmd/uzi/tui/` package, and
   reuses `uzicli.Client` + existing command logic so business rules live in one
   place. Charm libraries are the mainstream, well-maintained Go TUI stack.
+
+  **Corrected during implementation:** it is not package-isolated — see the
+  Files-column correction above. It shipped as `api/cmd/uzi/tui_*.go` in
+  `package main`, so the mitigation is **file-level separation, not
+  package-level**: reuse of `uzicli.Client` and the plain commands' helpers
+  holds (arguably more strongly, since nothing needs re-exporting to be
+  reachable), but nothing stops a future change to `api/cmd/uzi`'s other
+  files from reaching into `tui_*.go` internals the way a real package
+  boundary would. That is the honest tradeoff, not a discipline this PRD can
+  enforce by naming a package that doesn't exist.
 - **R4 — Prompt-injection via judge/issue/agent free text (Risk 13).** Mitigation:
   D7 — branch only on closed enums, render all free text as inert markdown.
 - **R5 — WS/terminal edge cases** (non-TTY, resize, disconnect, huge transcripts).
@@ -381,6 +585,18 @@ ready (D3/D8).
   socket either), not a new regression — recorded in the specs note (M5) so it is a
   known, accepted property rather than a surprise.
 
+  **Reframed during implementation:** "parity" undersells the change. A
+  browser session cookie is short-lived and tied to one open tab; a `uzc_`/
+  `uza_` token is *designed* to outlive a session (that's the whole point of
+  a CLI credential), and the WS ping (`wsPingInterval`, 30s) keeps the socket
+  up indefinitely rather than letting an idle tab time out on its own. So
+  this is **parity in mechanism** (the server has never had a way to kick a
+  live socket on revocation) but **wider in blast radius**: a leaked, revoked
+  `uzc_` can watch a run far longer, in expectation, than a leaked session
+  ever could. A hub-level kick-on-revoke is its own future backend PRD, not a
+  TODO folded into this one — recorded here so it isn't lost, not because
+  this PRD is where it gets built.
+
 ## Open Questions
 
 - **Entry name and jump-in.** `uzi tui` (board) + `uzi tui <run>` (one run) — or a
@@ -388,8 +604,15 @@ ready (D3/D8).
 - **Board liveness.** Poll interval for `ListRuns` (2s like the log follow, or
   slower with a manual `[r]efresh`)? A board-level WS is deferred (D3); revisit
   only if the poll proves too laggy in practice.
-- **Theme.** Adaptive light/dark via Lip Gloss `AdaptiveColor`, or a fixed dark
-  palette? Adaptive is the best-practice default.
+- **Theme — closed during implementation.** Adaptive, not fixed — but **not**
+  via `lipgloss.AdaptiveColor`. In Lip Gloss v2, `AdaptiveColor` survives only
+  in the `compat` shim, driven by a package-level `HasDarkBackground` probe
+  evaluated at import time against `os.Stdin`/`os.Stdout` — wrong for a Bubble
+  Tea program, which owns the terminal and fires a terminal query even
+  without a TTY. The shipped palette uses `lipgloss.LightDark(isDark)`,
+  fed by `tea.BackgroundColorMsg.IsDark()` — the background Bubble Tea itself
+  reports once it has the terminal, not a second, independent detection that
+  could disagree with it.
 
 ## Out of Scope
 
@@ -403,3 +626,23 @@ ready (D3/D8).
 - **Any new server capability beyond M1's Bearer-on-`/api/ws`** — the TUI is a new
   consumer of existing APIs, not a reason to add endpoints.
 - **Replacing the web board** — this is the terminal analogue, not a migration.
+
+## Known Gaps (pre-existing, not introduced by this PRD)
+
+Found during implementation and recorded rather than silently fixed or
+silently ignored, since neither is this PRD's to decide:
+
+- **`/api/ws` has no per-user connection cap.** Pre-existing, and M1 doesn't
+  make it worse — but M1 does make the exposure easier to reach in practice:
+  the credential opening a socket can now be a long-lived, headless `uzc_`/
+  `uza_` token instead of only a browser session tied to an open tab (see the
+  R6 reframing above). Worth a limiter in its own right; out of scope here.
+- **The web has the same `Cf`-stripping gap D7 closes for the TUI.**
+  `web/src/pages/RunView.tsx:955` renders judge free text
+  (`summary_md`/`rationale_md`) as escaped plain text — safe against
+  HTML/script injection, since React never interprets it as markup, but not
+  against a Unicode bidi override: the browser's own bidi algorithm still
+  reorders a plain text node, so the same visual-spoof class D7 strips for
+  the terminal is still reachable in the browser. Filed separately as issue
+  #124, deliberately out of scope here — this PRD's D7 covers the TUI's own
+  render path, not the web's.
