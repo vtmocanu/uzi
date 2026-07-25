@@ -208,3 +208,24 @@ M5's `workers.networkPolicy.allowWebService` conditional exists **only** in `dep
 - **`devbox.lock` provenance → ACCEPTED as hand-extended, not regenerated.** The lock was extended by mirroring the existing go/gcc entry shape at the same pinned rev, to avoid realizing a darwin closure on the macOS host and mutating the real global toolchain. The authoritative realization is the **Linux image build's own `devbox global install`**, which has been passing since v0.11.0 — that is what proves the entries resolve, and it runs on every image build. Regenerating on a Linux builder would buy provenance tidiness, not correctness. **Not a residual; a recorded decision.**
 
 **Remaining to close #87 after the above:** (1) M7 proper — a genuine `web-ux` **agent** run against the web UI, once !105 deploys; the browser mechanics are already proven. (2) The §2(c) **build-time** deltas (protected-ref, MR-cache-less ×2, #92 reseed), which need CI pipeline runs to read numbers off.
+
+### ⚠ CORRECTION to the M7 entry above (2026-07-25, later the same day) — the shim is BYPASSED in the agent's shell
+
+**The section above says the browser mechanics pass "under the real k8s posture". That is true of the WORKER shell, which is what was probed, and NOT established for the AGENT shell, which is the one that matters.** The M7 gate run (issue #128, run `1dfc65b4`) established the difference, and it inverts the conclusion.
+
+**What the run measured.** `web-ux` did **not** launch clean. It took **4 tool calls**: the first `open` died on `FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166` (SUID helper not `root:4755`), and the second succeeded only with an explicit `--args "--no-sandbox"`. The agent did not know that flag — `agent-browser`'s own error output printed the hint and it copied it.
+
+**The mechanism, pre-registered before the run so it could not be retrofitted.** In the agent's shell `which -a agent-browser` resolves:
+
+1. `/app/node_modules/.bin/agent-browser` — the **real npm CLI**
+2. `/usr/local/bin/agent-browser` — the **PRD #87 shim**
+
+So a bare `agent-browser` reaches the real CLI first and **`AGENT_BROWSER_ARGS=--no-sandbox` is never injected**. The shim's own header asserts the opposite invariant — *"the real npm bin … is NOT on the image PATH, so a bare `agent-browser` from the agent always hits this shim first"* — and that invariant is **false in the shell that matters**. The lead recorded the prediction before dispatching and deliberately neither fixed the PATH nor hinted at it, so the uncoached measurement stands.
+
+**Why the earlier probe missed it.** It ran `agent-browser --version` and a direct chromium launch **inside the worker container's shell**, where the shim does resolve first and everything passes. `agent/src/sdk-env.ts` `buildSdkEnv` hands the agent subprocess a rebuilt, allowlisted env with `PATH=runnerPath()` — a *different* PATH. Generalising a worker-shell result across that boundary is what produced the wrong claim. *(Same error class as reading one worker's egress as the whole fleet's earlier the same day: a measurement taken on one side of a boundary, reported as if it held on the other.)*
+
+**What still stands from the earlier entry, unchanged:** chromium launches headless under the hardening *when given the flag*; the crashpad `XDG_*` fix is load-bearing (`exit=133` without it); fonts are correct — and the **glyph line is now settled by direct observation**: the owner pulled `/tmp/prd128-m7/landing.png` out of the pod and viewed it. Full landing page, nav *Docs / Log in / Register*, h1 **Uzinele Întunecate** with `Î`/`î` as **real glyphs, not tofu** — a stronger test than ASCII. `web-ux` reached the same verdict independently by canvas ink-profiling, which agreed with direct observation.
+
+**Consequence for the DoD.** The "legibly-rendered screenshot from a real worker" line is **SATISFIED**. The implicit promise of §4 — that an agent gets `--no-sandbox` *without having to know about it* — is **NOT**, and that is a real delivery gap, not deploy lag. It belongs to **PRD #120**, whose Hypothesis B this run supports over Hypothesis A. Two caveats travel with that verdict and must not be dropped: 4 calls is far milder than the 15+ #120 recorded, and the flag came from the CLI's own error hint rather than blind trial. Real, but cheaper than #120 feared.
+
+**Not fixed here, deliberately.** The PATH ordering, the shim, and the missing `--no-sandbox` note in the `web-ux` template are all left alone — the run was scoped to observation, and the fix belongs to #120 with the provenance answer (why `/app/node_modules/.bin` precedes `/usr/local/bin`) in hand.
