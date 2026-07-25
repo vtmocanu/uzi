@@ -9844,6 +9844,10 @@ appeared in. Design record: `prds/98-judge-menu.md`.
 
 ## 364. What this PRD does NOT cover — the coverage boundary, recorded as a decision
 
+**SUPERSEDED IN PART by §381 (2026-07-25): four of the five bullets below have moved. This
+section stays as written because it was true as of the M8a commit it dates itself to; §381
+re-derives it at the wave-3 tip. Read both.**
+
 Written here rather than left to be inferred, because every Blocking after M3 was
 about evidence rather than behaviour, and a doc claiming "the judge backlog is
 covered end to end" would be wrong on four counts. All true as of the M8a commit:
@@ -10255,3 +10259,405 @@ for the full Decision Log, and [docs/run-auto-stopped.md](../docs/run-auto-stopp
 for the operator-facing account — which, because PRD #47's exit contract clears
 run health on every terminal path, is together with M7's log lines the only
 durable record of why a run carries `stop_kind='auto_stopped'`.
+
+## 373. PRD #98 Part C — the printed-instruction registry: the KIND is derived from the AST position, and nested entries resolve most-specific-wins
+
+The backstop lives in `api/cmd/uzi/instructions_test.go` and exists because a shipped
+instruction can be false while parsing perfectly — two of them were.
+
+- **Two kinds, two bars, ONE lift set.** A RUNTIME emission (a `Printf`/`Println`/`Exitf` at a
+  decision point) tells a user what to do next and is only validated by RUNNING it; a HELP
+  reference (`Short`/`Long`/flag usage) cross-links a sibling command, and what it can be wrong
+  about is naming a path that does not exist. Four of the original eight notes misdescribed
+  their own site. **The kind is DERIVED from the AST position and can never be declared**, so a
+  runtime instruction cannot be relabelled out of the execution bar; an unrecognised emitter is
+  UNKNOWN and FAILS rather than defaulting to help. Both directions — registered-but-gone and
+  printed-but-unregistered — run over one lift set, because the earlier staleness check was a
+  `strings.Contains` that returned true where the registration scan saw nothing, and only the
+  blind one gated the build.
+- **Matching is on a word boundary; a candidate attributes to the LONGEST matching entry.**
+  CONFIRMED BY MEASUREMENT, not preference. `uzi review backlog` (HELP, a flag-usage reference)
+  and `uzi review backlog --run` (RUNTIME, the truncation remedy) must coexist, and the runtime
+  candidate matches both. Simulated over the package's whole lift set (9 candidates, 0 UNKNOWN,
+  exactly one of them multi-matching), **first-match and all-match both land the runtime
+  candidate on the HELP entry**, which then derives two kinds and trips the ambiguity arm —
+  *"is printed from BOTH help and runtime positions. Split it into two entries."* The entries
+  already ARE split, so the only way to green either alternative is to delete one of them, which
+  undoes the finding the whole of Part C rests on. Against a registry Part C requires, the
+  alternatives are **unsatisfiable**, not merely worse.
+- **"Longest" is a faithful specificity measure, not a heuristic.** Two entries matching one
+  candidate on a word boundary are both word-boundary prefixes of the same string, so one is a
+  prefix of the other and their byte lengths are strictly ordered. The single real exception is
+  two entries with the IDENTICAL `command`: `attribute`'s strict `>` silently keeps the first,
+  and the loser surfaces as *"no lifted candidate matches any more"* — which names the wrong
+  cause (the code is not gone, a duplicate ate it). Closed by a well-formedness check before the
+  per-entry loop (no two entries share a `command`; no `command` carries surrounding whitespace,
+  which would break `entry+" "` matching outright). Neither fires today, so both were EXERCISED
+  by appending a duplicate `uzi repo list` and a trailing-space `uzi login `, then restoring the
+  file byte-identical.
+- **Rejected: exact-match entries.** They would close the absorption residual completely, and
+  they key the registry on FORMAT STRINGS (`uzi review undo %s %s`), so a `%s`→`%v` edit, a
+  reordered `Printf` or any new flag becomes a registry edit and the entry text stops reading as
+  a command. That churn is what gets a mechanism deleted — the same reasoning that makes
+  `evidenceNotExecuted` a legal, green, permanent state rather than a TODO.
+- **The residual is NAMED rather than closed: same kind, new site, extension text.** A new hint
+  printing `uzi repo list --json` is absorbed by `uzi repo list` and inherits its claim that
+  someone EXECUTED it — a false EXECUTED claim being precisely what the registry exists to
+  prevent. It is a property of prefix matching, which every alternative absorbs identically.
+  Three mitigations already in the tree, named so nobody double-pays: a new site of a DIFFERENT
+  kind trips the ambiguity arm; a new command PATH rather than an extension is caught (that is
+  how `uzi worker set-token` arrived from PRD #104 and reddened the build); and the e2e rows lift
+  from the emitting command's OWN output, so changed text at the same site is still executed
+  verbatim.
+- **Scope is `api/cmd/uzi` and nothing else, and that is part of the claim.** `instructionScope`
+  says so at the site (`parser.ParseDir` over one directory). Widening the extractor past that
+  package — with the entry bound to its emitting site, which is what would close the residual
+  without the exact-match churn — is **deliberately unfunded this wave**; the design is in
+  `prds/98-judge-menu-m8-w3-rulings.md` §1.6.
+
+## 374. PRD #98 Part C — the harness `eval`s lifted instructions behind an ANCHORED ALLOWLIST floor, never a metacharacter blacklist
+
+`e2e/run-e2e.sh` lifts an instruction from a command's own output and `eval`s it, which is what
+makes "this instruction works" an executed claim rather than a parsed one. The exposure was never
+that the helper ignores content — every match already satisfied its caller's ERE and a
+`case "$cmd" in "uzi "*)` guard. It is that **the entire safety burden sat in each caller's regex
+with NO FLOOR in the helper**. A future row with a loose ERE (a `.*`, an unanchored class, a
+`[^ ]+` that happens to admit a metacharacter) hands unreviewed text to an `eval` running in the
+HARNESS's own shell on the developer's host — before `uzi_cli`'s `env -i`, so an injected `;`
+runs as the user rather than inside the sandbox.
+
+- **A positive, anchored character class immediately before the `eval`. ALLOWLIST, NOT
+  BLACKLIST.** Blacklisting shell metacharacters is famously incomplete: you learn which one you
+  forgot by being bitten. A positive class excludes `<`, `>`, `|`, `;`, `$`, backtick, quotes,
+  backslash, newline and every glob character BY CONSTRUCTION. The property worth naming is that
+  it makes the wrong option **structurally impossible rather than discouraged** — a row trying to
+  substitute a placeholder into printed text cannot pass, because `<` cannot pass. That is why
+  §376's CLI change had to be a real format verb and not a helper special case.
+- **The floor is `[[ =~ ]]`, not `grep -qE`, and that is not a style swap.** `grep` is
+  LINE-oriented, so `^…$` anchors per line and `grep -q` returns 0 when ANY line matches.
+  Measured against the committed guard: a span of `uzi repo list` + newline + `; touch /tmp/PWNED`
+  is ACCEPTED by the grep form and rejected by `[[ =~ ]]`. Reachability is zero today
+  (`while IFS= read -r cmd` cannot yield a newline) — but the grep form puts the invariant back
+  outside the helper, one layer over, and newline is the one excluded character that is itself a
+  command separator.
+- **It reddens nothing today, which is exactly why it needed a positive control** or it is
+  untested decoration. The function body was extracted verbatim and driven through 12 cases: the
+  three real shapes reach `uzi_cli`; a greedy `.*` swallowing a backtick, an injected
+  `; touch /tmp/PWNED-BY-THE-HARNESS`, an unanchored class admitting `$(whoami)` and one admitting
+  a `>` redirect are all rejected before anything runs (checked for EFFECT — the file did not
+  exist afterwards — not only for exit status); and the literal `uzi review backlog --run <run-id>`
+  is REJECTED while the same shape with a substituted uuid executes.
+- **The heredoc feeding the loop is load-bearing.** `fail` ends in `exit 1`; fed by a heredoc the
+  loop runs in the current shell and the script dies. Fed by a PIPE it would run in a subshell and
+  the run would continue past a failed instruction with its diagnostic swallowed.
+- **The two character classes now point at each other, and the consequence is documented at both
+  ends**: the static extractor reads SOURCE and must admit `%`, `<`, `>` and `-`; this floor reads
+  EMITTED text and must not. So an instruction whose emitted form carries `%`, `+`, `@`, `,` or
+  `~` can be REGISTERED and can never be EXECUTED — `evidenceNotExecuted` by construction rather
+  than by choice.
+- **Scope kept unblurred at the site**: this is a shell-injection floor, NOT an authorization one.
+  It cannot stop an admitted span naming a destructive `uzi` subcommand, and an author can still
+  assign a literal to the variable passed as OUT.
+
+## 375. PRD #98 M8b — Part B narrowed to B4′ + B6′; the duplication that justifies it POSTDATED the ruling it overrides
+
+**USER RULING, 2026-07-25.** It overrides the same user's 2026-07-21 ruling *"drive to 100%; M8b
+is funded, do not trim it for time"*, and the reason it is not a trim is the whole point:
+`feature/prd-98-tier2`'s live-DB tests came to duplicate B1/B2/B3/B5 and B6's matrix, and **that
+duplication did not exist when the earlier ruling was made**. The alternative to a wire assertion
+here is not a fake — it is a live-DB store test running the real SQL against a real Postgres, and
+the tree now carries a lot of them.
+
+- **Coverage is RECORDED rather than REPEATED.** Where each dropped block is actually pinned is
+  written into `prds/98-judge-menu.md` **by test function name**. A property asserted twice is not
+  covered twice; it is covered once and paid for twice, and the second copy is the one that rots
+  when the first is edited.
+- **What survived, and why only these two.** B4 (the row cap) was **unpinned anywhere live** — the
+  largest live `Lim` is 1000 and the one cap test uses a fake store — and it gates Part C's
+  truncation-remedy row. B6's residual is the POLLER: all six `TestFiledIssueClose*LiveDB` tests
+  call `svc.SyncFiledIssueCloses(ctx, repoID)` DIRECTLY, the poller's own call site is covered
+  only against a fake store, and nothing else in the repo runs the poller. The chain *forge issue
+  closed → issue cache reflects it → the poller's tick calls `SyncFiledIssueCloses` → a
+  disposition with the right provenance appears* was unpinned end to end.
+- **B2's one genuinely-uncovered shape was folded into B4′ as one extra seeded row** rather than
+  kept as its own block: a coordinate seeded TWICE on ONE review (`occurrences > run_count`), which
+  costs nothing once a bulk seed exists because there is no UNIQUE on `(review_id, category, target)`.
+- **B7 and B8 stay dropped for the reasons already recorded** — the notification deep link is
+  client-side and unit-covered, and the no-token-spend property is proven by
+  `TestDispositionTouchesStoreOnly`/`TestBulkDispositionTouchesStoreOnly`, NOT by an e2e leg. The
+  PRD's Success Criteria claim otherwise and that claim is wrong.
+- **`apidelete` is a comment fix, not a helper to build.** It appears exactly once in
+  `e2e/run-e2e.sh`, inside `retry_read`'s comment listing write helpers *"deliberately NOT
+  wrapped"*, and was never defined; the harness's single DELETE is an inline `curl -X DELETE`.
+  Defining a helper nothing calls is dead code PLUS a comment that has become true about a
+  function nobody uses. Corrected the comment instead — and the same comment turned out to cite
+  three `db_psql` INSERTs by line number (all three pointing at unrelated text at this tree, and
+  there are five such writes, not three, some of them DELETEs). Named by PHASE now, which survives
+  an edit.
+
+## 376. PRD #98 M8b/B4′ — `truncated == false` per execution is the certification, and the CLI prints one runnable line per settled run
+
+- **The remedy is certified by its own PROMISE, not by a coordinate grep.** The warning says the
+  read was cut; the remedy claims to get you below the cap. So the assertion is that the anchored
+  re-read is **NOT truncated** — immune to which bucket a coordinate lands in, which is exactly
+  how the previous coordinate marker broke. A coordinate grep asserts FIXTURE SHAPE; this asserts
+  the property.
+- **Paired with a PER-EXECUTION positive, over per-instruction output files.** The honest reason
+  is narrower than the first draft claimed, and the draft was wrong about shell semantics: over a
+  concatenation of both re-reads the NEGATIVE is not weakened at all (if the warning appears in
+  either, it appears in the union — measured). What the union DOES lose is the positive companion:
+  *"some output rendered a backlog"* is satisfied by re-read #1 alone, so #2 erroring or printing
+  NOTHING passes. And the two are a pair — **absence of a truncation warning is trivially true of
+  output that does not exist**, so the negative is vacuous without a per-execution positive beside
+  it. Six discrimination cases measured; a clean #1 with an errored or silent #2 goes RED per file
+  and GREEN over the union.
+- **The fixture MINTS four dedicated runs rather than borrowing other phases'**, so the anchor's
+  separation is a property of the fixture instead of a coincidence of harness history. Three
+  reviews at three ages, because `ORDER BY rv.updated_at DESC` decides what the cut keeps: one old
+  review carrying the coordinate that must be cut, one carrying the 2001-row bulk seed, and two
+  small recent ones on TWO DIFFERENT runs. The bulk seed deliberately sits on a run the remedy
+  never anchors to: the `?run=` anchor is a COORDINATE semi-join, so anchoring to a run returns
+  every coordinate in ANY of that run's reviews — had the bulk seed shared a run with a settled
+  coordinate, the anchored re-read would return all 2001 again, still truncated, and the printed
+  remedy would be FALSE. Two settled runs rather than one, because a count of 1 cannot distinguish
+  real behaviour from a `head -1` regression.
+- **The positive control runs in BOTH directions**: delete the bulk review and `truncated` goes
+  false AND the previously-cut coordinate comes back — which is what proves it was cut by the CAP
+  rather than absent for some other reason. A `truncated` boolean alone is satisfiable by a flag
+  flip over complete data.
+- **The shipped CLI output changed, USER-APPROVED.** `uzi review backlog --run` was printed as a
+  single line carrying the LITERAL `<run-id>` — a placeholder in the OUTPUT, not a value
+  substituted at emit time — so *"execute it verbatim"* was undefined for it and the entry sat
+  `evidenceNotExecuted` behind a reachability excuse that was only half the reason. It is now
+  **one runnable line per settled run**, through a real format verb, mirroring the
+  `uzi review undo %s %s` emission 40 lines below that already substituted. The advice is strictly
+  better: a write spanning three runs used to tell the user to guess one. A truncated write that
+  settled NOTHING now prints no command at all — that branch is why the old literal needed no data
+  to render. `distinctSettledRuns` dedupes because `Settled` carries one member per settled
+  COORDINATE and a run commonly carries several.
+- **The registry entry flips in the SAME commit as the harness row**, which is what couples them:
+  the well-formedness check reads `e2e/run-e2e.sh` for the `where` label, so flipping without the
+  row goes red (*"claims e2e evidence at …, which no longer appears in e2e/run-e2e.sh"*) and
+  landing the row without the flip leaves a stale not-executed claim. The entry's `command`
+  shortened with the printed text, to `uzi review backlog --run`, and still attributes correctly
+  against the sibling HELP entry `uzi review backlog` under §373's rule — measured, not assumed.
+- **A pinning test whose fixture cannot fail is pinning the STRING, not the behaviour.**
+  `TestReviewTruncationWarningsNameAWorkingRemedy` set `Updated: 2` with an EMPTY `Settled`, and
+  the old code printed its remedy anyway, because a literal needs no data. It now carries three
+  members across two runs with one run deliberately repeated, and asserts no `<run-id>` in the
+  output, exactly one line per DISTINCT run in first-appearance order, and that a settle-nothing
+  truncation prints no command.
+
+## 377. PRD #98 M8b/B6′ — `close_issue`, not a symmetric `flip_issue`; the poller's liveness proved by `synced_at`; the lane argument recorded structurally
+
+- **`close_issue IID`, not `flip_issue IID STATE`.** The new forge-fake route accepts `"opened"`,
+  but the product consumes the **open→closed edge only** — a reopen is explicitly not acted on
+  (`close_synced_at` stays stamped, so a flapping issue cannot ping-pong a backlog). A helper
+  spelled `flip_issue` would advertise a round trip the product does not make, and the next reader
+  would write a reopen assertion against a guarantee that does not exist. Said at the site, and
+  cross-referenced with `flip_mr`, which genuinely IS called both ways because the MR watcher acts
+  in both directions.
+- **`POST /_e2e/issues/{iid}/state` had to be added because `state` was write-once**: `makeIssue`
+  stamps `state: "opened"` and nothing in the fake assigns it afterwards — the GitLab
+  `PUT /issues/{iid}` handler applies only `add_labels`/`remove_labels`, and the Forgejo `PATCH`
+  does the same — so the whole edge was unreachable from the harness. Lane-neutrality is MEASURED
+  rather than argued: the route mutates the shared `state.issues` that `toForgejoIssue` maps, and
+  one mutation was observed through both lanes' views. `updated_at` is bumped because a real forge
+  does, not because the harness needs it.
+- **A state check is not a liveness check, and mislabelling one poisons the diagnosis.** The first
+  precondition waited for the issue cache to show the issue OPEN and called that proof the poller
+  was running. It is not: `settleFiledIssue` calls `UpsertIssue` in the SAME TRANSACTION as
+  settling the filed link (*"so the board card appears without a poll"*), so the wait is satisfied
+  instantly by a row the file-issue handler wrote and **passes against a stone-dead poller**. The
+  sentence lived inside the failure output a debugger reads at 3am, and a false reassurance in a
+  diagnosis is worse than no diagnosis — it routes the reader away from the true cause WITH
+  EVIDENCE ATTACHED.
+- **The real liveness control is free: `synced_at` advances on every tick.** `UpsertIssue`'s
+  conflict path sets `synced_at = now()` UNCONDITIONALLY, not only when a column changed, and the
+  poller runs it for every issue the forge returns (forge-fake returns every recorded issue
+  wholesale on every poll). The only other callers that re-upsert this row are one-shot, so a
+  moving `synced_at` is the poller and nothing else. No probe coordinate, no second issue, no
+  perturbation of `triage.todo`. It is armed AFTER the close, so it bounds the window from below by
+  OBSERVED poller work — and it is INFERRED from the query and the sync path, not executed, which
+  its own failure message says.
+- **The failure message was written BEFORE the wait**, because *"no disposition after N seconds"*
+  has two causes needing opposite fixes — the poller never ran, or it ran and did not consume the
+  edge — and a message that cannot separate them routes the next reader into the wrong subsystem.
+  It also states which cause it cannot rule out.
+- **The lane argument is recorded STRUCTURALLY instead of gaining a tripwire.** Five checkable
+  facts: `$FORGE` is validated to two values at parse time; the lane's `if` opens at column 0; the
+  harness's only bare `exit 0` is at the TOP LEVEL of that block; the matching `fi` is at column 0
+  with none between; the #98 phases open ~2000 lines below. **A guard would defend a state the
+  control flow cannot produce.**
+- **The fidelity limit is stated in the phase's own comment, not left to be discovered.**
+  `forge-fake.mjs` contains zero occurrences of `updated_after` — `GET /issues` returns every
+  recorded issue wholesale, by deliberate design (*"keeps a reconcile pass from evicting the
+  cache"*) — while `IncrementalSync` really does send `UpdatedAfter`. **So this block proves the
+  poller wires the edge up given the cache reflects the close; it does NOT prove the real
+  incremental sync would ever observe the close.** Deliberately not closed inside #98: it would
+  change `GET /issues` semantics for every phase that depends on "return all recorded issues".
+- **Two boolean idioms coexist in the harness and a unifying sweep would be a REGRESSION.**
+  `psql -tAc` renders a bare boolean as `t`/`f` and `(expr)::text` as `true`/`false` (measured:
+  `SELECT (1 IS NULL)::text, 1 IS NULL` → `false|f`). The #68/#104 phases compare bare to `t`; #98
+  casts and compares to `true`. Both are correct where they sit; that coexistence is what produced
+  a diagnostic legend naming values its own message could never print.
+
+## 378. PRD #98 seam 6 — the mock↔server golden fixture is the fidelity mechanism, and `-count=1` at the gate is what keeps it live
+
+`web/src/mocks/mockApi.ts` is not a stub: it reimplements the judge backlog's dedup, the
+`dismissed > done > filed > todo` rollup, `run_count`, the rationale preview and the `?bucket=`
+filter, all of which also exist in Go. Until this fixture, their agreement was verified only by
+reading — and when it drifts two things break at once and neither announces itself: the demo lies,
+and ~950 mock-backed vitests pass while asserting a fiction.
+
+- **`fixtures/judge-fidelity/{cases,expected}.json` sits at the REPO ROOT, owned by neither
+  runtime.** Not `api/internal/workersvc/testdata/`, which is where a `go test -update` flag gets
+  added; not `web/src/mocks/`, which is where `toMatchSnapshot()` gets added. **Each runtime
+  compares its OWN output against `expected.json`, never Go against JS directly** — a direct diff
+  can only report THAT they disagree, never WHICH one drifted, and it would make `npm test` depend
+  on a Go toolchain. A missing or unreadable fixture is FATAL on both sides, never a skip.
+- **There is no regenerator, and that is the design.** Both files are hand-authored to
+  discriminate; a golden snapshotted from `mockReviews` would lock in the demo's own blind spot
+  (zero `occurrences > run_count` rows, zero fully-settled groups with disagreeing members) and
+  read as full coverage. The anti-regeneration mechanism is a **two-halved self-check**: an
+  input-side pass proving each case can still tell a correct implementation from a wrong one, and
+  an output-side pass proving the GOLDEN still describes that discrimination. Its honest limit: a
+  regression preserving every declared property regenerates cleanly, so the declared property list
+  IS the coverage.
+- **Detection power was MEASURED at landing, ten folds, each proved applied by diffing the tree,**
+  and recorded by the assertion MESSAGE that reddened rather than by red/green. The first two folds
+  redden exactly one runtime each, which is what justifies the third artifact. The last three are
+  the ones to read: in each, the golden comparison printed `--- PASS` while the fixture had been
+  neutered, and only the self-check caught it — one of them left `expected.json` byte-identical.
+- **`-count=1` moved onto the documented gate and onto CI's `test:api`, and the fix belongs at the
+  GATE rather than in the test.** Go's test cache hashes the files a test opens **but only those
+  inside the module root**, so every byte of a repo-root fixture contributes nothing to
+  `internal/workersvc`'s cache key. Measured: deleting an entire case left the bare per-package
+  command printing `ok (cached)` while `-count=1` on the same tree reddened. The general statement
+  is that **any test reading a file the Go toolchain does not treat as a source input is
+  cache-invisible**, and this repo now has a whole `fixtures/` directory of them plus the
+  controller's contract goldens pointing the other way. CI was exposed for the same reason
+  (`.go_job` persists `.gocache/` keyed on `api/go.sum`, which a fixture edit never touches);
+  `test:controller` had already set the precedent.
+- **The asymmetry between the halves is itself the finding.** The rule reads symmetric — *"Go red
+  plus vitest green means Go drifted"* — and has a third explanation nobody had written down:
+  **Go never ran.** vitest has no such cache and reddens with no flag at all.
+- **The obvious control for that gate is BLIND, and it was reported as evidence six times before
+  anyone measured it.** *"The run printed no `(cached)` lines"* is satisfied by construction
+  whenever `-count=1` is passed, since `cmd/go` prints `(cached)` only when it SERVES a cached
+  result; measured, `go clean -testcache` followed by the fully-exposed bare command also printed
+  ZERO `(cached)` lines, and a run that skipped every test prints `ok` with none either. **The
+  control is the MUTATION** — gut the fixture, confirm the gate reddens — because that is bound to
+  the artifact.
+- **Do not "fix" this by moving the fixture under `api/`**, which reintroduces the regenerator
+  gravity above; and do not widen `./e2e/run-store-it.sh`'s package list to reach it, because its
+  `-run 'LiveDB$'` filter is a second independent exclusion and a widened sweep would run zero of
+  these tests while printing `ok`.
+
+## 379. PRD #98 — the admin-wide CLI token inventory: a visibility gap with no natural end, read-only by decision, and `token_hash` absent at four layers
+
+`GET /api/admin/cli-tokens` plus `uzi admin cli-tokens` answers *"who holds standing credentials
+to this instance, and are any stale or unexpected?"* — which nothing could answer before. Every
+other query in `cli_tokens.sql` is scoped to one `user_id` or one `token_hash`, so a token was
+visible to its owner and to nobody else, while `workers` has been admin-visible since PRD #42. A
+user-scope token also never expires, so **the gap had no natural end** — that is the severity
+argument, and it is about visibility rather than rate.
+
+- **The value and its hash appear nowhere, held by three independent mechanisms across four
+  layers.** (1) The value is never stored at all — shown once at mint. (2) The query projects its
+  columns EXPLICITLY, so `token_hash` is absent from the sqlc-generated row type; that is a
+  security boundary, not a style choice, and it is deliberately unlike the sibling `ListCLITokens`
+  (`SELECT *`, relying on its DTO to drop the hash — safe today only because that row never leaves
+  the handler). (3) `AdminCLITokenDTO` therefore has no field to drop, and (4) a wire pin
+  enumerates the exact JSON key set, so adding one fails the build. Folding `token_hash` back
+  through query, DTO and handler COMPILES, and is caught twice: the live test finds the base64
+  sha256 of all four fixture tokens in the response body, and the wire pin fails with NO database
+  at all. A sha256 of a credential is offline-crackable; an admin-wide list of them would convert
+  a visibility fix into a disclosure surface.
+- **Read-only by decision, not omission**: no admin revoke. Only visibility was authorised, and
+  taking a credential away is a different blast radius.
+- **Revoked rows are INCLUDED** (sorted last): a revoked token is the incident trail — the whole
+  reason the table soft-deletes — so an audit view that hid them would hide exactly what an
+  investigation needs. What the DTO carries is the forensic surface the schema already calls out:
+  `token_prefix` names a row without revealing it, and `last_used_at`/`last_used_ip` are the only
+  detection controls that exist, since there is no per-request audit log.
+- **Admin-gated by the existing `RequireUser` + `RequireAdminRO` group**, so admin-ness resolves
+  live from the row and a non-`admin_ro` token is already masked — the handler re-checks nothing.
+  It is added to `adminReadPaths`, and it is the one admin read whose BODY is security-relevant,
+  so that masking is what stops a token holder enumerating every credential in the factory.
+- **The limiter object is reused (`authLimiter`), which shares only the rate config.**
+  `PerUserMiddleware` keys buckets by `(route pattern, user)`, so this route cannot contend with
+  `/vault/unlock`; a ninth limiter parameter would move the position-to-name mapping for no
+  behavioural gain.
+- **The CLI verb is required, not optional garnish** (`uzi admin` has one subcommand per admin
+  read, per this repo's own convention), and that is what moves the DTO into `apitypes` — a Go CLI
+  verb decodes it. `web/` is deliberately untouched.
+
+## 380. PRD #98 — demo-mode truncation is reachable and CUTS BEFORE GROUPING; the banner ships unchanged
+
+`truncated` was hardcoded `false` at both mock sites, so the banner could not render in demo mode
+at all — and truncation is the state a person most needs to SEE, because it is the only one where
+the screen is not the truth.
+
+- **The demo cut removes ROWS BEFORE GROUPING, mirroring the server.** Flipping `truncated: true`
+  over complete data would show *"some groups may be missing and counts may be understated"* above
+  a page that is in fact the whole truth, teaching the reader the opposite of what the banner
+  means. Cutting first produces the real state: a SURVIVING group that under-reports `run_count`
+  and may roll up to the wrong bucket. Measured over the demo data (11 rows, 7 groups) at a cap of
+  6 — 5 groups instead of 7, one coordinate dropping from "seen in 3 runs" to 1, another from 2 to
+  1, one untouched, and the auto-done group vanishing entirely. The cap is chosen to cut through
+  the middle of a recurring coordinate rather than at a group boundary, because a boundary cut only
+  removes whole groups, which is the easy half of the state.
+- **`triage` stays the canonical aggregate and does NOT move**, exactly as on the server where it
+  comes from a separate query with no `LIMIT`. That is not an inconsistency to reconcile — **it IS
+  the truncated state**: the nav badge keeps reporting every open coordinate while the page shows
+  fewer.
+- **Exposure is the existing PRD #45 demo-scenario mechanism** (USER-CHOSEN, over a build flag):
+  `?mock=truncated-backlog`, or the `uzi_mock_scenario` localStorage key. Default is no cap, so an
+  ordinary demo visitor cannot reach it by accident, and a test pins that. The scenario value is a
+  single string, so this and the OIDC demo states are mutually exclusive by construction.
+- **ONE cut, in one place**: the bulk-disposition site reads `truncated` from the re-read, mirroring
+  `judge_bulk_disposition.go`, rather than computing the flag a second time. Every assertion that
+  matters is about a surviving group's counts, never about the boolean — the boolean is exactly
+  what a wrong implementation would get right.
+- **The banner ships AS IS — no warning icon, no dismiss control.** Recorded as a decision rather
+  than left to read as an omission: it is a plain `Alert tone="warning"` whose message names the
+  two consequences (understated counts, missing groups) and the two remedies (dispose a smaller
+  slice, narrow by bucket). A dismiss control on a banner that says *"the screen is not the truth"*
+  would let a reader silence the one signal the page cannot restate.
+
+## 381. PRD #98 — §364's coverage boundary, re-derived at the wave-3 tip
+
+§364 recorded what this PRD did NOT cover, and said so as of the M8a commit. Four of its five
+bullets have moved. Re-derived here rather than edited there, so the earlier boundary stays
+readable as the honest statement it was.
+
+- **"No e2e coverage exists for this PRD at all. M8b is deferred." — NO LONGER TRUE.** M8b landed
+  narrowed to B4′ + B6′ (§375-§377), and the harness's final summary line now names the #98 phase
+  it had been running without listing.
+- **"mock↔server fidelity is NOT asserted." — CLOSED, and the named blind spots with it** (§378):
+  the fixture is authored, not snapshotted, and carries the `occurrences > run_count` case and the
+  full six-pair precedence ladder the demo fixture never exercised. **"Truncation is unreachable in
+  demo mode" is also no longer true** (§380).
+- **"`ListRunInputsForRun` is declared UNPINNED because no live test executes it." — CLOSED**, and
+  it is the mechanism working as intended: the inventory named a query nobody was looking at,
+  outside the work that motivated it. Now pinned by `TestListRunInputsForRunLiveDB` — run scoping,
+  every kind rather than `follow_up` only, oldest-first, and the cap taking the OLDEST n — with
+  four folds, each RED, hitting three distinct assertions. `consumed_at`/`created_at` remain
+  uncovered and the fixture says so. The surrounding claim still holds exactly as written: the
+  inventory proves only that someone DECLARED where a query is pinned, never that the pin is good.
+- **"`OccurrenceFileIssue` has zero tests" — NO LONGER TRUE.** `web/src/components/
+  OccurrenceFileIssue.test.tsx` exists (501 lines, 15 cases), landed on the wave-2 web branch. The
+  reasoning that made the gap matter still stands: it is the only forge-writing web path in this
+  PRD, and its security controls had been verified by line-by-line diff against RunView's filer,
+  which is how the duplication duplicated away its coverage.
+- **What is STILL open, deliberately.** Widening the query inventory beyond the judge family
+  remains open by design, one file at a time. Widening the printed-instruction extractor beyond
+  `api/cmd/uzi` is unfunded (§373). The incremental-sync path stays structurally unprovable while
+  forge-fake ignores `updated_after` (§377), and B4′ pins the row cap's FLAG and cut ordering but
+  not the `LIMIT`/`ORDER BY` interaction at scale.
+
+See [prds/98-judge-menu.md](../prds/98-judge-menu.md) for the Decision Log,
+[prds/98-judge-menu-m8-design.md](../prds/98-judge-menu-m8-design.md) for the M8 design note, and
+[prds/98-judge-menu-m8-w3-rulings.md](../prds/98-judge-menu-m8-w3-rulings.md) for the wave-3
+rulings these sections record.
