@@ -38,6 +38,8 @@ const (
 	steerNotOwner
 	// steerChatRun: chat runs are watch-only in the TUI.
 	steerChatRun
+	// steerTerminal: the run has finished, so every verb is refused server-side.
+	steerTerminal
 )
 
 type steerState2 struct {
@@ -86,6 +88,14 @@ func steerAccessFor(run apitypes.RunDTO, inputsErr error) steerAccess {
 	if run.Kind == "chat" {
 		return steerChatRun
 	}
+	// A finished run refuses every verb: SubmitInput's SECOND statement is
+	// terminalStatuses[run.Status] -> ErrRunTerminal (service.go:2243). Offering
+	// "x cancel run" on a completed run is the same lie this function exists to
+	// prevent — a shown control whose call cannot succeed — reached through a
+	// different predicate than ownership.
+	if isTerminalRunStatus(run.Status) {
+		return steerTerminal
+	}
 	if inputsErr == nil {
 		return steerAllowed
 	}
@@ -96,6 +106,14 @@ func steerAccessFor(run apitypes.RunDTO, inputsErr error) steerAccess {
 	// Any other failure (transport, 5xx) is not evidence about ownership, so the bar
 	// stays hidden until a later probe answers. Failing CLOSED is the right direction:
 	// a hidden bar is an inconvenience, a shown one that 404s is a lie.
+	//
+	// It must not be a ONE-WAY door, though, and it was. The three fetchInputsCmd call
+	// sites are the initial load, a steer result (only reachable once steering already
+	// works) and the `input`-frame path, which is itself gated on steerAllowed — so an
+	// api restart or a transient 5xx on the FIRST probe pinned access here for the rest
+	// of the session while the bar rendered "checking whether you can steer this run…",
+	// a message promising a check that could never run again. A `state` frame now
+	// re-probes while access is unknown; see the streamEventsMsg handler.
 	return steerUnknown
 }
 
@@ -106,6 +124,8 @@ func steerSuppressedReason(a steerAccess) string {
 		return "read-only: you can watch this run but not steer it — follow-ups, approvals and cancel are owner-only"
 	case steerChatRun:
 		return "read-only: chat runs are steered from the web chat surface, not here"
+	case steerTerminal:
+		return "read-only: this run has finished — follow-ups, approvals and cancel are refused once a run is terminal"
 	default:
 		return "checking whether you can steer this run…"
 	}

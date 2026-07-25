@@ -320,3 +320,104 @@ func TestSteerOutcomeUsesTheSharedPhrasing(t *testing.T) {
 		t.Errorf("a failed steer did not surface the server's reason: %q", m.detail.steer.notice)
 	}
 }
+
+// A FINISHED run must not offer verbs the server will refuse. SubmitInput's second
+// statement is terminalStatuses[run.Status] -> ErrRunTerminal, so "x cancel run" on a
+// completed run is the same lie the ownership gate exists to prevent, reached through a
+// different predicate.
+func TestSteerBarSuppressedOnATerminalRun(t *testing.T) {
+	for _, status := range []string{"completed", "failed", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			runID := "r-done"
+			run := ownedRun(runID)
+			run.Status = status
+
+			fake := &uzicli.FakeClient{}
+			m := tuiTestModel(t, fake, runID)
+			next, _ := m.Update(detailLoadedMsg{run: run})
+			m = next.(tuiModel)
+			// The ownership probe SUCCEEDS — the caller does own it — so only the
+			// terminal-status rule can suppress the bar.
+			next, _ = m.Update(runInputsMsg{runID: runID})
+			m = next.(tuiModel)
+
+			if m.detail.steer.access != steerTerminal {
+				t.Fatalf("access on a %s run = %v, want steerTerminal even though the caller owns it", status, m.detail.steer.access)
+			}
+			out := m.View().Content
+			// Assert on the KEY HINTS the bar draws, not on bare words: the suppression
+			// message itself says "follow-ups, approvals and cancel are refused", so a
+			// Contains(out, "follow-up") matches the explanation and fails on correct
+			// code. It did. The hints are what a user could actually press.
+			for _, hint := range []string{"f follow-up", "x cancel run", "y approve", "n reject"} {
+				if strings.Contains(out, hint) {
+					t.Errorf("a %s run still offers %q; every steer verb is refused server-side with ErrRunTerminal\n%s", status, hint, out)
+				}
+			}
+			if !strings.Contains(out, "has finished") {
+				t.Errorf("the terminal-run suppression is not explained on screen\n%s", out)
+			}
+			// And the keys are inert, not merely unrendered.
+			for _, k := range []string{"f", "x", "y", "n"} {
+				nm, cmd := m.handleKey(k)
+				if cmd != nil {
+					t.Errorf("key %q produced a command on a %s run", k, status)
+				}
+				if nm.(tuiModel).detail.steer.mode != steerIdle {
+					t.Errorf("key %q opened a steer mode on a %s run", k, status)
+				}
+			}
+		})
+	}
+}
+
+// steerUnknown must not be a ONE-WAY door. If the first ownership probe fails for a
+// reason that is not a 404 — an api restart, a transient 5xx — nothing else would ever
+// ask again, and the bar would render "checking whether you can steer this run…" for
+// the rest of the session: a message promising a check that cannot happen.
+func TestSteerUnknownIsRetriedOnAStateFrame(t *testing.T) {
+	runID := "r-blip"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: ownedRun(runID)})
+	m = next.(tuiModel)
+
+	// A transport failure: not evidence about ownership, so the bar fails closed.
+	next, _ = m.Update(runInputsMsg{runID: runID, err: uzicli.Exitf(uzicli.ExitUnreachable, "connection refused")})
+	m = next.(tuiModel)
+	if m.detail.steer.access != steerUnknown {
+		t.Fatalf("access after a transport failure = %v, want steerUnknown (fail closed)", m.detail.steer.access)
+	}
+	if !strings.Contains(m.View().Content, "checking whether you can steer") {
+		t.Fatal("the unknown state does not say it is still checking")
+	}
+
+	// A state frame must trigger a re-probe. Without this the message above is a
+	// promise the model cannot keep.
+	m.detail.stream = uzicli.NewRunStream(context.Background(), nil)
+	defer m.detail.stream.Close()
+	_, cmd := m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+		{Type: uzicli.RunEventTypeState, Status: "running"},
+	}})
+	if cmd == nil {
+		t.Fatal("a state frame produced no command while access was unknown; the ownership probe would never be retried and the bar would say \"checking…\" forever")
+	}
+
+	// A MESSAGE frame alone must not retry — that would re-probe on every transcript
+	// line, turning a recovery path into a per-frame REST call.
+	//
+	// Asserted on the PREDICATE rather than by invoking the returned command: the
+	// non-retry command is readStreamCmd, which blocks until the stream produces an
+	// event, so calling it here hangs the test rather than answering it. (It did: the
+	// first version of this test timed out at 6m40s.) hasStateFrame is the whole
+	// decision, so testing it directly is both faster and more precise than inferring
+	// it from a command's behaviour.
+	if hasStateFrame([]apitypes.RunEventDTO{{Type: uzicli.RunEventTypeMessage, Seq: 1, Kind: "text"}}) {
+		t.Error("a message frame reported as a state frame; the ownership re-probe would fire on every transcript line")
+	}
+	if !hasStateFrame([]apitypes.RunEventDTO{
+		{Type: uzicli.RunEventTypeMessage, Seq: 1},
+		{Type: uzicli.RunEventTypeState, Status: "running"},
+	}) {
+		t.Error("a batch containing a state frame was not recognised; the retry would never fire")
+	}
+}

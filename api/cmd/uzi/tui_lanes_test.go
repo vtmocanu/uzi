@@ -223,11 +223,18 @@ func TestWorstLaneStateIsWorstNotNewest(t *testing.T) {
 
 func TestBuildLanesGroupsByInvocationInFirstSeenOrder(t *testing.T) {
 	now := time.Now()
+	// One definition. The auditor found this as the SIXTH instance of the
+	// literal-in-diagnostic class, and my own sweep missed it because it collected
+	// literals used as VALUES while this one is a COMPARISON operand — the sweep's
+	// scope was narrower than the class it was written to catch, which is the same
+	// defect one level up.
+	const wantLabel = "write it"
+	const inst1, inst2 = "toolu_01", "toolu_02"
 	frames := []laneFrame{
 		lf(1, laneLead, "", "", 3*time.Minute, now),
-		lf(2, "coder", "toolu_01", "write it", 2*time.Minute, now),
-		lf(3, "coder", "toolu_02", "write it too", 90*time.Second, now),
-		lf(4, "coder", "toolu_01", "", time.Minute, now),
+		lf(2, "coder", inst1, wantLabel, 2*time.Minute, now),
+		lf(3, "coder", inst2, "write it too", 90*time.Second, now),
+		lf(4, "coder", inst1, "", time.Minute, now),
 		lf(5, laneLead, "", "", 30*time.Second, now),
 	}
 	lanes := buildLanes(frames)
@@ -236,8 +243,9 @@ func TestBuildLanesGroupsByInvocationInFirstSeenOrder(t *testing.T) {
 	}
 	// Two parallel invocations of the SAME role stay distinct — the whole point of
 	// keying on the invocation rather than the role.
-	if lanes[1].Key != "toolu_01" || lanes[2].Key != "toolu_02" {
-		t.Errorf("lane keys = %q/%q, want toolu_01/toolu_02 — two parallel invocations of one role must not collapse into one lane", lanes[1].Key, lanes[2].Key)
+	if lanes[1].Key != inst1 || lanes[2].Key != inst2 {
+		t.Errorf("lane keys = %q/%q, want %q/%q — two parallel invocations of one role must not collapse into one lane",
+			lanes[1].Key, lanes[2].Key, inst1, inst2)
 	}
 	if lanes[0].Key != laneLead {
 		t.Errorf("first lane key = %q, want %q (instance-less frames coalesce per role)", lanes[0].Key, laneLead)
@@ -250,7 +258,7 @@ func TestBuildLanesGroupsByInvocationInFirstSeenOrder(t *testing.T) {
 	if !lanes[0].LastActivity.Equal(frames[4].CreatedAt) {
 		t.Errorf("lead lane LastActivity = %v, want the newest frame's %v", lanes[0].LastActivity, frames[4].CreatedAt)
 	}
-	if lanes[1].Label != "write it" {
-		t.Errorf("lane label = %q, want %q", lanes[1].Label, "write it")
+	if lanes[1].Label != wantLabel {
+		t.Errorf("lane label = %q, want %q", lanes[1].Label, wantLabel)
 	}
 }

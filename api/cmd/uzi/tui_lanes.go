@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // Agent lanes and the per-lane state dot (PRD #112 D5), ported from the web so the
@@ -255,11 +256,16 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	return crewIdle
 }
 
-// isTerminalRunStatus mirrors the DB CHECK's terminal set. It is the same set
-// uzicli.IsTerminalRunStatus holds; kept as a local so this file's ladder reads against
-// one literal list, matching the web's own isTerminalStatus.
+// isTerminalRunStatus DELEGATES to uzicli rather than restating the set.
+//
+// It used to hold its own literal list "so this file's ladder reads against one literal
+// list" — which bought local readability and paid for it with a third definition of the
+// terminal statuses (run.go's terminalRunStatuses map, uzicli.IsTerminalRunStatus, and
+// this) with nothing pinning them equal. That is precisely the drift the package-main
+// layout decision made a REVIEW property rather than a compile property, so the answer
+// is to call the exported one that is already in scope, not to add a fourth test.
 func isTerminalRunStatus(status string) bool {
-	return status == "completed" || status == "failed" || status == "cancelled"
+	return uzicli.IsTerminalRunStatus(status)
 }
 
 // worstLaneState is the rollup dot for a group of lanes: the WORST state wins, so one

@@ -594,21 +594,22 @@ func actorCell(m apitypes.MessageDTO) string {
 // offset pinned at 58 throughout, which is why the existing alignment test could
 // not see it. Folded to a space, which preserves the word break the tab was doing.
 //
-// DEL. 0x7f is outside sanitizeTTY's C0 (<0x20) and C1 (0x80–0x9f) ranges, so it
-// survives too. It advances no column but some terminals draw a glyph for it, so it
-// is dropped rather than folded.
+// DEL used to need handling here too, and NO LONGER DOES. This paragraph read "0x7f
+// is outside sanitizeTTY's C0 (<0x20) and C1 (0x80–0x9f) ranges, so it survives too",
+// which described the predicate PRD #112 M3 replaced: sanitizeTTY now tests
+// unicode.IsControl, which is true for 0x7f, so compactText strips DEL before this
+// Map ever sees it. The `case 0x7f: return -1` arm was dead — deleting it reddened
+// nothing — and is gone. The tab arm stays live, because sanitizeTTY spares tab
+// deliberately.
 //
-// Both are cosmetic — no cursor motion, no erase, no OSC, and `\n` cannot survive
+// The tab fold is cosmetic — no cursor motion, no erase, no OSC, and `\n` cannot survive
 // compactText — but the actor column's whole purpose is to stay aligned down a
 // `uzi run logs --follow` stream, and model-authored prose is exactly where a stray
 // tab comes from.
 func cellText(s string) string {
 	s = strings.Map(func(r rune) rune {
-		switch r {
-		case '\t':
+		if r == '\t' {
 			return ' '
-		case 0x7f:
-			return -1
 		}
 		return r
 	}, compactText(s))

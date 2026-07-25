@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -392,7 +393,10 @@ func TestTUIDetailEscReturnsToBoard(t *testing.T) {
 // state rather than calling the helpers directly, so it covers the wiring too.
 func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	now := time.Now()
-	const nasty = "we\x1b[2Jare\u202Efine\x07"
+	// Hostile bytes at the FRONT: capCell/Plain truncate to 8-60 runes, so a payload at
+	// the tail can be legitimately cut and produce a false green. shortInstanceID keeps
+	// only 8 runes, which is the tightest budget any of these fixtures meets.
+	const nasty = "\x1b[2J\u202E\x07\x01safe"
 	runID := "88888888-1111"
 
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
@@ -414,27 +418,86 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	assertNoRawControls(t, "detail", detail.View().Content)
 }
 
-// assertNoRawControls fails on any control byte the UI did not put there itself.
-// Lipgloss legitimately emits ESC-led SGR sequences, so those are skipped and
-// everything else — BEL, the C1 range, DEL, and every Cf format char — is not.
+// assertNoRawControls fails on anything in a rendered frame that is not printable text
+// or a legitimate SGR colour sequence.
+//
+// IT USED TO BE BLIND TO MOST OF ITS OWN CLASS, and the fixture it shipped with was in
+// the blind spot. Measured against the old loop, 11 of 14 hostile inputs went unflagged:
+// ESC[2J, ESC[H, ESCc, ESC[2K, U+202A, U+2066, U+200F, U+00AD, U+202E-after-ESC[, and
+// bare 0x01 / 0x0b. Only a lone U+202E, a lone BEL, and an OSC's trailing BEL were seen.
+// The test passed for a real reason — sanitizeTTY genuinely strips these — but the
+// assertion could not fail on them, so it was not what held the property. It caught the
+// unsanitized-instance-id defect via U+202E and BEL, the two things it could see.
+//
+// Four causes, all fixed here:
+//
+//  1. It skipped from ESC to the first ASCII letter, which is a blanket amnesty: J, H,
+//     K and c are letters, so every cursor/erase/reset sequence was consumed as though
+//     it were lipgloss styling. Now only ESC [ [0-9;:]* m — an SGR sequence — is
+//     allowed, and everything else is a finding. That turns "skip to a letter" (a
+//     pattern) into "only SGR may appear" (an identity).
+//  2. The format-character arm was a three-codepoint list while production strips all
+//     of unicode.Cf. Now the same predicate. This is not circular: it asserts on the
+//     rendered FRAME, not on sanitizeTTY's return value, so it stays end to end.
+//  3. The control arm never tested r < 0x20 generally, so most of C0 was unflagged.
+//  4. The escape-state check ran BEFORE the control/Cf arms, so anything between ESC
+//     and a letter was sheltered. Order is now reversed.
+//
+// CAVEAT, and treat a red here as information rather than a defect: nobody has proven
+// the frames contain ONLY SGR. If lipgloss v2 starts emitting OSC 8 hyperlinks, this
+// goes red on legitimate output. Widen the allowlist with a named reason — never
+// restore the blanket skip, which is what made it blind.
+//
+// RESIDUAL, stated rather than papered over: the steer bar, help overlay and quit modal
+// are not driven by any caller of this, so their draws are unasserted. That decay is
+// bounded and visible (a view nobody drove), unlike a guard that silently stops
+// matching. And this says nothing about structural markdown spoofing — "# VERDICT:
+// APPROVED" is valid markdown, not a hostile byte; provenanceBox handles that and is
+// tested separately.
 func assertNoRawControls(t *testing.T, where, out string) {
 	t.Helper()
-	inEsc := false
-	for _, r := range out {
-		switch {
-		case r == 0x1b:
-			inEsc = true
-		case inEsc:
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
+	rs := []rune(out)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if r == 0x1b {
+			if end, ok := sgrSequenceEnd(rs, i); ok {
+				i = end // a legitimate colour sequence; skip past it
+				continue
 			}
-		case r == '\n' || r == '\t':
-		case r == 0x07 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-			t.Errorf("%s view emitted a raw control byte %U from untrusted text", where, r)
-		case r == 0x202E || r == 0x200B || r == 0xFEFF:
-			t.Errorf("%s view emitted a format character %U from untrusted text (a bidi override can make a label read as something else)", where, r)
+			t.Errorf("%s view emitted a NON-SGR escape sequence at rune %d (%q…) — only ESC[…m colour sequences are legitimate here; a cursor-move, erase, reset or OSC sequence in a rendered frame is either a bug or an injection",
+				where, i, string(rs[i:min(i+8, len(rs))]))
+			continue
+		}
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if unicode.IsControl(r) {
+			t.Errorf("%s view emitted a raw control character %U from untrusted text", where, r)
+		}
+		if unicode.In(r, unicode.Cf) {
+			t.Errorf("%s view emitted a format character %U from untrusted text (a bidi override can make a label read as something it is not, and zero-width runes steal column budget while drawing nothing)", where, r)
 		}
 	}
+}
+
+// sgrSequenceEnd reports the index of the final rune of a legitimate SGR sequence
+// starting at i (ESC [ [0-9;:]* m), and whether one is there at all.
+func sgrSequenceEnd(rs []rune, i int) (int, bool) {
+	j := i + 1
+	if j >= len(rs) || rs[j] != '[' {
+		return 0, false
+	}
+	for j++; j < len(rs); j++ {
+		c := rs[j]
+		if c == ';' || c == ':' || (c >= '0' && c <= '9') {
+			continue
+		}
+		if c == 'm' {
+			return j, true
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 // The stream reader hands over a BATCH, so a burst of frames costs one re-render

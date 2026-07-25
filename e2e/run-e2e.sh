@@ -1459,6 +1459,18 @@ pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve rout
 # subscribe and the steer.
 say "PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_message frame"
 
+# MEASURE that Node sends no Origin, rather than asserting it by omission. The leg's
+# whole point is the empty-Origin exemption (coder/websocket accept.go:228-232) — if a
+# future Node emitted an Origin equal to the Host, every assertion below would still
+# pass while never exercising the property the leg is named after. The probe opens a
+# throwaway HTTP listener in-process, points a WebSocket at it, and reports the Origin
+# header the runtime actually sent.
+ORIGIN_PROBE='const http=require("http");const srv=http.createServer();srv.on("upgrade",(req,sock)=>{ console.log("ORIGIN="+JSON.stringify(req.headers.origin===undefined?null:req.headers.origin)); sock.destroy(); srv.close(); process.exit(0); });srv.listen(0,"127.0.0.1",()=>{ const p=srv.address().port; const ws=new WebSocket("ws://127.0.0.1:"+p+"/probe",{headers:{Authorization:"Bearer probe"}}); ws.addEventListener("error",()=>{}); });setTimeout(()=>{ console.log("ORIGIN_PROBE_TIMEOUT"); process.exit(1); },10000);'
+ORIGIN_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$ORIGIN_PROBE" 2>&1 || true)"
+[ "$ORIGIN_OUT" = "ORIGIN=null" ] \
+  || fail "the agent runtime sends an Origin header on a headers-only WebSocket (probe: ${ORIGIN_OUT:-<none>}) — the Bearer leg below would then pass WITHOUT exercising the empty-Origin exemption it exists to prove; see PRD #112 D2"
+pass "the agent runtime sends NO Origin on a Bearer WebSocket — the empty-Origin exemption is genuinely what this leg exercises"
+
 # Leg 3 CONSUMES the uzc_ token Leg 2 minted, and consumes it inside a command
 # substitution. Guard it HERE, at top level, outside any subshell: under `set -u` an
 # absent $UZI_TOKEN_VAL would fire inside the `$( ... )`, the subshell would exit 1, and
@@ -1477,6 +1489,12 @@ wait_status "$RUN_WSB" awaiting_approval
 # NEGATIVE control FIRST (run still parked, so a valid run id — the ONLY rejection reason
 # is the junk credential): a bogus Bearer must be refused. Without this the positive
 # assertion below would also pass against a route that admits anything.
+#
+# It is only HALF a control on its own: an "error" event fires for ANY connect failure —
+# the agent container being down, node missing, a syntax error in the probe — so this
+# passing means "the socket did not open", not "the gate refused it". It is valid only
+# PAIRED with the positive assertion below, which cannot pass unless the route really
+# works. Neither is evidence alone.
 WSB_NEG_PROBE='const wsurl=process.argv[1];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Authorization:"Bearer uzc_not-a-real-token"}});ws.addEventListener("open",()=>finish(1,"OPENED_WITH_BOGUS_BEARER"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
 if NEGB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WSB")"; then
   pass "bogus-Bearer /api/ws upgrade is rejected ($NEGB_OUT) — the RequireUser bearer gate is real"
@@ -1503,7 +1521,7 @@ else
   #         fault is in the socket or frame path, not the gate.
   # 403 is deliberately NOT listed: the origin check lives inside websocket.Accept, which
   # this probe never reaches, so it can never be the answer here.
-  fail "no live /api/ws run_message frame over Bearer (probe: ${WSB_OUT:-<none>}) — read http_probe_status: 401 = authN refused (is /ws back in the cookie-only tail?), 404 = per-run authz refused, 426 = route healthy so look at the socket/frame path, TIMEOUT with no status = the upgrade succeeded but no frame arrived"
+  fail "no live /api/ws run_message frame over Bearer (probe: ${WSB_OUT:-<none>}). Read the probe output first: APPROVE_STATUS=<n> means the socket opened and the Bearer approve was refused (409 = the run already left the gate — a timing problem, not an auth one); APPROVE_ERR=<msg> means the approve request never completed; WS_ERR carries http_probe_status where 401 = authN refused (is /ws back in the cookie-only tail?), 404 = per-run authz refused, 426 = route healthy so look at the socket/frame path; TIMEOUT with no status = the upgrade succeeded but no frame arrived; probe:<none> means docker compose exec itself failed (agent down, no node, bad JS) and NOTHING about auth was tested"
 fi
 # The probe's Bearer approve drove the run: confirm it advances to completed.
 wait_status "$RUN_WSB" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"

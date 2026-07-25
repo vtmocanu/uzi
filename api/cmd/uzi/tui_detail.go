@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
@@ -332,22 +333,16 @@ func padVisual(s string, n int) string {
 	return s + strings.Repeat(" ", n-w)
 }
 
-func visualWidth(s string) int {
-	w, inEsc := 0, false
-	for _, r := range s {
-		switch {
-		case r == 0x1b:
-			inEsc = true
-		case inEsc:
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
-			}
-		default:
-			w++
-		}
-	}
-	return w
-}
+// visualWidth is lipgloss's own width measurement.
+//
+// It was a hand-rolled rune count that skipped ANSI sequences, and that was wrong in a
+// way a CLI table can tolerate but a two-column TUI cannot: a CJK or emoji rune occupies
+// TWO terminal columns and was counted as one, so every such rune in a transcript walked
+// the split pane's right column one place left. lipgloss.Width delegates to
+// ansi.StringWidth, which is both ANSI-aware and wide-rune-aware, and lipgloss v2 is
+// already a direct dependency — the correct implementation was linked into the binary
+// the whole time.
+func visualWidth(s string) int { return lipgloss.Width(s) }
 
 func itoa(n int) string {
 	if n == 0 {

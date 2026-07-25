@@ -289,6 +289,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		inputChanged := m.detail.applyEvents(msg.events)
+		// A `state` frame is the retry trigger for a stuck ownership probe: if the
+		// first probe failed for a reason that was not a 404, access is steerUnknown
+		// and nothing else would ever ask again.
+		if m.detail.steer.access == steerUnknown && hasStateFrame(msg.events) {
+			return m, tea.Batch(readStreamCmd(msg.runID, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
+		}
 		if inputChanged && m.detail.steer.access == steerAllowed {
 			// PRD #95: an `input` frame says the steer queue changed (a follow-up was
 			// consumed). It carries no data — it is a prompt to re-read — so the
@@ -438,4 +444,14 @@ func fmtErr(err error) string {
 		return ""
 	}
 	return cellText(fmt.Sprintf("%v", err))
+}
+
+// hasStateFrame reports whether a batch carries an authoritative run-state frame.
+func hasStateFrame(evs []apitypes.RunEventDTO) bool {
+	for _, ev := range evs {
+		if ev.Type == uzicli.RunEventTypeState {
+			return true
+		}
+	}
+	return false
 }

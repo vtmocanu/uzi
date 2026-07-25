@@ -517,10 +517,28 @@ the disposition/short-id resolution in `review.go`, the roster selection in
 `run.go` — none of which a subpackage could reach. It shipped as
 `api/cmd/uzi/tui_*.go`, in `package main`, file-level separation instead of
 package-level. That is a tradeoff worth recording honestly rather than
-re-describing as the original plan: D6/D7 hold *by construction* now (the
-helpers are simply reachable, so "the TUI and the plain commands cannot
-drift" needs no discipline to keep true), at the cost of the TUI having no
-package boundary of its own — see R3, also corrected below.
+re-describing as the original plan.
+
+**Split the claim in two, because "by construction" is true of only half of it
+and a reader who sees the MR say "review property" will otherwise call it a
+contradiction.** REACHABILITY holds by construction: the helpers are in-package,
+so no future contributor has a justification for writing a second `sanitizeTTY`
+or a second short-id resolver — the reason duplicates get written is that the
+original is out of reach, and it is not. ENFORCEMENT is a review property:
+nothing *makes* a new render path call them, and a raw `sb.WriteString(dto.Field)`
+compiles. `tui_d7_guard_test.go` narrows that gap at the syntax level (direct
+writes and concatenations, including the internal field names the lane rail uses)
+and the frame tests catch the indirection case the guard cannot; neither is a
+compile-time guarantee, and the PRD should not claim one.
+
+**Reopen trigger, so the decision is revisitable rather than permanent:** if the
+helpers are ever extracted into an importable package, extract *all* of them. The
+half-measure was priced and rejected — leaving `renderReview`, `resolveRecID` and
+`approveSelection` behind means the subpackage still would not compile, so a
+partial extraction buys nothing and costs a refactor.
+
+The cost of the shipped choice is that the TUI has no package boundary of its own
+— see R3, also corrected below.
 
 M1 is a small, security-sensitive backend MR that lands on its own so a reviewer
 reasons about the origin-gate change in isolation (not buried in a UI diff). M2
