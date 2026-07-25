@@ -23,10 +23,16 @@ describe("formatTokens", () => {
     expect(formatTokens(18_400_000)).toBe("18.40M");
   });
 
-  it("keeps M all the way to just under 1B (the boundary #77 was about)", () => {
+  it("keeps M all the way to just under 1B, and pins the known top-of-tier wart", () => {
     expect(formatTokens(999_000_000)).toBe("999.00M");
-    // 999.99M must NOT tip into B — the tier is chosen from the raw value.
+    // 999_990_000 / 1e6 is EXACTLY 999.99, so this pins the tier but proves nothing
+    // about rounding. The pair below is the real edge: the tier is chosen from the
+    // RAW value, so the top of M rounds up past its own unit rather than tipping
+    // into B. Documented in formatTokens.ts; pinned here so it cannot drift silently.
     expect(formatTokens(999_990_000)).toBe("999.99M");
+    expect(formatTokens(999_994_999)).toBe("999.99M");
+    expect(formatTokens(999_995_000)).toBe("1000.00M"); // known wart, not a typo
+    expect(formatTokens(999_999_999)).toBe("1000.00M"); // ← the shape #77 is named after
   });
 
   it("renders ≥1B with two decimals and a B suffix (#77)", () => {

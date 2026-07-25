@@ -8,19 +8,29 @@
 //   48_200       → "48.2k"
 //   188_000      → "188.0k"
 //   1_280_000    → "1.28M"
-//   5_400_000_000→ "5.40B"
-//   2.3e12       → "2.30T"
+//   5_400_000_000 → "5.40B"
+//   2_300_000_000_000 → "2.30T"
 //
 // The M scale used to be the top of the ladder, so a run in the billions rendered
 // as "5400.00M" (issue #77) — technically correct, unreadable in a column, and
 // increasingly common as runs get longer. B and T continue the same two-decimal
 // convention rather than introducing a third.
 //
-// NOTE on an adjacent wart, left ALONE deliberately: each tier's upper boundary
-// can still round up past its own unit — 999_999 renders "1000.0k", not "1.00M",
-// because the tier is chosen from the raw value before `toFixed` rounds it. Same
-// defect class one rung down, but fixing it changes what a handful of existing
-// values render as, which is a behaviour change nobody asked for in #77's scope.
+// KNOWN WART, left alone deliberately — and it is ON THE TIERS THIS ADDED, not
+// only below them. The tier is chosen from the RAW value, then `toFixed` rounds
+// within it, so each tier's top edge can still round up past its own unit:
+//
+//   999_999           → "1000.0k"    (k→M)
+//   999_995_000       → "1000.00M"   (M→B)  ← the exact shape #77 is named after
+//   999_999_999       → "1000.00M"
+//   999_995_000_000   → "1000.00B"   (B→T)
+//
+// So the B/T tiers below shrink the defect rather than removing it: the old
+// two-tier function rendered "1000.00M" for the whole 1e9→2e9 decade, this
+// renders it for a 5,000-token window at the top of M. Fixing it properly means
+// choosing the tier from the ROUNDED value, which changes what a handful of
+// existing values render as — a behaviour change outside #77's scope, pinned by
+// test rather than left as prose.
 export function formatTokens(n: number): string {
   if (!Number.isFinite(n) || n < 0) n = 0;
   n = Math.round(n);

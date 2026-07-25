@@ -5733,7 +5733,10 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   frames, clamped ≥0), per-agent table, and finish-line tokens from the replayed message stream
   (`web/src/lib/runUsage.ts`, a pure reduction re-run as messages grow → live fold-in, no
   accumulator). `formatTokens`/`formatCost` (Decision 10) are the single shared formatters — adaptive
-  (k under 1M, M above); a sub-1M list total showing "640.0k" (not "0.64M") is correct, not drift.
+  (k under 1M, then M/B/T above, two decimals each — **corrected 2026-07-25, issue #77**: this line
+  read "M above", which was true when written and became false once B and T were added; a
+  rebuild-from-specs off the old wording reproduces the two-tier formatter that rendered billions as
+  "5400.00M"); a sub-1M list total showing "640.0k" (not "0.64M") is correct, not drift.
   Cost is secondary and a $0 cost renders "—" (Decision 8). The dashboard's "Your usage" is for
   everyone; the factory total + per-user table (share bars by total tokens) render only when the
   admin view was fetched — a non-admin never calls the admin endpoint. **Caveat:** the run-view strip
