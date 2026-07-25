@@ -711,7 +711,8 @@ and identically for window 2, arming `probeB` after the Undo:
 
 ```bash
 # ---- window 2: Undo sticks ----------------------------------------------
-# NB: `apidelete` DOES NOT EXIST — see the note below. Inline curl, per :3843.
+# NB: `apidelete` DOES NOT EXIST and, per the wave-3 ruling, never will — see the struck
+# ruling below. Inline curl. (This sketch belongs to B6a, which the narrowing DROPPED.)
 curl -fsS -b "$JAR" -X DELETE "$BASE/api/runs/$J_RUN/review/recommendations/$F_REC/disposition" \
   -H "X-CSRF-Token: $(csrf)" >/dev/null || fail "the human Undo failed"
 close_issue "$PROBE_B_IID"
@@ -741,14 +742,30 @@ cannot pass while the poller is dead, cannot pass while the poller is merely slo
 no `apidelete` function in `run-e2e.sh`.** It is named in the `retry_read` comment at `:235`
 (*"the write helpers (apipost/apiput/apipatch/apidelete, fake_post) … are deliberately NOT
 wrapped"*) but never defined; the harness's single DELETE is an inline
-`curl -fsS -b "$JAR" -X DELETE … -H "X-CSRF-Token: $(csrf)"` at `:3843`. A dangling reference
+`curl -fsS -b "$JAR" -X DELETE … -H "X-CSRF-Token: $(csrf)"` against
+`/api/me/secrets/anthropic_token/` in the PRD #104 token-binding phase — cited by PHASE because
+the `:3843` this line used to carry now points at unrelated text, which is the very defect the
+paragraph is about. A dangling reference
 to a helper that was never written — the same class as the registry notes in Part C, in the
 harness's own documentation.
 
-**Ruling: define `apidelete` properly** (matching `apipost`/`apiput`, CSRF header included,
+~~**Ruling: define `apidelete` properly** (matching `apipost`/`apiput`, CSRF header included,
 deliberately *not* `retry_read`-wrapped) and use it. That makes the `:235` comment true rather
 than aspirational, and it is three lines. Do **not** rewrite `:3843` to use it in this MR —
-that is an unrelated phase, and touching it is noise a reviewer has to read.
+that is an unrelated phase, and touching it is noise a reviewer has to read.~~
+
+> 🔴 **SUPERSEDED AND STRUCK, 2026-07-25.** The architect's wave-3 ruling (§2.5 of
+> `98-judge-menu-m8-w3-rulings.md`) reversed this, and `a01787f2` implemented the reversal:
+> **correct the comment, do not define the helper.** The reason the reversal is right is that
+> this ruling was made *in service of B6a's Undo window*, and the wave-3 narrowing dropped
+> B6a — so defining `apidelete` would have shipped dead code **plus** a comment that had just
+> become true about a function nobody calls. That is strictly worse than the dangling
+> reference it was meant to fix.
+>
+> **Left struck rather than deleted, because this section is the one a future B6-matrix author
+> would read**, and an instruction that silently vanished teaches nothing about why. What
+> landed: `apidelete` removed from the `retry_read` comment's helper list, and the list's
+> line-number citations replaced by phase names.
 
 Three more helpers, all following existing patterns:
 
@@ -925,7 +942,7 @@ Revised for pass 3: B8 removed, B6a added, B9/B10 moved to Part C.
 | | |
 |---|---|
 | forge-fake `/_e2e/issues/{iid}/state` mutator + `close_issue` | 1h |
-| `apidelete` + `disposition_set_at` + `wait_disposition` helpers | 0.5h |
+| ~~`apidelete`~~ + `disposition_set_at` + `wait_disposition` helpers (apidelete STRUCK — see §above) | 0.5h |
 | B1-B3 | 2h |
 | B4 (seed, containment, delete-and-recheck control) | 1.5h |
 | B5 | 2h |
