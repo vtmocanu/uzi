@@ -264,3 +264,68 @@ This also explains why an operator probe on 2026-07-25 found a *clean* launch: i
 4. Independently: the `web-ux` builtin template still carries **no `--no-sandbox` note**, so an agent that never reads an error hint has nothing to go on.
 
 (1) is the recommendation; the shim's header assertion must be corrected in the same change, since it is currently false.
+
+## FIXED 2026-07-25 — option (1) implemented (branch `fix/120-shim-path-shadowing`)
+
+**The change (one line of behaviour).** `agent/templates/entrypoint.sh`, non-root branch:
+`export UZI_RUNNER_PATH="$PATH"` — placed **after** the existing
+`unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR`, so the operator fail-safe still
+clears any stray value and the value that survives is the entrypoint's own. The entrypoint
+runs **before** the CMD, so `$PATH` there is still the untouched image PATH — the identical
+value `IMAGE_PATH` captures on the root path. `runnerPath()` now returns the image PATH in
+**both** modes, so `/usr/local/bin`'s shim is the only PATH-resolvable `agent-browser`
+again.
+
+**Why the `:69` unset is preserved, not weakened.** That unset exists so a stray
+`UZI_UID_SPLIT=1` on a non-root deploy cannot make the single-uid worker setpriv-wrap every
+runner spawn (EPERM ⇒ DoS). `uidSplitActive()` keys on `UZI_UID_SPLIT` **alone** —
+`UZI_RUNNER_PATH` activates nothing — so re-exporting it leaves the single-uid posture
+untouched. It also widens nothing: single-uid means worker == runner, and that PATH was
+already the worker's own. `UZI_RUNNER_TMPDIR` is deliberately **not** re-exported —
+`controller/internal/kube/render.go` sets a pod-spec `TMPDIR` for docker workers and relies
+on this branch leaving it unset.
+
+**Compose is unaffected by construction:** every added line sits inside the
+`if [ "$uid" != "0" ]` block, which a root start never enters. The root path's bytes are
+unchanged.
+
+**Also corrected (the false doc, per the same-commit rule).** The shim header in
+`agent/bin/agent-browser` asserted the layout alone made a bare `agent-browser` hit the
+shim. It now states the npm-CMD mechanism, that the claim was false on the primary runtime,
+and that the guarantee lives in the **entrypoint** — plus the residual: a provisioned
+`toolEnv.PATH` (PRD #18 M3) still REPLACES the agent PATH in `buildSdkEnv` and could shadow
+the shim again. The same false claim in both Dockerfile comments, and the stale
+"single-uid ⇒ falls back to the worker PATH" notes in `runner-uid.ts`,
+`toolchain-preflight.ts`, `sdk-env.ts` and `docs/proc-hardening.md`, were corrected too.
+
+**Tests (3 new; the 2 ENTRYPOINT tests are mutation-proven, the third is a model test).** `agent/test/runner-uid.test.ts` pins the resolution
+order (which dir a bare `agent-browser` resolves from) across pre-fix, post-fix and compose
+PATH shapes. `agent/test/templates-guardrails.test.ts` adds a structural test (pin after the
+unset, before the exec; neither of the other two vars re-exported) and one that **executes**
+the real non-root branch with only the two absolute-path constants (`id`, `tini`) stubbed,
+asserting a stray `UZI_RUNNER_PATH` is replaced by the image PATH while stray
+`UZI_UID_SPLIT`/`UZI_RUNNER_TMPDIR` stay cleared. Removing the pin turns both RED.
+
+**Not verifiable locally.** No local gate can prove the fix on the real runtime — that needs
+a release + ArgoCD roll + a worker on the new image. M5 (a clean web-ux run) remains open and
+is the only thing that closes this.
+
+**Milestones:** M2 done for the web-ux/shim path (and agent-agnostically: every runner child
+gets the corrected PATH, so a coder rasterizing SVG→PNG via chromium is covered by the same
+shim). M6 partially done (unit coverage + docs; no `specs/ai.md` entry — see below). M3/M4/M5
+still open.
+
+**M3 recommendation — do NOT ride the `--no-sandbox` template note on this fix.** The
+measured cost without it was 4 tool calls with the flag supplied by agent-browser's own error
+hint, and a note would create a second source of truth for a value the shim owns. Worse, the
+obvious phrasing teaches the agent to pass `--args "--no-sandbox"` — and agent-browser's
+README documents `--args` and `AGENT_BROWSER_ARGS` as *the same single list-valued setting*,
+not additive, so an explicit `--args` would drop `--disable-dev-shm-usage` (64MB `/dev/shm`).
+That is precisely what run `1dfc65b4` did on its recovery. If M3 adds a note anyway, phrase it
+as *"the runtime already injects `--no-sandbox`; do not pass `--args` unless you repeat the
+full list"*. Better still, let M5 confirm the flag now arrives by construction first.
+
+**Follow-up not taken here:** a `specs/ai.md` entry for "the entrypoint pins the runner PATH
+in both modes". Skipped deliberately — `specs/ai.md` is append-only at the tail and several
+sessions are live in this repo, so claiming a section number now risks a collision. Worth
+adding on the landing rebase.
