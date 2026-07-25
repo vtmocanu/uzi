@@ -130,14 +130,26 @@ type persistFailEntry struct {
 	firstAt time.Time // start of the CURRENT streak (a reset restarts it)
 	lastAt  time.Time // last failure — TTL eviction only
 	lastSeq int32     // runs.last_seq as the last failure observed it
+	// stopReqAt is when a stop verdict was enqueued for this run (M5), zero until
+	// then. It is the escalation clock, and it is deliberately NOT reset by a class
+	// or seq change: those restart the EVIDENCE, while this records that we already
+	// acted. A restart loses it, which forgets the escalation and restarts the clock
+	// — a delay, never a double kill (and the verdict row itself survives in
+	// run_user_inputs, so the stop is not lost, only our bookkeeping about it).
+	stopReqAt time.Time
+	// declineLoggedAt rate-limits the "auto-stop is holding" line to once per
+	// autoStopWindow. A wedged run is evaluated every sweep tick for as long as it
+	// lives, and an unthrottled line would be hours of identical warnings.
+	declineLoggedAt time.Time
 }
 
 // persistFailStats is the read-only view of an entry.
 type persistFailStats struct {
-	kind    persistFailKind
-	streak  int
-	firstAt time.Time
-	lastSeq int32
+	kind      persistFailKind
+	streak    int
+	firstAt   time.Time
+	lastSeq   int32
+	stopReqAt time.Time
 }
 
 // persistFailTracker is the whole of PRD #108 Phase 2's state. It is IN-PROCESS
@@ -247,7 +259,97 @@ func (t *persistFailTracker) stats(runID uuid.UUID) persistFailStats {
 	if !ok {
 		return persistFailStats{}
 	}
-	return persistFailStats{kind: e.kind, streak: e.streak, firstAt: e.firstAt, lastSeq: e.lastSeq}
+	return statsOf(e)
+}
+
+func statsOf(e *persistFailEntry) persistFailStats {
+	return persistFailStats{kind: e.kind, streak: e.streak, firstAt: e.firstAt, lastSeq: e.lastSeq, stopReqAt: e.stopReqAt}
+}
+
+// persistFailCandidate is one run the auto-stop evaluator should look at, with its
+// state snapshotted under the lock.
+type persistFailCandidate struct {
+	runID uuid.UUID
+	persistFailStats
+}
+
+// candidates returns every run whose streak has reached the kill threshold on both
+// legs, as VALUE snapshots.
+//
+// The candidate set is the in-process map and NOT ListActiveRunsForHealth, which is
+// what makes a wedged CHAT run covered: that query ends `AND kind <> 'chat'`, while
+// agent/src/chat-runner.ts builds the same MessageBatcher against the same
+// /messages route, so a chat run wedges identically. It is also why the evaluator
+// costs zero queries in the common case — this map is normally empty.
+func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow time.Duration) []persistFailCandidate {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []persistFailCandidate
+	for id, e := range t.fail {
+		if e.streak >= minStreak && !e.firstAt.IsZero() && now.Sub(e.firstAt) >= minWindow {
+			out = append(out, persistFailCandidate{runID: id, persistFailStats: statsOf(e)})
+		}
+	}
+	return out
+}
+
+// peersSucceeding counts runs OTHER than runID that persisted messages inside the
+// window. This is the outage-vs-poison discriminator, and it is the whole safety
+// argument for killing anything at all.
+//
+// Membership, stated because every clause is load-bearing:
+//   - a member is any OTHER run id — including a chat run, since chat appends ride
+//     the same route and the same recorder. Deliberate: a healthy chat proves the
+//     write path works, which is the only question this asks.
+//   - runID itself NEVER counts, not even for its own pre-streak successes.
+//     recordSuccess writes lastOK[runID], so the exclusion has to be explicit here.
+//   - "active" is not "succeeding": a neighbour mid-long-build appends nothing and
+//     is not a member. Only recordSuccess writes lastOK, which enforces that.
+//   - a run that appended one second past the window is not a member. Strict recency.
+//
+// When the answer is zero the rule is FLAG AND DO NOT KILL — permanently, with no
+// fallback and no timeout into killing (Decision 5). An api-wide outage drives every
+// run's appends to fail, so nothing enters lastOK and the count is zero: the outage
+// case and the lonely-instance case are the SAME PREDICATE, not two mechanisms.
+func (t *persistFailTracker) peersSucceeding(runID uuid.UUID, now time.Time, window time.Duration) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for id, at := range t.lastOK {
+		if id == runID {
+			continue
+		}
+		if now.Sub(at) <= window {
+			n++
+		}
+	}
+	return n
+}
+
+// markStopRequested stamps the escalation clock. No-op if the entry is gone (the
+// run recovered or was evicted between the decision and this call).
+func (t *persistFailTracker) markStopRequested(runID uuid.UUID, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e, ok := t.fail[runID]; ok {
+		e.stopReqAt = now
+	}
+}
+
+// shouldLogDecline reports whether the "auto-stop is holding" line is due for this
+// run, stamping it when it is. Rate-limited to once per `every`.
+func (t *persistFailTracker) shouldLogDecline(runID uuid.UUID, now time.Time, every time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e, ok := t.fail[runID]
+	if !ok {
+		return false
+	}
+	if !e.declineLoggedAt.IsZero() && now.Sub(e.declineLoggedAt) < every {
+		return false
+	}
+	e.declineLoggedAt = now
+	return true
 }
 
 // prune drops entries untouched for persistFailTTL. Called once per sweep tick.

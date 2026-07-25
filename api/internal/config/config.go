@@ -330,6 +330,23 @@ type Config struct {
 	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
 	ProposalConfirmStuckTimeout time.Duration
 
+	// AutoStopEnabled is the operator kill switch for PRD #108 M5's auto-stop of a
+	// run whose message writes are in a confirmed permanent-failure loop
+	// (UZI_AUTOSTOP_ENABLED, default true).
+	//
+	// It exists as env rather than as an instance setting for two reasons. Decision 8
+	// refuses to subordinate auto-stop to health_enabled, which would otherwise leave
+	// nothing short of a redeploy to stop a misfiring kill switch; and an automatic
+	// DESTRUCTIVE behaviour should not depend for its off switch on the database it
+	// might be misbehaving against. It also expresses the PRD's own "ship M4 (flag
+	// only) and hold M5" fallback as configuration rather than as a revert. Phase 1
+	// set the precedent with UZI_HOME_RECLAIM.
+	//
+	// It is a control over a destructive action, so — like UZI_REGISTRATION_ENABLED
+	// and unlike the tuning knobs — a set-but-malformed value aborts boot rather than
+	// silently taking the default.
+	AutoStopEnabled bool
+
 	// IssueFilingStuckTimeout is how long a recommendation_filed_issues claim may sit
 	// with filing_since set but filed_at NULL before the sweeper DELETEs it (PRD #68 M3):
 	// recovery for a file handler killed after the claim but before it settled. This
@@ -562,6 +579,16 @@ func Load() (Config, error) {
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.HostedRateLimitMax = parseInt("HOSTED_RATE_LIMIT_MAX", 10)
 	cfg.HostedRateLimitWindow = parseDuration("HOSTED_RATE_LIMIT_WINDOW", time.Minute)
+	// PRD #108 M5. parseBool, not parseDuration/parseInt: a typo must abort boot,
+	// because the two failure modes are not symmetric. A misread that silently
+	// defaults to TRUE leaves an operator who typed `UZI_AUTOSTOP_ENABLED=flase`
+	// believing they disarmed a behaviour that kills runs.
+	autoStop, err := parseBool("UZI_AUTOSTOP_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AutoStopEnabled = autoStop
+
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
 	// LOAD-BEARING ordering invariant (reviewer + auditor): the stuck-confirming sweep
 	// must NEVER revert a proposal to pending while a legitimately-slow CreateIssue is

@@ -190,6 +190,10 @@ type Store interface {
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
+	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
+	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
+	// request from a user whose ownership must be proven.
+	FailRunAutoStop(ctx context.Context, arg store.FailRunAutoStopParams) (int64, error)
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
@@ -336,6 +340,20 @@ type Params struct {
 	// recovery for a confirm handler killed mid-flight. Must sit above the forge HTTP
 	// timeout so a legitimately in-flight confirm is never reaped. 0 disables the sweep.
 	ProposalConfirmStuckTimeout time.Duration
+	// AutoStopEnabled is the operator kill switch for PRD #108 M5's auto-stop
+	// (UZI_AUTOSTOP_ENABLED, default true), read once at boot.
+	//
+	// It is deliberately NOT the health toggle (Decision 8: an admin disabling
+	// health must not silently disable loop protection) and deliberately NOT a
+	// settings key: an automatic destructive behaviour needs an off switch that does
+	// not depend on the database it might be misbehaving against, and this also
+	// expresses the PRD's "ship M4, hold M5" fallback as configuration rather than a
+	// revert. Same shape as Phase 1's UZI_HOME_RECLAIM.
+	//
+	// NOTE the zero value is FALSE, so a Params literal that omits it has auto-stop
+	// OFF. That is the fail-safe direction and it is why the default lives in
+	// config.go (where the env is read) rather than in New.
+	AutoStopEnabled bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2531,6 +2549,10 @@ type SweepResult struct {
 	// HealthChanged is the number of runs whose health flag the detector wrote this
 	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
 	HealthChanged int64
+	// AutoStopped is the number of runs this pass stopped, or requested a stop for,
+	// because their message writes are in a confirmed permanent-failure loop
+	// (PRD #108 M5). Normally 0 — the candidate set is usually empty.
+	AutoStopped int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -2642,6 +2664,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// non-terminal — it never kills a run and never fails the sweep (it logs and
 	// returns a count); a nil settings (tests) disables it entirely.
 	res.HealthChanged = s.detectRunHealth(ctx, now)
+
+	// Auto-stop confirmed per-run persistence loops (PRD #108 M5). Deliberately NOT
+	// inside detectRunHealth — Decision 8 (it must not ride health_enabled), and
+	// because ListActiveRunsForHealth excludes chat runs, which wedge identically.
+	// Runs AFTER the detector so the flag always lands first ("health first, kill
+	// second"); its own thresholds sit above the flag's, so that ordering is
+	// belt-and-braces rather than the mechanism.
+	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
 	return res, nil
 }
 

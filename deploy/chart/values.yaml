@@ -43,12 +43,23 @@ api:
     # Unset => follows Chart.appVersion (Model B). Pin only to override per-cluster.
     tag: ""
     pullPolicy: IfNotPresent
-  # HARD SINGLETON (do NOT raise): three independent reasons the api cannot run
+  # HARD SINGLETON (do NOT raise): FOUR independent reasons the api cannot run
   # >1 replica today — the forge poller + run sweeper hold single-goroutine
   # in-memory state (two replicas double-poll/double-sweep), the Slack Socket Mode
-  # manager would double-handle events, and store.Migrate runs goose at boot with
-  # NO advisory lock (two pods booting concurrently race the migrations). Paired
-  # with strategy: Recreate below (RollingUpdate's surge would briefly run two).
+  # manager would double-handle events, store.Migrate runs goose at boot with
+  # NO advisory lock (two pods booting concurrently race the migrations), and PRD
+  # #108 M4/M5's persistence-failure streak counters plus their "other runs are
+  # succeeding on THIS instance" comparison set are in-process
+  # (api/internal/workersvc/persistfail.go).
+  #
+  # That fourth one is worth the extra sentence because it fails SILENTLY where the
+  # other three fail loudly. Split traffic means neither pod's streak reaches the
+  # threshold and each pod's comparison set is a fraction of reality, so auto-stop
+  # simply STOPS FIRING — it does not misfire. A guard that quietly disarms looks
+  # exactly like a healthy fleet, which is why it is written down here rather than
+  # left to be discovered.
+  #
+  # Paired with strategy: Recreate below (RollingUpdate's surge would briefly run two).
   replicaCount: 1
   resources:
     requests:

@@ -60,16 +60,30 @@ export function mrChipTitle(state: MrChipState, forgeType: string): string {
 // the server-stamped stop_kind (PRD #33), so a live-poller plan reject carrying the
 // user's VERBATIM reason is recognised too — the exact case the old exact-string
 // heuristic could not. It covers status `cancelled` (which the server-side cancel
-// path also stamps stop_kind for) and status `failed` carrying a stop_kind.
+// path also stamps stop_kind for) and status `failed` carrying a HUMAN stop_kind.
+//
+// "human" is load-bearing since PRD #108 M5 added `auto_stopped` — see
+// HUMAN_STOP_KINDS below.
 //
 // The `failed` guard is load-bearing: on the live path stop_kind is stamped at
 // verdict enqueue, while the run is still awaiting_approval/running, and a
 // reject-then-approve race can even COMPLETE a run that carries a stop_kind. So a
 // non-terminal or completed run is never styled "stopped" just because a verdict was
 // once queued — only a `failed`/`cancelled` run is.
+// HUMAN_STOP_KINDS is the set isStoppedRun's calm styling actually means (PRD #108
+// M5). Enumerated rather than null-tested BECAUSE a null test silently absorbed
+// "auto_stopped": that run is `failed` with a non-null stop_kind, so before this
+// change it rendered as a calm neutral "stopped" pill everywhere and dropped out of
+// favicon.ts's attention set — the exact opposite of what an auto-stop means.
+//
+// An auto-stop is uzi killing a run because it was broken. That is breakage and its
+// owner needs to see it. Listing the members means the NEXT stop_kind added has to
+// make this choice deliberately instead of inheriting it.
+const HUMAN_STOP_KINDS: ReadonlySet<StopKind> = new Set<StopKind>(["cancelled", "plan_rejected"]);
+
 export function isStoppedRun(status: string, stopKind: StopKind | null | undefined): boolean {
   if (status === "cancelled") return true;
-  if (status === "failed" && stopKind != null) return true;
+  if (status === "failed" && stopKind != null && HUMAN_STOP_KINDS.has(stopKind)) return true;
   return false;
 }
 
