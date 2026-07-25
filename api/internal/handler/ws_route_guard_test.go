@@ -200,7 +200,17 @@ func TestWSRouteBogusBearerDoesNotFallBackToCookie(t *testing.T) {
 		t.Fatalf("cookie + bogus Bearer GET /api/ws = %d, want 401\nbody: %s", rec.Code, rec.Body.String())
 	}
 	if !db.saw(wsGuardCLITokenRead) {
-		t.Errorf("a request with an Authorization header never read cli_tokens; presence-dispatch must send it to the bearer branch\nrecorded: %v", db.queries)
+		// FATAL, and it names the MOUNT rather than the dispatch predicate, because
+		// this is the discriminator between two very different faults. If the route is
+		// reverted to RequireAuth there is no bearer branch on it at all, so BOTH this
+		// check and the users-read check below would fire — and the one below alleges a
+		// live CSRF bypass in cli_auth.go, which is untouched and correct in that case.
+		// Sending a reader to audit working auth code is the most expensive wrong
+		// answer available here, so stopping at this one keeps the alarming claim below
+		// printable only when it is true.
+		t.Fatalf("a request with an Authorization header never read cli_tokens, so NO bearer branch ran at all.\n"+
+			"    Check handler.go's MOUNT for /ws (is it RequireUser, or has it reverted to RequireAuth?) — NOT cli_auth.go's dispatch, which this does not implicate.\n"+
+			"    recorded: %v", db.queries)
 	}
 	if db.saw(wsGuardUserRead) {
 		t.Errorf("a request whose Bearer token failed went on to read users — RequireUser fell back to the COOKIE branch, which is the CSRF-bypass shape (append a junk Authorization header to skip the CSRF-checked path)\nrecorded: %v", db.queries)

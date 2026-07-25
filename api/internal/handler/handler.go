@@ -733,8 +733,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		// The run live channel (PRD #112 M1): a WebSocket subscribed to ONE run's
-		// events. It is mounted with the run READS above, not below in the cookie-only
-		// tail, because it IS one: every frame it carries was already persisted and is
+		// events. It is a SIBLING group carrying the same guard as the run READS above
+		// — not inside r.Route("/runs"), which it cannot be, since the path is
+		// /api/ws — and deliberately not below in the cookie-only tail, because it IS
+		// a read: every frame it carries was already persisted and is
 		// re-readable over GET /{id}/messages, and its per-run authz is the same
 		// GetRunForViewer. RequireUser (session OR uzc_/uza_) so a headless CLI/TUI can
 		// subscribe; a GET upgrade, so the cookie path passes CSRF exactly as it did

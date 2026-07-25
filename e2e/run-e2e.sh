@@ -1459,6 +1459,15 @@ pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve rout
 # subscribe and the steer.
 say "PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_message frame"
 
+# Leg 3 CONSUMES the uzc_ token Leg 2 minted, and consumes it inside a command
+# substitution. Guard it HERE, at top level, outside any subshell: under `set -u` an
+# absent $UZI_TOKEN_VAL would fire inside the `$( ... )`, the subshell would exit 1, and
+# the surrounding `if` would swallow that — so Leg 3 would print its auth verdict for
+# what is really a missing variable. Latent today (Leg 2 hard-guards the mint ~75 lines
+# up and `fail` exits), so this closes a REORDERING hazard, not a live bug.
+{ [ -n "${UZI_TOKEN_VAL:-}" ] && [ "${UZI_TOKEN_VAL#uzc_}" != "$UZI_TOKEN_VAL" ]; } \
+  || fail "Leg 3 needs the uzc_ token Leg 2 mints (got '${UZI_TOKEN_VAL-<unset>}') — do not reorder the legs"
+
 IID_WSB="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E ws bearer","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 { [ -n "$IID_WSB" ] && [ "$IID_WSB" != null ]; } || fail "could not create the Bearer /api/ws issue"
@@ -1482,7 +1491,19 @@ if WSB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_PROBE" \
     "$WS_API/api/ws?run=$RUN_WSB" "$UZI_TOKEN_VAL" "$WS_API/api/runs/$RUN_WSB/inputs")"; then
   pass "live /api/ws frame received over a Bearer uzc_ token, no Origin sent: $WSB_OUT"
 else
-  fail "no live /api/ws run_message frame over Bearer (probe: ${WSB_OUT:-<none>}) — /ws is back in the cookie-only tail (http_probe_status=401), the origin gate rejected a no-Origin client (403), or per-run authz refused the owner (404)"
+  # The diagnostic in WS_ERR is a PLAIN GET (wsurl with ws:// swapped for http://, no
+  # upgrade headers), so it can only observe what the route answers BEFORE any
+  # handshake. Naming a status it cannot produce would send the next reader hunting a
+  # gate the probe never reached:
+  #   401 — authN refused: /ws is back in the cookie-only tail, or the token is bad.
+  #   404 — ServeWS's per-run authz refused; it runs BEFORE websocket.Accept.
+  #   426 — the route is HEALTHY and this is the expected answer: a plain GET carries no
+  #         `Connection: Upgrade`, which coder/websocket rejects first (accept.go:189-192)
+  #         with Upgrade Required. A 426 here means auth and authz both PASSED, so the
+  #         fault is in the socket or frame path, not the gate.
+  # 403 is deliberately NOT listed: the origin check lives inside websocket.Accept, which
+  # this probe never reaches, so it can never be the answer here.
+  fail "no live /api/ws run_message frame over Bearer (probe: ${WSB_OUT:-<none>}) — read http_probe_status: 401 = authN refused (is /ws back in the cookie-only tail?), 404 = per-run authz refused, 426 = route healthy so look at the socket/frame path, TIMEOUT with no status = the upgrade succeeded but no frame arrived"
 fi
 # The probe's Bearer approve drove the run: confirm it advances to completed.
 wait_status "$RUN_WSB" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
