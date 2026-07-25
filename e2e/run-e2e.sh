@@ -512,6 +512,16 @@ fake_post() { curl -fsSk -X POST "$FAKE_BASE$1" -H 'Content-Type: application/js
 # merging an MR (PRD #24).
 flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')" >/dev/null; }
 
+# close_issue IID — the harness stand-in for a human closing an issue on the forge
+# (PRD #98 M6). Deliberately NOT a two-argument `flip_issue IID STATE` mirroring
+# flip_mr, even though the route accepts "opened": the product consumes the
+# open→closed EDGE ONLY, and a reopen is explicitly not acted on
+# (judge_issue_close.sql: close_synced_at stays stamped, so a flapping issue cannot
+# ping-pong a user's backlog). A helper spelled `flip_issue` would advertise a
+# round trip the product does not make, and the next reader would write a reopen
+# assertion against a guarantee that does not exist.
+close_issue() { fake_post "/_e2e/issues/$1/state" '{"state":"closed"}' >/dev/null; }
+
 # fake_state — the fake's recorded state (issues, MRs, notes, label events). Read-only
 # GET, wrapped in retry_read (like apiget) so a transient blip on a point-in-time read
 # does not abort the run; the /_e2e mutators (fake_post) stay unwrapped (writes).
@@ -3028,6 +3038,140 @@ PI_TODO_CLEAN="$(uzi_cli review stats --json | jq -r '.todo')"
   || fail "PRD #98 M8c: after deleting the fixture the wire triage todo is $PI_TODO_CLEAN, not the pre-seed $PI_TODO_PRESEED — the fixture was not what moved the count, so the +2/-2 assertions above proved nothing about it"
 pass "printed-instruction fixture removed; wire todo back to the pre-seed $PI_TODO_PRESEED (positive control for the +2/-2 arithmetic)"
 
+# =============================================================================
+# PRD #98 M8b / B6' — the close→Done WIRING leg. THE POLLER ACTUALLY RUNS IT.
+# =============================================================================
+#
+# WHAT THIS ROW IS FOR, AND WHAT IT DELIBERATELY DOES NOT RE-ASSERT. The behaviour
+# matrix — auto-Done once, Undo sticks, a dismissed verdict is not overwritten, repo
+# scoping, unsettled/orphaned rows skipped, a reopen does not reopen — is pinned by the
+# six TestFiledIssueClose*LiveDB tests against a real Postgres, and re-asserting any of
+# it here would buy nothing but harness minutes. Every one of those six calls
+# svc.SyncFiledIssueCloses(ctx, repoID) DIRECTLY. What NOTHING in the repo does is RUN
+# THE POLLER: its call site is covered only by forgesvc's TestSyncFiledIssueClosesWiring,
+# which runs against a FAKE store. So the chain
+#
+#   a forge issue is closed → the issue cache reflects it → the poller's tick calls
+#   SyncFiledIssueCloses → a disposition with the right provenance appears
+#
+# is unpinned end to end, and it is the one assertion neither a fake nor a live-DB store
+# test can make. This block asserts exactly that.
+#
+# PLACEMENT. It rides $F_IID — the issue the #68 phase already filed against $F_REC on
+# $F_REVIEW — so it costs no second judged run and no second forge issue. It sits BEFORE
+# the judge-disable restore below, which is safe because the poller's call takes only the
+# repo id and is NOT gated on judge_enabled, unlike the funnel above it.
+#
+# LANE. No gate is needed and none is added: the forgejo lane ends with `exit 0` inside
+# its own `if`, hundreds of lines above the #46/#68/#98 phases, so everything here is
+# gitlab-lane BY CONSTRUCTION rather than by a guard someone has to maintain. The
+# forge-fake mutator is lane-neutral in any case (it mutates the shared state.issues,
+# which the Forgejo lane serves through toForgejoIssue).
+#
+# 🔴 FIDELITY LIMIT, stated here rather than left for a reader to infer, because it bounds
+# what a green means. forge-fake contains ZERO occurrences of `updated_after`: GET /issues
+# returns every recorded issue wholesale, by deliberate design ("Keeps a reconcile pass
+# from evicting the cache"), and the Forgejo lane does the same. The real IncrementalSync
+# DOES send UpdatedAfter (forgesvc/service.go, forge/gitlab.go). SO: this block proves the
+# poller WIRES THE EDGE UP GIVEN A CACHE THAT REFLECTS THE CLOSE. It does NOT prove a real
+# incremental sync would ever OBSERVE the close. That hole is deliberately not closed
+# inside #98 — changing GET /issues' semantics would change them for every phase that
+# depends on "return all recorded issues" — and it is raised separately instead.
+say "PRD #98 M8b/B6': a closed forge issue reaches Done THROUGH THE POLLER (M6's wiring)"
+
+B6_CAT=install_worker_tool
+B6_TGT=jq
+
+# One-shot getter for wait_eq, in this file's own idiom.
+b6_issue_state() { db_psql "SELECT state FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID"; }
+
+# wait_disposition REVIEW CAT TGT WANT [TIMEOUT] — poll for the auto-Done and, ON
+# TIMEOUT, SAY WHICH OF THE TWO CAUSES IT IS. "No disposition after N seconds" has two
+# explanations that need opposite fixes — the poller never ran, or it ran and did not
+# consume the edge — and a message that does not separate them routes the next reader
+# into the wrong subsystem with evidence attached, which is worse than a vague one.
+# B6a's probe fixtures went with the dropped matrix, so there is no separate positive
+# control left; the DIAGNOSIS is gathered at failure time from the two rows that
+# discriminate. Reads $REPO_ID and $F_IID from the enclosing phase.
+#
+# TIMEOUT FLOOR: the chain crosses two stages inside ONE poller tick (the issue sync
+# writes the cache, then SyncFiledIssueCloses reads it), so one tick suffices only if
+# the close lands before that tick's sync; land it mid-tick and the cache write is next
+# tick and the disposition the tick after. The reconcile period here is
+# E2E_FORGE_POLL_INTERVAL=2s x FORGE_RECONCILE_EVERY=2 = 4s, so the floor is 2 periods
+# = 8s. The default below is 20s: the floor plus real slack, and report_margins will
+# show the headroom actually used rather than leaving the ceiling to guesswork.
+wait_disposition() {
+  local review="$1" cat="$2" tgt="$3" want="$4" timeout="${5:-20}"
+  local start=$SECONDS deadline=$((SECONDS + timeout)) got="" cache stamp
+  while [ $SECONDS -lt $deadline ]; do
+    got="$(db_psql "SELECT status FROM recommendation_dispositions WHERE review_id='$review' AND category='$cat' AND target='$tgt'")"
+    if [ "$got" = "$want" ]; then
+      record_margin "disposition $cat/$tgt -> $want" "$((SECONDS - start))" "$timeout"
+      return 0
+    fi
+    sleep 0.3
+  done
+  cache="$(db_psql "SELECT state FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
+  stamp="$(db_psql "SELECT (close_synced_at IS NOT NULL)::text FROM recommendation_filed_issues WHERE review_id='$review' AND category='$cat' AND target='$tgt'")"
+  fail "PRD #98 M8b/B6': no '$want' disposition on $cat/$tgt after ${timeout}s (status is '${got:-<none>}').
+  DIAGNOSIS — issue cache state for #$F_IID: '${cache:-<no cached row>}'; edge consumed (close_synced_at IS NOT NULL): '${stamp:-<no filed row>}'.
+    cache 'closed' + edge 'false' -> the poller's ISSUE SYNC ran but SyncFiledIssueCloses did not consume the edge. Look at the poller call site and ListFiledIssueCloseEdges' filters. NOT a forge-fake problem.
+    cache 'opened' or empty       -> the poller's ISSUE SYNC did not run or did not see the close, so SyncFiledIssueCloses was never in a position to act. Look at the poll interval and the forge-fake state route. NOT a judge problem.
+    cache 'closed' + edge 'true'  -> the edge WAS consumed and the insert wrote nothing, i.e. a competing disposition already existed on this coordinate. The precondition below exists to have caught that first.
+  WHAT THIS CANNOT RULE OUT: an api that is dead or wedged, which presents as the second case. The cache precondition above is what makes that unlikely here — a poller that never ran fails THERE, on its own message, before this wait starts."
+}
+
+# PRECONDITION 1, which doubles as the control separating those two causes: the issue
+# cache must already reflect #$F_IID as OPEN. A poller that is not running fails HERE,
+# with a message about the CACHE, instead of 20 seconds later with one about the judge.
+wait_eq opened 20 "the issue cache reflects filed issue #$F_IID as open (poller alive)" b6_issue_state
+
+# PRECONDITION 2, or the assertion below is vacuous. The coordinate must be SETTLED-filed
+# with the edge unconsumed, and must carry NO disposition — a pre-existing verdict would
+# make ApplyFiledIssueCloseEdge's ON CONFLICT DO NOTHING write nothing while still
+# stamping the edge, and the row would then be asserting a disposition it did not cause.
+[ "$(db_psql "SELECT count(*) FROM recommendation_filed_issues WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT' AND filed_at IS NOT NULL AND close_synced_at IS NULL")" = 1 ] \
+  || fail "PRD #98 M8b/B6': the $B6_CAT/$B6_TGT coordinate on review $F_REVIEW is not a settled filed link with an unconsumed edge (want exactly 1 row with filed_at NOT NULL and close_synced_at NULL)"
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")" = 0 ] \
+  || fail "PRD #98 M8b/B6': the $B6_CAT/$B6_TGT coordinate already carries a disposition — the auto-Done assertion below would pass without the poller having done anything"
+# And the WIRE agrees it is filed, not merely the tables: this is the rung the shared
+# BucketOf ladder puts a settled filed link on, read through the API the panel reads.
+apiget "/api/me/judge/recommendations?bucket=filed" \
+  | jq -e --arg c "$B6_CAT" --arg t "$B6_TGT" 'any(.groups[]?; .category == $c and .target == $t)' >/dev/null \
+  || fail "PRD #98 M8b/B6': $B6_CAT/$B6_TGT does not bucket 'filed' on GET /api/me/judge/recommendations — the precondition the close edge acts on is not what the wire reports"
+pass "precondition: #$F_IID cached open, $B6_CAT/$B6_TGT filed on the wire, edge unconsumed, no disposition"
+
+# THE HUMAN ACTION M6 REACTS TO. uzi never closes an issue itself — it only ever reads
+# the state — which is why this needs the /_e2e mutator at all.
+close_issue "$F_IID"
+pass "closed forge issue #$F_IID on the fake forge"
+
+wait_disposition "$F_REVIEW" "$B6_CAT" "$B6_TGT" done
+
+# THE PROVENANCE TRIPLE, and it is the assertion that makes this row about the POLLER
+# rather than about a disposition existing. status='done' alone is equally satisfied by a
+# human clicking Done; set_via='issue_close' with a NULL actor is reachable only from
+# ApplyFiledIssueCloseEdge, whose provenance is fixed in the query text rather than
+# parameterised precisely so no call site can forge it.
+B6_PROV="$(db_psql "SELECT COALESCE(status,'?') || '|' || COALESCE(set_via,'?') || '|' || (set_by_user_id IS NULL)::text
+                      FROM recommendation_dispositions
+                     WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")"
+[ "$B6_PROV" = "done|issue_close|true" ] \
+  || fail "PRD #98 M8b/B6': the auto-Done's provenance is '$B6_PROV', want 'done|issue_close|true' (status|set_via|set_by_user_id IS NULL). A 'done|manual|false' here means a HUMAN path wrote it and the poller proved nothing"
+# The other half of the atomic statement: the edge is consumed, so a second tick cannot
+# re-apply after an Undo. The six live-DB tests pin what that guarantees; this only
+# asserts the poller's own run left the marker.
+[ "$(db_psql "SELECT (close_synced_at IS NOT NULL)::text FROM recommendation_filed_issues WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")" = true ] \
+  || fail "PRD #98 M8b/B6': the disposition landed but close_synced_at was never stamped — the two halves of ApplyFiledIssueCloseEdge are no longer atomic"
+pass "PRD #98 M8b/B6': closing #$F_IID drove the POLLER to auto-Done $B6_CAT/$B6_TGT with provenance done|issue_close|<null actor>, edge consumed"
+
+# NOT CLEANED UP, deliberately: the disposition IS the outcome, and deleting it would
+# delete the evidence. It shifts the global triage `todo` by one, which is why every
+# later count assertion in this file is a DELTA against its own pre-seed reading rather
+# than an absolute. The issue is left CLOSED for the same reason a reopen is not tested:
+# close_synced_at stays stamped and the product does not act on a reopen.
+
 # NOT PROVEN HERE, deliberately: `uzi review backlog --run <run-id>` (the post-write
 # truncation remedy) and `uzi login` (the device-auth polling hint). The first needs the
 # 2001-row seed that reaches the server's compile-time row cap — that is M8b's, and running
@@ -4083,4 +4227,8 @@ apiget /api/workers \
   || fail "deleting a bound token nulled workers.user_id — the composite FK's SET NULL is missing its column list"
 pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user_id intact"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+# This line enumerates every phase the run covered, and it is the only place a reader
+# who did not watch the output learns what was in it — so a phase that lands without
+# being named here is invisible in exactly the summary people quote. PRD #98 was missing:
+# its M8c printed-instruction phase landed at 4b94f714 without touching this line.
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
