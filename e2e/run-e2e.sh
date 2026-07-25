@@ -1474,7 +1474,7 @@ ORIGIN_PROBE='const http=require("http");const srv=http.createServer();srv.on("u
 ORIGIN_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$ORIGIN_PROBE" 2>&1 || true)"
 printf '%s\n' "$ORIGIN_OUT" | grep -q '^ORIGIN=null$' \
   || fail "the agent runtime sends an Origin header on a headers-only WebSocket (probe: ${ORIGIN_OUT:-<none>}) — the Bearer leg below would then pass WITHOUT exercising the empty-Origin exemption it exists to prove; see PRD #112 D2"
-pass "the agent runtime sends NO Origin on a Bearer WebSocket — the empty-Origin exemption is genuinely what this leg exercises"
+pass "the agent runtime sends NO Origin on a Bearer WebSocket ($ORIGIN_OUT) — the empty-Origin exemption is genuinely what this leg exercises"
 
 # Leg 3 mints its OWN credential (issue #126). It used to consume the token Leg 2 mints,
 # which put M1's Bearer-WS auth evidence DOWNSTREAM of `command -v go` and
