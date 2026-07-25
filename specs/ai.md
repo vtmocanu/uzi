@@ -9980,7 +9980,7 @@ unified-visual-vocabulary PRINCIPLE of Decision 6 is retained in full.
   threshold coloring. Tailwind `--ok/--warn/--danger` color VALUES unchanged; only the
   numeric breakpoints that select among them moved.
 
-See [prds/115-meter-color-thresholds.md](../prds/115-meter-color-thresholds.md) for
+See [prds/done/115-meter-color-thresholds.md](../prds/done/115-meter-color-thresholds.md) for
 the Locked Decisions, user journey, and the full test re-pin inventory.
 
 ## 367. PRD #108 Phase 2 — the API counts its own write failures, and the kill needs a full conjunction plus a class it can name (D5-D10, plus the decisions Phase 2 made itself)
