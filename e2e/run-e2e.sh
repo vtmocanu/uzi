@@ -2974,6 +2974,21 @@ run_printed_instructions() {
   [ "$n" = "$want" ] || fail "$label: expected exactly $want printed instruction(s) matching /$shape/ in the emitting command's OWN output, got $n. The output was:
 $out"
   : > "$PRINTED_OUT"
+  # PER-INSTRUCTION CAPTURE, alongside the concatenated $PRINTED_OUT the older rows grep.
+  #
+  # WHY BOTH. $PRINTED_OUT is the UNION of every execution, so a `grep -q` over it is
+  # satisfied by the FIRST instruction alone: N lifted, N executed, ONE certified. That is
+  # the same shape as a loop that runs with one element actually checked, and it is the
+  # weakness these rows exist to close — the undo row seeds a coordinate on TWO reviews
+  # precisely so a single-address regression cannot pass as a green.
+  #
+  # A COUNT OVER THE UNION IS NOT THE FIX, and that was learned by shipping it: the B4' row
+  # replaced `grep -q` with `grep -c … -ge 2` and turned a check satisfiable by ONE line into
+  # one satisfiable by NONE, because the two anchored re-reads legitimately print DIFFERENT
+  # things. Per-instruction files let a caller assert what is true of EACH execution instead
+  # of guessing a number that is true of the pile.
+  rm -f "$PRINTED_OUT".[0-9]* 2>/dev/null || true
+  PRINTED_N=0
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     case "$cmd" in
@@ -3000,9 +3015,11 @@ $out"
     # comment above still reads as if it could not. This form owes nothing to the read loop.
     [[ "$cmd" =~ ^uzi\ [A-Za-z0-9\ ._:/=-]+$ ]] \
       || fail "$label: lifted span carries a character outside the executable allowlist, so it is not runnable verbatim: $cmd"
-    eval "uzi_cli ${cmd#uzi }" >>"$PRINTED_OUT" 2>&1 \
+    PRINTED_N=$((PRINTED_N + 1))
+    eval "uzi_cli ${cmd#uzi }" > "$PRINTED_OUT.$PRINTED_N" 2>&1 \
       || fail "$label: the printed instruction FAILED when run VERBATIM: $cmd
-$(cat "$PRINTED_OUT")"
+$(cat "$PRINTED_OUT.$PRINTED_N")"
+    cat "$PRINTED_OUT.$PRINTED_N" >> "$PRINTED_OUT"
     # THE HEREDOC BELOW IS LOAD-BEARING — do not "tidy" it into `printf … | while read`.
     # `fail` ends in `exit 1`. Fed by a heredoc, this loop runs in the CURRENT shell, so a
     # `fail` inside it kills the script. Fed by a PIPE, the loop would run in a subshell and
@@ -3559,21 +3576,47 @@ run_printed_instructions "$PI_LABEL_TRUNC" 'uzi review backlog --run [0-9a-f-]{3
 # The other `grep … && fail` sites in this file were checked against that rule and left
 # alone: none is a function's last command. Rewriting them would be a mechanical sweep on a
 # mechanism that does not reach them.
-if grep -q "row cap" "$PRINTED_OUT"; then
-  fail "$PI_LABEL_TRUNC: the printed remedy ran but its own output still reports the row cap — the anchor did not narrow the read below the cap, so the instruction is false:
+[ "$PRINTED_N" = 2 ] \
+  || fail "$PI_LABEL_TRUNC: $PRINTED_N instruction(s) executed, want 2 — the per-execution assertions below cannot certify what did not run"
+for i in 1 2; do
+  if grep -q "row cap" "$PRINTED_OUT.$i"; then
+    fail "$PI_LABEL_TRUNC: anchored re-read #$i still reports the row cap — the anchor did not narrow it below the cap, so the printed instruction is FALSE:
+$(cat "$PRINTED_OUT.$i")"
+  fi
+  # PER EXECUTION, and this is what the union could not do: EACH re-read must have rendered a
+  # well-formed backlog view. Both spellings are legitimate outcomes and which one a given
+  # run produces depends on the fixture, so accepting either is correct rather than lax —
+  # what is asserted is that the command produced a BACKLOG, not an error or nothing.
+  grep -qE "groups \(|no recommendations in this bucket" "$PRINTED_OUT.$i" \
+    || fail "$PI_LABEL_TRUNC: anchored re-read #$i produced neither a groups listing nor the empty-bucket line, so it did not render a backlog at all:
+$(cat "$PRINTED_OUT.$i")"
+done
+# 🔴 THE DISMISSED COORDINATE MUST BE ABSENT, AND THIS ASSERTION REPLACES ONE THAT DEMANDED
+# THE OPPOSITE. The previous version counted occurrences of $B4_TGT and required >= 2 — one
+# per re-read. It reddened on the first run that reached it, and the CLI was right: `uzi
+# review backlog --run <id>` renders the TODO bucket, and $B4_TGT was just dismissed, so it
+# has left todo BY CONSTRUCTION. Zero was the correct answer and the assertion demanded a row
+# the write is defined to remove.
+#
+# Worth recording as a shape, because the correction is more interesting than the bug: a
+# reviewer correctly found the original `grep -q` too WEAK (satisfiable by the first line
+# alone), and the fix — a count over the union — moved it from satisfiable-by-one to
+# satisfiable-by-NONE. The over-correction is what reddened, and it was invisible until
+# execution. Neither candidate marker could have carried `>= 2` either: renderBacklog never
+# prints the run id, and `b4-dup` survives on ONE of the two runs only.
+#
+# So the dismissal is asserted directly, which is both true and the stronger statement.
+[ "$(grep -c "$B4_TGT" "$PRINTED_OUT" || true)" = 0 ] \
+  || fail "$PI_LABEL_TRUNC: the dismissed coordinate $B4_CAT/$B4_TGT is still listed by an anchored re-read. It was settled by the write above, so a todo view must not return it:
 $(cat "$PRINTED_OUT")"
-fi
-# PER EXECUTION, NOT ONCE ACROSS BOTH. run_printed_instructions appends every execution to
-# one file, so a bare `grep -q` here is satisfied by the FIRST anchored read alone — N lines
-# lifted, N executed, ONE certified. That is the same shape as a loop that runs with one
-# element actually checked, and it is the weakness the printed-instruction rows exist to
-# avoid: the undo row above seeds a coordinate on TWO reviews precisely so a single-address
-# regression cannot pass as a green. Count the occurrences instead.
-PI_TRUNC_HITS="$(grep -c "$B4_TGT" "$PRINTED_OUT" || true)"
-[ "$PI_TRUNC_HITS" -ge 2 ] \
-  || fail "$PI_LABEL_TRUNC: the coordinate the write settled is named on $PI_TRUNC_HITS line(s) of the executed output, want at least 2 — one per anchored re-read. Both instructions ran, but only $PI_TRUNC_HITS of them was certified to have read the right run:
+# And the fixture's SURVIVING todo coordinate must appear, or the re-reads proved only that
+# they printed something: `b4-dup` is seeded on B4_RUN_A alone and is untouched by the
+# dismiss, so exactly one of the two anchored reads names it. That is what shows an anchor
+# resolved to THIS fixture's data rather than to an empty or foreign result.
+grep -q "b4-dup" "$PRINTED_OUT" \
+  || fail "$PI_LABEL_TRUNC: no anchored re-read named b4-dup, the coordinate that SURVIVES the dismiss on B4_RUN_A — so nothing proves either read reached this fixture's rows:
 $(cat "$PRINTED_OUT")"
-pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, and each anchored re-read comes back BELOW the cap"
+pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, each rendered a backlog BELOW the cap, the dismissed coordinate is gone and the surviving one is present"
 
 # --- positive control + teardown ---------------------------------------------
 # Delete the bulk review and re-assert BOTH directions. Without this, a truncated:true from
