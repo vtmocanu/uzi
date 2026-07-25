@@ -3,6 +3,9 @@ module gitlab.example.com/vtmocanu/uzi/api
 go 1.26.4
 
 require (
+	charm.land/bubbletea/v2 v2.0.8
+	charm.land/glamour/v2 v2.0.1
+	charm.land/lipgloss/v2 v2.0.5
 	code.gitea.io/sdk/gitea v0.25.1
 	github.com/BurntSushi/toml v1.6.0
 	github.com/coder/websocket v1.8.14
@@ -22,10 +25,6 @@ require (
 )
 
 require (
-	charm.land/bubbles/v2 v2.1.1 // indirect
-	charm.land/bubbletea/v2 v2.0.8 // indirect
-	charm.land/glamour/v2 v2.0.1 // indirect
-	charm.land/lipgloss/v2 v2.0.5 // indirect
 	github.com/42wim/httpsig v1.2.4 // indirect
 	github.com/alecthomas/chroma/v2 v2.14.0 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
