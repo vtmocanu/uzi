@@ -181,6 +181,12 @@ Nothing here is an oversight. PRD #18 M3/M4 built provisioning when the worker w
 
 **Wiring caveat:** the E2E stub executor runs the same `provisionRunTools` path (`executor.ts:351`), so the e2e claim fixture must carry the denylist or the stub path silently diverges from production and the e2e stops covering the check.
 
+**Decision 6a — Batch toolchain additions: the RESEED is the cost unit, not the package.** Any edit to `agent/devbox-global/devbox.json` changes the toolchain store hash, hence `/etc/uzi-toolchain-profile`, hence triggers the version-aware reseed **fleet-wide** — which per §3 wipes every runtime-realized store path and clears the shared devbox/nix state under `/data`. So a 1 MB utility costs exactly as much to ship as a 648 MB browser closure. **Never spend a standalone roll on a small addition; ride an existing one.**
+
+**Rider on M2 — add `file` to the global toolchain.** Surfaced 2026-07-25 during PRD #87's M7 gate run: a `web-ux` agent hit `exit 127`, `/bin/bash: line 1: file: command not found` while trying to identify a screenshot it had just captured. `file` is the right shape for the baked toolchain — tiny, broadly useful to any agent inspecting an artifact, not repo-specific — the same argument that promoted `openssl` out of tier-2 (`devbox.json:32-34`). It is **not** an allowlist candidate: the allowlist bounds what a tier-1 profile may `devbox install`, whereas this wants to be on every run's PATH unconditionally.
+
+> **Live illustration of Decision 6a, from the same day.** The worker that ran the M7 gate provisioned tier-2 `ruby@3.3` cleanly *because its `/nix` was warm* (2 ruby store paths). Shipping `file` on its own would reseed, wipe those paths, and force a re-fetch — free on the docker tier (github reachable) and **fatal on a standard-tier worker**, which is §3's thesis reproduced in one package. That is the concrete reason to batch rather than a tidiness preference.
+
 **Decision 7 — Seed growth is measured and `nixSize` re-validated.** `nixSize` is a flat 20Gi (`preset/preset.go:146` — *deployed-fact caveat: that is `main`'s value, and the controller binary in-cluster may lag*). jq/yq/fd/ripgrep are negligible; kubectl, terraform and any nodejs decision are the weight. M2 records image-size, build-delta and reseed-delta as PRD #87 M2 does.
 
 ## Implementation Milestones
