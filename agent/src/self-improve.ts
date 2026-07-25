@@ -169,7 +169,9 @@ export function buildCheckEnv(
   const env: NodeJS.ProcessEnv = {
     // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
     // the /nix-bearing runner image PATH under the split (checks run as `runner`), NOT
-    // the worker's stripped PATH. Single-uid (#58): the worker's own PATH.
+    // the worker's stripped PATH. Single-uid (#58): ALSO the image PATH since PRD #120 —
+    // the entrypoint now pins UZI_RUNNER_PATH on both branches, so this no longer inherits
+    // npm's run-script injections (/app/node_modules/.bin et al).
     PATH: toolEnv?.PATH ?? runnerPath(source),
     HOME: homeDir,
     // No interactive prompt if a check shells out to git; not a secret.

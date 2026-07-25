@@ -1,7 +1,16 @@
 # PRD #87: Prebake a browser (+ `agent-browser`) into the worker toolchain so `web-ux` works in the worker runtime
 
 **GitLab Issue**: [#87](https://gitlab.example.com/vtmocanu/uzi/-/issues/87)
-**Status**: Draft (created 2026-07-20; revised same day after an architect/fable review that verified every load-bearing claim against the code; **re-scoped 2026-07-20 to the owner's chosen delivery: the browser rides the shared `devbox global` toolchain — the exact path go/gcc/python already take — NOT a dedicated image variant**; a second fable review of the re-scope then folded in two spec-level fixes — the runtime ENV must be set in BOTH `base` and `jvm` because jvm is not `FROM base` and does not inherit ENV (else jvm workers re-crash with M0, §4), and §5's egress must add a selector-based ALLOW to M7's in-cluster target, not only blocks, on a floor that currently denies it). Root cause of the worker-runtime failure is CONFIRMED from a live crash (M0). **Implementation LANDED 2026-07-22** on `feature/prd-87-browser` — M1/M3/M4/M5/M6 committed and unit-gate-green; the two remaining gates are M2's image-build measurements (image-size / build-delta / `nixSize`) and M7's live `web-ux` run on dev-cluster, both of which need a real CI kaniko build + cluster (see "Implementation progress" at the tail). **No open design decisions remain**: the §5 egress question resolved to Option A (a selector-based `extraEgress` allow to the in-cluster uzi `web` Service; the metadata/apiserver/node blocks are already shipped), owner-chosen 2026-07-20.
+**Status**: **DONE** — closed 2026-07-25, shipped across v0.11.0–v0.11.6. Every DoD line is satisfied except one, and that one's cause is diagnosed and owned elsewhere (below). GitLab issue #87 already closed.
+
+> **The one unsatisfied DoD line, stated plainly rather than quietly ticked.** *"Issue #87 closed; the M0 crash cannot recur"* — **it recurred.** The M7 gate run's `web-ux` hit the exact M0 abort (`FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166`) on its first launch. §4's env contract does not reach the agent, because `npm run start` prepends `/app/node_modules/.bin` and shadows the shim on the non-root k8s path. That is a **real delivery gap in this PRD's own M4**, not a technicality.
+>
+> **It is closed anyway, deliberately.** The mechanism is fully diagnosed (`entrypoint.sh:69` vs `:226`, `runner-uid.ts:51`), four candidate fixes are recorded, and the fix belongs to **PRD #120**, whose entire subject is this friction and which this run resolved to Hypothesis B. Holding #87 open would duplicate #120's ownership without adding a lever. The second residual — runtime memory was never re-costed for the browser, and the M7 run OOMed an 8Gi worker — is **issue #131**.
+>
+> **What this PRD did deliver, verified live on dev-cluster rather than asserted:** a pinned Chromium + fonts + `agent-browser` on every worker image via the shared toolchain; a headless launch under the real hardening (uid 10001, `cap_drop: ALL`, `no-new-privileges`); the crashpad `XDG_*` fix proved load-bearing by reproducing `exit=133` without it; **legible DejaVu glyphs confirmed by direct inspection of a real screenshot** (`prds/mockups/87-m7-font-legibility-2026-07-25.png`, and the M7 gate's own 1280×900 capture of the live UI); the `web-ux` builtin with the roster at eleven; and the M5 egress allow, extended to the docker tier in !105 after the gate run proved it missing.
+>
+> **Residuals handed off:** PRD #120 (the shim/PATH delivery gap), issue #131 (worker memory sizing), and one measurement gap — a true MR-cache-less build pair was never taken; §2(c)'s cold column is an upper bound from an accidentally-early tag, not a controlled run.
+
 **Priority**: Medium. Ships a genuinely new capability (browser-based UX validation in workers) and closes a real defect: today the shipped `web-ux` role, once engaged in a worker, crashes with a raw Chromium abort instead of validating anything.
 **Depends on**: PRD #18 (devbox/nix per-run tool provisioning — the ONE delivery path a browser rides). PRD #83 M1 (baked the go/gcc/python3/pip global toolchain via `devbox global install` from `agent/devbox-global/devbox.json` — **the exact manifest + Dockerfile stanza this PRD extends**). PRD #92 (immutable `/opt/uzi-toolchain` + version-aware `/nix` seed — a heavy browser closure makes the reseed more expensive, so the prebake MUST land on top of #92's seed, and the §2 measurement includes the reseed delta).
 **Related**: PRD #51 (worker/runner uid split + `no-new-privileges` + `cap_drop: ALL` — the hardening that makes Chromium's setuid sandbox impossible and forces `--no-sandbox`). PRD #37 (the worker detects the cloned repo's `.claude/agents/*.md` and surfaces them to the lead via the SDK `agents` option — the mechanism by which `web-ux` reaches a worker at all). Issue #61 (promote roles to builtins — `web-ux` is the one library role blocked on this PRD).
@@ -208,3 +217,53 @@ M5's `workers.networkPolicy.allowWebService` conditional exists **only** in `dep
 - **`devbox.lock` provenance → ACCEPTED as hand-extended, not regenerated.** The lock was extended by mirroring the existing go/gcc entry shape at the same pinned rev, to avoid realizing a darwin closure on the macOS host and mutating the real global toolchain. The authoritative realization is the **Linux image build's own `devbox global install`**, which has been passing since v0.11.0 — that is what proves the entries resolve, and it runs on every image build. Regenerating on a Linux builder would buy provenance tidiness, not correctness. **Not a residual; a recorded decision.**
 
 **Remaining to close #87 after the above:** (1) M7 proper — a genuine `web-ux` **agent** run against the web UI, once !105 deploys; the browser mechanics are already proven. (2) The §2(c) **build-time** deltas (protected-ref, MR-cache-less ×2, #92 reseed), which need CI pipeline runs to read numbers off.
+
+### ⚠ CORRECTION to the M7 entry above (2026-07-25, later the same day) — the shim is BYPASSED in the agent's shell
+
+**The section above says the browser mechanics pass "under the real k8s posture". That is true of the WORKER shell, which is what was probed, and NOT established for the AGENT shell, which is the one that matters.** The M7 gate run (issue #128, run `1dfc65b4`) established the difference, and it inverts the conclusion.
+
+**What the run measured.** `web-ux` did **not** launch clean. It took **4 tool calls**: the first `open` died on `FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166` (SUID helper not `root:4755`), and the second succeeded only with an explicit `--args "--no-sandbox"`. The agent did not know that flag — `agent-browser`'s own error output printed the hint and it copied it.
+
+**The mechanism, pre-registered before the run so it could not be retrofitted.** In the agent's shell `which -a agent-browser` resolves:
+
+1. `/app/node_modules/.bin/agent-browser` — the **real npm CLI**
+2. `/usr/local/bin/agent-browser` — the **PRD #87 shim**
+
+So a bare `agent-browser` reaches the real CLI first and **`AGENT_BROWSER_ARGS=--no-sandbox` is never injected**. The shim's own header asserts the opposite invariant — *"the real npm bin … is NOT on the image PATH, so a bare `agent-browser` from the agent always hits this shim first"* — and that invariant is **false in the shell that matters**. The lead recorded the prediction before dispatching and deliberately neither fixed the PATH nor hinted at it, so the uncoached measurement stands.
+
+**Why the earlier probe missed it.** It ran `agent-browser --version` and a direct chromium launch **inside the worker container's shell**, where the shim does resolve first and everything passes. `agent/src/sdk-env.ts` `buildSdkEnv` hands the agent subprocess a rebuilt, allowlisted env with `PATH=runnerPath()` — a *different* PATH. Generalising a worker-shell result across that boundary is what produced the wrong claim. *(Same error class as reading one worker's egress as the whole fleet's earlier the same day: a measurement taken on one side of a boundary, reported as if it held on the other.)*
+
+**What still stands from the earlier entry, unchanged:** chromium launches headless under the hardening *when given the flag*; the crashpad `XDG_*` fix is load-bearing (`exit=133` without it); fonts are correct — and the **glyph line is now settled by direct observation**: the owner pulled `/tmp/prd128-m7/landing.png` out of the pod and viewed it. Full landing page, nav *Docs / Log in / Register*, h1 **Uzinele Întunecate** with `Î`/`î` as **real glyphs, not tofu** — a stronger test than ASCII. `web-ux` reached the same verdict independently by canvas ink-profiling, which agreed with direct observation.
+
+**Consequence for the DoD.** The "legibly-rendered screenshot from a real worker" line is **SATISFIED**. The implicit promise of §4 — that an agent gets `--no-sandbox` *without having to know about it* — is **NOT**, and that is a real delivery gap, not deploy lag. It belongs to **PRD #120**, whose Hypothesis B this run supports over Hypothesis A. Two caveats travel with that verdict and must not be dropped: 4 calls is far milder than the 15+ #120 recorded, and the flag came from the CLI's own error hint rather than blind trial. Real, but cheaper than #120 feared.
+
+**Not fixed here, deliberately.** The PATH ordering, the shim, and the missing `--no-sandbox` note in the `web-ux` template are all left alone — the run was scoped to observation, and the fix belongs to #120 with the provenance answer (why `/app/node_modules/.bin` precedes `/usr/local/bin`) in hand.
+
+### §2(c) build-time deltas — MEASURED 2026-07-25 (closes the last non-M7 residual)
+
+Taken off the v0.11.6 release, which carried the M5 docker-tier fix. Both pipelines built the same sha (`9ee9d072`), so the pair is a clean protected-ref vs cold-cache comparison rather than two unrelated runs.
+
+| job | `#20002` protected-ref `main` (warm cache) | `#20003` tag publish (cold cache) | delta |
+|---|---|---|---|
+| agent `[base]` | **316 s** | 451 s | +135 s (+43%) |
+| agent `[jvm]` | **365 s** | 461 s | +96 s (+26%) |
+| controller | 79 s | 102 s | +23 s |
+| api | 58 s | 85 s | +27 s |
+| web | 33 s | 43 s | +10 s |
+| chart package+push | — | 16 s | — |
+
+**Reading these honestly — the two columns are not the measurement the PRD asked for.** §2(c) wanted *protected-ref* and *MR-cache-less ×2*. `#20002` is a genuine protected-ref build. `#20003` is **not** a clean cache-less build: it ran on a tag whose commit's `main` pipeline was still in flight, so it got a partially-cold cache — the slow path, but not a controlled one, and it happened because the tag was pushed early rather than by design. Treat the right-hand column as *an* upper bound, not *the* cache-less number. A true MR-cache-less pair is still unmeasured.
+
+**What is solid:** the browser closure puts the agent images at **~5–8 minutes** to build, roughly 4–7× the controller and ~10× web. That is the standing cost of the ~648 MiB chromium closure, and it is why the kaniko jvm OOM (fixed with `--compressed-caching=false`) bit on the heaviest job first. Both agent images now build and publish green at that size, on both paths.
+
+**`nixSize`** was already re-validated and bumped 4Gi → 20Gi by owner decision (2026-07-22); the live worker measures **2.6 GB** of baked `/nix`, so the headroom holds.
+
+### Runtime memory was never re-costed — the M7 run OOMed the worker (issue #131)
+
+The M7 gate run died `worker restarted; run orphaned and out of re-queue budget`. The pod was **`OOMKilled`, exit 137, twice**, on the **L** preset (`limits {cpu 4, memory 8Gi}`, `requests {cpu 1, memory 4Gi}`). The workload was ordinary for this feature: a `web-ux` subagent driving headless Chromium 150 against the live UI, plus `fact-checker` and `researcher` in parallel, plus the lead and the dind sidecar.
+
+**This PRD re-costed disk and not memory.** §2(c) measured the baked `/nix` at 2.6 GB and drove the owner's `nixSize` 4Gi → 20Gi bump. Chromium was added to **every** worker image without any preset's `MemoryRequest`/`MemoryLimit` being revisited (`controller/internal/preset/preset.go`). The largest standard size does not fit the feature this PRD shipped.
+
+Distinct from the kaniko OOM already recorded above: that was a CI **build-time** OOM on the runner, fixed with `--compressed-caching=false`. This is a **runtime** OOM in the worker pod. Same symptom word, unrelated cause — worth stating because the earlier fix could be mistaken for covering this.
+
+**Not a DoD failure of this PRD's browser work** — the validation had already succeeded when the OOM hit (screenshot captured and owner-verified, a11y snapshot taken, the PATH mechanism identified). The evidence survived only because it was already in the message transcript. Tracked forward in **issue #131**, which also asks whether this belongs to the preset table, to PRD #84's capability-aware scheduling (dismissed here as moot for *capability*, which does not settle *sizing*), or to `web-ux` bounding its own concurrency.

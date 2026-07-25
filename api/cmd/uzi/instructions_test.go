@@ -175,6 +175,53 @@ type knownInstruction struct {
 var knownInstructions = []knownInstruction{
 	// ---- HELP: references inside help text. The bar is that the path RESOLVES. ----------
 	{
+		command:  "uzi run list",
+		evidence: evidenceE2E,
+		where:    "uzi run list --json parses and matches GET /api/runs",
+		// ARRIVED FROM PRD #112 ON THE WAVE-3 MERGE, and adapted rather than invented: the
+		// entry main added carried `command` and `note` only, predating the `evidence` field,
+		// which this tree requires (evidenceUnset is invalid on purpose). The CLAIM below is
+		// main's author's, verified here rather than paraphrased; only its EXPRESSION is new.
+		//
+		// One site emits BOTH this and the `uzi run logs` entry below — `uzi tui`'s non-TTY
+		// refusal (tui.go), a single Exitf naming the two scriptable alternatives an agent
+		// should use instead of a full-screen UI. Exitf is an emitter, so both derive RUNTIME.
+		//
+		// VERIFIED, not inherited: the e2e address is a real executed phase, not a comment
+		// mentioning one — `pass "uzi run list --json parses and matches GET /api/runs (…)"`.
+		// That distinction matters because the address check is a strings.Contains over the
+		// harness text, which a comment would satisfy just as well.
+		note: "RUNTIME: `uzi tui`'s non-TTY refusal (tui.go) names the two scriptable " +
+			"alternatives. EXECUTED against a booted API in e2e/run-e2e.sh: the harness runs " +
+			"`uzi run list --json` on the host against the live stack and asserts its run-id SET " +
+			"EQUALS GET /api/runs's — so the command works AND its output agrees with the API, " +
+			"which is the property the instruction actually promises. Also driven through the " +
+			"real cobra parse against a fake client in commands_test.go.",
+	},
+	{
+		command:  "uzi run logs",
+		evidence: evidenceGoTest,
+		where:    "TestRunLogsFollowStopsOnTerminal",
+		// Same site, same adaptation as above.
+		//
+		// 🔴 MAIN'S NOTE CITED `commands_test.go:692` AND THE LINE HAD DRIFTED — the call is at
+		// :732, inside TestRunLogsFollowStopsOnTerminal. The CLAIM is true and the CITATION was
+		// stale, which is exactly why evidenceGoTest takes a FUNCTION NAME: a name survives the
+		// edit that moves a line. Found by grepping for `"--follow"` rather than reading :692.
+		//
+		// MAIN'S HONEST LIMIT IS PRESERVED VERBATIM IN SUBSTANCE, because the author who
+		// measured it is worth more than a paraphrase: the follow loop is NOT executed against
+		// a booted API. e2e covers live streaming through the /api/ws legs instead, so the poll
+		// loop's behaviour against a real server is unit-level only.
+		note: "RUNTIME: the same `uzi tui` non-TTY refusal (tui.go), as the follow-a-run " +
+			"alternative. EXECUTED WITH --follow through the real parse in " +
+			"TestRunLogsFollowStopsOnTerminal (commands_test.go), which asserts the follow loop " +
+			"drains and terminates on a terminal run. NOT executed with --follow against a " +
+			"booted API — the e2e harness uses the /api/ws legs for live streaming, so the poll " +
+			"loop against a real server is covered only at the unit level. Stated rather than " +
+			"implied, per this file's own rule.",
+	},
+	{
 		command:  "uzi worker set-token",
 		evidence: evidenceHelpOnly,
 		// This entry arrived from PRD #104 on the landing merge (2026-07-21), because the

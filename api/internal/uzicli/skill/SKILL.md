@@ -28,6 +28,13 @@ Two rules cover almost everything:
 2. **Branch on the exit code, not on the text.** The message wording is for
    humans and may change; the exit code is the contract.
 
+**`uzi tui` is not for you.** It is a full-screen, keyboard-driven UI for a human
+watching runs, and it refuses to start when stdout is not a terminal (exit 2). There
+is nothing it shows that the `--json` verbs do not: use `uzi run list --json` for the
+board, `uzi run get --json` for one run's state, and `uzi run logs <id> --follow` to
+follow a transcript. Mentioned here only so you recognise it and do not try to drive
+it.
+
 ### Exit codes
 
 | Code | Meaning | What to do |
@@ -82,6 +89,7 @@ uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi run inputs <run-id>
+uzi tui [run-id]
 uzi review show <run-id>
 uzi review backlog [--bucket todo|filed|done|dismissed|all] [--run <run-id>]
 uzi review resolve <run-id> <rec-id> | --category <c> --target <t>

@@ -148,6 +148,63 @@ for (const file of files) {
   }
 }
 
+// Relative-link existence OUTSIDE docs/ (issue #132). ARCHITECTURE.md and
+// specs/*.md link PRDs heavily, and nothing validated them — so every
+// `git mv prds/X.md prds/done/X.md` silently broke its own inbound references.
+// Measured 2026-07-25: 36 distinct dead PRD paths had accumulated, 11 in
+// ARCHITECTURE.md alone. These files carry no frontmatter and no `order`, so
+// only the link check applies to them.
+//
+// Gated on fullCheckout for the same reason as the doc->outside case above: the
+// web image build context is trimmed to web/ + docs/, so these files are absent
+// there by design and the containerized build must stay green.
+const extraLinkFiles = ["ARCHITECTURE.md", "README.md", "CLAUDE.md"];
+if (existsSync(path.join(repoRoot, "specs"))) {
+  for (const f of readdirSync(path.join(repoRoot, "specs")).sort()) {
+    if (f.endsWith(".md")) extraLinkFiles.push(path.join("specs", f));
+  }
+}
+
+if (fullCheckout) {
+  for (const rel of extraLinkFiles) {
+    const abs = path.join(repoRoot, rel);
+    if (!existsSync(abs)) continue; // optional files
+    const noCode = stripCode(readFileSync(abs, "utf8"));
+    const baseDir = path.dirname(abs);
+    for (const target of extractTargets(noCode)) {
+      if (isExternal(target) || target.startsWith("#")) continue;
+      const filePart = target.split("#")[0].split("?")[0];
+      if (filePart === "") continue;
+      if (!existsSync(path.resolve(baseDir, filePart))) {
+        fail(rel, `broken relative link: ${target} (not found)`);
+      }
+    }
+    // A link whose display text is itself a path must not name a file that does
+    // not exist. Repairing a target and leaving the text behind resolves
+    // correctly and reads wrong, sending a reader to a directory with nothing in
+    // it — 8 such links existed before #132.
+    //
+    // The discriminator is "the TEXT does not resolve", NOT "text differs from
+    // target": a correct link in specs/ reads
+    // [prds/done/X.md](../prds/done/X.md), where the two legitimately differ by
+    // the `../` a relative path needs. A first cut of this check compared them
+    // literally and produced 18 false positives on correct links.
+    for (const m of noCode.matchAll(/\[([^\]]*\.md)\]\(([^)\s]+)\)/g)) {
+      const text = m[1];
+      // Only text that names a PATH (contains a separator) makes a claim that
+      // can go stale. A bare filename like [auth-design.md](docs/auth-design.md)
+      // is a display name, not a claim — requiring the separator removed 4 false
+      // positives on correct links.
+      if (isExternal(m[2]) || text.includes(" ") || !text.includes("/")) continue;
+      const textResolvesFromRoot = existsSync(path.resolve(repoRoot, text));
+      const textResolvesFromHere = existsSync(path.resolve(baseDir, text));
+      if (!textResolvesFromRoot && !textResolvesFromHere) {
+        warn(rel, `link text "${text}" looks like a path but no such file exists (target "${m[2]}" may have been repaired without updating the text)`);
+      }
+    }
+  }
+}
+
 // Per-image byte budget for everything shipped in docs/img/.
 if (existsSync(imgDir)) {
   for (const f of readdirSync(imgDir).sort()) {

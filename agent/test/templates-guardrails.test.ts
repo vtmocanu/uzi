@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -274,6 +276,85 @@ describe("the shared root-entry drop wrapper", () => {
     // make the single-uid worker try (and EPERM) to setpriv-wrap runner spawns.
     const unsetAt = entrypoint.search(/unset\s+UZI_UID_SPLIT\s+UZI_RUNNER_PATH\s+UZI_RUNNER_TMPDIR/);
     assert.ok(unsetAt >= 0 && unsetAt < nonrootExecAt, "the non-root path must unset the split env before exec tini");
+  });
+
+  it("issue #120: the non-root branch pins UZI_RUNNER_PATH to the image PATH (the shim must not be shadowed)", () => {
+    // The CMD is `npm run start`, and npm's run-script PREPENDS /app/node_modules/.bin to
+    // the PATH the worker process sees. With UZI_RUNNER_PATH left unset, runnerPath() fell
+    // back to that mutated PATH and the real agent-browser npm CLI shadowed the
+    // /usr/local/bin shim that injects --no-sandbox — so browser launches hit the setuid
+    // sandbox the PRD #51 hardening makes impossible. The entrypoint runs BEFORE the CMD,
+    // so `$PATH` here is still the untouched image PATH (== IMAGE_PATH on the root path).
+    const unsetAt = entrypoint.search(/unset\s+UZI_UID_SPLIT\s+UZI_RUNNER_PATH\s+UZI_RUNNER_TMPDIR/);
+    const pinAt = entrypoint.search(/export\s+UZI_RUNNER_PATH="\$PATH"/);
+    const nonrootExecAt = entrypoint.search(/exec\s+"\$TINI"\s+--\s+"\$@"/);
+    assert.ok(pinAt >= 0, 'the non-root branch must export UZI_RUNNER_PATH="$PATH"');
+    assert.ok(unsetAt >= 0 && unsetAt < pinAt, "the pin must come AFTER the unset, so a stray operator value is still cleared");
+    assert.ok(pinAt < nonrootExecAt, "the pin must come BEFORE the non-root exec tini");
+
+    // ...and the branch must re-export NEITHER of the other two: UZI_UID_SPLIT would
+    // activate the split (setpriv EPERMs non-root ⇒ every runner spawn fails ⇒ DoS, the
+    // fail-safe the unset exists for), and UZI_RUNNER_TMPDIR would override the pod-spec
+    // TMPDIR the k8s docker render depends on (controller/internal/kube/render.go).
+    const branch = entrypoint.slice(unsetAt, nonrootExecAt);
+    assert.doesNotMatch(branch, /export\s+UZI_UID_SPLIT/, "the non-root branch must never activate the split");
+    assert.doesNotMatch(branch, /export\s+UZI_RUNNER_TMPDIR/, "the non-root branch must leave TMPDIR to the pod spec");
+
+    // The compose/A1 path is untouched: it still captures the image PATH BEFORE stripping
+    // the worker's own, which is what has always made the shim win there.
+    const captureAt = entrypoint.search(/IMAGE_PATH="\$\{PATH\}"/);
+    const stripAt = entrypoint.search(/^PATH=\/usr\/local\/sbin:/m);
+    assert.ok(captureAt >= 0 && stripAt >= 0 && captureAt < stripAt, "IMAGE_PATH must be captured before the worker PATH is stripped");
+  });
+
+  it("issue #120: RUNS the non-root branch — pins the runner PATH, still clears the split env", () => {
+    // Behavioural, not textual: execute the real script's non-root branch with the two
+    // absolute-path constants stubbed (`id` so the branch is taken regardless of who runs
+    // the suite — including a root CI container, where the root branch would chown /nix and
+    // /data; `tini` so the exec lands on an env dump instead of PID 1). Everything between
+    // — the uid read, the numeric validation, the unset, the pin — is the shipped code.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-entrypoint-120-"));
+    try {
+      const stubId = path.join(dir, "id");
+      const stubTini = path.join(dir, "tini");
+      fs.writeFileSync(stubId, "#!/bin/sh\necho 10001\n", { mode: 0o755 });
+      fs.writeFileSync(stubTini, "#!/bin/sh\nenv\n", { mode: 0o755 });
+      const script = path.join(dir, "entrypoint.sh");
+      const patched = entrypoint
+        .replace("ID=/usr/bin/id", `ID=${stubId}`)
+        .replace("TINI=/sbin/tini", `TINI=${stubTini}`);
+      assert.ok(patched.includes(stubId) && patched.includes(stubTini), "both constants must be stubbed");
+      fs.writeFileSync(script, patched, { mode: 0o755 });
+
+      // The image PATH as the entrypoint sees it (before the CMD's npm mutates it), plus
+      // STRAY values for all three split vars — an operator misconfig the branch must clear.
+      const IMAGE_PATH = "/opt/uzi-toolchain/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+      const r = spawnSync("/bin/sh", [script, "npm", "run", "start"], {
+        encoding: "utf8",
+        env: {
+          PATH: IMAGE_PATH,
+          UZI_UID_SPLIT: "1",
+          UZI_RUNNER_PATH: "/stray/operator/value",
+          UZI_RUNNER_TMPDIR: "/stray/operator/tmp",
+        },
+      });
+      assert.equal(r.status, 0, `the non-root branch must exec cleanly (stderr: ${r.stderr})`);
+      assert.match(r.stderr, /single-uid non-root mode \(PRD #58\)/, "must take the non-root branch");
+
+      const env = new Map(
+        r.stdout
+          .split("\n")
+          .filter((l) => l.includes("="))
+          .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)] as [string, string]),
+      );
+      // The fix: the runner PATH is the image PATH, NOT the stray value and NOT unset.
+      assert.equal(env.get("UZI_RUNNER_PATH"), IMAGE_PATH, "UZI_RUNNER_PATH must be pinned to the image PATH");
+      // The fail-safe the unset exists for, still intact.
+      assert.equal(env.has("UZI_UID_SPLIT"), false, "a stray UZI_UID_SPLIT must still be cleared (setpriv EPERMs non-root)");
+      assert.equal(env.has("UZI_RUNNER_TMPDIR"), false, "a stray UZI_RUNNER_TMPDIR must still be cleared (pod-spec TMPDIR wins)");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("fails CLOSED on an unreadable uid (never silently takes the non-root branch)", () => {

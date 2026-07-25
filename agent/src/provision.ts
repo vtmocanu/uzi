@@ -122,7 +122,10 @@ export function buildProvisionEnv(source: NodeJS.ProcessEnv, homeDir: string): N
   const env: NodeJS.ProcessEnv = {
     // So `devbox`, `nix`, and `sh` resolve. The RUNNER PATH (PRD #51 M4): the
     // /nix-bearing image PATH under the split (provisioning runs as `runner`), NOT the
-    // worker's stripped PATH. Single-uid (#58): the worker's own PATH. Not a secret.
+    // worker's stripped PATH. Single-uid (#58): ALSO the image PATH since PRD #120 — the
+    // entrypoint pins UZI_RUNNER_PATH on both branches. Not a secret. NOTE this value is
+    // what devbox's `$PATH` back-ref expands against in filterShellenv below, so the
+    // toolEnv.PATH handed to the agent inherits the image PATH as its tail.
     PATH: runnerPath(source),
     // nix single-user profile + devbox state live under this (data volume) HOME.
     HOME: homeDir,

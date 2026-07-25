@@ -202,3 +202,130 @@ efficiency + reliability fix, so Medium priority.
   `--no-sandbox` note; (4) path/line nits. Also added the M2 agent-agnostic
   `--no-sandbox` clause so the SVG→PNG rasterization use case (dismissed
   dedicated-rasterizer rec, run 0ab992db) is covered for non-web-ux launches too.
+
+## RESOLVED 2026-07-25 — Hypothesis B. The mechanism is `npm run start`, and it is k8s-only.
+
+Settled by the PRD #87 M7 gate run (issue #128, run `1dfc65b4`) on worker `8e1fef71`, image `agent-base:0.11.6` — i.e. carrying every relevant fix, which is what kills Hypothesis A.
+
+### The measurement
+
+`web-ux`, dispatched **uncoached** (no mention of the shim, `--no-sandbox`, or PATH — deliberately, so item 6 measured discovery rather than recall):
+
+- **Not clean. 4 tool calls.** First `open` died on `FATAL:sandbox/linux/suid/client/setuid_sandbox_host.cc:166`; the second worked with an explicit `--args "--no-sandbox"`.
+- **Provenance of the flag matters:** the agent did **not** know it. `agent-browser`'s own error output printed the hint and it copied it. So the recovery was cheap, but it was recovery, not correct-by-construction.
+- The launch resolved **`/app/node_modules/.bin/agent-browser`** — the real npm CLI — so the shim never ran and `AGENT_BROWSER_ARGS=--no-sandbox` was never injected.
+
+The lead **pre-registered** the PATH prediction before dispatching and refused to repair it, so the outcome could not be retrofitted either way.
+
+### Root cause — `npm run start`, not any Dockerfile and not `sdk-env.ts`
+
+Neither Dockerfile prepends `/app/node_modules/.bin`; the only `ENV PATH` lines add `/nix/var/nix/profiles/default/bin` and `/opt/uzi-toolchain/bin`. `buildSdkEnv` merely propagates `runnerPath()`. **npm's run-script is the injector**, via `CMD ["npm","run","start"]` (`base/Dockerfile:324`) plus the fallback at `runner-uid.ts:51`, `return env.UZI_RUNNER_PATH || env.PATH`.
+
+Live PATH on the worker (uid 10001), in order:
+
+```
+1 /app/node_modules/.bin                                   <- real agent-browser CLI
+2 /node_modules/.bin
+3 …/@npmcli/run-script/lib/node-gyp-bin                    <- only `npm run` ever adds this
+4 /opt/uzi-toolchain/bin                                   <- start of the untouched image PATH
+7 /usr/local/bin                                           <- the shim
+```
+
+Entry 3 is the fingerprint: only `npm run` prepends `node-gyp-bin`, so npm inserted exactly three entries ahead of the image PATH.
+
+### Why it is k8s-only — and why every earlier probe missed it
+
+`agent/templates/entrypoint.sh` behaves differently per mode:
+
+| | root / compose (A1 uid-split) | **non-root / hosted k8s (#58 single-uid)** |
+|---|---|---|
+| `IMAGE_PATH` captured at `:89`, before npm runs | yes | yes |
+| exported as `UZI_RUNNER_PATH` at `:226` | **yes** | **no** — `:69` explicitly *unsets* it, then `exec tini -- npm run start` |
+| `runnerPath()` returns | clean image PATH | **npm-mutated PATH** |
+| shim wins? | **yes — invariant holds** | **no — shadowed** |
+
+So the shim's header assertion (*"the real npm bin … is NOT on the image PATH"*) is true on compose and **false on the primary runtime**. `toolchain-preflight.ts:17` already documented the same `UZI_RUNNER_PATH`-unset fallback — the mechanism was known, just never connected to the shim.
+
+This also explains why an operator probe on 2026-07-25 found a *clean* launch: it ran in the **worker container's** shell, which is not the npm-spawned agent environment. A worker-shell result does not transfer across that boundary.
+
+**PRD #121 is NOT implicated** — it is unimplemented (two docs commits only) and contains zero PATH mutations. Provisioning's `toolEnv.PATH` is downstream of the same defect, not a second cause.
+
+### Verdict, with both caveats kept
+
+**Hypothesis B (real delivery gap), not deploy lag.** The friction is real, reproducible, and structural. But it is **much cheaper than this PRD feared**: 4 tool calls, not the 15+ recorded on run `2ebc093e`, and the flag came from the CLI's own hint rather than blind trial. Do not round that up to "confirmed as recorded" or down to "minor" — both numbers stand.
+
+*(The 15+ on `2ebc093e` may still have been aggravated by the mid-upgrade worker #113 documents. Hypothesis A is dead as the **sole** explanation, not necessarily as a contributing factor to that particular run's severity.)*
+
+### Candidate fixes — not implemented, deliberately
+
+1. **Export `UZI_RUNNER_PATH` on the non-root path too** (`entrypoint.sh`), so `runnerPath()` returns the clean image PATH in both modes. Smallest change, fixes the class, and makes the two modes agree — which is the actual defect.
+2. **Reorder** so `/usr/local/bin` precedes npm's injections. Fragile: npm re-prepends per invocation.
+3. **Rename the shim** so it cannot be shadowed by a same-named real binary. Most robust, largest blast radius.
+4. Independently: the `web-ux` builtin template still carries **no `--no-sandbox` note**, so an agent that never reads an error hint has nothing to go on.
+
+(1) is the recommendation; the shim's header assertion must be corrected in the same change, since it is currently false.
+
+## FIXED 2026-07-25 — option (1) implemented (branch `fix/120-shim-path-shadowing`)
+
+**The change (one line of behaviour).** `agent/templates/entrypoint.sh`, non-root branch:
+`export UZI_RUNNER_PATH="$PATH"` — placed **after** the existing
+`unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR`, so the operator fail-safe still
+clears any stray value and the value that survives is the entrypoint's own. The entrypoint
+runs **before** the CMD, so `$PATH` there is still the untouched image PATH — the identical
+value `IMAGE_PATH` captures on the root path. `runnerPath()` now returns the image PATH in
+**both** modes, so `/usr/local/bin`'s shim is the only PATH-resolvable `agent-browser`
+again.
+
+**Why the `:69` unset is preserved, not weakened.** That unset exists so a stray
+`UZI_UID_SPLIT=1` on a non-root deploy cannot make the single-uid worker setpriv-wrap every
+runner spawn (EPERM ⇒ DoS). `uidSplitActive()` keys on `UZI_UID_SPLIT` **alone** —
+`UZI_RUNNER_PATH` activates nothing — so re-exporting it leaves the single-uid posture
+untouched. It also widens nothing: single-uid means worker == runner, and that PATH was
+already the worker's own. `UZI_RUNNER_TMPDIR` is deliberately **not** re-exported —
+`controller/internal/kube/render.go` sets a pod-spec `TMPDIR` for docker workers and relies
+on this branch leaving it unset.
+
+**Compose is unaffected by construction:** every added line sits inside the
+`if [ "$uid" != "0" ]` block, which a root start never enters. The root path's bytes are
+unchanged.
+
+**Also corrected (the false doc, per the same-commit rule).** The shim header in
+`agent/bin/agent-browser` asserted the layout alone made a bare `agent-browser` hit the
+shim. It now states the npm-CMD mechanism, that the claim was false on the primary runtime,
+and that the guarantee lives in the **entrypoint** — plus the residual: a provisioned
+`toolEnv.PATH` (PRD #18 M3) still REPLACES the agent PATH in `buildSdkEnv` and could shadow
+the shim again. The same false claim in both Dockerfile comments, and the stale
+"single-uid ⇒ falls back to the worker PATH" notes in `runner-uid.ts`,
+`toolchain-preflight.ts`, `sdk-env.ts` and `docs/proc-hardening.md`, were corrected too.
+
+**Tests (3 new; the 2 ENTRYPOINT tests are mutation-proven, the third is a model test).** `agent/test/runner-uid.test.ts` pins the resolution
+order (which dir a bare `agent-browser` resolves from) across pre-fix, post-fix and compose
+PATH shapes. `agent/test/templates-guardrails.test.ts` adds a structural test (pin after the
+unset, before the exec; neither of the other two vars re-exported) and one that **executes**
+the real non-root branch with only the two absolute-path constants (`id`, `tini`) stubbed,
+asserting a stray `UZI_RUNNER_PATH` is replaced by the image PATH while stray
+`UZI_UID_SPLIT`/`UZI_RUNNER_TMPDIR` stay cleared. Removing the pin turns both RED.
+
+**Not verifiable locally.** No local gate can prove the fix on the real runtime — that needs
+a release + ArgoCD roll + a worker on the new image. M5 (a clean web-ux run) remains open and
+is the only thing that closes this.
+
+**Milestones:** M2 done for the web-ux/shim path (and agent-agnostically: every runner child
+gets the corrected PATH, so a coder rasterizing SVG→PNG via chromium is covered by the same
+shim). M6 partially done (unit coverage + docs; no `specs/ai.md` entry — see below). M3/M4/M5
+still open.
+
+**M3 recommendation — do NOT ride the `--no-sandbox` template note on this fix.** The
+measured cost without it was 4 tool calls with the flag supplied by agent-browser's own error
+hint, and a note would create a second source of truth for a value the shim owns. Worse, the
+obvious phrasing teaches the agent to pass `--args "--no-sandbox"` — and agent-browser's
+README documents `--args` and `AGENT_BROWSER_ARGS` as *the same single list-valued setting*,
+not additive, so an explicit `--args` would drop `--disable-dev-shm-usage` (64MB `/dev/shm`).
+That is precisely what run `1dfc65b4` did on its recovery. If M3 adds a note anyway, phrase it
+as *"the runtime already injects `--no-sandbox`; do not pass `--args` unless you repeat the
+full list"*. Better still, let M5 confirm the flag now arrives by construction first.
+
+**Follow-up not taken here:** a `specs/ai.md` entry for "the entrypoint pins the runner PATH
+in both modes". Skipped deliberately — `specs/ai.md` is append-only at the tail and several
+sessions are live in this repo, so claiming a section number now risks a collision. Worth
+adding on the landing rebase.

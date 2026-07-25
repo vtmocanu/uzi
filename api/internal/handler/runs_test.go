@@ -566,8 +566,12 @@ func TestAdminListWorkersAndRuns(t *testing.T) {
 }
 
 // wsTestServer wires ServeWS behind a middleware that injects user into context,
-// standing in for RequireAuth so the WS authz + upgrade can be exercised end to
-// end over a real (hijackable) connection.
+// standing in for the RequireUser mount (PRD #112 M1) so the WS authz + upgrade can
+// be exercised end to end over a real (hijackable) connection.
+//
+// It deliberately proves nothing about WHICH middleware handler.go mounted /ws
+// behind — it injects the user directly, so it is green either way. That property is
+// pinned separately, over the real router, in ws_bearer_livedb_test.go.
 func wsTestServer(h *Handler, user store.User) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.ServeWS(w, r.WithContext(mw.ContextWithUser(r.Context(), user)))

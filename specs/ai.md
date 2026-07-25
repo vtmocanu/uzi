@@ -5733,7 +5733,10 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   frames, clamped ≥0), per-agent table, and finish-line tokens from the replayed message stream
   (`web/src/lib/runUsage.ts`, a pure reduction re-run as messages grow → live fold-in, no
   accumulator). `formatTokens`/`formatCost` (Decision 10) are the single shared formatters — adaptive
-  (k under 1M, M above); a sub-1M list total showing "640.0k" (not "0.64M") is correct, not drift.
+  (k under 1M, then M/B/T above, two decimals each — **corrected 2026-07-25, issue #77**: this line
+  read "M above", which was true when written and became false once B and T were added; a
+  rebuild-from-specs off the old wording reproduces the two-tier formatter that rendered billions as
+  "5400.00M"); a sub-1M list total showing "640.0k" (not "0.64M") is correct, not drift.
   Cost is secondary and a $0 cost renders "—" (Decision 8). The dashboard's "Your usage" is for
   everyone; the factory total + per-user table (share bars by total tokens) render only when the
   admin view was fetched — a non-admin never calls the admin endpoint. **Caveat:** the run-view strip
@@ -5907,7 +5910,7 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
 ## 235. Per-user Claude rate-limit meters — background poller + gauge row + read-endpoint split
 
 Serves human: Feature #53 (per-user Claude rate-limit visibility; human.md entry pending lead/user
-confirmation). Full design record: [prds/53-rate-limits.md](../prds/53-rate-limits.md) (D1–D7, the
+confirmation). Full design record: [prds/done/53-rate-limits.md](../prds/done/53-rate-limits.md) (D1–D7, the
 frozen DTO, accepted residuals). This file records only the shape and the reconciliations decided
 this session; the PRD is authoritative for rationale.
 
@@ -7224,7 +7227,7 @@ Serves human: as §264. Recorded because the honest inventory is part of the con
 
 Serves human Feature #70 (a GitLab-style status favicon + a brand favicon). `web/`-only: no api,
 agent, DB, or migration change. The shipped CSP (`img-src 'self' data:`) already permits the `data:`
-favicon and was deliberately NOT touched. Full decision log: [prds/70-status-favicon.md](../prds/70-status-favicon.md).
+favicon and was deliberately NOT touched. Full decision log: [prds/done/70-status-favicon.md](../prds/done/70-status-favicon.md).
 
 ## 276. Brand favicon + client-side dynamic status overlay from the signed-in user's own runs
 
@@ -10260,6 +10263,366 @@ for the operator-facing account — which, because PRD #47's exit contract clear
 run health on every terminal path, is together with M7's log lines the only
 durable record of why a run carries `stop_kind='auto_stopped'`.
 
+## 368. PRD #112 D1/D2 — `/api/ws` admits a Bearer CLI token by a ROUTE MOVE; the origin rule is untouched, and that is the whole safety argument
+
+*(§367 was reserved by PRD #108 Phase 2 while it was in flight on its own branch; it
+has since landed and now sits directly above. The reservation was deliberate and it was
+right: the number was claimed in an uncommitted worktree, so a tip-only sweep would have
+taken 367 and collided. Recorded on the `origin/main` merge, 2026-07-25.)*
+
+**D1 — ride the existing hub; do not build an SSE endpoint.** `internal/hub` already
+fans `message` / `state` / `health` / `input` frames to per-run subscribers and the
+web already rides it; `coder/websocket` was already a dependency. A second
+`text/event-stream` channel would be marginally simpler to *consume* and strictly
+worse to *own*: two fan-out paths to keep in sync on every future frame type, with
+nothing forcing them to agree. One channel, two clients.
+
+**D2 — the move, stated precisely.** `/ws` left the cookie-only `RequireAuth` tail
+and now sits in its own `RequireUser` group mounted with the run READS
+(`handler/handler.go:735-748`, route at `:746`). `websocket.Accept`'s options were
+**not** touched: no `InsecureSkipVerify`, no `OriginPatterns` widening, and **no
+auth-type branch inside `ServeWS`** — such a branch would be a second copy of
+`RequireUser`'s dispatch predicate, free to drift from it. Per-run authz is the same
+`GetRunForViewer` call it always was.
+
+**Why that is safe, in two independent halves.** Either one alone would do; both hold.
+
+- **A browser-less client sends no `Origin`, and the library passes an empty one.**
+  `authenticateOrigin` returns nil for `origin == ""` (pinned `coder/websocket@v1.8.14`,
+  `accept.go:228-232`, reached from `accept.go:116-117` whenever `InsecureSkipVerify`
+  is false), and its own `Dial` never sets the header. So the Bearer upgrade passes
+  the **unmodified** default check — nothing has to be skipped to let the CLI in. An
+  earlier PRD draft claimed `InsecureSkipVerify` was required on the Bearer path;
+  that was false, and acting on it would have removed the defense the move preserves.
+  This is verified by a live handshake matrix (`handler/ws_bearer_livedb_test.go`,
+  four LiveDB tests), not only by reading the dependency.
+- **A cross-site browser page cannot attach an `Authorization` header** (the browser
+  WebSocket API forbids custom headers), so it can only present the ambient cookie —
+  it stays on the cookie path, sends its own foreign `Origin`, and is still rejected
+  same-origin. The CSWSH defense the cookie needs is byte-for-byte what it was.
+
+**`Origin: null` is REJECTED, and that distinction is load-bearing.** A sandboxed
+iframe or a `data:` page sends the literal string `null`, which parses to a URL with
+no host and fails at `accept.go:256-258`. It is **not** the absent-`Origin` case the
+CLI relies on. If a future refactor ever collapsed "null" into "absent" as a
+convenience, the entire cookie defense would be one `sandbox` attribute away from
+bypass. Pinned by `TestWSCookieForeignOriginStillRejectedLiveDB`, which asserts the
+same-origin control passes first so the foreign-origin refusal is not vacuous.
+
+**Correction to an earlier claim in this PRD's own D2, recorded because it was
+believed and shipped in a draft.** D2 said `RequireUser` and `RequireAuth` populate an
+*identical* context user. That is false. `middleware/cli_auth.go:86` clears
+`user.IsAdmin` on any token whose scope is not `admin_ro`. Same context key, same
+`store.User` type, same `GetRunForViewer` call — but the **reach is narrowed** by
+token scope, never widened. An admin's session cookie subscribes to any run; the same
+admin's default-scope `uzc_` is owner-only and takes the pre-upgrade 404. *The
+narrowing direction is the reason no handler change was needed*: admitting Bearer can
+only shrink what a given person can reach through this route. The `[a]` admin board
+depends on exactly this — a `uzc_` is cleanly refused the factory-wide view even when
+its holder is an admin in the database.
+
+**Supersedes the `/api/ws` line in §279** (`specs/ai.md:7411-7412` at the time of
+writing), which recorded WS-follow as deferred and noted that leaving
+it unswapped "keeps `handler/ws.go`'s 'runs inside the session-authenticated group'
+comment true". That comment has been rewritten (`handler/ws.go:26-74`) and the route
+has moved, so the line is now stale. It is **left in place, not edited**: this file is
+append-at-tail and §279 is the record of a decision that was correct when it was made.
+§279's governing principle — enumerate the disposition per route, never swap a whole
+group — is not superseded; this is one more route enumerated, with its reasons.
+
+**R6, reframed: a live socket outlives token revocation, and "parity" undersold it.**
+The honest framing is **parity in mechanism, wider in blast radius**. In mechanism it
+is parity: the hub has no kick API at all, and a cookie session already survives
+logout the same way. In blast radius it is not: a `uzc_`/`uza_` is *designed* to
+outlive a session, and `wsPingInterval` (30s) keeps the socket up indefinitely rather
+than letting an idle tab time out. So a leaked, revoked `uzc_` can watch a run far
+longer, in expectation, than a leaked session ever could. A hub-level kick-on-revoke
+is its own backend PRD, recorded here so it is a known accepted property rather than a
+surprise — not a TODO folded into this one. Related and also recorded rather than
+fixed: `/api/ws` has no per-user connection cap, pre-existing, and M1 does not worsen
+it but does make it easier to reach in practice.
+
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) for D1/D2, R1, R6 and the M1
+milestone record.
+
+## 369. PRD #112 M2 — the hub's seq-less drop hole (the old comment was FALSE at four sites), and why `Kind` stays OPEN while `Status` is CLOSED
+
+**The false claim, and where it lived.** `internal/hub` documented, in four separate
+places, that a dropped frame "is not lost — only its WS fast-path", because the client
+detects the seq gap and does a REST catch-up: the package doc, the `subBuffer`
+comment, `broadcast`'s docstring, and the inline comment in `broadcast`'s `default:`
+branch. That is true for **`message`** frames and **false for the other three**. Only
+`message` carries a `Seq`. A dropped `state`/`health`/`input` frame produces **no
+gap**, so there is nothing to detect, nothing triggers a re-read, and the signal is
+simply gone until the next frame of that type — which, for a **terminal** `state`
+frame, never comes. A completed run then renders as still running for as long as the
+consumer trusts the socket. All four sites were rewritten in the same commit as the
+work that disproved them (M2); the hub was a producer with no consumer that needed the
+distinction until now, which is why four wrong comments survived.
+
+**The recovery cannot live in the hub — it is the consumer's, and it must be
+time-based.** An event-based repair is impossible here by construction: no event is
+coming. `uzicli.StreamRun` closes it with a periodic `GetRun` reconcile
+(`defaultStreamReconcile = 12s`), **which stops once the run is terminal**. That stop
+is safe because it was checked against the requeue paths, not assumed: both
+`RequeueRunsOfStaleWorkers` and `RequeueWorkerRuns` (`store/queries/runtime.sql`) are
+scoped `WHERE status IN ('claimed','running','awaiting_approval')`, so a terminal run
+is never returned to `queued` and there is no state the poll could miss by stopping.
+`broadcast`'s rewritten docstring now states the obligation directly: *a new consumer
+of this hub must provide a time-based re-read, or it will render terminal runs as
+live.*
+
+**On every reconnect, not merely on a detected gap.** `RunStream` replays via
+`RunLogs(after)` **and** re-reads `GetRun`, because the reconnect itself is the only
+evidence available that a seq-less frame may have been missed.
+
+**`hub.Event` is now a type ALIAS for `apitypes.RunEventDTO`, not a copy.** The shape
+moved to `apitypes` when the CLI became a second decoder of these frames. An alias
+(not a defined type) is what makes the server and the CLI *provably* the same shape: a
+second struct definition could drift a JSON tag and nothing would fail.
+
+**`Kind` is OPEN, `Status` is CLOSED — the reasoning, so nobody tidies them into
+symmetry.** They look like peers on the wire and are not:
+
+- **`run_messages.kind` has no DB constraint anywhere.** The column is declared
+  `kind text NOT NULL` (`migrations/00020_workers_runs.sql:74`) with the value list in
+  a comment only, and the values originate at `agent/src/protocol.ts:29` in a
+  **separately-deployed container** that versions independently of the API. `protocol.ts`
+  says so itself: "the DB column carries no CHECK, so these need no migration". A `uzi`
+  built today will routinely see kinds a newer worker emits. Normalising them to a
+  sentinel would silently and permanently discard information.
+- **`runs.status` has a CHECK constraint** over exactly seven values
+  (`migrations/00020_workers_runs.sql:37`). A value outside the set cannot be stored,
+  so one arriving on the wire means the server is newer than this binary — which is
+  precisely when it must not be trusted to mean "active".
+
+Hence `NormalizeRunEvent` (`internal/uzicli/stream.go:74`) normalises `Type` and
+`Status` to inert sentinels and preserves `Kind` and `Agent` verbatim. It runs at the
+**decode boundary**, not at render, because a value that reaches a consumer intact can
+be branched on by any render path added later — including one written after this rule
+is forgotten. An unknown `Type` additionally has its `Status` cleared, so an
+unrecognised frame cannot drive the run chip through a consumer that inspects `Status`
+before `Type`. **`Kind`'s inertness requirement is met by a different mechanism at a
+different layer**: terminal-control-byte stripping at render (D7, §371). Nothing
+branches on `Kind` for liveness.
+
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) M2 for the full reconnect-replay
+contract.
+
+## 370. PRD #112 M3 — the TUI is `api/cmd/uzi/tui_*.go` in `package main`, NOT a `tui/` subpackage; the tradeoff recorded honestly
+
+The PRD's own Files column, its Parallelization table, and R3's mitigation all named
+`api/cmd/uzi/tui/*` — **a package that was never buildable**. All 41 `.go` files in
+`api/cmd/uzi/` are `package main` (measured 2026-07-25), and Go forbids importing a
+main package, so a subpackage could reach **none** of the roughly two dozen unexported
+helpers D6 and D7 mandate reusing: `sanitizeTTY`, `compactText`, `cellText`,
+`capCell`, `shortInstanceID`, `runTitle`, `relAge`, the disposition/short-id
+resolution in `review.go` (`resolveRecID`, `mapDismissReason`, `triageLine`,
+`dispositionsByCoord`, `coordKey`, `dispositionSuffix`, `shortRecID`), and the roster
+selection in `run.go`. D6, D7 and the Files column could not all hold; the Files column
+is the one that gave way.
+
+**What it buys.** In-package, those helpers are simply reachable, so D6's goal — "the
+TUI and the plain commands cannot drift" — is **structurally true rather than a rule
+to remember**. Extracting them into a shared package instead would have refactored
+shipped CLI code this PRD has no other reason to touch.
+
+**What it costs, stated plainly.** File-level separation, not package-level. Nothing
+stops a future change to `api/cmd/uzi`'s other files from reaching into `tui_*.go`
+internals the way a real package boundary would. That is the honest tradeoff; R3's
+"isolated in its own package" mitigation does not apply and has been corrected in the
+PRD rather than left to read as though it did.
+
+**The secondary reason, which is a working gate and would have been dropped
+silently.** `TestPrintedInstructionsAreRegistered` (`api/cmd/uzi/instructions_test.go:188`)
+parses the **current directory only**. A `tui/` subpackage escapes it — no failure, no
+warning, just a gate that quietly stops covering the newest code. Related and settled
+the same way: `uzi tui`'s SKILL.md entry had to land in **M3, not M5**, because
+`TestSkillMatchesCommandTree` asserts in the reverse direction that every *runnable*
+command is documented in the embedded SKILL.md, and `uzi tui` becomes runnable in M3.
+
+**Dependency cost, measured rather than waved at.** The Charm stack landed as
+`charm.land/{bubbletea/v2 v2.0.8, lipgloss/v2 v2.0.5, bubbles/v2 v2.1.1, glamour/v2 v2.0.1}`
+— the fork import paths, not `github.com/charmbracelet/*` v1 as the PRD named. They
+enter the **shared** `api` module, growing its dep graph and the kaniko build inputs
+for a CLI-only feature: `api/go.sum` went 129 → 182 lines. Acceptable in a
+single-binary repo, recorded so it reads as a deliberate choice rather than an
+oversight.
+
+**Theme, closed here and not with `AdaptiveColor`.** In Lip Gloss v2, `AdaptiveColor`
+survives only in the `compat` shim, driven by a package-level `HasDarkBackground`
+probe evaluated **at import time** against `os.Stdin`/`os.Stdout` — wrong for a Bubble
+Tea program, which owns the terminal, and it fires a terminal query even without a TTY.
+The palette uses `lipgloss.LightDark(isDark)` fed by `tea.BackgroundColorMsg.IsDark()`:
+the background Bubble Tea itself reports, not a second independent detection that could
+disagree with it.
+
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) — the Parallelization and R3
+corrections.
+
+## 371. PRD #112 D7 — terminal safety: `sanitizeTTY` fixed IN PLACE, sanitize-then-Glamour is FUNCTIONAL, and two things it deliberately does not cover
+
+**The predicate was wrong and was fixed in place, not forked.** `sanitizeTTY`
+(`api/cmd/uzi/run.go:503`) described itself as removing "C0 controls (0x00–0x1F)
+except tab and newline, and C1 controls (0x80–0x9F)" — an accurate description of a
+predicate with two holes: `r < 0x20` let **DEL** (`0x7f`) through, and no codepoint
+range can catch category `Cf` at all. It now uses **category predicates**:
+`unicode.IsControl(r) || unicode.In(r, unicode.Cf)`, deliberately converged on the
+**same pair** `workersvc.hasUnsafeChar` already used
+(`internal/workersvc/agent_selection.go:236-240`) rather than inventing a third
+spelling of "unsafe character" for the CLI to drift from.
+
+**Fixing it in place is the decision, not an implementation detail.** A new
+`sanitizeTUI` would have left every pre-existing call site on the holed predicate.
+Fixed in place, all of them inherit the fix: measured on `origin/main` there were
+**10 direct call sites** — 7 in `run.go`, 3 in `review.go` — plus 3 more reaching it
+indirectly through `cellText`. (Counts drift; the shape is what matters: one function,
+every human-render path, one predicate shared with the server.)
+
+**The `Cf` half is the half that matters.** Unlike a control byte, a bidi override
+(`U+202A`–`U+202E`, the isolates `U+2066`–`U+2069`, `U+200F`) visually **reorders**
+text, so an agent label or a judge's `target` can be made to *read* as something it is
+not — precisely the spoof a fixed-width lane rail invites. It also fixed a silent
+alignment drift in the same stroke: `Cf` codepoints are zero-width while `capCell`
+pads by **runes**, so a label full of them consumed column budget while drawing
+nothing.
+
+**Order: `sanitizeTTY` → Glamour, and the requirement is FUNCTIONAL, not merely
+defensive.** Glamour *emits* the ANSI escapes that make styled markdown work, so
+sanitizing after it strips Glamour's own styling along with anything hostile.
+Measured on the shipped renderer (glamour v2.0.1): sanitize→render yields **426**
+escape sequences with correct styling; render→sanitize yields **zero** escapes and
+prints literal `[38;5;39;1m##` garbage on screen. Getting it backwards breaks the
+screen outright rather than opening a silent hole — which is what makes it a
+regression test (`TestTUIRenderOrderIsSanitizeThenGlamour`) rather than a review note.
+The order is enforced structurally too: `tuiRenderer` wraps the Glamour renderer so a
+caller cannot reach the markdown renderer without passing the sanitizer first, and on
+a render error it falls back to the **sanitized plain** text, never the raw input.
+
+**`sanitizeTTY` alone is the wrong unit for a fixed-width cell.** It deliberately
+spares `\t`/`\n` — correct for a scrolling transcript, wrong for a board row or a lane
+rail, where a raw newline breaks column alignment. Those go through `cellText`
+(`sanitizeTTY` + `compactText`) and `capCell`. D7 as written named only `sanitizeTTY`;
+that is necessary and not sufficient for half the UI.
+
+**Two things this does NOT cover, recorded so nobody reads it as more than it is.**
+
+- **Combining marks are category `Mn`, not `Cf`, and are out of scope.** "Zalgo" text
+  is a grapheme-**width** problem, fixed by a width-aware layout, not by a stripper.
+- **Markdown *structural* spoofing survives sanitization entirely.** Judge text of
+  `"# VERDICT: APPROVED"` passes `sanitizeTTY` intact and renders as a genuine
+  heading, because it **is** valid markdown — and stripping markdown structure would
+  defeat the point of using Glamour. So the defense is a different one: untrusted free
+  text renders inside a **provenance box** whose border and label are drawn by the UI,
+  outside the region the untrusted string can reach. Chrome the attacker cannot render
+  above, rather than a filter that cannot see the attack.
+
+**Branching stays on the closed enums only** (`verdict`, `category`, `confidence`); an
+unrecognised value renders as data, never replaced by a placeholder that would claim
+knowledge the binary does not have.
+
+**Known gap, filed not fixed.** The web has the same `Cf` hole: `RunView.tsx:955`
+renders judge free text as escaped plain text — safe against markup injection, since
+React never interprets it, but the browser's own bidi algorithm still reorders a plain
+text node. Filed as issue #124; D7 covers the TUI's render path, not the web's.
+
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D7, R4 and Known Gaps.
+
+## 372. PRD #112 D4/D5/D8 — lanes are a DISPLAY heuristic, steering is RUN-LEVEL, and the steer gate ASKS the server instead of comparing ids
+
+**D4 — steering is run-level, and the scope is a fact about the server, not a
+simplification.** The steer verbs the API accepts are run-level (`follow_up`,
+`approve_plan`, `reject_plan`, `cancel`, `revise_plan`), a follow-up enters the run's
+steer queue and the lead drains it on its next turn (PRD #95), and `AgentSelection`
+chooses the *roster* at approval, not a live target. **There is no wire to address one
+live subagent**, and building one — a steer kind targeting an `agent_instance`, plus
+worker-side routing into that subagent's context — is its own backend PRD. So the TUI
+*observes* per-agent and *steers* the run; the lead then directs its own agents. This
+is recorded explicitly so nobody reads "steer agents" into the lane rail and expects to
+whisper to `coder` alone.
+
+**D5 — the lane dot is `crewStateFor`, ported from the web, and the PRD described the
+wrong function.** D5's prose ("last frame was a tool call still open → running…")
+describes `agentOneLiner` (`web/src/components/ActivityFeed.tsx:279-310`), which
+produces the one-liner **text**. The **dot** is `crewStateFor` (`:209-245`), which
+takes **no frame kind as input at all** — only `run.status`, `run.health`, whether the
+lane is the active actor, and recency. They are two separate pure functions; both were
+ported (`api/cmd/uzi/tui_lanes.go`). D5 also undercounted the ladder: there are
+**five** states, not four — `stalled` was missing, and it is the PRD #47 health
+integration, the only state that means "look at this now".
+
+Three traps the ported source's own comments call out, each load-bearing, each kept as
+a comment in the Go port so nobody re-derives them:
+
+- **The active speaker trusts `run.health`, never the recency timer.** The server's
+  stall flag defaults to **300s** while `laneStaleAfter` is 45s, so a *healthy* tool
+  call running 45s–300s must still read `working`. Applying the recency window to the
+  active lane flips healthy long tool calls to `idle`.
+- **"Active" includes `claimed`, not just `running`** (`tui_lanes.go:219`; the web's
+  `liveLane`, `ActivityFeed.tsx:443`). The running-only variant drives the tool spinner,
+  not the dot. Get this wrong and every lane of a claimed run reads `idle`.
+- **The rollup is worst-state-wins, not newest-wins**, so one stalled lane surfaces
+  over a working one.
+
+Lane identity is two more functions. The **key** is `laneKeyOf(m) = agent_instance ||
+agent || LEAD` — `||`, never `??`, because an empty-string instance must fall through
+to the role rather than survive as a key of its own. The **role** is titled from the
+first frame naming a *non-lead* role, not the lane's first frame outright: on SDK
+replay a resumed subagent's frame arrives with `agent == "lead"` and no
+`subagent_type`, and testing `agent != null` would not catch it because the field is
+already collapsed to the literal string `"lead"` upstream in `agent/src/sdk-messages.ts`,
+never to null. The final fallback may legitimately *be* `"lead"` (a repo can ship
+`.claude/agents/lead.md`), so this cannot be "first non-lead role, or bust" — and the
+source's own note that the final fallback is provably equivalent to a bare
+`return LEAD`, so **that mutant cannot be killed**, was carried into the Go port rather
+than left for the next person to rediscover. The **label** is independent of the role
+(first frame carrying one wins; absent renders the role alone, no placeholder) and is
+clamped at **80 runes** to match the server's storage cap — *not* the web's 48 UTF-16
+code units, whose own comment admits it can split an astral pair. That is a defect in
+the source being ported, not a contract, so the Go port clamps on runes.
+
+The dot stays **best-effort and never authoritative**: an unclassifiable frame degrades
+to a neutral dot rather than blocking the render, and the run-level chip (the
+authoritative `status`/`health`) is correct even when a lane dot is stale.
+
+**D8 — the steer gate is OWNERSHIP, not visibility, and it is computed by ASKING the
+server.** `GetRunForViewer` branches on `isAdmin`, so an admin observer loads another
+user's run perfectly well; deciding "can I steer" from "did the run load" would show a
+full steer bar whose every call 404s. The obvious fix — `run.UserID == caller.ID` — **is
+not computable on this wire**: `RunDTO` carries no user id at all, and
+`RunListItemDTO` carries only `OwnerEmail`, which is `omitempty` and populated on the
+**admin** list alone. So the TUI probes `RunInputs`, whose `ListFollowUpInputs`
+resolves ownership with `s.GetRun(ctx, userID, runID)` — the **same function**
+`SubmitInput`'s first statement calls (`workersvc/service.go:2128-2132` and `:2239`).
+That is the distinction worth recording: probing `RunInputs` is **not an approximation**
+of the write's predicate, it is *that predicate, evaluated server-side by the same
+code*. A client-side id comparison would have been a second copy of the rule, free to
+drift — the exact failure D6 exists to prevent. It also costs nothing extra: the
+queued/delivered indicator needs that call anyway.
+
+Three consequences, each deliberate:
+
+- **A non-owner's keys are INERT, not merely unrendered**, and the suppression **states
+  its reason** — a bar that vanishes with no explanation reads as a bug, and the two
+  reasons (not the owner; chat run) have different remedies.
+- **A transport failure is not evidence about ownership, so the gate fails closed.** A
+  hidden bar is an inconvenience; a shown one that 404s is a lie.
+- **Chat runs are watch-only regardless of ownership.** `SubmitRunInput` does not gate
+  `kind=chat`, so a raw follow-up would inject into a chat outside the guarded,
+  cookie-only `/chats` path. Chat runs also never appear on the board (the list queries
+  filter `kind NOT IN ('chat','judge')`), so a chat run is reachable only by id.
+
+**Keybindings, changed from the PRD for a safety reason worth keeping.** Approve/reject
+shipped as `[y]`/`[n]`, not `[a]`/`[r]`: `[a]` doubling as the board's admin toggle
+*and* approve would put "approve a plan" one keystroke from `[x]` cancel-a-live-run,
+and `[r]` is refresh everywhere else in the app. Both destructive verbs (`cancel`,
+`reject_plan`) require the affirmative key — "not escape" is not consent — while
+approve is unconfirmed and offered only while the run is actually at its gate. Quit is
+confirmed for both `[q]` and `ctrl+c`, with a second `ctrl+c` as the escape hatch for a
+stuck confirm prompt; a stray keystroke must not drop a watched run.
+
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D4/D5/D8, R2, and the M3/M4
+milestone corrections.
 ## 373. PRD #98 Part C — the printed-instruction registry: the KIND is derived from the AST position, and nested entries resolve most-specific-wins
 
 The backstop lives in `api/cmd/uzi/instructions_test.go` and exists because a shipped

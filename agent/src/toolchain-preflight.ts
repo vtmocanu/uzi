@@ -14,8 +14,9 @@ import { runnerPath } from "./runner-uid.js";
 // NOT `process.env.PATH`: under the PRD #51 A1 split the worker's own PATH is
 // deliberately stripped of `/nix`, and the full image PATH (incl. `/nix`) is handed to
 // the runner via UZI_RUNNER_PATH — so checking process.env.PATH would false-fail on
-// every correctly-hardened worker. On a #58 single-uid start UZI_RUNNER_PATH is unset
-// and runnerPath() falls back to the (unstripped) worker PATH, so the same check holds.
+// every correctly-hardened worker. Since issue #120 the #58 single-uid (non-root) start
+// exports the same untouched image PATH, so BOTH modes now check the image PATH; the
+// `|| PATH` fallback in runnerPath() remains only for a non-entrypoint start.
 
 /** The baked worker toolchain every subagent depends on (PRD #83/#89; openssl added
  *  as a broadly-used base crypto/TLS CLI, judge rec run dd06c0ed). */

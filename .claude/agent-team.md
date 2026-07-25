@@ -847,3 +847,25 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
 - **"Did I run something that would fail if this were false?"** — ask it *before* writing a
   claim down, not after. Every claim mutation-tested has held; every claim reasoned to has
   needed correcting.
+- **STAGE BY PATH. Never `git add -A`, `git add .`, or `commit -a` in a worktree that has a
+  writer-token holder.** The `fd951e07` merge on PRD #112 used a blanket add and swept up the
+  tester's uncommitted edits. The content was correct, so nothing broke — but minutes earlier the
+  tester had been running positive-control mutations in that same worktree: `getCLITokenByHash`
+  with its revoked/expiry predicate deleted, and `cli_auth.go` with `!user.IsActive` neutered. A
+  blanket add landing while either was applied would have committed **a live authentication
+  regression under a merge commit's message**, where nobody reads for one, with the tester's own
+  suite as the only thing standing between it and `main`.
+  **We were saved by timing, not by process.** And on this branch mutation testing was the
+  *primary* evidence mechanism rather than an occasional one — over forty mutations across five
+  milestones — so a shared worktree is in a mutated state a meaningful fraction of the time. That
+  makes a blanket add a standing hazard here, not a one-off.
+  It recurred while this very rule was being written, and the second half is the sharper lesson.
+  The batch found `e2e/run-e2e.sh` dirty with a change the lead had **explicitly deferred** —
+  sitting exactly where `git add -A` would have taken it. Staging by path would have left it
+  alone. But before it could be staged at all, a CONCURRENT WRITER committed it (`b71c7d1a`),
+  in a worktree that had a named token holder.
+  So stage-by-path is necessary and not sufficient: it protects the diff **you** author, and
+  protects nothing against a second writer in the same tree. The two rules are one rule —
+  **one writer at a time, and stage by path** — and the failure mode of dropping either is the
+  same: a commit whose contents nobody chose. Here it also silently invalidated a measurement,
+  because the deferred edit landed on the green path *after* the e2e number was taken.

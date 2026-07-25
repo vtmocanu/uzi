@@ -40,6 +40,15 @@ type Client interface {
 	// including an admin_ro token on another user's run — gets a 404 →
 	// *ExitError{ExitNotFound}, never another user's steer text.
 	RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error)
+	// StreamRun subscribes to one run's live events over /api/ws (PRD #112 M2),
+	// authenticating with the same Bearer CLI token the REST reads use (M1 opened
+	// that route to it). The returned stream reconnects, replays what a drop
+	// swallowed, and periodically re-reads authoritative run state — see RunStream
+	// for why the last of those is required rather than defensive.
+	//
+	// It is on this INTERFACE, not only on *HTTPClient, so a consumer can take a
+	// Client and still be testable: FakeClient implements it too.
+	StreamRun(ctx context.Context, runID string) (*RunStream, error)
 	ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error)
 	// ListSecrets returns the caller's Anthropic tokens as metadata (labels, ids,
 	// default flags — never values): GET /api/me/secrets, RequireUser (PRD #104 D8,
@@ -162,6 +171,15 @@ type HTTPClient struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+
+	// StreamRun tuning, zero = the package defaults. Unexported so they are not part
+	// of the CLI's configuration surface: they exist so the stream tests can drive
+	// the reconnect/reconcile timing deterministically instead of sleeping for real
+	// seconds, which is the difference between pinning the recovery contract and
+	// hoping for it.
+	streamReconcile   time.Duration
+	streamBackoffBase time.Duration
+	streamBackoffMax  time.Duration
 }
 
 // NewHTTPClient builds the live client from resolved settings.
@@ -202,18 +220,9 @@ var _ Client = (*HTTPClient)(nil)
 // http exception ONLY for the loopback compose stack (127.0.0.1/localhost). Mirrors
 // the server's https-only FORGE_ALLOWED_BASE_URLS.
 func (c *HTTPClient) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	base := strings.TrimSpace(c.BaseURL)
-	if base == "" {
-		return nil, Exitf(ExitUsage, "no uzi API URL configured: pass --url or set $UZI_URL")
-	}
-	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || u.Scheme == "" {
-		return nil, Exitf(ExitUsage, "invalid uzi API URL %q", base)
-	}
-	if u.Scheme != "https" && !isLoopbackURL(u) {
-		return nil, Exitf(ExitUsage,
-			"refusing to send credentials to %q: only https (or http on 127.0.0.1/localhost) is allowed — a plaintext URL leaks your token",
-			base)
+	u, err := c.credentialSafeBase()
+	if err != nil {
+		return nil, err
 	}
 	full := strings.TrimRight(u.String(), "/") + path
 	req, err := http.NewRequestWithContext(ctx, method, full, body)
@@ -228,6 +237,29 @@ func (c *HTTPClient) newRequest(ctx context.Context, method, path string, body i
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	return req, nil
+}
+
+// credentialSafeBase parses and vets BaseURL, returning it only when it is safe to
+// attach a credential to. It is the SINGLE gate for that decision: newRequest uses
+// it for every REST call and StreamRun uses it for the WebSocket dial (PRD #112 M2),
+// because the socket carries the same `Authorization: Bearer <uzc_/uza_>` header and
+// a second copy of this check is a second thing that can drift. A transport added
+// later must call this before it sends the token, not re-derive the rule.
+func (c *HTTPClient) credentialSafeBase() (*url.URL, error) {
+	base := strings.TrimSpace(c.BaseURL)
+	if base == "" {
+		return nil, Exitf(ExitUsage, "no uzi API URL configured: pass --url or set $UZI_URL")
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || u.Scheme == "" {
+		return nil, Exitf(ExitUsage, "invalid uzi API URL %q", base)
+	}
+	if u.Scheme != "https" && !isLoopbackURL(u) {
+		return nil, Exitf(ExitUsage,
+			"refusing to send credentials to %q: only https (or http on 127.0.0.1/localhost) is allowed — a plaintext URL leaks your token",
+			base)
+	}
+	return u, nil
 }
 
 // isLoopbackURL reports whether the URL's host is loopback (127.0.0.0/8, ::1) or

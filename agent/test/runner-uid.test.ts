@@ -66,6 +66,61 @@ describe("runner-uid: split detection", () => {
     assert.equal(runnerTmpdir({ TMPDIR: "/tmp/uzi-worker", UZI_RUNNER_TMPDIR: "/tmp/uzi-runner" }), "/tmp/uzi-runner");
   });
 
+  it("issue #120: the agent PATH resolves `agent-browser` to the SHIM in BOTH entrypoint modes", () => {
+    // Two dirs in the worker image hold an `agent-browser` entry, and only one injects
+    // --no-sandbox: the PRD #87 shim at /usr/local/bin, and the real npm CLI at
+    // /app/node_modules/.bin (which the Dockerfiles never put on the image PATH).
+    const SHIM_DIR = "/usr/local/bin";
+    const REAL_CLI_DIR = "/app/node_modules/.bin";
+    /** The dir a bare `agent-browser` resolves to — first PATH entry holding the name. */
+    const resolvesFrom = (p: string | undefined): string | undefined =>
+      (p ?? "").split(":").find((d) => d === SHIM_DIR || d === REAL_CLI_DIR);
+
+    // The image PATH the entrypoint sees (it runs BEFORE the CMD), live worker order.
+    const IMAGE = [
+      "/opt/uzi-toolchain/bin",
+      "/nix/var/nix/profiles/default/bin",
+      "/usr/local/sbin",
+      SHIM_DIR,
+      "/usr/sbin",
+      "/usr/bin",
+      "/sbin",
+      "/bin",
+    ].join(":");
+    // What the CMD (`npm run start`) turns that into inside the worker process: npm's
+    // run-script prepends exactly these three entries (node-gyp-bin is its fingerprint).
+    const NPM_MUTATED = [
+      REAL_CLI_DIR,
+      "/node_modules/.bin",
+      "/app/node_modules/@npmcli/run-script/lib/node-gyp-bin",
+      IMAGE,
+    ].join(":");
+
+    // THE REGRESSION (pre-#120 non-root/k8s branch): UZI_RUNNER_PATH unset ⇒ runnerPath()
+    // falls back to the npm-mutated PATH ⇒ the real CLI wins ⇒ no --no-sandbox ⇒ SUID abort.
+    assert.equal(
+      resolvesFrom(runnerPath({ PATH: NPM_MUTATED })),
+      REAL_CLI_DIR,
+      "sanity: without the entrypoint pin the npm-injected dir shadows the shim",
+    );
+
+    // FIXED: the entrypoint pins UZI_RUNNER_PATH to the image PATH on the non-root branch
+    // too, so the shim wins even though the worker's OWN PATH is still npm-mutated.
+    assert.equal(
+      resolvesFrom(runnerPath({ PATH: NPM_MUTATED, UZI_RUNNER_PATH: IMAGE })),
+      SHIM_DIR,
+      "the pinned runner PATH must resolve agent-browser to the shim",
+    );
+
+    // COMPOSE/A1 was always correct (worker PATH stripped, IMAGE_PATH handed over) — the
+    // fix must not disturb it.
+    assert.equal(
+      resolvesFrom(runnerPath({ PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", UZI_RUNNER_PATH: IMAGE })),
+      SHIM_DIR,
+      "the A1/compose mode must keep resolving to the shim",
+    );
+  });
+
   it("killRunnerGroup is a no-op for an undefined/invalid pid", () => {
     assert.equal(killRunnerGroup(undefined), false);
     assert.equal(killRunnerGroup(0), false);
