@@ -50,6 +50,35 @@ type knownInstruction struct {
 
 var knownInstructions = []knownInstruction{
 	{
+		command: "uzi run list",
+		// Printed by `uzi tui`'s non-TTY refusal (tui.go), which names the two scriptable
+		// alternatives an agent should use instead of a full-screen UI.
+		//
+		// EXECUTED, against a booted API: e2e/run-e2e.sh (PRD #97 M2, leg 2) runs
+		// `uzi run list --json` on the host against the live stack and asserts its run-id
+		// SET EQUALS GET /api/runs's — so the command works AND its output agrees with the
+		// API, which is the property the instruction is really promising. Also driven
+		// through the real cobra parse against a fake client in commands_test.go.
+		note: "Printed by `uzi tui`'s non-TTY refusal. Executed against a booted API in " +
+			"e2e/run-e2e.sh (leg 2): the --json run-id set must equal GET /api/runs's, so both " +
+			"the invocation and its output are asserted, not just the exit code.",
+	},
+	{
+		command: "uzi run logs",
+		// Printed by the same refusal, as the follow-a-run alternative.
+		//
+		// EXECUTED including --follow: commands_test.go:692 drives
+		// Main(env, []string{"run","logs","r1","--follow"}) through the real parse and
+		// asserts the follow loop drains and terminates on a terminal run. NOT executed
+		// against a booted API with --follow: the e2e harness uses the WS legs for live
+		// streaming instead, so the poll loop's behaviour against a real server is covered
+		// only at the unit level. Stated rather than implied, per this file's own rule.
+		note: "Printed by `uzi tui`'s non-TTY refusal. Executed WITH --follow through the real " +
+			"parse in commands_test.go:692 (the follow loop drains and exits on a terminal run). " +
+			"NOT executed with --follow against a booted API — e2e covers live streaming via the " +
+			"/api/ws legs, so the poll loop against a real server is unit-level only.",
+	},
+	{
 		command: "uzi worker set-token",
 		// NOT PRD #98's command — it arrived from PRD #104 on the landing merge (2026-07-21),
 		// and this entry exists because the backstop did exactly what it was built to do:

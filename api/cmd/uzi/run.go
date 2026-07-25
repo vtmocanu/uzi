@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -469,15 +470,42 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 // it is written to a human TTY (Risk 13). Judge/run content can carry attacker-
 // shaped bytes that repo/issue/CI text fed the LLM; printed verbatim, an embedded
 // ANSI escape/CSI sequence could clear the screen, recolour, hide, or spoof
-// output. It removes C0 controls (0x00–0x1F) except tab and newline, and C1
-// controls (0x80–0x9F); every other rune, including all printable UTF-8, passes
-// through unchanged. It iterates runes (not bytes) so a multibyte UTF-8 codepoint
+// output. It removes every control character (C0, C1 and DEL) except tab and
+// newline, plus every Unicode format character (category Cf); all printable UTF-8
+// passes through unchanged. It iterates runes (not bytes) so a multibyte codepoint
 // whose bytes fall in 0x80–0x9F is never corrupted. Human render path ONLY —
 // --json output stays byte-exact (structural JSON encoding already escapes these
 // and agents decode it verbatim, so sanitizing there would corrupt payloads).
+//
+// The Cf half and DEL arrived with PRD #112 M3. This comment used to say it removed
+// "C0 controls (0x00–0x1F) except tab and newline, and C1 controls (0x80–0x9F)",
+// which was an accurate description of a predicate with two holes: `r < 0x20` let
+// DEL (0x7f) through, and no range test can catch Cf at all.
+// It uses CATEGORY PREDICATES, not codepoint ranges, and deliberately the SAME pair
+// workersvc.hasUnsafeChar already settled on (agent_selection.go:236-240):
+// unicode.IsControl covers C0 and C1 (so the old hand-rolled 0x00-0x1F / 0x80-0x9F
+// ranges are subsumed) and it covers DEL 0x7f, which the old `r < 0x20` test let
+// through; unicode.In(r, unicode.Cf) covers the format characters a range test can
+// never enumerate — the bidi overrides U+202A-202E, the isolates U+2066-2069, U+200F,
+// the zero-widths, the BOM, and SHY. A bidi override is the one that matters most: it
+// visually reorders text, so an agent label or judge target can be made to READ as
+// something it is not, which is precisely the spoof a TUI's fixed-width rails invite.
+//
+// TWO THINGS THIS DOES NOT COVER, so nobody reads it as more than it is:
+//
+//   - Combining marks are Mn, not Cf. "Zalgo" text stays a grapheme-WIDTH problem and
+//     is not addressed here; a width-aware layout is the fix, not a stripper.
+//   - Cf codepoints are ZERO-WIDTH while capCell pads by RUNES, so before this change
+//     a label full of them consumed column budget while drawing nothing, silently
+//     misaligning the rail. That is the same root cause as the tab bug whose comment
+//     notes the rune offset stayed pinned "which is why the existing alignment test
+//     could not see it". Stripping Cf fixes the spoof and that drift together.
 func sanitizeTTY(s string) string {
 	return strings.Map(func(r rune) rune {
-		if (r < 0x20 && r != '\t' && r != '\n') || (r >= 0x80 && r <= 0x9f) {
+		if r == '\t' || r == '\n' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
 			return -1
 		}
 		return r

@@ -1,0 +1,485 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+// The model is driven IN PROCESS, with no PTY: Update takes a message and returns a
+// model, and View returns a string. That is a design constraint, not a testing
+// convenience — a model that can only be exercised through a terminal cannot be
+// asserted on in the ordinary `go test ./...` gate, which is where this has to run.
+
+func tuiTestModel(t *testing.T, c uzicli.Client, startRun string) tuiModel {
+	t.Helper()
+	m := newTUIModel(context.Background(), c, startRun)
+	m.width, m.height = 120, 40
+	return m
+}
+
+// press drives one key through the real key path and returns the updated model.
+func press(t *testing.T, m tuiModel, k string) tuiModel {
+	t.Helper()
+	next, _ := m.handleKey(k)
+	tm, ok := next.(tuiModel)
+	if !ok {
+		t.Fatalf("handleKey(%q) returned %T, not tuiModel", k, next)
+	}
+	return tm
+}
+
+func msgDTO(seq int32, kind, agent, instance, label, text string, at time.Time) apitypes.MessageDTO {
+	m := apitypes.MessageDTO{Seq: seq, Kind: kind, CreatedAt: at,
+		Payload: json.RawMessage(`{"text":` + quoteJSON(text) + `}`)}
+	if agent != "" {
+		m.Agent = &agent
+	}
+	if instance != "" {
+		m.AgentInstance = &instance
+	}
+	if label != "" {
+		m.AgentLabel = &label
+	}
+	return m
+}
+
+func quoteJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func TestTUIBoardRendersRunsAndMoves(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "first issue"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-1111-2222-3333-444444444444", Kind: "ci_fix", Status: "completed", IssueTitle: "second issue"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+
+	out := m.View().Content
+	for _, want := range []string{"aaaaaaaa", "bbbbbbbb", "first issue", "second issue", "running", "completed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("board does not render %q\n%s", want, out)
+		}
+	}
+	// The cursor starts on the first row and moves with both j and the arrow.
+	if got, _ := m.board.selected(); got.ID != fake.Runs[0].ID {
+		t.Fatalf("cursor starts on %q, want the first run", got.ID)
+	}
+	m = press(t, m, "j")
+	if got, _ := m.board.selected(); got.ID != fake.Runs[1].ID {
+		t.Errorf("j did not move the cursor to the second run")
+	}
+	m = press(t, m, keyUp)
+	if got, _ := m.board.selected(); got.ID != fake.Runs[0].ID {
+		t.Errorf("↑ did not move the cursor back to the first run")
+	}
+}
+
+// The `[a]` admin toggle is refused CLEANLY with a non-admin token, not crashed (D8),
+// and the board falls back to the caller's own runs.
+func TestTUIBoardAdminToggleIsRefusedCleanly(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1111", Kind: "issue", Status: "running"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+
+	m = press(t, m, keyAdmin)
+	if !m.board.admin {
+		t.Fatal("[a] did not turn the admin view on")
+	}
+	// The server refuses a uzc_ token on the admin surface.
+	next, _ = m.Update(boardRunsMsg{admin: true, err: uzicli.Exitf(uzicli.ExitAuth, "admin access required")})
+	m = next.(tuiModel)
+
+	if m.board.admin {
+		t.Error("a refused admin list left the board in admin mode; the toggle must fall back to the caller's own runs")
+	}
+	if !m.board.adminDenied {
+		t.Error("the refusal was not recorded, so it cannot be explained on screen")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "admin") {
+		t.Errorf("the refusal is not explained on screen; D8 requires a clear message, not a silent revert\n%s", out)
+	}
+	// And the caller's own runs are still there — a refused toggle must not blank the
+	// board it was toggled away from.
+	if len(m.board.runs) != 1 {
+		t.Errorf("the own-runs list was lost on a refused admin toggle (%d rows)", len(m.board.runs))
+	}
+}
+
+// The admin board is labelled "active runs", because AdminListRuns returns
+// non-terminal runs only. Promising completed rows there is a claim the API cannot
+// satisfy.
+func TestTUIAdminBoardIsLabelledActiveRuns(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m = press(t, m, keyAdmin)
+	next, _ := m.Update(boardRunsMsg{admin: true, runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "cccccccc-1111", Kind: "issue", Status: "running"}},
+	}})
+	m = next.(tuiModel)
+	out := m.View().Content
+	if !strings.Contains(out, "active runs") {
+		t.Errorf("the admin board must be labelled \"active runs\" — AdminListRuns returns non-terminal runs only, so a plain \"runs\" header promises completed rows the API never returns\n%s", out)
+	}
+}
+
+func TestTUIBoardFilter(t *testing.T) {
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "add the widget"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "ci_fix", Status: "running", IssueTitle: "fix the pipeline"}},
+	}}
+	m := tuiTestModel(t, fake, "")
+	next, _ := m.Update(boardRunsMsg{runs: fake.Runs})
+	m = next.(tuiModel)
+
+	m = press(t, m, keyFilter)
+	for _, k := range []string{"p", "i", "p", "e"} {
+		m = press(t, m, k)
+	}
+	if n := len(m.board.visible()); n != 1 {
+		t.Fatalf("filter %q matched %d rows, want 1", m.board.filter, n)
+	}
+	// While filtering, an ordinary letter TYPES rather than triggering its binding —
+	// otherwise "a" would flip to the admin board mid-search.
+	m = press(t, m, "a")
+	if m.board.admin {
+		t.Error("typing \"a\" into the filter toggled the admin board; filter input must swallow ordinary keys")
+	}
+	m = press(t, m, keyEsc)
+	if m.board.filter != "" || len(m.board.visible()) != 2 {
+		t.Errorf("esc did not clear the filter (filter=%q, %d visible)", m.board.filter, len(m.board.visible()))
+	}
+}
+
+// Quit is confirmed, and BOTH q and ctrl+c route through the modal — a stray key must
+// not drop a watched run. A second ctrl+c is the escape hatch.
+func TestTUIQuitIsConfirmed(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+
+	m = press(t, m, keyQuit)
+	if !m.quitting {
+		t.Fatal("q did not open the quit confirmation")
+	}
+	if !strings.Contains(m.View().Content, "Quit") {
+		t.Error("the quit confirmation is not rendered")
+	}
+	// Any other key cancels.
+	m = press(t, m, "x")
+	if m.quitting {
+		t.Error("a non-confirming key did not dismiss the quit modal")
+	}
+
+	// ctrl+c opens the same modal rather than quitting outright.
+	next, cmd := m.handleKey(keyCtrlC)
+	m = next.(tuiModel)
+	if !m.quitting {
+		t.Error("ctrl+c did not route through the confirm modal")
+	}
+	if cmd != nil {
+		t.Error("the first ctrl+c returned a command; it must only open the modal")
+	}
+	// The second ctrl+c quits immediately — the way out when the modal is the problem.
+	if _, cmd = m.handleKey(keyCtrlC); cmd == nil {
+		t.Error("a second ctrl+c did not quit; there must be an escape hatch that does not depend on the modal")
+	}
+}
+
+// The detail view: replay builds lanes, and a live frame extends them.
+func TestTUIDetailBuildsLanesFromReplayThenLiveFrames(t *testing.T) {
+	now := time.Now()
+	runID := "dddddddd-1111-2222-3333-444444444444"
+	fake := &uzicli.FakeClient{}
+	m := tuiTestModel(t, fake, runID)
+
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running", Health: "ok"},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", "lead", "", "", "planning", now.Add(-2*time.Minute)),
+			msgDTO(2, "text", "coder", "toolu_aaa111", "write the tests", "writing", now.Add(-time.Minute)),
+		},
+	})
+	m = next.(tuiModel)
+
+	if len(m.detail.lanes) != 2 {
+		t.Fatalf("replay produced %d lanes, want 2", len(m.detail.lanes))
+	}
+	out := m.View().Content
+	for _, want := range []string{"lead", "coder", "write the tests"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail view does not render %q\n%s", want, out)
+		}
+	}
+
+	// A live frame for a NEW invocation opens a third lane.
+	inst, agent := "toolu_bbb222", "tester"
+	at := now
+	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+		Type: uzicli.RunEventTypeMessage, Seq: 3, Kind: "text",
+		Agent: &agent, AgentInstance: &inst, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"testing"}`),
+	}}})
+	m = next.(tuiModel)
+	if len(m.detail.lanes) != 3 {
+		t.Fatalf("a live frame for a new invocation produced %d lanes, want 3", len(m.detail.lanes))
+	}
+}
+
+// A frame that arrives over BOTH transports must not be counted twice: a reconnect
+// replays from the last seq seen and the socket can deliver the same frame.
+func TestTUIDetailDedupesBySeqAcrossTransports(t *testing.T) {
+	now := time.Now()
+	runID := "eeeeeeee-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+
+	next, _ := m.Update(detailLoadedMsg{
+		run:  apitypes.RunDTO{ID: runID, Status: "running"},
+		msgs: []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "hello", now)},
+	})
+	m = next.(tuiModel)
+
+	agent, at := "lead", now
+	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{{
+		Type: uzicli.RunEventTypeMessage, Seq: 1, Kind: "text", Agent: &agent, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"hello"}`),
+	}}})
+	m = next.(tuiModel)
+
+	if n := len(m.detail.frames); n != 1 {
+		t.Errorf("seq 1 arrived over replay AND the socket and was kept %d times; a duplicate doubles a lane's contribution", n)
+	}
+}
+
+// A state frame is authoritative — including the SYNTHETIC one StreamRun's reconcile
+// emits when a terminal frame was dropped. The view must not need to tell them apart.
+func TestTUIDetailAppliesStateFrames(t *testing.T) {
+	runID := "ffffffff-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "running"}})
+	m = next.(tuiModel)
+
+	next, _ = m.Update(streamEventsMsg{runID: runID, events: []apitypes.RunEventDTO{
+		{Type: uzicli.RunEventTypeState, Status: "completed"},
+	}})
+	m = next.(tuiModel)
+	if m.detail.run.Status != "completed" {
+		t.Errorf("run status = %q after a state frame, want completed", m.detail.run.Status)
+	}
+	// And every lane then reads `done`, which is rung 1 of the ladder.
+	if !strings.Contains(m.View().Content, laneDot(crewDone)) && len(m.detail.lanes) > 0 {
+		t.Error("lanes did not fall to the done dot after the run reached a terminal state")
+	}
+}
+
+// D8: an unusable socket degrades to the REST poll WITH A VISIBLE REASON, never a
+// crash and never a silently stale pane.
+func TestTUIDetailDegradesWhenTheStreamCannotOpen(t *testing.T) {
+	runID := "99999999-1111"
+	fake := &uzicli.FakeClient{
+		StreamErr: uzicli.Exitf(uzicli.ExitUnreachable, "cannot open the run stream"),
+		RunByID:   map[string]apitypes.RunDTO{runID: {ID: runID, Status: "running"}},
+	}
+	m := tuiTestModel(t, fake, runID)
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: runID, Status: "running"}})
+	m = next.(tuiModel)
+
+	next, cmd := m.Update(streamReadyMsg{runID: runID, err: fake.StreamErr})
+	m = next.(tuiModel)
+	if !m.detail.polling {
+		t.Fatal("a failed stream did not fall back to polling")
+	}
+	if cmd == nil {
+		t.Error("the fallback returned no command, so nothing will ever refresh the pane")
+	}
+	out := m.View().Content
+	if !strings.Contains(out, "live stream unavailable") {
+		t.Errorf("the degradation is not visible on screen; a user looking at a stale pane must be able to see WHY\n%s", out)
+	}
+}
+
+// A late reply for a run the user has already left must be ignored, or it would
+// overwrite the run they are now looking at.
+func TestTUIDetailIgnoresRepliesForAnotherRun(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-current")
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: "run-current", Status: "running"}})
+	m = next.(tuiModel)
+
+	agent, at := "coder", time.Now()
+	next, _ = m.Update(streamEventsMsg{runID: "run-OTHER", events: []apitypes.RunEventDTO{{
+		Type: uzicli.RunEventTypeMessage, Seq: 9, Kind: "text", Agent: &agent, CreatedAt: &at,
+		Payload: json.RawMessage(`{"text":"from another run"}`),
+	}}})
+	m = next.(tuiModel)
+
+	if len(m.detail.frames) != 0 {
+		t.Error("a stream batch for a DIFFERENT run was applied to the current one")
+	}
+}
+
+// Lane switching cycles both ways and resets the scroll, so a long lane does not
+// leave the next one scrolled past its start.
+func TestTUIDetailLaneSwitching(t *testing.T) {
+	now := time.Now()
+	runID := "77777777-1111"
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	next, _ := m.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running"},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", "lead", "", "", "a", now),
+			msgDTO(2, "text", "coder", "toolu_a", "", "b", now),
+			msgDTO(3, "text", "tester", "toolu_b", "", "c", now),
+		},
+	})
+	m = next.(tuiModel)
+
+	m = press(t, m, "j") // scroll down within the lane
+	if m.detail.scroll == 0 {
+		t.Fatal("j did not scroll the transcript")
+	}
+	m = press(t, m, keyTab)
+	if m.detail.laneIdx != 1 {
+		t.Errorf("tab moved to lane %d, want 1", m.detail.laneIdx)
+	}
+	if m.detail.scroll != 0 {
+		t.Error("switching lanes did not reset the scroll; the new lane opens mid-transcript")
+	}
+	// Wrap-around in both directions.
+	m = press(t, m, keyTab)
+	m = press(t, m, keyTab)
+	if m.detail.laneIdx != 0 {
+		t.Errorf("tab did not wrap to lane 0, got %d", m.detail.laneIdx)
+	}
+	m = press(t, m, "h")
+	if m.detail.laneIdx != 2 {
+		t.Errorf("h did not wrap backwards to the last lane, got %d", m.detail.laneIdx)
+	}
+}
+
+// esc returns to the board and CLOSES the stream — otherwise every run a user opens
+// leaks a socket and a goroutine for the life of the session.
+func TestTUIDetailEscReturnsToBoard(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "run-1")
+	next, _ := m.Update(detailLoadedMsg{run: apitypes.RunDTO{ID: "run-1", Status: "running"}})
+	m = next.(tuiModel)
+
+	stream := uzicli.NewRunStream(context.Background(), nil)
+	m.detail.stream = stream
+
+	m = press(t, m, keyEsc)
+	if m.view != viewBoard {
+		t.Fatal("esc did not return to the board")
+	}
+	select {
+	case <-stream.Events():
+	case <-time.After(2 * time.Second):
+		t.Error("esc left the run's stream open; each opened run would leak a socket and a goroutine")
+	}
+}
+
+// The whole untrusted surface goes through the sanitizer. This drives REAL model
+// state rather than calling the helpers directly, so it covers the wiring too.
+func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
+	now := time.Now()
+	const nasty = "we\x1b[2Jare\u202Efine\x07"
+	runID := "88888888-1111"
+
+	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: runID, Kind: "issue", Status: "running", IssueTitle: nasty}},
+	}}
+	board := tuiTestModel(t, fake, "")
+	next, _ := board.Update(boardRunsMsg{runs: fake.Runs})
+	board = next.(tuiModel)
+	assertNoRawControls(t, "board", board.View().Content)
+
+	detail := tuiTestModel(t, fake, runID)
+	next, _ = detail.Update(detailLoadedMsg{
+		run: apitypes.RunDTO{ID: runID, Status: "running", IssueTitle: nasty},
+		msgs: []apitypes.MessageDTO{
+			msgDTO(1, "text", nasty, "toolu_"+nasty, nasty, nasty, now),
+		},
+	})
+	detail = next.(tuiModel)
+	assertNoRawControls(t, "detail", detail.View().Content)
+}
+
+// assertNoRawControls fails on any control byte the UI did not put there itself.
+// Lipgloss legitimately emits ESC-led SGR sequences, so those are skipped and
+// everything else — BEL, the C1 range, DEL, and every Cf format char — is not.
+func assertNoRawControls(t *testing.T, where, out string) {
+	t.Helper()
+	inEsc := false
+	for _, r := range out {
+		switch {
+		case r == 0x1b:
+			inEsc = true
+		case inEsc:
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEsc = false
+			}
+		case r == '\n' || r == '\t':
+		case r == 0x07 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+			t.Errorf("%s view emitted a raw control byte %U from untrusted text", where, r)
+		case r == 0x202E || r == 0x200B || r == 0xFEFF:
+			t.Errorf("%s view emitted a format character %U from untrusted text (a bidi override can make a label read as something else)", where, r)
+		}
+	}
+}
+
+// The stream reader hands over a BATCH, so a burst of frames costs one re-render
+// rather than one per frame — the SSH latency requirement.
+func TestReadStreamCmdBatchesQueuedEvents(t *testing.T) {
+	events := make([]apitypes.RunEventDTO, 0, 5)
+	for i := int32(1); i <= 5; i++ {
+		events = append(events, apitypes.RunEventDTO{Type: uzicli.RunEventTypeMessage, Seq: i, Kind: "text"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := uzicli.NewRunStream(ctx, events)
+	defer s.Close()
+
+	// The first read blocks for one event; whatever else has queued behind it comes in
+	// the same message. The fake emits as fast as the reader drains, so the batch is
+	// timing-dependent in SIZE but must never exceed what was sent, and repeated reads
+	// must together deliver everything exactly once.
+	var got []int32
+	deadline := time.After(5 * time.Second)
+	for len(got) < len(events) {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d of %d events arrived: %v", len(got), len(events), got)
+		default:
+		}
+		msg, ok := readStreamCmd("r", s)().(streamEventsMsg)
+		if !ok {
+			t.Fatal("readStreamCmd returned the wrong message type")
+		}
+		for _, ev := range msg.events {
+			got = append(got, ev.Seq)
+		}
+		if msg.closed {
+			break
+		}
+	}
+	if len(got) != len(events) {
+		t.Fatalf("got seqs %v, want %d events exactly once", got, len(events))
+	}
+	for i, seq := range got {
+		if seq != int32(i+1) {
+			t.Fatalf("events arrived out of order: %v", got)
+		}
+	}
+}
+
+var _ tea.Model = tuiModel{}
