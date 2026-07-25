@@ -144,10 +144,29 @@ import (
 // and sanity-check the capture with `grep -c -- '-- name:'` before trusting a zero — a zero from
 // a broken capture is indistinguishable from a zero from a query nobody calls.
 //
-// EXECUTION COUNTS FOR ALL 53 ROWS, measured this way on whole-sweep runs (RUN=141 PASS=141
-// FAIL=0 SKIP=0). Two different things live in the list and they have different shelf lives: the
-// LIST ITSELF IS A MAINTAINED CENSUS and must track the table, while the FIGURES are receipts of
-// those sweeps and move with the fixtures. The ZEROES are the load-bearing part.
+// EXECUTION COUNTS FOR THE 52 ROWS THE RUN=141 SWEEPS MEASURED (RUN=141 PASS=141 FAIL=0 SKIP=0).
+// Two different things live in the list and they have different shelf lives: the LIST ITSELF IS A
+// MAINTAINED CENSUS and must track the table, while the FIGURES are receipts of those sweeps and
+// move with the fixtures. The ZEROES are the load-bearing part.
+//
+// 🔴 ROW 53 IS UNMEASURED BY THIS METHOD, and saying otherwise was a third pass at the same
+// defect. A previous version of this line read "ALL 53 ROWS … measured on whole-sweep runs
+// (RUN=141 …)". No RUN=141 sweep ever saw row 53: re-derived here, `git show
+// 536f9730:…/queries/cli_tokens.sql | grep -c ListAllCLITokensForAdmin` is 0, and so is the same
+// at `321a25b2` — the query arrived via `c309e8a0` on the lim branch and reached this tree only
+// in the wave-3 integration merge. It is not named in the list either, so it fell into
+// "1..39 everything else", which asserts a measured execution count for a query that did not
+// exist when the measurement ran. And no RUN=141 sweep can ever describe this tree: the live
+// sweep at the integrated tip counts RUN=162.
+//
+// So the honest statement is the one above: 52 measured, row 53 unmeasured by the statement-log
+// method. Establishing it properly needs a fresh `log_statement=all` sweep at this tip — real
+// work, not worth it for one row, but then this header must not claim it. That the row is
+// nonetheless PINNED is a separate claim, made by its own `why` and by a fold receipt; the two
+// are different questions and this file exists partly to keep them apart.
+// It is worth naming what went wrong three times in one paragraph: the defect is a figure that is
+// REASONED rather than OBSERVED, in the file whose founding instruction is "OBSERVE IT, DO NOT
+// REASON ABOUT IT".
 //
 // 🔴 CORRECTED TWICE, and the second correction is an instance of the defect it sits beside.
 // This header said "ALL 46 ROWS"; the first repair made it "all 46 the table held AT THAT SWEEP …
@@ -162,6 +181,17 @@ import (
 // numerals must track the tree (this list, and `:90`'s self-description). Not edited ⇒ receipt:
 // bind it, never overwrite it (control 8's "SIX truthful pins" and the `ad6c63d9` 290-across-28
 // figures, both left exactly as measured).
+//
+// AND HERE IS HOW TO ANSWER IT, because a rule with no command is a rule people cite rather than
+// follow — everywhere else this file hands one over (`grep -c '^-- name: '`, the `docker logs`
+// redirect order, the `-- name:` anchor):
+//
+//	git log -L <first-line>,<last-line>:api/internal/store/query_inventory_test.go <run-sha>..HEAD
+//
+// Non-empty output means the block has been edited since that sweep, i.e. it is a maintained
+// CENSUS and its numerals must track the tree. Empty means it is a RECEIPT: bind it and leave it.
+// `-L` follows the range through the intervening commits, which is what makes the answer survive
+// the line drift that a plain `git blame` on today's numbers would hide.
 //
 // One thing `RUN=141` cannot do is date the sweep it is the receipt of: `536f9730` (46 rows) and
 // `321a25b2` (52 rows) BOTH report RUN=141 — necessarily, since adding inventory rows adds no

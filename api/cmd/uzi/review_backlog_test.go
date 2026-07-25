@@ -233,6 +233,37 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 			remedies, want, out2)
 	}
 
+	// THE ONE-RUN CASE, written because nothing else covers it and it is the shape a real
+	// single-run write takes. Two runs exercises the loop and the dedup; zero exercises the
+	// else branch; one is the middle the e2e row cannot reach (its fixture settles two on
+	// purpose, so a single-address regression cannot pass as a green there).
+	fcOne := backlogFake()
+	fcOne.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated:   2,
+		Truncated: true,
+		Settled: []apitypes.JudgeSettledMemberDTO{
+			{RunID: "run-solo", RecID: "rec-1"},
+			{RunID: "run-solo", RecID: "rec-2"},
+		},
+	}
+	outOne, _, codeOne := runCLI(t, fakeEnv(fcOne), "review", "resolve", "--category", "tests", "--target", "unit")
+	if codeOne != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", codeOne)
+	}
+	soloLines := 0
+	for _, line := range strings.Split(outOne, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "uzi review backlog --run ") {
+			soloLines++
+		}
+	}
+	if soloLines != 1 {
+		t.Errorf("two coordinates on ONE run printed %d remedy lines, want exactly 1 — the dedup is "+
+			"what makes the count a property of the RUNS rather than of the coordinates:\n%s", soloLines, outOne)
+	}
+	if !strings.Contains(outOne, "uzi review backlog --run run-solo") {
+		t.Errorf("the single remedy line does not name the settled run:\n%s", outOne)
+	}
+
 	// A truncated write that settled NOTHING must print no command at all. The template form
 	// printed one regardless, which is how an unrunnable instruction reaches a user in the
 	// one state where it is also useless — there is no run to anchor on.

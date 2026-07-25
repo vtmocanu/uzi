@@ -359,6 +359,17 @@ var knownInstructions = []knownInstruction{
 // The false-positive load is carried by the cobra-verb filter, not by the class — the root's
 // own "uzi drives the factory" is rejected under both the narrow and the widened class,
 // because `drives` is not a verb in the tree.
+//
+// 🔴 THERE IS A SECOND, NARROWER CLASS IN e2e/run-e2e.sh AND THE DIFFERENCE HAS A CONSEQUENCE.
+// This one reads SOURCE literals, so it must admit format verbs and placeholders: `%<>-`.
+// run_printed_instructions' allowlist reads EMITTED text, which has to be runnable verbatim
+// in a shell, so it is `[A-Za-z0-9 ._:/=-]` and admits none of them. The asymmetry is
+// correct — but it means an instruction whose EMITTED form carries any character outside the
+// runtime class can be REGISTERED here and can never be EXECUTED there: evidenceNotExecuted
+// by construction rather than by choice. `%`, `+`, `@`, `,` and `~` are all outside it, so a
+// judge target containing one would fail the harness floor with a message about the
+// allowlist rather than about the target. Loud rather than silent, and low probability —
+// but it is discoverable only by reading both files, so each now points at the other.
 var instructionRE = regexp.MustCompile("`(uzi [a-z][a-z0-9 %<>-]*)`|(?m)^\\s*(uzi [a-z][a-z0-9 %<>-]*)")
 
 // instructionScope is every package this backstop scans, relative to api/cmd/uzi. IT IS PART
