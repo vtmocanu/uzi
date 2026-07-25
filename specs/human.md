@@ -404,7 +404,7 @@ Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`.
 
 ## Feature #58 — Hosted k8s workers (self-service worker provisioning)
 
-Tracked as GitLab issue vtmocanu/uzi#58; PRD at `prds/58-hosted-k8s-workers.md`. Partially delivers the Deferred "on-demand worker spawning" item below — spawn-on-queued-work is NOT in scope here.
+Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8s-workers.md` (moved to `done/` 2026-07-25). Partially delivers the Deferred "on-demand worker spawning" item below — spawn-on-queued-work is NOT in scope here.
 
 - Self-service: any user provisions their own worker from the web UI, bounded by an admin-set per-user quota. [user 2026-07-16]
 - The user picks two things: a worker type (image template) and a size (S/M/L). [user 2026-07-16]

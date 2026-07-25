@@ -911,7 +911,7 @@ on.
 
 Full design rationale — why a dedicated controller rather than the api, the
 RBAC verb-by-verb reasoning, the namespace/NetworkPolicy split, and the sizing
-presets — is `prds/58-hosted-k8s-workers.md` (its Decision Log especially). The
+presets — is `prds/done/58-hosted-k8s-workers.md` (its Decision Log especially). The
 docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/83-docker-capable-worker.md`.

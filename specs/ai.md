@@ -363,8 +363,12 @@ a link to the PRD file".
 - Board shows **only `PRD`-labeled issues** (`ListIssues(labels=["PRD"], …)`).
 - **PRD-link check** computed at fetch time from the issue description: must contain
   a relative path or absolute URL to a PRD file. Regex:
-  `(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/[\w.-]+\.md(?:[#?][^\s)]*)?` — matches
+  `(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/(?:[\w.-]+/)*[\w.-]+\.md(?:[#?][^\s)]*)?` — matches
   subdir paths (e.g. `prds/done/…`). Result stored as `issues.has_prd_link`
+  *(regex re-synced 2026-07-25: this line quoted `prds/[\w.-]+\.md`, which cannot match a
+  subdirectory at all — `[\w.-]` excludes `/` — so the quoted pattern contradicted the very
+  sentence after it. The prose and the code were right; only the quote was stale. Source of
+  truth is `prdLinkRe`, `api/internal/forgesvc/service.go:49`.)*
   (description not persisted). Failing cards render a warning badge and are
   **excluded from future agent pickup**.
 
@@ -6539,7 +6543,7 @@ Serves human: the Deferred "on-demand worker spawning" item — **its operator h
 requires a dedicated operator, "never the api, which must never hold container-runtime credentials";
 PRD #58 delivers exactly that operator, and provisions workers **on user request** rather than when
 queued work appears. The queued-work trigger, autoscaling and scale-to-zero remain deferred; a hosted
-worker is persistent and runs until deleted. Design rationale: `prds/58-hosted-k8s-workers.md`
+worker is persistent and runs until deleted. Design rationale: `prds/done/58-hosted-k8s-workers.md`
 (Decision 1). Supersedes the k8s half of §168 — §168's compose half (always-on worker, no spawning,
 `docker.sock` never mounted into the api) stands unchanged and is what compose still does.
 
