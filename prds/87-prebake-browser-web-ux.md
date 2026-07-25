@@ -248,3 +248,13 @@ Taken off the v0.11.6 release, which carried the M5 docker-tier fix. Both pipeli
 **What is solid:** the browser closure puts the agent images at **~5–8 minutes** to build, roughly 4–7× the controller and ~10× web. That is the standing cost of the ~648 MiB chromium closure, and it is why the kaniko jvm OOM (fixed with `--compressed-caching=false`) bit on the heaviest job first. Both agent images now build and publish green at that size, on both paths.
 
 **`nixSize`** was already re-validated and bumped 4Gi → 20Gi by owner decision (2026-07-22); the live worker measures **2.6 GB** of baked `/nix`, so the headroom holds.
+
+### Runtime memory was never re-costed — the M7 run OOMed the worker (issue #131)
+
+The M7 gate run died `worker restarted; run orphaned and out of re-queue budget`. The pod was **`OOMKilled`, exit 137, twice**, on the **L** preset (`limits {cpu 4, memory 8Gi}`, `requests {cpu 1, memory 4Gi}`). The workload was ordinary for this feature: a `web-ux` subagent driving headless Chromium 150 against the live UI, plus `fact-checker` and `researcher` in parallel, plus the lead and the dind sidecar.
+
+**This PRD re-costed disk and not memory.** §2(c) measured the baked `/nix` at 2.6 GB and drove the owner's `nixSize` 4Gi → 20Gi bump. Chromium was added to **every** worker image without any preset's `MemoryRequest`/`MemoryLimit` being revisited (`controller/internal/preset/preset.go`). The largest standard size does not fit the feature this PRD shipped.
+
+Distinct from the kaniko OOM already recorded above: that was a CI **build-time** OOM on the runner, fixed with `--compressed-caching=false`. This is a **runtime** OOM in the worker pod. Same symptom word, unrelated cause — worth stating because the earlier fix could be mistaken for covering this.
+
+**Not a DoD failure of this PRD's browser work** — the validation had already succeeded when the OOM hit (screenshot captured and owner-verified, a11y snapshot taken, the PATH mechanism identified). The evidence survived only because it was already in the message transcript. Tracked forward in **issue #131**, which also asks whether this belongs to the preset table, to PRD #84's capability-aware scheduling (dismissed here as moot for *capability*, which does not settle *sizing*), or to `web-ux` bounding its own concurrency.
