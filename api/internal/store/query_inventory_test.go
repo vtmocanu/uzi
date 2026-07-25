@@ -144,12 +144,28 @@ import (
 // and sanity-check the capture with `grep -c -- '-- name:'` before trusting a zero — a zero from
 // a broken capture is indistinguishable from a zero from a query nobody calls.
 //
-// EXECUTION COUNTS FOR ALL 46 ROWS THE TABLE HELD AT THAT SWEEP, measured this way on one
-// whole-sweep run (RUN=141 PASS=141 FAIL=0 SKIP=0). Bound to that run, not offered as constants —
-// they move with the fixtures, and the ZEROES are the load-bearing part. **"ALL" was a
-// completeness claim and it expired: the table holds 53 rows today**, so the seven added since
-// carry their own evidence in their own `why` and are NOT in the list below. Read this as the
-// receipt of one sweep, never as a census of the current table:
+// EXECUTION COUNTS FOR ALL 53 ROWS, measured this way on whole-sweep runs (RUN=141 PASS=141
+// FAIL=0 SKIP=0). Two different things live in the list and they have different shelf lives: the
+// LIST ITSELF IS A MAINTAINED CENSUS and must track the table, while the FIGURES are receipts of
+// those sweeps and move with the fixtures. The ZEROES are the load-bearing part.
+//
+// 🔴 CORRECTED TWICE, and the second correction is an instance of the defect it sits beside.
+// This header said "ALL 46 ROWS"; the first repair made it "all 46 the table held AT THAT SWEEP …
+// the seven added since are NOT in the list below". That is FALSE — `321a25b2` added four of them
+// to the zero list four lines down (the three `user_vaults.sql` rows and
+// `ListAppSettingsForUpdate`), and the correspondence assertion twenty lines below depends on the
+// list having been maintained. A paragraph cannot declare itself a frozen receipt while a census
+// claim downstream requires it to be live.
+//
+// THE DISCRIMINATOR, because "is this a receipt or a census" is the question that keeps arising
+// here: HAS THIS TEXT BEEN EDITED SINCE THE RUN IT CLAIMS TO RECORD? Edited ⇒ census, and the
+// numerals must track the tree (this list, and `:90`'s self-description). Not edited ⇒ receipt:
+// bind it, never overwrite it (control 8's "SIX truthful pins" and the `ad6c63d9` 290-across-28
+// figures, both left exactly as measured).
+//
+// One thing `RUN=141` cannot do is date the sweep it is the receipt of: `536f9730` (46 rows) and
+// `321a25b2` (52 rows) BOTH report RUN=141 — necessarily, since adding inventory rows adds no
+// tests. Cite the SHA when the tree matters; the tally cannot stand in for it.
 //
 //	0  CreateSelfImproveRun, MarkImproveUziRecommendationsAddressed  (selfimprove.sql)
 //	0  ListCLITokens                                                 (cli_tokens.sql)
@@ -565,7 +581,11 @@ var queryInventory = []queryPin{
 			"still passed, because every seeded address has the same shape. Re-folded after the equality " +
 			"landed (5d5d0be4 + the fix): RED at that assertion, reporting a token under a different " +
 			"human's address. Note what still does NOT fire under that fold — `len(got) != len(fixtures)` " +
-			"stays green, because the duplicated rows collapse in the id-keyed map. Also: " +
+			"stays green, because the duplicated rows collapse in the id-keyed map. HOW MANY rows redden " +
+			"is NOT a property of the fix and must not be quoted as one: two independent runs got one of " +
+			"four and three of four, both honest, because `ORDER BY u.email ASC` over freshly-generated " +
+			"uuids decides which row wins each id's map slot, and only ids whose winner is the wrong user " +
+			"redden. The MECHANISM is the durable half. Also: " +
 			"revoked-sorts-last is asserted PAIRWISE WITHIN THE FIXTURE rather than table-wide, so the " +
 			"shared live database's other rows may interleave without touching it"},
 	// ── notifications.sql — the inbox. THE WRITE PATH IS PINNED; THE READ PATH IS NOT ───
