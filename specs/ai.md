@@ -5907,7 +5907,7 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
 ## 235. Per-user Claude rate-limit meters — background poller + gauge row + read-endpoint split
 
 Serves human: Feature #53 (per-user Claude rate-limit visibility; human.md entry pending lead/user
-confirmation). Full design record: [prds/53-rate-limits.md](../prds/53-rate-limits.md) (D1–D7, the
+confirmation). Full design record: [prds/done/53-rate-limits.md](../prds/done/53-rate-limits.md) (D1–D7, the
 frozen DTO, accepted residuals). This file records only the shape and the reconciliations decided
 this session; the PRD is authoritative for rationale.
 
@@ -7224,7 +7224,7 @@ Serves human: as §264. Recorded because the honest inventory is part of the con
 
 Serves human Feature #70 (a GitLab-style status favicon + a brand favicon). `web/`-only: no api,
 agent, DB, or migration change. The shipped CSP (`img-src 'self' data:`) already permits the `data:`
-favicon and was deliberately NOT touched. Full decision log: [prds/70-status-favicon.md](../prds/70-status-favicon.md).
+favicon and was deliberately NOT touched. Full decision log: [prds/done/70-status-favicon.md](../prds/done/70-status-favicon.md).
 
 ## 276. Brand favicon + client-side dynamic status overlay from the signed-in user's own runs
 
@@ -10335,7 +10335,7 @@ surprise — not a TODO folded into this one. Related and also recorded rather t
 fixed: `/api/ws` has no per-user connection cap, pre-existing, and M1 does not worsen
 it but does make it easier to reach in practice.
 
-See [prds/112-uzi-tui.md](../prds/112-uzi-tui.md) for D1/D2, R1, R6 and the M1
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) for D1/D2, R1, R6 and the M1
 milestone record.
 
 ## 369. PRD #112 M2 — the hub's seq-less drop hole (the old comment was FALSE at four sites), and why `Kind` stays OPEN while `Status` is CLOSED
@@ -10399,7 +10399,7 @@ before `Type`. **`Kind`'s inertness requirement is met by a different mechanism 
 different layer**: terminal-control-byte stripping at render (D7, §371). Nothing
 branches on `Kind` for liveness.
 
-See [prds/112-uzi-tui.md](../prds/112-uzi-tui.md) M2 for the full reconnect-replay
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) M2 for the full reconnect-replay
 contract.
 
 ## 370. PRD #112 M3 — the TUI is `api/cmd/uzi/tui_*.go` in `package main`, NOT a `tui/` subpackage; the tradeoff recorded honestly
@@ -10450,7 +10450,7 @@ The palette uses `lipgloss.LightDark(isDark)` fed by `tea.BackgroundColorMsg.IsD
 the background Bubble Tea itself reports, not a second independent detection that could
 disagree with it.
 
-See [prds/112-uzi-tui.md](../prds/112-uzi-tui.md) — the Parallelization and R3
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) — the Parallelization and R3
 corrections.
 
 ## 371. PRD #112 D7 — terminal safety: `sanitizeTTY` fixed IN PLACE, sanitize-then-Glamour is FUNCTIONAL, and two things it deliberately does not cover
@@ -10519,7 +10519,7 @@ renders judge free text as escaped plain text — safe against markup injection,
 React never interprets it, but the browser's own bidi algorithm still reorders a plain
 text node. Filed as issue #124; D7 covers the TUI's render path, not the web's.
 
-See [prds/112-uzi-tui.md](../prds/112-uzi-tui.md) D7, R4 and Known Gaps.
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D7, R4 and Known Gaps.
 
 ## 372. PRD #112 D4/D5/D8 — lanes are a DISPLAY heuristic, steering is RUN-LEVEL, and the steer gate ASKS the server instead of comparing ids
 
@@ -10614,5 +10614,5 @@ approve is unconfirmed and offered only while the run is actually at its gate. Q
 confirmed for both `[q]` and `ctrl+c`, with a second `ctrl+c` as the escape hatch for a
 stuck confirm prompt; a stray keystroke must not drop a watched run.
 
-See [prds/112-uzi-tui.md](../prds/112-uzi-tui.md) D4/D5/D8, R2, and the M3/M4
+See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D4/D5/D8, R2, and the M3/M4
 milestone corrections.

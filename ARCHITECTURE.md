@@ -68,7 +68,7 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 ## Forge integration
 
-uzi's second surface connects each user to a git forge (**GitLab and Forgejo**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) is the second driver, and it landed exactly as the abstraction promised: no caller, schema, or REST-shape change — the seam held. It adds no new service — everything below lives inside `api` — but it does add a second trust boundary: `api` now makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) and [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) for the second-driver design record, and the PRDs (`prds/2-forge-integration-kanban.md`, `prds/65-forgejo-support.md`) for the full rationale.
+uzi's second surface connects each user to a git forge (**GitLab and Forgejo**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) is the second driver, and it landed exactly as the abstraction promised: no caller, schema, or REST-shape change — the seam held. It adds no new service — everything below lives inside `api` — but it does add a second trust boundary: `api` now makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) and [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) for the second-driver design record, and the PRDs (`prds/done/2-forge-integration-kanban.md`, `prds/done/65-forgejo-support.md`) for the full rationale.
 
 ### Forge abstraction
 
@@ -215,7 +215,7 @@ recipe a later release renders into a running one.
 A skill is a named Markdown playbook (progressive disclosure: name +
 description sit cheaply in an agent's context; the body loads on demand) that
 attaches to agent templates rather than existing on its own. Full rationale
-in `prds/16-agent-skills.md` (Solution Overview, Technical Design, Trust
+in `prds/done/16-agent-skills.md` (Solution Overview, Technical Design, Trust
 model); this section is the map. User-facing usage is
 [docs/skills.md](docs/skills.md).
 
@@ -349,7 +349,7 @@ Two read endpoints (`GET /api/me/rate-limits`, self-scoped; `GET
 /api/admin/rate-limits`, every user) serve the same frozen DTO — an array of
 per-token readings — and the SPA renders them as meters in three places: a
 Settings card, a sidebar micro-meter, and an Admin → Rate limits table. See
-[prds/53-rate-limits.md](prds/53-rate-limits.md) (especially its Design
+[prds/done/53-rate-limits.md](prds/done/53-rate-limits.md) (especially its Design
 Decisions) for the full rationale, including the vault-locked staleness
 rule and the failure/backoff semantics; user-facing behavior is in
 [docs/rate-limits.md](docs/rate-limits.md).
@@ -361,7 +361,7 @@ queued work, drives a Claude Agent SDK session against a cloned repo, and opens
 an MR — never touching `main`. This adds one optional service (`agent`, above)
 and a third trust boundary: `api` now also accepts *inbound* calls from each
 user's worker (the reverse of the forge boundary, where `api` calls *out*).
-Full design rationale lives in the PRD (`prds/4-agent-runtime-workers.md`,
+Full design rationale lives in the PRD (`prds/done/4-agent-runtime-workers.md`,
 especially its Decision Log); this section is the map.
 
 ```
@@ -466,7 +466,7 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   user actually saw — an approve or reject arriving mid-revision is
   discarded rather than silently applied to a plan no human reviewed. Once
   approved, the run resumes the same SDK session into the implement ⇄ review
-  loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/41-plan-revision-gate.md)
+  loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/done/41-plan-revision-gate.md)
   for the epoch mechanism (Decisions 2/3) and
   [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
   user-facing actions.
@@ -660,19 +660,19 @@ The breaker trips immediately on a fatal verdict (401/403/404 — every message 
 
 ## Slack integration (outbound-only)
 
-uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, and reply-from-Slack steering. It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/25-slack-integration.md`, especially its Security posture and Decision Log); user-facing setup is [docs/slack.md](docs/slack.md).
+uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, and reply-from-Slack steering. It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/done/25-slack-integration.md`, especially its Security posture and Decision Log); user-facing setup is [docs/slack.md](docs/slack.md).
 
 - **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud — and, since PRD #41, gated plan bodies too (see Content minimization, below).
 - **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
 - **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject and follow-up submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate.
-- **Content minimization — with one deliberate exception for the plan gate.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then a **whole-blob** mrkdwn escape (not the per-field rule above, since the blob carries no trusted markup of its own to preserve), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering.
+- **Content minimization — with one deliberate exception for the plan gate.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then a **whole-blob** mrkdwn escape (not the per-field rule above, since the blob carries no trusted markup of its own to preserve), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering.
 - **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
 - **The primary directive is unaffected.** Slack can only approve, reject, request changes to (feeding text back into the same planning session), or otherwise thread-steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
 - **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
 
 ## Chat with uzi (the fifth surface)
 
-uzi's fifth surface is a conversational one: a **Chat** page where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft GitLab issues the user confirms. It adds **no new service and no new trust boundary** — chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/39-chat-agent.md`, especially its Decision Log and the review-corrected decisions); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
+uzi's fifth surface is a conversational one: a **Chat** page where a user talks to an agent that knows uzi's own source, can investigate the user's runs, and can draft GitLab issues the user confirms. It adds **no new service and no new trust boundary** — chat rides the existing worker/run machinery as a third run **kind** (`runs.kind = 'chat'`), the same way `ci_fix` did as a second kind. Full design rationale is in the PRD (`prds/done/39-chat-agent.md`, especially its Decision Log and the review-corrected decisions); user-facing usage is [docs/chat.md](docs/chat.md). The short map:
 
 - **Chat is a run kind, not a new service.** A conversation is one `chat` run: `repo_id`/`issue_iid`/`branch` all NULL (`runs.repo_id` was made nullable, with `runs_kind_shape` enforcing the all-NULL shape for chat and the existing NOT-NULL shape for every other kind). The first user message and every follow-up are ordinary `run_user_inputs` (`kind='follow_up'`) rows — the initial message is atomically seeded into `run_user_inputs` by `CreateChatRun` so a chat can never exist without its first message — and the whole conversation streams through the same persisted-first `run_messages` → `/api/ws` pipeline (with REST replay) as any run. Chat runs are excluded from the board, the runs list, and the admin runs list (they have no repo/issue), but an individual chat is still openable owner-or-admin via the run view (`GET /api/runs/:id`).
 - **A dedicated claim lane, narrower credentials.** The worker polls a second, independent claim lane (`POST /api/worker/runs/claim?lane=chat`) alongside its run slot, so a chat is served concurrently with an executing run (up to `WORKER_CHAT_SESSIONS`, default 1) without queueing behind a long run. Chat is cheap to hold — no clone, no worktree, no provisioning. The chat claim payload is a **separate `ChatClaimPayload` that structurally cannot carry a forge PAT** — the `ForgePAT` field does not exist on it, one tier narrower than a run claim (which carries the PAT for the worker's git operations). A chat needs no repo and no forge connection at all: a user with only an Anthropic token can still chat.
@@ -691,8 +691,22 @@ over a different credential. It adds **no new service and no new inbound
 port**: the CLI is an outbound-only client of the existing `api`, the same
 way a browser is. User-facing usage is [docs/cli.md](docs/cli.md); full
 design rationale — including the security audit that found and closed the
-scope-ceiling gap below — is in the PRD (`prds/64-uzi-cli.md`, especially its
+scope-ceiling gap below — is in the PRD (`prds/done/64-uzi-cli.md`, especially its
 Decision Log).
+
+`uzi tui` (PRD #112, `api/cmd/uzi/tui_*.go`) is a full-screen view over that same
+client — a live runs board, a run-detail split with a per-agent lane rail and
+transcript, and run-level steering. It adds **no endpoint and no service**: every
+read and write is a call the plain CLI already makes. Its one new capability is a
+Bearer-authenticated subscription to the existing `/api/ws` hub, which required
+moving that route from the cookie-only group into `RequireUser` — a route move with
+`websocket.Accept`'s options untouched (see the ws section above for why the
+same-origin rule still covers both credential paths). It lives in `package main`
+rather than a `tui/` subpackage because Go forbids importing a main package, and the
+sanitize and render helpers it must reuse live there; that trade is recorded in
+[prds/done/112-uzi-tui.md](prds/done/112-uzi-tui.md). User-facing usage is
+[docs/cli.md](docs/cli.md); the plain `--json` verbs remain the agent-facing surface
+and are unchanged.
 
 - **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
   user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
@@ -750,7 +764,7 @@ renders the repo's own `docs/*.md` in-app, bundled at build time via a Vite
 glob (`web/src/lib/docs.ts`) rather than served from an API or duplicated
 into `web/`, so the in-app copy can never drift from the repo copy. See
 [docs/README.md](docs/README.md) for the frontmatter contract and how to
-add a page, and the PRD (`prds/7-docs-section-webui.md`) for the design
+add a page, and the PRD (`prds/done/7-docs-section-webui.md`) for the design
 rationale.
 
 - **Audience-gated visibility.** Every doc carries a leading-fence
@@ -924,7 +938,7 @@ RBAC verb-by-verb reasoning, the namespace/NetworkPolicy split, and the sizing
 presets — is `prds/done/58-hosted-k8s-workers.md` (its Decision Log especially). The
 docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
-`prds/83-docker-capable-worker.md`.
+`prds/done/83-docker-capable-worker.md`.
 
 ## Not yet in scope
 
@@ -941,6 +955,6 @@ skills-management UI, encrypting secrets with the user's
 own password instead of a shared server key, PAT least-privilege
 verification, and a second (e.g. OpenAI) execution provider are all
 deliberately deferred — see [plan.md](plan.md), the PRDs' Risks sections, and
-`prds/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
+`prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.
