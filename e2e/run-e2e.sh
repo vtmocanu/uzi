@@ -195,11 +195,39 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
 cleanup() {
   local code=$?
+  # 🔴 BREADCRUMB FIRST, BEFORE ANYTHING THAT CAN FAIL. It exists to answer one question
+  # that was unanswerable after a real run: did the EXIT trap fire at all?
+  #
+  #   breadcrumb + a teardown/KEEP_STACK line  -> cleanup ran to completion
+  #   breadcrumb + NEITHER                     -> cleanup ran and DIED INSIDE
+  #   NEITHER                                  -> the trap never fired (signal, or the
+  #                                               capture ended before this point)
+  #
+  # A run ended with no margin report and no teardown line, and none of the three could be
+  # distinguished from the log. Three structural hypotheses were eliminated by minimal
+  # repro — `set -e` from a failing pipeline in a function, the `env -i` re-exec, and
+  # `set -u` in a function all fire the trap normally — and the cause is still unknown.
+  # One line converts the next occurrence from an investigation into a reading.
+  printf '\n[cleanup] EXIT trap entered (code %s)\n' "$code"
   # Margin report BEFORE teardown (PRD #97 M9) — on the failure path too, where it is
   # most useful: a red run's margins usually show the whole suite running hot, which is
-  # the difference between "this assertion is wrong" and "this host was slow". Wrapped
-  # so a broken diagnostic can never change the exit code we are about to return.
-  report_margins 2>/dev/null || true
+  # the difference between "this assertion is wrong" and "this host was slow".
+  #
+  # 🔴 THE `2>/dev/null` THAT USED TO BE HERE IS GONE, AND ITS REMOVAL IS THE FIX. The
+  # wrapper written to stop a broken diagnostic from doing harm was what made its own
+  # failure unreportable. `|| true` is what protects the exit code; the stderr suppression
+  # protected nothing and cost the only evidence. REPRODUCED: with MARGINS_FILE unbound,
+  # `report_margins 2>/dev/null || true` under `set -u` kills the shell MID-CLEANUP and
+  # prints nothing at all — `|| true` does not catch it, because an unbound variable is a
+  # fatal shell error rather than a command failure, and the redirect eats the one message
+  # that would have named it. Empty log, no teardown, no cause.
+  #
+  # That was not merely hypothetical here: the trap is registered ~200 lines ABOVE
+  # MARGINS_FILE's first assignment, so any failure in that window — which covers stack
+  # bring-up, where failures are COMMON — hit exactly this. `${MARGINS_FILE:-}` in
+  # report_margins closes it at the source; dropping the redirect is what makes the next
+  # one visible.
+  report_margins || true
   # KEEP_STACK leaves the whole stack running (containers + volumes + rundir) so
   # the auditor can inspect logs, the claim payload path, and the worker's /data
   # against a live run. Tear it down manually with the printed command.
@@ -421,7 +449,7 @@ wait_http() {
 # never bodies, tokens, or vault material.
 MARGINS_FILE=""   # assigned once RUNROOT exists (see the mkdir below)
 record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
-  [ -n "$MARGINS_FILE" ] || return 0
+  [ -n "${MARGINS_FILE:-}" ] || return 0
   printf '%s\t%s\t%s\n' "$2" "$3" "$1" >> "$MARGINS_FILE" 2>/dev/null || true
 }
 
@@ -431,7 +459,10 @@ record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
 # over twice the population hides exactly the newly-visible tight waits it was added
 # to expose.
 report_margins() {
-  [ -n "$MARGINS_FILE" ] && [ -s "$MARGINS_FILE" ] || return 0
+  # ${MARGINS_FILE:-}, not $MARGINS_FILE: cleanup calls this, and cleanup can fire BEFORE the
+  # assignment ~200 lines below the trap. Under `set -u` a bare reference there is a FATAL
+  # shell error, not a return — it kills cleanup mid-flight with no teardown and no message.
+  [ -n "${MARGINS_FILE:-}" ] && [ -s "${MARGINS_FILE:-}" ] || return 0
   say "PRD #97 M9 — wait_* margin report (tightest first; headroom = ceiling - actual)"
   # Emit "<headroom>\t<line>", numeric-sort on the leading key, then strip it — sorting
   # the rendered text directly does not work (the number is not at a field boundary).
