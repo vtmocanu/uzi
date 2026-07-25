@@ -31,7 +31,18 @@ An unlocked `devbox install` resolves the floating `nixpkgs-unstable` flake ref,
 
 The worker FQDN allowlist on dev-cluster is three entries (`deploy/values/dev-cluster.yaml:234-246`): `gitlab.example.com`, `*.anthropic.com`, `cache.nixos.org`. Antrea default-denies the rest. Verified from inside a worker pod during #78: `cache.nixos.org` CONNECT ok (120ms); `github.com` and `api.github.com` both TIMEOUT.
 
-> *Live-fact caveat:* those three FQDNs are read from the repo, and ArgoCD auto-sync makes repo≈live a strong inference — but #82 records a github stopgap being applied and then reverted, i.e. exactly a drift episode. One `kubectl get annp -n <worker-ns>` turns this into a measurement.
+> **MEASURED LIVE 2026-07-25, and the answer is that WORKER TIER changes it — a distinction this PRD did not draw.** The two worker namespaces carry different egress:
+>
+> | | `uzi-workers` (standard) | `uzi-workers-docker` |
+> |---|---|---|
+> | egress rules | DNS + api `:8443` + web `:8080` only; external governed by the `uzi-worker-egress` ANNP | DNS + api `:8443` + **broad `0.0.0.0/0` except internal CIDRs** |
+> | github reachable? | **no** | **YES** — `api.github.com` 200, `codeload.github.com` 301, `search.devbox.sh` 404 |
+>
+> So **§1's premise holds for standard-tier workers** — which is where #78 ran and what this PRD is about — but **provisioning would simply work on a docker-tier worker**, because that tier has broad internet egress by design (PRD #83).
+>
+> *(Recorded because the operator got this wrong first: an egress probe was run against the only worker that happened to be up, which was docker-tier, and the 200s were briefly read as falsifying §1 outright. Generalising from one pod across a tier boundary is the same error class as reading the allowlist off a seed migration. **M0 must state which tier every measurement came from.**)*
+>
+> Two consequences for scope: **(a)** M0(b)'s tier-2 reproduction must run on a **standard-tier** worker, or it will pass for the wrong reason; **(b)** a docker-tier worker combines broad internet egress with the §6 denylist bypass and `sandbox = false` (measured live, same day) — that combination is worth an explicit look in M1b rather than being left implied.
 
 ### 2. The allowlist and the image seed are different sets — and both columns below are approximations
 

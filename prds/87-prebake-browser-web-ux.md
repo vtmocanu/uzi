@@ -175,3 +175,28 @@ Landed on `feature/prd-87-browser` (base `origin/main` fb3b7bca) by a three-trac
   - The `devbox.lock` was hand-extended (mirroring the existing go/gcc entry shape at the same rev) rather than regenerated via `devbox global install`, to avoid realizing a darwin closure on the macOS host + mutating the real global toolchain; the linux image build's `devbox global install` is what realizes and authoritatively confirms it. For a devbox-authoritative lock, regenerate on a linux builder.
   - (arm64 cache coverage — now VERIFIED above, no longer open.)
 - **M7 (live k8s verify on dev-cluster):** unrun — a real worker driving headless `--no-sandbox` Chromium against uzi's own web UI, a legibly-rendered screenshot, and a browser-less-runtime graceful skip. This is the headline DoD gate and requires the built image deployed to the cluster.
+
+### M7 — PARTIALLY VERIFIED LIVE (2026-07-25). Browser mechanics pass; the target is unreachable from the tier that has a worker.
+
+Run against the live hosted worker **`8e1fef71`** on dev-cluster (`uzi-workers-docker`), under the real k8s posture — `uid=10001`, `cap_drop: ALL`, `no-new-privileges`, single-uid (#58). Commands and outputs below were executed, not reasoned about.
+
+**PASSES — the browser half of the DoD is now evidence, not intent:**
+
+- **Headless launch under the hardening.** `chromium --headless --no-sandbox --disable-dev-shm-usage --dump-dom about:blank` → `exit=0`, `<html><head></head><body></body></html>`. (The dbus `Failed to connect to the bus` lines are benign container noise, not launch failures.)
+- **The shim resolves and runs on Node 22.** `agent-browser --version` → `agent-browser 0.32.3`, `exit=0`.
+- **Font legibility — the line only M7 could prove.** A rendered page screenshotted at 800×300 shows real DejaVu glyphs: heading, body text, digits `0123456789`, and an em dash, all correct, **no tofu**. `/opt/uzi-toolchain/share/fonts/truetype` holds `DejaVuSans-*.ttf`; `/opt/uzi-toolchain/bin/chromium` → `chromium-150.0.7871.128`; the baked ENV contract (`AGENT_BROWSER_EXECUTABLE_PATH`, `AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage`, `AGENT_BROWSER_IDLE_TIMEOUT_MS`, `FONTCONFIG_FILE`) is present in the worker env. Baked store measures **2.6 GB**, matching §2(c).
+
+**The crashpad fix is LOAD-BEARING, and this run proved it by breaking it first.** The first attempt invoked `/opt/uzi-toolchain/bin/chromium` **directly**, bypassing the shim, and reproduced the documented trap exactly: `exit=133`, `chrome_crashpad_handler: --database is required`. Re-running with `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` pointed at a writable dir — precisely what the shim defaults — flipped it to `exit=0`. So the shim is not defence-in-depth over the ENV contract; **it is the thing that makes Chromium start at all under this uid.** Any future change that lets a caller reach the real binary without the shim re-opens `rc=133`. *(Recorded as a self-correcting result: the operator's own first command was wrong, and the failure it produced is the best available proof that the shim earns its place.)*
+
+**BLOCKED — and it is a real M5 gap, not a test artifact.** M7's target (uzi's own in-cluster web UI) is **unreachable from a docker-tier worker**. `curl http://uzi-web.uzi.svc.cluster.local/` times out; the screenshot step produces no file. Cause, read off the live NetworkPolicies:
+
+| egress rule | `uzi-workers` (standard) | `uzi-workers-docker` |
+|---|---|---|
+| web Service `:8080` to `component: web` in ns `uzi` | **present** | **MISSING** |
+| broad `0.0.0.0/0` except internal CIDRs | absent | **present** |
+
+M5's `workers.networkPolicy.allowWebService` conditional exists **only** in `deploy/chart/templates/worker-networkpolicy.yaml:83-90`; `worker-docker-networkpolicy.yaml` never received it. And `uzi-workers` currently has **zero pods** — the only running worker is docker-tier. So M7 cannot complete today by either route.
+
+**OPEN DECISION for the owner (a behaviour change, so not taken here):** is the missing docker-tier allow a **bug** (a docker-capable worker should be able to drive `web-ux` against the in-cluster target, so the conditional belongs in both templates) or **intentional scoping** (the docker tier already holds broad internet egress, and adding an in-cluster allow widens it further)? Either answer is defensible; the PRD must state which, because right now the asymmetry is undocumented and reads as an oversight.
+
+**Still open after this run:** M7 proper (a genuine `web-ux` **agent** run against a chosen §7 target — the browser mechanics above are necessary, not sufficient); the §2(c) **build-time** deltas (protected-ref, MR-cache-less ×2, #92 reseed); and the `devbox.lock` provenance decision.
