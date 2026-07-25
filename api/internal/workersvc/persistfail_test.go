@@ -135,6 +135,53 @@ func TestPersistFailEvictDropsBothMaps(t *testing.T) {
 	}
 }
 
+func TestAppendMessagesDropsASubThresholdStreakWhenTheRunLeavesRunning(t *testing.T) {
+	// The gap the two Sweep hooks and the evaluator all miss. The evaluator only ever
+	// sees CANDIDATES (streak >= autoStopStreak and the window elapsed), so a streak
+	// below the threshold crossed a requeue untouched — and kept GROWING, because
+	// this method went on recording against a queued run.
+	//
+	// Measured before the fix: 12 carried across a Register-path requeue, then the
+	// fresh attempt killed after 8 new failures, with the whole window leg satisfied
+	// by the DEAD attempt's firstAt. A streak has to pass through 12 to reach 20, so
+	// which side of the threshold a worker OOM lands on is close to a coin flip;
+	// half that population landed here.
+	//
+	// Register's RequeueWorkerRuns returns no ids, so it can never have a Sweep-style
+	// hook. Closing it at the RECORDER retires the class instead of adding a fourth
+	// path-specific patch — and costs nothing, since appendMessages already read the
+	// run row.
+	w := worker()
+	runID := uuid.New()
+	fs := &persistFakeStore{
+		run:       store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"},
+		poisonSeq: 1,
+		insertErr: unstorableErr(),
+	}
+	clk := t0
+	svc := persistSvc(fs, &clk)
+
+	const subThreshold = 12
+	if subThreshold >= autoStopStreak {
+		t.Fatalf("fixture bug: %d is not below autoStopStreak (%d), so this test is not exercising the sub-threshold path at all", subThreshold, autoStopStreak)
+	}
+	for i := 0; i < subThreshold; i++ {
+		clk = t0.Add(time.Duration(i) * 500 * time.Millisecond)
+		_ = svc.AppendMessages(context.Background(), w, runID, []IncomingMessage{msg(274)})
+	}
+	if got := svc.persistFail.stats(runID).streak; got != subThreshold {
+		t.Fatalf("precondition: streak = %d, want %d", got, subThreshold)
+	}
+
+	// The requeue. No hook fires for this path; the next POST is what must clear it.
+	fs.run.Status = "queued"
+	_ = svc.AppendMessages(context.Background(), w, runID, []IncomingMessage{msg(274)})
+
+	if got := svc.persistFail.stats(runID).streak; got != 0 {
+		t.Fatalf("streak = %d, want 0: a sub-threshold streak survived the run leaving `running`, so the fresh attempt starts %d failures into a 20-failure budget it never spent — and the window leg is already satisfied by the dead attempt", got, got)
+	}
+}
+
 func TestAppendMessagesTerminalRunNeverJoinsTheComparisonSet(t *testing.T) {
 	// The same property at the recorder, which is where the attack would actually be
 	// mounted: a SUCCESSFUL append on a terminal run must not write lastOK. The

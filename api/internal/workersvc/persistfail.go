@@ -394,8 +394,14 @@ func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow 
 // and since autoStopKillableKinds landed, G5 refuses `store` BEFORE this function is
 // ever called. So a transient outage is stopped by the CLASS gate, not by an empty
 // comparison set. MEASURED — folding this function to `return 99` leaves the transient
-// outage test green and reddens the others. The guard that made the old sentence true
-// is the guard that falsified it.
+// outage test green and reddens the others. It was true only while nothing upstream
+// refused `store`.
+//
+// (An earlier draft of this block ended "the guard that made the old sentence true is
+// the guard that falsified it" — memorable and WRONG, which is the dangerous pair.
+// G4 made it true; G5 falsified it, by taking the outage away from G4 before it
+// arrives. Two different guards. It was quoted approvingly in a review before anyone
+// checked it, which is exactly how a quotable formulation travels into a spec.)
 //
 // What this function alone still proves is the case where G5 PASSES and only it
 // stands: every active run failing on a KILLING class, i.e. a fleet-wide worker bug.

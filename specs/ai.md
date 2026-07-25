@@ -9979,7 +9979,7 @@ unified-visual-vocabulary PRINCIPLE of Decision 6 is retained in full.
 See [prds/115-meter-color-thresholds.md](../prds/115-meter-color-thresholds.md) for
 the Locked Decisions, user journey, and the full test re-pin inventory.
 
-## 367. PRD #108 Phase 2 — the API counts its own write failures, and the kill needs six guards plus a class it can name (D5-D10, plus six Phase 2 added)
+## 367. PRD #108 Phase 2 — the API counts its own write failures, and the kill needs a full conjunction plus a class it can name (D5-D10, plus the decisions Phase 2 made itself)
 
 - **D5 — auto-stop requires a comparison set; with none, flag and notify, permanently.**
   A rule that cannot distinguish "this run is poisoned" from "the database is
@@ -10023,7 +10023,7 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   no alert. M7 names the log lines an operator greps instead
   (`docs/run-auto-stopped.md`); a metrics endpoint is its own PRD.
 
-**Six decisions Phase 2 made that the PRD did not anticipate:**
+**The decisions Phase 2 made that the PRD did not anticipate:**
 
 - **The killable classes are `{unstorable, oversize}` — and the reason recorded is
   NOT "a worker can choose it".** That justification does not discriminate:
@@ -10058,7 +10058,23 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   an operator upgrades the worker image to fix the wedge, the run is requeued onto
   a 0.10.1+ worker that would split, bisect and succeed, and the stale streak
   kills it first — *the fix that made the upgrade worth doing is what the kill
-  lands on.*
+  lands on.* **The rule is enforced at the RECORDER** (`AppendMessages` evicts
+  whenever the observed status is not `running`), which is what makes it a rule
+  rather than a list of patched paths: the evaluator only ever sees CANDIDATES, so
+  it cannot reach a sub-threshold streak, and `Register`'s `RequeueWorkerRuns`
+  returns no ids so it can never have a sweep-style hook. Measured before that
+  fix: 12 failures carried across a requeue, then the fresh attempt killed after 8
+  new ones with the whole window leg satisfied by the dead attempt's `firstAt`.
+  The two `Sweep` hooks are now belt and braces.
+- **Time to stop is 60-78s typical, ~135-150s if the escalation fires — and the
+  first number is a MAX, not a sum.** The streak leg and the window leg run
+  CONCURRENTLY: at the incident's ~2 Hz the streak clears at t=10s while the 60s
+  window clears at t=60s, so the earliest a run can become a candidate is t=60s,
+  plus ≤15s of sweep granularity plus ≤3s of steering poll (≤1s for chat). An
+  earlier report published 70-80s — the worst case, labelled typical — by adding
+  the two legs. The escalation figure IS a sum, because `stopReqAt` starts at
+  enqueue. Recorded here rather than only in a commit message: a latency figure is
+  a durable claim, and a commit message is immutable and the least-read artifact.
 - **G4 asks "is the API's write path working"; "is the worker at fault" is G5's
   question.** This is why peers held by the failing run's own worker are NOT
   excluded from the comparison set: a same-worker peer persisting successfully

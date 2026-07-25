@@ -1131,13 +1131,32 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// this run is not this worker's to vouch for. Recording here is what would let
 		// worker A build a kill streak against user B's run — see persistfail.go's
 		// ownership tripwire. NOT a persistence failure, and not counted as one.
-	case obs.terminal:
-		// A finished run, checked BEFORE the success arm on purpose. worker_id
-		// survives the terminal transition and neither GetRunOwnedByWorker nor this
-		// method filters on status, so a late or hostile POST would otherwise
-		// resurrect a streak on a dead run one tick after eviction — and, on the
-		// SUCCESS path, keep a terminal run in M5's comparison set indefinitely for
-		// the cost of one deduplicated append every few minutes. Both are closed here.
+	case obs.status != "running":
+		// NOT RUNNING — checked BEFORE the success arm on purpose, and stated as one
+		// rule rather than as a terminal special case: A STREAK IS EVIDENCE ABOUT ONE
+		// RUNNING ATTEMPT, so leaving `running` ends that attempt's claim on it.
+		//
+		// This single arm retires a whole class of defect instead of one path of it:
+		//
+		//   - TERMINAL. worker_id survives the terminal transition and neither
+		//     GetRunOwnedByWorker nor this method filters on status, so a late or
+		//     hostile POST would resurrect a streak on a dead run one tick after
+		//     eviction — and on the SUCCESS path would keep a terminal run in M5's
+		//     comparison set indefinitely for one deduplicated append every few minutes.
+		//   - REQUEUED. The evaluator evicts too, but it only ever sees CANDIDATES
+		//     (streak >= autoStopStreak and the window elapsed), so a SUB-THRESHOLD
+		//     streak crossed a requeue untouched — and kept growing, since this method
+		//     went on recording against a queued run. Measured: 12 carried across, then
+		//     the fresh attempt killed after 8 new failures, with the entire window leg
+		//     satisfied by the DEAD attempt's firstAt. A streak must pass through 12 to
+		//     reach 20, so which side of the threshold an OOM lands on is close to a
+		//     coin flip; half that population landed here.
+		//   - Every OTHER path that resets status without a hook, including Register's
+		//     RequeueWorkerRuns, which returns no ids and so can never have one.
+		//
+		// Sweep's two requeue-site evictions and the evaluator's are now belt and
+		// braces rather than the mechanism, which is the safer arrangement: this arm
+		// needs no candidacy test and no enumeration of the paths.
 		s.persistFail.evict(runID)
 	case err == nil:
 		s.persistFail.recordSuccess(runID, s.now())
@@ -1160,8 +1179,13 @@ type appendObservation struct {
 	// resolved is true once runOwnedByWorker has returned a run — i.e. once the
 	// caller is known to own this run. Nothing may be recorded while it is false.
 	resolved bool
-	terminal bool
-	lastSeq  int32
+	// status is the run's status as this attempt read it. Carried whole rather than
+	// as a derived `terminal bool` on purpose: the recorder's rule is "is this run
+	// RUNNING", and a boolean named for one of the several non-running cases invites
+	// the next reader to treat that case as the rule. One field cannot disagree
+	// with itself.
+	status  string
+	lastSeq int32
 }
 
 // NoteOversizeBatch records a 413 against the run's persistence-failure streak.
@@ -1257,7 +1281,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return appendObservation{}, err
 	}
-	obs := appendObservation{resolved: true, terminal: terminalStatuses[run.Status], lastSeq: run.LastSeq}
+	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.

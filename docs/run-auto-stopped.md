@@ -39,7 +39,7 @@ A run can carry the `looping` flag forever and never be auto-stopped. That is a 
 | The failing requests are **malformed** (guard 5) | **Roll the worker image.** A malformed batch is not something a correct worker produces, so this says the worker *build* is broken — and a build defect hits every run that worker touches. Stopping them one at a time would hide the pattern while the same image kept claiming new work. Operators: the log line carries `failure_class=invalid`. |
 | The error keeps changing kind (guard 4) | Usually a transient infrastructure problem resolving itself. If it persists, check the api and database. |
 
-**An absent flag is not proof of an absent wedge.** The streak resets whenever the error changes kind, so a worker whose batch oscillates around the size limit can fail continuously and never accumulate enough of one kind to be flagged at all. That is fail-safe by design, but it means "no flag" means "no *confirmed* loop", not "no problem".
+**An absent flag is not proof of an absent wedge.** uzi's count resets whenever the evidence stops describing one continuous attempt, and two things can therefore fail continuously while never being flagged or stopped: a worker whose batch oscillates around the size limit (the error keeps changing kind), and a worker that flaps between `running` and `awaiting_approval` — a plan-revision loop, say — which resets the count every time it leaves `running`. Both are the fail-safe direction, and both present identically to you: **no flag, no stop, run still wedged.** So "no flag" means "no *confirmed* loop", not "no problem". If a run is producing nothing and carries no flag, check the worker's logs rather than concluding it is fine.
 
 ## How you find out
 

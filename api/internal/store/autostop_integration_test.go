@@ -5,9 +5,14 @@ package store_test
 // auto-generated constraint, and a wrong name would make store.Migrate fail at
 // every boot), and whether FailRunAutoStop's SQL does what its comment claims.
 //
-// Everything else about auto-stop — all six guards, the escalation, the two halves
-// — is a pure function of in-process state plus one row read, so it lives in
-// workersvc's fake-store suite and needs no container.
+// Everything else about auto-stop — the whole guard conjunction, the escalation, the
+// two halves — is a pure function of in-process state plus one row read, so it lives
+// in workersvc's fake-store suite and needs no container. (This line used to say
+// "all six guards". Six was the PRE-G5 count, and it survived here for three commits
+// after the class gate landed — the very stale tally whose disagreement with two
+// other counts is what made the missing gate visible. Name the mechanism, never the
+// number: the conjunction lives in workersvc/autostop.go and every member is named
+// there.)
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
 // e2e/run-store-it.sh. A package that prints `ok` with PASS=0 is INVALID, not green.
