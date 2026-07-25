@@ -352,6 +352,15 @@ func (h *Handler) WorkerRunMessages(w http.ResponseWriter, r *http.Request) {
 			// fixed net/http literal "http: request body too large", pinned by
 			// Hyrum's law in the stdlib, and echoing it would couple our wire
 			// contract to a stdlib constant. err.Limit is likewise never disclosed.
+			//
+			// Counted against the run's persistence-failure streak (PRD #108 M4)
+			// because this arm answers BEFORE AppendMessages runs, so the recorder
+			// inside it never sees a 413. That blind spot is the incident's own long
+			// tail: a pre-0.10.1 worker's retry batch grows, so the failure rotates
+			// 500 → 413 and then stays 413 forever. NoteOversizeBatch re-checks
+			// ownership itself — this handler has authenticated the worker but has not
+			// yet established that it holds THIS run.
+			h.wsvc.NoteOversizeBatch(r.Context(), wkr, runID)
 			httpx.Error(w, http.StatusRequestEntityTooLarge, "this batch is too large; split it and retry")
 			return
 		}

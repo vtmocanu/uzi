@@ -62,6 +62,32 @@ const (
 	reasonVaultLocked   = "your vault is locked, so this run can't start"
 	reasonNoWorker      = "no worker is online to pick up this run"
 	reasonWaitingWorker = "waiting for a worker to pick up this run"
+	// reasonPersistFailing is the PRD #108 M4 reason: the run's messages cannot be
+	// written, so the agent keeps re-sending them. Same contract as its siblings —
+	// fixed, server-controlled, no tool name, no repo content, no live duration.
+	//
+	// It names the MECHANISM rather than the symptom, unlike the `slow` this
+	// replaces: the incident reported "this run is taking longer than usual" for a
+	// run that was neither slow nor working. No migration is owed — runs.health_reason
+	// is plain text with no CHECK (00057), and only runs.health is constrained, where
+	// 'looping' already exists.
+	reasonPersistFailing = "the agent's updates can't be saved, so it keeps resending them"
+)
+
+// Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
+// reason loopWindow/loopThreshold are: they describe a mechanism, not an operator
+// preference.
+//
+// They sit strictly BELOW M5's kill thresholds (autoStopStreak/autoStopWindow), and
+// detectRunHealth runs before the auto-stop step in Sweep, so the PRD's "health
+// first, kill second" ordering holds by construction rather than by timing — the
+// flag lands at least three sweep ticks before a kill can.
+//
+// 5 failures is ~2.5s at the incident's observed ~2 Hz — enough not to be one blip;
+// the 10s window rides out a single slow query.
+const (
+	persistFlagStreak = 5
+	persistFlagWindow = 10 * time.Second
 )
 
 // Loop-detection window (Decision 4), code constants (not settings): flag when any
@@ -185,10 +211,31 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 	}
 }
 
-// runningTarget computes the flag for a running run, priority looping > stalled >
-// slow (Decision 3): looping is the strongest evidence of pathology, and slow is a
-// wall-clock backstop that must not mask a more specific signal.
+// runningTarget computes the flag for a running run, priority persist-looping >
+// tool-looping > stalled > slow (Decision 3, extended by PRD #108 M4): looping is
+// the strongest evidence of pathology, and slow is a wall-clock backstop that must
+// not mask a more specific signal.
 func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
+	// looping, persistence flavour (PRD #108 M4). Checked FIRST, and deliberately
+	// NOT from run_messages: the arm below reads ListRunToolWindow, and this wedge IS
+	// a failure to persist run_messages, so that evidence source is blind BY
+	// CONSTRUCTION rather than by threshold. This arm reads the api's own in-process
+	// count of AppendMessages failures for this run instead — evidence produced by
+	// the thing that failed, which the wedge cannot suppress because the wedge is the
+	// event being counted.
+	//
+	// Above the tool-window arm because both map to the same `looping` enum and this
+	// is the more specific truth: below it, a run that is BOTH repeating a call and
+	// failing to persist would report the repeat and hide the wedge. Same enum means
+	// nothing downstream (slacksvc, web badge, CLI) changes shape.
+	//
+	// Bonus worth keeping: returning here skips the per-tick ListRunToolWindow query
+	// for exactly the runs whose message stream is broken.
+	if fs := s.persistFail.stats(r.ID); fs.streak >= persistFlagStreak &&
+		!fs.firstAt.IsZero() && now.Sub(fs.firstAt) >= persistFlagWindow {
+		return healthLooping, reasonPersistFailing
+	}
+
 	stats := s.toolWindow(ctx, r.ID)
 
 	// looping: the same tool call recurred past the threshold in the window. Not

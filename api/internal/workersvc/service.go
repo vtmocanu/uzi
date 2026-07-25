@@ -472,6 +472,15 @@ type Service struct {
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
 	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
 	lastSlowClampWarn time.Duration
+	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
+	// the signal a persistence wedge cannot suppress because the wedge IS the event
+	// being counted. Always non-nil (New constructs it).
+	//
+	// Unlike lastSlowClampWarn directly above, it is NOT sweeper-only: it is written
+	// by every HTTP handler goroutine serving /messages and read by the sweeper, so
+	// it carries its own mutex. Do not copy that field's lock-free reasoning here —
+	// see persistfail.go.
+	persistFail *persistFailTracker
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -523,7 +532,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
-	return &Service{q: q, box: box, p: p, now: time.Now}
+	return &Service{q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker()}
 }
 
 // -------------------------------------------------------------------------
@@ -1087,6 +1096,83 @@ type IncomingMessage struct {
 // (run_id, seq)) and advances the run's last_seq high-water mark. The worker
 // must own the run.
 //
+// It is a thin RECORDER around appendMessages (PRD #108 M4): the persistence work
+// is unchanged and lives below, and this layer exists only to feed the per-run
+// failure streak the health detector and the auto-stop evaluator read. The split
+// is what lets the counter see EVERY failure return of a function that has five of
+// them, instead of the one a caller happens to remember to instrument.
+//
+// The recording rules and the reasons they are rules, not defaults, are on each
+// arm of the switch; the invariant they all serve is persistfail.go's ownership
+// tripwire.
+func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
+	obs, err := s.appendMessages(ctx, wkr, runID, msgs)
+	switch {
+	case !obs.resolved:
+		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
+		// this run is not this worker's to vouch for. Recording here is what would let
+		// worker A build a kill streak against user B's run — see persistfail.go's
+		// ownership tripwire. NOT a persistence failure, and not counted as one.
+	case err == nil:
+		s.persistFail.recordSuccess(runID, s.now())
+	case obs.terminal:
+		// A finished run. worker_id survives the terminal transition and neither
+		// GetRunOwnedByWorker nor this method filters on status, so a late or hostile
+		// POST would otherwise resurrect a streak on a dead run one tick after
+		// eviction. Positive check, evaluated on the write path rather than left to
+		// the M5 evaluator's read.
+		s.persistFail.evict(runID)
+	default:
+		s.persistFail.recordFailure(runID, classifyPersistFail(err), obs.lastSeq, s.now())
+	}
+	return err
+}
+
+// appendObservation is what the recorder needs from one append attempt and cannot
+// get from the error alone: whether ownership resolved at all, whether the run was
+// already terminal, and the run's message high-water mark AS THIS ATTEMPT SAW IT.
+//
+// lastSeq is max(runs.last_seq, maxStored) — the PRD's "max(seq) has not advanced"
+// evidence. It reads runs.last_seq rather than a SELECT max(seq) FROM run_messages
+// because UpdateRunLastSeq is `last_seq = GREATEST(last_seq, @seq)` over maxStored,
+// which counts deduplicated rows too, so the column is a faithful high-water mark
+// that is already on the row this path holds and costs no extra query.
+type appendObservation struct {
+	// resolved is true once runOwnedByWorker has returned a run — i.e. once the
+	// caller is known to own this run. Nothing may be recorded while it is false.
+	resolved bool
+	terminal bool
+	lastSeq  int32
+}
+
+// NoteOversizeBatch records a 413 against the run's persistence-failure streak.
+//
+// It exists because a 413 is answered in handler.WorkerRunMessages BEFORE
+// AppendMessages is ever called, so an oversize batch is otherwise invisible to
+// the recorder. That is not academic: a pre-0.10.1 worker's retry batch GROWS (PRD
+// #108 M0 defect 4), so the incident's own long tail rotates 500 → 413 and then
+// stays 413 forever. Without this hook, both M4's flag and M5's kill go blind in
+// exactly that steady state.
+//
+// It re-checks ownership ITSELF — the one recording hook not already below
+// runOwnedByWorker — because an unowned record is a cross-tenant kill primitive.
+// One indexed query on a rare path. Best-effort: a lookup failure records nothing.
+func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID uuid.UUID) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return
+	}
+	if terminalStatuses[run.Status] {
+		s.persistFail.evict(runID)
+		return
+	}
+	s.persistFail.recordFailure(runID, persistFailOversize, run.LastSeq, s.now())
+}
+
+// appendMessages is AppendMessages' persistence half. It returns the observation
+// the recorder needs alongside the error; every early return therefore carries the
+// state observed so far.
+//
 // ONLY the InsertRunMessage error is eligible for the ErrUnstorableMessage (→
 // 400) classification, and that narrowness is the point rather than an oversight.
 // This function returns store errors from three places — the insert,
@@ -1138,11 +1224,12 @@ type IncomingMessage struct {
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
-func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return err
+		return appendObservation{}, err
 	}
+	obs := appendObservation{resolved: true, terminal: terminalStatuses[run.Status], lastSeq: run.LastSeq}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.
@@ -1161,7 +1248,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
-			return ErrInvalidMessage
+			return obs, ErrInvalidMessage
 		}
 		// A kind of nothing but NUL escapes passes the emptiness check above — it is
 		// non-empty on the wire — and would then strip to "" in the sanitation pass,
@@ -1171,7 +1258,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// invariants intact — nothing is written, and nothing is logged as laundered.
 		// The double stripNUL costs one strings.Count on the fast path.
 		if stripped, _ := stripNUL(m.Kind); stripped == "" {
-			return ErrInvalidMessage
+			return obs, ErrInvalidMessage
 		}
 	}
 	// SECOND pass for sanitation, separate from validation on purpose. The
@@ -1272,6 +1359,27 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
+	// The high-water mark AS OBSERVED, whether or not the insert loop broke and
+	// whether or not the UpdateRunLastSeq below runs. This is what the streak's
+	// no-progress reset compares (PRD #108 M4).
+	//
+	// The partial apply the comment above the validation loop flags, worked through:
+	// on a batch whose Nth message the database refuses, rows 1..N-1 commit and this
+	// advances the mark ONCE. It is frozen from the next attempt onward, because the
+	// loop breaks at the same message every time so maxStored can never exceed the
+	// value it already set. Whether that costs a streak reset depends on whether an
+	// entry already existed — this line runs BEFORE the recorder sees the failure, so
+	// a run whose first-ever failure is the partial apply is recorded at the advanced
+	// mark and never resets at all. Either way it can only DELAY a kill by one
+	// failure; it can never cause a false one.
+	//
+	// Where it genuinely helps: a 0.10.1+ worker bisecting the poison out re-groups
+	// the batch, so messages after it DO land, this advances repeatedly, and the
+	// streak keeps resetting — the server correctly declines to kill a run whose
+	// client is already handling it.
+	if maxStored > obs.lastSeq {
+		obs.lastSeq = maxStored
+	}
 	// Advance the high-water mark to what landed, BEFORE propagating any insert
 	// error. Leaving it stale is not cosmetic: on resume the worker restarts from
 	// runs.last_seq and re-emits those seq numbers carrying DIFFERENT content, the
@@ -1283,13 +1391,13 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if maxStored > run.LastSeq {
 		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
 			if insertErr != nil {
-				return insertErr // the insert failure is the more informative of the two
+				return obs, insertErr // the insert failure is the more informative of the two
 			}
-			return err
+			return obs, err
 		}
 	}
 	if insertErr != nil {
-		return insertErr
+		return obs, insertErr
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
@@ -1300,7 +1408,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// that lands after a mid-flight cancel still folds (pre-cancel spend is real
 	// spend, Decision 4).
 	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
-		return err
+		return obs, err
 	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
 	// that reacts by replaying from last_seq sees a consistent state.
@@ -1310,7 +1418,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, m.AgentInstance, m.AgentLabel, []byte(m.Payload), now)
 		}
 	}
-	return nil
+	return obs, nil
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold
@@ -2522,6 +2630,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 		res.ProposalsRecovered = int64(len(recovered))
 	}
+
+	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
+	// memory bound for the one case no other eviction path reaches: a run whose
+	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
+	// detector so a flag is never raised off an entry this tick was going to expire.
+	s.persistFail.prune(now)
 
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and
