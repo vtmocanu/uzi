@@ -182,6 +182,46 @@ func TestAppendMessagesDropsASubThresholdStreakWhenTheRunLeavesRunning(t *testin
 	}
 }
 
+func TestAppendMessagesComparisonSetIsRunningRunsOnly(t *testing.T) {
+	// The recorder's non-running arm has a SECOND effect beyond dropping streaks:
+	// sitting above the success arm, it means recordSuccess fires only for running
+	// runs, so it also narrows G4's comparison set. A run parked at the approval gate
+	// that IS successfully persisting messages no longer vouches for the write path.
+	//
+	// Intended on both counts — fail-safe (fewer peers ⇒ fewer kills), and it keeps
+	// warming the comparison set costing a live run doing real work. Pinned here
+	// because the effect is a CONSEQUENCE of arm ordering rather than of anything
+	// that names G4, so it is invisible at the site someone would edit: restoring
+	// recordSuccess for a parked run looks like a fix for an oversight.
+	for _, tc := range []struct {
+		status string
+		peer   bool
+	}{
+		{"running", true},
+		{"awaiting_approval", false},
+		{"claimed", false},
+		{"queued", false},
+		{"completed", false},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			w := worker()
+			runID, accused := uuid.New(), uuid.New()
+			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: tc.status}}
+			clk := t0
+			svc := persistSvc(fs, &clk)
+
+			if err := svc.AppendMessages(context.Background(), w, runID, []IncomingMessage{msg(1)}); err != nil {
+				t.Fatalf("AppendMessages: %v", err)
+			}
+			peers := svc.persistFail.peersSucceeding(accused, t0, autoStopWindow)
+			if got := peers > 0; got != tc.peer {
+				t.Fatalf("a SUCCESSFUL append on a %s run counts as a peer = %v, want %v — G4 asks whether the write path works, and only a RUNNING run answers it for this design's purposes",
+					tc.status, got, tc.peer)
+			}
+		})
+	}
+}
+
 func TestAppendMessagesTerminalRunNeverJoinsTheComparisonSet(t *testing.T) {
 	// The same property at the recorder, which is where the attack would actually be
 	// mounted: a SUCCESSFUL append on a terminal run must not write lastOK. The

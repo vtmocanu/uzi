@@ -10014,9 +10014,20 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
 - **D9 — `stalled`'s in-flight suppression is not weakened.** A long build
   genuinely looks like silence, and the wedge presents as exactly that benign
   case (its last persisted message is a `tool_use` with no result). The wedge is
-  caught by a new, independent signal instead. The new arm returns BEFORE
-  `stalled` is evaluated, so it can only add a flag where there was `slow` or
-  `ok`; it can never remove a suppression.
+  caught by a new, independent signal instead. What is preserved is the
+  SUPPRESSION RULE: the new arm does not touch `stats.inFlight`, so nothing that
+  used to suppress `stalled` stops suppressing it. **What is NOT preserved is
+  priority, and an earlier draft of this bullet claimed otherwise** — it said the
+  arm "can only add a flag where there was `slow` or `ok`", which its own next
+  clause refutes: an arm that returns BEFORE `stalled` is evaluated necessarily
+  PRE-EMPTS it. `runningTarget`'s order is persist-looping > tool-looping >
+  stalled > slow, so a wedged run whose last persisted message is a COMPLETED
+  `tool_result` now reads `looping` where it would have read `stalled`, and a run
+  both repeating a call and failing to persist reports the persistence cause.
+  Both are intended (health.go says so at the arm), and both are user-visible —
+  different Slack head, different reason text. The defensible claim is the narrow
+  one: no suppression is weakened, and no run that was `ok` becomes flagged for a
+  reason it did not earn.
 - **D10 — there is no metrics surface, and the gap is recorded rather than
   papered over.** Re-measured: zero `promhttp`/`prometheus`/`/metrics` hits in
   `api/` and nothing in `go.mod`. So there is no counter to add, no dashboard and
@@ -10025,6 +10036,63 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
 
 **The decisions Phase 2 made that the PRD did not anticipate:**
 
+- **THE OWNERSHIP GATE IS THE COUNTER'S WHOLE SAFETY ARGUMENT — and the entry cap
+  is NOT the memory bound.** Every recorded failure must be reached only AFTER
+  `runOwnedByWorker` has succeeded for the calling worker, or a worker POSTing to
+  a run it does not own drives THAT run's streak toward a kill, with the failed
+  check being precisely the ownership check. There are exactly two recording
+  hooks: `AppendMessages`' recorder (below the gate by construction — the
+  recorder requires a resolved observation), and `NoteOversizeBatch`, which
+  re-checks ownership ITSELF because a 413 is answered by the handler before any
+  ownership check runs. **A third hook without that check is a cross-tenant kill
+  primitive.** The `NoteOversizeBatch` hook exists at all because a pre-0.10.1
+  worker's retry batch GROWS, so the incident's own long tail rotates 500 → 413
+  and stays there — without it both the flag and the kill go blind in the
+  incident's own steady state, at a stated cost of one indexed lookup on a path
+  that previously touched the database not at all. **The retracted claim, because
+  it is the one a reader will re-derive:** the header once said the map keys were
+  worker-supplied, so an unknown run id would mint an unreachable entry, so the
+  cap was load-bearing. False, and two validators found it independently — only
+  `recordFailure` mints and both callers sit below the gate, so an unknown id
+  gives `ErrRunNotOwned` and records nothing. The keys are server-derived. The cap
+  is defence in depth whose residual is one legitimate user holding thousands of
+  concurrently-failing OWNED runs; the TTL covers only a run whose worker vanished
+  without ever reaching terminal. And the safety does not rest on eviction at all:
+  every write M5 performs is status-scoped in SQL, so a stale entry can at worst
+  cause one no-op UPDATE.
+- **The tracker is TWO maps, and `lastOK` is written in M4 rather than M5 on
+  purpose.** `fail` holds the streaks; `lastOK` is the comparison set. Writing
+  `lastOK` from M4's one hook means the `AppendMessages` hot path is opened
+  exactly ONCE, so holding M5 reverts nothing and adds no second hook later — the
+  same seam that made "ship M4, hold M5" a real option rather than a hope.
+- **The flag thresholds and the kill thresholds are code constants at two levels,
+  and the ordering is structural, not timed.** Flag at 5 failures over 10s
+  (`persistFlagStreak`/`persistFlagWindow`, ~2.5s at the incident's ~2 Hz); kill
+  at 20 over 60s with a 60s escalation (`autoStopStreak`/`autoStopWindow`/
+  `autoStopEscalateAfter`). Neither set is a setting: they describe a mechanism,
+  not an operator preference, and putting the kill's in the settings cache that
+  owns `health_enabled` would re-create exactly the coupling D8 exists to prevent.
+  Because the kill thresholds sit strictly above the flag's AND `detectRunHealth`
+  runs before the auto-stop step in the same `Sweep`, "health first, kill second"
+  holds by construction. The PRD's "no progress" and "same error class" guards are
+  implemented as streak RESETS rather than as predicates at decision time, so
+  reaching the threshold IS the proof that neither changed — and a reset restarts
+  `firstAt`, which is what keeps the count and the window describing one episode.
+- **The flag does NOT narrow by class, and the blast radius is stated rather than
+  discovered.** `autoStopKillableKinds` narrows only the KILL; any repeated
+  persistence failure is worth warning about. The consequence: a fault lasting
+  ≥ `persistFlagWindow` that hits `run_messages` inserts specifically will flag
+  EVERY actively-appending run `looping` and DM each owner, subject to PRD #47's
+  cooldown. A whole-database outage does not reach this, because `SetRunHealth`
+  fails too and `detectRunHealth` logs and skips.
+- **A wedged CHAT run is auto-stopped but never flagged, and widening the query is
+  the wrong fix.** `ListActiveRunsForHealth` ends `AND kind <> 'chat'`, so the
+  detector can never see a chat run, while `chat-runner.ts` builds the same
+  `MessageBatcher` against the same `/messages` route and wedges identically. The
+  kill covers it because its candidate set is the in-process map, not that query.
+  Widening the query would flag every legitimately-parked chat. The asymmetry is
+  real, deliberate, and the reason the evaluator costs zero queries in the common
+  case — that map is normally empty.
 - **The killable classes are `{unstorable, oversize}` — and the reason recorded is
   NOT "a worker can choose it".** That justification does not discriminate:
   `{"n":1e1000000}` is `json.Valid`, survives every class the sanitizer strips,
@@ -10066,23 +10134,41 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   fix: 12 failures carried across a requeue, then the fresh attempt killed after 8
   new ones with the whole window leg satisfied by the dead attempt's `firstAt`.
   The two `Sweep` hooks are now belt and braces.
-- **Time to stop is 60-78s typical, ~135-150s if the escalation fires — and the
-  first number is a MAX, not a sum.** The streak leg and the window leg run
-  CONCURRENTLY: at the incident's ~2 Hz the streak clears at t=10s while the 60s
-  window clears at t=60s, so the earliest a run can become a candidate is t=60s,
-  plus ≤15s of sweep granularity plus ≤3s of steering poll (≤1s for chat). An
-  earlier report published 70-80s — the worst case, labelled typical — by adding
-  the two legs. The escalation figure IS a sum, because `stopReqAt` starts at
-  enqueue. Recorded here rather than only in a commit message: a latency figure is
-  a durable claim, and a commit message is immutable and the least-read artifact.
+- **Time to stop is 60-78s on the compliant path, ~120-150s if the escalation
+  fires — and the first number is a MAX, not a sum.** The streak leg and the
+  window leg run CONCURRENTLY: at the incident's ~2 Hz the streak clears at t=10s
+  while the 60s window clears at t=60s, so the earliest a run can become a
+  candidate is t=60s, plus ≤15s of sweep granularity plus ≤3s of steering poll
+  (≤1s for chat). An earlier report published 70-80s — the worst case, labelled
+  typical — by adding the two legs. **The escalation range was published as
+  135-150s and that floor is not derivable**: it adds the WORST case of the first
+  leg (75s) to the 60s escalation while the same bullet uses 60s as that leg's
+  floor. `stopReqAt` is stamped from the sweep pass's own `now`, and
+  `autoStopEscalateAfter` is exactly four sweep ticks, so the escalation lands at
+  `t_verdict + 60s` when the comparison clears and `t_verdict + 75s` when tick
+  jitter puts it a hair under — over `t_verdict ∈ [60, 75]` that is ~120s at the
+  floor and ~150s at the top. The steering poll does NOT add on this path: the
+  escalation exists precisely because the worker did not act on the cancel.
+  Recorded here rather than only in a commit message: a latency figure is a
+  durable claim, and a commit message is immutable and the least-read artifact.
+  Neither range is pinned by a test — the suite drives a fake clock, so these are
+  derivations from `defaultInterval`, `autoStopWindow` and `autoStopEscalateAfter`,
+  and they move if any of the three does.
 - **G4 asks "is the API's write path working"; "is the worker at fault" is G5's
   question.** This is why peers held by the failing run's own worker are NOT
   excluded from the comparison set: a same-worker peer persisting successfully
   answers G4's question correctly, because the API did persist it. The exclusion
   would make G4 attempt G5's job with a worse instrument. (It would also only
-  bite at `WORKER_MAX_CONCURRENT_RUNS > 1`, the default being 1.) Terminal runs
-  ARE excluded, because a worker could otherwise keep the kill armed for every
-  other user's runs with one deduplicated append every few minutes.
+  bite at `WORKER_MAX_CONCURRENT_RUNS > 1`, the default being 1.) What IS excluded
+  is every run that is not `running` — not merely terminal ones, which is how this
+  was first written. It falls out of arm ordering in the recorder rather than from
+  anything that names G4: the non-running arm sits above the success arm, so
+  `recordSuccess` fires only for running runs. Measured per status. Intended on both
+  counts — fail-safe (fewer peers ⇒ fewer kills), and warming the comparison set
+  should cost a live run doing real work rather than a parked or finished one,
+  which is the point a terminal-only rule missed: a worker could otherwise keep the
+  kill armed against every other user's runs with one deduplicated append every few
+  minutes.
 - **The kill's status set is IDENTICAL to the flag's (`running` only).**
   `runningTarget` is reached only from `healthTargetFor`'s `"running"` arm, so a
   run in any other status was never flagged, and killing a run that was never
@@ -10104,11 +10190,57 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   class as a stale comment. The single-guard pins have to stage a scenario where
   the other guards PASS. Measured twice on this branch, once by the tester finding
   a test that certified a guard it never reached.
+- **`stop_kind='auto_stopped'` is the MACHINE contract; `failure_reason` is human
+  prose and must never be parsed.** Forced by the two halves, not chosen: on the
+  live-poller half the worker reports its own terminal state and `SetRunFailed`
+  overwrites `failure_reason` unconditionally with `"run cancelled"`, so the two
+  halves genuinely carry different strings and only `stop_kind` survives both.
+  That is why the PRD's identifier-shaped `message_persist_permanent` was NOT
+  used: it would have been the only identifier in a column the CLI
+  (`FAILURE_REASON`) and the web render verbatim to humans, and it is decoration
+  anyway. The stamp is written in the SAME statement as the thing that caused it
+  on both halves (`CreateStopVerdictInput`'s CTE; `FailRunAutoStop`'s status
+  write), so it cannot be lost independently — 00050's rule, applied to a third
+  value. **The consumer half is the part that bit:** `isStoppedRun` read
+  `stop_kind IS NOT NULL`, so adding a value to the CHECK silently retuned it and
+  an auto-stopped run rendered as a calm neutral "stopped" pill and dropped out of
+  the favicon attention set. It now enumerates `HUMAN_STOP_KINDS`, so a fourth
+  value has to make the choice deliberately instead of inheriting it. A
+  non-enumerating consumer is the general shape of this defect, not a web bug.
+- **Slack wording is ADDED for the new cause, never CHANGED for the old one.**
+  `looping` now carries two genuinely different causes and the enum cannot tell
+  them apart, so `healthNudgeHead` gained a reason-keyed branch and the existing
+  "repeating the same step" sentence is untouched — no shipped nudge's wording
+  moves. The alternative, a new health enum, costs a migration on `runs.health`'s
+  CHECK, a `RunHealth` union change in web, and a badge label, for wording. The
+  cost of the branch is one MIRRORED constant: `slacksvc` reads a reason string
+  for the only time in its life, which qualifies rather than falsifies its
+  "keyed off the enum" contract. Safe because a drift degrades to the generic
+  head — the behaviour before this existed — and pinned from BOTH sides, since a
+  one-sided pin catches one drift direction and lets the other fail silently.
+- **`docs/run-auto-stopped.md` ships at 73 body lines against the 60-line house
+  budget, deliberately.** The exit contract clears run health on every terminal
+  path, so an auto-stopped run carries no flag afterwards and this page plus M7's
+  log lines are the ONLY durable record of why it died — a page that has to
+  explain a kill, the six things checked before it, three flagged-but-not-stopped
+  outcomes and their remedies, and the operator's log-grep table does not compress
+  to 60 without dropping one of them. Measured honestly rather than pleaded:
+  `check-docs` WARNs and exits OK, and 20 of 35 shipped pages are already over,
+  several by 3-6x. This is the smallest kind of exception, not a new one.
 - **Do not carry a guard COUNT anywhere.** Three places once carried three
   different tallies for the same conjunction (five, six, seven), and every one of
   them was consistent with a guard being ABSENT — which is exactly how the
   killable-class gate went missing with nothing flagging it. A tally cannot detect
   its own referent disappearing; citing the mechanism and where it lives can.
+  **A NUMBERING SCHEME IS A TALLY WEARING A DIFFERENT HAT, and this branch grew
+  two of them.** `autostop.go` labels G0, G4, G5, G6 and its prose cites "G3",
+  while G1, G2 and G3 are never defined — so the scheme asserts seven slots and
+  names four. Independently, `docs/run-auto-stopped.md` numbers its own list 1-6
+  and refers to "guard 6", "guard 5", "guard 4"; its guard 6 is the code's G4 and
+  its guard 4 is the code's undefined G3, so an operator and an engineer saying
+  "guard 6" mean different guards. Both schemes are stable only by accident. Cite
+  the guard by what it ASKS (`autoStopKillableKinds`, `peersSucceeding`), never by
+  its ordinal.
 
 See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
 for the full Decision Log, and [docs/run-auto-stopped.md](../docs/run-auto-stopped.md)

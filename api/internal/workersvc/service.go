@@ -1157,6 +1157,28 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// Sweep's two requeue-site evictions and the evaluator's are now belt and
 		// braces rather than the mechanism, which is the safer arrangement: this arm
 		// needs no candidacy test and no enumeration of the paths.
+		//
+		// 🔴 AND IT HAS A SECOND EFFECT, WHICH IS DELIBERATE. Sitting above the
+		// success arm means recordSuccess fires ONLY for running runs, so this also
+		// narrows M5's G4 COMPARISON SET to running runs. Measured, per status:
+		//
+		//	running            joins lastOK  -> counts as a peer
+		//	awaiting_approval  does not      -> does not count
+		//	claimed            does not      -> does not count
+		//	queued             does not      -> does not count
+		//	completed          does not      -> does not count
+		//
+		// So a run parked at the approval gate that IS successfully persisting
+		// messages — alive and doing real work by any ordinary reading — no longer
+		// vouches for the write path. That is intended on both counts: it is the
+		// fail-safe direction (fewer peers ⇒ fewer kills), and it keeps the earlier
+		// hardening's rule intact, that warming the comparison set should cost a live
+		// run doing real work rather than a parked or finished one.
+		//
+		// Written down because the three bullets above are all about STREAKS, and a
+		// reader restoring recordSuccess for a parked run would be undoing something
+		// deliberate with nothing in the place they would look to say so. Pinned by
+		// TestAppendMessagesComparisonSetIsRunningRunsOnly.
 		s.persistFail.evict(runID)
 	case err == nil:
 		s.persistFail.recordSuccess(runID, s.now())
