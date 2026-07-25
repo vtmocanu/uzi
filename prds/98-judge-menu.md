@@ -1169,7 +1169,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       non-zero exits tolerated. Reviewed by reviewer-web, audited, and the architect ruled KEEP on
       the scan-scope commit after owning two of its own three objections as measurably wrong.
       *Original entry preserved below — its measurements are the record of how the gap was found.*
-- [ ] **The printed-instruction backstop.** Three instructions existed in the CLI, **none had
+      **Original:** **The printed-instruction backstop.** Three instructions existed in the CLI, **none had
       ever been executed, and two were false** (the revert hint, fixed; the truncation
       remedy, fixed). A string that tells a user what to do is an assertion nothing
       typechecks. The mechanism: a table of `arrange → produce → extract → assert` rows that
@@ -1258,7 +1258,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       which was armed by the same mechanism (`.go_job` persists `.gocache/` keyed on `api/go.sum`,
       which a fixture edit never touches), copying `test:controller`'s merged precedent.
       *Original entry preserved below.*
-- [ ] **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
+      **Original:** **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
       demo fixture cannot reach the two riskiest behaviours.** A differential harness dumped
       the shipped `mockReviews`, ran the real `GroupJudgeRecommendations` over rows built in
       `rv.updated_at DESC` order, and structurally diffed against `mockApi.getJudgeBacklog`:
@@ -1467,7 +1467,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       it is not later misread as a bug: an anchor also switches the default bucket from To-triage
       to All (deliberate, commented at `Judge.tsx:91`), which is why an anchored view can show MORE
       groups than the unanchored landing. *Original entry preserved below.*
-- [ ] **The anchored deep-link's RENDER PATH is rarely exercised in real use — a testing
+      **Original:** **The anchored deep-link's RENDER PATH is rarely exercised in real use — a testing
       concern, not a product gap** (M5 review, 2026-07-21; **corrected the same day**).
       **The behaviour is COHERENT and the user ruled ship-as-is.** The three cases line up,
       and each default is right for what was clicked:
@@ -1548,7 +1548,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       — had the enclosing group carried one, the comment would have become false at the merge and
       the integration would have carried a false statement into main. One of the four line numbers
       was unchanged by luck rather than by design, and the coder said so. *Original entry below.*
-- [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
+      **Original:** **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,
       `forgeLimiter`, draft gate, provenance box, `isHttpsUrl`) — but that duplication also
@@ -1615,7 +1615,7 @@ costs nothing; do not attribute it.
       it; the harness found it on first execution) and then on an assertion that demanded the
       re-read name a coordinate the write is defined to remove. Still open here: `docs/judge.md`
       and `docs/cli.md`, the CHANGELOG entry for the admin CLI-token inventory, and `specs/ai.md`.
-- [ ] **M8a — Tests + Docs (docs half in the first MR)**: e2e leg (dedup grouping; a group **Dismiss** fans out
+      **Original scope statement:** **M8a — Tests + Docs (docs half in the first MR)**: e2e leg (dedup grouping; a group **Dismiss** fans out
       across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
       Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
       deep-links to `/judge?run=`; ~~**no token spend** on any disposition~~); vitest for
