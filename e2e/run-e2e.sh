@@ -1466,19 +1466,36 @@ say "PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_messa
 # throwaway HTTP listener in-process, points a WebSocket at it, and reports the Origin
 # header the runtime actually sent.
 ORIGIN_PROBE='const http=require("http");const srv=http.createServer();srv.on("upgrade",(req,sock)=>{ console.log("ORIGIN="+JSON.stringify(req.headers.origin===undefined?null:req.headers.origin)); sock.destroy(); srv.close(); process.exit(0); });srv.listen(0,"127.0.0.1",()=>{ const p=srv.address().port; const ws=new WebSocket("ws://127.0.0.1:"+p+"/probe",{headers:{Authorization:"Bearer probe"}}); ws.addEventListener("error",()=>{}); });setTimeout(()=>{ console.log("ORIGIN_PROBE_TIMEOUT"); process.exit(1); },10000);'
+# stderr is merged deliberately — the captured text is what the failure message prints,
+# and a warning line is useful context. But the VERDICT must be a match, not equality:
+# any incidental stderr (an ExperimentalWarning, a deprecation notice, a docker banner)
+# would fail `=` and redden this leg with "sends an Origin header", naming a cause that
+# did not occur. Green today; a base-image node bump turns it red for the wrong reason.
 ORIGIN_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$ORIGIN_PROBE" 2>&1 || true)"
-[ "$ORIGIN_OUT" = "ORIGIN=null" ] \
+printf '%s\n' "$ORIGIN_OUT" | grep -q '^ORIGIN=null$' \
   || fail "the agent runtime sends an Origin header on a headers-only WebSocket (probe: ${ORIGIN_OUT:-<none>}) — the Bearer leg below would then pass WITHOUT exercising the empty-Origin exemption it exists to prove; see PRD #112 D2"
 pass "the agent runtime sends NO Origin on a Bearer WebSocket — the empty-Origin exemption is genuinely what this leg exercises"
 
-# Leg 3 CONSUMES the uzc_ token Leg 2 minted, and consumes it inside a command
-# substitution. Guard it HERE, at top level, outside any subshell: under `set -u` an
-# absent $UZI_TOKEN_VAL would fire inside the `$( ... )`, the subshell would exit 1, and
-# the surrounding `if` would swallow that — so Leg 3 would print its auth verdict for
-# what is really a missing variable. Latent today (Leg 2 hard-guards the mint ~75 lines
-# up and `fail` exits), so this closes a REORDERING hazard, not a live bug.
-{ [ -n "${UZI_TOKEN_VAL:-}" ] && [ "${UZI_TOKEN_VAL#uzc_}" != "$UZI_TOKEN_VAL" ]; } \
-  || fail "Leg 3 needs the uzc_ token Leg 2 mints (got '${UZI_TOKEN_VAL-<unset>}') — do not reorder the legs"
+# Leg 3 mints its OWN credential (issue #126). It used to consume the token Leg 2 mints,
+# which put M1's Bearer-WS auth evidence DOWNSTREAM of `command -v go` and
+# `go build ./cmd/uzi`: a runner without go, or a compile error anywhere in that package,
+# aborted in Leg 2 and took the auth evidence with it as collateral. That coupling got
+# worse on PRD #112 — M3 and M4 added ~2,300 lines to `api/cmd/uzi/`, so the auth gate
+# became both the most important leg and the most downstream. There is no cap on
+# per-user CLI tokens (CreateCLIToken validates only the name), so a second mint is free.
+#
+# Deliberately NOT asserting that one credential drives both the CLI and the WS: that was
+# a side effect of variable reuse, never a designed invariant, and the point of this
+# change is to stop the two legs sharing state at all.
+WSB_TOKEN_VAL="$(apipost "/api/me/cli-tokens" '{"name":"e2e-m1-ws-bearer"}' | jq -r '.token')"
+{ [ -n "$WSB_TOKEN_VAL" ] && [ "$WSB_TOKEN_VAL" != null ] && [ "${WSB_TOKEN_VAL#uzc_}" != "$WSB_TOKEN_VAL" ]; } \
+  || fail "did not mint a uzc_ for the Bearer WS leg (got '${WSB_TOKEN_VAL:-<none>}')"
+
+# Belt-and-braces only, and no longer the thing standing between a reorder and a
+# misattributed verdict: the cross-leg variable this used to guard is gone, so the
+# hazard is structurally absent rather than merely checked for.
+{ [ -n "${WSB_TOKEN_VAL:-}" ] && [ "${WSB_TOKEN_VAL#uzc_}" != "$WSB_TOKEN_VAL" ]; } \
+  || fail "Leg 3's own uzc_ mint did not produce a usable token (got '${WSB_TOKEN_VAL-<unset>}')"
 
 IID_WSB="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E ws bearer","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
@@ -1506,7 +1523,7 @@ fi
 # token, assert a run_message frame.
 WSB_PROBE='const wsurl=process.argv[1], token=process.argv[2], approveUrl=process.argv[3];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const auth="Bearer "+token;const ws=new WebSocket(wsurl,{headers:{Authorization:auth}});ws.addEventListener("open",()=>{ fetch(approveUrl,{method:"POST",headers:{"Content-Type":"application/json","Authorization":auth},body:JSON.stringify({kind:"approve_plan",body:""})}).then(r=>{ if(!r.ok) finish(3,"APPROVE_STATUS="+r.status); }).catch(e=>finish(2,"APPROVE_ERR="+e.message)); });ws.addEventListener("message",(ev)=>{ let f; try{ f=JSON.parse(ev.data); }catch(e){ return; } if(f.type==="message"&&f.seq>0){ finish(0,"FRAME type=message seq="+f.seq+(f.agent?(" agent="+f.agent):"")+" kind="+(f.kind||"")); } });ws.addEventListener("error",(e)=>{ fetch(wsurl.replace(/^ws/,"http"),{headers:{Authorization:auth}}).then(r=>finish(5,"WS_ERR http_probe_status="+r.status+" msg="+((e&&e.message)||""))).catch(err=>finish(5,"WS_ERR msg="+((e&&e.message)||"")+" (diag_fetch_failed="+err.message+")")); });setTimeout(()=>finish(6,"TIMEOUT no live /api/ws run_message frame over Bearer"),25000);'
 if WSB_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WSB_PROBE" \
-    "$WS_API/api/ws?run=$RUN_WSB" "$UZI_TOKEN_VAL" "$WS_API/api/runs/$RUN_WSB/inputs")"; then
+    "$WS_API/api/ws?run=$RUN_WSB" "$WSB_TOKEN_VAL" "$WS_API/api/runs/$RUN_WSB/inputs")"; then
   pass "live /api/ws frame received over a Bearer uzc_ token, no Origin sent: $WSB_OUT"
 else
   # The diagnostic in WS_ERR is a PLAIN GET (wsurl with ws:// swapped for http://, no
