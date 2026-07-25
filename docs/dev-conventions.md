@@ -66,3 +66,38 @@ exists to fix the convention ahead of that work so a future E2E suite
 doesn't invent a second naming scheme. When it lands, it should skip (not
 fail) when these are unset, the same way `scripts/smoke.sh` requires an
 already-running stack rather than assuming one.
+
+## The mock/demo build
+
+`web/` can build itself entirely against in-browser fake data
+(`src/mocks/`) instead of a real API — no backend, no compose stack. This
+is what `web/Dockerfile.mock` produces: `docker build -f web/Dockerfile.mock
+-t uzi-ux-multica .` (context is the repo root) gives a static, backend-free
+image, with `web/nginx.mock.conf` 404ing any stray `/api/` call as a
+tripwire rather than silently proxying it anywhere.
+
+**`npm run dev` alone does NOT reach mock mode.** The switch is
+`VITE_UZI_MOCK=1`, read once at build time (`web/src/lib/api.ts`) to swap in
+`src/mocks/mockApi.ts` and `MockRunSocket` for the real `api`/socket — so a
+mock bundle contains no code path to a live backend at all, not just a
+disabled one. There's no separate demo `npm` script for this; run
+`VITE_UZI_MOCK=1 npm run dev` directly (Vite reads the var the same way at
+dev-server start), or use the Dockerfile above for a full static build.
+
+**Demo scenarios**, once in mock mode: `?mock=<name>` on the URL, or the
+`uzi_mock_scenario` `localStorage` key for a sticky choice across reloads
+(`src/mocks/mockApi.ts`'s `mockScenario()`). It's a single string, so
+scenarios are mutually exclusive by construction. Known values:
+
+- `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
+  unreachable in the demo (OIDC off, password on, by default).
+- `truncated-backlog` — `/judge?mock=truncated-backlog` puts the
+  [Judge menu](./judge-menu.md) over its row cap (`MOCK_BACKLOG_MAX_ROWS`,
+  the demo's small stand-in for the server's real `JudgeBacklogMaxRows`).
+  This doesn't just make the truncation banner reachable, it **reproduces
+  the under-count the banner warns about**: the same recurring
+  recommendation reads "seen in 3 runs" without the toggle and "seen in 1
+  run" with it, while the tab counts (which are exempt from the cap) stay
+  truthful throughout — so the screen's own inconsistency between a group's
+  count and the tallies above it is visible in one view, not just asserted
+  in a warning banner. (PRD #98.)
