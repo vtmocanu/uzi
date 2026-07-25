@@ -10096,6 +10096,14 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   its code — if the variable exists, its tests, its migration and its review have
   all completed and one `helm upgrade --set` arms it. The code seam is the
   shipping decision; this is the lever for an incident.
+- **A test can cover two guards and pin NEITHER, when the scenario correlates them.**
+  "An api-wide outage kills nothing" staged on the `store` class is blocked by G5
+  AND by G4 — an outage has no succeeding peers by definition — so folding out
+  either one alone leaves it green. Defence in depth is real and worth a test, but
+  it is not a pin, and a caption claiming otherwise is the same false-assertion
+  class as a stale comment. The single-guard pins have to stage a scenario where
+  the other guards PASS. Measured twice on this branch, once by the tester finding
+  a test that certified a guard it never reached.
 - **Do not carry a guard COUNT anywhere.** Three places once carried three
   different tallies for the same conjunction (five, six, seven), and every one of
   them was consistent with a guard being ABSENT — which is exactly how the

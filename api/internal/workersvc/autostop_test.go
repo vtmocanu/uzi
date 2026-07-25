@@ -219,15 +219,25 @@ func TestAutoStopFleetWideKillingClassStopsNothing(t *testing.T) {
 }
 
 func TestAutoStopApiWideTransientOutageStopsNothing(t *testing.T) {
-	// The realistic outage: every run failing with a transient 500. It is refused by
-	// G5 (`store` is not killable) BEFORE G4 is consulted, so — unlike the test above
-	// — this one deliberately does NOT prove anything about the comparison set. It
-	// proves the class gate, which is the guard that actually stands between a
-	// database hiccup and a mass kill on this path.
+	// The realistic outage: every run failing with a transient 500.
 	//
-	// Kept as its own case rather than folded into the one above because the two
-	// verdicts now come from DIFFERENT guards, and a reader who assumes one covers
-	// the other will delete the wrong one.
+	// 🔴 THIS TEST PINS NEITHER GUARD ON ITS OWN, and the caption used to claim it
+	// proved the class gate. MEASURED: folding out the class gate leaves it GREEN,
+	// because G4 also blocks — an api-wide outage has no succeeding peers BY
+	// DEFINITION, so the two guards are perfectly correlated in this scenario and it
+	// reddens only when BOTH are folded. What it actually pins is that the outage is
+	// covered TWICE, which is worth having and is not nothing; it is just not a
+	// single-guard pin and must not be counted as one.
+	//
+	// The real single-guard G5 pins are TestAutoStopWillNotKillOnAClassNoCorrect...
+	// and ...KillsOnceTheClassFlipsToOneTheWorldCanCause — they are the two that
+	// redden under that fold. G4's single-guard pins are the fleet-wide test above
+	// and the lonely-instance test below.
+	//
+	// Kept as its own case anyway: defence in depth is a property worth a test, and
+	// the alternative — folding it into the fleet-wide case — would lose the one
+	// scenario where an operator's intuition ("the database is down") and the code's
+	// reasoning happen to agree through two independent routes.
 	f := newAutoStopFixture(t)
 	f.svc.persistFail = newPersistFailTracker()
 	start := t0.Add(-(autoStopWindow + 5*time.Second))
@@ -899,9 +909,26 @@ func TestAutoStopWillNotKillOverAStableUsageFoldFailure(t *testing.T) {
 	if got.kind != persistFailStore {
 		t.Fatalf("fold failure classified as %v, want store", got.kind)
 	}
-	// A healthy neighbour, so G4 is satisfied and the class is the only thing left.
-	svc.persistFail.recordSuccess(uuid.New(), clk.Add(-time.Second))
-	if n := svc.autoStopWedgedRuns(context.Background(), clk.Add(autoStopWindow)); n != 0 {
+	// A healthy neighbour, so G4 is SATISFIED and the class is the only thing left.
+	//
+	// The staging is the whole test. Evaluation happens at `at`, and peersSucceeding
+	// admits a neighbour only while `at - lastOK <= autoStopWindow` — so a success
+	// recorded at `clk.Add(-time.Second)` is 61s old against a 60s window and the
+	// comparison set is EMPTY. That was the original staging, and it made this test
+	// pass on G4 while never reaching G5 at all: measured, folding out G5's
+	// killability conjunct left it green. It is the one test the design calls "the
+	// specific hole this guard closes, so it deserves its own test", and it was
+	// certifying a different guard.
+	at := clk.Add(autoStopWindow)
+	svc.persistFail.recordSuccess(uuid.New(), at.Add(-time.Second))
+
+	// Assert the precondition rather than trusting the arithmetic. A future edit to
+	// autoStopWindow, to the clock, or to this line reddens HERE with the cause,
+	// instead of silently returning this test to passing on the wrong guard.
+	if peers := svc.persistFail.peersSucceeding(runID, at, autoStopWindow); peers == 0 {
+		t.Fatalf("precondition: peersSucceeding = 0, so G4 blocks and G5 is never reached — this test would pass without exercising the guard it exists for")
+	}
+	if n := svc.autoStopWedgedRuns(context.Background(), at); n != 0 {
 		t.Fatalf("stopped = %d, want 0: a run whose MESSAGES persisted fine must never be destroyed over a run_usage upsert", n)
 	}
 }
