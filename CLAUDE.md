@@ -50,11 +50,17 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ```sh
 cd api
 go build ./...
-go test ./...                              # NOT all tests — see live-DB note below
+go test -count=1 ./...                     # NOT all tests — see live-DB note below
 go test ./internal/forge -run TestName     # single test
 # after editing internal/store/migrations/ or internal/store/queries/:
 go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
 ```
+
+**`-count=1` ON THE GATE IS LOAD-BEARING, NOT A HABIT — a green `go test ./...` can mean the suite was served from cache and never ran.** Go's test cache hashes the files a test opens, **but only those inside the module root** (cmd/go: *"Do not recheck files outside the module, GOPATH, or GOROOT root"*, re-derived in go1.26.5). This repo now has a whole `fixtures/` directory at the **repo root**, above `api/`, read across the module boundary — `fixtures/judge-fidelity/{cases,expected}.json` by `api/internal/workersvc/judge_backlog_fidelity_test.go`, and the controller's contract goldens the other way. **Editing one of those files changes nothing in the module's cache key.** Measured 2026-07-25: deleting an entire case from `cases.json` left `cd api && go test ./internal/workersvc/` printing `ok (cached)`, while `-count=1` on the same tree reddened with *"fixture broken: cases.json has no case …"*. The vitest half has no such cache and reddened with no flag at all, so the two halves are **not** symmetric.
+
+The general rule, which is why this belongs at the gate rather than in each test: **any test reading a file the Go toolchain does not treat as a source input is cache-invisible.** The cost is bounded — `-count=1` disables the test-result cache, not the build cache, so compilation is still reused. Two more instances, both measured the same day: the build cache is content-addressed and **shared globally across worktrees**, so a fresh throwaway worktree can still serve `(cached)` for packages identical to ones tested elsewhere; and CI's `test:api` was exposed for the same reason (`.go_job` persists `.gocache/` keyed on `api/go.sum`, which a fixture edit never touches) until it gained `-count=1`, copying the precedent `test:controller` had already set.
+
+Note the irony, because it inverts the usual intuition: **`./e2e/run-store-it.sh` was never exposed — it already hardcodes `-count=1`.** The path everyone treats as fragile was the protected one; the plain gate was not.
 
 Migrations are goose SQL files embedded via `go:embed` and run at API boot; there is no separate migration step.
 

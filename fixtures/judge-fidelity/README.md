@@ -36,6 +36,43 @@ A missing or unreadable fixture is a **fatal**, never a skip, on both sides. A s
 the same false-green shape `CLAUDE.md` records for the live-DB suites, where a suite that
 ran nothing prints `ok`.
 
+### 🔴 The two halves are NOT symmetric, and the Go half needs `-count=1`
+
+Go's test cache hashes the files a test opens, **but only those inside the module root** --
+cmd/go's own words are *"Do not recheck files outside the module, GOPATH, or GOROOT root"*.
+This directory is at the repo root, above `api/`, **on purpose** (see below). So every byte
+of `cases.json` and `expected.json` is outside the `api` module and contributes **nothing**
+to `internal/workersvc`'s cache key.
+
+MEASURED at `6002d808`, and it produced output indistinguishable from success:
+
+| | |
+|---|---|
+| delete an entire case from `cases.json`, then `cd api && go test ./internal/workersvc/` | `ok  (cached)` |
+| same tree, `cd api && go test -count=1 ./...` | **FAIL** -- *"fixture broken: cases.json has no case ..."* plus the orphaned-golden message |
+| same tree, `cd web && npx vitest run src/mocks/judgeBacklogFidelity.test.ts` | **FAIL**, no flag needed -- vitest has no such cache |
+
+**That asymmetry is the finding, because the rule above reads as symmetric.** "Go red plus
+vitest green means Go drifted" has a third explanation this file did not name: *Go never
+ran.* If the two halves ever disagree, check that the Go half actually executed before
+concluding anything about which implementation moved.
+
+Exposure, narrowed rather than left as "the Go half":
+
+- **`./e2e/run-store-it.sh` was never at risk**, for two independent reasons -- it passes
+  `-count=1` (line 72), and it sweeps `-run 'LiveDB$'` over `./internal/store/...` and
+  `./internal/handler/...` only, so it never reaches this package.
+- **CI's `test:controller` was never at risk** -- it already passes `-count=1`, and
+  `.gitlab-ci.yml` spells out this exact mechanism for the `api/` goldens *it* reads across
+  the same module boundary. That comment predates this fixture and describes it precisely.
+- **The exposed gates were `cd api && go test ./...`** (the command `CLAUDE.md` prescribes)
+  **and CI's `test:api`**, which ran it bare while `.go_job` persists `.gocache/` across
+  pipelines. `test:api` now passes `-count=1` for the reason its controller sibling already
+  did.
+
+**Do not "fix" this by moving the fixture under `api/`.** That reintroduces exactly the
+regenerator gravity the next section rejects.
+
 ## There is no regenerator, and that is deliberate
 
 No `-update` flag on the Go side. No `toMatchSnapshot()` on the vitest side -- vitest
@@ -52,6 +89,18 @@ disagreeing members), agree on everything it covered, and read as full coverage.
 `GroupJudgeRecommendations`' doc comment, and write it into `expected.json`. If you find
 yourself pasting a test's actual output, stop -- that is the regeneration this file exists
 to forbid, and the output-side self-check below is what will catch it.
+
+Then run **both** halves, and the Go one **with `-count=1`** -- a fixture-only edit changes
+nothing inside the `api` module, so a bare `go test` reports `ok (cached)` and you will have
+verified nothing:
+
+```sh
+cd api && go test -count=1 ./internal/workersvc/
+cd web && npx vitest run src/mocks/judgeBacklogFidelity.test.ts
+```
+
+`-count=1` is load-bearing here, not a habit. See the asymmetry section above for the
+measurement.
 
 ## Both JSON files are pure ASCII, by construction
 

@@ -31,6 +31,44 @@ type storeRow = store.ListJudgeRecommendationRowsForUserRow
 // point (rune(0x00A0) and friends) rather than pasted, because a pasted glyph corrupts
 // silently in transit and the corruption reads as a passing test. One occurred while this
 // fixture was being authored: a literal U+0020 arrived as U+00A0.
+//
+// 🔴 RUN THIS PACKAGE WITH -count=1 AFTER ANY FIXTURE-ONLY EDIT. GO'S TEST CACHE CANNOT SEE
+// THE FIXTURE, AND A NEUTERED FIXTURE THEREFORE PRINTS "ok (cached)".
+//
+// Go's test cache hashes the files a test opens, but ONLY those inside the module root --
+// cmd/go's own comment is "Do not recheck files outside the module, GOPATH, or GOROOT root".
+// fidelityDir points ABOVE api/, deliberately (see the fixture README: repo root, owned by
+// neither runtime), so every byte of cases.json and expected.json is outside this module and
+// contributes NOTHING to this package's cache key.
+//
+// MEASURED at 6002d808, and the whole point is that it produced output indistinguishable
+// from success:
+//
+//	delete an entire case from cases.json
+//	cd api && go test ./internal/workersvc/   -> ok (cached)     <- the fixture is gutted
+//	cd api && go test -count=1 ./...          -> FAIL, "fixture broken: cases.json has no
+//	                                             case ..." and the orphaned-golden message
+//
+// THE ASYMMETRY IS THE FINDING, because the README's "each suite stands alone" reads as
+// symmetric and is not: the vitest half has no such cache and reddened on the SAME tree with
+// no flag at all. So "Go green + vitest red means Go drifted" -- the rule both files state
+// at their failure sites -- has a THIRD explanation nobody had written down: Go never ran.
+//
+// WHICH GATE IS ACTUALLY EXPOSED, narrowed rather than left as "the Go half":
+//   - ./e2e/run-store-it.sh was NEVER at risk, for two independent reasons: it passes
+//     -count=1 (line 72), and it runs -run 'LiveDB$' over ./internal/store/... and
+//     ./internal/handler/... only, so it never reaches this package at all.
+//   - CI's test:controller was never at risk either -- it already passes -count=1, with this
+//     exact mechanism written out in .gitlab-ci.yml for the api goldens IT reads across the
+//     same module boundary.
+//   - The exposed gates were the repo's own `cd api && go test ./...` (CLAUDE.md's api
+//     section) and CI's test:api, which ran it bare while .go_job persists .gocache/ between
+//     pipelines. test:api now passes -count=1 for the reason its controller sibling already
+//     did.
+//
+// DO NOT "FIX" THIS BY MOVING THE FIXTURE UNDER api/. That reintroduces the regenerator
+// gravity the design rejected: testdata/ is where a -update flag gets added, and a golden any
+// run can rewrite is a snapshot.
 const fidelityDir = "../../../fixtures/judge-fidelity"
 
 type fidelityCase struct {
