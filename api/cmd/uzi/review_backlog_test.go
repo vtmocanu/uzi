@@ -232,6 +232,28 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 		t.Errorf("remedy lines = %q, want %q (one per DISTINCT settled run, first-appearance order)\n%s",
 			remedies, want, out2)
 	}
+	// THE EMPTY-RESULT CLAUSE, pinned because it is what stops a correct empty from reading as
+	// a dead end. The warning above asks "did my write land"; the remedy answers "what is
+	// still un-triaged", and the step between them was left to the reader.
+	if !strings.Contains(out2, "an empty result from one of these is the answer") {
+		t.Errorf("the remedy does not say an empty result is the answer, so a correct empty reads as "+
+			"a dead end:\n%s", out2)
+	}
+	// And it gives the REASON, which is a property of renderBacklog rather than of the advice:
+	// the truncation warning prints BEFORE the listing, so an empty with no warning is complete.
+	if !strings.Contains(out2, "no warning is complete") {
+		t.Errorf("the clause asserts an empty is trustworthy without giving the reason a reader could "+
+			"check (the warning precedes the listing):\n%s", out2)
+	}
+	// NO --bucket in the remedy block, not even --bucket all. The line above says --bucket
+	// cannot narrow a re-check; naming one a line later invites the reader to re-derive that it
+	// can. `--bucket all` was the second false printed instruction this path paid to remove.
+	for _, line := range strings.Split(out2, "\n") {
+		if strings.Contains(line, "empty result") && strings.Contains(line, "--bucket") {
+			t.Errorf("the empty-result clause names --bucket, one line below the sentence saying "+
+				"--bucket cannot narrow a re-check:\n%s", line)
+		}
+	}
 
 	// THE ONE-RUN CASE, written because nothing else covers it and it is the shape a real
 	// single-run write takes. Two runs exercises the loop and the dedup; zero exercises the

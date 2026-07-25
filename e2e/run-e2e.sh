@@ -3505,11 +3505,23 @@ pass "seeded 2001 bulk coordinates (${B4_SEED_SECS}s) plus the oldest-review, du
 
 # The design ASSUMED this seed is sub-second and asked for that to be measured rather than
 # inherited. MEASURED before this landed, against a throwaway Postgres 17 on the real table
-# shape: EXPLAIN ANALYZE reports 8.4 ms of execution for the 2001-row generate_series
-# insert, so the assumption holds by two orders of magnitude and the added harness time is
-# the round trip, not the write.
+# shape: ~27 ms (median, Execution Time; the 8.4 ms figure this line used to carry is the
+# Insert node's BEST CASE) for the 2001-row insert. Still two orders of magnitude under a
+# second, so the assumption holds and the added harness time is the round trip, not the write.
 #
-# B4_SEED_SECS ABOVE DOES NOT CORROBORATE THAT NUMBER AND MUST NOT BE READ AS DOING SO. It
+# 🔴 CORRECTED, AND BOTH HALVES OF THE CORRECTION ARE REUSABLE. Measured properly against the
+# live stack: five samples, each inside BEGIN…ROLLBACK so nothing persists.
+#   Insert node     8.497 – 25.655 ms   (median ~11.9)
+#   Execution Time 21.454 – 42.940 ms   (median ~26.7)
+# (1) The old number was not WRONG, it was measured ONCE — 8.497 ms came back on sample 1,
+#     within 0.1 ms of it. Drawing the good end of an 8.5–25.7 ms spread is what a single
+#     sample does; "measured once" is the finding, not "measured wrong".
+# (2) THE NODE IS NOT THE STATEMENT. `Insert on …` excludes planning-adjacent setup,
+#     constraint and index work, and returning; Execution Time is the statement. Quoting the
+#     node was quoting the most flattering slice of what was measured — the same discipline
+#     the tally corrections in this wave turned on numerals, applied to a profile.
+#
+# B4_SEED_SECS ABOVE DOES NOT CORROBORATE ANY OF THIS AND MUST NOT BE READ AS DOING SO. It
 # comes from $SECONDS — WHOLE-SECOND resolution — so it reads 0 or 1 whether the true cost
 # is 8 ms or 900 ms, and it includes docker exec and psql startup besides. What it is good
 # for is a floor check across runs: if it ever climbs, the seed stopped being cheap and that
@@ -3576,47 +3588,64 @@ run_printed_instructions "$PI_LABEL_TRUNC" 'uzi review backlog --run [0-9a-f-]{3
 # The other `grep … && fail` sites in this file were checked against that rule and left
 # alone: none is a function's last command. Rewriting them would be a mechanical sweep on a
 # mechanism that does not reach them.
+# 🔴 THE ASSERTION IS `truncated == false`, PER EXECUTION, AND IT IS NOT A COORDINATE GREP.
+# Architect's ruling, and it was already in the design note (§2.4, B4' step 3): "execute it
+# verbatim, assert the re-read is NOT truncated".
+#
+# THAT IS THE REMEDY'S ACTUAL PROMISE. The warning said the read was cut; the remedy claims
+# to get you below the cap; not-truncated is exactly that claim discharged. A COORDINATE GREP
+# ASSERTS FIXTURE SHAPE; THIS ASSERTS THE PROPERTY — and it is immune to which bucket the
+# coordinate lands in, which is precisely how the previous marker broke.
+#
+# The history, because two corrections in a row missed and the sequence is the lesson: the
+# original `grep -q <coordinate>` over the concatenation was correctly found too WEAK
+# (satisfiable by the FIRST re-read alone — N lifted, N executed, ONE certified). The fix, a
+# count over the same concatenation with `-ge 2`, moved it from satisfiable-by-one to
+# satisfiable-by-NONE and reddened on the first run that reached it: `uzi review backlog
+# --run <id>` renders the TODO bucket, and the dismissed coordinate has left todo BY
+# CONSTRUCTION, so zero was the correct answer. Neither proposed replacement marker could
+# have carried `-ge 2` either — renderBacklog never prints the run id, and `b4-dup` survives
+# on ONE of the two runs only. The weakness was real, both coordinate-shaped remedies were
+# wrong, and the property was the answer all along.
+#
+# PER EXECUTION is the half that must not be lost while swapping the marker — but NOT for the
+# reason it is tempting to write, and getting this exactly right matters because it is a claim
+# about shell semantics:
+#
+#   * the NEGATIVE (`! grep -q "row cap"`) is ALREADY union-equivalent. If the warning appears
+#     in any re-read it appears in the concatenation, so per-file buys it nothing. Measured:
+#     a truncated re-read #1 with a clean #2 reddens either way.
+#   * the POSITIVE companion is where the split does the work. Over the concatenation,
+#     "some output rendered a backlog" is satisfied by re-read #1 alone — so #2 erroring, or
+#     printing NOTHING, passes. Measured: both of those go GREEN on a union check and RED
+#     per-file.
+#
+# And the two are a PAIR, which is the point: absence of a truncation warning is trivially
+# true of output that does not exist, so the negative is vacuous without a per-execution
+# positive beside it. That is why run_printed_instructions writes $PRINTED_OUT.$i.
 [ "$PRINTED_N" = 2 ] \
   || fail "$PI_LABEL_TRUNC: $PRINTED_N instruction(s) executed, want 2 — the per-execution assertions below cannot certify what did not run"
 for i in 1 2; do
+  # truncated == false, read off the CLI's own rendering: renderBacklog prints the "row cap"
+  # warning if and only if b.Truncated, so its ABSENCE is the flag being false.
   if grep -q "row cap" "$PRINTED_OUT.$i"; then
-    fail "$PI_LABEL_TRUNC: anchored re-read #$i still reports the row cap — the anchor did not narrow it below the cap, so the printed instruction is FALSE:
+    fail "$PI_LABEL_TRUNC: anchored re-read #$i came back TRUNCATED — the anchor did not narrow it below the cap, so the remedy the CLI printed is FALSE:
 $(cat "$PRINTED_OUT.$i")"
   fi
-  # PER EXECUTION, and this is what the union could not do: EACH re-read must have rendered a
-  # well-formed backlog view. Both spellings are legitimate outcomes and which one a given
-  # run produces depends on the fixture, so accepting either is correct rather than lax —
-  # what is asserted is that the command produced a BACKLOG, not an error or nothing.
+  # And it rendered a BACKLOG rather than erroring or printing nothing. Both spellings are
+  # legitimate — an empty result is an ANSWER here, not a dead end (nothing on that run is
+  # still un-triaged) — so accepting either is correct rather than lax. This is what makes
+  # the not-truncated check above meaningful: absence of a warning in EMPTY output would
+  # otherwise be satisfied by a command that printed nothing at all.
   grep -qE "groups \(|no recommendations in this bucket" "$PRINTED_OUT.$i" \
-    || fail "$PI_LABEL_TRUNC: anchored re-read #$i produced neither a groups listing nor the empty-bucket line, so it did not render a backlog at all:
+    || fail "$PI_LABEL_TRUNC: anchored re-read #$i produced neither a groups listing nor the empty-bucket line, so it did not render a backlog at all — and 'no row cap warning' is trivially true of output that does not exist:
 $(cat "$PRINTED_OUT.$i")"
 done
-# 🔴 THE DISMISSED COORDINATE MUST BE ABSENT, AND THIS ASSERTION REPLACES ONE THAT DEMANDED
-# THE OPPOSITE. The previous version counted occurrences of $B4_TGT and required >= 2 — one
-# per re-read. It reddened on the first run that reached it, and the CLI was right: `uzi
-# review backlog --run <id>` renders the TODO bucket, and $B4_TGT was just dismissed, so it
-# has left todo BY CONSTRUCTION. Zero was the correct answer and the assertion demanded a row
-# the write is defined to remove.
-#
-# Worth recording as a shape, because the correction is more interesting than the bug: a
-# reviewer correctly found the original `grep -q` too WEAK (satisfiable by the first line
-# alone), and the fix — a count over the union — moved it from satisfiable-by-one to
-# satisfiable-by-NONE. The over-correction is what reddened, and it was invisible until
-# execution. Neither candidate marker could have carried `>= 2` either: renderBacklog never
-# prints the run id, and `b4-dup` survives on ONE of the two runs only.
-#
-# So the dismissal is asserted directly, which is both true and the stronger statement.
-[ "$(grep -c "$B4_TGT" "$PRINTED_OUT" || true)" = 0 ] \
-  || fail "$PI_LABEL_TRUNC: the dismissed coordinate $B4_CAT/$B4_TGT is still listed by an anchored re-read. It was settled by the write above, so a todo view must not return it:
-$(cat "$PRINTED_OUT")"
-# And the fixture's SURVIVING todo coordinate must appear, or the re-reads proved only that
-# they printed something: `b4-dup` is seeded on B4_RUN_A alone and is untouched by the
-# dismiss, so exactly one of the two anchored reads names it. That is what shows an anchor
-# resolved to THIS fixture's data rather than to an empty or foreign result.
-grep -q "b4-dup" "$PRINTED_OUT" \
-  || fail "$PI_LABEL_TRUNC: no anchored re-read named b4-dup, the coordinate that SURVIVES the dismiss on B4_RUN_A — so nothing proves either read reached this fixture's rows:
-$(cat "$PRINTED_OUT")"
-pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, each rendered a backlog BELOW the cap, the dismissed coordinate is gone and the surviving one is present"
+# NOT ASSERTED HERE, deliberately: that the re-reads name any particular coordinate. That the
+# dismissed one has left todo is the BULK DISPOSITION's property, pinned by the `= 2`
+# disposition count above and by the four TestBulkDisposition*LiveDB tests; that a given
+# coordinate is still present is fixture shape, which is what the ruling above removes.
+pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, and EACH came back NOT truncated with a rendered backlog"
 
 # --- positive control + teardown ---------------------------------------------
 # Delete the bulk review and re-assert BOTH directions. Without this, a truncated:true from
