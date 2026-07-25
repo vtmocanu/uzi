@@ -27,10 +27,18 @@ const wsPingInterval = 30 * time.Second
 //
 // It runs inside a RequireUser group (PRD #112 M1), so the credential is EITHER a
 // validated session JWT cookie OR a user-scoped CLI token (uzc_/uza_) — the same
-// dual guard the run READ routes use. RequireUser dispatches on credential
-// presence at parse time and populates the IDENTICAL context user either way,
-// which is why nothing below branches on which one arrived: an auth-type branch
-// here would be a second copy of that dispatch predicate, free to drift from it.
+// dual guard the run READ routes use. RequireUser dispatches on credential presence
+// at parse time and populates the same context key with the same store.User type
+// either way, which is why nothing below branches on which one arrived: an auth-type
+// branch here would be a second copy of that dispatch predicate, free to drift.
+//
+// Same context, same authz call — but NOT the same reach, and the asymmetry is
+// deliberate. RequireUser clears IsAdmin on any token whose scope is not admin_ro
+// (middleware/cli_auth.go:85-87), so an admin holding a cookie subscribes to any run
+// through GetRunForViewer's admin branch while the SAME admin's default-scope uzc_ is
+// owner-only and gets the 404 below. Admitting Bearer therefore NARROWS what a given
+// person can reach, never widens it, which is why no handler change was needed.
+//
 // Two authorization rules the PRD makes mandatory are enforced here:
 //
 //   - Origin validation on the upgrade. coder/websocket's default Accept checks
@@ -50,7 +58,10 @@ const wsPingInterval = 30 * time.Second
 //     authenticateOrigin returns nil for an empty Origin (v1.8.14 accept.go:228-232,
 //     reached from accept.go:116-117 whenever InsecureSkipVerify is false). Its own
 //     Dial never sets one. So a Bearer upgrade passes the default check unmodified:
-//     nothing has to be skipped to let the CLI in.
+//     nothing has to be skipped to let the CLI in. Note ABSENT is the only value that
+//     passes for free — "Origin: null", what a sandboxed iframe or a data: page sends,
+//     parses to a URL with no host and is rejected at accept.go:256-258. A browser
+//     cannot reach the exemption by stripping its own origin.
 //   - A cross-site browser page CANNOT attach an Authorization header (the browser
 //     WebSocket API forbids custom headers), so it can only present the ambient
 //     cookie. It therefore stays on the cookie path, sends its own foreign Origin,

@@ -198,16 +198,36 @@ func TestWSCookieForeignOriginStillRejectedLiveDB(t *testing.T) {
 	}
 	_ = same.Close(websocket.StatusNormalClosure, "")
 
-	// Byte-identical request except the Origin.
+	// Byte-identical request except the Origin. The value is a variable and the
+	// diagnostic PRINTS it rather than repeating it as a literal, so the message cannot
+	// outlive the fixture: aiming this dial elsewhere (as a mutation check does) changes
+	// what the failure claims instead of leaving it asserting an origin never sent.
+	const foreignOrigin = "http://evil.example"
 	evil, resp, err := websocket.Dial(ctx, wsLiveDBURL(srv, runID), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Cookie": []string{cookie}, "Origin": []string{"http://evil.example"}},
+		HTTPHeader: http.Header{"Cookie": []string{cookie}, "Origin": []string{foreignOrigin}},
 	})
 	if err == nil {
 		wsCloseNow(evil)
-		t.Fatal("a cookie upgrade carrying Origin: http://evil.example was ACCEPTED — the same-origin CSWSH defense is gone (InsecureSkipVerify set, or OriginPatterns widened)")
+		t.Fatalf("a cookie upgrade carrying Origin: %s (Host: %s) was ACCEPTED — the same-origin CSWSH defense is gone (InsecureSkipVerify set, or OriginPatterns widened)",
+			foreignOrigin, srv.Listener.Addr())
 	}
 	if got := wsHandshakeStatus(resp); got != http.StatusForbidden {
 		t.Fatalf("foreign-Origin cookie upgrade was refused with status %d, want 403 — the refusal must come from websocket.Accept's origin check, not from authN (401) or per-run authz (404)", got)
+	}
+
+	// "Origin: null" — a sandboxed iframe or a data: page — must NOT be mistaken for
+	// the absent-Origin case the CLI relies on. It parses to a URL with no host and is
+	// rejected at accept.go:256-258; if it were treated as empty, the whole CSWSH
+	// defense would be one sandbox attribute away from bypass.
+	nul, resp, err := websocket.Dial(ctx, wsLiveDBURL(srv, runID), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Cookie": []string{cookie}, "Origin": []string{"null"}},
+	})
+	if err == nil {
+		wsCloseNow(nul)
+		t.Fatal("a cookie upgrade carrying Origin: null was ACCEPTED — a sandboxed iframe would reach the socket; \"null\" must not be treated as the absent-Origin exemption the browser-less client uses")
+	}
+	if got := wsHandshakeStatus(resp); got != http.StatusForbidden {
+		t.Errorf("Origin: null cookie upgrade was refused with status %d, want 403 from the origin check", got)
 	}
 }
 

@@ -1356,9 +1356,13 @@ wait_status "$RUN_WS" awaiting_approval
 # upgrade — proving the auth gate is real and the positive assertion non-vacuous.
 WS_NEG_PROBE='const wsurl=process.argv[1], origin=process.argv[2];let done=false;const finish=(code,msg)=>{ if(done)return; done=true; console.log(msg); process.exit(code); };const ws=new WebSocket(wsurl,{headers:{Origin:origin}});ws.addEventListener("open",()=>finish(1,"OPENED_WITHOUT_COOKIE"));ws.addEventListener("error",()=>finish(0,"rejected"));setTimeout(()=>finish(2,"NO_REJECTION"),10000);'
 if NEG_OUT="$("${COMPOSE[@]}" exec -T agent node -e "$WS_NEG_PROBE" "$WS_API/api/ws?run=$RUN_WS" "$WS_ORIGIN")"; then
-  pass "no-cookie /api/ws upgrade is rejected ($NEG_OUT) — the WS auth gate is real"
+  pass "uncredentialed /api/ws upgrade is rejected ($NEG_OUT) — the WS auth gate is real"
 else
-  fail "no-cookie /api/ws upgrade was NOT rejected (probe: ${NEG_OUT:-<none>}) — the cookie auth gate is broken/vacuous"
+  # Names the gate this probe actually exercises. The request carries neither a cookie
+  # nor a Bearer, so what refused it is RequireUser as a whole — saying "the cookie auth
+  # gate" would send the next reader to audit cookie handling for a failure that is just
+  # as likely the bearer branch or the route's mount.
+  fail "uncredentialed /api/ws upgrade was NOT rejected (probe: ${NEG_OUT:-<none>}) — the RequireUser gate on /ws is broken/vacuous (cookie branch, bearer branch, or the route lost its guard)"
 fi
 
 # POSITIVE: subscribe with the admin cookie, approve on open, assert a run_message frame.
