@@ -232,7 +232,7 @@ WTOKEN=""
 # bare point-in-time GET that hiccups would otherwise kill the whole suite). RESTRICTED to
 # idempotent GETs — only apiget + fake_state are wrapped below. A retried WRITE could
 # double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch,
-# fake_post) and db_psql (also used for INSERTs, in the #46, #68, #98 and rate-limit phases)
+# fake_post) and db_psql (also used for WRITES, in the #32, #68, #98 and rate-limit phases)
 # are deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
 # non-zero after 3 tries: this smooths a blip, it never masks a persistent failure. curl -f
 # writes nothing to stdout on a failed attempt, so a retry cannot double the captured body.
@@ -243,11 +243,20 @@ WTOKEN=""
 # this file and was never defined; the harness's single DELETE is an inline `curl -X DELETE`
 # against /api/me/secrets/anthropic_token/. It is struck rather than defined, because a
 # helper nothing calls is dead code PLUS a comment that has become true about a function
-# nobody uses. (2) It cited the db_psql INSERTs by LINE (`:2087/:2191/:2843`), and at the
+# nobody uses. (2) It cited the db_psql writes by LINE (`:2087/:2191/:2843`), and at the
 # time of this edit all three pointed at unrelated text — one blank line, one wait_status,
 # and one line of a comment written minutes earlier. This repo's own rule is that a line
-# number is meaningless without a SHA; naming the PHASES survives edits, and there are more
-# than three of them.
+# number is meaningless without a SHA; naming the PHASES survives edits.
+#
+# THEN A THIRD, because the second repair introduced the same family of defect it was
+# fixing — one abstraction up. It read "INSERTs, in the #46, #68, #98 and rate-limit
+# phases", and both halves were wrong. The `user_secrets` write belongs to **#32**, the
+# per-user vault phase; the #46 phase contains no db_psql write at all, only two SELECTs.
+# And db_psql performs DELETEs as well, so enumerating only INSERTs understates this
+# comment's own argument — which is that a retried WRITE could double-execute. `writes` is
+# both accurate and edit-proof. Re-derived by listing the `say "` phase headers and the
+# `db_psql "INSERT|DELETE|UPDATE` sites and reading the line numbers against each other,
+# rather than by trusting the previous sentence.
 retry_read() {
   local n=1 rc
   while :; do
@@ -509,7 +518,10 @@ wait_status() {
 fake_post() { curl -fsSk -X POST "$FAKE_BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 
 # flip_mr IID STATE — the harness stand-in for a reviewer closing/reopening/
-# merging an MR (PRD #24).
+# merging an MR (PRD #24). Takes a STATE because the MR-close watcher acts in BOTH
+# directions and this file calls it both ways (closed and reopened, in the #24 phase).
+# Its issue counterpart is `close_issue` and takes no state — see there for why the
+# asymmetry tracks a real product difference rather than an oversight.
 flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')" >/dev/null; }
 
 # close_issue IID — the harness stand-in for a human closing an issue on the forge
@@ -520,6 +532,13 @@ flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')"
 # ping-pong a user's backlog). A helper spelled `flip_issue` would advertise a
 # round trip the product does not make, and the next reader would write a reopen
 # assertion against a guarantee that does not exist.
+#
+# THE HARNESS DEMONSTRATES THAT BETTER THAN THE ARGUMENT DOES: `flip_mr` is genuinely
+# called BOTH ways in the #24 phase (closed, then reopened), because the MR-close
+# watcher acts in both directions. Nothing in the product acts on an issue reopen, and
+# TestFiledIssueCloseReopenDoesNotReopenLiveDB already pins that NON-behaviour at the
+# live-DB layer. So the asymmetry between these two helpers is the product's, not a
+# gap in this one.
 close_issue() { fake_post "/_e2e/issues/$1/state" '{"state":"closed"}' >/dev/null; }
 
 # fake_state — the fake's recorded state (issues, MRs, notes, label events). Read-only
@@ -2885,6 +2904,21 @@ say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting comma
 # by it. A positive class excludes `< > | ; $ backtick ' " \ newline` and every glob
 # character BY CONSTRUCTION, without anyone having to enumerate them.
 #
+# THIS CLASS IS NARROWER THAN THE STATIC EXTRACTOR'S, DELIBERATELY, AND THE GAP HAS A
+# CONSEQUENCE. api/cmd/uzi/instructions_test.go's instructionRE reads SOURCE literals, so it
+# must admit format verbs and placeholders (`%<>-`); this one reads EMITTED text, which has
+# to be runnable verbatim in a shell. So an instruction whose emitted form carries any
+# character outside this class can be REGISTERED there and never EXECUTED here —
+# evidenceNotExecuted by construction rather than by choice. `%`, `+`, `@`, `,` and `~` are
+# all outside it, so a judge target containing one would fail here with a message about the
+# allowlist rather than about the target. Loud rather than silent, and low probability. The
+# extractor's comment points back at this one.
+#
+# SCOPE, so a later comment does not blur it: this is a SHELL-INJECTION floor, not an
+# AUTHORIZATION one. It cannot stop an admitted span from naming a destructive `uzi`
+# subcommand — nothing here inspects the verb. That is bounded today by the three explicit
+# shapes each caller passes plus each row's own outcome assertion, not by this check.
+#
 # The property worth naming: it makes the wrong option STRUCTURALLY IMPOSSIBLE rather than
 # discouraged. A row that tried to substitute a placeholder into the printed text cannot
 # pass this floor, because `<` cannot pass it. That is why the sibling change in review.go
@@ -2915,11 +2949,33 @@ $out"
     # THE FLOOR (mechanism 4 above). Anchored at both ends, positive class only. Every span
     # the three current rows lift already satisfies it, so it reddens nothing today — which
     # is exactly why it was exercised deliberately rather than assumed; see the commit.
-    printf '%s' "$cmd" | grep -qE '^uzi [A-Za-z0-9 ._:/=-]+$' \
+    #
+    # 🔴 `[[ =~ ]]`, NOT `grep -qE`, AND THAT IS THE WHOLE POINT OF THE GUARD. grep is
+    # LINE-oriented: `^…$` anchors per LINE, so `grep -q` returns 0 when ANY line matches
+    # and the rest of the span is never examined. Measured against the first version of this
+    # check: the span "uzi repo list\n; touch /tmp/PWNED" was ACCEPTED, because line 1
+    # matched. Bash's `=~` matches the WHOLE STRING and `$` is end-of-string; the same span
+    # is rejected and the legal `review undo <uuid> <uuid>` span still passes.
+    #
+    # Reachability of that hole today is ZERO — `while IFS= read -r cmd` yields one line per
+    # iteration, so `cmd` cannot contain a newline. But the floor exists precisely because
+    # the safety burden sat on an invariant OUTSIDE the helper, and for newline the grep form
+    # left it outside: it moved from the caller's ERE to the read loop. Newline is the one
+    # excluded character that is itself a command separator, and a future edit to the lift
+    # path (`grep -oEz`, `mapfile`, a `for` over $matches) re-opens it silently while the
+    # comment above still reads as if it could not. This form owes nothing to the read loop.
+    [[ "$cmd" =~ ^uzi\ [A-Za-z0-9\ ._:/=-]+$ ]] \
       || fail "$label: lifted span carries a character outside the executable allowlist, so it is not runnable verbatim: $cmd"
     eval "uzi_cli ${cmd#uzi }" >>"$PRINTED_OUT" 2>&1 \
       || fail "$label: the printed instruction FAILED when run VERBATIM: $cmd
 $(cat "$PRINTED_OUT")"
+    # THE HEREDOC BELOW IS LOAD-BEARING — do not "tidy" it into `printf … | while read`.
+    # `fail` ends in `exit 1`. Fed by a heredoc, this loop runs in the CURRENT shell, so a
+    # `fail` inside it kills the script. Fed by a PIPE, the loop would run in a subshell and
+    # that `exit 1` would kill only the subshell — the run would continue past a failed
+    # instruction with its diagnostic swallowed. That is not hypothetical: the probe written
+    # to verify this very guard had exactly that bug in its stub, and read as "the floor did
+    # not fire" when it had.
   done <<PI_EOF
 $matches
 PI_EOF
@@ -3062,11 +3118,16 @@ pass "printed-instruction fixture removed; wire todo back to the pre-seed $PI_TO
 # the judge-disable restore below, which is safe because the poller's call takes only the
 # repo id and is NOT gated on judge_enabled, unlike the funnel above it.
 #
-# LANE. No gate is needed and none is added: the forgejo lane ends with `exit 0` inside
-# its own `if`, hundreds of lines above the #46/#68/#98 phases, so everything here is
-# gitlab-lane BY CONSTRUCTION rather than by a guard someone has to maintain. The
-# forge-fake mutator is lane-neutral in any case (it mutates the shared state.issues,
-# which the Forgejo lane serves through toForgejoIssue).
+# LANE. No gate is needed and none is added, and the argument is STRUCTURAL rather than
+# "it is a long way above". Five facts, each checkable: `$FORGE` is validated at parse time
+# to be exactly `gitlab` or `forgejo`, so there is no third value that skips both branches;
+# the forgejo lane's `if` opens at column 0; the harness's ONLY bare `exit 0` sits at the
+# TOP LEVEL of that block, directly under its closing `pass` — not nested in a deeper
+# conditional that might not fire; the matching `fi` is at column 0 with no column-0 `fi`
+# between, so the block is continuous; and the #98 phases open ~2000 lines below it.
+# Adding `[ "$FORGE" = gitlab ] || fail` here would therefore guard a state the control
+# flow cannot produce. The forge-fake mutator is lane-neutral in any case — it mutates the
+# shared state.issues, which the Forgejo lane serves through toForgejoIssue.
 #
 # 🔴 FIDELITY LIMIT, stated here rather than left for a reader to infer, because it bounds
 # what a green means. forge-fake contains ZERO occurrences of `updated_after`: GET /issues
@@ -3081,6 +3142,17 @@ say "PRD #98 M8b/B6': a closed forge issue reaches Done THROUGH THE POLLER (M6's
 
 B6_CAT=install_worker_tool
 B6_TGT=jq
+
+# 🔴 THIS FILE HAS TWO BOOLEAN IDIOMS AND YOU MUST NOT UNIFY THEM. `psql -tAc` renders a
+# bare boolean as `t`/`f`, and `(expr)::text` as `true`/`false` — measured, not assumed:
+# `SELECT (1 IS NULL)::text, 1 IS NULL` returns `false|f`. Both spellings are live and both
+# are CORRECT where they sit: the PRD #68 and #104 phases compare bare booleans to `t`, and
+# the #98 blocks below cast to ::text and compare to `true`. A "consistency" sweep that
+# unifies them is a REGRESSION, because it changes the value without changing the comparison.
+# The coexistence is also what produced a real defect here: a failure legend written for one
+# convention against a value produced by the other, naming `f`/`t` for a message that could
+# only ever print `false`/`true`. Read which form the projection uses before writing the
+# expected value, every time.
 
 # One-shot getter for wait_eq, in this file's own idiom.
 b6_issue_state() { db_psql "SELECT state FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID"; }
@@ -3119,13 +3191,23 @@ wait_disposition() {
     cache 'closed' + edge 'false' -> the poller's ISSUE SYNC ran but SyncFiledIssueCloses did not consume the edge. Look at the poller call site and ListFiledIssueCloseEdges' filters. NOT a forge-fake problem.
     cache 'opened' or empty       -> the poller's ISSUE SYNC did not run or did not see the close, so SyncFiledIssueCloses was never in a position to act. Look at the poll interval and the forge-fake state route. NOT a judge problem.
     cache 'closed' + edge 'true'  -> the edge WAS consumed and the insert wrote nothing, i.e. a competing disposition already existed on this coordinate. The precondition below exists to have caught that first.
-  WHAT THIS CANNOT RULE OUT: an api that is dead or wedged, which presents as the second case. The cache precondition above is what makes that unlikely here — a poller that never ran fails THERE, on its own message, before this wait starts."
+  WHAT THIS CANNOT RULE OUT: an api that is dead or wedged, which presents as the second case. What DOES separate it is the synced_at liveness probe armed after close_issue — that one moves only when a poller tick touches this repo's issue cache, so if it passed and this failed, the poller RAN. (The cache precondition earlier proves the FILING landed; it is written by the file-issue handler in its own transaction and says nothing about the poller.)"
 }
 
-# PRECONDITION 1, which doubles as the control separating those two causes: the issue
-# cache must already reflect #$F_IID as OPEN. A poller that is not running fails HERE,
-# with a message about the CACHE, instead of 20 seconds later with one about the judge.
-wait_eq opened 20 "the issue cache reflects filed issue #$F_IID as open (poller alive)" b6_issue_state
+# PRECONDITION 1: the issue cache reflects #$F_IID as OPEN.
+#
+# 🔴 THIS IS A STATE CHECK, NOT A LIVENESS CHECK, and it was labelled as one. The cache row
+# is written by the FILE-ISSUE HANDLER, not by the poller: settleFiledIssue
+# (handler/review_issue_file.go) calls UpsertIssue in the SAME TRANSACTION as settling the
+# filed link, with State: created.State, and its own comment says why — "so the board card
+# appears without a poll". forge-fake creates issues state:"opened". So this wait is
+# satisfied instantly by a row the #68 phase's own API call wrote, and IT PASSES AGAINST A
+# STONE-DEAD POLLER. Two reviewers derived that independently, from different starting
+# points, after it had been written here as a liveness control.
+#
+# It still earns its place — it proves the filing reached the cache, and it pairs with the
+# wire check below — but the liveness question is answered by the probe underneath.
+wait_eq opened 20 "the issue cache reflects filed issue #$F_IID as open (the FILING landed; not a poller check)" b6_issue_state
 
 # PRECONDITION 2, or the assertion below is vacuous. The coordinate must be SETTLED-filed
 # with the edge unconsumed, and must carry NO disposition — a pre-existing verdict would
@@ -3144,8 +3226,44 @@ pass "precondition: #$F_IID cached open, $B6_CAT/$B6_TGT filed on the wire, edge
 
 # THE HUMAN ACTION M6 REACTS TO. uzi never closes an issue itself — it only ever reads
 # the state — which is why this needs the /_e2e mutator at all.
+B6_SYNC0="$(db_psql "SELECT to_char(synced_at,'YYYYMMDDHH24MISSUS') FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
 close_issue "$F_IID"
-pass "closed forge issue #$F_IID on the fake forge"
+pass "closed forge issue #$F_IID on the fake forge (issue-cache synced_at before the close: ${B6_SYNC0:-<none>})"
+
+# THE LIVENESS PROBE, which is the positive control B6a's dropped probe fixtures were going
+# to buy — recovered for free, with no probe coordinate, no second issue and no perturbation
+# of triage.todo.
+#
+# MECHANISM: UpsertIssue's conflict path sets `synced_at = now()` UNCONDITIONALLY, not only
+# when a column changed (queries/forge.sql), and the poller's sync runs it for every issue
+# the forge returns — and forge-fake returns every recorded issue wholesale on every poll.
+# So synced_at advances on EVERY tick whether or not anything changed. Re-derived here: after
+# the filing, the only callers that re-upsert this row are the poller's three sync paths in
+# forgesvc/service.go; the two non-poller callers are the file-issue handler (one-shot, above)
+# and the manual /issues endpoint, which nothing in this phase touches. So a moving synced_at
+# is the poller and nothing else.
+#
+# to_char because that is this file's own idiom for making a timestamp shell-comparable.
+# Armed AFTER close_issue so it bounds the window from below by OBSERVED poller work rather
+# than by elapsed time.
+#
+# 🔴 THIS PROBE WAS INFERRED FROM THE QUERY AND THE SYNC PATH, NOT EXECUTED — nobody has run
+# it against a live stack. Its failure message says so, because a new wait that has never run
+# is exactly the thing that turns into a confident wrong diagnosis on someone else's night.
+b6_synced_advanced() {
+  local now; now="$(db_psql "SELECT to_char(synced_at,'YYYYMMDDHH24MISSUS') FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
+  [ -n "$now" ] && [ "$now" != "$B6_SYNC0" ] && echo advanced || echo same
+}
+B6_LIVE_START=$SECONDS
+B6_LIVE_DEADLINE=$((SECONDS + 20))
+while [ $SECONDS -lt $B6_LIVE_DEADLINE ]; do
+  [ "$(b6_synced_advanced)" = advanced ] && break
+  sleep 0.3
+done
+[ "$(b6_synced_advanced)" = advanced ] || fail "PRD #98 M8b/B6': issues.synced_at for #$F_IID has not moved off '$B6_SYNC0' in 20s, so no poller tick has touched this repo's issue cache — the close→Done chain below cannot start.
+  BEFORE CONCLUDING THE POLLER IS DEAD: this probe was INFERRED from UpsertIssue's unconditional 'synced_at = now()' on the conflict path and from forge-fake returning every issue wholesale. It has never been executed against a live stack. If the incremental sync short-circuits before the upsert — or forge-fake's list route changed — the probe is wrong and the poller may be perfectly healthy. Check a second issue's synced_at before touching the judge code."
+record_margin "issues.synced_at advances (poller liveness)" "$((SECONDS - B6_LIVE_START))" 20
+pass "poller liveness: issues.synced_at for #$F_IID advanced off '$B6_SYNC0' — a tick has run since the close"
 
 wait_disposition "$F_REVIEW" "$B6_CAT" "$B6_TGT" done
 
@@ -3340,8 +3458,15 @@ if grep -q "row cap" "$PRINTED_OUT"; then
   fail "$PI_LABEL_TRUNC: the printed remedy ran but its own output still reports the row cap — the anchor did not narrow the read below the cap, so the instruction is false:
 $(cat "$PRINTED_OUT")"
 fi
-grep -q "b4-remedy" "$PRINTED_OUT" \
-  || fail "$PI_LABEL_TRUNC: the anchored re-read ran clean but does not name the coordinate the write settled — it read the wrong run:
+# PER EXECUTION, NOT ONCE ACROSS BOTH. run_printed_instructions appends every execution to
+# one file, so a bare `grep -q` here is satisfied by the FIRST anchored read alone — N lines
+# lifted, N executed, ONE certified. That is the same shape as a loop that runs with one
+# element actually checked, and it is the weakness the printed-instruction rows exist to
+# avoid: the undo row above seeds a coordinate on TWO reviews precisely so a single-address
+# regression cannot pass as a green. Count the occurrences instead.
+PI_TRUNC_HITS="$(grep -c "b4-remedy" "$PRINTED_OUT" || true)"
+[ "$PI_TRUNC_HITS" -ge 2 ] \
+  || fail "$PI_LABEL_TRUNC: the coordinate the write settled is named on $PI_TRUNC_HITS line(s) of the executed output, want at least 2 — one per anchored re-read. Both instructions ran, but only $PI_TRUNC_HITS of them was certified to have read the right run:
 $(cat "$PRINTED_OUT")"
 pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, and each anchored re-read comes back BELOW the cap"
 
