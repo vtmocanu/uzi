@@ -23,6 +23,27 @@ describe("formatTokens", () => {
     expect(formatTokens(18_400_000)).toBe("18.40M");
   });
 
+  it("keeps M all the way to just under 1B (the boundary #77 was about)", () => {
+    expect(formatTokens(999_000_000)).toBe("999.00M");
+    // 999.99M must NOT tip into B — the tier is chosen from the raw value.
+    expect(formatTokens(999_990_000)).toBe("999.99M");
+  });
+
+  it("renders ≥1B with two decimals and a B suffix (#77)", () => {
+    expect(formatTokens(1_000_000_000)).toBe("1.00B");
+    // The literal regression: this used to render "5400.00M".
+    expect(formatTokens(5_400_000_000)).toBe("5.40B");
+    expect(formatTokens(999_000_000_000)).toBe("999.00B");
+  });
+
+  it("renders ≥1T with two decimals and a T suffix (#77)", () => {
+    expect(formatTokens(1_000_000_000_000)).toBe("1.00T");
+    expect(formatTokens(2_300_000_000_000)).toBe("2.30T");
+    // No tier above T: very large values keep scaling in T rather than overflowing
+    // into an undefined suffix.
+    expect(formatTokens(45_000_000_000_000)).toBe("45.00T");
+  });
+
   it("rounds to the nearest whole token before scaling", () => {
     expect(formatTokens(48_249)).toBe("48.2k");
     expect(formatTokens(48_250)).toBe("48.3k");
