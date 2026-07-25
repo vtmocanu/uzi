@@ -20,14 +20,14 @@ Modern workers (v0.10.1 and later) handle this themselves: they isolate the one 
 
 An auto-stop is deliberately hard to trigger. Every one of these must hold:
 
-- at least 20 consecutive failures for that one run;
-- sustained for at least 60 seconds;
-- no progress in that time — the run's message counter has not moved;
-- the same kind of error every time (an error that keeps *changing* looks like an outage, not a bad message);
-- that error is one **a correct worker could hit through no fault of its own** — output uzi genuinely cannot store, or a batch that grew too large. A malformed request is the worker being broken, and uzi does not stop runs for that (see below);
-- **other runs on the same uzi are successfully saving messages** in that window.
+1. at least 20 consecutive failures for that one run;
+2. sustained for at least 60 seconds;
+3. no progress in that time — the run's message counter has not moved;
+4. the same kind of error every time (an error that keeps *changing* looks like an outage, not a bad message);
+5. that error is one **a correct worker could hit through no fault of its own** — output uzi genuinely cannot store, or a batch that grew too large. A malformed request is the worker being broken, and uzi does not stop runs for that (see below);
+6. **other runs on the same uzi are successfully saving messages** in that window.
 
-The last one is the important one. If uzi's database is having a bad day, *every* run's writes fail, and killing runs during an outage would turn a bad hour into lost work — so when nothing else is succeeding, uzi flags and stops there. **A consequence worth knowing: if yours is the only active run, uzi will never auto-stop it.** That is intended, not a gap.
+These numbers are this page's own, for reading order only — they are deliberately not referred to anywhere else, and they do not match any numbering in uzi's source. The last one is the important one. If uzi's database is having a bad day, *every* run's writes fail, and killing runs during an outage would turn a bad hour into lost work — so when nothing else is succeeding, uzi flags and stops there. **A consequence worth knowing: if yours is the only active run, uzi will never auto-stop it.** That is intended, not a gap.
 
 ## Flagged but not stopped
 

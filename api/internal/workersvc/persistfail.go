@@ -255,7 +255,8 @@ func newPersistFailTracker() *persistFailTracker {
 
 // recordSuccess clears any streak for the run and records it in the comparison
 // set. Both halves matter: the delete is the ordinary recovery path, and the
-// lastOK write is the only evidence M5's G4 will accept that the write path works.
+// lastOK write is the only evidence M5's comparison-set guard will accept that the
+// write path works.
 func (t *persistFailTracker) recordSuccess(runID uuid.UUID, now time.Time) {
 	t.applySuccess(runID, now).emit()
 }
@@ -314,7 +315,8 @@ func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind,
 //
 // It drops the lastOK entry too, and that half is a security property rather than
 // tidiness. An earlier version kept it, reasoning that a successful append proves
-// the write path works whatever the run's status. True but insufficient: G4 is a
+// the write path works whatever the run's status. True but insufficient: the
+// comparison-set guard is a
 // GLOBAL "other runs are succeeding", so a worker holding one terminal run and
 // re-POSTing a deduplicated append every few minutes — near-zero cost, no tokens,
 // no slot — could keep the kill armed for every OTHER user's run on the instance.
@@ -391,7 +393,8 @@ func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow 
 // This paragraph used to end "the outage case and the lonely-instance case are the
 // SAME PREDICATE, not two mechanisms." THAT IS NOW FALSE and it is worth saying why,
 // because it was true when written: a realistic api-wide outage is the `store` class,
-// and since autoStopKillableKinds landed, G5 refuses `store` BEFORE this function is
+// and since autoStopKillableKinds landed, the KILLABLE-CLASS guard refuses `store`
+// BEFORE this function is
 // ever called. So a transient outage is stopped by the CLASS gate, not by an empty
 // comparison set. MEASURED — folding this function to `return 99` leaves the transient
 // outage test green and reddens the others. It was true only while nothing upstream
@@ -399,11 +402,13 @@ func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow 
 //
 // (An earlier draft of this block ended "the guard that made the old sentence true is
 // the guard that falsified it" — memorable and WRONG, which is the dangerous pair.
-// G4 made it true; G5 falsified it, by taking the outage away from G4 before it
+// This guard made it true; the KILLABLE-CLASS guard falsified it, by taking the
+// outage away from this one before it
 // arrives. Two different guards. It was quoted approvingly in a review before anyone
 // checked it, which is exactly how a quotable formulation travels into a spec.)
 //
-// What this function alone still proves is the case where G5 PASSES and only it
+// What this function alone still proves is the case where the class guard PASSES
+// and only this one
 // stands: every active run failing on a KILLING class, i.e. a fleet-wide worker bug.
 // That is TestAutoStopFleetWideKillingClassStopsNothing, and it is the comparison
 // set's only real proof.
@@ -412,8 +417,9 @@ func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow 
 // proposed and declined deliberately. This guard asks "IS THE API'S WRITE PATH
 // WORKING?", and a peer on the same worker persisting successfully answers that
 // correctly — the api did persist it. "Is the worker at fault?" is a different
-// question, it is G5's, and G5 answers it with the could-a-correct-worker test.
-// A same-worker exclusion would make this guard attempt G5's job with a worse
+// question, it is the KILLABLE-CLASS guard's, and that guard answers it with the
+// could-a-correct-worker test. A same-worker exclusion would make this guard attempt
+// that one's job with a worse
 // instrument. (It would also bite only at WORKER_MAX_CONCURRENT_RUNS > 1, since the
 // default is 1 — agent/src/config.ts — where a single-worker instance has one run
 // and this count is already zero.)

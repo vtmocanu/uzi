@@ -20,7 +20,7 @@ package workersvc
 //     loop would run per active run per tick.
 //
 // HONEST SCOPE, and it must not be oversold in review: THIS WOULD NOT HAVE FIRED ON
-// THE INCIDENT THAT MOTIVATED IT. There was one active run, so G4's comparison set
+// THE INCIDENT THAT MOTIVATED IT. There was one active run, so the comparison set
 // was empty, so the rule degrades to flag-and-notify permanently. That is the
 // correct behaviour on insufficient evidence and is tested as such. On a
 // single-active-run deployment M4 is the value and this is insurance — for
@@ -62,6 +62,14 @@ const (
 	autoStopEscalateAfter = 60 * time.Second
 )
 
+// 🔴 THE GUARDS ARE CITED BY WHAT THEY ASK, NOT BY ORDINAL. This file used to
+// number them G0-G6 — and defined only G0, G4, G5 and G6 while its prose cited G3,
+// so the scheme asserted seven slots and named four. That is the guard-tally defect
+// one layer in: an ordinal scheme with gaps is a count, and a count cannot detect
+// its own referent disappearing (see 00082 and specs/ai.md §367). It also collided
+// with a THIRD numbering in docs/run-auto-stopped.md, whose "guard 6" was this
+// file's G4 — an operator following it landed on the non-terminal re-read.
+//
 // autoStopKillableKinds is the set of failure classes that may reach the kill.
 // The MEMBERSHIP DECISION LIVES HERE AND NOWHERE ELSE — everything downstream
 // tests this set, so adding or removing a class is one line plus its test.
@@ -137,7 +145,7 @@ const autoStopBody = "stopped automatically: this run's messages could not be pe
 // acted on. Best-effort in the sweep's style: every failure is logged and skipped,
 // never returned, so an auto-stop hiccup cannot fail the sweep.
 func (s *Service) autoStopWedgedRuns(ctx context.Context, now time.Time) int64 {
-	// G0 — the operator kill switch, read once at boot. Deliberately NOT
+	// THE OPERATOR KILL SWITCH, read once at boot. Deliberately NOT
 	// health_enabled (Decision 8), and deliberately not a settings key: an automatic
 	// destructive behaviour needs an off switch that does not depend on the database
 	// it might be misbehaving against. Mirrors UZI_HOME_RECLAIM, the precedent Phase 1
@@ -161,7 +169,7 @@ func (s *Service) autoStopWedgedRuns(ctx context.Context, now time.Time) int64 {
 // evaluateAutoStop runs the remaining guards for one candidate and takes the
 // action they allow. Returns whether the run was stopped or a stop was requested.
 func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persistFailCandidate) bool {
-	// G6 — still non-terminal, re-read from Postgres at decision time. Double-guarded
+	// STILL NON-TERMINAL, re-read from Postgres at decision time. Double-guarded
 	// on purpose: this read closes the ordinary case and FailRunAutoStop's status
 	// scope closes the race between the read and the write, the same pattern
 	// SetRunHealth's Status param uses for the exit race.
@@ -189,7 +197,8 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	// shape, since a pre-0.10.1 worker's retry batch grows and OOMs — would come back
 	// as a fresh attempt carrying the dead one's 20-failure streak and be killed
 	// before the new worker persisted a byte. uzi had just decided that run deserved
-	// another try and spent budget saying so. It also defeats G3's own purpose: a
+	// another try and spent budget saying so. It also defeats the no-progress guard's
+	// own purpose: a
 	// 0.10.1+ worker would have bisected the poison out on the retry.
 	//
 	// Sweep evicts at the requeue sites directly, which is immediate; this is the
@@ -203,7 +212,8 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 		return false
 	}
 
-	// G5 — the streak's stable class must be one auto-stop is allowed to kill on.
+	// THE STREAK'S STABLE CLASS must be one auto-stop is allowed to kill on
+	// (autoStopKillableKinds).
 	// Checked here rather than in candidates() so the DECLINE below still fires: for
 	// a non-killable class this log line is the only operator signal that a worker
 	// BUILD is broken, since these runs are never stopped and their flag is erased
@@ -221,14 +231,16 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 		return false
 	}
 
-	// G4 — other runs are succeeding on THIS instance inside the window. When the
+	// OTHER RUNS ARE SUCCEEDING on THIS instance inside the window (peersSucceeding).
+	// When the
 	// answer is zero we flag and do not kill, permanently: a rule that cannot
 	// distinguish "this run is poisoned" from "the database is down" must not kill
 	// runs (Decision 5).
 	peers := s.persistFail.peersSucceeding(c.runID, now, autoStopWindow)
 	if peers == 0 {
 		// The DECLINED line, and it is the one that earns its keep: a run satisfying
-		// G1-G3 but blocked by G4 is the incident's own shape, and without this an
+		// the streak, window and no-progress guards but blocked by the comparison set is
+		// the incident's own shape, and without this an
 		// operator sees a `looping` flag and nothing else, forever.
 		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow) {
 			slog.Warn("workersvc: a run's messages cannot be persisted, but auto-stop is holding",
