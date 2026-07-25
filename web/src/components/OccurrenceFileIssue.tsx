@@ -56,8 +56,25 @@ export function OccurrenceFileIssue({
   const [local, setLocal] = useState<JustFiled | null>(null);
 
   // Already filed (a server link) or just filed (local) → the filed row. The occurrence's
-  // filed_issue is only ever a SETTLED link (#68), so — unlike RunView, which must guard a
-  // stale link against a re-judge — there is nothing to re-derive here.
+  // filed_issue is only ever a SETTLED link (#68) — no in-flight/claimed state reaches here.
+  //
+  // NO STALE-LINK WARNING, AND THAT IS A DATA LIMIT — NOT A PROOF THE HAZARD IS ABSENT.
+  // RunView flags a link filed against an earlier revision of the recommendation
+  // (`filed_at < review.updated_at` → "filed for an earlier version"). The same hazard
+  // exists on this surface: a re-judge UPSERTS the review IN PLACE and replaces its
+  // recommendations (`ON CONFLICT (target_run_id) DO UPDATE … updated_at = now()`, then
+  // `DELETE FROM review_recommendations` — api/internal/store/queries/judge.sql), while
+  // recommendation_filed_issues is keyed (review_id, category, target) and cascades only
+  // from run_reviews — so the link survives the re-judge and can end up pointing at an
+  // issue written from text that no longer exists.
+  //
+  // What is missing is the ability to SEE it: JudgeOccurrence (and its enclosing group)
+  // ships no review timestamp — see lib/api.ts — so the comparison RunView makes is not
+  // computable from this DTO. The server does not merely have the column, it ALREADY READS
+  // it: `rv.updated_at` is the leading sort key of the backlog query
+  // (api/internal/store/queries/judge_recommendations.sql:100, `ORDER BY rv.updated_at
+  // DESC …`). So it is loaded and simply not selected, and projecting it onto the occurrence
+  // is what would let this filed row carry the same warning.
   if (filed || local) {
     const iid = local ? local.iid : filed!.issue_iid;
     const url = local ? local.web_url : filed!.issue_url;
