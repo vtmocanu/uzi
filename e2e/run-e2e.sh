@@ -2897,7 +2897,10 @@ say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting comma
 # unanchored class, a `[^ ]+` that happens to admit a metacharacter) hands unreviewed text
 # to an `eval` that runs in the HARNESS's own shell on the developer's host — before
 # uzi_cli's `env -i`, so an injected `;` runs as the user rather than inside the sandbox.
-# All three shapes today are closed EREs, which is why this is a floor and not a fix.
+# All FOUR shapes today are closed EREs, which is why this is a floor and not a fix. (A count
+# in a comment is a thing this wave keeps deciding not to write; it is here because the
+# argument depends on EVERY caller being closed, so the number is the claim, not decoration —
+# and it was already wrong once, saying three after the fourth row landed.)
 #
 # IT IS AN ALLOWLIST, NOT A BLACKLIST, and that is the whole point. Blacklisting shell
 # metacharacters is famously incomplete — you find out which one you forgot by being bitten
@@ -2947,7 +2950,7 @@ $out"
       *) fail "$label: lifted span is not a uzi instruction: $cmd" ;;
     esac
     # THE FLOOR (mechanism 4 above). Anchored at both ends, positive class only. Every span
-    # the three current rows lift already satisfies it, so it reddens nothing today — which
+    # the FOUR current rows lift already satisfies it, so it reddens nothing today — which
     # is exactly why it was exercised deliberately rather than assumed; see the commit.
     #
     # 🔴 `[[ =~ ]]`, NOT `grep -qE`, AND THAT IS THE WHOLE POINT OF THE GUARD. grep is
@@ -3304,16 +3307,17 @@ pass "PRD #98 M8b/B6': closing #$F_IID drove the POLLER to auto-Done $B6_CAT/$B6
 # service's slice and says nothing about the query's LIMIT. This block is the only place
 # the real SQL meets the real cap.
 #
-# THE SEED'S SHAPE IS THE WHOLE DESIGN — three reviews at three ages, because
-# `ORDER BY rv.updated_at DESC …` decides what the cut keeps:
+# THE SEED'S SHAPE IS THE WHOLE DESIGN — four reviews at three ages, each on a run this
+# fixture mints for itself, because `ORDER BY rv.updated_at DESC …` decides what the cut
+# keeps and `run_reviews.target_run_id` is UNIQUE (see the seeding note below):
 #
-#   B4_OLD    (updated_at -3d, on RUN_CLI)      1 coordinate, `cut-me`. MUST be cut.
-#   B4_BIG    (updated_at -2d, on RUN_CLI)      2001 distinct coordinates. The cap.
-#   B4_SMALL_A(now, on J_RUN)                   `remedy` + `dup` twice
-#   B4_SMALL_B(now, on F_START_RUN)             `remedy` again, on a SECOND run
+#   B4_OLD  (-3d, on B4_RUN_OLD)   1 coordinate, `b4-cut-me`. MUST be cut.
+#   B4_BIG  (-2d, on B4_RUN_BIG)   2001 distinct coordinates. The cap.
+#   B4_SA   (now, on B4_RUN_A)     $B4_TGT + `b4-dup` twice
+#   B4_SB   (now, on B4_RUN_B)     $B4_TGT again, on a SECOND run
 #
-# so the returned window is B4_SMALL_* first, then most of B4_BIG, and `cut-me` falls off
-# the end. A `truncated` boolean on its own is satisfiable by a flag flip over complete
+# so the returned window is B4_SA/B4_SB first, then most of B4_BIG, and `b4-cut-me` falls
+# off the end. A `truncated` boolean on its own is satisfiable by a flag flip over complete
 # data; the absent coordinate is what makes it a claim about the CUT.
 #
 # WHY B4_BIG SITS ON A RUN THE REMEDY NEVER ANCHORS TO, and this is the non-obvious part:
@@ -3324,8 +3328,18 @@ pass "PRD #98 M8b/B6': closing #$F_IID drove the POLLER to auto-Done $B6_CAT/$B6
 # carries the bulk seed.
 #
 # TWO SETTLED RUNS, NOT ONE, for the reason the undo row above states: a count of 1 cannot
-# distinguish the real behaviour from a `head -1` regression. Dismissing `adjust_template/b4-remedy`
+# distinguish the real behaviour from a `head -1` regression. Dismissing $B4_CAT/$B4_TGT
 # fans out to both reviews, so the CLI prints exactly two remedy lines.
+#
+# THE TARGET IS A VARIABLE, and that is a fix rather than a flourish. This block hardcoded
+# the literal at the dismiss call site while using $B4_CAT for the category, and the two
+# halves drifted: the seed said `b4-remedy` and the dismiss said `remedy`. Matching is exact
+# equality — reviewCoord only TrimSpaces the flag, and the bulk query joins
+# `want.target = rr.target` with no LIKE and no prefix match — so nothing would have
+# settled, and the dismiss STILL EXITS 0 because the CLI treats a no-match as a legal
+# updated=0. It would then have failed twice over, at the arrange count and again with the
+# lift seeing 0 matches against want=2, neither message naming the typo. The M8c row three
+# phases up already does this correctly through $PI_TGT; this now matches it.
 #
 # FOLDS IN B2's ONE UNCOVERED SHAPE at no extra cost: `dup` is seeded TWICE on ONE review,
 # which is `occurrences > run_count` (occurrences 2, run_count 1). It costs one INSERT row.
@@ -3346,17 +3360,58 @@ say "PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed a
 # WHOLE table with no review or user scope, and this repo has already lost time to a fixture
 # that seeded an open improve_uzi row. Every target additionally carries a `b4-` prefix.
 B4_CAT=adjust_template
+B4_TGT=b4-remedy
 B4_OWNER="$(db_psql "SELECT user_id FROM run_reviews WHERE id='$F_REVIEW'")"
 printf '%s' "$B4_OWNER" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
   || fail "PRD #98 M8b/B4': could not resolve the fixture owner off review $F_REVIEW (got '$B4_OWNER')"
-# The three runs must be distinct and uuid-shaped, or the arrangement above silently
-# collapses — two of them sharing a run would put the bulk seed under an anchored re-read.
-for pair in "J_RUN:$J_RUN" "RUN_CLI:$RUN_CLI" "F_START_RUN:$F_START_RUN"; do
-  printf '%s' "${pair#*:}" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
-    || fail "PRD #98 M8b/B4': ${pair%%:*} is not a uuid ('${pair#*:}') — the three-run arrangement this block depends on is not in place"
-done
-[ "$J_RUN" != "$RUN_CLI" ] && [ "$J_RUN" != "$F_START_RUN" ] && [ "$RUN_CLI" != "$F_START_RUN" ] \
-  || fail "PRD #98 M8b/B4': J_RUN, RUN_CLI and F_START_RUN must be three DIFFERENT runs; the bulk seed would otherwise land under an anchored re-read and the remedy would be false"
+
+# 🔴 THE FIXTURE SEEDS ITS OWN RUNS, AND IT MUST. `run_reviews.target_run_id` is
+# `NOT NULL UNIQUE` (migration 00059, whose own comment says "One review per reviewed run …
+# so a re-judge UPSERTs"). ONE REVIEW PER RUN, by design. The first version of this block
+# reused the harness's existing runs and aborted at the second INSERT with
+#
+#   ERROR: duplicate key value violates unique constraint "run_reviews_target_run_id_key"
+#
+# broken twice over: it put TWO of its reviews on RUN_CLI, and J_RUN already owns F_REVIEW
+# from the #68 phase. Found by RUNNING the harness. Five validators read this block
+# statically and three attacked the fixture arrangement specifically; none of us saw it,
+# because "are the runs distinct enough for the semi-join" and "may these runs carry a
+# review at all" are different questions and only the first was asked. That is the argument
+# for the e2e leg existing, made by the leg on its first execution.
+#
+# Four dedicated runs also make the arrangement SELF-CONTAINED rather than dependent on what
+# earlier phases left behind: the separation the anchor needs is now a property of this
+# fixture, not a coincidence of the harness's history.
+#
+# Direct-seeded as `completed`, which is safe rather than merely convenient: a judge run is
+# enqueued by maybeEnqueueJudge on a just-committed TERMINAL TRANSITION, never by a scan for
+# unjudged completed runs, so a row inserted straight into the terminal state is never
+# judged and its review slot stays free. `kind` is omitted — it defaults to 'issue'
+# (migration 00043). The iid range is far above anything forge-fake mints, and no `issues`
+# row is created for them, so they cannot appear on a board or collide with a phase that
+# addresses an issue by iid.
+#
+# b4_seed_run VAR IID — insert a completed run owned by the fixture owner, assign its id.
+b4_seed_run() {
+  local var="$1" iid="$2" id
+  db_psql "INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, status)
+           VALUES ('$B4_OWNER', '$REPO_ID', $iid, 'PRD98-B4 fixture run $iid', 'B4 fixture; never executed', 'completed')" >/dev/null
+  id="$(db_psql "SELECT id FROM runs WHERE repo_id='$REPO_ID' AND issue_iid=$iid")"
+  printf '%s' "$id" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || fail "PRD #98 M8b/B4': seeded run for iid $iid did not read back as a bare uuid: '$id'"
+  printf -v "$var" '%s' "$id"
+}
+b4_seed_run B4_RUN_OLD 990001
+b4_seed_run B4_RUN_BIG 990002
+b4_seed_run B4_RUN_A   990003
+b4_seed_run B4_RUN_B   990004
+# The separation the ?run= anchor depends on, asserted rather than assumed: the bulk seed's
+# run must not be one of the two the remedy anchors to. All four are freshly minted here, so
+# this cannot fail today — which is exactly why it is cheap to keep. It fires the moment
+# someone "simplifies" the fixture back onto shared runs, which is how it broke the first time.
+[ "$B4_RUN_BIG" != "$B4_RUN_A" ] && [ "$B4_RUN_BIG" != "$B4_RUN_B" ] && [ "$B4_RUN_A" != "$B4_RUN_B" ] \
+  || fail "PRD #98 M8b/B4': the bulk-seed run must differ from BOTH runs the remedy anchors to. The anchor is a COORDINATE semi-join, so an anchored re-read returns every coordinate in any of that run's reviews — sharing a run would return all 2001 rows again, the re-read would still be truncated, and the remedy the CLI prints would be FALSE"
+pass "seeded 4 dedicated runs for the B4' fixture (run_reviews.target_run_id is UNIQUE: one review per run)"
 
 # b4_seed_review VAR TARGET_RUN SUMMARY AGE_INTERVAL — insert a review and ASSIGN its id
 # to VAR.
@@ -3381,10 +3436,10 @@ b4_seed_review() {
     || fail "PRD #98 M8b/B4': seeded review '$summary' did not read back as a bare uuid: '$id'"
   printf -v "$var" '%s' "$id"
 }
-b4_seed_review B4_OLD "$RUN_CLI"     'PRD98-B4-oldest'  '3 days'
-b4_seed_review B4_BIG "$RUN_CLI"     'PRD98-B4-bulk'    '2 days'
-b4_seed_review B4_SA  "$J_RUN"       'PRD98-B4-small-a' '0 days'
-b4_seed_review B4_SB  "$F_START_RUN" 'PRD98-B4-small-b' '0 days'
+b4_seed_review B4_OLD "$B4_RUN_OLD" 'PRD98-B4-oldest'  '3 days'
+b4_seed_review B4_BIG "$B4_RUN_BIG" 'PRD98-B4-bulk'    '2 days'
+b4_seed_review B4_SA  "$B4_RUN_A"   'PRD98-B4-small-a' '0 days'
+b4_seed_review B4_SB  "$B4_RUN_B"   'PRD98-B4-small-b' '0 days'
 
 db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
          VALUES ('$B4_OLD','$B4_CAT','b4-cut-me','B4 oldest-review coordinate: it must fall outside the cap','low')" >/dev/null
@@ -3394,19 +3449,23 @@ db_psql "INSERT INTO review_recommendations (review_id, category, target, ration
            FROM generate_series(1, 2001) g" >/dev/null
 B4_SEED_SECS=$((SECONDS - B4_SEED_START))
 db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
-         VALUES ('$B4_SA','$B4_CAT','b4-remedy','B4 remedy coordinate, run A','low'),
+         VALUES ('$B4_SA','$B4_CAT','$B4_TGT','B4 remedy coordinate, run A','low'),
                 ('$B4_SA','$B4_CAT','b4-dup','B4 duplicate coordinate on ONE review, member 1','low'),
                 ('$B4_SA','$B4_CAT','b4-dup','B4 duplicate coordinate on ONE review, member 2','low'),
-                ('$B4_SB','$B4_CAT','b4-remedy','B4 remedy coordinate, run B','low')" >/dev/null
+                ('$B4_SB','$B4_CAT','$B4_TGT','B4 remedy coordinate, run B','low')" >/dev/null
 pass "seeded 2001 bulk coordinates (${B4_SEED_SECS}s) plus the oldest-review, duplicate and remedy fixtures"
 
 # The design ASSUMED this seed is sub-second and asked for that to be measured rather than
 # inherited. MEASURED before this landed, against a throwaway Postgres 17 on the real table
 # shape: EXPLAIN ANALYZE reports 8.4 ms of execution for the 2001-row generate_series
 # insert, so the assumption holds by two orders of magnitude and the added harness time is
-# the round trip, not the write. B4_SEED_SECS above is the runtime receipt (whole-second
-# resolution, includes docker exec + psql startup). If it ever stops being cheap, say so
-# rather than lowering the cap — the cap is the thing under test.
+# the round trip, not the write.
+#
+# B4_SEED_SECS ABOVE DOES NOT CORROBORATE THAT NUMBER AND MUST NOT BE READ AS DOING SO. It
+# comes from $SECONDS — WHOLE-SECOND resolution — so it reads 0 or 1 whether the true cost
+# is 8 ms or 900 ms, and it includes docker exec and psql startup besides. What it is good
+# for is a floor check across runs: if it ever climbs, the seed stopped being cheap and that
+# is worth knowing. Say so rather than lowering the cap — the cap is the thing under test.
 
 # --- the cap itself ----------------------------------------------------------
 B4_ALL="$(apiget "/api/me/judge/recommendations?bucket=all")"
@@ -3417,7 +3476,7 @@ echo "$B4_ALL" | jq -e '.truncated == true' >/dev/null \
 # from the OLDEST review, which is the ordering the cut depends on.
 echo "$B4_ALL" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and .target == "b4-cut-me") | not' >/dev/null \
   || fail "PRD #98 M8b/B4': the coordinate seeded on the OLDEST review still came back under a truncated read — the cap is reporting truncation without cutting, or the ORDER BY no longer decides what survives"
-echo "$B4_ALL" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and .target == "b4-remedy")' >/dev/null \
+echo "$B4_ALL" | jq -e --arg c "$B4_CAT" --arg t "$B4_TGT" 'any(.groups[]?; .category == $c and .target == $t)' >/dev/null \
   || fail "PRD #98 M8b/B4': the remedy coordinate is not in the truncated window, so the dismiss below would settle nothing"
 # B2's uncovered shape, live: the same coordinate twice on ONE review is 2 occurrences
 # behind 1 run. This is the SQLSTATE 21000 shape the grouper's own comment names, and the
@@ -3438,22 +3497,37 @@ pass "row cap reached: truncated=true, the oldest review's coordinate is CUT, an
 # the OUTPUT, not a value substituted at emit time — which cannot be executed verbatim by
 # anyone. It is now one runnable line per settled run.
 PI_LABEL_TRUNC="printed-instruction row: uzi review backlog --run"
-PI_OUT_TRUNC="$(uzi_cli review dismiss --category "$B4_CAT" --target remedy --reason wont-do)" \
+PI_OUT_TRUNC="$(uzi_cli review dismiss --category "$B4_CAT" --target "$B4_TGT" --reason wont-do)" \
   || fail "$PI_LABEL_TRUNC: the group dismiss that EMITS the remedy failed (exit $?)"
 # ARRANGE, not the assertion: the write must have settled BOTH members, or there is only one
 # run to name and the count below stops discriminating.
-[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='b4-remedy'")" = 2 ] \
-  || fail "$PI_LABEL_TRUNC: the group dismiss settled $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='b4-remedy'") coordinate(s), want 2 (one per review, on two different runs). Output was:
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='$B4_TGT'")" = 2 ] \
+  || fail "$PI_LABEL_TRUNC: the group dismiss settled $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='$B4_TGT'") coordinate(s), want 2 (one per review, on two different runs). Output was:
 $PI_OUT_TRUNC"
 run_printed_instructions "$PI_LABEL_TRUNC" 'uzi review backlog --run [0-9a-f-]{36}' 2 "$PI_OUT_TRUNC"
 # THE OUTCOME, and it is the whole point of the remedy: the anchored re-read is NOT
 # truncated. Exit 0 alone would be satisfied by an anchored read that truncates identically,
 # which is exactly what `--bucket all` does and why naming it was the false instruction.
 #
-# Spelled as an `if`, not as `grep … && fail`. Under `set -e` the second form EXITS THE
-# WHOLE RUN when grep finds nothing — i.e. on the passing path — because a failing final
-# command in an AND-list is not exempt. An `if` condition is exempt, so this is the only
-# spelling of a negative grep that does not turn success into a silent abort.
+# Spelled as an `if`, not as `grep … && fail`, because an `if` condition is exempt from
+# `set -e` in every position. The rewrite stays; the REASON it originally carried was too
+# broad and is corrected here, since a wrong explanation of a shell rule is worse than none
+# — one reviewer nearly filed three false findings against the other sites on the strength
+# of it.
+#
+# MEASURED under `set -euo pipefail`, three positions:
+#   top level                             echo hi | grep -qF nope && fail "x"   SURVIVES
+#   inside a for loop                     same                                  SURVIVES
+#   LAST COMMAND OF A FUNCTION, called
+#   at top level                          same                                  ABORTS
+# So the AND-list IS exempt — except as a function's last command, where the FUNCTION
+# returns the list's non-zero status and the call becomes an ordinary top-level command that
+# `set -e` does not exempt. Much narrower than "a failing final command in an AND-list is
+# not exempt", which is what this comment used to say.
+#
+# The other `grep … && fail` sites in this file were checked against that rule and left
+# alone: none is a function's last command. Rewriting them would be a mechanical sweep on a
+# mechanism that does not reach them.
 if grep -q "row cap" "$PRINTED_OUT"; then
   fail "$PI_LABEL_TRUNC: the printed remedy ran but its own output still reports the row cap — the anchor did not narrow the read below the cap, so the instruction is false:
 $(cat "$PRINTED_OUT")"
@@ -3464,7 +3538,7 @@ fi
 # element actually checked, and it is the weakness the printed-instruction rows exist to
 # avoid: the undo row above seeds a coordinate on TWO reviews precisely so a single-address
 # regression cannot pass as a green. Count the occurrences instead.
-PI_TRUNC_HITS="$(grep -c "b4-remedy" "$PRINTED_OUT" || true)"
+PI_TRUNC_HITS="$(grep -c "$B4_TGT" "$PRINTED_OUT" || true)"
 [ "$PI_TRUNC_HITS" -ge 2 ] \
   || fail "$PI_LABEL_TRUNC: the coordinate the write settled is named on $PI_TRUNC_HITS line(s) of the executed output, want at least 2 — one per anchored re-read. Both instructions ran, but only $PI_TRUNC_HITS of them was certified to have read the right run:
 $(cat "$PRINTED_OUT")"
@@ -3483,16 +3557,23 @@ echo "$B4_AFTER" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and 
   || fail "PRD #98 M8b/B4': the oldest review's coordinate is STILL absent after the cap was removed, so its earlier absence was not the cut"
 pass "positive control: bulk review deleted -> truncated=false AND the previously-cut coordinate returns"
 
-db_psql "DELETE FROM run_reviews WHERE id IN ('$B4_OLD','$B4_SA','$B4_SB')" >/dev/null
-# Both tables, and the category is exact because no other phase uses it. The dispositions
-# go by FK cascade (recommendation_dispositions.review_id ON DELETE CASCADE), so asserting
-# them is asserting the cascade rather than a second DELETE — which is the point: a fixture
-# that leaves dispositions behind moves every later triage count.
+# TEARDOWN BY RUN, so the fixture's own runs go too and nothing it created survives into the
+# later phases. One DELETE, three cascade levels: runs -> run_reviews (target_run_id ON
+# DELETE CASCADE, migration 00059) -> review_recommendations and
+# recommendation_dispositions. The bulk review was already deleted by the positive control
+# above; its run is removed here with the rest.
+db_psql "DELETE FROM runs WHERE id IN ('$B4_RUN_OLD','$B4_RUN_BIG','$B4_RUN_A','$B4_RUN_B')" >/dev/null
+# Assert all three levels, and assert them on the CATEGORY, which is exact because no other
+# phase uses adjust_template. Asserting the cascaded tables is asserting the CASCADE rather
+# than a second DELETE — the point being that a fixture leaving dispositions behind moves
+# every later triage count, and one leaving runs behind moves every later run count.
 [ "$(db_psql "SELECT count(*) FROM review_recommendations WHERE category='$B4_CAT'")" = 0 ] \
   || fail "PRD #98 M8b/B4': the fixture teardown left $(db_psql "SELECT count(*) FROM review_recommendations WHERE category='$B4_CAT'") $B4_CAT recommendation row(s) behind; later sections would read them"
 [ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT'")" = 0 ] \
   || fail "PRD #98 M8b/B4': the teardown left $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT'") $B4_CAT disposition row(s) behind — the ON DELETE CASCADE from run_reviews did not fire"
-pass "PRD #98 M8b/B4' fixtures removed (recommendations and their cascaded dispositions)"
+[ "$(db_psql "SELECT count(*) FROM runs WHERE issue_iid BETWEEN 990001 AND 990004")" = 0 ] \
+  || fail "PRD #98 M8b/B4': the teardown left $(db_psql "SELECT count(*) FROM runs WHERE issue_iid BETWEEN 990001 AND 990004") fixture run(s) behind; every later assertion counting runs would read them"
+pass "PRD #98 M8b/B4' fixtures removed — 4 runs, and their reviews, recommendations and dispositions by cascade"
 
 # STILL NOT PROVEN HERE, deliberately: `uzi login`, the device-auth polling hint. It is
 # permanently unreachable from a harness — the command declares no flags, it is a
