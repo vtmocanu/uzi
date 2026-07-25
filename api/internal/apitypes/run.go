@@ -180,3 +180,48 @@ type SteerInputDTO struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	ConsumedAt *time.Time `json:"consumed_at"`
 }
+
+// RunEventDTO is one /api/ws frame: the live-channel counterpart to the REST
+// reads above, shared by the web, the hub that emits it, and the uzi CLI.
+//
+// It lives here rather than in internal/hub because M1 (PRD #112) moved /api/ws
+// onto the RequireUser routes, which is this package's stated membership rule —
+// and because a parallel decode struct in the CLI is the failure this package
+// exists to prevent: nothing would catch tag-set drift between two definitions of
+// one live wire contract. hub.Event is an ALIAS of this type, so there is exactly
+// one definition and the server cannot emit a shape the client does not decode.
+//
+// The socket is a live channel only. Every frame it carries was already persisted
+// (messages) or applied (state) before the hub was poked, so a dropped or missed
+// frame is recovered by the client's REST replay — this is never the source of
+// truth. See uzicli.StreamRun for the recovery contract that depends on that.
+type RunEventDTO struct {
+	// Type is a CLOSED set: message | state | health | input. "message" carries a
+	// persisted run message (rendered directly, deduped by seq); the other three are
+	// signals to re-read over REST, since the socket never carries authoritative run
+	// state. A consumer must treat an unrecognised Type as inert — see
+	// uzicli.NormalizeRunEvent.
+	Type string `json:"type"`
+	// Seq is set on "message" frames ONLY. state/health/input carry none, which is
+	// why seq-gap detection cannot recover a dropped one of those.
+	Seq  int32  `json:"seq,omitempty"`
+	Kind string `json:"kind,omitempty"`
+	// Agent is the emitting agent's name; Kind the message kind. Both are OPEN sets
+	// written by the separately-deployed worker, so a value this binary does not
+	// recognise is expected and must be preserved, not normalised away.
+	Agent *string `json:"agent,omitempty"`
+	// AgentInstance/AgentLabel are the PRD #99 subagent invocation id + task
+	// label. The browser lanes a live frame off these without a REST re-read, so
+	// they must ride the frame exactly as Agent does. Absent when the frame
+	// carried no parent_tool_use_id (which is NOT the same as Agent == "lead").
+	AgentInstance *string         `json:"agent_instance,omitempty"`
+	AgentLabel    *string         `json:"agent_label,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+	CreatedAt     *time.Time      `json:"created_at,omitempty"`
+	// Status is set on "state" frames and is a CLOSED set enforced by a database
+	// CHECK constraint (runs.status, migration 00020_workers_runs.sql:37): queued,
+	// claimed, running, awaiting_approval, completed, failed, cancelled. It is the
+	// field that decides whether a run reads as still live, so an unrecognised value
+	// must never reach a consumer as-is.
+	Status string `json:"status,omitempty"` // set on "state" frames
+}

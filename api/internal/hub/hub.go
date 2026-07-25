@@ -5,9 +5,15 @@
 // to that run.
 //
 // The hub is deliberately a LIVE/cache-invalidation channel, never authoritative:
-// a frame may be dropped for a slow subscriber (bounded buffer), and the client
-// recovers by replaying from its last-seen seq over REST on any gap or reconnect
-// (the lossless guarantee lives in the persisted run_messages log, not here).
+// a frame may be dropped for a slow subscriber (bounded buffer). The lossless
+// guarantee lives in the persisted run_messages log, not here — the client replays
+// from its last-seen seq over REST on any gap or reconnect.
+//
+// That replay covers "message" frames and ONLY those: they are the only type
+// carrying a seq, so they are the only type whose loss a client can detect. A
+// dropped state/health/input frame is undetectable and unrecovered by replay, and
+// needs a periodic re-read instead. broadcast documents the consequence in full;
+// it is the single most misread property of this package.
 package hub
 
 import (
@@ -17,11 +23,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // subBuffer is the per-subscriber frame buffer. A subscriber that falls this far
-// behind has a frame dropped; the client detects the resulting seq gap and does a
-// REST catch-up, so no data is lost — only the WS fast-path is skipped.
+// behind has a frame dropped. For a "message" that costs only the WS fast-path (its
+// seq gap drives a REST catch-up); for the seq-less frame types the signal is gone,
+// which is why every consumer needs a time-based reconcile. See broadcast.
 const subBuffer = 256
 
 // Event is one WS frame. "message" carries a persisted run message (the client
@@ -29,21 +38,13 @@ const subBuffer = 256
 // "health" a run-health flag change (PRD #47), and "input" a steer-queue change
 // (PRD #95) — for all three the client re-reads over REST, since WS never carries
 // authoritative run state.
-type Event struct {
-	Type  string  `json:"type"` // "message" | "state" | "health" | "input"
-	Seq   int32   `json:"seq,omitempty"`
-	Kind  string  `json:"kind,omitempty"`
-	Agent *string `json:"agent,omitempty"`
-	// AgentInstance/AgentLabel are the PRD #99 subagent invocation id + task
-	// label. The browser lanes a live frame off these without a REST re-read, so
-	// they must ride the frame exactly as Agent does. Absent when the frame
-	// carried no parent_tool_use_id (which is NOT the same as Agent == "lead").
-	AgentInstance *string         `json:"agent_instance,omitempty"`
-	AgentLabel    *string         `json:"agent_label,omitempty"`
-	Payload       json.RawMessage `json:"payload,omitempty"`
-	CreatedAt     *time.Time      `json:"created_at,omitempty"`
-	Status        string          `json:"status,omitempty"` // set on "state" frames
-}
+//
+// It is an ALIAS, not a copy: the shape lives in apitypes because PRD #112 M1 put
+// /api/ws on the RequireUser routes, and the uzi CLI now decodes these frames too.
+// An alias (not a defined type) is what makes the server and the CLI provably the
+// same shape — a second definition could drift a tag and nothing would fail. The
+// field documentation lives with the type; see apitypes.RunEventDTO.
+type Event = apitypes.RunEventDTO
 
 // Subscription is one browser's view of a single run's live events.
 type Subscription struct {
@@ -143,10 +144,27 @@ func (h *Hub) PublishInput(runID uuid.UUID) {
 }
 
 // broadcast marshals ev once and sends it to every subscriber of runID,
-// non-blocking: a subscriber whose buffer is full has this frame dropped (it
-// recovers via REST replay on the resulting gap). Marshal failures are logged and
-// skipped rather than propagated — a broadcast must never break the write path
-// that persisted the underlying event.
+// non-blocking: a subscriber whose buffer is full has this frame dropped. Marshal
+// failures are logged and skipped rather than propagated — a broadcast must never
+// break the write path that persisted the underlying event.
+//
+// WHAT A DROP COSTS DEPENDS ON THE FRAME TYPE, and only one of the four self-heals.
+// This comment used to say a dropped frame "is not lost — only its WS fast-path",
+// which is true for "message" and FALSE for the other three:
+//
+//   - "message" frames carry a per-run gapless Seq, so a drop leaves a hole the
+//     client sees and repairs with a REST replay from its last-seen seq.
+//   - "state", "health" and "input" carry NO Seq. A drop produces no gap, so there
+//     is nothing to detect and nothing triggers a re-read: the signal is simply
+//     gone until the next frame of that type, which for a TERMINAL state frame
+//     never comes. A completed run then reads as still running for as long as the
+//     consumer trusts the socket.
+//
+// The recovery for the second bullet cannot live here — it is the consumer's, and
+// it must be time-based rather than event-based, because no event will arrive to
+// trigger it. uzicli.StreamRun closes it with a periodic GetRun reconcile; the web
+// re-reads on its own signals. A new consumer of this hub MUST provide one of the
+// two, or it will render terminal runs as live.
 func (h *Hub) broadcast(runID uuid.UUID, ev Event) {
 	frame, err := json.Marshal(ev)
 	if err != nil {
@@ -159,8 +177,9 @@ func (h *Hub) broadcast(runID uuid.UUID, ev Event) {
 		select {
 		case s.ch <- frame:
 		default:
-			// Buffer full: drop. The client's seq-gap detection triggers a REST
-			// catch-up, so the dropped frame is not lost — only its WS fast-path.
+			// Buffer full: drop. Recoverable for a "message" (its seq gap triggers a
+			// REST catch-up); NOT self-healing for state/health/input, which carry no
+			// seq — see the note above this function before assuming otherwise.
 		}
 	}
 }
