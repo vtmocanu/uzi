@@ -223,7 +223,47 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailLoadedMsg:
 		m.detail.applyLoaded(msg)
+		// The ownership probe rides the same call the queue indicator needs.
+		return m, m.fetchInputsCmd(m.detail.runID)
+
+	case runInputsMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		m.detail.steer.access = steerAccessFor(m.detail.run, msg.err)
+		if msg.err == nil {
+			m.detail.steer.queue = msg.inputs
+		}
 		return m, nil
+
+	case steerResultMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		m.applySteerResult(msg)
+		// Re-read the queue so the indicator reflects the write immediately rather
+		// than waiting for the run's next `input` frame.
+		return m, m.fetchInputsCmd(m.detail.runID)
+
+	case reviewLoadedMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		m.detail.review.loading = false
+		m.detail.review.review, m.detail.review.err = msg.review, msg.err
+		return m, nil
+
+	case dispositionDoneMsg:
+		if msg.runID != m.detail.runID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.detail.review.notice = "could not record that: " + fmtErr(msg.err)
+			return m, nil
+		}
+		m.detail.review.notice = "triage recorded"
+		m.detail.review.loading = true
+		return m, m.loadReviewCmd(m.detail.runID)
 
 	case streamReadyMsg:
 		if msg.runID != m.detail.runID {
@@ -248,7 +288,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.runID != m.detail.runID {
 			return m, nil
 		}
-		m.detail.applyEvents(msg.events)
+		inputChanged := m.detail.applyEvents(msg.events)
+		if inputChanged && m.detail.steer.access == steerAllowed {
+			// PRD #95: an `input` frame says the steer queue changed (a follow-up was
+			// consumed). It carries no data — it is a prompt to re-read — so the
+			// indicator refreshes off it rather than guessing.
+			return m, tea.Batch(readStreamCmd(msg.runID, m.detail.stream), m.fetchInputsCmd(m.detail.runID))
+		}
 		if msg.closed {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err

@@ -35,6 +35,11 @@ type detailState struct {
 	// polling is the D8 fallback: the socket is unusable, so the view re-reads over
 	// REST on the same 2s cadence `uzi run logs --follow` uses.
 	polling bool
+
+	// M4 surfaces. steer is gated on OWNERSHIP, not visibility (see steerAccessFor);
+	// review is the [v] overlay.
+	steer  steerState2
+	review reviewState
 }
 
 func newDetailState(runID string) detailState {
@@ -56,7 +61,10 @@ func (d *detailState) applyLoaded(msg detailLoadedMsg) {
 	d.rebuild()
 }
 
-func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) {
+// applyEvents folds a batch in and reports whether the steer queue was signalled
+// changed, so the caller can re-read it.
+func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) bool {
+	inputChanged := false
 	for _, ev := range evs {
 		switch ev.Type {
 		case uzicli.RunEventTypeMessage:
@@ -68,11 +76,15 @@ func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) {
 			if ev.Status != "" {
 				d.run.Status = ev.Status
 			}
+		case uzicli.RunEventTypeInput:
+			// Carries no data by design (the steer text is owner-gated and never rides
+			// the socket): it is a prompt to re-read GET /runs/{id}/inputs.
+			inputChanged = true
 		}
-		// health and input frames carry no data: they are a prompt to re-read, and M3
-		// is read-only, so the next poll/reconcile picks the change up.
+		// A health frame likewise carries no data; the next reconcile/poll picks it up.
 	}
 	d.rebuild()
+	return inputChanged
 }
 
 // addFrame appends a message frame, deduped by seq. Dedup is required, not defensive:
@@ -106,6 +118,23 @@ func (d *detailState) selectedLane() (agentLane, bool) {
 }
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
+	// The overlay and the steer bar get first refusal, in that order: while either is
+	// in an input/confirm mode it must swallow keys that would otherwise be lane
+	// navigation, or typing "l" into a follow-up would switch lanes underneath it.
+	if nm, cmd, handled := m.reviewKey(k); handled {
+		return nm, cmd
+	}
+	if nm, cmd, handled := m.steerKey(k); handled {
+		return nm, cmd
+	}
+	if k == "v" {
+		m.detail.review.open = true
+		if m.detail.review.review == nil && !m.detail.review.loading {
+			m.detail.review.loading = true
+			return m, m.loadReviewCmd(m.detail.runID)
+		}
+		return m, nil
+	}
 	switch k {
 	case keyEsc:
 		if m.detail.stream != nil {
@@ -179,10 +208,15 @@ func (m tuiModel) renderDetail() string {
 		return sb.String()
 	}
 
+	if m.detail.review.open {
+		return sb.String() + m.renderReviewOverlay()
+	}
+
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(joinColumns(rail, body, laneRailWidth))
-	sb.WriteString("\n" + m.pal.faint.Render("tab/h/l lane · j/k scroll · r refresh · esc back · ? keys"))
+	sb.WriteString(m.renderSteerBar() + "\n")
+	sb.WriteString(m.pal.faint.Render("tab/h/l lane · j/k scroll · r refresh · esc back · ? keys"))
 	return sb.String()
 }
 
