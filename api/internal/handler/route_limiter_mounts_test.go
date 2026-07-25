@@ -62,9 +62,13 @@ var limiterNames = [...]string{
 	limCLIPoll,
 }
 
-// The limiter names, as constants so a typo in the 141-row table below is a compile
+// The limiter names, as constants so a typo in the 142-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
+//
+// 142 as of this commit; it was 141 until `c309e8a0` added GET /api/admin/cli-tokens.
+// THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
+// which lines a mount-adder owns.
 //
 // noLimiter marks a route that carries NO per-user limiter. Spelling that out
 // (rather than omitting the route) is what makes an ADDED-without-a-limiter route
@@ -99,11 +103,27 @@ type routeMount struct {
 // endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; only /cli/approve,
-// /vault/unlock and /vault/passphrase take its PerUserMiddleware. This table covers
-// the per-user mounts ONLY — the per-IP ones read as noLimiter here and are not
-// guarded by this file. e2e/run-e2e.sh asserts a 429 on /api/auth/login, which is
-// the per-IP mount and closes none of the 24.
+// /register, /login, /config, the OIDC pair and /cli/start; FOUR routes take its
+// PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase and
+// /admin/cli-tokens. This table covers the per-user mounts ONLY — the per-IP ones read
+// as noLimiter here and are not guarded by this file. e2e/run-e2e.sh asserts a 429 on
+// /api/auth/login, which is the per-IP mount and closes none of the 25.
+//
+// 🔴 WHICH LINES A MOUNT-ADDER OWNS, because two numerals in this paragraph and one at
+// the `lim*` constants above were rotted by a single commit — `c309e8a0`, which added
+// GET /api/admin/cli-tokens as the FOURTH auth per-user mount and the 142nd table row:
+//
+//	any new ROUTE                  -> the "142-row table" sentence at the lim* constants
+//	a new AUTH per-user mount      -> this paragraph: the four-route list AND the "25"
+//
+// Both figures are this commit's inventory. THE TABLE BELOW IS THE MECHANISM THAT FAILS
+// WHEN THE TREE MOVES; this prose only has to stop lying, which is why it is bound to a
+// tip rather than derived — deriving it would put a second parser in the file and give it
+// a way to be self-consistently wrong.
+//
+// The pattern is measured rather than argued, and this file ran the experiment on itself:
+// across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
+// and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
