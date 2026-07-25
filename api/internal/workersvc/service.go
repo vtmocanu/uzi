@@ -2647,6 +2647,15 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		// say so. Likely rather than theoretical for the population M5 exists to
 		// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
 		// is a prime OOM candidate, and OOM is exactly what puts it here.
+		//
+		// The window is wide, and uzi's own configuration is the calibration:
+		// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
+		// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
+		// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
+		// has an empty cache and takes the cold cloneBare path, and that clone runs
+		// between the worker's reportState({status:"running"}) and its first flush
+		// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
+		// is about that ORDERING, not a stopwatched duration.
 		s.persistFail.evict(r.ID)
 	}
 

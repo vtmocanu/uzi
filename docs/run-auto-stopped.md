@@ -12,9 +12,7 @@ Sometimes a run ends with **failed** and the reason *"uzi stopped this run: its 
 
 ## What actually happens
 
-The agent streams its work back to uzi as messages. Occasionally a message is something Postgres genuinely cannot store — most often output containing raw NUL bytes (a headless Chromium's error spew is the case that first produced this), a broken Unicode fragment, or a number too large for the database's numeric type.
-
-An older worker image treats every rejection as "try again", so it re-sends the same message forever at roughly twice a second. The run then reads `running` while producing nothing, spending nothing, and holding a slot. Left alone it would sit like that until `RUN_TIMEOUT` (two hours by default).
+The agent streams its work back to uzi as messages. Occasionally a message is something Postgres genuinely cannot store — most often output containing raw NUL bytes (a headless Chromium's error spew is the case that first produced this), a broken Unicode fragment, or a number too large for the database's numeric type. An older worker image treats every rejection as "try again", so it re-sends the same message forever at roughly twice a second: the run reads `running` while producing nothing, spending nothing, and holding a slot until `RUN_TIMEOUT` (two hours by default).
 
 Modern workers (v0.10.1 and later) handle this themselves: they isolate the one bad message, replace it with a marker, and carry on — so you should rarely see an auto-stop at all. **The auto-stop exists mainly for workers on older images.** If you are seeing these, the first thing worth checking is your worker's version.
 
@@ -29,9 +27,7 @@ An auto-stop is deliberately hard to trigger. Every one of these must hold:
 5. that error is one **a correct worker could hit through no fault of its own** — output uzi genuinely cannot store, or a batch that grew too large. A malformed request is the worker being broken, and uzi does not stop runs for that (see below);
 6. **other runs on the same uzi are successfully saving messages** in that window.
 
-The sixth is the important one. If uzi's database is having a bad day, *every* run's writes fail — and killing runs during an outage would turn a bad hour into lost work. So when nothing else is succeeding, uzi flags the run and stops there.
-
-A consequence worth knowing: **if yours is the only active run, uzi will never auto-stop it.** There is nothing to compare against, so it flags and waits. That is the intended behaviour, not a gap.
+The sixth is the important one. If uzi's database is having a bad day, *every* run's writes fail, and killing runs during an outage would turn a bad hour into lost work — so when nothing else is succeeding, uzi flags and stops there. **A consequence worth knowing: if yours is the only active run, uzi will never auto-stop it.** That is intended, not a gap.
 
 ## Flagged but not stopped
 
@@ -47,16 +43,14 @@ A run can carry the `looping` flag forever and never be auto-stopped. That is a 
 
 ## How you find out
 
-Before any stop, the run is flagged in the UI and the CLI:
+Before any stop, the run is flagged in the UI and the CLI, and Slack notifications DM you on that flag:
 
 ```
 HEALTH          looping
 HEALTH_REASON   the agent's updates can't be saved, so it keeps resending them
 ```
 
-If you have Slack notifications on, you get a DM on that flag.
-
-An auto-stopped run is styled as **breakage**, not as a stop you asked for — a rose "failed" badge, and it counts toward the browser tab's attention mark. That is on purpose: a run you cancelled is not a problem, and this one is.
+An auto-stopped run is then styled as **breakage**, not as a stop you asked for — a rose "failed" badge, and it counts toward the browser tab's attention mark. That is on purpose: a run you cancelled is not a problem, and this one is.
 
 ## What to do about it
 

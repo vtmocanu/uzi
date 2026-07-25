@@ -9978,3 +9978,116 @@ unified-visual-vocabulary PRINCIPLE of Decision 6 is retained in full.
 
 See [prds/115-meter-color-thresholds.md](../prds/115-meter-color-thresholds.md) for
 the Locked Decisions, user journey, and the full test re-pin inventory.
+
+## 367. PRD #108 Phase 2 — the API counts its own write failures, and the kill needs six guards plus a class it can name (D5-D10, plus six Phase 2 added)
+
+- **D5 — auto-stop requires a comparison set; with none, flag and notify, permanently.**
+  A rule that cannot distinguish "this run is poisoned" from "the database is
+  down" must not kill runs. `peersSucceeding` counts runs OTHER than the accused
+  that actually PERSISTED messages inside the window — never runs that merely
+  exist, since a neighbour mid-long-build appends nothing. When that count is
+  zero there is no fallback, no timeout into killing, and no "if it has been zero
+  long enough". This is why the motivating incident itself would not have been
+  auto-stopped: one active run, no comparison set. **That is the correct outcome
+  on insufficient evidence and is tested as correct behaviour, not as a gap.**
+- **D6 — the stop reuses `kind='cancel'` on the wire, and carries its identity in
+  server-side state.** `SteeringChannel.route`'s `default:` arm logs and DROPS an
+  unrecognised input kind (verbatim at v0.10.0 and at HEAD), and `/inputs` is
+  consume-on-read, so the drop is permanent and unacknowledgeable. A new input
+  kind would therefore be a silent no-op on exactly the older fleet Phase 2
+  exists to protect — and would need a second migration for
+  `run_user_inputs.kind`'s CHECK. Version skew is impossible by construction:
+  the only thing on the wire is a cancel every worker version has understood.
+- **D7 — the in-process counters are the FOURTH reason `api` is a hard singleton,
+  and the only one that fails silently.** Split across replicas, neither pod's
+  streak reaches the threshold and each pod's comparison set is a fraction of
+  reality, so auto-stop stops firing rather than misfiring. A guard that quietly
+  disarms looks exactly like a healthy fleet, which is why the failure DIRECTION
+  is written into `deploy/chart/values.yaml` at the line someone would edit.
+- **D8 — auto-stop is NOT subordinate to the health toggle.** `detectRunHealth`
+  no-ops when `health_enabled` is false. The `looping` flag may ride that toggle;
+  the availability fix must not, or an admin disabling health silently disables
+  loop protection. The operator control is `UZI_AUTOSTOP_ENABLED` — env, read at
+  boot, malformed value aborts boot — deliberately not a settings key, because an
+  automatic DESTRUCTIVE behaviour should not depend for its off switch on the
+  database it might be misbehaving against.
+- **D9 — `stalled`'s in-flight suppression is not weakened.** A long build
+  genuinely looks like silence, and the wedge presents as exactly that benign
+  case (its last persisted message is a `tool_use` with no result). The wedge is
+  caught by a new, independent signal instead. The new arm returns BEFORE
+  `stalled` is evaluated, so it can only add a flag where there was `slow` or
+  `ok`; it can never remove a suppression.
+- **D10 — there is no metrics surface, and the gap is recorded rather than
+  papered over.** Re-measured: zero `promhttp`/`prometheus`/`/metrics` hits in
+  `api/` and nothing in `go.mod`. So there is no counter to add, no dashboard and
+  no alert. M7 names the log lines an operator greps instead
+  (`docs/run-auto-stopped.md`); a metrics endpoint is its own PRD.
+
+**Six decisions Phase 2 made that the PRD did not anticipate:**
+
+- **The killable classes are `{unstorable, oversize}` — and the reason recorded is
+  NOT "a worker can choose it".** That justification does not discriminate:
+  `{"n":1e1000000}` is `json.Valid`, survives every class the sanitizer strips,
+  and is permanently unstorable; a worker POSTs an oversized body whenever it
+  likes. Applied consistently it empties the set and deletes the milestone. The
+  premise is false anyway — `/state` is mounted beside `/messages` and
+  `SetState`'s `failed` arm takes a worker-supplied reason, so a worker has
+  always been able to end its own run in one call; M5 adds no capability, only a
+  label, and a label problem is answered by M7's `failure_class` field.
+  **The test that discriminates: could a CORRECT pre-0.10.1 worker have produced
+  this in ordinary operation?** `unstorable` yes (a headless Chromium's HarfBuzz
+  spew puts raw NULs in a `tool_result`), `oversize` yes (a chatty run riding out
+  an outage grows past 1 MiB with no cap and no splitter), `invalid` never
+  (`kind` comes from a fixed SDK vocabulary, `seq` from the batcher's own
+  accounting, the payload from `JSON.stringify`), `store` no (500 means retry —
+  the contract Phase 1 exists to make honest — and `classifyStoreError` is
+  statement-level, so a `foldRunUsage` 500 is literally the same value as an
+  insert 500). **Auto-stop exists to protect a correct old client from the
+  world.** A worker defect is per-BUILD, not per-RUN: every run that image
+  touches fails identically, and the flag makes that correlated symptom visible
+  in ~10s — the signal that says roll the image. Auto-stopping them one at a time
+  would make the affected runs disappear while the broken build kept claiming new
+  ones, converting a loud diagnosable fleet symptom into a trickle of
+  individually-explained deaths.
+- **A streak is evidence about ONE RUNNING ATTEMPT.** It is evicted on terminal,
+  on leaving `running`, and — load-bearing — whenever the sweeper hands the run
+  back to the queue. `RequeueRunsOfStaleWorkers` writes `status='queued'` and
+  KEEPS `worker_id` for affinity, so without the eviction a requeued run returns
+  under a fresh worker still carrying the dead attempt's streak and dies before
+  the new worker persists a byte. Measured, both legs. The framing worth keeping:
+  an operator upgrades the worker image to fix the wedge, the run is requeued onto
+  a 0.10.1+ worker that would split, bisect and succeed, and the stale streak
+  kills it first — *the fix that made the upgrade worth doing is what the kill
+  lands on.*
+- **G4 asks "is the API's write path working"; "is the worker at fault" is G5's
+  question.** This is why peers held by the failing run's own worker are NOT
+  excluded from the comparison set: a same-worker peer persisting successfully
+  answers G4's question correctly, because the API did persist it. The exclusion
+  would make G4 attempt G5's job with a worse instrument. (It would also only
+  bite at `WORKER_MAX_CONCURRENT_RUNS > 1`, the default being 1.) Terminal runs
+  ARE excluded, because a worker could otherwise keep the kill armed for every
+  other user's runs with one deduplicated append every few minutes.
+- **The kill's status set is IDENTICAL to the flag's (`running` only).**
+  `runningTarget` is reached only from `healthTargetFor`'s `"running"` arm, so a
+  run in any other status was never flagged, and killing a run that was never
+  flagged breaks "health first, kill second". The realistic case is
+  `awaiting_approval`: `/state` and `/messages` are different routes and only
+  `/messages` wedges, so a run could otherwise report its plan, reach the gate,
+  and be killed while a human was reading the prompt.
+- **`UZI_AUTOSTOP_ENABLED` is a RUNTIME ESCAPE HATCH, not the shipping decision.**
+  An earlier framing called it the PRD's "ship M4, hold M5" fallback expressed as
+  configuration; that was retracted and is wrong. Holding M5 means not landing
+  its code — if the variable exists, its tests, its migration and its review have
+  all completed and one `helm upgrade --set` arms it. The code seam is the
+  shipping decision; this is the lever for an incident.
+- **Do not carry a guard COUNT anywhere.** Three places once carried three
+  different tallies for the same conjunction (five, six, seven), and every one of
+  them was consistent with a guard being ABSENT — which is exactly how the
+  killable-class gate went missing with nothing flagging it. A tally cannot detect
+  its own referent disappearing; citing the mechanism and where it lives can.
+
+See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
+for the full Decision Log, and [docs/run-auto-stopped.md](../docs/run-auto-stopped.md)
+for the operator-facing account — which, because PRD #47's exit contract clears
+run health on every terminal path, is together with M7's log lines the only
+durable record of why a run carries `stop_kind='auto_stopped'`.
