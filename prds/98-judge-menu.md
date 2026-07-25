@@ -1420,7 +1420,50 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       the only reason it is
       visible at all.
 
-- [ ] **Widen the query inventory beyond the judge family.** The declaration test landed for
+- [ ] **Widen the query inventory beyond the judge family.**
+
+      **STATE AT `407d6b72` (2026-07-25) — re-derive before trusting, the commands are below.**
+      **12 of 28 files covered, 53 queries declared. 16 files and 239 queries remain**, and the
+      original "five judge-family files (17 queries)" below describes the wave-2 tree, not this one.
+      ```sh
+      # what is covered / what is left
+      awk '/inventoryQueryFiles = /,/^}/' api/internal/store/query_inventory_test.go \
+        | grep -oE '"[a-z_]+\.sql"' | tr -d '"' | sort            # covered
+      ls api/internal/store/queries/*.sql | xargs -n1 basename | sort   # all
+      ```
+      Remaining, by size — **but note this is the COST, not the priority**: the file's own rule is
+      that files are picked by RISK, a query whose drift is silent and user-visible before one
+      whose breakage is loud. `runtime.sql` 66 · `forge.sql` 31 · `users.sql` 21 ·
+      `user_secrets.sql` 18 · `slack.sql` 18 · `chat.sql` 16 · `skills.sql` 13 ·
+      `agent_templates.sql` 9 · `agent_template_allocations.sql` 7 · `tool_profiles.sql`,
+      `pipeline_statuses.sql`, `hosted_workers.sql`, `cli_auth_requests.sql`,
+      `anthropic_rate_limits.sql` 6 each · `ci_fix.sql`, `autopilot.sql` 5 each. The two large
+      ones are ~40% of what is left and want a wave each; the nine small ones go in ones and twos
+      alongside other work, which is how the first twelve landed.
+
+      **HOW TO WIDEN — the procedure, because the entry below explains the constraints and not the
+      steps:**
+      1. **Add the file to `inventoryQueryFiles`.** That is the only switch. The test goes red and
+         **names every query in that file with no row**, so the work list derives itself rather
+         than being estimated.
+      2. **Open the call sites and declare one of three states per query.** `PINNED` — name the
+         test function; the test verifies the name resolves, so a typo or a deleted test fails the
+         build. **`UNPINNED`** — no test executes it, *and why*. **`EXERCISED-UNASSERTED`** — a live
+         test executes it and nothing asserts on the result; this state exists because of a real
+         case (`CountActiveSelfImproveRuns`): the route reaches the query but the caller swallows
+         the error, so the 200 assertion structurally cannot observe it, and neither of the other
+         two states would have been true.
+      3. **FOLD-VERIFY the pin, do not assert it.** Mutate the query, confirm the named test
+         reddens, restore. A row naming a test that merely brushes the query is exactly as green as
+         one that reddens under mutation, and only the fold separates them. **Two rows in this PRD
+         were found overstated in exactly that way** — including one added while resolving a merge
+         conflict, whose `why` claimed a column pinned a JOIN it did not.
+      4. **Watch out:** the pin resolver collects **every top-level func** under `api/`, not just
+         test functions, so a row could name `main` and pass. Latent today; it bites the first time
+         someone declares a pin carelessly.
+
+      *(Original entry follows — its measurements are the record of how the mechanism was designed
+      and are still accurate about the judge family.)* The declaration test landed for
       the five judge-family `.sql` files (**17 queries**). Repo-wide is **28 files** — and the
       query count is whatever the tree holds when you read this: `grep -h '^-- name:'
       api/internal/store/queries/*.sql | wc -l` gives **292 at `d2c2d1f4`**, against 290 recorded
