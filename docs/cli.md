@@ -85,6 +85,7 @@ uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
 uzi skill status | install [--force] | install-hook | uninstall-hook
+uzi tui [run-id]
 uzi version
 ```
 
@@ -162,6 +163,107 @@ A few worth knowing:
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).
+
+## Watching runs live: `uzi tui`
+
+```sh
+uzi tui            # board — a live view of your own runs
+uzi tui <run-id>   # jump straight into one run's lanes
+```
+
+A full-screen, keyboard-driven view of the factory: a board that updates
+itself, a drill-in showing what each subagent is doing right now, and
+in-place steering — all without leaving the keyboard. It needs an
+interactive terminal; run it against a pipe or in CI and it exits with a
+usage error pointing at `run list --json` and `run logs --follow` instead of
+drawing escape codes into your log.
+
+**This doesn't replace `run logs --follow`.** The TUI is for a human at a
+keyboard; `--follow` (with `--json` for NDJSON, `--after <seq>` to resume,
+and stop-on-terminal-status) stays the scriptable, single-run surface and is
+also the TUI's own fallback when the live channel is unreachable (below).
+
+### Three views
+
+- **Board** (the default). Your own runs, refreshed on a poll — a live list
+  doesn't need a socket per row, so this is the one screen that doesn't use
+  the live channel. `[a]` toggles the factory-wide admin board (needs a
+  `uza_` token; a `uzc_` token gets refused inline and stays on your own
+  runs, never a crash). **The admin board isn't your own-runs list widened —
+  it's a different shape**: active runs only (nothing completed), capped at
+  500, no judge-verdict or usage columns, titled "active runs (factory-wide)"
+  on screen so it never promises a row it can't show.
+- **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
+  A left rail of agent lanes — the lead plus each live subagent, one lane per
+  invocation, each with a status dot — beside the selected lane's transcript,
+  rendered as markdown. Lanes are built from the same per-invocation
+  `agent`/`agent_instance`/`agent_label` attribution `run logs` prints; see
+  [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
+  for what a lane's dot means.
+- **Review overlay** (`[v]` from run detail). The judge's verdict, summary,
+  and recommendations, with the same resolve/dismiss/undo triage described
+  under [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli).
+
+### Keybindings
+
+```
+j/k, ↓/↑     move (board: row · detail: scroll the transcript)
+tab, h/l     switch lane (detail view only; h/← previous, tab/l/→ next)
+enter        open the selected run (board)
+/            filter the board
+a            toggle the factory-wide admin board (board only)
+r            refresh
+v            open/close the review overlay (detail)
+f            start a follow-up (detail, owner only)
+y/n          approve/reject, at a plan gate (detail, owner only)
+x            cancel the run, asks to confirm (detail, owner only)
+esc          back out / dismiss
+?            this help
+q            quit — asks to confirm; a second ctrl+c quits at once
+```
+
+Note what isn't here: there's no `[a]`-for-approve and no bare `[q]`-quits —
+early drafts of this feature used both, but `[a]` doubling as admin-toggle
+*and* approve would put "approve a plan" one keystroke from `[x]` cancel on
+a live run, so approve/reject moved to `y`/`n` and `a` stayed admin-only.
+Quitting always asks first (`q` or `ctrl+c`); a second `ctrl+c` is the
+escape hatch when the confirm prompt itself is what's stuck.
+
+### Steering is run-level, not per-agent
+
+The steer bar sends `follow_up`, `approve_plan`, `reject_plan`, or `cancel`
+to the **run** — there's no wire to whisper to one live subagent. The lane
+rail is where you *watch* per-agent activity; the run (and its lead, who
+then directs its own subagents) is what you *steer*. A queued/delivered
+indicator above the bar reflects the same steer queue `uzi run inputs`
+prints.
+
+### Who can steer what
+
+The steer bar only appears when you own the run — an admin who opens
+someone else's run through `[a]` sees the transcript, lanes, and review
+render normally, but the steer bar and queue indicator are replaced with a
+one-line reason instead of controls that would 404. Ownership is checked by
+asking the server (the same read the steer write itself scopes by), not by
+comparing ids client-side, so the two can't drift apart.
+
+**`uzi tui <chat-run>` opens and is read-only, on purpose.** Chat runs never
+appear on the board — you can only reach one by id — and the TUI always
+suppresses the steer bar for `kind=chat`: a chat follow-up is a
+forge-minting action that belongs to the web's guarded, cookie-only chat
+surface, and the plain run-input write doesn't know to keep a raw follow-up
+out of it. Watching a chat run's transcript and lanes still works.
+
+### The live channel and degradation
+
+Run detail subscribes to the same `/api/ws` hub the web run view rides,
+now reachable with a Bearer CLI token (`uzc_`/`uza_`) as well as a browser
+session — that's the one backend change this feature needed; per-run
+authorization (owner-or-admin) and the socket's origin check are both
+unchanged. If the socket can't be opened or drops, the view falls back to a
+plain 2s REST poll — the same cadence `run logs --follow` uses — and says so
+on screen rather than freezing silently. A non-TTY stdout is refused up
+front, before anything tries to draw (see above).
 
 ## Reviewing and triaging from the CLI
 

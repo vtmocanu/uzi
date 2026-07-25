@@ -732,8 +732,24 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			})
 		})
 
-		// Cookie-only tail: self usage, chat (mints runs) and the WS follow channel
-		// (deferred — ws.go asserts it runs inside the session-authenticated group).
+		// The run live channel (PRD #112 M1): a WebSocket subscribed to ONE run's
+		// events. It is a SIBLING group carrying the same guard as the run READS above
+		// — not inside r.Route("/runs"), which it cannot be, since the path is
+		// /api/ws — and deliberately not below in the cookie-only tail, because it IS
+		// a read: every frame it carries was already persisted and is
+		// re-readable over GET /{id}/messages, and its per-run authz is the same
+		// GetRunForViewer. RequireUser (session OR uzc_/uza_) so a headless CLI/TUI can
+		// subscribe; a GET upgrade, so the cookie path passes CSRF exactly as it did
+		// under RequireAuth and is byte-identical after the move. Origin validation +
+		// per-run authz are enforced in ServeWS — read its docstring for why the one
+		// unchanged same-origin rule covers both credential paths.
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/ws", h.ServeWS)
+		})
+
+		// Cookie-only tail: self usage and chat (mints runs). The WS follow channel
+		// used to sit here and no longer does (PRD #112 M1, the group above).
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 
@@ -760,11 +776,6 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/proposals/{pid}/confirm", h.ConfirmProposal)
 				r.Post("/{id}/proposals/{pid}/dismiss", h.DismissProposal)
 			})
-
-			// Browser live channel (M5): a WebSocket subscribed to one run's
-			// events. Session-cookie authN via RequireAuth above (a GET upgrade, so
-			// no CSRF step); Origin validation + per-run authz enforced in ServeWS.
-			r.Get("/ws", h.ServeWS)
 		})
 
 		h.mountWorkerRoutes(r, proposalLimiter)

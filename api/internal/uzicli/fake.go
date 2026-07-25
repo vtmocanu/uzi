@@ -104,6 +104,12 @@ type FakeClient struct {
 	LastBulkReason        string
 	BulkDispositionErr    error
 
+	// Live stream (PRD #112 M2). StreamEvents is replayed to the subscriber in
+	// order; StreamErr models a socket that cannot be opened at all.
+	StreamEvents    []apitypes.RunEventDTO
+	StreamErr       error
+	LastStreamRunID string
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -344,4 +350,24 @@ func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string,
 		return apitypes.RunInputResponse{}, f.Err
 	}
 	return f.InputResp, nil
+}
+
+// StreamRun replays StreamEvents to a subscriber and then holds the stream open
+// until the caller cancels, mirroring a live socket that has simply gone quiet
+// rather than one that ended. StreamErr models an unusable socket (the D8
+// fall-back-to-polling path); it is returned in preference to Err so a test can
+// have the REST reads succeed while only the stream fails, which is exactly the
+// degradation the TUI has to handle and which a global Err cannot express.
+//
+// The events go through NormalizeRunEvent, like the live decode boundary, so a
+// fake cannot deliver a frame shape the real client would have made inert.
+func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, error) {
+	f.LastStreamRunID = runID
+	if f.StreamErr != nil {
+		return nil, f.StreamErr
+	}
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return NewRunStream(ctx, f.StreamEvents), nil
 }

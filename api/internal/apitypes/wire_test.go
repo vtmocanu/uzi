@@ -391,3 +391,31 @@ func contains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// RunEventDTO is the /api/ws frame (PRD #112). Both halves matter and the second is
+// the load-bearing one: every field except `type` is omitempty, so a pin on the ZERO
+// value asserts exactly one key and would sail through a rename of the other eight.
+// The populated pin is what actually holds the wire contract — and this type is
+// aliased by hub.Event, so it is one shape for the server, the web and the CLI.
+func TestRunEventDTOTags(t *testing.T) {
+	// Zero value: the signal frames (state/health/input) really do serialize to just
+	// a type, which is the property the CLI's seq-less recovery contract rests on.
+	assertTags(t, "RunEventDTO(zero)", RunEventDTO{}, "type")
+
+	agent, instance, label := "coder", "toolu_01", "write the tests"
+	now := time.Unix(0, 0)
+	full := RunEventDTO{
+		Type:          "message",
+		Seq:           7,
+		Kind:          "text",
+		Agent:         &agent,
+		AgentInstance: &instance,
+		AgentLabel:    &label,
+		Payload:       json.RawMessage(`{"text":"hi"}`),
+		CreatedAt:     &now,
+		Status:        "running",
+	}
+	assertTags(t, "RunEventDTO(full)", full,
+		"type", "seq", "kind", "agent", "agent_instance", "agent_label",
+		"payload", "created_at", "status")
+}

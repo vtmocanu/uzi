@@ -119,11 +119,15 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
     `/api/ws?run=<id>` (the browser's primary real-time transport; every *other*
     stream assertion here uses the REST `?after=<seq>` replay), authenticating with
     the admin **session cookie** plumbed into the upgrade — a GET upgrade behind
-    `RequireAuth`, with a same-origin (CSWSH) check and per-run authz. It subscribes
+    `RequireUser`, with a same-origin (CSWSH) check and per-run authz. It subscribes
     **first**, then approves the parked plan on socket open, and asserts it receives a
     live `run_message` frame (hub-broadcast → client wire, not REST replay); a
     **no-cookie** upgrade is separately asserted to be **rejected**, so the gate is
-    non-vacuous. **CLI**: `api/cmd/uzi` is built on the host and pointed at the live
+    non-vacuous. A third leg (PRD #112 M1) repeats the subscribe over a **Bearer
+    `uzc_` token with no `Origin` header** — the headless `uzi tui` shape — approving
+    from inside the socket over the same token, with a **bogus-Bearer** rejection as
+    its own negative control; that is the only place both credential classes are
+    driven against one route. **CLI**: `api/cmd/uzi` is built on the host and pointed at the live
     api, authed headless via a minted `uzc_` `$UZI_TOKEN` (from `POST
     /api/me/cli-tokens`); `uzi run list --json` must parse and its run-id set must
     equal `GET /api/runs`'s, then `uzi run approve` drives a parked run to
