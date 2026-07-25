@@ -447,6 +447,20 @@ func nonEmpty(in []string) []string {
 // renderRunDetail prints a run as an aligned key/value block. Health + the health
 // reason are surfaced here (Risk 4): a run parked behind a locked vault carries
 // its reason on the DTO, so `uzi run get` shows it without a webui round-trip.
+//
+// STOP_KIND is here for PRD #108 M9b, and it is the one row this block genuinely
+// owed. Without it an auto-stopped run reads
+//
+//	STATUS           failed
+//	FAILURE_REASON   run cancelled
+//
+// — byte-identical to a user cancel, because on the live-poller half the worker's
+// own SetRunFailed overwrites failure_reason with REASON_CANCELLED. stop_kind is
+// the ONLY field that survives both halves of that stop, so without this row the
+// CLI cannot distinguish "you stopped this" from "uzi stopped this because your
+// updates could not be saved". The reasons need no change here: this block already
+// prints HEALTH_REASON and FAILURE_REASON generically, switching on no vocabulary,
+// so PRD #108's new reason strings flow through untouched.
 func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	rows := [][]string{
 		{"ID", r.ID},
@@ -462,6 +476,13 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
+	}
+	// Emitted only when set, like its two neighbours — every non-stopped run would
+	// otherwise carry a blank row. It is a server-controlled enum, so sanitizeTTY is
+	// not strictly required; applied anyway for uniformity with the free text above,
+	// and because "server-controlled today" is exactly the assumption that rots.
+	if r.StopKind != nil && *r.StopKind != "" {
+		rows = append(rows, []string{"STOP_KIND", sanitizeTTY(*r.StopKind)})
 	}
 	return p.Table(nil, rows)
 }

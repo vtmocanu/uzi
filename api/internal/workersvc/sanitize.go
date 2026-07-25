@@ -251,6 +251,14 @@ func hex4(b []byte) (rune, bool) {
 // (57*), and any non-PgError at all — notably context.Canceled from a
 // disconnecting worker — must all be retried. So must 23503 (the run was deleted
 // mid-batch): permanent, but not a payload fault, and out of Phase 1's scope.
+// 🔴 SINCE PRD #108 M5 THIS SET IS LOAD-BEARING FOR A KILL, NOT ONLY FOR A STATUS
+// CODE. A SQLSTATE in here becomes ErrUnstorableMessage, which is one of the two
+// classes in autoStopKillableKinds — so widening this set widens what auto-stop is
+// willing to terminate a run over. The membership test is no longer just "is this
+// permanent"; it is also "could a CORRECT pre-0.10.1 worker have produced it in
+// ordinary operation", because that is the question auto-stop's exclusion of
+// `invalid` turns on (autostop.go). Adding a code here without answering it is how
+// a transient class quietly becomes a kill.
 var unstorableSQLSTATEs = map[string]bool{
 	"22P05": true,
 	"22P02": true,

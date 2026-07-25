@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/clitoken"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 )
 
@@ -35,17 +37,28 @@ import (
 // a test goes green against a hole it was written to catch.
 //
 // POSITIVE CONTROLS — these were run, and a future reader should re-run them before
-// trusting this file (measured 2026-07-25):
+// trusting this file. Run them over the WHOLE package, not a -run filter: the first
+// version of this comment claimed "and nothing else" for mutation A while having only
+// ever measured the six tests below, and it was wrong by one. A blast radius measured
+// through a filter is not a blast radius (measured 2026-07-25):
 //
 //   - Drop `AND NOT revoked AND (expires_at IS NULL OR expires_at > now())` from
-//     getCLITokenByHash. Reddens exactly the `revoked` and `expired` subtests, plus
-//     the revocation-landed control in (P5) — which reads the same predicate — and
-//     nothing else.
+//     getCLITokenByHash. Reddens the `revoked` and `expired` subtests, the
+//     revocation-landed control in (P5) which reads the same predicate, and the
+//     pre-existing TestCLIExpiredRevokedReject401LiveDB, which pins the same predicate
+//     on the REST path — and nothing else.
 //   - Neuter the `!user.IsActive` check in middleware/cli_auth.go. Reddens exactly the
-//     `owner_deactivated` subtest and nothing else.
+//     `owner_deactivated` subtest and nothing else, across the whole package.
 //
-// Each mutation reddens only its own assertion: the instrument discriminates rather
-// than smearing one fault across the file.
+// No mutation smears across unrelated tests: each reddens the assertions that read the
+// predicate it broke, and only those.
+//
+// Mutation B's result is a finding in its own right, and a stronger one than the reason
+// this file was written. `owner_deactivated` is the ONLY test in the package that goes
+// red when the deactivation check is removed — so before this file, the account
+// kill-switch had no gate anywhere, on any route. Not "the WS path lacked coverage
+// while REST had it": nothing was watching. That is why the deactivation case below
+// carries its own control rather than sharing one.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
@@ -243,7 +256,57 @@ func TestWSWorkerJoinTokenCannotOpenLiveDB(t *testing.T) {
 //
 // The re-dial is load-bearing: without it, "frames still arrive" is equally explained
 // by a revocation that never landed.
+//
+// The whole value of a change detector is in the going-red, so it does NOT use the
+// shared wsReadMarkedFrame: that helper's read diagnostic blames the hub→client wire
+// and says "(not the auth change)", which is precisely backwards here. If this read
+// ever fails it is most likely because mid-socket revocation was implemented — the one
+// cause the shared message rules out — and the next reader would spend an hour in a hub
+// that is working fine. wsReadFrameOrExplainRevocation says so instead.
 // -------------------------------------------------------------------------
+
+// wsReadFrameOrExplainRevocation is wsReadMarkedFrame with the diagnostic (P5) needs:
+// it names the design change that would cause the read to fail, rather than the wire.
+// The republish ticker is load-bearing for the same reason it is in the shared helper —
+// ServeWS subscribes a beat AFTER the handshake returns, and the hub is live-only, so a
+// single publish racing that window is broadcast to nobody and lost.
+func wsReadFrameOrExplainRevocation(ctx context.Context, t *testing.T, h *Handler, c *websocket.Conn, runID uuid.UUID, seq int32, marker string) hub.Event {
+	t.Helper()
+	payload, err := json.Marshal(map[string]string{"marker": marker})
+	if err != nil {
+		t.Fatalf("marshal marker payload: %v", err)
+	}
+	stop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				h.hub.PublishMessage(runID, seq, "text", "coder", "", "", payload, time.Now())
+			}
+		}
+	}()
+	defer close(stop)
+
+	_, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("the socket stopped delivering after its uzc_ was revoked: %v\n"+
+			"This test RECORDS that revocation does not reach an open socket. If it now does, "+
+			"that is very likely a deliberate change (mid-socket revocation, a periodic "+
+			"re-auth in ServeWS's loop, or a hub eviction on token revoke) — update PRD #112's "+
+			"threat model and rewrite this test to assert the new bound. DO NOT debug the "+
+			"hub→client wire: the three tests in ws_bearer_livedb_test.go read frames over "+
+			"the same wire and would be red too if it were broken.", err)
+	}
+	var ev hub.Event
+	if err := json.Unmarshal(data, &ev); err != nil {
+		t.Fatalf("the frame on the wire is not a hub.Event: %v (raw %q)", err, string(data))
+	}
+	return ev
+}
 
 func TestWSRevocationDoesNotCloseAnOpenSocketLiveDB(t *testing.T) {
 	h, router, pool := cliLiveDB(t)
@@ -270,7 +333,7 @@ func TestWSRevocationDoesNotCloseAnOpenSocketLiveDB(t *testing.T) {
 		"the revocation did not land (a NEW dial with the revoked token still opened)")
 
 	marker := uuid.NewString()
-	ev := wsReadMarkedFrame(ctx, t, h, c, runID, 5, marker)
+	ev := wsReadFrameOrExplainRevocation(ctx, t, h, c, runID, 5, marker)
 	wsAssertMarkedFrame(t, ev, 5, marker)
 	t.Logf("RECORDED BEHAVIOUR: an already-open /api/ws socket keeps delivering frames "+
 		"after its uzc_ is revoked (read seq=%d after revocation). AuthN is handshake-only; "+

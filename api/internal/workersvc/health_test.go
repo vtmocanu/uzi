@@ -27,12 +27,20 @@ type healthFakeStore struct {
 	// leftStatus marks run ids whose SetRunHealth returns 0 rows — the exit race,
 	// where the run changed status between the list read and the health write.
 	leftStatus map[uuid.UUID]bool
+	// windowCalls counts ListRunToolWindow fetches per run. PRD #108 M4's arm
+	// returns above that query, so this is how a test proves the wedged case stops
+	// issuing one per tick — an assertion the returned flag alone cannot make.
+	windowCalls map[uuid.UUID]int
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
 	return f.active, nil
 }
 func (f *healthFakeStore) ListRunToolWindow(_ context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error) {
+	if f.windowCalls == nil {
+		f.windowCalls = map[uuid.UUID]int{}
+	}
+	f.windowCalls[arg.RunID]++
 	return f.window[arg.RunID], nil
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {

@@ -180,6 +180,46 @@ func TestRunGetHealthReason(t *testing.T) {
 	}
 }
 
+// PRD #108 M9b. An auto-stopped run must be distinguishable from a user cancel at
+// the CLI, and the two are IDENTICAL on every other field: both end `failed`, and
+// on the live-poller half the worker's own SetRunFailed overwrites failure_reason
+// with "run cancelled". stop_kind is the only thing that tells them apart.
+func TestRunGetSurfacesStopKind(t *testing.T) {
+	autoStop, cancelled := "auto_stopped", "cancelled"
+	// The SAME failure_reason on both, which is what the live half actually produces
+	// — the point being that the reason cannot be the discriminator.
+	reason := "run cancelled"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"auto":  {ID: "auto", Status: "failed", FailureReason: &reason, StopKind: &autoStop},
+		"user":  {ID: "user", Status: "failed", FailureReason: &reason, StopKind: &cancelled},
+		"plain": {ID: "plain", Status: "failed", FailureReason: &reason},
+	}}
+
+	autoOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "auto")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(autoOut, "STOP_KIND") || !strings.Contains(autoOut, "auto_stopped") {
+		t.Fatalf("an auto-stopped run does not show its stop kind, so it is indistinguishable from a user cancel:\n%s", autoOut)
+	}
+	userOut, _, _ := runCLI(t, fakeEnv(fc), "run", "get", "user")
+	if !strings.Contains(userOut, "cancelled") {
+		t.Errorf("a user-cancelled run lost its stop kind:\n%s", userOut)
+	}
+	// The whole claim, stated as a comparison rather than as two substring checks:
+	// the two outputs must actually DIFFER. Without this the assertions above would
+	// pass on a build that printed the same constant for every run.
+	if autoOut == userOut {
+		t.Errorf("an auto-stop and a user cancel render identically; stop_kind is the only field that separates them:\n%s", autoOut)
+	}
+	// And a run that stopped for neither reason carries no row at all, rather than an
+	// empty one — same shape as HEALTH_REASON and FAILURE_REASON above it.
+	plainOut, _, _ := runCLI(t, fakeEnv(fc), "run", "get", "plain")
+	if strings.Contains(plainOut, "STOP_KIND") {
+		t.Errorf("a genuine failure (no stop_kind) printed an empty STOP_KIND row:\n%s", plainOut)
+	}
+}
+
 func TestRunGetMissingExit4(t *testing.T) {
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{}}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "get", "nope")
@@ -937,4 +977,26 @@ func derefOr(s *string) string {
 		return "<nil>"
 	}
 	return *s
+}
+
+// PRD #108 M9b. docs/run-auto-stopped.md's first remedy for an auto-stopped run is
+// "check the worker's version" — v0.10.1+ isolates a poisoned message itself, so an
+// upgrade is the real fix. The web has shown it since PRD #42; the CLI did not, so
+// the page shipped a remedy one of its two audiences could not follow.
+func TestWorkerListShowsVersion(t *testing.T) {
+	v := "v0.10.1"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", Version: &v},
+		{ID: "w2", Name: "beta", Status: "offline"}, // never registered a version
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "VERSION") || !strings.Contains(out, v) {
+		t.Fatalf("worker list does not surface the version, so the doc's first remedy is unfollowable from the CLI:\n%s", out)
+	}
+	if !strings.Contains(out, "-") {
+		t.Errorf("a worker that never registered a version should render \"-\", not an empty cell:\n%s", out)
+	}
 }

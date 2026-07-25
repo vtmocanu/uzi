@@ -2,6 +2,9 @@
 
 **Issue**: [#118](https://gitlab.example.com/vtmocanu/uzi/-/issues/118) · **Label**: PRD · **Priority**: Low
 **Area**: `web/` — the `Select` UI primitive (`web/src/components/ui.tsx`) and its one styled-override caller, the Workers page token picker (PRD #104 lineage).
+**Status**: **DONE** — merged `cbc660e7` via `f8b79b9f`, released in **v0.11.3**. Closed 2026-07-25.
+
+> **Verified against the merged diff 2026-07-25.** M1: `ui.tsx:123` is `cx(INPUT_CLASS, className)` — and the same fix landed for `Input` and `Textarea` (`:119`, `:127`), which the PRD scoped to `Select` alone; the wider fix is correct and is noted here rather than left unrecorded. `ui.test.tsx:21-25` asserts both base tokens (`border-edge`, `bg-raised`) and the caller's classes (`h-8`, `custom-x`), the composition pin M1 asked for. M2: `WorkersSettings.test.tsx:602-603` asserts the picker keeps base-field styling. Web suite re-run at close: 959 tests green, `tsc` clean. The M2 in-app confirmation is ticked on shipped-and-live evidence (v0.11.3), not on a recorded manual pass.
 
 ## Problem
 
@@ -111,14 +114,14 @@ Two files, one of them a one-line primitive change.
 
 ## Milestones
 
-- [ ] **M1 — Fix the primitive + pin it.** Merge `className` in `Select` via
+- [x] **M1 — Fix the primitive + pin it.** Merge `className` in `Select` via
   `cx(INPUT_CLASS, className)`. Add a `web/src/components/ui.test.tsx` assertion
   (create it if absent) that a `<Select className="h-8 custom-x">` renders a
   `<select>` whose class list contains **both** a base-styling token from
   `INPUT_CLASS` (e.g. `border-edge` or `bg-raised`) **and** the caller's classes
   (`h-8`, `custom-x`) — a positive pin proving the two compose rather than one
   replacing the other. `npm test` + `npm run typecheck` green.
-- [ ] **M2 — Verify in-app + guard the regression.** Confirm in the running app
+- [x] **M2 — Verify in-app + guard the regression.** Confirm in the running app
   (mock mode is enough) that the Workers-page token picker now matches the Size
   chooser's styling, and eyeball the row layout with several badges present so
   the now-`w-full`/`max-w-[11rem]` picker sits well next to them and the Delete

@@ -322,8 +322,9 @@ export interface LatestRun {
   // board card (the issue's latest run); a superseded run's value can be stale.
   mr_state: string | null;
   failure_reason: string | null;
-  // Server-stamped deliberate-stop signal (PRD #33); null for every non-stop run.
-  // Read by isStoppedRun to render a stop as calm "stopped" instead of rose "failed".
+  // Server-stamped stop signal (PRD #33, widened by #108 M5); null for every
+  // non-stop run. Read by isStoppedRun, which renders the two HUMAN kinds as a calm
+  // "stopped" and deliberately leaves "auto_stopped" looking like the breakage it is.
   stop_kind: StopKind | null;
   // Run-health flag (PRD #47). health + health_since are non-sensitive (like
   // stop_kind) and always present. health_reason can name owner state ("your vault
@@ -682,12 +683,20 @@ export function isTerminalRun(status: string): boolean {
   return (TERMINAL_RUN_STATUSES as string[]).includes(status);
 }
 
-// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled" or
-// "plan_rejected", null for a run that stopped for any other reason (a genuine
-// failure, a timeout, or is still going). isStoppedRun reads this — never the
-// free-text failure_reason — so a live-poller plan reject carrying the user's
-// verbatim reason is still recognised as a deliberate stop.
-export type StopKind = "cancelled" | "plan_rejected";
+// StopKind is the server-stamped stop signal (PRD #33, widened by PRD #108 M5):
+// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
+// the SERVER stopped a run whose updates could not be saved, and null for a run
+// that stopped for any other reason (a genuine failure, a timeout, or is still
+// going). isStoppedRun reads this — never the free-text failure_reason — so a
+// live-poller plan reject carrying the user's verbatim reason is still recognised.
+//
+// It does NOT treat every value alike, and that distinction is the point: only the
+// two human kinds are styled as a calm "stopped". See isStoppedRun.
+//
+// This union crosses a JSON decode boundary, so an unlisted member is a silent lie
+// rather than a type error — TypeScript cannot catch a missing value here, only a
+// test can.
+export type StopKind = "cancelled" | "plan_rejected" | "auto_stopped";
 
 // RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
 // self-clearing signal that a run looks slow, stuck, or looping. "ok" is the
@@ -748,8 +757,9 @@ export interface Run {
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
   mr_state: string | null;
   failure_reason: string | null;
-  /** Server-stamped deliberate-stop signal (PRD #33): "cancelled" or
-   *  "plan_rejected", null otherwise. isStoppedRun reads this, not failure_reason. */
+  /** Server-stamped stop signal (PRD #33, widened by #108 M5): "cancelled" or
+   *  "plan_rejected" (human), "auto_stopped" (server), null otherwise. isStoppedRun
+   *  reads this, not failure_reason — and treats only the two human kinds as calm. */
   stop_kind: StopKind | null;
   /** Run-health flag (PRD #47). This owner-scoped DTO carries health_reason
    *  unconditionally (the run view is owner/admin only); health_since drives the

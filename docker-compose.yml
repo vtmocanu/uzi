@@ -167,6 +167,15 @@ services:
       RUN_MAX_ITERATIONS: ${RUN_MAX_ITERATIONS:-5}
       PLAN_MAX_REVISIONS: ${PLAN_MAX_REVISIONS:-3}
       RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
+      # PRD #108 M5's auto-stop kill switch. Passed through explicitly because the
+      # comment above is load-bearing here in a way it is not for a tuning knob:
+      # docs/run-auto-stopped.md TELLS an operator to set this to disable a behaviour
+      # that terminates runs, and without this line that instruction silently does
+      # nothing on compose — config.go's `true` default wins and the operator
+      # believes they disarmed something they did not. That is the exact failure the
+      # abort-on-malformed-value choice in config.go exists to prevent, arriving by
+      # a different route.
+      UZI_AUTOSTOP_ENABLED: ${UZI_AUTOSTOP_ENABLED:-true}
       WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
       WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
     # Not published to the host: reached only by web over the compose network.
