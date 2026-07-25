@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -83,6 +84,87 @@ func (q *Queries) GetCLITokenByHash(ctx context.Context, tokenHash []byte) (CliT
 		&i.ExpiresAt,
 	)
 	return i, err
+}
+
+const listAllCLITokensForAdmin = `-- name: ListAllCLITokensForAdmin :many
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.name,
+       t.token_prefix,
+       t.scope,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM cli_tokens t
+  JOIN users u ON u.id = t.user_id
+ ORDER BY t.revoked ASC, u.email ASC, t.created_at DESC, t.id ASC
+`
+
+type ListAllCLITokensForAdminRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	OwnerEmail  string             `json:"owner_email"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scope       string             `json:"scope"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+}
+
+// The factory-wide standing-credential inventory (admin read-only). The question it
+// exists to answer is "who holds credentials to this instance, and are any stale or
+// unexpected?" — which nothing could answer before: every other query in this file is
+// scoped to one user_id or to one token_hash, so a token was visible to its owner and
+// to nobody else, while `workers` has had an admin-wide view since PRD #42.
+//
+// COLUMNS ARE PROJECTED EXPLICITLY, AND THAT IS A SECURITY BOUNDARY, NOT A STYLE
+// CHOICE. token_hash is omitted here rather than dropped in the DTO, so it is absent
+// from the generated Go struct and a future DTO edit CANNOT leak it — the sha256 of a
+// credential is offline-crackable, and an admin-wide list of them would turn a
+// visibility fix into a credential-disclosure surface. Contrast ListCLITokens above,
+// which is `SELECT *` and relies on cliTokenDTO to drop the hash: that is safe today
+// because the row never leaves the handler, but it is one careless marshal away from
+// not being. Do not "simplify" this to SELECT * or sqlc.embed.
+//
+// Revoked rows are INCLUDED: a revoked token is the incident trail (the whole reason
+// this table soft-deletes), so an audit view that hid them would hide exactly what an
+// investigation needs. They sort last.
+func (q *Queries) ListAllCLITokensForAdmin(ctx context.Context) ([]ListAllCLITokensForAdminRow, error) {
+	rows, err := q.db.Query(ctx, listAllCLITokensForAdmin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllCLITokensForAdminRow{}
+	for rows.Next() {
+		var i ListAllCLITokensForAdminRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OwnerEmail,
+			&i.Name,
+			&i.TokenPrefix,
+			&i.Scope,
+			&i.Revoked,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.LastUsedIp,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listCLITokens = `-- name: ListCLITokens :many

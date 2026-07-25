@@ -239,8 +239,8 @@ func TestCLICeilingTrioCrossUser404LiveDB(t *testing.T) {
 	owner := cliSeedUser(t, pool, false)
 	runID := cliSeedJudgedRun(t, pool, owner)
 
-	adminUzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)     // masked to IsAdmin=false
-	adminUza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)  // keeps IsAdmin
+	adminUzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)    // masked to IsAdmin=false
+	adminUza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO) // keeps IsAdmin
 	ownerUzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 
 	paths := []string{
@@ -413,6 +413,11 @@ var adminReadPaths = []string{
 	"/api/admin/usage",
 	"/api/admin/rate-limits",
 	"/api/admin/selfimprove",
+	// The standing-credential inventory. It belongs here for a sharper reason than
+	// the others: it is the one admin read whose BODY is itself security-relevant, so
+	// "a user-scope uzc_ cannot reach it" is the assertion that keeps a token holder
+	// from enumerating every credential in the factory.
+	"/api/admin/cli-tokens",
 }
 
 func TestCLIAdminSurfaceLiveDB(t *testing.T) {
@@ -421,8 +426,10 @@ func TestCLIAdminSurfaceLiveDB(t *testing.T) {
 	uza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)
 	uzc := cliMintToken(t, pool, admin, clitoken.ScopeUser) // admin owner, but user scope
 
-	// A uza_ reads all 9 admin GETs; the same admin's uzc_ is rejected by every one
-	// (the masking, not the route prefix, is doing the work here).
+	// A uza_ reads every admin GET in adminReadPaths; the same admin's uzc_ is
+	// rejected by every one (the masking, not the route prefix, is doing the work
+	// here). Deliberately not a count — the list grows, and a tally in a comment goes
+	// stale exactly like a line number.
 	for _, p := range adminReadPaths {
 		if rec := bearerReq(router, http.MethodGet, p, uza); rec.Code != http.StatusOK {
 			t.Errorf("uza_ GET %s = %d, want 200\nbody: %s", p, rec.Code, rec.Body.String())

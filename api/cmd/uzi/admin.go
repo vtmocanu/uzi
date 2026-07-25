@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -159,7 +160,48 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, usage, rateLimits)
+	cliTokens := &cobra.Command{
+		Use:   "cli-tokens",
+		Short: "List every CLI token in the factory (metadata only)",
+		Long: "List every CLI token in the factory with its owner, so an operator can " +
+			"answer who holds standing credentials to this instance and whether any are " +
+			"stale or unexpected.\n\n" +
+			"Never prints a token value or its hash: the value is not stored at all, and " +
+			"the hash is excluded by the query's projection. USED is the coarse (<=1/min) " +
+			"last-use stamp and, with the prefix, the only forensic signal there is -- " +
+			"there is no per-request audit log. A blank EXPIRES is a never-expiring " +
+			"user-scope token, which is the row most worth looking at.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			ts, err := c.AdminListCLITokens(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(ts)
+			}
+			rows := make([][]string, 0, len(ts))
+			for _, t := range ts {
+				rows = append(rows, []string{
+					t.OwnerEmail,
+					t.TokenPrefix,
+					t.Name,
+					t.Scope,
+					tokenStateCell(t),
+					tsCell(t.LastUsedAt),
+					tsCell(t.ExpiresAt),
+				})
+			}
+			return p.Table([]string{"OWNER", "PREFIX", "NAME", "SCOPE", "STATE", "USED", "EXPIRES"}, rows)
+		},
+	}
+
+	cmd.AddCommand(users, runs, workers, usage, rateLimits, cliTokens)
 	return cmd
 }
 
@@ -209,4 +251,29 @@ func windowPct(w *apitypes.RateLimitWindow) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", w.Pct)
+}
+
+// tokenStateCell folds the two independent ways a token stops working into one
+// column. They are genuinely different states and an operator reading an incident
+// needs to tell them apart: "revoked" is a deliberate act with a trail, "expired" is
+// the server-set 90-day bound arriving. Revoked wins when both are true, because it
+// is the one someone DID.
+func tokenStateCell(t apitypes.AdminCLITokenDTO) string {
+	switch {
+	case t.Revoked:
+		return "revoked"
+	case t.ExpiresAt != nil && t.ExpiresAt.Before(time.Now()):
+		return "expired"
+	default:
+		return "active"
+	}
+}
+
+// tsCell renders a nullable timestamp. "-" means the column is genuinely empty, not
+// unknown: never used, or (for expires_at) never expires.
+func tsCell(t *time.Time) string {
+	if t == nil {
+		return "-"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
