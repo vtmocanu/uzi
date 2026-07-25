@@ -229,3 +229,22 @@ So a bare `agent-browser` reaches the real CLI first and **`AGENT_BROWSER_ARGS=-
 **Consequence for the DoD.** The "legibly-rendered screenshot from a real worker" line is **SATISFIED**. The implicit promise of §4 — that an agent gets `--no-sandbox` *without having to know about it* — is **NOT**, and that is a real delivery gap, not deploy lag. It belongs to **PRD #120**, whose Hypothesis B this run supports over Hypothesis A. Two caveats travel with that verdict and must not be dropped: 4 calls is far milder than the 15+ #120 recorded, and the flag came from the CLI's own error hint rather than blind trial. Real, but cheaper than #120 feared.
 
 **Not fixed here, deliberately.** The PATH ordering, the shim, and the missing `--no-sandbox` note in the `web-ux` template are all left alone — the run was scoped to observation, and the fix belongs to #120 with the provenance answer (why `/app/node_modules/.bin` precedes `/usr/local/bin`) in hand.
+
+### §2(c) build-time deltas — MEASURED 2026-07-25 (closes the last non-M7 residual)
+
+Taken off the v0.11.6 release, which carried the M5 docker-tier fix. Both pipelines built the same sha (`9ee9d072`), so the pair is a clean protected-ref vs cold-cache comparison rather than two unrelated runs.
+
+| job | `#20002` protected-ref `main` (warm cache) | `#20003` tag publish (cold cache) | delta |
+|---|---|---|---|
+| agent `[base]` | **316 s** | 451 s | +135 s (+43%) |
+| agent `[jvm]` | **365 s** | 461 s | +96 s (+26%) |
+| controller | 79 s | 102 s | +23 s |
+| api | 58 s | 85 s | +27 s |
+| web | 33 s | 43 s | +10 s |
+| chart package+push | — | 16 s | — |
+
+**Reading these honestly — the two columns are not the measurement the PRD asked for.** §2(c) wanted *protected-ref* and *MR-cache-less ×2*. `#20002` is a genuine protected-ref build. `#20003` is **not** a clean cache-less build: it ran on a tag whose commit's `main` pipeline was still in flight, so it got a partially-cold cache — the slow path, but not a controlled one, and it happened because the tag was pushed early rather than by design. Treat the right-hand column as *an* upper bound, not *the* cache-less number. A true MR-cache-less pair is still unmeasured.
+
+**What is solid:** the browser closure puts the agent images at **~5–8 minutes** to build, roughly 4–7× the controller and ~10× web. That is the standing cost of the ~648 MiB chromium closure, and it is why the kaniko jvm OOM (fixed with `--compressed-caching=false`) bit on the heaviest job first. Both agent images now build and publish green at that size, on both paths.
+
+**`nixSize`** was already re-validated and bumped 4Gi → 20Gi by owner decision (2026-07-22); the live worker measures **2.6 GB** of baked `/nix`, so the headroom holds.
