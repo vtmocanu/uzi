@@ -2,8 +2,15 @@
 
 -- A THIRD stop_kind (PRD #108 M5). 'cancelled' and 'plan_rejected' (00050) are
 -- both deliberate HUMAN stops; 'auto_stopped' is the SERVER stopping a run whose
--- message writes are in a confirmed permanent-failure loop — five guards, all of
--- which must hold, one of which is "other runs are succeeding on this instance".
+-- message writes are in a confirmed permanent-failure loop.
+--
+-- Deliberately no guard COUNT here. Three places once carried three different
+-- tallies for the same conjunction (five, six, seven) and every one of them was
+-- consistent with a guard being absent — which is how the killable-class gate went
+-- missing without anything flagging it. Cite the mechanism instead: the conjunction
+-- lives in autoStopWedgedRuns/evaluateAutoStop (workersvc/autostop.go) and every
+-- member is named there. The one worth knowing at this layer is that a run is never
+-- stopped unless OTHER runs are succeeding on the same api instance.
 --
 -- It is stamped by the same two mechanisms 00050 documents, and for the same
 -- reason (the stamp must never be losable independently of what caused it):

@@ -2590,6 +2590,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.ClaimedReset = int64(len(claimed))
 	for _, r := range claimed {
 		s.publishSwept(r.ID, r.Status)
+		// A fresh attempt starts with no evidence against it (PRD #108 M5). See the
+		// requeue loop below for the argument; this reset is the same event.
+		s.persistFail.evict(r.ID)
 	}
 
 	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
@@ -2635,6 +2638,16 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.StaleRequeued = int64(len(requeued))
 	for _, r := range requeued {
 		s.publishSwept(r.ID, r.Status)
+		// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
+		// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
+		// worker_id for affinity, so without this the run returns to `running` under a
+		// new attempt still carrying the old one's 20-failure streak and is
+		// auto-stopped before the new worker persists a byte — uzi killing a run one
+		// tick after deciding it deserved another try and spending re-queue budget to
+		// say so. Likely rather than theoretical for the population M5 exists to
+		// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
+		// is a prime OOM candidate, and OOM is exactly what puts it here.
+		s.persistFail.evict(r.ID)
 	}
 
 	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is

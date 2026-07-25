@@ -173,23 +173,74 @@ func TestAutoStopSingleFailingRunBesideHealthyNeighboursIsStopped(t *testing.T) 
 // G4 — the comparison set. The safety argument, and the two PRD negatives
 // -------------------------------------------------------------------------
 
-func TestAutoStopApiWideOutageStopsNothing(t *testing.T) {
-	// Every run's appends are failing, so nothing is in the comparison set. Killing
-	// here turns an outage into data loss.
+func TestAutoStopFleetWideKillingClassStopsNothing(t *testing.T) {
+	// 🔴 THIS IS G4's ONLY REAL PROOF, and it is staged on a KILLING class on purpose.
+	//
+	// The obvious way to write "an api-wide outage kills nothing" is with the `store`
+	// class, and that version was here — but once G5 landed it stopped reaching G4 at
+	// all: the class gate turns a `store` streak away before peersSucceeding is ever
+	// called, so folding peersSucceeding to `return 99` left it GREEN. It had silently
+	// become a second G5 test wearing a G4 caption. MEASURED, not reasoned.
+	//
+	// So the case that actually isolates G4 is one where G5 PASSES and only the
+	// comparison set stands: every active run failing on `unstorable`, which is what a
+	// fleet-wide worker bug emitting NULs looks like. Flag-only is still correct
+	// there, because "every run is poisoned" and "the api is broken in a way that
+	// looks like poison" are indistinguishable from inside this process — and if we
+	// are wrong about which, we have just mass-killed a fleet.
+	//
+	// Distinct from the lonely-instance test below: that one has NO peers, so it
+	// proves G4 blocks on an EMPTY set. This one has peers that exist and are all
+	// failing. Different situation, same verdict; neither proves the other.
 	f := newAutoStopFixture(t)
 	f.svc.persistFail = newPersistFailTracker() // clear the staged peer success
 	start := t0.Add(-(autoStopWindow + 5*time.Second))
 	for _, id := range []uuid.UUID{f.wedged, f.peer} {
-		f.fs.runs[id] = store.Run{ID: id, Kind: "issue", Status: "running"}
+		r := f.fs.runs[f.wedged]
+		r.ID = id
+		f.fs.runs[id] = r
+		for i := 0; i < autoStopStreak*2; i++ {
+			f.svc.persistFail.recordFailure(id, persistFailUnstorable, 273, start.Add(time.Duration(i)*500*time.Millisecond))
+		}
+	}
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("stopped = %d, want 0: when EVERY run is failing the same permanent way, killing them turns one bad worker image — or one bad api — into a mass extinction of live runs", n)
+	}
+	if len(f.fs.failCalls)+len(f.fs.verdicts) != 0 {
+		t.Fatalf("a fleet-wide failure produced %d fail + %d verdict writes, want 0", len(f.fs.failCalls), len(f.fs.verdicts))
+	}
+	// THE POSITIVE CONTROL, and without it the above is green on a build where
+	// auto-stop never fires at all. One neighbour recovers — that is the ONLY change
+	// — and the wedged run must then die.
+	f.svc.persistFail.recordSuccess(f.peer, t0.Add(-time.Second))
+	if n := f.sweep(t); n != 1 {
+		t.Fatalf("stopped = %d, want 1 once ONE neighbour starts succeeding: if this is 0 then the assertion above passes for any reason at all, including auto-stop being inert", n)
+	}
+}
+
+func TestAutoStopApiWideTransientOutageStopsNothing(t *testing.T) {
+	// The realistic outage: every run failing with a transient 500. It is refused by
+	// G5 (`store` is not killable) BEFORE G4 is consulted, so — unlike the test above
+	// — this one deliberately does NOT prove anything about the comparison set. It
+	// proves the class gate, which is the guard that actually stands between a
+	// database hiccup and a mass kill on this path.
+	//
+	// Kept as its own case rather than folded into the one above because the two
+	// verdicts now come from DIFFERENT guards, and a reader who assumes one covers
+	// the other will delete the wrong one.
+	f := newAutoStopFixture(t)
+	f.svc.persistFail = newPersistFailTracker()
+	start := t0.Add(-(autoStopWindow + 5*time.Second))
+	for _, id := range []uuid.UUID{f.wedged, f.peer} {
+		r := f.fs.runs[f.wedged]
+		r.ID = id
+		f.fs.runs[id] = r
 		for i := 0; i < autoStopStreak*2; i++ {
 			f.svc.persistFail.recordFailure(id, persistFailStore, 10, start.Add(time.Duration(i)*500*time.Millisecond))
 		}
 	}
 	if n := f.sweep(t); n != 0 {
-		t.Fatalf("stopped = %d, want 0: when EVERY run is failing the fault is the api, and killing runs turns an outage into data loss", n)
-	}
-	if len(f.fs.failCalls)+len(f.fs.verdicts) != 0 {
-		t.Fatalf("an api-wide outage produced %d fail + %d verdict writes, want 0", len(f.fs.failCalls), len(f.fs.verdicts))
+		t.Fatalf("stopped = %d, want 0: a 500 means retry — the contract Phase 1 exists to make honest — and the worker's own breaker waits ~10 minutes on it, so killing at ~75s takes the decision away from a client correctly riding it out", n)
 	}
 }
 
@@ -198,10 +249,12 @@ func TestAutoStopWithNoComparisonSetFlagsAndDoesNotKill(t *testing.T) {
 	// no comparison set, so this degrades to flag-and-notify PERMANENTLY: there is no
 	// fallback, no timeout into killing, no "if it has been zero long enough".
 	//
-	// Worth stating for whoever prunes tests later: this and the outage test above
-	// exercise ONE predicate, not two. They differ in SETUP (which is where a fixture
-	// bug would live), so neither proves the other, but a mutation to peersSucceeding
-	// reddens both. Do not delete either as redundant.
+	// Worth stating for whoever prunes tests later, and CORRECTED once G5 landed:
+	// this and TestAutoStopFleetWideKillingClassStopsNothing both exercise G4 and a
+	// peersSucceeding mutation reddens both — but the TRANSIENT outage test does NOT,
+	// because G5 refuses a `store` streak before G4 is ever consulted. Measured:
+	// folding peersSucceeding to `return 99` leaves that one green. Three tests,
+	// two different guards; do not fold them together.
 	f := newAutoStopFixture(t)
 	f.svc.persistFail.recordSuccess(f.peer, t0.Add(-time.Hour)) // long outside the window
 	f.svc.persistFail.prune(t0)                                 // ...and now gone entirely
@@ -397,7 +450,10 @@ func TestAutoStopOneSuccessResetsTheStreak(t *testing.T) {
 }
 
 func TestAutoStopARotatingErrorNeverAccumulates(t *testing.T) {
-	// G5. A rotating error class is an outage signature, so the streak resets on
+	// G5's STABILITY conjunct only — the killability conjunct is
+	// TestAutoStopWillNotKillOnAClassNoCorrectWorkerCanProduce. This caption used to
+	// say "G5" flat, which advertised coverage of a guard that did not yet exist.
+	// A rotating error class is an outage signature, so the streak resets on
 	// every rotation and can never reach the threshold. Driven at 4x the threshold to
 	// show the guard is structural, not a race with the count.
 	f := newAutoStopFixture(t)
@@ -470,7 +526,13 @@ func TestAutoStopOnlyKillsRunsTheFLAGCanAlsoReach(t *testing.T) {
 	// healthTargetFor's "running" arm, so a queued/claimed/awaiting_approval run was
 	// never flagged — and killing a run that was never flagged breaks the "health
 	// first, kill second" ordering this step is placed after the detector to
-	// guarantee. Not a terminal check: these runs are alive and may return to running.
+	// guarantee. The realistic one is awaiting_approval: /state and /messages are
+	// different routes and only /messages wedges, so a run can report its plan, reach
+	// the gate, and be killed at ~75s while a human is reading the approval prompt.
+	//
+	// It also EVICTS, and that is not tidiness — see the requeue test below. A streak
+	// is evidence about one running attempt; leaving `running` ends that attempt's
+	// claim on it.
 	for _, status := range []string{"queued", "claimed", "awaiting_approval"} {
 		t.Run(status, func(t *testing.T) {
 			f := newAutoStopFixture(t)
@@ -481,8 +543,8 @@ func TestAutoStopOnlyKillsRunsTheFLAGCanAlsoReach(t *testing.T) {
 			if n := f.sweep(t); n != 0 {
 				t.Fatalf("stopped = %d, want 0 for a %s run — it was never flagged, so killing it is a kill with no warning in front of it", n, status)
 			}
-			if got := f.svc.persistFail.stats(f.wedged); got.streak == 0 {
-				t.Fatal("the entry was evicted; a non-terminal run may return to running and its evidence should survive that (the TTL prunes it if it does not)")
+			if got := f.svc.persistFail.stats(f.wedged); got.streak != 0 {
+				t.Fatalf("streak = %d, want 0: leaving the evidence in place only DELAYS the wrong kill to the moment the run re-enters running", got.streak)
 			}
 		})
 	}
@@ -491,6 +553,76 @@ func TestAutoStopOnlyKillsRunsTheFLAGCanAlsoReach(t *testing.T) {
 	f := newAutoStopFixture(t)
 	if n := f.sweep(t); n != 1 {
 		t.Fatalf("control: stopped = %d for a running run, want 1", n)
+	}
+}
+
+func TestAutoStopARequeuedRunDoesNotCarryTheDeadAttemptsStreak(t *testing.T) {
+	// 🔴 The run comes back as a FRESH ATTEMPT and must come back clean.
+	//
+	// RequeueRunsOfStaleWorkers writes status='queued' and KEEPS worker_id for
+	// affinity. Blocking the kill while the run is queued is not enough — measured:
+	// with only the status check, the run is skipped at `queued` and then killed the
+	// instant the new attempt returns it to `running`, on twenty failures the dead
+	// worker recorded. uzi had just spent re-queue budget deciding it deserved
+	// another try.
+	//
+	// Likely rather than theoretical for exactly the population M5 protects: a
+	// pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz is a prime
+	// OOM candidate, and OOM is what lands it here. It also defeats G3's own stated
+	// purpose, since a 0.10.1+ worker would have bisected the poison out on the retry.
+	f := newAutoStopFixture(t)
+	r := f.fs.runs[f.wedged]
+	r.Status = "queued" // exactly what the requeue writes; worker_id retained
+	f.fs.runs[f.wedged] = r
+
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("stopped = %d, want 0 for a queued run", n)
+	}
+	if got := f.svc.persistFail.stats(f.wedged); got.streak != 0 {
+		t.Fatalf("streak = %d, want 0: leaving the dead attempt's evidence in place only DELAYS the wrong kill to the moment the new attempt starts running", got.streak)
+	}
+
+	// The new attempt starts. It has persisted nothing and failed at nothing.
+	r.Status = "running"
+	f.fs.runs[f.wedged] = r
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("stopped = %d, want 0: the new attempt was killed before it wrote a byte, on the previous attempt's streak", n)
+	}
+}
+
+func TestSweepClearsTheStreakWhenItGrantsAFreshAttempt(t *testing.T) {
+	// The immediate half of the same rule, at the two sweep sites that hand a run
+	// back to the queue. The evaluator's eviction is the catch-all (bounded by one
+	// tick); this is what makes it exact — and what covers a run whose streak has not
+	// yet reached candidate size, which the evaluator never sees at all.
+	for _, tc := range []struct {
+		name  string
+		stage func(*autoStopSweepStore, uuid.UUID)
+	}{
+		{"stale-worker requeue", func(fs *autoStopSweepStore, id uuid.UUID) {
+			fs.requeued = []store.RequeueRunsOfStaleWorkersRow{{ID: id, Status: "queued"}}
+		}},
+		{"claimed-never-started reset", func(fs *autoStopSweepStore, id uuid.UUID) {
+			fs.claimed = []store.SweepClaimedNeverStartedRow{{ID: id, Status: "queued"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAutoStopFixture(t)
+			fs := &autoStopSweepStore{autoStopFakeStore: f.fs}
+			f.svc.q = fs
+			tc.stage(fs, f.wedged)
+			// A sub-candidate streak: too small for the evaluator to ever look at, which
+			// is exactly why the sweep site has to do this itself.
+			f.svc.persistFail.evict(f.wedged)
+			f.svc.persistFail.recordFailure(f.wedged, persistFailUnstorable, 273, t0)
+
+			if _, err := f.svc.Sweep(context.Background()); err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got := f.svc.persistFail.stats(f.wedged); got.streak != 0 {
+				t.Fatalf("streak = %d, want 0: a run handed back to the queue starts its next attempt with no evidence against it", got.streak)
+			}
+		})
 	}
 }
 
@@ -811,13 +943,15 @@ type autoStopSweepStore struct {
 	*autoStopFakeStore
 	active       []store.ListActiveRunsForHealthRow
 	healthWrites []store.SetRunHealthParams
+	requeued     []store.RequeueRunsOfStaleWorkersRow
+	claimed      []store.SweepClaimedNeverStartedRow
 }
 
 func (f *autoStopSweepStore) MarkStaleWorkersOffline(context.Context, pgtype.Timestamptz) (int64, error) {
 	return 0, nil
 }
 func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
-	return nil, nil
+	return f.claimed, nil
 }
 func (f *autoStopSweepStore) SweepRunningTimeout(context.Context, store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	return nil, nil
@@ -826,7 +960,7 @@ func (f *autoStopSweepStore) FailRunsOfStaleWorkersOverCap(context.Context, stor
 	return nil, nil
 }
 func (f *autoStopSweepStore) RequeueRunsOfStaleWorkers(context.Context, store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error) {
-	return nil, nil
+	return f.requeued, nil
 }
 func (f *autoStopSweepStore) SweepIdleChatRuns(context.Context, pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error) {
 	return nil, nil

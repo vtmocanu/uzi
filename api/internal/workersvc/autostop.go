@@ -178,12 +178,28 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	// from healthTargetFor's "running" arm, so a run in any other status was never
 	// flagged — and killing a run that was never flagged breaks the "health first,
 	// kill second" ordering this whole step is placed after Sweep's detector to
-	// guarantee. Not evicted: a run parked at awaiting_approval may return to running
-	// with its evidence intact, and if it never does the TTL prunes it.
+	// guarantee. Without this, a run could reach the approval gate on /state (a
+	// different route, which does not wedge) and be killed at ~75s while a human was
+	// reading the plan, with no flag ever shown.
+	//
+	// AND IT EVICTS, which is the half that matters more. A STREAK IS EVIDENCE ABOUT
+	// ONE RUNNING ATTEMPT; leaving `running` ends that attempt's claim on it. The
+	// case that forced this: RequeueRunsOfStaleWorkers writes status='queued' and
+	// KEEPS worker_id (affinity), so a wedged run whose worker died — the likely
+	// shape, since a pre-0.10.1 worker's retry batch grows and OOMs — would come back
+	// as a fresh attempt carrying the dead one's 20-failure streak and be killed
+	// before the new worker persisted a byte. uzi had just decided that run deserved
+	// another try and spent budget saying so. It also defeats G3's own purpose: a
+	// 0.10.1+ worker would have bisected the poison out on the retry.
+	//
+	// Sweep evicts at the requeue sites directly, which is immediate; this is the
+	// catch-all for every other path that resets status without a hook (Register's
+	// RequeueWorkerRuns returns no ids, so it has none), bounded by one sweep tick.
 	//
 	// Chat coverage survives this: chat-runner.ts reports `running` before it does any
 	// work, so a wedged chat run is `running` exactly like an issue run.
 	if run.Status != "running" {
+		s.persistFail.evict(c.runID)
 		return false
 	}
 
