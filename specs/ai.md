@@ -9937,7 +9937,7 @@ covered end to end" would be wrong on four counts. All true as of the M8a commit
   both at 200 runes before the upsert — a cap, not a code, since the error is
   raised by a different call than the one D3's classifier inspects.
 
-See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
+See [prds/done/108-worker-retry-loop-autostop.md](../prds/done/108-worker-retry-loop-autostop.md)
 for the incident, the full Decision Log, and the Phase 1 progress record.
 
 ## 366. PRD #115 — meter tone thresholds move to warn ≥40 / danger ≥85; badge and SR announcement decoupled from the tone at 95
@@ -10246,7 +10246,7 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   the guard by what it ASKS (`autoStopKillableKinds`, `peersSucceeding`), never by
   its ordinal.
 
-See [prds/108-worker-retry-loop-autostop.md](../prds/108-worker-retry-loop-autostop.md)
+See [prds/done/108-worker-retry-loop-autostop.md](../prds/done/108-worker-retry-loop-autostop.md)
 for the full Decision Log, and [docs/run-auto-stopped.md](../docs/run-auto-stopped.md)
 for the operator-facing account — which, because PRD #47's exit contract clears
 run health on every terminal path, is together with M7's log lines the only

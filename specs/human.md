@@ -449,7 +449,7 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/95-activity-pane-v2.md`. R
 
 ## Feature #108 — Worker retry loop: stop losing runs to unsaveable messages
 
-Tracked as GitLab issue vtmocanu/uzi#108; PRD at `prds/108-worker-retry-loop-autostop.md`.
+Tracked as GitLab issue vtmocanu/uzi#108; PRD at `prds/done/108-worker-retry-loop-autostop.md`.
 
 **Every bullet below is [AI-proposed; NEEDS USER RATIFICATION].** The user's direct input on
 this work was "finish PRD 108" and "use the team"; the requirements here were derived by the
