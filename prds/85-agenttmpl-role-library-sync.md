@@ -6,7 +6,7 @@
 **Related**:
 - `github.com/vtmocanu/skills` `agent-team/roles.yaml` — the upstream role library (11 roles, per-role `version:` since v0.15.0; local HEAD `a6ae17e` = PR #10).
 - MR !17 (`a1f9615`) decoupled `builtins/` from `.claude/agents/`; MR !87 + MR !93 (`d69fe53e`) are the two hand-run syncs this PRD exists to make verifiable.
-- Issue #87 / `prds/87-prebake-browser-web-ux.md` — prebakes a browser into the worker image. `web-ux` ships here **before** that lands; see Decision 7.
+- Issue #87 / `prds/done/87-prebake-browser-web-ux.md` — prebakes a browser into the worker image. `web-ux` ships here **before** that lands; see Decision 7.
 - Issue #63 — dev-team ↔ product role-parity nudge. Adjacent, not this: that compares `.claude/agents/` to `builtins/`; this compares `builtins/` to the upstream library.
 
 ## Problem
@@ -143,7 +143,7 @@ UI (Decision 8).
    the engaged `web-ux` did *not* notice the absence and stop: it installed
    `agent-browser` ad hoc, pulled a nix Chromium, and that Chromium aborted on
    the SUID sandbox under the PRD #51 hardening
-   (`prds/87-prebake-browser-web-ux.md:28-45`). Nothing in the worker blocks
+   (`prds/done/87-prebake-browser-web-ux.md:28-45`). Nothing in the worker blocks
    that today — #87's crash-close is unimplemented — and a *builtin* web-ux is
    seeded as a global default allocation, so the exposure widens from
    repo-detected agents in dogfooding runs to every run whose lead picks the
