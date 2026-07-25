@@ -231,11 +231,23 @@ WTOKEN=""
 # transient curl/exec blip does not abort the ~20-min run under `set -euo pipefail` (a
 # bare point-in-time GET that hiccups would otherwise kill the whole suite). RESTRICTED to
 # idempotent GETs — only apiget + fake_state are wrapped below. A retried WRITE could
-# double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch/
-# apidelete, fake_post) and db_psql (also used for INSERTs, :2087/:2191/:2843) are
-# deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
+# double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch,
+# fake_post) and db_psql (also used for INSERTs, in the #46, #68, #98 and rate-limit phases)
+# are deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
 # non-zero after 3 tries: this smooths a blip, it never masks a persistent failure. curl -f
 # writes nothing to stdout on a failed attempt, so a retry cannot double the captured body.
+#
+# TWO CORRECTIONS TO THIS COMMENT, both found while building PRD #98 M8b, both the kind of
+# defect the comment's own subject matter is about. (1) It listed `apidelete` among the
+# helpers "deliberately NOT wrapped". There is no apidelete — it appeared nowhere else in
+# this file and was never defined; the harness's single DELETE is an inline `curl -X DELETE`
+# against /api/me/secrets/anthropic_token/. It is struck rather than defined, because a
+# helper nothing calls is dead code PLUS a comment that has become true about a function
+# nobody uses. (2) It cited the db_psql INSERTs by LINE (`:2087/:2191/:2843`), and at the
+# time of this edit all three pointed at unrelated text — one blank line, one wait_status,
+# and one line of a comment written minutes earlier. This repo's own rule is that a line
+# number is meaningless without a SHA; naming the PHASES survives edits, and there are more
+# than three of them.
 retry_read() {
   local n=1 rc
   while :; do
@@ -2838,7 +2850,7 @@ say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting comma
 #   SHAPE an ERE describing the WHOLE instruction, UUID-shaped where applicable.
 #   WANT  the exact number of instructions the row expects.
 #
-# Three mechanisms, in descending strength:
+# Four mechanisms, in descending strength:
 #  1. ONE helper. A row that hand-writes argv has to visibly bypass this function, which is
 #     reviewable in a way that a subtly-wrong string is not.
 #  2. A SHAPE-GUARDED eval. `eval` never sees text that did not come out of the command in
@@ -2847,12 +2859,32 @@ say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting comma
 #     mechanism exists to forbid.
 #  3. The COUNT is asserted before any match is used. Never `head -1`: output that stops at
 #     your limit is indistinguishable from output that ended.
+#  4. A CHARACTER ALLOWLIST INSIDE THE HELPER, checked immediately before the eval.
 #
-# HONEST RESIDUAL, stated rather than papered over: shell cannot make the shortcut
-# STRUCTURALLY unavailable. A determined author can still assign a literal to the variable
-# passed as OUT. What these three buy is that the shortcut becomes visible in review rather
-# than invisible in a passing test. That is a real improvement and it is not the same as
-# impossible.
+# WHY 4 EXISTS WHEN 2 ALREADY GUARDS THE SHAPE. It is not that the helper ignores content —
+# every match already satisfied the caller's ERE, and the `case` below already requires the
+# span to start `uzi `. The exposure is that the ENTIRE safety burden sat on each caller's
+# `$shape`, with NO FLOOR in the helper: a future row passing a loose ERE (`.*`, an
+# unanchored class, a `[^ ]+` that happens to admit a metacharacter) hands unreviewed text
+# to an `eval` that runs in the HARNESS's own shell on the developer's host — before
+# uzi_cli's `env -i`, so an injected `;` runs as the user rather than inside the sandbox.
+# All three shapes today are closed EREs, which is why this is a floor and not a fix.
+#
+# IT IS AN ALLOWLIST, NOT A BLACKLIST, and that is the whole point. Blacklisting shell
+# metacharacters is famously incomplete — you find out which one you forgot by being bitten
+# by it. A positive class excludes `< > | ; $ backtick ' " \ newline` and every glob
+# character BY CONSTRUCTION, without anyone having to enumerate them.
+#
+# The property worth naming: it makes the wrong option STRUCTURALLY IMPOSSIBLE rather than
+# discouraged. A row that tried to substitute a placeholder into the printed text cannot
+# pass this floor, because `<` cannot pass it. That is why the sibling change in review.go
+# had to be a real format verb rather than a helper special case.
+#
+# HONEST RESIDUAL, stated rather than papered over, AND NOT CLOSED BY 4: shell cannot make
+# the shortcut STRUCTURALLY unavailable. A determined author can still assign a literal to
+# the variable passed as OUT, and the allowlist would happily accept it. What these four buy
+# is that the shortcut becomes visible in review rather than invisible in a passing test.
+# That is a real improvement and it is not the same as impossible.
 #
 # The `|| fail` on the exec below is a FLOOR (an instruction that errors is definitionally
 # false), not the row's assertion — every caller asserts an OUTCOME afterwards.
@@ -2870,6 +2902,11 @@ $out"
       "uzi "*) ;;
       *) fail "$label: lifted span is not a uzi instruction: $cmd" ;;
     esac
+    # THE FLOOR (mechanism 4 above). Anchored at both ends, positive class only. Every span
+    # the three current rows lift already satisfies it, so it reddens nothing today — which
+    # is exactly why it was exercised deliberately rather than assumed; see the commit.
+    printf '%s' "$cmd" | grep -qE '^uzi [A-Za-z0-9 ._:/=-]+$' \
+      || fail "$label: lifted span carries a character outside the executable allowlist, so it is not runnable verbatim: $cmd"
     eval "uzi_cli ${cmd#uzi }" >>"$PRINTED_OUT" 2>&1 \
       || fail "$label: the printed instruction FAILED when run VERBATIM: $cmd
 $(cat "$PRINTED_OUT")"
