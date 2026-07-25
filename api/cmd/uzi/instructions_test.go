@@ -38,16 +38,22 @@ import (
 // been EXECUTED" — to every `uzi …` span it could find. Measured against this package, that
 // conflated two different things:
 //
-//   - RUNTIME: emitted at a decision point through Printf/Println/Exitf/…. It tells a user
-//     what to do NEXT, so the only thing that validates it is running it and asserting the
-//     outcome. `uzi review undo %s %s`, `uzi review show %s`, `uzi repo list`, `uzi login`,
-//     `uzi review backlog --run <run-id>`.
+//   - RUNTIME: emitted at a decision point through Printf/Println/Exitf/…, or bound to a name
+//     on its way there. It tells a user what to do NEXT, so the only thing that validates it
+//     is running it and asserting the outcome. `uzi review undo %s %s`, `uzi review show %s`,
+//     `uzi repo list`, `uzi login`, `uzi review backlog --run <run-id>`, `uzi auth token`.
 //   - HELP: a Short/Long description or a flag's usage text, cross-linking a sibling command.
-//     Nobody needs to EXECUTE `uzi skill install` to validate a Short line that mentions it.
+//     Nobody needs to EXECUTE `uzi worker set-token` to validate a Long line that mentions it.
 //     What such a string can be wrong about is naming a command path that does not exist —
 //     which is statically checkable, complete, and stronger than the old bar, since nothing
 //     used to verify that `uzi worker set-token` was a real path at all (only that `worker`
 //     was a real top-level verb).
+//
+//     (This paragraph used to illustrate HELP with `uzi skill install`. It no longer can:
+//     that string ALSO names the hook command uzicli writes into settings.json for Claude
+//     Code to execute, so it carries the runtime bar. The example was true for the scan it
+//     was written against and false for this one — which is the whole argument for scope
+//     being part of the claim.)
 //
 // Four of the eight original entries' notes misdescribed their own site as a result — two
 // help strings were described as printed output, `uzi login`'s hint was attributed to an
@@ -62,19 +68,50 @@ import (
 // wrapper would silently buy every future instruction an exemption.
 //
 // THE BASELINE IS ZERO UNKNOWNS, and that number is what makes a future one meaningful.
-// MEASURED when this landed: all 9 lifted candidates resolved to a definite kind. So a
-// kindUnknown you hit later is a genuinely NEW emitter, not a gap in the classifier's
-// original coverage — and widening `emitters` is therefore a DECISION to record with its
-// reason, not a nuisance to clear. It is the one edit that can quietly re-open the hole
-// this file exists to close: every string printed through the newly-added function becomes
-// classifiable, and if the wrapper is not really an emitter they all become HELP, exempt
-// from the execution bar, silently.
+// MEASURED at `5d5d0be4` across BOTH scanned packages (see instructionScope): 10 distinct
+// candidates lifted from 13 sites, every one resolving to a definite kind. So a kindUnknown
+// you hit later is a genuinely NEW emitter, not a gap in the classifier's original coverage.
+// (The figure this paragraph used to carry was 9 candidates, correct for the one-package scan
+// it was written against; the two extra are `uzi auth token` and the second `uzi skill
+// install` site, both in api/internal/uzicli.)
+//
+// 🔴 WHICH EDIT CAN SILENTLY RE-OPEN THE HOLE — CORRECTED, and the old answer was wrong in the
+// SAFE direction, which is exactly why it survived review. This paragraph used to say that
+// widening `emitters` was the one edit that could quietly exempt strings, because a wrongly
+// added wrapper would make everything printed through it HELP. It cannot. `emitters` has ONE
+// use site (classifyKind), and that arm can only ever return kindRuntime — the STRICTEST bar.
+// Widening `emitters` can only ADD work: strings that were kindUnknown (failing) become
+// RUNTIME (needing execution evidence). It is a decision worth recording, but it is not the
+// dangerous one, and pointing at it sent a reader to guard the door that does not open.
+//
+// The knobs that CAN silently exempt, in the order someone would actually reach for them:
+//
+//  1. classifyKind's kindHelp ARMS AND ITS DEFAULT. The default returns kindUnknown, which
+//     FAILS. Change that default to kindHelp — or add a `case` returning kindHelp for a
+//     position that is not documentation — and every string in that position is exempt at
+//     once, with no entry for anyone to review. `helpFields` and `flagSets` are the same knob
+//     wearing different names: both feed kindHelp. This is the one to guard.
+//  2. A HUMAN CHOOSING evidenceHelpOnly. It is the only evidence value that requires neither
+//     an execution nor a written reason, so it is the cheapest way out of the bar. What stops
+//     it today is the derived-kind check below: an entry declared evidenceHelpOnly whose sites
+//     classify RUNTIME reddens with "the kind is DERIVED, not declared". So this knob is not
+//     usable on its own — it needs knob 1 to have been turned first. That pairing is the
+//     mechanism, and it is why knob 1 is not merely the more likely one but the load-bearing one.
+//  3. SCOPE — see instructionScope. A package that is not scanned is exempt in full, and
+//     nothing in the file announces it. That was true here for three weeks; see below.
 //
 // WHY A REGISTRY RATHER THAN THREE TESTS. Fixing three strings leaves the seam open: the next
-// commit that prints a hint reopens it, and nothing says so. These tests fail the build when
-// this package prints a `uzi …` command that has no entry below — so a FOURTH instruction
+// commit that prints a hint reopens it, and nothing says so. These tests fail the build when a
+// SCANNED package prints a `uzi …` command that has no entry below — so a FOURTH instruction
 // cannot land silently. They need no server, which is why they run in `go test ./...` and
 // make the omission loud at the moment of writing rather than at review time.
+//
+// 🔴 THAT GUARANTEE WAS FALSE UNTIL `5d5d0be4`, AND THE HOLE WAS SCOPE. The scan was
+// `parser.ParseDir(fset, ".", …)` — api/cmd/uzi and nothing else — while
+// api/internal/uzicli/client.go already printed a backticked, liftable `uzi auth token` with
+// zero entries here, and a brand-new instruction added in that package left all three tests
+// green. The guarantee is only ever as wide as instructionScope, so the scope list is part of
+// the claim and is stated as such rather than buried in liftAll.
 //
 // WHAT AN ENTRY MEANS. For a RUNTIME entry, adding a line is a claim that the instruction has
 // been EXECUTED and its outcome asserted — not that it looks right — and `where` must name a
@@ -176,17 +213,48 @@ var knownInstructions = []knownInstruction{
 		note: "HELP: inside `uzi run inputs`'s own Long description (run.go), naming itself " +
 			"while explaining what a chat run's steer queue holds. Never emitted at runtime.",
 	},
-	{
-		command:  "uzi skill install",
-		evidence: evidenceHelpOnly,
-		// CORRECTED. The old note said "Printed by the skill auto-upgrade warning". It is
-		// the Short description of `uzi skill install-hook`, saying what the hook it
-		// installs will run.
-		note: "HELP: the Short description of `uzi skill install-hook` (skill.go), naming the " +
-			"command the installed SessionStart hook runs. Never emitted at runtime.",
-	},
 
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi skill install",
+		evidence: evidenceGoTest,
+		where:    "TestSkillInstallCommand",
+		// TWICE CORRECTED. The first note said "Printed by the skill auto-upgrade warning";
+		// the second said HELP, naming only the Short description in skill.go. Both were
+		// right about the site they looked at and wrong about the set: the scan reached one
+		// package, so the second site did not exist as far as this file was concerned.
+		note: "RUNTIME by the strictest-bar rule, from TWO sites lifting the identical text. " +
+			"(a) the Short description of `uzi skill install-hook` (cmd/uzi/skill.go) — " +
+			"documentation; (b) `hookCommand` (internal/uzicli/skillhook.go), the command " +
+			"written into ~/.claude/settings.json for Claude Code to EXECUTE at session start. " +
+			"(b) makes a stronger claim than any printed hint does — it does not tell a human to " +
+			"run something, it causes a machine to — and until the scope widened it carried no " +
+			"bar at all. No split is expressible (both sites lift the same string and " +
+			"attribute() keys on the text), so the execution bar governs. EXECUTED by " +
+			"TestSkillInstallCommand, which runs `uzi skill install` through runCLI and asserts " +
+			"the OUTCOME: the bundled SKILL.md is on disk byte-for-byte. Its honest limit: that " +
+			"is the command working, not the HOOK invoking it — the wiring is " +
+			"TestSkillInstallHookCommand's, and no test runs the settings.json entry the way " +
+			"Claude Code would.",
+	},
+	{
+		command:  "uzi auth token",
+		evidence: evidenceGoTest,
+		where:    "TestAuthTokenStdin",
+		// The entry reviewer-web's Blocking #2 predicted: liftable, printed, and invisible
+		// to this file for as long as the scan was one package deep.
+		note: "RUNTIME: statusError's 401 message (internal/uzicli/client.go) — the remedy every " +
+			"unauthenticated CLI call prints, through Exitf, i.e. STDERR with exit 3 (ExitAuth). " +
+			"The literal is bound to `msg` and emitted two lines later, which is why it needed " +
+			"the binding arm in classifyKind. EXECUTED by TestAuthTokenStdin: `uzi auth token` " +
+			"reads the token from stdin and the OUTCOME asserted is that it is readable back out " +
+			"of the credential store, not that it exited 0. Its honest limit, stated because the " +
+			"e2e rows set a higher bar: the instruction is run with hand-written argv against a " +
+			"fake client, NOT lifted from a real 401's own stderr. Nobody has closed the loop " +
+			"from the failing call to the remedy fixing it. Doing so needs a stack, so it belongs " +
+			"in e2e/run-e2e.sh next to the other three rows, not here.",
+	},
+
 	{
 		command:  "uzi review undo",
 		evidence: evidenceE2E,
@@ -278,10 +346,24 @@ var knownInstructions = []knownInstruction{
 // because `drives` is not a verb in the tree.
 var instructionRE = regexp.MustCompile("`(uzi [a-z][a-z0-9 %<>-]*)`|(?m)^\\s*(uzi [a-z][a-z0-9 %<>-]*)")
 
+// instructionScope is every package this backstop scans, relative to api/cmd/uzi. IT IS PART
+// OF THE GUARANTEE, not an implementation detail: an unscanned package is exempt in full and
+// silently, which is knob 3 above and was a live hole until `5d5d0be4`.
+//
+// api/internal/uzicli is in scope because it is the CLI's own client library and it PRINTS —
+// statusError builds the messages every non-2xx exit carries, `uzi auth token` among them.
+// Adding a package here is cheap and safe (it can only add candidates); leaving one out is
+// neither, and nothing fails when you do.
+var instructionScope = []string{".", "../../internal/uzicli"}
+
 // emitters are the calls whose string arguments reach a user at runtime. A call NOT in this
 // set is not a classification — classifyKind keeps walking outward, so a literal wrapped in a
 // Sprintf inside a Println still classifies RUNTIME. A genuinely unrecognised position stays
 // kindUnknown and FAILS; see C11 of the design note.
+//
+// Widening this set is safe by construction: its only arm returns kindRuntime, the strictest
+// bar. See the corrected residual-risk paragraph at the top of this file — this is NOT the
+// knob that can grant a silent exemption, and it was named as such for three weeks.
 var emitters = map[string]bool{
 	"Print": true, "Printf": true, "Println": true,
 	"Fprint": true, "Fprintf": true, "Fprintln": true,
@@ -341,6 +423,39 @@ func classifyKind(stack []ast.Node) instructionKind {
 			if id, ok := n.Key.(*ast.Ident); ok && helpFields[id.Name] {
 				return kindHelp
 			}
+		case *ast.AssignStmt, *ast.ValueSpec:
+			// A command string BOUND TO A NAME — a local variable, or a package-level
+			// const/var — rather than handed straight to an emitter or sitting in a help
+			// field. THE STRICTEST BAR APPLIES, and this arm exists because a binding is
+			// precisely where an instruction goes to hide from a position-based classifier.
+			//
+			// The header comment already promised that indirection was handled ("a literal
+			// wrapped in a Sprintf inside a Println still classifies RUNTIME"), and that was
+			// only ever true of EXPRESSION nesting. A variable binding broke the chain, so
+			// MEASURED at `5d5d0be4`, `uzicli/client.go`'s
+			//
+			//	msg = "authentication required or token invalid — run `uzi auth token` …"
+			//	…
+			//	return Exitf(ExitAuth, "%s", msg)
+			//
+			// derived kindUnknown despite reaching the user through Exitf two lines later —
+			// no enclosing CallExpr, so nothing to recognise. Same for the package const
+			// `uzicli/skillhook.go`'s hookCommand, which is not printed at all: it is written
+			// into ~/.claude/settings.json for Claude Code to EXECUTE, which is a stronger
+			// claim than any printed hint makes and had no bar on it whatsoever.
+			//
+			// WHY THIS ARM CANNOT GRANT AN EXEMPTION, which is the only property that matters
+			// for a new classifier arm: it returns kindRuntime and nothing else. It can only
+			// move a string from kindUnknown (build fails, author must decide) to kindRuntime
+			// (needs execution evidence). Contrast a kindHelp arm, which is knob 1.
+			//
+			// The cost, stated because it is real: a `const` holding help prose that happens
+			// to name a command classifies RUNTIME here even though a Long field is its only
+			// consumer, and its author must then restructure or carry runtime evidence. That
+			// is a false POSITIVE on the strict side. There are none in the tree today, and
+			// erring strict is the correct direction for this file — a false positive costs
+			// an argument, a false negative costs the guarantee.
+			return kindRuntime
 		}
 	}
 	return kindUnknown
@@ -415,42 +530,56 @@ func inspectWithStack(root ast.Node, fn func(n ast.Node, stack []ast.Node)) {
 func liftAll(t *testing.T) map[string]*candidate {
 	t.Helper()
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", nil, 0)
-	if err != nil {
-		t.Fatalf("parse cmd/uzi: %v", err)
-	}
 	commands := topLevelCommands(t)
 	found := map[string]*candidate{}
-	for _, pkg := range pkgs {
-		for name, file := range pkg.Files {
-			// Test files may legitimately quote a command while asserting on it.
-			if strings.HasSuffix(name, "_test.go") {
-				continue
-			}
-			inspectWithStack(file, func(n ast.Node, stack []ast.Node) {
-				lit, ok := n.(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					return
+	for _, dir := range instructionScope {
+		pkgs, err := parser.ParseDir(fset, dir, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", dir, err)
+		}
+		// POSITIVE CONTROL PER DIRECTORY. A moved or renamed package makes ParseDir return an
+		// empty map with NO error, and this loop would then scan it to zero candidates while
+		// every test stayed green — the same false-green shape as a live-DB suite that skips.
+		// The scope list is part of the guarantee, so a scope entry that contributes no source
+		// must fail rather than vanish.
+		scanned := 0
+		for _, pkg := range pkgs {
+			for name, file := range pkg.Files {
+				// Test files may legitimately quote a command while asserting on it.
+				if strings.HasSuffix(name, "_test.go") {
+					continue
 				}
-				val, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					return
-				}
-				lifted := liftInstructions(val, commands)
-				if len(lifted) == 0 {
-					return
-				}
-				kind := classifyKind(stack)
-				pos := fset.Position(lit.Pos()).String()
-				for _, cmd := range lifted {
-					c := found[cmd]
-					if c == nil {
-						c = &candidate{kinds: map[instructionKind][]string{}}
-						found[cmd] = c
+				scanned++
+				inspectWithStack(file, func(n ast.Node, stack []ast.Node) {
+					lit, ok := n.(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						return
 					}
-					c.kinds[kind] = append(c.kinds[kind], pos)
-				}
-			})
+					val, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						return
+					}
+					lifted := liftInstructions(val, commands)
+					if len(lifted) == 0 {
+						return
+					}
+					kind := classifyKind(stack)
+					pos := fset.Position(lit.Pos()).String()
+					for _, cmd := range lifted {
+						c := found[cmd]
+						if c == nil {
+							c = &candidate{kinds: map[instructionKind][]string{}}
+							found[cmd] = c
+						}
+						c.kinds[kind] = append(c.kinds[kind], pos)
+					}
+				})
+			}
+		}
+		if scanned == 0 {
+			t.Fatalf("instructionScope names %q, which yielded no non-test Go source. The package "+
+				"moved or was renamed; an entry that silently contributes nothing is worse than a "+
+				"missing one, because the guarantee still reads as covering it.", dir)
 		}
 	}
 	if len(found) == 0 {
@@ -544,7 +673,14 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 	found := liftAll(t)
 
 	// Derived kind per entry, from the candidates attributed to it.
+	//
+	// `oneText` records that a SINGLE candidate text carried more than one kind. That is the
+	// one shape the "split it into two entries" remedy below cannot address, because attribute()
+	// keys on the candidate TEXT: two entries with the same command string are forbidden (they
+	// make the most-specific tie-break silent), so there is no split to make. See the
+	// same-text arm below.
 	kinds := map[int]map[instructionKind][]string{}
+	oneText := map[int]bool{}
 	for cmd, c := range found {
 		i := attribute(cmd)
 		if i < 0 {
@@ -552,6 +688,9 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 		}
 		if kinds[i] == nil {
 			kinds[i] = map[instructionKind][]string{}
+		}
+		if len(c.kinds) > 1 {
+			oneText[i] = true
 		}
 		for k, ps := range c.kinds {
 			kinds[i][k] = append(kinds[i][k], ps...)
@@ -588,15 +727,27 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 				"way a runtime instruction can dodge the execution bar.", k.command, byKind[kindUnknown])
 			continue
 		}
-		if len(byKind) > 1 {
+		if len(byKind) > 1 && !oneText[i] {
+			// TWO DIFFERENT candidate texts landed on this entry and disagree. That IS
+			// splittable — the texts differ, so a longer entry can take the runtime one and
+			// most-specific-wins routes it there. This is the arm the architect's ruling 1.2
+			// relies on to show first-match and all-match attribution are unsatisfiable
+			// against a registry C0 requires; it is unchanged.
 			t.Errorf("%q is printed from BOTH help and runtime positions (%v). Split it into two "+
 				"entries — the two kinds carry different bars and one entry cannot honestly hold both.",
 				k.command, byKind)
 			continue
 		}
-		var derived instructionKind
-		for kk := range byKind {
-			derived = kk
+		// THE STRICTEST BAR PRESENT GOVERNS. With one kind this is that kind, which is all it
+		// has ever been. It differs only for the same-text case above: ONE command string
+		// emitted from both a documentation position and a runtime position, where no split is
+		// expressible and the honest rule is that a string printed at a decision point must be
+		// executed regardless of also appearing in help text. Live today for
+		// `uzi skill install` — a Short description in skill.go AND the hook command uzicli
+		// writes into settings.json for Claude Code to run.
+		derived := kindHelp
+		if _, runtime := byKind[kindRuntime]; runtime {
+			derived = kindRuntime
 		}
 
 		switch k.evidence {
@@ -617,12 +768,21 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 			}
 		}
 
-		switch k.evidence {
-		case evidenceHelpOnly:
-			// The complete bar for a help reference: the path it names must RESOLVE in the live
-			// cobra tree. Nothing used to check this — only that the SECOND word was a real
-			// top-level verb, so `uzi worker set-token` was never verified past `worker`.
+		// THE PATH MUST RESOLVE in the live cobra tree. Nothing used to check this — only that
+		// the SECOND word was a real top-level verb, so `uzi worker set-token` was never
+		// verified past `worker`.
+		//
+		// Applied to EVERY entry whose command is a pure path, not only to the help ones. It
+		// was help-only while evidenceHelpOnly was the only kind that could hold a bare path;
+		// `uzi skill install` moving to a runtime bar would otherwise have silently dropped its
+		// path check, which is a regression hiding inside a fix. It also gains `uzi repo list`,
+		// `uzi review show`, `uzi review undo` and `uzi login` — all of which could have been
+		// renamed out from under their entries with nothing here noticing.
+		if isCommandPath(k.command) {
 			assertCommandPathResolves(t, root, k.command)
+		}
+
+		switch k.evidence {
 		case evidenceNotExecuted:
 			if strings.TrimSpace(k.reason) == "" {
 				t.Errorf("%q is declared NOT EXECUTED with no reason. An honest gap is legal, green and "+
@@ -651,8 +811,25 @@ func TestInstructionEvidenceIsWellFormed(t *testing.T) {
 	}
 }
 
-// assertCommandPathResolves checks that every word of a help reference past `uzi` names a real
-// command in the tree, with nothing left over.
+// isCommandPath reports whether every word past `uzi` could name a command — no flags, no
+// format verbs, no placeholders. Only those entries can be looked up in the cobra tree;
+// `uzi review backlog --run <run-id>` carries an argument and is deliberately excluded rather
+// than special-cased, since a partial resolve would assert less than it appears to.
+func isCommandPath(cmd string) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) < 2 || fields[0] != "uzi" {
+		return false
+	}
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "-") || strings.ContainsAny(f, "%<>") {
+			return false
+		}
+	}
+	return true
+}
+
+// assertCommandPathResolves checks that every word of a command-path reference past `uzi` names
+// a real command in the tree, with nothing left over.
 func assertCommandPathResolves(t *testing.T, root *cobra.Command, ref string) {
 	t.Helper()
 	fields := strings.Fields(ref)
@@ -663,13 +840,15 @@ func assertCommandPathResolves(t *testing.T, root *cobra.Command, ref string) {
 	path := fields[1:]
 	cmd, rest, err := root.Find(path)
 	if err != nil {
-		t.Errorf("help reference %q does not resolve in the cobra tree: %v", ref, err)
+		t.Errorf("registered instruction %q does not resolve in the cobra tree: %v", ref, err)
 		return
 	}
 	if len(rest) != 0 {
-		t.Errorf("help reference %q does not resolve: %q is not a command under %q (the tree stopped "+
-			"at %q). A help string naming a path that does not exist is the one thing this kind of "+
-			"entry CAN be wrong about.", ref, rest, cmd.CommandPath(), cmd.CommandPath())
+		t.Errorf("registered instruction %q does not resolve: %q is not a command under %q (the tree "+
+			"stopped at %q). For a HELP entry this is the one thing it can be wrong about and the "+
+			"complete bar; for a RUNTIME entry it is the cheap half — the command was renamed out "+
+			"from under a string that still tells a user to run it.",
+			ref, rest, cmd.CommandPath(), cmd.CommandPath())
 	}
 }
 

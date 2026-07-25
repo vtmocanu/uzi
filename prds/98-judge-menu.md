@@ -79,9 +79,21 @@ from an exactly-full one) stays out of reach — a proxy that would *read* as pi
   is the entry point:**
   1. **The classifier's baseline is ZERO UNKNOWNs** — all 9 candidates resolved to a definite kind
      at landing, and none was resolved away. So a later `kindUnknown` is a **genuinely new emitter,
-     not an original gap**, and widening the `emitters` set is a decision to record with its
-     reason. It is the single edit that can quietly re-open the hole: every string printed through
-     a wrongly-added wrapper becomes HELP and is exempt from the execution bar.
+     not an original gap**. (Re-measured at `5d5d0be4` after the scan widened to
+     `api/internal/uzicli`: **10 candidates across 13 sites, still zero unknowns.** The `9` is the
+     receipt of the one-package scan it was written against, not a live count.)
+     ~~and widening the `emitters` set is a decision to record with its reason. It is the single
+     edit that can quietly re-open the hole: every string printed through a wrongly-added wrapper
+     becomes HELP and is exempt from the execution bar.~~ **STRUCK — FALSE, and it was false in the
+     safe direction, which is why it survived review and got copied here.** `emitters` has one use
+     site and its arm returns `kindRuntime`, the STRICTEST bar; widening it can only turn a failing
+     `kindUnknown` into a string that needs execution evidence. It can never produce a HELP, so it
+     can never exempt anything. The knobs that genuinely can are (a) `classifyKind`'s `kindHelp`
+     arms and its `kindUnknown` default — `helpFields` and `flagSets` are the same knob — and
+     (b) a human choosing `evidenceHelpOnly`, which is only usable once (a) has been turned,
+     because the derived-kind check reddens an `evidenceHelpOnly` entry with RUNTIME sites. A third
+     was live and unnamed: **SCOPE**. See the corrected paragraph in
+     `api/cmd/uzi/instructions_test.go`, which is the copy that governs.
   2. **An open design question for the architect, implemented but not ruled.** Part C does not say
      how a candidate chooses between two nested entries — `uzi review backlog` (HELP) versus
      `uzi review backlog --run <run-id>` (RUNTIME), where the prefix matcher matches both and the
@@ -1166,6 +1178,23 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       — an e2e-shaped cost for a unit-shaped test, and the likely reason six entries say NOT
       EXECUTED rather than nobody having tried. If only a subset is reachable, the registry is
       already the right artifact for saying which, honestly.
+      **STATUS 2026-07-25 (wave 3): the executing half landed at `79fada44` (three rows), and
+      then the guarantee turned out to be false for a THIRD reason nobody had named — SCOPE.**
+      The paragraph above says "a backstop scanning `api/cmd/uzi/`", and that is exactly what it
+      did: `parser.ParseDir(fset, ".", …)`, one package. `api/internal/uzicli/client.go` was
+      already printing a backticked, liftable `` `uzi auth token` `` with **zero** entries, and
+      adding a brand-new instruction in that package left all three tests green — measured by
+      reviewer-web, reproduced here before the fix and again after. Closed at `25ace437`+1: the
+      scan is now a declared `instructionScope` list covering `api/cmd/uzi` **and**
+      `api/internal/uzicli`, each scope entry carries its own positive control (a directory that
+      contributes no non-test source is a FATAL, not a silent zero), and the same fold now
+      reddens naming the file and the derived kind. **The lesson is not "add a package": the
+      guarantee is only ever as wide as the scan, and nothing in the file said how wide that
+      was.** Two entries arrived with the widening — `uzi auth token` and a second site for
+      `uzi skill install` (`hookCommand`, written into `~/.claude/settings.json` for Claude Code
+      to execute, which is a stronger claim than any printed hint makes and had no bar on it at
+      all). Both needed a new `classifyKind` arm for a literal BOUND TO A NAME on its way to an
+      emitter; that arm returns `kindRuntime` only, so it cannot grant an exemption.
 - [ ] **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
       demo fixture cannot reach the two riskiest behaviours.** A differential harness dumped
       the shipped `mockReviews`, ran the real `GroupJudgeRecommendations` over rows built in
