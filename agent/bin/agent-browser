@@ -1,8 +1,31 @@
 #!/bin/sh
 # PRD #87 — name-agnostic browser crash-close shim + launch-config injector for the
 # `agent-browser` CLI. Baked at /usr/local/bin/agent-browser (on the image PATH) in BOTH
-# worker templates; the real npm bin at /app/node_modules/.bin/agent-browser is NOT on the
-# image PATH, so a bare `agent-browser` from the agent always hits this shim first.
+# worker templates. The real npm bin at /app/node_modules/.bin/agent-browser is NOT on the
+# IMAGE PATH — but that fact ALONE never made "a bare `agent-browser` always hits this shim
+# first" true, and on the primary (hosted-k8s) runtime it was FALSE until issue #120:
+#
+#   The CMD is `npm run start`, and npm's run-script PREPENDS /app/node_modules/.bin (plus
+#   /node_modules/.bin and @npmcli/run-script/lib/node-gyp-bin) to the PATH the worker
+#   process sees. On a ROOT/compose (A1) start that never reached the agent — the entrypoint
+#   captures the image PATH BEFORE the CMD runs and hands it to runner children as
+#   UZI_RUNNER_PATH. On a NON-ROOT (#58 single-uid, hosted k8s) start UZI_RUNNER_PATH was
+#   left unset, `runnerPath()` fell back to the npm-mutated PATH, and the real CLI SHADOWED
+#   this shim: launches got no AGENT_BROWSER_ARGS, hence no --no-sandbox, hence the raw SUID
+#   abort this shim exists to prevent. Measured on run 1dfc65b4 (worker 8e1fef71,
+#   agent-base:0.11.6) — the launch resolved /app/node_modules/.bin/agent-browser.
+#
+# WHAT GUARANTEES THE INVARIANT NOW (it is NOT this file, and it is NOT the Dockerfile):
+# agent/templates/entrypoint.sh exports UZI_RUNNER_PATH = the untouched image PATH on BOTH
+# branches, so `runnerPath()` (agent/src/runner-uid.ts) — the PATH every runner child gets,
+# including the agent's Bash tool via buildSdkEnv — is the image PATH in both modes, and
+# /app/node_modules/.bin is on neither. agent/test/templates-guardrails.test.ts pins that
+# export (both branches) and agent/test/runner-uid.test.ts pins the resolution order.
+#
+# RESIDUAL: anything that hands a runner child a PATH the entrypoint did not produce can
+# shadow this shim again — notably a provisioned `toolEnv.PATH` (PRD #18 M3), which
+# buildSdkEnv folds in as a full PATH REPLACEMENT. If a browser launch ever loses
+# --no-sandbox again, dump the agent's effective PATH first; do not assume this shim ran.
 #
 # It does two things the bare CLI cannot do on its own in the hardened worker:
 #

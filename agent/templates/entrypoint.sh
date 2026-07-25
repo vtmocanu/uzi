@@ -67,6 +67,36 @@ if [ "$uid" != "0" ]; then
   # non-root) → every spawn fails → DoS. Clear them so single-uid mode is robust to a
   # stray value. Not attacker-reachable (the runner cannot set the worker's env).
   unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR
+  # PRD #120 / issue #120: pin the RUNNER PATH here too, AFTER the unset above (so a stray
+  # operator value is still cleared and the value that survives is the entrypoint's own).
+  #
+  # Why: leaving it unset made `runnerPath()` (agent/src/runner-uid.ts) fall back to
+  # `env.PATH` — and the CMD is `npm run start`, so npm's run-script PREPENDS
+  # /app/node_modules/.bin, /node_modules/.bin and @npmcli/run-script/lib/node-gyp-bin to
+  # the PATH the worker process actually sees. Every runner child (SDK agent, provision,
+  # checks, git) then inherited a PATH on which the real npm `agent-browser` CLI shadowed
+  # the crash-close + launch-config shim baked at /usr/local/bin (PRD #87), so browser
+  # launches silently lost `--no-sandbox` and Chromium aborted on the setuid sandbox that
+  # the PRD #51 hardening makes impossible. The ROOT/A1 path never had this: it captures
+  # IMAGE_PATH below BEFORE the CMD runs and hands it over at the drop. The two modes
+  # disagreeing was the defect; this makes them agree.
+  #
+  # `$PATH` is still the untouched image PATH at this point (the entrypoint runs BEFORE the
+  # CMD), so this is exactly the value IMAGE_PATH captures on the root path.
+  #
+  # This does NOT weaken the #58 single-uid posture. UZI_UID_SPLIT stays unset, so
+  # `uidSplitActive()` is false and every runner-uid.ts primitive remains a passthrough (no
+  # setpriv wrap, no cross-uid kill) — that is what the unset above exists for, and it is
+  # untouched. Nor does it widen anything: single-uid means worker == runner, and the
+  # worker's own PATH already carries /nix here (only the ROOT path strips it, because only
+  # there is /nix owned by a *different*, untrusted uid). It is also strictly safer than the
+  # old fallback — a stray operator value used to be replaced by whatever npm produced, and
+  # is now replaced by the image's own PATH.
+  #
+  # UZI_RUNNER_TMPDIR is deliberately NOT re-exported: controller/internal/kube/render.go
+  # sets a pod-spec TMPDIR for docker workers and relies on this branch leaving it unset so
+  # `runnerTmpdir()` (= UZI_RUNNER_TMPDIR || TMPDIR) returns the pod-spec value.
+  export UZI_RUNNER_PATH="$PATH"
   exec "$TINI" -- "$@"
 fi
 echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2

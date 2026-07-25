@@ -76,8 +76,11 @@ export function buildSdkEnv(
     HOME: homeDir,
     // The RUNNER PATH (PRD #51 M4): the /nix-bearing image PATH under the split (the
     // agent's Bash resolves git/bash/coreutils + provisioned tools), NOT the worker's
-    // stripped PATH. Single-uid (#58): the worker's own PATH. A provisioned toolEnv.PATH
-    // still overrides this below.
+    // stripped PATH. Single-uid (#58): the entrypoint exports the same image PATH there
+    // (issue #120) — before that this fell back to the worker's npm-mutated PATH, on which
+    // /app/node_modules/.bin shadowed the /usr/local/bin agent-browser shim and browser
+    // launches lost --no-sandbox. A provisioned toolEnv.PATH still REPLACES this below, so
+    // it is the one remaining way an agent PATH can diverge from the image's.
     PATH: runnerPath(),
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,

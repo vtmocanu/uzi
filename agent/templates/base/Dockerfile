@@ -223,10 +223,15 @@ ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
 # M1 crash-close shim on PATH ahead of the real CLI: a browser-driving agent that finds no
 # runnable browser exits cleanly (exit 0 + a clear message) instead of a raw Chromium SUID
 # abort (M0), keyed on the missing-browser FAILURE not the role name. /usr/local/bin is on
-# PATH; the real npm bin (/app/node_modules/.bin/agent-browser) is NOT, so a bare
-# `agent-browser` always hits the shim, which execs the real CLI by absolute path (no PATH
-# recursion) when a browser resolves and injects the M4 launch config the sparse SDK env
-# would otherwise drop. Root-owned 0755. MIRRORED in jvm.
+# PATH; the real npm bin (/app/node_modules/.bin/agent-browser) is NOT. The shim execs the
+# real CLI by absolute path (no PATH recursion) when a browser resolves, and injects the M4
+# launch config the sparse SDK env would otherwise drop. Root-owned 0755. MIRRORED in jvm.
+#
+# The layout above is NOT on its own what makes a bare `agent-browser` hit the shim: the
+# CMD below is `npm run start`, and npm's run-script PREPENDS /app/node_modules/.bin to the
+# PATH the worker sees, which SHADOWED the shim on the non-root (#58 k8s) start until issue
+# #120. The invariant is held by agent/templates/entrypoint.sh exporting UZI_RUNNER_PATH =
+# the untouched image PATH on BOTH branches — see the shim header for the full account.
 COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 
 # Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the

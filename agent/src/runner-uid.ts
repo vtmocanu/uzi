@@ -45,8 +45,17 @@ export function uidSplitActive(env: NodeJS.ProcessEnv = process.env): boolean {
  * full image PATH INCLUDING `/nix` (which the runner needs to realize devbox/nix
  * packages), while the WORKER's own PATH is stripped to root-owned image dirs only (no
  * `/nix`) — so a runner-writable `/nix` can never plant a binary the PAT-holding worker
- * resolves (M2-audit MEDIUM). Single-uid (#58): unset → the worker's own PATH (which
- * still carries `/nix`, since there is no separate runner). */
+ * resolves (M2-audit MEDIUM).
+ *
+ * Single-uid (#58, hosted k8s): the entrypoint exports the SAME untouched image PATH on
+ * that branch too (issue #120). That export is NOT redundant with the `env.PATH` fallback
+ * below: the CMD is `npm run start`, so by the time the worker reads its own PATH npm's
+ * run-script has PREPENDED `/app/node_modules/.bin` (+ `/node_modules/.bin`, +
+ * `@npmcli/run-script/.../node-gyp-bin`) to it — and the real `agent-browser` npm CLI
+ * there SHADOWED the `/usr/local/bin` shim that injects `--no-sandbox`, so browser
+ * launches hit the setuid sandbox the PRD #51 hardening makes impossible. The fallback is
+ * kept for a non-entrypoint start (unit tests, a bare `npm start`), not as the container
+ * path. Do not "simplify" the second export away. */
 export function runnerPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
   return env.UZI_RUNNER_PATH || env.PATH;
 }

@@ -115,6 +115,17 @@ uid-split containment applies only on the **root-started** (compose / A1) path;
 `runner-uid.ts` primitive a passthrough. Single-uid is PRD #58's own accepted
 posture; the cross-container split for that world is the k8s form below.
 
+`UZI_RUNNER_PATH` is the one split-shaped var the non-root branch **does** export
+(issue #120), and it carries no containment meaning there — it exists so the PATH
+handed to runner children is the image's own in **both** modes. The container's CMD
+is `npm run start`, and npm's run-script prepends `/app/node_modules/.bin` to the
+worker's PATH; leaving `UZI_RUNNER_PATH` unset made `runnerPath()` fall back to that
+mutated PATH, where the real `agent-browser` npm CLI shadowed the `/usr/local/bin`
+shim that injects `--no-sandbox` (PRD #87) and Chromium aborted on the setuid
+sandbox this very hardening makes impossible. Exporting it does not activate the
+split (`UZI_UID_SPLIT` stays unset) and widens nothing: single-uid means worker ==
+runner, so that PATH was already the worker's.
+
 ## Local ↔ k8s mapping (align at the abstraction, not the mechanism)
 
 The durable abstraction is **"the untrusted execution surface runs under a
