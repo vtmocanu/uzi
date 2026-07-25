@@ -93,4 +93,32 @@ spec:
               {{- range .Values.workers.docker.networkPolicy.extraExcept }}
               - {{ . }}
               {{- end }}
+    {{- if .Values.workers.networkPolicy.allowWebService }}
+    # The in-cluster uzi web Service (PRD #87 §5 / M5), mirrored here from
+    # worker-networkpolicy.yaml. Added 2026-07-25 after a live M7 attempt found the
+    # docker tier could not reach it: the restricted tier got this rule and the docker
+    # tier never did, so `web-ux` on a docker-capable worker had no target. Same flag,
+    # same default (off), same selector + CONTAINER port (8080) reasoning as the
+    # restricted tier's copy — read that comment for why an FQDN ANNP cannot express it.
+    #
+    # THIS IS A DELIBERATE WIDENING, not a no-op, and the header's "WHAT IT CLOSES"
+    # paragraph is why it needs saying. The internet rule above allows 0.0.0.0/0 EXCEPT
+    # every in-cluster CIDR — so before this rule the docker tier could reach exactly two
+    # in-cluster destinations, DNS and the api. This makes it three. On the PRIVILEGED
+    # tier (dind; a compromised worker can `docker run --network=host`) each in-cluster
+    # address added is real lateral reach, so the justification has to be the feature,
+    # not "it already has internet". It is scoped to one component, one port, one
+    # namespace, and stays off unless a cluster opts in.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
 {{- end }}
