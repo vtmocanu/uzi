@@ -10126,8 +10126,12 @@ the Locked Decisions, user journey, and the full test re-pin inventory.
   an operator upgrades the worker image to fix the wedge, the run is requeued onto
   a 0.10.1+ worker that would split, bisect and succeed, and the stale streak
   kills it first — *the fix that made the upgrade worth doing is what the kill
-  lands on.* **The rule is enforced at the RECORDER** (`AppendMessages` evicts
-  whenever the observed status is not `running`), which is what makes it a rule
+  lands on.* **The rule is enforced at BOTH RECORDING HOOKS** — `AppendMessages` and
+  `NoteOversizeBatch` each evict whenever the observed status is not `running`.
+  Naming both is not pedantry: the 413 hook was left on the older terminal-only
+  check for four commits, so the two sites disagreed with each other, and an
+  `oversize` streak (a killable class) could accumulate entirely while a run was
+  parked at the approval gate. Enforcing at the recorders is what makes it a rule
   rather than a list of patched paths: the evaluator only ever sees CANDIDATES, so
   it cannot reach a sub-threshold streak, and `Register`'s `RequeueWorkerRuns`
   returns no ids so it can never have a sweep-style hook. Measured before that

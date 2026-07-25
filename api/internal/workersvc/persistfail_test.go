@@ -757,14 +757,27 @@ func TestNoteOversizeBatchCountsOnlyOwnedNonTerminalRuns(t *testing.T) {
 		}
 	})
 
-	t.Run("terminal", func(t *testing.T) {
-		fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "cancelled"}}
-		svc := persistSvc(fs, &clk)
-		svc.NoteOversizeBatch(context.Background(), w, runID)
-		if got := svc.persistFail.stats(runID); got.streak != 0 {
-			t.Fatalf("streak = %d, want 0 for a terminal run", got.streak)
-		}
-	})
+	// BOTH recording hooks must be on the SAME rule. This one was left on a
+	// terminal-only check when AppendMessages moved to `status != "running"`, so the
+	// two sites disagreed with each other — and the divergence was reachable through
+	// the exact case that forced the status narrowing: a run parks at
+	// `awaiting_approval` while a pre-0.10.1 batcher keeps taking 413s on its grown
+	// batch. Measured then: streak 20 built entirely at the gate, `window_seconds=95`,
+	// and `oversize` is a killable class, so the run died on the first sweep after
+	// the human approved it.
+	for _, status := range []string{"cancelled", "completed", "failed", "awaiting_approval", "queued", "claimed"} {
+		t.Run("not running: "+status, func(t *testing.T) {
+			fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: status}}
+			svc := persistSvc(fs, &clk)
+			for i := 0; i < 12; i++ {
+				svc.NoteOversizeBatch(context.Background(), w, runID)
+			}
+			if got := svc.persistFail.stats(runID); got.streak != 0 {
+				t.Fatalf("streak = %d after 12 oversize batches on a %s run, want 0: the 413 hook must hold the SAME rule as the recorder, or a streak accumulates where the recorder would have refused it",
+					got.streak, status)
+			}
+		})
+	}
 }
 
 func TestSweepPrunesTheTracker(t *testing.T) {

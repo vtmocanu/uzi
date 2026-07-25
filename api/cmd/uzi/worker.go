@@ -34,9 +34,16 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
-				rows = append(rows, []string{w.ID, w.Name, w.Status})
+				rows = append(rows, []string{w.ID, w.Name, w.Status, strOr(w.Version, "-")})
 			}
-			return p.Table([]string{"ID", "NAME", "STATUS"}, rows)
+			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
+			// auto-stopped run is "check the worker's version" — v0.10.1+ isolates a
+			// poisoned message itself, so an upgrade is the real fix and the version is
+			// the first thing an operator needs. The web has rendered it since PRD #42
+			// (WorkersSettings.tsx); the CLI is a first-class second consumer and did
+			// not, so the doc shipped a remedy one of its two audiences could not
+			// follow. "-" when a worker has never registered a version.
+			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION"}, rows)
 		},
 	}
 

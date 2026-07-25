@@ -978,3 +978,25 @@ func derefOr(s *string) string {
 	}
 	return *s
 }
+
+// PRD #108 M9b. docs/run-auto-stopped.md's first remedy for an auto-stopped run is
+// "check the worker's version" — v0.10.1+ isolates a poisoned message itself, so an
+// upgrade is the real fix. The web has shown it since PRD #42; the CLI did not, so
+// the page shipped a remedy one of its two audiences could not follow.
+func TestWorkerListShowsVersion(t *testing.T) {
+	v := "v0.10.1"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", Version: &v},
+		{ID: "w2", Name: "beta", Status: "offline"}, // never registered a version
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "VERSION") || !strings.Contains(out, v) {
+		t.Fatalf("worker list does not surface the version, so the doc's first remedy is unfollowable from the CLI:\n%s", out)
+	}
+	if !strings.Contains(out, "-") {
+		t.Errorf("a worker that never registered a version should render \"-\", not an empty cell:\n%s", out)
+	}
+}

@@ -1236,7 +1236,21 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 	if err != nil {
 		return
 	}
-	if terminalStatuses[run.Status] {
+	// THE SAME RULE AS THE RECORDER'S, and it must stay the same rule. This hook was
+	// left on the old terminal-only check when AppendMessages moved to
+	// `status != "running"`, so the two recording sites disagreed with each other —
+	// one recording on any non-running run, one unless terminal. That is a worse
+	// divergence than the `terminal bool` the observation type was changed to avoid,
+	// because the boolean at least meant the same thing in both places.
+	//
+	// It was reachable, and through the case that forced the status narrowing to
+	// begin with: /state is a different route and does not wedge, so a run reports
+	// its plan and parks at `awaiting_approval` while a pre-0.10.1 batcher keeps
+	// re-POSTing its grown batch and takes a 413 each time. Measured: streak 20 built
+	// entirely at the gate, `window_seconds=95`, then the human approves and the
+	// first sweep after the run returns to `running` kills it — and `oversize` IS a
+	// killable class, so nothing downstream stopped it.
+	if run.Status != "running" {
 		s.persistFail.evict(runID)
 		return
 	}
