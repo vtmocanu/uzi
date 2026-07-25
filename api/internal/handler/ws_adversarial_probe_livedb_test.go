@@ -42,13 +42,16 @@ import (
 // ever measured the six tests below, and it was wrong by one. A blast radius measured
 // through a filter is not a blast radius (measured 2026-07-25):
 //
+// Baseline for both, `go test -v -run 'LiveDB$' ./internal/handler/`: 128 PASS, 0 FAIL,
+// 0 SKIP.
+//
 //   - Drop `AND NOT revoked AND (expires_at IS NULL OR expires_at > now())` from
-//     getCLITokenByHash. Reddens the `revoked` and `expired` subtests, the
+//     getCLITokenByHash → 123 PASS. Reddens the `revoked` and `expired` subtests, the
 //     revocation-landed control in (P5) which reads the same predicate, and the
 //     pre-existing TestCLIExpiredRevokedReject401LiveDB, which pins the same predicate
 //     on the REST path — and nothing else.
-//   - Neuter the `!user.IsActive` check in middleware/cli_auth.go. Reddens exactly the
-//     `owner_deactivated` subtest and nothing else, across the whole package.
+//   - Neuter the `!user.IsActive` check in middleware/cli_auth.go → 126 PASS. Reddens
+//     exactly the `owner_deactivated` subtest and nothing else.
 //
 // No mutation smears across unrelated tests: each reddens the assertions that read the
 // predicate it broke, and only those.
