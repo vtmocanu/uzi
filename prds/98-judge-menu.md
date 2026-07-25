@@ -1158,6 +1158,17 @@ Five items. All found by execution, all with evidence recorded here or in the M3
         `TestSyncFiledIssueClosesWiring` (`internal/forgesvc/judge_issue_close_test.go`),
         against a **fake store**. Nothing in the repo ran the poller, so the chain
         close → cache → tick → disposition was unpinned end to end.
+- [x] **DONE, wave 3 — validated by execution, not by report.** The registry half was already in;
+      the executing half landed at `4b94f714`, its scan-scope claim was corrected at `6002d808`
+      (the headline "a FOURTH instruction cannot land silently" was false — the scan covered
+      `api/cmd/uzi` only, while `internal/uzicli/client.go` was already printing a liftable
+      `uzi auth token` with zero registry entries), and the `eval` it executes through gained an
+      anchored allowlist floor at `a01787f2` after the auditor found the whole safety burden sat
+      on each caller's regex with no floor in the helper. **Green in e2e at `e535edb6`: 197 PASS /
+      0 FAIL**, including three rows executed verbatim from the emitting command's own stderr with
+      non-zero exits tolerated. Reviewed by reviewer-web, audited, and the architect ruled KEEP on
+      the scan-scope commit after owning two of its own three objections as measurably wrong.
+      *Original entry preserved below — its measurements are the record of how the gap was found.*
 - [ ] **The printed-instruction backstop.** Three instructions existed in the CLI, **none had
       ever been executed, and two were false** (the revert hint, fixed; the truncation
       remedy, fixed). A string that tells a user what to do is an assertion nothing
@@ -1231,6 +1242,22 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       to execute, which is a stronger claim than any printed hint makes and had no bar on it at
       all). Both needed a new `classifyKind` arm for a literal BOUND TO A NAME on its way to an
       emitter; that arm returns `kindRuntime` only, so it cannot grant an exemption.
+- [x] **DONE, wave 3.** The golden fixture landed (`fixtures/judge-fidelity/{cases,expected}.json`,
+      repo root, owned by neither runtime), authored to discriminate rather than snapshotted from
+      the demo, with input- and output-side self-checks in both runtimes that fatal by name.
+      reviewer-web re-measured 7 folds AT THE TIP rather than trusting the README's table: the Go
+      `sort.SliceStable`→`sort.Slice` fold reddens exactly one case, the rune and trim folds redden
+      **disjoint** case sets (so the two-part mock fix is measured, not asserted), and both the
+      missing-case and orphaned-golden guards fire. Truncation is correctly absent from the
+      cross-implementation fixture — the cap cuts rows before grouping, so the Go grouper never
+      sees it — and is pinned mock-side, with the demo toggle now reachable at
+      `?mock=truncated-backlog` (browser-validated; the user confirmed the mechanism 2026-07-25).
+      **One Blocking came out of it and is fixed:** the Go half could serve `ok (cached)` over a
+      fixture-only edit, because `fixtures/` sits outside the `api/` module root — deleting a whole
+      case still went green. `-count=1` is now on the documented local gate AND on CI's `test:api`,
+      which was armed by the same mechanism (`.go_job` persists `.gocache/` keyed on `api/go.sum`,
+      which a fixture edit never touches), copying `test:controller`'s merged precedent.
+      *Original entry preserved below.*
 - [ ] **Seam 6 — mock↔server fidelity. MEASURED 2026-07-21: no divergence found, but the
       demo fixture cannot reach the two riskiest behaviours.** A differential harness dumped
       the shipped `mockReviews`, ran the real `GroupJudgeRecommendations` over rows built in
@@ -1429,6 +1456,17 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       M5 makes the inbox a first-class judge surface — so it is now the obvious next place
       someone does that, and the one place nothing would fail.
 
+- [x] **DONE, wave 3 — pinned in a test AND driven in a real browser.** The anchored-href render
+      pin landed on the web branch (`0dbfc0f5`, on a row INSIDE an opened judge group, which is the
+      case the old fixture could not reach), reviewed with 0 Blocking. Then web-ux drove it live
+      via cmux against a mock-mode dev server and confirmed the property the anchor exists for:
+      **7 groups unanchored versus 5 anchored on the same bucket**, and expanding an anchored group
+      still yields occurrences linking to the two OTHER runs — so the anchor selects coordinates
+      without trimming occurrences, seen rather than asserted. A nonexistent run id renders the
+      same message as a real-but-empty one, so there is no existence oracle. One thing recorded so
+      it is not later misread as a bug: an anchor also switches the default bucket from To-triage
+      to All (deliberate, commented at `Judge.tsx:91`), which is why an anchored view can show MORE
+      groups than the unanchored landing. *Original entry preserved below.*
 - [ ] **The anchored deep-link's RENDER PATH is rarely exercised in real use — a testing
       concern, not a product gap** (M5 review, 2026-07-21; **corrected the same day**).
       **The behaviour is COHERENT and the user ruled ship-as-is.** The three cases line up,
@@ -1502,6 +1540,14 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       `agent-team-tasks`. The dispatched line numbers were already one hit short of what it
       returns, which is the argument for re-running it rather than inheriting the list.
 
+- [x] **DONE, wave 3 — `8b2ac005`, +501 lines of tests on the 236-line component.** M3's only
+      forge-writing web path now has coverage, reviewed with 0 Blocking. The commit also carries a
+      finding worth more than the tests: the reviewer re-derived all four coordinates cited in the
+      component's own comment **against the merged tree** before the integration commit landed, and
+      found the claim held only because `JudgeRecommendationGroup` ships no review timestamp either
+      — had the enclosing group carried one, the comment would have become false at the merge and
+      the integration would have carried a false statement into main. One of the four line numbers
+      was unchanged by luck rather than by design, and the coder said so. *Original entry below.*
 - [ ] **N2 — `OccurrenceFileIssue` tests.** 236 lines, **zero tests**, and M3's **only
       forge-writing web path**; no test ever opens the occurrence expander. Its security
       controls were verified by line-by-line diff against RunView's filer (same CSRF path,
@@ -1558,6 +1604,17 @@ container name" that does not exist, and load contention measured at 3-6× headr
 concurrent suite). Recorded in the checkpoint as unknown. Sequencing is the mitigation and it
 costs nothing; do not attribute it.
 
+- [ ] **PARTIAL, wave 3 — the e2e half is GREEN; the docs/specs half is what remains.** The leg
+      landed as B4′ + B6′ (Part B narrowed by user ruling on 2026-07-25: duplicate removal, not a
+      time trim — `tier2`'s live-DB tests came to cover B1/B2/B3/B5 and B6's matrix, and where each
+      is pinned is now recorded **by test function name** rather than rebuilt). **`e535edb6`: 197
+      PASS / 0 FAIL, matching a prediction locked to a file before the run.** B6′ — the close→Done
+      edge driven by the POLLER — is the chain nothing in this repo had ever executed and it now
+      passes; B4′ ran end to end on its third attempt, the first two having died on a fixture
+      colliding with `run_reviews.target_run_id`'s UNIQUE constraint (five static reviewers missed
+      it; the harness found it on first execution) and then on an assertion that demanded the
+      re-read name a coordinate the write is defined to remove. Still open here: `docs/judge.md`
+      and `docs/cli.md`, the CHANGELOG entry for the admin CLI-token inventory, and `specs/ai.md`.
 - [ ] **M8a — Tests + Docs (docs half in the first MR)**: e2e leg (dedup grouping; a group **Dismiss** fans out
       across runs and drops an `improve_uzi` rec from the backlog; **issue-close →
       Done, edge-once, Undo sticks, dismissed not overwritten**; the notification
