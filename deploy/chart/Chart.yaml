@@ -7,8 +7,8 @@ type: application
 # (oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>); ArgoCD deploys that
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
 # follows appVersion. Bump both (and the argo-apps targetRevision) per release.
-version: 0.11.4
-appVersion: "0.11.4"
+version: 0.11.5
+appVersion: "0.11.5"
 
 # Umbrella chart (same pattern example-app uses): the CloudNativePG upstream `cluster`
 # chart ships as a subchart (aliased `postgres`) so one release brings up the api,
