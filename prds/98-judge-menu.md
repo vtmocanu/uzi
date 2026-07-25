@@ -1,7 +1,11 @@
 # PRD #98: Judge menu — a dedicated cross-run recommendation workbench
 
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
-**Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
+**Status (2026-07-25)**: In progress on **`feature/prd-98-t3`**, the wave-3 integration branch — all six wave-2 branches merged into it, `origin/main` merged in, awaiting the MR. **M8's e2e leg is no longer deferred: it is BUILT and GREEN** (197 PASS / 0 FAIL at `e535edb6`, matching a prediction locked to a file before the run). PRD #97 merged, which is what unblocked it.
+
+**⚠️ EVERYTHING BELOW THIS LINE UNTIL "## Problem" IS A HISTORICAL RECORD, NOT CURRENT STATE.** The tip table and both RESUME blocks describe 2026-07-21, when six branches were unmerged and the validation debt was open. A fact-check on 2026-07-25 measured every row of that table as stale and the `⚠️ WHOLLY UNVALIDATED` block as describing a state three tasks closed. They are kept because the measurements in them are the record of how this wave's findings were made — but **do not read them as a resume point**. The resume point is this Status line.
+
+*(Superseded status line, kept so a stale copy of this file is recognisable:)* In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
 
 **Progress (2026-07-21, end of day)** — **FIRST MR MERGED.** [MR !90](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/90) landed on `main` as `8515cfab` with CI green across every stage: all seven implementation milestones (M1-M7) plus M8a's docs half, 95 files, +15,594/−225. The migration shipped as `00081_judge_issue_close_sync.sql`, renumbered above the live head at landing (the draft `00075` collided with a *different* migration already on `main`; the `00076` gap was deliberately not filled, since a free number below the applied head is the boot-refusing case).
 
@@ -1165,7 +1169,9 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       `uzi auth token` with zero registry entries), and the `eval` it executes through gained an
       anchored allowlist floor at `a01787f2` after the auditor found the whole safety burden sat
       on each caller's regex with no floor in the helper. **Green in e2e at `e535edb6`: 197 PASS /
-      0 FAIL**, including three rows executed verbatim from the emitting command's own stderr with
+      0 FAIL**, across **four** `run_printed_instructions` rows — the fourth, `uzi review backlog
+      --run`, landed in `e535edb6` itself, so "three" was true two commits earlier and a fact-check
+      caught it here. Rows are executed verbatim from the emitting command's own stderr with
       non-zero exits tolerated. Reviewed by reviewer-web, audited, and the architect ruled KEEP on
       the scan-scope commit after owning two of its own three objections as measurably wrong.
       *Original entry preserved below — its measurements are the record of how the gap was found.*
@@ -1400,15 +1406,27 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       (`workersvc/service_test.go:393`), which returns a canned slice, so the SQL text has
       never executed under test. The judge's oldest-first input cap rides this query
       (`follow_up_inputs_integration_test.go:21` describes the shape). Recorded rather than
-      fixed because scope is frozen; it is declared `UNPINNED` with this reason in
+      fixed because scope is frozen; it **was** declared `UNPINNED` with this reason in
+      *(🔴 **that "declared UNPINNED" sentence is STALE and this entry is ticked DONE above it.**
+      At `d2c2d1f4` the inventory row reads `{"ListRunInputsForRun", "judge.sql",
+      "TestListRunInputsForRunLiveDB", "WAS the one UNPINNED row…"}`, and that test exists at
+      `api/internal/store/judge_trace_inputs_integration_test.go`. A fact-check caught it on
+      2026-07-25: unlike its neighbouring ticks this entry carried no `**Original:**` marker, so
+      the superseded sentence read as current — the exact class the tick commit set out to fix,
+      in the one entry it missed. Everything from here to the end of this item is the
+      **original** text, kept for its measurements.)* — original continues:
       `api/internal/store/query_inventory_test.go` (renamed off the `judge` prefix at `041c5291`
       when the table outgrew the judge family — it was `judge_query_inventory_test.go`), which is
       the only reason it is
       visible at all.
 
 - [ ] **Widen the query inventory beyond the judge family.** The declaration test landed for
-      the five judge-family `.sql` files (**17 queries**). Repo-wide is **276 queries across
-      28 files**, and a repo-wide table written in one sitting would be mostly `UNPINNED` rows
+      the five judge-family `.sql` files (**17 queries**). Repo-wide is **28 files** — and the
+      query count is whatever the tree holds when you read this: `grep -h '^-- name:'
+      api/internal/store/queries/*.sql | wc -l` gives **292 at `d2c2d1f4`**, against 290 recorded
+      at `ad6c63d9` in the inventory test's own header and an unhedged **276** this line carried
+      until 2026-07-25, which matched neither. Run the command; do not trust a numeral here.
+      A repo-wide table written in one sitting would be mostly `UNPINNED` rows
       authored by someone who had not investigated any of them — which is a worse artifact
       than none, because it reads as an audit. Widen one file at a time, with the call sites
       opened.
@@ -1540,7 +1558,12 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       `agent-team-tasks`. The dispatched line numbers were already one hit short of what it
       returns, which is the argument for re-running it rather than inheriting the list.
 
-- [x] **DONE, wave 3 — `8b2ac005`, +501 lines of tests on the 236-line component.** M3's only
+- [x] **DONE, wave 3 — `8b2ac005` (+431/−2, of which 414 is the new test file) on the
+      then-236-line component.** *(This entry first read "+501 lines" against that one SHA. A
+      fact-check corrected it: 501 is the test file's size **now**, after seven commits
+      — `8b2ac005`, `3194633a`, `4a469178`, `40e96a4c`, `4c87d0f1`, `aa73a0bb`, `abf039e4` — and
+      the component is 253 lines at HEAD, not 236. Attributing a cumulative figure to the commit
+      that started it is the same shape as quoting an Insert node as a statement's cost.)* M3's only
       forge-writing web path now has coverage, reviewed with 0 Blocking. The commit also carries a
       finding worth more than the tests: the reviewer re-derived all four coordinates cited in the
       component's own comment **against the merged tree** before the integration commit landed, and
@@ -1744,8 +1767,14 @@ sites and never constructs `h.Routes()` — **no middleware chain executes at al
 observe a missing mount even in principle. The only tests that build the real route table use
 `noLimit` or a 100k/minute budget that cannot fire. `chi.Walk` appears **nowhere** in `api/`, so
 no route-table snapshot exists or could be trivially derived. And the only 429 assertion in
-`e2e/run-e2e.sh` (`:1850-1871`, PRD #58's XFF forgery) is on `authLimiter.Middleware` at
-`/api/auth/login` — an **IP-keyed** mount, not a per-user one, so it closes none of the 24.
+`e2e/run-e2e.sh` (PRD #58's XFF forgery — cite it by content, `say "PRD #58 M4: X-Forwarded-For
+forgery"`; the `:1850-1871` this line used to carry now points at `/proc` hardening) is on
+`authLimiter.Middleware` at `/api/auth/login` — an **IP-keyed** mount, not a per-user one, so it
+closes none of them. *(That last clause read "none of the 24" until 2026-07-25. It is **25** now:
+`c309e8a0` — this PRD's own admin CLI-token inventory — added a fourth `authLimiter` per-user
+mount at `handler.go:586`. The same commit rotted three unhedged numerals in
+`route_limiter_mounts_test.go`, and the file ran the experiment for us: **every SHA-bound claim in
+it survived our commit and every unbound one did not, three for three each way.**)*
 **CLOSED IN THIS WAVE (`feature/prd-98-t2-lim`) — and closing it surfaced a SECOND, live
 production hole that nothing could see.** `api/internal/handler/route_limiter_mounts_test.go`
 walks the real `Routes(...)` table and pins, per route, **which limiter instance** is mounted —
