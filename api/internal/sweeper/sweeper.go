@@ -103,7 +103,7 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
@@ -113,6 +113,10 @@ func (e *Engine) runOnce(ctx context.Context) {
 			"chat_idle_completed", res.ChatIdleCompleted,
 			"proposals_recovered", res.ProposalsRecovered,
 			"health_changed", res.HealthChanged,
+			// PRD #108 M5. In the sum above as well as emitted here: a field documented
+			// as observability that nothing observes is the wrong shape for an M7
+			// milestone, and without it an auto-stop does not raise this line at all.
+			"auto_stopped", res.AutoStopped,
 		)
 	}
 }

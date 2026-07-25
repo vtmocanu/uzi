@@ -49,6 +49,14 @@ describe("deriveFaviconState — a deliberate stop is not a failure", () => {
   it("a cancelled run does not redden", () => {
     expect(deriveFaviconState([run("cancelled")], 0, NONE)).toBe("idle");
   });
+  // ...but an AUTO-stop is not a deliberate stop (PRD #108 M5). It is uzi killing a
+  // broken run, so it must redden the tab exactly like any other fresh failure. The
+  // exclusion here is inherited from isStoppedRun, which is precisely why the
+  // narrowing needed a test on THIS side too: nothing in favicon.ts mentions
+  // stop_kind's members, so a change there silently retunes the attention set.
+  it("an auto-stopped run DOES redden — the tab must show breakage", () => {
+    expect(deriveFaviconState([run("failed", { stop_kind: "auto_stopped" })], 0, NONE)).toBe("failed");
+  });
 });
 
 describe("deriveFaviconState — fresh vs. baseline", () => {

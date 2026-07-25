@@ -190,6 +190,10 @@ type Store interface {
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
+	// FailRunAutoStop is the server-side half of PRD #108 M5's auto-stop. Unlike
+	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
+	// request from a user whose ownership must be proven.
+	FailRunAutoStop(ctx context.Context, arg store.FailRunAutoStopParams) (int64, error)
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
@@ -336,6 +340,20 @@ type Params struct {
 	// recovery for a confirm handler killed mid-flight. Must sit above the forge HTTP
 	// timeout so a legitimately in-flight confirm is never reaped. 0 disables the sweep.
 	ProposalConfirmStuckTimeout time.Duration
+	// AutoStopEnabled is the operator kill switch for PRD #108 M5's auto-stop
+	// (UZI_AUTOSTOP_ENABLED, default true), read once at boot.
+	//
+	// It is deliberately NOT the health toggle (Decision 8: an admin disabling
+	// health must not silently disable loop protection) and deliberately NOT a
+	// settings key: an automatic destructive behaviour needs an off switch that does
+	// not depend on the database it might be misbehaving against. Same shape as
+	// Phase 1's UZI_HOME_RECLAIM. It is a runtime escape hatch, NOT the PRD's "ship
+	// M4, hold M5" fallback — see config.go for why that framing was retracted.
+	//
+	// NOTE the zero value is FALSE, so a Params literal that omits it has auto-stop
+	// OFF. That is the fail-safe direction and it is why the default lives in
+	// config.go (where the env is read) rather than in New.
+	AutoStopEnabled bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -472,6 +490,15 @@ type Service struct {
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
 	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
 	lastSlowClampWarn time.Duration
+	// persistFail counts consecutive AppendMessages failures per run (PRD #108 M4),
+	// the signal a persistence wedge cannot suppress because the wedge IS the event
+	// being counted. Always non-nil (New constructs it).
+	//
+	// Unlike lastSlowClampWarn directly above, it is NOT sweeper-only: it is written
+	// by every HTTP handler goroutine serving /messages and read by the sweeper, so
+	// it carries its own mutex. Do not copy that field's lock-free reasoning here —
+	// see persistfail.go.
+	persistFail *persistFailTracker
 }
 
 // SetSettings wires the instance settings reader (PRD #46). Call once at startup,
@@ -523,7 +550,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	if p.ClaimGrace <= 0 {
 		p.ClaimGrace = defaultClaimGrace
 	}
-	return &Service{q: q, box: box, p: p, now: time.Now}
+	return &Service{q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker()}
 }
 
 // -------------------------------------------------------------------------
@@ -1087,6 +1114,153 @@ type IncomingMessage struct {
 // (run_id, seq)) and advances the run's last_seq high-water mark. The worker
 // must own the run.
 //
+// It is a thin RECORDER around appendMessages (PRD #108 M4): the persistence work
+// is unchanged and lives below, and this layer exists only to feed the per-run
+// failure streak the health detector and the auto-stop evaluator read. The split
+// is what lets the counter see EVERY failure return of a function that has five of
+// them, instead of the one a caller happens to remember to instrument.
+//
+// The recording rules and the reasons they are rules, not defaults, are on each
+// arm of the switch; the invariant they all serve is persistfail.go's ownership
+// tripwire.
+func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
+	obs, err := s.appendMessages(ctx, wkr, runID, msgs)
+	switch {
+	case !obs.resolved:
+		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
+		// this run is not this worker's to vouch for. Recording here is what would let
+		// worker A build a kill streak against user B's run — see persistfail.go's
+		// ownership tripwire. NOT a persistence failure, and not counted as one.
+	case obs.status != "running":
+		// NOT RUNNING — checked BEFORE the success arm on purpose, and stated as one
+		// rule rather than as a terminal special case: A STREAK IS EVIDENCE ABOUT ONE
+		// RUNNING ATTEMPT, so leaving `running` ends that attempt's claim on it.
+		//
+		// This single arm retires a whole class of defect instead of one path of it:
+		//
+		//   - TERMINAL. worker_id survives the terminal transition and neither
+		//     GetRunOwnedByWorker nor this method filters on status, so a late or
+		//     hostile POST would resurrect a streak on a dead run one tick after
+		//     eviction — and on the SUCCESS path would keep a terminal run in M5's
+		//     comparison set indefinitely for one deduplicated append every few minutes.
+		//   - REQUEUED. The evaluator evicts too, but it only ever sees CANDIDATES
+		//     (streak >= autoStopStreak and the window elapsed), so a SUB-THRESHOLD
+		//     streak crossed a requeue untouched — and kept growing, since this method
+		//     went on recording against a queued run. Measured: 12 carried across, then
+		//     the fresh attempt killed after 8 new failures, with the entire window leg
+		//     satisfied by the DEAD attempt's firstAt. A streak must pass through 12 to
+		//     reach 20, so which side of the threshold an OOM lands on is close to a
+		//     coin flip; half that population landed here.
+		//   - Every OTHER path that resets status without a hook, including Register's
+		//     RequeueWorkerRuns, which returns no ids and so can never have one.
+		//
+		// Sweep's two requeue-site evictions and the evaluator's are now belt and
+		// braces rather than the mechanism, which is the safer arrangement: this arm
+		// needs no candidacy test and no enumeration of the paths.
+		//
+		// 🔴 AND IT HAS A SECOND EFFECT, WHICH IS DELIBERATE. Sitting above the
+		// success arm means recordSuccess fires ONLY for running runs, so this also
+		// narrows M5's G4 COMPARISON SET to running runs. Measured, per status:
+		//
+		//	running            joins lastOK  -> counts as a peer
+		//	awaiting_approval  does not      -> does not count
+		//	claimed            does not      -> does not count
+		//	queued             does not      -> does not count
+		//	completed          does not      -> does not count
+		//
+		// So a run parked at the approval gate that IS successfully persisting
+		// messages — alive and doing real work by any ordinary reading — no longer
+		// vouches for the write path. That is intended on both counts: it is the
+		// fail-safe direction (fewer peers ⇒ fewer kills), and it keeps the earlier
+		// hardening's rule intact, that warming the comparison set should cost a live
+		// run doing real work rather than a parked or finished one.
+		//
+		// Written down because the three bullets above are all about STREAKS, and a
+		// reader restoring recordSuccess for a parked run would be undoing something
+		// deliberate with nothing in the place they would look to say so. Pinned by
+		// TestAppendMessagesComparisonSetIsRunningRunsOnly.
+		s.persistFail.evict(runID)
+	case err == nil:
+		s.persistFail.recordSuccess(runID, s.now())
+	default:
+		s.persistFail.recordFailure(runID, classifyPersistFail(err), obs.lastSeq, s.now())
+	}
+	return err
+}
+
+// appendObservation is what the recorder needs from one append attempt and cannot
+// get from the error alone: whether ownership resolved at all, whether the run was
+// already terminal, and the run's message high-water mark AS THIS ATTEMPT SAW IT.
+//
+// lastSeq is max(runs.last_seq, maxStored) — the PRD's "max(seq) has not advanced"
+// evidence. It reads runs.last_seq rather than a SELECT max(seq) FROM run_messages
+// because UpdateRunLastSeq is `last_seq = GREATEST(last_seq, @seq)` over maxStored,
+// which counts deduplicated rows too, so the column is a faithful high-water mark
+// that is already on the row this path holds and costs no extra query.
+type appendObservation struct {
+	// resolved is true once runOwnedByWorker has returned a run — i.e. once the
+	// caller is known to own this run. Nothing may be recorded while it is false.
+	resolved bool
+	// status is the run's status as this attempt read it. Carried whole rather than
+	// as a derived `terminal bool` on purpose: the recorder's rule is "is this run
+	// RUNNING", and a boolean named for one of the several non-running cases invites
+	// the next reader to treat that case as the rule. One field cannot disagree
+	// with itself.
+	status  string
+	lastSeq int32
+}
+
+// NoteOversizeBatch records a 413 against the run's persistence-failure streak.
+//
+// It exists because a 413 is answered in handler.WorkerRunMessages BEFORE
+// AppendMessages is ever called, so an oversize batch is otherwise invisible to
+// the recorder. That is not academic: a pre-0.10.1 worker's retry batch GROWS (PRD
+// #108 M0 defect 4), so the incident's own long tail rotates 500 → 413 and then
+// stays 413 forever. Without this hook, both M4's flag and M5's kill go blind in
+// exactly that steady state.
+//
+// It re-checks ownership ITSELF — the one recording hook not already below
+// runOwnedByWorker — because an unowned record is a cross-tenant kill primitive.
+// Best-effort: a lookup failure records nothing.
+//
+// COST, stated for the case that is not benign. This arm previously did zero
+// database work; it now does one indexed lookup. Rare for the incident's own
+// shape (a 413 means a worker already past the 1 MiB cap), but a worker holding a
+// valid join token can POST oversized bodies as fast as it likes, so this is one
+// GetRunOwnedByWorker per such request — on a path that exists because the
+// database is already under stress. The alternative was leaving both the flag and
+// the kill blind in the incident's own steady state, which is worse; naming the
+// cost is not the same as calling it free.
+func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID uuid.UUID) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return
+	}
+	// THE SAME RULE AS THE RECORDER'S, and it must stay the same rule. This hook was
+	// left on the old terminal-only check when AppendMessages moved to
+	// `status != "running"`, so the two recording sites disagreed with each other —
+	// one recording on any non-running run, one unless terminal. That is a worse
+	// divergence than the `terminal bool` the observation type was changed to avoid,
+	// because the boolean at least meant the same thing in both places.
+	//
+	// It was reachable, and through the case that forced the status narrowing to
+	// begin with: /state is a different route and does not wedge, so a run reports
+	// its plan and parks at `awaiting_approval` while a pre-0.10.1 batcher keeps
+	// re-POSTing its grown batch and takes a 413 each time. Measured: streak 20 built
+	// entirely at the gate, `window_seconds=95`, then the human approves and the
+	// first sweep after the run returns to `running` kills it — and `oversize` IS a
+	// killable class, so nothing downstream stopped it.
+	if run.Status != "running" {
+		s.persistFail.evict(runID)
+		return
+	}
+	s.persistFail.recordFailure(runID, persistFailOversize, run.LastSeq, s.now())
+}
+
+// appendMessages is AppendMessages' persistence half. It returns the observation
+// the recorder needs alongside the error; every early return therefore carries the
+// state observed so far.
+//
 // ONLY the InsertRunMessage error is eligible for the ErrUnstorableMessage (→
 // 400) classification, and that narrowness is the point rather than an oversight.
 // This function returns store errors from three places — the insert,
@@ -1138,11 +1312,12 @@ type IncomingMessage struct {
 // A broader wrap was considered and rejected: with the above holding it catches
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
-func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) error {
+func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return err
+		return appendObservation{}, err
 	}
+	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
 	// Validate the whole batch before persisting any of it: a single invalid
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.
@@ -1161,7 +1336,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
-			return ErrInvalidMessage
+			return obs, ErrInvalidMessage
 		}
 		// A kind of nothing but NUL escapes passes the emptiness check above — it is
 		// non-empty on the wire — and would then strip to "" in the sanitation pass,
@@ -1171,7 +1346,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// invariants intact — nothing is written, and nothing is logged as laundered.
 		// The double stripNUL costs one strings.Count on the fast path.
 		if stripped, _ := stripNUL(m.Kind); stripped == "" {
-			return ErrInvalidMessage
+			return obs, ErrInvalidMessage
 		}
 	}
 	// SECOND pass for sanitation, separate from validation on purpose. The
@@ -1272,6 +1447,27 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			inserted = append(inserted, m)
 		}
 	}
+	// The high-water mark AS OBSERVED, whether or not the insert loop broke and
+	// whether or not the UpdateRunLastSeq below runs. This is what the streak's
+	// no-progress reset compares (PRD #108 M4).
+	//
+	// The partial apply the comment above the validation loop flags, worked through:
+	// on a batch whose Nth message the database refuses, rows 1..N-1 commit and this
+	// advances the mark ONCE. It is frozen from the next attempt onward, because the
+	// loop breaks at the same message every time so maxStored can never exceed the
+	// value it already set. Whether that costs a streak reset depends on whether an
+	// entry already existed — this line runs BEFORE the recorder sees the failure, so
+	// a run whose first-ever failure is the partial apply is recorded at the advanced
+	// mark and never resets at all. Either way it can only DELAY a kill by one
+	// failure; it can never cause a false one.
+	//
+	// Where it genuinely helps: a 0.10.1+ worker bisecting the poison out re-groups
+	// the batch, so messages after it DO land, this advances repeatedly, and the
+	// streak keeps resetting — the server correctly declines to kill a run whose
+	// client is already handling it.
+	if maxStored > obs.lastSeq {
+		obs.lastSeq = maxStored
+	}
 	// Advance the high-water mark to what landed, BEFORE propagating any insert
 	// error. Leaving it stale is not cosmetic: on resume the worker restarts from
 	// runs.last_seq and re-emits those seq numbers carrying DIFFERENT content, the
@@ -1283,13 +1479,13 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if maxStored > run.LastSeq {
 		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxStored}); err != nil {
 			if insertErr != nil {
-				return insertErr // the insert failure is the more informative of the two
+				return obs, insertErr // the insert failure is the more informative of the two
 			}
-			return err
+			return obs, err
 		}
 	}
 	if insertErr != nil {
-		return insertErr
+		return obs, insertErr
 	}
 	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
 	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
@@ -1300,7 +1496,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// that lands after a mid-flight cancel still folds (pre-cancel spend is real
 	// spend, Decision 4).
 	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
-		return err
+		return obs, err
 	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
 	// that reacts by replaying from last_seq sees a consistent state.
@@ -1310,7 +1506,7 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, m.AgentInstance, m.AgentLabel, []byte(m.Payload), now)
 		}
 	}
-	return nil
+	return obs, nil
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold
@@ -2423,6 +2619,10 @@ type SweepResult struct {
 	// HealthChanged is the number of runs whose health flag the detector wrote this
 	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
 	HealthChanged int64
+	// AutoStopped is the number of runs this pass stopped, or requested a stop for,
+	// because their message writes are in a confirmed permanent-failure loop
+	// (PRD #108 M5). Normally 0 — the candidate set is usually empty.
+	AutoStopped int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -2450,6 +2650,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.ClaimedReset = int64(len(claimed))
 	for _, r := range claimed {
 		s.publishSwept(r.ID, r.Status)
+		// A fresh attempt starts with no evidence against it (PRD #108 M5). See the
+		// requeue loop below for the argument; this reset is the same event.
+		s.persistFail.evict(r.ID)
 	}
 
 	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
@@ -2495,6 +2698,25 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.StaleRequeued = int64(len(requeued))
 	for _, r := range requeued {
 		s.publishSwept(r.ID, r.Status)
+		// 🔴 A REQUEUE GRANTS A FRESH ATTEMPT, SO IT MUST CLEAR THE DEAD ATTEMPT'S
+		// EVIDENCE (PRD #108 M5). This query writes status='queued' but KEEPS
+		// worker_id for affinity, so without this the run returns to `running` under a
+		// new attempt still carrying the old one's 20-failure streak and is
+		// auto-stopped before the new worker persists a byte — uzi killing a run one
+		// tick after deciding it deserved another try and spending re-queue budget to
+		// say so. Likely rather than theoretical for the population M5 exists to
+		// protect: a pre-0.10.1 worker's retry batch GROWS, so a worker wedged at 2 Hz
+		// is a prime OOM candidate, and OOM is exactly what puts it here.
+		//
+		// The window is wide, and uzi's own configuration is the calibration:
+		// defaultClaimGrace budgets FIVE MINUTES for claimed→started, while the sweeper
+		// gives this 15 seconds. The whole of the new attempt's checkout sits inside it
+		// — ensureClone branches on isBareRepo, so a fresh container from a NEW image
+		// has an empty cache and takes the cold cloneBare path, and that clone runs
+		// between the worker's reportState({status:"running"}) and its first flush
+		// (runner.ts; batcher.emit only buffers and then waits for a tick). The claim
+		// is about that ORDERING, not a stopwatched duration.
+		s.persistFail.evict(r.ID)
 	}
 
 	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is
@@ -2523,11 +2745,25 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		res.ProposalsRecovered = int64(len(recovered))
 	}
 
+	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the
+	// memory bound for the one case no other eviction path reaches: a run whose
+	// worker vanished without the run ever reaching terminal. Pruned BEFORE the
+	// detector so a flag is never raised off an entry this tick was going to expire.
+	s.persistFail.prune(now)
+
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and
 	// non-terminal — it never kills a run and never fails the sweep (it logs and
 	// returns a count); a nil settings (tests) disables it entirely.
 	res.HealthChanged = s.detectRunHealth(ctx, now)
+
+	// Auto-stop confirmed per-run persistence loops (PRD #108 M5). Deliberately NOT
+	// inside detectRunHealth — Decision 8 (it must not ride health_enabled), and
+	// because ListActiveRunsForHealth excludes chat runs, which wedge identically.
+	// Runs AFTER the detector so the flag always lands first ("health first, kill
+	// second"); its own thresholds sit above the flag's, so that ordering is
+	// belt-and-braces rather than the mechanism.
+	res.AutoStopped = s.autoStopWedgedRuns(ctx, now)
 	return res, nil
 }
 

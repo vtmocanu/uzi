@@ -180,6 +180,7 @@ func run() error {
 		WorkerChatIdleTimeout:       cfg.WorkerChatIdleTimeout,
 		WorkerChatTurnTimeout:       cfg.WorkerChatTurnTimeout,
 		ProposalConfirmStuckTimeout: cfg.ProposalConfirmStuckTimeout,
+		AutoStopEnabled:             cfg.AutoStopEnabled,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
