@@ -16,8 +16,11 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -263,6 +266,100 @@ func TestAutoStopComparisonSetAcceptsAChatNeighbour(t *testing.T) {
 }
 
 // -------------------------------------------------------------------------
+// G5 — the killable classes. Auto-stop protects a CORRECT old client from the
+// world; a class no correct worker can produce is the client being broken.
+// -------------------------------------------------------------------------
+
+func TestAutoStopWillNotKillOnAClassNoCorrectWorkerCanProduce(t *testing.T) {
+	// (f), the discriminating case: EVERY other guard satisfied, a healthy neighbour
+	// present, and the only difference from the positive test at the top of this file
+	// is the failure class. It must be flagged and not stopped.
+	//
+	// `invalid` means seq<=0, an empty kind, an empty or non-JSON payload, or an
+	// all-NUL kind. `kind` comes from a fixed SDK-frame vocabulary, `seq` from the
+	// batcher's own accounting, the payload from JSON.stringify — so no correct
+	// worker of any version produces it, and a streak of it says the worker BUILD is
+	// broken. A worker defect is per-build, not per-run: every run that image touches
+	// fails identically, and M4's flag makes that correlated symptom visible in ~10s.
+	// Auto-stopping them one at a time would make the affected runs disappear while
+	// the broken build keeps claiming new ones.
+	f := newAutoStopFixture(t)
+	f.svc.persistFail.evict(f.wedged)
+	start := t0.Add(-(autoStopWindow + 5*time.Second))
+	for i := 0; i < autoStopStreak*2; i++ {
+		f.svc.persistFail.recordFailure(f.wedged, persistFailInvalid, 273, start.Add(time.Duration(i)*500*time.Millisecond))
+	}
+
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("stopped = %d, want 0: `invalid` is the client being broken, not the world being hostile — the flag plus RUN_TIMEOUT is the accepted outcome and the correlated flag is what says ROLL THE IMAGE", n)
+	}
+	if len(f.fs.failCalls)+len(f.fs.verdicts) != 0 {
+		t.Fatalf("a non-killable class produced %d fail + %d verdict writes, want 0", len(f.fs.failCalls), len(f.fs.verdicts))
+	}
+}
+
+func TestAutoStopKillsOnceTheClassFlipsToOneTheWorldCanCause(t *testing.T) {
+	// (g), and it is what makes (f) mean anything. Without it, (f) passes green on a
+	// build where auto-stop never fires at all — the same shape as the positive
+	// control G4's tests carry.
+	f := newAutoStopFixture(t)
+	f.svc.persistFail.evict(f.wedged)
+	start := t0.Add(-(autoStopWindow + 30*time.Second))
+	for i := 0; i < autoStopStreak*2; i++ {
+		f.svc.persistFail.recordFailure(f.wedged, persistFailInvalid, 273, start.Add(time.Duration(i)*500*time.Millisecond))
+	}
+	if n := f.sweep(t); n != 0 {
+		t.Fatalf("precondition: stopped = %d on the invalid streak, want 0", n)
+	}
+
+	// The class flips to one a correct old worker genuinely hits (a NUL from a
+	// headless browser). The streak restarts, so rebuild it and the kill fires.
+	rebuild := t0.Add(-(autoStopWindow + 5*time.Second))
+	for i := 0; i < autoStopStreak; i++ {
+		f.svc.persistFail.recordFailure(f.wedged, persistFailUnstorable, 273, rebuild.Add(time.Duration(i)*500*time.Millisecond))
+	}
+	if n := f.sweep(t); n != 1 {
+		t.Fatalf("stopped = %d, want 1 once the class is `unstorable`: if this is 0 then auto-stop fires for NO class and the exclusion test above proves nothing", n)
+	}
+}
+
+func TestAutoStopKillableKindsIsTheSingleSourceOfTruth(t *testing.T) {
+	// The membership decision lives in exactly one place, so flipping a class is one
+	// line plus a test rather than a hunt. Pinned so a second predicate cannot grow
+	// somewhere else and disagree with this one.
+	if autoStopKillableKinds[persistFailInvalid] {
+		t.Error("invalid is killable; auto-stop exists to protect a CORRECT old client from the world, and no correct worker produces an invalid batch")
+	}
+	if autoStopKillableKinds[persistFailStore] {
+		t.Error("store is killable; 500 means retry — that is the contract Phase 1 exists to make honest — and classifyStoreError is statement-level, so a foldRunUsage 500 is the same value as an insert 500")
+	}
+	if !autoStopKillableKinds[persistFailUnstorable] || !autoStopKillableKinds[persistFailOversize] {
+		t.Error("unstorable and oversize must both be killable: both are things a CORRECT pre-0.10.1 worker hits unavoidably (a browser's NUL bytes; a batch grown past 1 MiB riding out an outage), and they are the whole reason M5 exists")
+	}
+}
+
+func TestAutoStopBodyAndReasonAreFixedServerText(t *testing.T) {
+	// CreateStopVerdictInput is a single data-modifying CTE, so a 22021 raised on its
+	// insert is atomic and therefore TOTAL: no input row, no stop_kind stamp, no stop
+	// at all. A body assembled from worker-controlled text would let the payload
+	// auto-stop exists to kill poison the kill itself, silently. These are compile-time
+	// constants; this test is the tripwire for someone making them dynamic later.
+	for name, s := range map[string]string{"autoStopBody": autoStopBody, "autoStopReason": autoStopReason} {
+		if strings.ContainsRune(s, 0) {
+			t.Errorf("%s carries a NUL; on the CTE that is a 22021 and the stop never happens", name)
+		}
+		if !utf8.ValidString(s) {
+			t.Errorf("%s is not valid UTF-8", name)
+		}
+		for _, r := range s {
+			if r > unicode.MaxASCII {
+				t.Errorf("%s carries a non-ASCII rune %q — fine for jsonb, but these strings must stay fixed server text and ASCII is the cheapest way to keep that visible", name, r)
+			}
+		}
+	}
+}
+
+// -------------------------------------------------------------------------
 // G1/G2 — the streak and window legs
 // -------------------------------------------------------------------------
 
@@ -336,9 +433,11 @@ func TestAutoStopAProgressingRunNeverAccumulates(t *testing.T) {
 // -------------------------------------------------------------------------
 
 func TestAutoStopKillSwitchDisarmsTheKillButNotTheFlag(t *testing.T) {
-	// UZI_AUTOSTOP_ENABLED=false. The PRD's "ship M4 (flag only), hold M5" fallback
-	// expressed as configuration rather than a revert, so the assertion is TWO-sided:
-	// nothing is killed, AND the run is still flagged.
+	// UZI_AUTOSTOP_ENABLED=false. A RUNTIME ESCAPE HATCH, not the PRD's "ship M4,
+	// hold M5" fallback (that framing was retracted — holding M5 means not landing
+	// the code, and if this flag exists the code shipped). The assertion is TWO-sided
+	// because the hatch has to leave the visibility behind: nothing is killed, AND
+	// the run is still flagged.
 	f := newAutoStopFixture(t)
 	f.svc.p.AutoStopEnabled = false
 	if n := f.sweep(t); n != 0 {
@@ -363,6 +462,35 @@ func TestAutoStopKillSwitchDefaultsOffInABareParamsLiteral(t *testing.T) {
 	f.svc.p = testParams() // no AutoStopEnabled
 	if n := f.sweep(t); n != 0 {
 		t.Fatalf("stopped = %d, want 0: an unset Params.AutoStopEnabled must mean OFF", n)
+	}
+}
+
+func TestAutoStopOnlyKillsRunsTheFLAGCanAlsoReach(t *testing.T) {
+	// The kill's status set must equal the flag's. runningTarget is reached only from
+	// healthTargetFor's "running" arm, so a queued/claimed/awaiting_approval run was
+	// never flagged — and killing a run that was never flagged breaks the "health
+	// first, kill second" ordering this step is placed after the detector to
+	// guarantee. Not a terminal check: these runs are alive and may return to running.
+	for _, status := range []string{"queued", "claimed", "awaiting_approval"} {
+		t.Run(status, func(t *testing.T) {
+			f := newAutoStopFixture(t)
+			r := f.fs.runs[f.wedged]
+			r.Status = status
+			f.fs.runs[f.wedged] = r
+
+			if n := f.sweep(t); n != 0 {
+				t.Fatalf("stopped = %d, want 0 for a %s run — it was never flagged, so killing it is a kill with no warning in front of it", n, status)
+			}
+			if got := f.svc.persistFail.stats(f.wedged); got.streak == 0 {
+				t.Fatal("the entry was evicted; a non-terminal run may return to running and its evidence should survive that (the TTL prunes it if it does not)")
+			}
+		})
+	}
+	// The positive control: the very same fixture at `running` DOES stop, so the
+	// three assertions above cannot be passing because auto-stop is inert.
+	f := newAutoStopFixture(t)
+	if n := f.sweep(t); n != 1 {
+		t.Fatalf("control: stopped = %d for a running run, want 1", n)
 	}
 }
 
@@ -549,6 +677,72 @@ func TestAutoStopDoesNotReEnqueueAVerdictEveryTick(t *testing.T) {
 	if len(f.fs.verdicts) != 1 {
 		t.Fatalf("stop verdicts = %d over four sweeps, want exactly 1", len(f.fs.verdicts))
 	}
+}
+
+func TestAutoStopWillNotKillOverAStableUsageFoldFailure(t *testing.T) {
+	// The hole the architect found in its own draft, closed by the class narrowing
+	// and pinned here so it cannot silently re-open.
+	//
+	// UpdateRunLastSeq runs BEFORE foldRunUsage, so on an all-duplicate re-delivery
+	// last_seq does not advance and the no-progress guard holds. A stable fold
+	// failure would therefore accumulate a full streak on a run whose MESSAGES
+	// persisted perfectly — destroying it over a telemetry side-table. It survives
+	// only because a fold error classifies as `store`, which is not killable:
+	// classifyStoreError is deliberately statement-level, so a 500 from
+	// InsertRunMessage and one from foldRunUsage are literally the same value and
+	// there is no origin to discriminate on.
+	w := worker()
+	runID := uuid.New()
+	fs := &usageFoldFakeStore{
+		persistFakeStore: persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "running"}},
+		foldErr:          errors.New("run_usage upsert failed"),
+	}
+	p := testParams()
+	p.AutoStopEnabled = true
+	svc := New(fs, nil, p)
+	clk := t0
+	svc.now = func() time.Time { return clk }
+
+	// Batch of one, re-delivered: the insert dedups (rows == 0), last_seq never
+	// advances, and the fold fails identically every time.
+	result := IncomingMessage{Seq: 1, Kind: "status", Payload: []byte(`{"event":"result","modelUsage":{"m":{"inputTokens":1}}}`)}
+	for i := 0; i < autoStopStreak*2; i++ {
+		clk = t0.Add(time.Duration(i) * 500 * time.Millisecond)
+		if err := svc.AppendMessages(context.Background(), w, runID, []IncomingMessage{result}); err == nil {
+			t.Fatalf("attempt %d: want the fold error to propagate", i)
+		}
+	}
+	got := svc.persistFail.stats(runID)
+	if got.streak < autoStopStreak {
+		t.Fatalf("precondition: streak = %d, want >= %d — this test is only meaningful if the streak DOES accumulate, which is the hole", got.streak, autoStopStreak)
+	}
+	if got.kind != persistFailStore {
+		t.Fatalf("fold failure classified as %v, want store", got.kind)
+	}
+	// A healthy neighbour, so G4 is satisfied and the class is the only thing left.
+	svc.persistFail.recordSuccess(uuid.New(), clk.Add(-time.Second))
+	if n := svc.autoStopWedgedRuns(context.Background(), clk.Add(autoStopWindow)); n != 0 {
+		t.Fatalf("stopped = %d, want 0: a run whose MESSAGES persisted fine must never be destroyed over a run_usage upsert", n)
+	}
+}
+
+// usageFoldFakeStore makes foldRunUsage fail while every message insert succeeds —
+// the one shape that separates "the batch is poison" from "a side-table write is
+// failing".
+type usageFoldFakeStore struct {
+	persistFakeStore
+	foldErr error
+}
+
+func (f *usageFoldFakeStore) UpsertRunUsage(context.Context, store.UpsertRunUsageParams) error {
+	return f.foldErr
+}
+
+// GetRunByID answers the evaluator's guard read. Reaching it at all is part of the
+// point: it proves the run really did become a kill CANDIDATE off a side-table
+// failure, and that only the class check turns it away.
+func (f *usageFoldFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return f.run, nil
 }
 
 func TestAutoStopStoreFailuresNeverFailTheSweep(t *testing.T) {

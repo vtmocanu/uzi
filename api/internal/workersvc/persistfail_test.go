@@ -106,10 +106,18 @@ func TestPersistFailSuccessClearsStreakAndJoinsComparisonSet(t *testing.T) {
 	}
 }
 
-func TestPersistFailEvictDropsTheStreakButKeepsTheComparisonSet(t *testing.T) {
-	// A terminal run must stop accumulating a kill streak, but its earlier
-	// successful append is still evidence that the WRITE PATH works — which is the
-	// only question M5's comparison set asks.
+func TestPersistFailEvictDropsBothMaps(t *testing.T) {
+	// evict runs when a run is observed TERMINAL, and it must leave the comparison
+	// set as well as the streak.
+	//
+	// An earlier version kept lastOK, reasoning that a successful append proves the
+	// write path works whatever the run's status. True but insufficient: G4 is a
+	// GLOBAL "other runs are succeeding", so a worker holding one terminal run and
+	// re-POSTing a deduplicated append every few minutes — near-zero cost, no tokens,
+	// no run slot — could keep the kill armed for every OTHER user's run on the
+	// instance. It kills nothing on its own (the victim still has to satisfy four
+	// other guards), but it hollows out the one guard that is supposed to be an
+	// INDEPENDENT observation that the world is healthy.
 	tr := newPersistFailTracker()
 	id := uuid.New()
 	tr.recordSuccess(id, t0)
@@ -122,8 +130,29 @@ func TestPersistFailEvictDropsTheStreakButKeepsTheComparisonSet(t *testing.T) {
 	tr.mu.Lock()
 	_, ok := tr.lastOK[id]
 	tr.mu.Unlock()
-	if !ok {
-		t.Fatal("evict must NOT drop the lastOK entry: a successful append proves the write path works whatever the run's status")
+	if ok {
+		t.Fatal("evict left the run in the comparison set: a terminal run must not be able to vouch for the write path, or warming G4 costs one deduplicated append instead of a live run doing real work")
+	}
+}
+
+func TestAppendMessagesTerminalRunNeverJoinsTheComparisonSet(t *testing.T) {
+	// The same property at the recorder, which is where the attack would actually be
+	// mounted: a SUCCESSFUL append on a terminal run must not write lastOK. The
+	// terminal arm therefore has to be evaluated BEFORE the success arm.
+	w := worker()
+	runID := uuid.New()
+	fs := &persistFakeStore{run: store.Run{ID: runID, WorkerID: pgUUID(w.ID), Status: "completed"}}
+	clk := t0
+	svc := persistSvc(fs, &clk)
+
+	if err := svc.AppendMessages(context.Background(), w, runID, []IncomingMessage{msg(1)}); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	svc.persistFail.mu.Lock()
+	_, ok := svc.persistFail.lastOK[runID]
+	svc.persistFail.mu.Unlock()
+	if ok {
+		t.Fatal("a successful append to a TERMINAL run joined M5's comparison set; a worker can then keep the kill armed for every other user's run for the cost of one deduplicated POST every few minutes")
 	}
 }
 

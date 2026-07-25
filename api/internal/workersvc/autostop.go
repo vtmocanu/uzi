@@ -62,6 +62,57 @@ const (
 	autoStopEscalateAfter = 60 * time.Second
 )
 
+// autoStopKillableKinds is the set of failure classes that may reach the kill.
+// The MEMBERSHIP DECISION LIVES HERE AND NOWHERE ELSE — everything downstream
+// tests this set, so adding or removing a class is one line plus its test.
+//
+// The test that decides membership: COULD A CORRECT PRE-0.10.1 WORKER HAVE
+// PRODUCED THIS IN ORDINARY OPERATION?
+//
+//   - unstorable — YES, unavoidably. A headless Chromium's HarfBuzz spew puts raw
+//     NULs in a tool_result. That is the world, and a pre-0.10.1 worker has no
+//     sanitizer and no bisector to answer it with.
+//   - oversize — YES, unavoidably. A chatty run riding out a transient outage grows
+//     its batch past the 1 MiB cap. No byte cap, no splitter, on that image.
+//   - invalid — NO, never. Every path into it is seq<=0, an empty kind, an empty or
+//     non-JSON payload, or an all-NUL kind. `kind` comes from a fixed SDK-frame
+//     vocabulary, `seq` from the batcher's own accounting, the payload from
+//     JSON.stringify. A streak of it means the CLIENT IS BROKEN.
+//   - store — NO. 500 means "try again", which is the contract Phase 1 exists to
+//     make honest, and classifyStoreError is deliberately statement-level so a 500
+//     from InsertRunMessage and one from foldRunUsage are literally the same value.
+//     Killing on it would destroy a run over a telemetry side-table.
+//
+// AUTO-STOP EXISTS TO PROTECT A CORRECT OLD CLIENT FROM THE WORLD. `invalid` is
+// not the world. The same test explains for free why a 0.10.1+ worker is never
+// killed by either surviving class: it sanitizes, caps, splits and bisects.
+//
+// 🔴 DO NOT record "excluded because a worker can choose it" as the reason for
+// `invalid`. That justification does not discriminate — `{"n":1e1000000}` is
+// json.Valid, survives every class the sanitizer strips, and is permanently
+// unstorable (sanitize.go's own comment says so), and a worker POSTs an oversized
+// body whenever it likes. Applied consistently it empties this set and deletes M5.
+// The premise is false anyway: /state is mounted beside /messages and SetState's
+// `failed` arm takes a worker-supplied reason, so a worker has ALWAYS been able to
+// end its own run in one call. M5 adds no capability; the only delta is the label,
+// and a label problem is answered by M7's failure_class field, not by a guard.
+// health.go's own header already says this machinery is not a guardrail.
+//
+// Why the residual is acceptable: a buggy old worker looping on invalid batches is
+// FLAGGED by M4 and bounded by RUN_TIMEOUT, which is the PRD's own accepted
+// baseline (on a single-active-run instance M5 permanently never kills, so flag +
+// RUN_TIMEOUT is already the documented outcome for the motivating incident
+// itself). And decisively: a worker defect is per-BUILD, not per-RUN. Every run
+// that worker touches fails identically, and the flag makes that visible across all
+// of them in ~10 seconds — the signal that says roll the image. Auto-stopping them
+// one at a time would make the affected runs DISAPPEAR while the broken build keeps
+// claiming new ones, converting a loud, correlated, diagnosable fleet symptom into
+// a trickle of individually-explained deaths. Worse than doing nothing.
+var autoStopKillableKinds = map[persistFailKind]bool{
+	persistFailUnstorable: true,
+	persistFailOversize:   true,
+}
+
 // stopKindAutoStopped is the CONTRACT (00082). failure_reason is not: on the
 // live-poller half the worker's own SetRunFailed overwrites it unconditionally with
 // REASON_CANCELLED ("run cancelled"), so the two halves genuinely carry different
@@ -121,6 +172,36 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	}
 	if terminalStatuses[run.Status] {
 		s.persistFail.evict(c.runID)
+		return false
+	}
+	// The kill's status set is IDENTICAL to the flag's. runningTarget is reached only
+	// from healthTargetFor's "running" arm, so a run in any other status was never
+	// flagged — and killing a run that was never flagged breaks the "health first,
+	// kill second" ordering this whole step is placed after Sweep's detector to
+	// guarantee. Not evicted: a run parked at awaiting_approval may return to running
+	// with its evidence intact, and if it never does the TTL prunes it.
+	//
+	// Chat coverage survives this: chat-runner.ts reports `running` before it does any
+	// work, so a wedged chat run is `running` exactly like an issue run.
+	if run.Status != "running" {
+		return false
+	}
+
+	// G5 — the streak's stable class must be one auto-stop is allowed to kill on.
+	// Checked here rather than in candidates() so the DECLINE below still fires: for
+	// a non-killable class this log line is the only operator signal that a worker
+	// BUILD is broken, since these runs are never stopped and their flag is erased
+	// by the exit contract when RUN_TIMEOUT finally ends them.
+	if !autoStopKillableKinds[c.kind] {
+		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow) {
+			slog.Warn("workersvc: a run's messages cannot be persisted, but auto-stop is holding",
+				"run_id", c.runID.String(),
+				"run_kind", run.Kind,
+				"streak", c.streak,
+				"window_seconds", int(now.Sub(c.firstAt).Seconds()),
+				"failure_class", c.kind.String(),
+				"decision", "class_not_killable")
+		}
 		return false
 	}
 

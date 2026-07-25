@@ -116,7 +116,10 @@ const (
 	persistFailNone persistFailKind = iota
 	// persistFailUnstorable is ErrUnstorableMessage — 400, permanent by SQLSTATE.
 	persistFailUnstorable
-	// persistFailInvalid is ErrInvalidMessage — 400, permanent by validation.
+	// persistFailInvalid is ErrInvalidMessage — 400, rejected in the validation loop
+	// before any database write. Permanent for the batch as sent, but NOT killable
+	// (autoStopKillableKinds): no correct worker of any version can produce it, so a
+	// streak of it means the CLIENT is broken rather than the world being hostile.
 	persistFailInvalid
 	// persistFailOversize is the 413 answered by the handler before AppendMessages
 	// is ever called. Permanent in steady state for a pre-0.10.1 worker, whose
@@ -304,15 +307,24 @@ func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind,
 	return capWarning{}
 }
 
-// evict drops a run's streak. Called when the run is observed terminal — a
+// evict drops a run from BOTH maps. Called when the run is observed terminal — a
 // worker_id survives the terminal transition and neither GetRunOwnedByWorker nor
 // AppendMessages filters on status, so a dead run can still be POSTed to and must
-// not accumulate a kill streak. The lastOK entry is deliberately KEPT: a
-// successful append proves the write path works whatever the run's status.
+// not accumulate a kill streak.
+//
+// It drops the lastOK entry too, and that half is a security property rather than
+// tidiness. An earlier version kept it, reasoning that a successful append proves
+// the write path works whatever the run's status. True but insufficient: G4 is a
+// GLOBAL "other runs are succeeding", so a worker holding one terminal run and
+// re-POSTing a deduplicated append every few minutes — near-zero cost, no tokens,
+// no slot — could keep the kill armed for every OTHER user's run on the instance.
+// Requiring the comparison set to be non-terminal means warming it costs a live
+// run that is really doing work.
 func (t *persistFailTracker) evict(runID uuid.UUID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.fail, runID)
+	delete(t.lastOK, runID)
 }
 
 // stats returns a value snapshot of a run's streak, or the zero value if it has

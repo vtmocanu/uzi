@@ -346,9 +346,9 @@ type Params struct {
 	// It is deliberately NOT the health toggle (Decision 8: an admin disabling
 	// health must not silently disable loop protection) and deliberately NOT a
 	// settings key: an automatic destructive behaviour needs an off switch that does
-	// not depend on the database it might be misbehaving against, and this also
-	// expresses the PRD's "ship M4, hold M5" fallback as configuration rather than a
-	// revert. Same shape as Phase 1's UZI_HOME_RECLAIM.
+	// not depend on the database it might be misbehaving against. Same shape as
+	// Phase 1's UZI_HOME_RECLAIM. It is a runtime escape hatch, NOT the PRD's "ship
+	// M4, hold M5" fallback — see config.go for why that framing was retracted.
 	//
 	// NOTE the zero value is FALSE, so a Params literal that omits it has auto-stop
 	// OFF. That is the fail-safe direction and it is why the default lives in
@@ -1131,15 +1131,16 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		// this run is not this worker's to vouch for. Recording here is what would let
 		// worker A build a kill streak against user B's run — see persistfail.go's
 		// ownership tripwire. NOT a persistence failure, and not counted as one.
+	case obs.terminal:
+		// A finished run, checked BEFORE the success arm on purpose. worker_id
+		// survives the terminal transition and neither GetRunOwnedByWorker nor this
+		// method filters on status, so a late or hostile POST would otherwise
+		// resurrect a streak on a dead run one tick after eviction — and, on the
+		// SUCCESS path, keep a terminal run in M5's comparison set indefinitely for
+		// the cost of one deduplicated append every few minutes. Both are closed here.
+		s.persistFail.evict(runID)
 	case err == nil:
 		s.persistFail.recordSuccess(runID, s.now())
-	case obs.terminal:
-		// A finished run. worker_id survives the terminal transition and neither
-		// GetRunOwnedByWorker nor this method filters on status, so a late or hostile
-		// POST would otherwise resurrect a streak on a dead run one tick after
-		// eviction. Positive check, evaluated on the write path rather than left to
-		// the M5 evaluator's read.
-		s.persistFail.evict(runID)
 	default:
 		s.persistFail.recordFailure(runID, classifyPersistFail(err), obs.lastSeq, s.now())
 	}

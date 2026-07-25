@@ -338,9 +338,13 @@ type Config struct {
 	// refuses to subordinate auto-stop to health_enabled, which would otherwise leave
 	// nothing short of a redeploy to stop a misfiring kill switch; and an automatic
 	// DESTRUCTIVE behaviour should not depend for its off switch on the database it
-	// might be misbehaving against. It also expresses the PRD's own "ship M4 (flag
-	// only) and hold M5" fallback as configuration rather than as a revert. Phase 1
-	// set the precedent with UZI_HOME_RECLAIM.
+	// might be misbehaving against. Phase 1 set the precedent with UZI_HOME_RECLAIM.
+	//
+	// It is a RUNTIME ESCAPE HATCH and nothing more. It is NOT the PRD's "ship M4,
+	// hold M5" fallback — that framing was retracted, and correctly: holding M5 means
+	// not landing its code, whereas if this variable exists then M5's tests, its
+	// migration and its review have all completed and one `helm upgrade --set` arms
+	// it. The code seam is the shipping decision; this is the lever for an incident.
 	//
 	// It is a control over a destructive action, so — like UZI_REGISTRATION_ENABLED
 	// and unlike the tuning knobs — a set-but-malformed value aborts boot rather than
