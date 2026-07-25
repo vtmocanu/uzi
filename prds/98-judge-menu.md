@@ -1777,8 +1777,17 @@ Judge page header). Single repo, so no cross-repo phase.
 - `uzi review backlog` + the disposition verbs drive the **same state** as the web
   from a uzc_ token; a uza_ read-only token can `backlog` but is refused (404) on a
   bulk disposition mutation.
-- **No Anthropic token is spent** by any disposition/backlog action (proven by
-  the M8 e2e leg).
+- **No Anthropic token is spent** by any disposition/backlog action — proven by
+  `TestDispositionTouchesStoreOnly` (`api/internal/handler/review_disposition_test.go`)
+  and `TestBulkDispositionTouchesStoreOnly` (`judge_bulk_disposition_test.go`), which
+  are positive store-call allowlists. **NOT by the M8 e2e leg**, which cannot prove it:
+  a disposition creates no run, so a before/after run-count or `run.usage` delta sits at
+  zero whether or not the property holds. See the M8a entry above for the full retraction
+  and the measurement behind it.
+  *(Corrected 2026-07-25. The retraction was written at the M8a milestone entry on
+  2026-07-21 and this bullet was never updated — one claim, two places, one of them fixed.
+  That is why a retraction has to be followed by a grep for every restatement of the claim:
+  the retraction's own presence is what stops the next reader looking.)*
 
 ## Risks
 
