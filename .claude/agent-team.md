@@ -218,6 +218,30 @@ Several agents commit against one worktree, so **the tree a claim was read from
 may already be gone by the time the claim is acted on.** Two rules, both earned
 on PRD #98 (2026-07-21), both by incidents rather than by argument.
 
+**0. THE DISPATCHER'S HALF, and on PRD #108 it was the branch's DOMINANT failure
+mode — bigger than any code defect.** Rules 1-4 below are all written for the
+RECIPIENT ("read the file before acting"). That leaves the cheaper fix unstated,
+and the gap cost three round-trips in one wave: a reviewer reported that three of
+its last four reports crossed with a fix or a briefing describing a tree that had
+already moved, and **every substantive lead-vs-validator disagreement in the whole
+run resolved to "both correct for the SHA each of us read."**
+
+**Name the tip in the dispatch, and add: "take the live tip if it has moved past
+this, and say so rather than guessing."** One clause. It would have prevented all
+three. Corollary the lead kept relearning: **verify the artifact immediately
+before SENDING, not before COMPOSING** — three of five crossings on PRD #108 were
+a lead verifying at SHA `N`, writing a long dispatch, and sending it after the
+worker reached `N+1`.
+
+Two lead-side failures worth naming because neither is a stale-read:
+- **Asserting a completed action from having INSTRUCTED it.** The lead told a
+  validator "the coder restaged the outage test" — it had only told the coder to.
+  Measured: that file changed 202 lines and the test was byte-identical.
+- **Reading absence as "elsewhere" instead of "absent".** A grep for a symbol
+  returned nothing and the lead concluded the code must live somewhere it had not
+  looked, then briefed two agents on it. The symbol did not exist, and its absence
+  WAS the blocking defect — the inverse of "a failed grep is not evidence."
+
 **1. An instruction to change a file is a CLAIM about that file's current
 contents, and it EXPIRES.** Read the file before acting on any dispatch that
 quotes it, names a line number, or says a fix "did not land". Evidence:
@@ -333,6 +357,30 @@ rule-holders, one number. Corollary worth keeping: when you fix an instance of
 this, **grep for the DEFECT (`RUN=`, `PASS=`, a bare tally), not for the string
 you just changed** — grepping the string is what leaves the fourth site.
 
+**1b-ii. DUPLICATE THE CLAIM, NEVER THE COUNT — and this one CUTS AGAINST the
+consolidation instinct, which is why it needs stating.** PRD #108 produced the
+counter-example to its own tally rule. A guard that was designed, ruled on, and
+never implemented went missing with **nothing flagging it**; the only trace was
+that three artifacts carried three different guard COUNTS (six, five, seven), and
+all three were consistent with the guard being absent. It was caught because they
+**disagreed with each other**. Meanwhile four comments were each falsified the same
+way — true when written, then invalidated by a guard added UPSTREAM of what they
+described — and each had exactly **one** copy, so each survived until somebody
+folded the code.
+
+So the two halves pull opposite ways and the resolution is the wording: a
+duplicated CLAIM is a cross-check that fires when reality moves; a duplicated
+COUNT is four things to drift. Resolve a count disagreement by **deleting the
+tally and citing the mechanism**, never by picking the winner — picking one
+removes the only instrument that detected the defect.
+
+**The operational check that would have caught all four comments** (sharper than
+"re-read nearby comments", and it is a grep of the CALLERS not the neighbours):
+when you add a guard, ask **"what did I just make unreachable, and what claims
+that reachability?"** Each of those comments stayed true about its own function
+and became false about the PATH — which is exactly what re-reading it in
+isolation cannot show.
+
 **1c. WHEN AN INSTRUCTION SAYS "VERBATIM", IT BINDS THE CLAIM AND NOT THE
 EXAMPLES.** A claim generalises; an example is a measurement with a shelf life,
 and copying one forward unexamined is how a warning ends up illustrated by
@@ -398,7 +446,13 @@ cannot run. A `none (gap)` slot that has been raised once gets a `noted` marker
 appended here; roles report a gap only when its line carries no marker.
 
 ```
-format         none (gap)          # gofmt -l ./api reports 26 drifted files
+format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it
+                                   # for the current list. Do NOT record a count here:
+                                   # it read 26, then 25, and a stale tally invites the
+                                   # truncated-view error it already caused (a filtered
+                                   # 4-file view reported as the whole list, 2026-07-25).
+                                   # The check that matters is `comm -12` between
+                                   # gofmt -l and your commit's file list being EMPTY.
 lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
 typecheck      cd web && npm run typecheck
                cd agent && npm run typecheck

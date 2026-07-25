@@ -216,6 +216,27 @@ describe("isStoppedRun (server-stamped stop_kind, terminal-guarded)", () => {
     // Must NOT read as stopped — the run finished and should show its MR chip.
     expect(isStoppedRun("completed", "plan_rejected")).toBe(false);
   });
+
+  // PRD #108 M5. The predicate used to be `stop_kind != null`, which silently
+  // absorbed every future value — so an auto-stopped run (failed + a non-null
+  // stop_kind) would have rendered as a calm neutral "stopped" pill across
+  // RunsList / IssueView / RunView / the board AND dropped out of favicon.ts's
+  // attention set. An auto-stop is uzi killing a run because it was BROKEN. It has
+  // to look like breakage.
+  //
+  // TypeScript cannot catch this: stop_kind crosses a JSON decode boundary, so the
+  // null test compiles perfectly against a value the union never listed. Only this
+  // test stands between a new stop_kind and silently-calm breakage.
+  it("false for auto_stopped — a server kill is breakage, not a deliberate stop", () => {
+    expect(isStoppedRun("failed", "auto_stopped")).toBe(false);
+  });
+  it("still true for both HUMAN kinds, so the narrowing did not overreach", () => {
+    // The positive control for the case above: if this pair ever goes false the
+    // predicate has stopped recognising deliberate stops at all, and the
+    // auto_stopped assertion would pass for entirely the wrong reason.
+    expect(isStoppedRun("failed", "cancelled")).toBe(true);
+    expect(isStoppedRun("failed", "plan_rejected")).toBe(true);
+  });
 });
 
 describe("runStatusTone (list-row tone)", () => {
@@ -229,6 +250,12 @@ describe("runStatusTone (list-row tone)", () => {
   });
   it("a genuine failure (no stop_kind) → danger", () => {
     expect(runStatusTone("failed", null)).toBe("danger");
+  });
+  it("an auto-stopped run → danger, exactly like any other breakage (PRD #108 M5)", () => {
+    // runStatusTone reads isStoppedRun, so this is the tone half of the same
+    // narrowing: it must land on `danger` with the genuine failures, not on the
+    // `neutral` the deliberate stops get.
+    expect(runStatusTone("failed", "auto_stopped")).toBe("danger");
   });
   it("completed → ok, claimed/running → info, queued → queue (matches StatusPill)", () => {
     expect(runStatusTone("completed", null)).toBe("ok");

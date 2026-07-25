@@ -47,9 +47,18 @@ type RunDTO struct {
 	// run's value can be stale, so freshness is scoped to the board card in the UI.
 	MrState       *string `json:"mr_state"`
 	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
-	// or "plan_rejected", null for every other run. It — not the failure_reason
-	// text — is what the client's isStoppedRun reads to style a stop as calm/neutral.
+	// StopKind is the server-stamped stop signal (PRD #33, widened by #108 M5):
+	// "cancelled" or "plan_rejected" for a deliberate HUMAN stop, "auto_stopped" when
+	// the SERVER stopped a run whose updates could not be saved, null for every other
+	// run. It — not the failure_reason text — is what clients read.
+	//
+	// Consumers must NOT treat the three alike, and the web's isStoppedRun is the
+	// worked example: it styles the two human kinds calm/neutral because a deliberate
+	// stop is not breakage, and deliberately leaves "auto_stopped" looking like the
+	// breakage it is. `uzi run get` renders it as its own STOP_KIND row for the same
+	// reason — on the live-poller half the worker overwrites failure_reason with its
+	// own "run cancelled", so this field is the ONLY thing that distinguishes an
+	// auto-stop from a user cancel.
 	StopKind *string `json:"stop_kind"`
 	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
 	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides

@@ -2,6 +2,11 @@
 
 **Issue**: [#115](https://gitlab.example.com/vtmocanu/uzi/-/issues/115) · **Label**: PRD · **Priority**: Medium
 **Supersedes the thresholds set by**: PRD #49 / #53 Decision 6 (unified `toneFor` at 80/95).
+**Status**: **DONE** — merged `c33211bd` + `10707d7a` via `4ffb80c2`, released in **v0.11.2**. Closed 2026-07-25.
+
+> **Verification for this close (2026-07-25), because "the commit exists" is not evidence that the milestones landed.** Each box below was checked against the merged diff, not against the commit subject: M1 `toneFor` reads `>= 85 danger / >= 40 warn` (`Meter.tsx:16-20`); M2a `statusBadge` escalates only at ≥95 and returns "Live" for an 85-94 row (`rateLimits.ts:146-164`); M2b the dedicated ≥95 announcer exists (`RateLimitMeters.tsx:194-219`); M4 `specs/ai.md` §366 records the bands, and the stale mock legends are stated left-as-superseded at line 142. M3 was verified by **running the suite**: 89 files, 959 tests, all green, plus `tsc --noEmit` clean — and no `ok(8, 47)` fixture survives anywhere, which was the specific breakage M3 named.
+>
+> **M5 is ticked on shipped-and-live evidence, not on a recorded manual pass.** No one wrote down an in-app check at 45/88/96%. What exists instead: the re-picked fixtures and badge/announcer tests cover those bands, and the change has been live since v0.11.2. Said plainly rather than implied, so a future reader does not mistake this for a logged visual verification.
 
 ## Problem
 
@@ -95,16 +100,16 @@ adjustment (both consequences of the badge/tone split at 95 vs 85).
 
 ## Milestones
 
-- [ ] **M1 — Core threshold change.** `toneFor` → warn ≥40 / danger ≥85, with its
+- [x] **M1 — Core threshold change.** `toneFor` → warn ≥40 / danger ≥85, with its
   comment and the "single visual language" header note updated. Manual sanity:
   the Settings card and a worker gauge repaint at the new bands in mock mode.
-- [ ] **M2 — Badge + announcer decoupled/adjusted.** (a) `statusBadge` keeps
+- [x] **M2 — Badge + announcer decoupled/adjusted.** (a) `statusBadge` keeps
   "nearly out" at ≥95 and returns "Live" for an 85–94 danger-band row
   (empty-`which` guard); comment updated; no empty-label pill reachable. (b) Per
   Decision 3, add the dedicated ≥95 announcement in `RateLimitAnnouncer` so the
   95% badge escalation keeps a screen-reader signal (its warn/danger steps having
   moved to 40/85 with the shared edit).
-- [ ] **M3 — Tests updated and green.** `toneFor` does **not** round (rounding is
+- [x] **M3 — Tests updated and green.** `toneFor` does **not** round (rounding is
   only in `MeterTrack`), so re-pin the direct boundary asserts as
   `toneFor(84.9)=warn`, `toneFor(85)=danger`, `toneFor(39)=ok`, `toneFor(40)=warn`:
   - `web/src/components/Meter.test.tsx` — the "ok below 80…" case (lines 9–18) and
@@ -126,7 +131,7 @@ adjustment (both consequences of the badge/tone split at 95 vs 85).
   - `web/src/components/WorkerStats.test.tsx` — the "danger at ≥95%" gauge test →
     ≥85; add/adjust a warn-band value.
   `npm test` + `npm run typecheck` green.
-- [ ] **M4 — Docs + specs + mocks.** `docs/rate-limits.md` has **no numeric
+- [x] **M4 — Docs + specs + mocks.** `docs/rate-limits.md` has **no numeric
   thresholds** (its color copy is qualitative) — review/soften wording that now
   reads oddly under a 40% amber (e.g. "shifts color as it gets tight"); do not
   invent 80/95→40/85 numbers that were never there. Append a decision to
@@ -141,7 +146,7 @@ adjustment (both consequences of the badge/tone split at 95 vs 85).
   State explicitly that the stale legends in `prds/mockups/53-…` (line 146, 218)
   and `54-ui-polish-mock.html` (line 183) are **left as-is, superseded** (frozen
   historical artifacts, not linter-checked).
-- [ ] **M5 — Verify in-app.** Confirm in mock mode (and, if convenient, the
+- [x] **M5 — Verify in-app.** Confirm in mock mode (and, if convenient, the
   e2e/k8s stack) that the rate-limit meters, admin table sort, badges, and worker
   gauges all read correctly at representative values (45%, 88%, 96%).
 

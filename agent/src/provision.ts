@@ -18,8 +18,15 @@
 // the cap-less `runner` uid (via runnerCommand below), and the join-token FILE at
 // /run/secrets/worker_token is 0400 worker-owned, so a build hook can no longer read it
 // — the same-uid residual this used to name is gone on the A1 (root-started) path. The
-// admin allowlist still bounds WHICH packages install (their build hooks run in this
-// scrubbed env). On a #58 single-uid (non-root) start there is no split and the hook runs
+// admin allowlist bounds WHICH packages install ONLY on the tier-1 path (their build hooks
+// run in this scrubbed env). CORRECTION (2026-07-25, PRD #123 §6): this line used to claim
+// the allowlist bounds them full stop. It does not. Under `repo_devbox_opt_in` the tier-2
+// list comes from the CLONED REPO's devbox.json and is filtered by SHAPE ONLY — no
+// allowlist, and no `toolprofile.Denied()`, so the 18 credential-bearing CLIs that check
+// exists to bar (toolprofile.go:66-72) install unimpeded. The worker cannot do better today:
+// ClaimConfig ships it no rule set (workersvc/claim.go:160-183). PRD #123 M1b closes it.
+// Stated plainly because this sentence is the recorded mitigation for the residual above.
+// On a #58 single-uid (non-root) start there is no split and the hook runs
 // as the sole uid (that PRD's accepted posture); the cross-container k8s form is mapped in
 // docs/proc-hardening.md.
 //

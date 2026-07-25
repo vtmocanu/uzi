@@ -1483,7 +1483,7 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       not rewritten: the original sentence stands and a dated parenthetical says the file did not
       survive and that "authoritative" now names the surviving text.
       **Left alone — HISTORICAL RECORDS that describe their own mortality:**
-      `prds/58-hosted-k8s-workers.md:1311` sits inside a dated 2026-07-16 log entry whose entire
+      `prds/done/58-hosted-k8s-workers.md:1311` sits inside a dated 2026-07-16 log entry whose entire
       subject IS that the directory is gitignored and the notes die with the worktree — it also
       records a coder correctly declining to `git add -f` over a deliberate ignore. Rewriting it
       would erase the reasoning. (This is the one the dispatch expected to be a current claim

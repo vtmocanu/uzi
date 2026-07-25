@@ -357,6 +357,13 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/47-loop-hang-detection.md`
 - Flags are non-terminal and self-clearing: a flag never kills, requeues, or times out a
   run — early-warning only; existing watchdogs keep the kill job.
   [AI-proposed surface, user-ratified via PRD approval 2026-07-12]
+  - **The clause "existing watchdogs keep the kill job" stopped being true on 2026-07-25**
+    (PRD #108 Phase 2). The rest of the line still holds exactly as written: the FLAG still
+    never kills, requeues or times out anything, and the stop is a separate mechanism with
+    its own off switch that deliberately does not ride the run-health toggle. What changed
+    is that there is now a NEW watchdog, and it kills. Recorded here rather than rewritten,
+    because a requirement that changed is not the same artifact as one that was wrong.
+    [AI-proposed; NEEDS USER RATIFICATION]
 
 ## Feature #49 — Worker resource stats (live per-worker CPU/memory)
 
@@ -397,7 +404,7 @@ Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`.
 
 ## Feature #58 — Hosted k8s workers (self-service worker provisioning)
 
-Tracked as GitLab issue vtmocanu/uzi#58; PRD at `prds/58-hosted-k8s-workers.md`. Partially delivers the Deferred "on-demand worker spawning" item below — spawn-on-queued-work is NOT in scope here.
+Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8s-workers.md` (moved to `done/` 2026-07-25). Partially delivers the Deferred "on-demand worker spawning" item below — spawn-on-queued-work is NOT in scope here.
 
 - Self-service: any user provisions their own worker from the web UI, bounded by an admin-set per-user quota. [user 2026-07-16]
 - The user picks two things: a worker type (image template) and a size (S/M/L). [user 2026-07-16]
@@ -439,6 +446,26 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/95-activity-pane-v2.md`. R
   - Show a real "who's alive": glance at the pane and see each agent's state — working / waiting / done / blocked. [user 2026-07-20]
   - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
 - Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
+
+## Feature #108 — Worker retry loop: stop losing runs to unsaveable messages
+
+Tracked as GitLab issue vtmocanu/uzi#108; PRD at `prds/done/108-worker-retry-loop-autostop.md`.
+
+**Every bullet below is [AI-proposed; NEEDS USER RATIFICATION].** The user's direct input on
+this work was "finish PRD 108" and "use the team"; the requirements here were derived by the
+team from the PRD and are recorded so they can be accepted or rejected on sight, not so they
+can be assumed.
+
+- A run whose updates the server cannot save must not spin silently until `RUN_TIMEOUT`.
+- The user is flagged with the cause, and DM'd on Slack, before anything is stopped.
+- uzi may stop such a run automatically. A stopped run is presented as **breakage**, not as a
+  stop the user asked for.
+- If uzi cannot tell "this run is poisoned" from "the database is down", it flags and does
+  **not** stop — permanently, with no fallback and no timeout into stopping.
+- uzi only stops for a failure a correct worker could have hit through no fault of its own. A
+  malformed request means the worker *build* is broken; that is flagged, never stopped, and
+  the remedy is rolling the image.
+- Operators can disable the automatic stop without losing the flag.
 
 ## Feature #102 — Board v2: column rename, label chips, manual order, non-PRD issues
 

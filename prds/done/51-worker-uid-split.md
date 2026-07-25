@@ -1035,7 +1035,7 @@ Remaining:
   readable" framing is inaccurate — the close is `0400`/worker mode+owner, not mount-RO;
   the worker `/proc/environ` is `worker:worker 0400`, NOT root-owned). `ARCHITECTURE.md`
   layer-2; close the PRD #46 residual notes (`self-improve.ts` header,
-  `docs/self-improvement.md`). k8s: reference `prds/58-hosted-k8s-workers.md`
+  `docs/self-improvement.md`). k8s: reference `prds/done/58-hosted-k8s-workers.md`
   (Decisions 3, 6); state the containment scope (#51 containment ⇔ root-started A1 path;
   non-root / compose `user:` forfeits the split); the fsGroup-vs-B2 constraint (k8s
   two-container form: the WORKER BARE stays off the fsGroup-shared workspace volume —

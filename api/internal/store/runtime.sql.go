@@ -693,11 +693,25 @@ type CreateStopVerdictInputParams struct {
 // CTE runs to completion exactly once, so the stop signal can never be lost
 // independently of the input that requested it — which a second, non-transactional
 // UPDATE would risk, reintroducing the failed-vs-stopped bug. workersvc.Store exposes
-// no transaction seam, so this single combined statement IS the atomicity. It is used
-// ONLY for the two stop verdicts, so the stamp is unconditional (no IS NOT NULL guard
-// and thus no parameter-type-inference pitfall). The stamp lands while the run is
-// still non-terminal (awaiting_approval/running); the client's terminal-guarded
-// isStoppedRun ignores it until the run actually reaches failed/cancelled.
+// no transaction seam, so this single combined statement IS the atomicity.
+//
+// THREE callers since PRD #108 M5, not two, and the third is not a human verdict:
+// the auto-stop evaluator enqueues kind='cancel' with stop_kind='auto_stopped' for a
+// run whose message writes are in a confirmed permanent-failure loop. The MECHANISM
+// is unchanged — every caller stamps, so the stamp stays unconditional (no
+// IS NOT NULL guard and thus no parameter-type-inference pitfall) — only the
+// enumeration in this comment was wrong, and it is corrected in the same commit that
+// made it wrong. The stamp lands while the run is still non-terminal
+// (awaiting_approval/running); the client's terminal-guarded isStoppedRun ignores it
+// until the run actually reaches failed/cancelled.
+//
+// Auto-stop reuses kind='cancel' ON PURPOSE and this is load-bearing rather than
+// convenient: a steering input kind no worker recognises is LOGGED AND DROPPED by
+// SteeringChannel.route's default arm (verbatim at v0.10.0 and at HEAD), and
+// /inputs is consume-on-read, so the drop is PERMANENT and unacknowledgeable. A new
+// kind would therefore be a silent no-op on exactly the older fleet Phase 2 exists
+// to protect — and would need a second migration for run_user_inputs.kind's CHECK.
+// The distinguishing information rides runs.stop_kind, which the worker never sees.
 func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerdictInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createStopVerdictInput,
 		arg.RunID,
@@ -784,6 +798,60 @@ type DeleteWorkerForUserParams struct {
 
 func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteWorkerForUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const failRunAutoStop = `-- name: FailRunAutoStop :execrows
+UPDATE runs SET status = 'failed',
+    failure_reason     = $1,
+    stop_kind          = 'auto_stopped',
+    move_pending_since = now(),
+    finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type FailRunAutoStopParams struct {
+	FailureReason pgtype.Text `json:"failure_reason"`
+	ID            uuid.UUID   `json:"id"`
+}
+
+// Server-side auto-stop (PRD #108 M5) for a run whose message writes are in a
+// confirmed permanent-failure loop AND which has no live poller to consume a stop
+// verdict — plus the escalation for a live worker that was sent one and ignored it.
+//
+// Modelled on SweepRunningTimeout (a server-side failed transition) and on
+// CancelRunServerSide (which stamps stop_kind in the same statement). failed
+// restores the origin column, so move_pending_since is stamped here exactly as
+// every other server-side failed path does; omit it and the run rots in the wrong
+// board column forever.
+//
+// stop_kind is stamped in the SAME statement as the status (PRD #33 Decision 3), so
+// the auto-stop identity can never be lost independently of the transition that
+// created it. It is the ONLY field that survives both halves of this stop: on the
+// live-poller half the worker reports its own terminal state through SetRunFailed,
+// which overwrites failure_reason unconditionally with "run cancelled" and never
+// touches stop_kind. So failure_reason below is decoration and MUST NOT BE PARSED.
+//
+// Status-scoped, and the scope is a guard rather than an optimisation: the
+// evaluator re-reads the run before deciding, and this clause closes the race
+// between that read and this write. A run that reached terminal in between is a
+// no-op (rows == 0), which is also why the escalation can fire unconditionally
+// instead of re-testing liveness — the SQL is the guard.
+//
+// No user_id predicate, unlike CancelRunServerSide/RejectRunServerSide: those are
+// driven by a request from a user who must be proven to own the run, and this is
+// driven by the server's own sweeper, which has no user to scope to. The
+// authorization that matters happened upstream — every failure that built this
+// run's streak was recorded only after runOwnedByWorker succeeded.
+func (q *Queries) FailRunAutoStop(ctx context.Context, arg FailRunAutoStopParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failRunAutoStop, arg.FailureReason, arg.ID)
 	if err != nil {
 		return 0, err
 	}

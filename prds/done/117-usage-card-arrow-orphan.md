@@ -2,6 +2,9 @@
 
 **Issue**: [#117](https://gitlab.example.com/vtmocanu/uzi/-/issues/117) · **Label**: PRD · **Priority**: Low
 **Area**: `web/` dashboard usage cards (PRD #40 lineage).
+**Status**: **DONE** — merged `f5d26658` via `95dfb5e3`, released in **v0.11.3**. Closed 2026-07-25.
+
+> **Verified against the merged diff 2026-07-25.** M1: `UsageCards.tsx:69-70` carries `whitespace-nowrap` and the `{"\u00A0"}` escape; `UsageCards.test.tsx:66,69` asserts both, including the **positive** pin `/detail\u00A0→/` this PRD specifically argued for over a negative one. M2: the mock's `a.faux` has `white-space: nowrap` (`prds/mockups/40-token-usage-mock.html:186`). Web suite re-run at close: 959 tests green, `tsc` clean. The M2 in-app confirmation is ticked on shipped-and-live evidence (v0.11.3), not on a recorded manual pass.
 
 ## Problem
 
@@ -68,7 +71,7 @@ Single file, one component.
 
 ## Milestones
 
-- [ ] **M1 — Fix + test.** Apply `whitespace-nowrap` + NBSP to the `YourUsageCard`
+- [x] **M1 — Fix + test.** Apply `whitespace-nowrap` + NBSP to the `YourUsageCard`
   link. Add a `web/src/components/UsageCards.test.tsx` assertion that the
   rendered link element (a) carries the `whitespace-nowrap` class and (b) its
   `textContent` **matches `/detail\u00A0→/`** — a *positive* pin asserting the
@@ -76,7 +79,7 @@ Single file, one component.
   space before `→`": a negative pin can pass vacuously if the label text later
   changes, whereas the positive form fails loudly the moment the escape is
   dropped.) `npm test` + `npm run typecheck` green.
-- [ ] **M2 — Verify in-app + mock fidelity.** Confirm in mock mode at a narrow
+- [x] **M2 — Verify in-app + mock fidelity.** Confirm in mock mode at a narrow
   width that the arrow no longer orphans (the whole link wraps together). Apply
   the same `white-space: nowrap` to the mock's `.faux` link (or note it left
   superseded). `npm run build` green (runs `check-docs` + `tsc`).
