@@ -1,0 +1,1085 @@
+{
+  "dedup-across-runs": [
+    {
+      "category": "enable_tool",
+      "target": "jq",
+      "bucket": "todo",
+      "open_count": 2,
+      "run_count": 2,
+      "rationale_preview": "rationale 1 for enable_tool/jq in run 1",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000001",
+          "run_title": "issue title for run 1",
+          "review_id": "11111111-1111-4111-8111-000000000001",
+          "rec_id": "33333333-3333-4333-8333-000000000001",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000002",
+          "run_title": "issue title for run 2",
+          "review_id": "11111111-1111-4111-8111-000000000002",
+          "rec_id": "33333333-3333-4333-8333-000000000003",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_agent",
+      "target": "coder",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 2 for improve_agent/coder in run 1",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000001",
+          "run_title": "issue title for run 1",
+          "review_id": "11111111-1111-4111-8111-000000000001",
+          "rec_id": "33333333-3333-4333-8333-000000000002",
+          "verdict": "ideal",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "occurrences-exceed-run-count": [
+    {
+      "category": "install_worker_tool",
+      "target": "ripgrep",
+      "bucket": "todo",
+      "open_count": 3,
+      "run_count": 2,
+      "rationale_preview": "rationale 4 for install_worker_tool/ripgrep in run 3",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000003",
+          "run_title": "issue title for run 3",
+          "review_id": "11111111-1111-4111-8111-000000000003",
+          "rec_id": "33333333-3333-4333-8333-000000000004",
+          "verdict": "ok",
+          "confidence": "high",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000003",
+          "run_title": "issue title for run 3",
+          "review_id": "11111111-1111-4111-8111-000000000003",
+          "rec_id": "33333333-3333-4333-8333-000000000005",
+          "verdict": "ideal",
+          "confidence": "medium",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000004",
+          "run_title": "issue title for run 4",
+          "review_id": "11111111-1111-4111-8111-000000000004",
+          "rec_id": "33333333-3333-4333-8333-000000000006",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "partial-settle": [
+    {
+      "category": "adjust_template",
+      "target": "lead",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 2,
+      "rationale_preview": "rationale 7 for adjust_template/lead in run 5",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000005",
+          "run_title": "issue title for run 5",
+          "review_id": "11111111-1111-4111-8111-000000000005",
+          "rec_id": "33333333-3333-4333-8333-000000000007",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000006",
+          "run_title": "issue title for run 6",
+          "review_id": "11111111-1111-4111-8111-000000000006",
+          "rec_id": "33333333-3333-4333-8333-000000000008",
+          "verdict": "ideal",
+          "confidence": "high",
+          "bucket": "done",
+          "set_via": "issue_close"
+        }
+      ]
+    }
+  ],
+  "rollup-precedence-pairs": [
+    {
+      "category": "enable_tool",
+      "target": "pair-dismissed-todo",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 2,
+      "rationale_preview": "rationale 13 for enable_tool/pair-dismissed-todo in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000013",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "dismissed"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000014",
+          "verdict": "ideal",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "pair-done-todo",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 2,
+      "rationale_preview": "rationale 17 for enable_tool/pair-done-todo in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000017",
+          "verdict": "ideal",
+          "confidence": "medium",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000018",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "pair-filed-todo",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 2,
+      "rationale_preview": "rationale 19 for enable_tool/pair-filed-todo in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000019",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "filed",
+          "filed_issue": {
+            "issue_iid": 1019,
+            "issue_url": "https://forge.example/uzi/-/issues/1019",
+            "filed_at": "2026-07-20T10:19:00Z"
+          }
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000020",
+          "verdict": "ideal",
+          "confidence": "high",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "pair-dismissed-done",
+      "bucket": "dismissed",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 9 for enable_tool/pair-dismissed-done in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000009",
+          "verdict": "issues",
+          "confidence": "medium",
+          "bucket": "dismissed"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000010",
+          "verdict": "ok",
+          "confidence": "low",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "pair-dismissed-filed",
+      "bucket": "dismissed",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 11 for enable_tool/pair-dismissed-filed in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000011",
+          "verdict": "ideal",
+          "confidence": "",
+          "bucket": "dismissed"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000012",
+          "verdict": "issues",
+          "confidence": "high",
+          "bucket": "filed",
+          "filed_issue": {
+            "issue_iid": 1012,
+            "issue_url": "https://forge.example/uzi/-/issues/1012",
+            "filed_at": "2026-07-20T10:12:00Z"
+          }
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "pair-done-filed",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 15 for enable_tool/pair-done-filed in run 7",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000007",
+          "run_title": "issue title for run 7",
+          "review_id": "11111111-1111-4111-8111-000000000007",
+          "rec_id": "33333333-3333-4333-8333-000000000015",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000008",
+          "run_title": "issue title for run 8",
+          "review_id": "11111111-1111-4111-8111-000000000008",
+          "rec_id": "33333333-3333-4333-8333-000000000016",
+          "verdict": "ok",
+          "confidence": "high",
+          "bucket": "filed",
+          "filed_issue": {
+            "issue_iid": 1016,
+            "issue_url": "https://forge.example/uzi/-/issues/1016",
+            "filed_at": "2026-07-20T10:16:00Z"
+          }
+        }
+      ]
+    }
+  ],
+  "sort-tie-first-seen-order": [
+    {
+      "category": "improve_uzi",
+      "target": "gamma",
+      "bucket": "todo",
+      "open_count": 2,
+      "run_count": 2,
+      "rationale_preview": "rationale 23 for improve_uzi/gamma in run 9",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000009",
+          "run_title": "issue title for run 9",
+          "review_id": "11111111-1111-4111-8111-000000000009",
+          "rec_id": "33333333-3333-4333-8333-000000000023",
+          "verdict": "ideal",
+          "confidence": "",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000010",
+          "run_title": "issue title for run 10",
+          "review_id": "11111111-1111-4111-8111-000000000010",
+          "rec_id": "33333333-3333-4333-8333-000000000026",
+          "verdict": "ideal",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "alpha",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 21 for improve_uzi/alpha in run 9",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000009",
+          "run_title": "issue title for run 9",
+          "review_id": "11111111-1111-4111-8111-000000000009",
+          "rec_id": "33333333-3333-4333-8333-000000000021",
+          "verdict": "issues",
+          "confidence": "medium",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "beta",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 22 for improve_uzi/beta in run 9",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000009",
+          "run_title": "issue title for run 9",
+          "review_id": "11111111-1111-4111-8111-000000000009",
+          "rec_id": "33333333-3333-4333-8333-000000000022",
+          "verdict": "ok",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "delta",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 24 for improve_uzi/delta in run 9",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000009",
+          "run_title": "issue title for run 9",
+          "review_id": "11111111-1111-4111-8111-000000000009",
+          "rec_id": "33333333-3333-4333-8333-000000000024",
+          "verdict": "issues",
+          "confidence": "high",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "epsilon",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 25 for improve_uzi/epsilon in run 9",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000009",
+          "run_title": "issue title for run 9",
+          "review_id": "11111111-1111-4111-8111-000000000009",
+          "rec_id": "33333333-3333-4333-8333-000000000025",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    }
+  ],
+  "bucket-filter-all": [
+    {
+      "category": "enable_tool",
+      "target": "bf-open-first",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 27 for enable_tool/bf-open-first in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000027",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "bf-open-second",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 31 for enable_tool/bf-open-second in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000031",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "bf-filed",
+      "bucket": "filed",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 28 for enable_tool/bf-filed in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000028",
+          "verdict": "ok",
+          "confidence": "high",
+          "bucket": "filed",
+          "filed_issue": {
+            "issue_iid": 1028,
+            "issue_url": "https://forge.example/uzi/-/issues/1028",
+            "filed_at": "2026-07-20T10:28:00Z"
+          }
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "bf-done",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 29 for enable_tool/bf-done in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000029",
+          "verdict": "ideal",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "bf-dismissed",
+      "bucket": "dismissed",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 30 for enable_tool/bf-dismissed in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000030",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "dismissed"
+        }
+      ]
+    }
+  ],
+  "bucket-filter-todo": [
+    {
+      "category": "enable_tool",
+      "target": "bf-open-first",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 27 for enable_tool/bf-open-first in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000027",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "enable_tool",
+      "target": "bf-open-second",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 31 for enable_tool/bf-open-second in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000031",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "bucket-filter-dismissed": [
+    {
+      "category": "enable_tool",
+      "target": "bf-dismissed",
+      "bucket": "dismissed",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 30 for enable_tool/bf-dismissed in run 11",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000011",
+          "run_title": "issue title for run 11",
+          "review_id": "11111111-1111-4111-8111-000000000011",
+          "rec_id": "33333333-3333-4333-8333-000000000030",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "dismissed"
+        }
+      ]
+    }
+  ],
+  "preview-ascii-cut": [
+    {
+      "category": "improve_agent",
+      "target": "pv-long",
+      "bucket": "todo",
+      "open_count": 2,
+      "run_count": 2,
+      "rationale_preview": "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLZ\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000012",
+          "run_title": "issue title for run 12",
+          "review_id": "11111111-1111-4111-8111-000000000012",
+          "rec_id": "33333333-3333-4333-8333-000000000033",
+          "verdict": "issues",
+          "confidence": "medium",
+          "bucket": "todo"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000013",
+          "run_title": "issue title for run 13",
+          "review_id": "11111111-1111-4111-8111-000000000013",
+          "rec_id": "33333333-3333-4333-8333-000000000034",
+          "verdict": "ok",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_agent",
+      "target": "pv-short",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "rationale 32 for improve_agent/pv-short in run 12",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000012",
+          "run_title": "issue title for run 12",
+          "review_id": "11111111-1111-4111-8111-000000000012",
+          "rec_id": "33333333-3333-4333-8333-000000000032",
+          "verdict": "ideal",
+          "confidence": "high",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "preview-multibyte-cut": [
+    {
+      "category": "improve_uzi",
+      "target": "pv-mb-cut-even",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000014",
+          "run_title": "issue title for run 14",
+          "review_id": "11111111-1111-4111-8111-000000000014",
+          "rec_id": "33333333-3333-4333-8333-000000000035",
+          "verdict": "ideal",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "pv-mb-cut-odd",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "a\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000014",
+          "run_title": "issue title for run 14",
+          "review_id": "11111111-1111-4111-8111-000000000014",
+          "rec_id": "33333333-3333-4333-8333-000000000036",
+          "verdict": "issues",
+          "confidence": "high",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "preview-multibyte-no-cut": [
+    {
+      "category": "improve_uzi",
+      "target": "pv-mb-nocut-even",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000015",
+          "run_title": "issue title for run 15",
+          "review_id": "11111111-1111-4111-8111-000000000015",
+          "rec_id": "33333333-3333-4333-8333-000000000037",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "pv-mb-nocut-odd",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "a\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80\ud83d\ude80",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000015",
+          "run_title": "issue title for run 15",
+          "review_id": "11111111-1111-4111-8111-000000000015",
+          "rec_id": "33333333-3333-4333-8333-000000000038",
+          "verdict": "ideal",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "preview-trim-boundary": [
+    {
+      "category": "improve_uzi",
+      "target": "pv-trim-nbsp",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt\u00a0\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000016",
+          "run_title": "issue title for run 16",
+          "review_id": "11111111-1111-4111-8111-000000000016",
+          "rec_id": "33333333-3333-4333-8333-000000000039",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "pv-trim-bom",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt\ufeff\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000016",
+          "run_title": "issue title for run 16",
+          "review_id": "11111111-1111-4111-8111-000000000016",
+          "rec_id": "33333333-3333-4333-8333-000000000040",
+          "verdict": "ok",
+          "confidence": "high",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "pv-trim-lsep",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt\u2028\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000016",
+          "run_title": "issue title for run 16",
+          "review_id": "11111111-1111-4111-8111-000000000016",
+          "rec_id": "33333333-3333-4333-8333-000000000041",
+          "verdict": "ideal",
+          "confidence": "medium",
+          "bucket": "todo"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "pv-trim-space",
+      "bucket": "todo",
+      "open_count": 1,
+      "run_count": 1,
+      "rationale_preview": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt\u2026",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000016",
+          "run_title": "issue title for run 16",
+          "review_id": "11111111-1111-4111-8111-000000000016",
+          "rec_id": "33333333-3333-4333-8333-000000000042",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "todo"
+        }
+      ]
+    }
+  ],
+  "sort-stability-13-groups": [
+    {
+      "category": "improve_uzi",
+      "target": "stab-01",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 44 for improve_uzi/stab-01 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000044",
+          "verdict": "ideal",
+          "confidence": "high",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000045",
+          "verdict": "issues",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-03",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 47 for improve_uzi/stab-03 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000047",
+          "verdict": "ideal",
+          "confidence": "",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000048",
+          "verdict": "issues",
+          "confidence": "high",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-05",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 50 for improve_uzi/stab-05 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000050",
+          "verdict": "ideal",
+          "confidence": "low",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000051",
+          "verdict": "issues",
+          "confidence": "",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-07",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 53 for improve_uzi/stab-07 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000053",
+          "verdict": "ideal",
+          "confidence": "medium",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000054",
+          "verdict": "issues",
+          "confidence": "low",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-09",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 56 for improve_uzi/stab-09 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000056",
+          "verdict": "ideal",
+          "confidence": "high",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000057",
+          "verdict": "issues",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-11",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 2,
+      "rationale_preview": "rationale 59 for improve_uzi/stab-11 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000059",
+          "verdict": "ideal",
+          "confidence": "",
+          "bucket": "done"
+        },
+        {
+          "run_id": "22222222-2222-4222-8222-000000000091",
+          "run_title": "issue title for run 91",
+          "review_id": "11111111-1111-4111-8111-000000000018",
+          "rec_id": "33333333-3333-4333-8333-000000000060",
+          "verdict": "issues",
+          "confidence": "high",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-00",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 43 for improve_uzi/stab-00 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000043",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-02",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 46 for improve_uzi/stab-02 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000046",
+          "verdict": "ok",
+          "confidence": "low",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-04",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 49 for improve_uzi/stab-04 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000049",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-06",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 52 for improve_uzi/stab-06 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000052",
+          "verdict": "ok",
+          "confidence": "high",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-08",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 55 for improve_uzi/stab-08 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000055",
+          "verdict": "ok",
+          "confidence": "",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-10",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 58 for improve_uzi/stab-10 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000058",
+          "verdict": "ok",
+          "confidence": "low",
+          "bucket": "done"
+        }
+      ]
+    },
+    {
+      "category": "improve_uzi",
+      "target": "stab-12",
+      "bucket": "done",
+      "open_count": 0,
+      "run_count": 1,
+      "rationale_preview": "rationale 61 for improve_uzi/stab-12 in run 90",
+      "occurrences": [
+        {
+          "run_id": "22222222-2222-4222-8222-000000000090",
+          "run_title": "issue title for run 90",
+          "review_id": "11111111-1111-4111-8111-000000000017",
+          "rec_id": "33333333-3333-4333-8333-000000000061",
+          "verdict": "ok",
+          "confidence": "medium",
+          "bucket": "done"
+        }
+      ]
+    }
+  ]
+}
