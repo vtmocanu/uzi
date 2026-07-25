@@ -42,8 +42,10 @@ describe("buildSdkEnv", () => {
 
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
     assert.strictEqual(env.HOME, HOME_DIR);
-    // The RUNNER PATH (PRD #51 M4): UZI_RUNNER_PATH under the split, else the worker's own
-    // PATH — unset here (single-uid), so it equals process.env.PATH.
+    // The RUNNER PATH (PRD #51 M4): UZI_RUNNER_PATH under the split, else process.env.PATH.
+    // Unset in THIS fixture, so it equals process.env.PATH. On a real single-uid worker it
+    // is no longer unset — since PRD #120 the entrypoint pins it on both branches, so the
+    // fallback is the non-entrypoint case only.
     assert.strictEqual(env.PATH, process.env.PATH);
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);

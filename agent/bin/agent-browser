@@ -22,10 +22,24 @@
 # /app/node_modules/.bin is on neither. agent/test/templates-guardrails.test.ts pins that
 # export (both branches) and agent/test/runner-uid.test.ts pins the resolution order.
 #
-# RESIDUAL: anything that hands a runner child a PATH the entrypoint did not produce can
-# shadow this shim again — notably a provisioned `toolEnv.PATH` (PRD #18 M3), which
-# buildSdkEnv folds in as a full PATH REPLACEMENT. If a browser launch ever loses
-# --no-sandbox again, dump the agent's effective PATH first; do not assume this shim ran.
+# RESIDUAL — narrower than "buildSdkEnv replaces the PATH", and worth stating precisely
+# because the obvious suspect is NOT one. A provisioned `toolEnv.PATH` (PRD #18 M3) DOES
+# replace the agent PATH wholesale, but it is not an independent PATH: provision.ts builds
+# devbox's env with `PATH: runnerPath(source)` (:126) and resolves devbox's `$PATH` back-ref
+# against that same value (:202, :165). So post-#120 toolEnv.PATH is
+# `<provisioned tool bins>:<image PATH>` — /usr/local/bin still on it, /app/node_modules/.bin
+# still off it. The back-ref is the mechanism; runnerPath() being the BASE is the invariant,
+# so a fully-expanded devbox output lands in the same place (devbox computes it from the PATH
+# in its own process env, which is runnerPath()).
+#
+# Pre-#120 that tail WAS the npm-mutated PATH, which is why a run WITH a tool profile was
+# shadowed too — the same single root cause, not a second one. A tool profile neither caused
+# the shadowing nor protected against it.
+#
+# What is actually left: a provisioned package shipping its own binary named `agent-browser`,
+# or a future caller handing a runner child a PATH neither the entrypoint nor provision.ts
+# produced. If a browser launch ever loses --no-sandbox again, dump the agent's effective
+# PATH first; do not assume this shim ran.
 #
 # It does two things the bare CLI cannot do on its own in the hardened worker:
 #

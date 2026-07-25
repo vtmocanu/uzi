@@ -298,7 +298,7 @@ the shim again. The same false claim in both Dockerfile comments, and the stale
 "single-uid ⇒ falls back to the worker PATH" notes in `runner-uid.ts`,
 `toolchain-preflight.ts`, `sdk-env.ts` and `docs/proc-hardening.md`, were corrected too.
 
-**Tests (3 new, all mutation-proven).** `agent/test/runner-uid.test.ts` pins the resolution
+**Tests (3 new; the 2 ENTRYPOINT tests are mutation-proven, the third is a model test).** `agent/test/runner-uid.test.ts` pins the resolution
 order (which dir a bare `agent-browser` resolves from) across pre-fix, post-fix and compose
 PATH shapes. `agent/test/templates-guardrails.test.ts` adds a structural test (pin after the
 unset, before the exec; neither of the other two vars re-exported) and one that **executes**

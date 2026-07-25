@@ -93,6 +93,14 @@ if [ "$uid" != "0" ]; then
   # old fallback — a stray operator value used to be replaced by whatever npm produced, and
   # is now replaced by the image's own PATH.
   #
+  # BEHAVIOUR DELTA worth naming: runner children lose ALL of /app/node_modules/.bin, not
+  # just its agent-browser. That dir also holds tsx, tsc, tsserver, esbuild and friends, so
+  # an agent on k8s that previously resolved a bare `tsc`/`tsx` from the WORKER's own
+  # node_modules now gets command-not-found. That is the correct outcome — the agent should
+  # never resolve the worker's toolchain — and nothing breaks: the SDK's own CLI is
+  # module-resolved rather than PATH-resolved, and node/npm/npx sit at /usr/local/bin on the
+  # image PATH. Stated here because it is a real change on the primary runtime.
+  #
   # UZI_RUNNER_TMPDIR is deliberately NOT re-exported: controller/internal/kube/render.go
   # sets a pod-spec TMPDIR for docker workers and relies on this branch leaving it unset so
   # `runnerTmpdir()` (= UZI_RUNNER_TMPDIR || TMPDIR) returns the pod-spec value.
