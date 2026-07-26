@@ -106,6 +106,17 @@ decides where the next person spends their time. Re-derive those too.
   different claims. Two validators can both be right and disagree, because they
   asked different questions. When two reports conflict, find the two questions
   before picking a winner.
+- **Correctness ≠ reachability — a DIFFERENT axis from presence, and the reason "write a
+  better test" does not close this class.** Asserting an attribute's *exact value* is
+  strictly stronger than asserting its presence, and **still** satisfiable while the
+  information reaches nobody: strength of assertion is orthogonal to reachability. Measured
+  2026-07-26 (PRD #113 M5): `upgrade_detail` reached the user only through a `title`
+  attribute, the detail strip rendered only for `upgrade_failed`, and `outdated` was *also*
+  an alert state — so one of the two states the nav badge counts had its entire explanation
+  in a hover: no keyboard, no touch, inconsistent for screen readers. The test asserted the
+  `title`'s exact string and passed, as it should have. **jsdom can verify an attribute is
+  correct; it cannot verify anyone can reach it.** Named by the coder who wrote the passing
+  test, about its own test.
 - **The experiment that justifies a choice usually also bounds it.** Record both
   halves, not the flattering one.
 
