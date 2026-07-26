@@ -202,6 +202,13 @@ export class GitCache {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
         this.log.info("repo cache: fetching", { bare: barePath });
+        // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
+        // object-writing command, hence the first spawner). cloneBare only runs on the very
+        // first clone, and `/data` is persistent — a per-worker PVC in k8s, the `agentdata`
+        // volume under compose — so every bare on an already-deployed worker would otherwise
+        // never receive these keys at all. That is the exact case the bare-repo reasoning
+        // below is about, so writing it only in cloneBare left it applied to none of them.
+        await this.disableAutoMaintenance(barePath);
         await this.fetch(barePath, pat, scope, username);
       } else {
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
@@ -305,9 +312,49 @@ export class GitCache {
       // skips populating the stale default so we check the agent branch out at the
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
       await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      // Issue #134 (production half of #127). ONE detached `git maintenance run --auto
+      // --detach` per object-writing command (fetch/commit/push) outlives the git we awaited
+      // and keeps writing inside `.git`; it spawns a repack/pack-objects subtree only once
+      // `gc.auto`'s threshold is met, which a per-run `--shared` clone never reaches.
+      // removeRunnerClone (runner.ts:454) `fs.rm`s this tree moments after the agent's last
+      // commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
+      //
+      // As RUNNER, matching the clone: `<clone>/.git/config` is runner-owned, so this
+      // rewrites it in place as the same uid. Doing it as WORKER would plant a worker-owned
+      // config inside a directory the untrusted runner owns and can replace anyway — no gain,
+      // and it breaks the ownership invariant the plant-a-key analysis above rests on. Note
+      // the image puts `worker` in the `runner` group, so a worker-uid write here would
+      // likely SUCCEED QUIETLY rather than fail loudly.
+      await this.disableAutoMaintenance(clonePath, /* asRunner */ true);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
       return { path: clonePath, branch, priorCommits };
     });
+  }
+
+  /**
+   * Turn git's detached auto-maintenance off in a repo we own (issue #134).
+   *
+   * Idempotent, so it is safe on the warm path — which is where it matters: `cloneBare`
+   * runs only on the very first clone, and `/data` is persistent (a per-worker PVC in k8s,
+   * the `agentdata` volume under compose), so a bare on an already-deployed worker is only
+   * ever reached through `ensureClone`'s fetch branch.
+   *
+   * Both keys, deliberately — neither subsumes the other across the version range. See the
+   * note on `gitEnv`'s inline pins, which close the same hole for every git that goes
+   * through this module; these repo-local writes additionally cover the AGENT's own git
+   * (the SDK Bash tool), which does not use `gitEnv`.
+   *
+   * `tryGit` rather than `runGit`: this prevents a warning-level directory leak, so it must
+   * never be the reason a run fails to seed.
+   */
+  private async disableAutoMaintenance(repoPath: string, asRunner = false): Promise<void> {
+    // No tryGitAsRunner exists; swallow explicitly rather than adding a near-duplicate of
+    // tryGit whose only caller would be this one.
+    const run = asRunner
+      ? (args: string[]) => this.runGitAsRunner(repoPath, args).catch(() => undefined)
+      : (args: string[]) => this.tryGit(repoPath, args).then(() => undefined);
+    await run(["config", "maintenance.auto", "false"]);
+    await run(["config", "gc.auto", "0"]);
   }
 
   /** Commits reachable from `sha` but not from the repo's default branch. Best-effort:
@@ -401,6 +448,15 @@ export class GitCache {
     // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
     // and lands back in refs/uzi-runner/* (fetchAgentBranch), never the bare's heads.
     await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    // Issue #134 — belt for a FRESH bare; the warm path in ensureClone is what covers the
+    // deployed fleet. The bare is LONG-LIVED and shared across runs, so auto-maintenance is
+    // arguably wanted here. Disabled anyway because a detached gc can run CONCURRENTLY with
+    // a claim's fetch — a race nobody chose. The cost is real and tracked: an unmaintained
+    // bare never repacks and never prunes, so `gc.autoPackLimit` (default 50) stops guarding
+    // pack growth against a fixed-size PVC. The clean fix is a DELIBERATE
+    // `git maintenance run --task=incremental-repack` taken inside `withLock(barePath)`,
+    // which already serializes every bare operation and so is race-free by construction.
+    await this.disableAutoMaintenance(dest);
     await this.fetch(dest, pat, scope, username);
   }
 
@@ -588,6 +644,22 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
   const pairs: Array<[string, string]> = [
     ["safe.directory", "*"],
     ["core.hooksPath", EMPTY_GIT_HOOKS_DIR],
+    // Issue #134. Every object-WRITING git (fetch/commit/push) ends by spawning a detached
+    // `git maintenance run --auto --detach` that outlives the process we awaited and keeps
+    // writing inside `.git` — so an `fs.rm` of that tree can hit ENOTEMPTY (`force: true`
+    // suppresses ENOENT, not ENOTEMPTY). Pinned HERE, inline, rather than only written into
+    // each repo's config: these pins are highest precedence, they apply warm or cold, they
+    // need no ordering care, and a planted config file cannot override them. The repo-local
+    // writes are kept as well — the AGENT's own git (SDK Bash tool) does not go through
+    // gitEnv, and that git is the one doing the commits.
+    //
+    // BOTH keys, and neither subsumes the other across the version range: on git 2.54 (the
+    // shipped worker image) `prepare_auto_maintenance` reads ONLY `maintenance.auto`, so
+    // `gc.auto=0` alone leaves the spawn intact; on 2.55 it gained a `gc.auto` fallback, so
+    // `gc.auto=0` alone suffices there — but an explicit `maintenance.auto=true` re-enables
+    // the spawn regardless of `gc.auto`. Setting both is correct on either.
+    ["maintenance.auto", "false"],
+    ["gc.auto", "0"],
     ...GIT_CODE_EXEC_KEY_PINS.map(([k, v]) => [k, v] as [string, string]),
   ];
   if (pat) {
