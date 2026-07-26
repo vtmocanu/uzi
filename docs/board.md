@@ -133,3 +133,8 @@ not arbitrary tickets). Each card also needs its issue description to link a
 excluded from agent pickup until the link is added. A card carrying more
 than one column label (edited outside uzi) shows a conflict badge and
 displays in its highest-positioned column until the next move normalizes it.
+
+A run that finishes a PRD is asked to move the file to `prds/done/` in its own
+merge request (see [Agent skills](./skills.md)). Once that merge request
+merges, uzi rewrites the matching link in the issue description so it still
+resolves, leaving every other `prds/*.md` reference there untouched.

@@ -60,6 +60,27 @@ manual **Start run** button doesn't have.
   comment points at the access-controlled run page for detail rather than
   repeating it in a member-visible GitLab comment.
 
+## PRD updates happen unattended
+
+An issue run is asked to update the issue's linked `prds/*.md` file before it
+finishes, and to move it to `prds/done/` if the PRD is now fully complete (see
+[Agent skills](./skills.md)). An autopilot run does this with nobody in the
+loop, the same way it writes code with nobody in the loop. The edit and the
+`git mv` are ordinary commits on the run's branch, so they arrive as reviewable
+file changes in the merge request, never as an out-of-band write.
+
+Two things worth knowing before you label an issue:
+
+- **A run using [repo agents](./repo-agents.md) can move a PRD to `prds/done/`
+  unattended.** Autopilot defaults to the repo's roster when one is detected,
+  and a repo-authored reviewer's sign-off is not uzi's own review. Read the PRD
+  diff when you review the merge request, the same as the code.
+- **The issue's own PRD link is corrected only after you merge.** If the run
+  moved the file, uzi rewrites that link in the issue description once the
+  merge request has merged, so your merge decision is what authorizes the edit.
+  It rewrites only the link the issue already pointed at and leaves any other
+  `prds/*.md` reference in the description alone.
+
 ## Retry
 
 Autopilot only reacts to a label being *added*; fix whatever blocked it

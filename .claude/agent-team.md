@@ -165,6 +165,24 @@ decides where the next person spends their time. Re-derive those too.
   log file and the grep that ran against the wrong working tree: *the verification mechanism
   failed silently while the thing it was verifying looked fine.* In all three, the output of a
   broken check is indistinguishable from the output of a passing one.
+- **THE zsh WORD-SPLITTING TRAP HAS A VERIFICATION-LOOP FORM, AND IT IS WORSE THAN THE
+  COMMAND FORM `CLAUDE.md` ALREADY DOCUMENTS.** Measured on PRD #72: an auditor building a
+  mutation table ran `for g in $combo` over a space-joined string. zsh does **not** word-split
+  unquoted variables, so the loop iterated **once, on the whole string**, and every pair- and
+  triple-mutant silently never applied — while those rows still printed a confident
+  **"reject"**. The output is indistinguishable from a guard that works. It was caught only by
+  an applied-versus-expected substitution counter.
+  Same shape as the `${PIPESTATUS[0]}` entry above and it belongs beside it: **a shell-ism in a
+  command fails loudly and you fix it; a shell-ism in the check that proves the command passed
+  fails silent, and the surrounding output still looks like success.** Use a real array
+  (`combo=(g1 g2); for g in "${combo[@]}"`), and give any mutation loop a counter asserting the
+  expected number of substitutions actually applied.
+- **DIRECTORY-WIDE `gofmt -w` IS A TRAP IN THIS REPO, BECAUSE `gofmt -l ./api` IS NOT EMPTY.**
+  `gofmt -w internal/<pkg>/` reformats that pre-existing drift and sweeps files
+  you never touched into your commit, under your commit message. Scope it to your own files, by
+  name. The check that matters is `comm -12` between `gofmt -l` and your commit's file list being
+  **empty** — deliberately not a count, per the `format` slot in Quality gates, where a tally has
+  already produced one truncated-view error.
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
@@ -190,6 +208,20 @@ decides where the next person spends their time. Re-derive those too.
   **separate** standing rule below and must stay one. A reader who believes the
   control covers all three will drop the tree comparison as duplicated effort,
   and that is the one of the three that has already produced a false green here.
+  **THE SAME FALSE `PASS=0` SIGNATURE HAS A SECOND CAUSE ON THE OTHER TWO TOOLCHAINS, AND IT IS
+  YOUR GREP RATHER THAN THE SUITE.** Neither `agent/` (`node --test` via tsx) nor `web/`
+  (vitest) emits TAP, and neither emits Go's `--- PASS` either. `node --test`'s spec reporter
+  prints `✔ name (1.2ms)` per test and an `ℹ tests` / `ℹ pass` / `ℹ fail` / `ℹ skipped` summary;
+  vitest prints `✓ name` and `Tests  N passed (N)`. **The two ticks are not even the same
+  character** — U+2714 `✔` for node, U+2713 `✓` for vitest — so a glyph copied from one report
+  matches nothing in the other. Measured 2026-07-26 at `cfa1c0a3`: over a fully healthy `agent/`
+  run (`ℹ pass 851`, `ℹ fail 0`, exit 0) both `grep -c '^ok '` and `grep -c '^# tests'` return
+  **0**, and the same two return **0** over a green `web/` run — the identical `RUN=0 PASS=0`
+  signature the entry above documents, produced by a run in which every assertion executed. The
+  durable finding is that a TAP-shaped tally reads zero from a healthy non-TAP runner; the pass
+  counts are that tree's inventory. Anchor on the reporter you actually invoked, and apply the
+  Go-side rule in the other direction too: before concluding a suite ran nothing, confirm your
+  pattern matches the runner it was pointed at.
 - **A fixture whose users or runs DELIBERATELY SHARE coordinate strings pins the
   `review_id` join halves FOR FREE — and "tidying" it silently deletes that
   coverage.** The pinning comes from the row-count guards (`rows != 2`,
@@ -211,6 +243,71 @@ decides where the next person spends their time. Re-derive those too.
   the `triage.todo` consumer, reading visibly inflated counts under the same
   fold. Same reason assertion *counts* are not citable: a tally drifts exactly
   like a line number.
+
+## A claim about what would happen if you removed it is not readable from the code
+
+*The generalization of "a failed grep is not evidence the text is absent" past greps.
+Recorded on PRD #72 (2026-07-26).*
+
+Repeatedly on PRD #72, across every agent on the branch including the lead, someone asserted a
+**counterfactual** — *if X were absent, Y would happen* — on the strength of having read the
+code. Every one was wrong, and reading could not have caught any of them.
+
+*(No tally here, deliberately. Two authors already disagreed on the count while adding rows to
+this very table — which is this file's own "duplicate the claim, never the count" rule catching
+an instance of itself. Add rows; never write a number.)*
+
+| claim | shape |
+|---|---|
+| "nothing stores the old PRD path" | a grep returned nothing |
+| "the only honest control is re-adding the join; that is expensive" | no cheaper precedent was looked for — the repo already had one |
+| "this Set is the load-bearing one" | the two were redundant with each other |
+| "the `.`/`..` check is the traversal fix; `path.Clean` is belt-and-braces" | three guards, mutually redundant, and the dotfile rule was the sole guard for two other cases |
+| "`prds/x.md.bak` → not matched" as evidence the boundary check works | green against a matcher that never matches anything |
+| "`prds/../../../etc/passwd` proves the traversal guards fire" | it fails the `.md` suffix rule, so it stays red with all three traversal guards deleted |
+| "an `init()` panic fires at boot, so it is later than the Go gate" | an `init()` is a **package-load** check — it fires during `go test` too, in every importing package |
+| "a test-only guard lets the bad map entry silently never fire" | it reddens CI on the MR that introduces it; measured by removing the panic and running the suite |
+| "the fixture rows exist, so the guard is pinned" | an inference about a mutation that was never run, drawn from a fixture that *was* read |
+
+The last row has a sharper self-diagnosis than any of the others, from the reviewer that
+produced it: **"I checked the conjuncts of one statement and the row-inventory of another."** It
+ran three of four guard×site mutation combinations and skipped the one that was defective — and
+it had both fixtures open, having explicitly noted that the *query* test's fixture carried the
+hostile row it then never looked for in the *backfill* test's. **Testing around the defect is
+the normal shape of this error, not an unlucky one:** the combinations you skip are the ones
+that felt already-answered.
+
+Note also how one of these travelled. *"Silently never fires"* was written by its author,
+retracted by that same author after measurement, and then **re-emitted by the lead from a copy
+taken before the retraction arrived**. A retraction propagates only as far as the people holding
+copies. If you correct a claim you have already sent, chase the copies.
+
+**⚑ The unifying error is treating a null result as an observation of the world when it is an
+observation of your instrument.** A grep that finds nothing tells you about your pattern. A test
+that stays green tells you about your fixture. A search that finds no precedent tells you about
+your search. In each case what was measured was the instrument, and what was concluded was about
+the code.
+
+**⚑ The evidence for a counterfactual is the counterfactual.** Remove the guard and watch the
+test redden; delete the line and watch the build fail; gut the fixture and confirm the gate goes
+red. If actually removing it is too expensive, then you do not know — say "I did not check"
+rather than asserting.
+
+The same rule covers **when** a mechanism fires, not just **whether** it does. "This is an
+`init()`, so it runs at boot" is a counterfactual about a state you have not instantiated — Go
+loads the package during `go test` too, so it also runs there, in every importing package. And
+the inverse trap is real: a check placed in its own `init()` in a file that sorts **earlier**
+reads empty data and panics on a healthy tree. Neither is visible at the call site; each costs
+one build to settle.
+
+Two corollaries this branch paid for: a **negative** test case must sit in a fixture containing a
+**positive** match, or its green is satisfiable by a mechanism that never fires at all; and an
+**absence** assertion needs a guard that the thing it asserts about still exists under that name
+(`TestMRStateIsWatcherOwned`'s `sawWriter` flag is the in-repo pattern).
+
+The last row is the one to keep if you keep only one: it was **written by the author who had
+catalogued this exact class two revisions earlier**, in the same document, and caught only on a
+re-derivation they volunteered. Fluency in the rule buys no immunity from it.
 
 ## Citing and dispatching across a moving tree (CRITICAL)
 
@@ -302,7 +399,10 @@ section before reporting "not found". Same family as *a measurement is bound to 
 tree*: in both, the tool's SILENCE reads as a finding when it is only a limit of the query.
 Evidence: the lead quoted an anchor for this very amendment that did not match the coder's
 grep because the sentence wrapped; the coder read the section and landed it correctly instead
-of replying "anchor not found".
+of replying "anchor not found". **The general form of this — every null result being an
+observation of your instrument, not of the world — has its own section above** (*A claim about
+what would happen if you removed it is not readable from the code*), because on PRD #72 the same
+error arrived through a green test and an empty precedent search as often as through a grep.
 
 **A TRUNCATED VIEW IS NOT THE OUTPUT.** `| head -N` / `| tail -N` produce something that
 looks complete — output that stops at your limit is indistinguishable from output that
@@ -461,7 +561,7 @@ test           cd api && go test -count=1 ./...
                cd web && npm test
                cd agent && npm test
                cd web && npm run check-docs
-dead code      none (gap)
+dead code      none (gap, noted 2026-07-26)
 coverage       none (gap)
 security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap)
