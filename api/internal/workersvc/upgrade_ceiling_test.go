@@ -499,3 +499,106 @@ func TestDevControlPlaneProducesNoAttention(t *testing.T) {
 		}
 	}
 }
+
+// M7 — THE AUDITOR'S DISCRIMINATING PROBE, and the reason it is worth its own test: it
+// FAILS under the anchor design originally proposed and PASSES under the one shipped, so it
+// is the case that distinguishes them rather than another instance of P1.
+//
+// A worker re-registers repeatedly on an UNCHANGED old version — which is exactly what a
+// crash-looping agent does, since it registers on every start — while the controller posts
+// `upgrading` continuously. Under "clear the anchor on any register" each restart buys a
+// fresh window and the ceiling never fires: the worst-off worker in the fleet becomes the
+// one most able to suppress its own alert. Under "clear only when the version MOVES" the
+// anchor survives every re-register and the ceiling fires on time.
+//
+// The register half is modelled here the way the SQL behaves — an unchanged version leaves
+// the anchor alone — and that behaviour is pinned against a real database in
+// store/worker_roll_health_integration_test.go. Modelling it rather than sharing code with
+// the implementation is deliberate; a helper built from the same code would agree with a
+// broken implementation.
+func TestCeilingSurvivesRepeatedReRegistrationOnAnUnchangedVersion(t *testing.T) {
+	t0 := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	now := t0
+	sig := postUpgrading(nil, now, PhaseRolling, "0.11.7", "Pulling image")
+
+	if status, _ := ClassifyUpgrade(fleetInput(now, sig), ceilingParams()); status != UpgradeStatusUpgrading {
+		t.Fatalf("precondition: the fresh signal must suppress outdated at T0; got %q", status)
+	}
+
+	// The crash-loop: a register every half-TTL, on the SAME old version, while the
+	// controller keeps posting. Both parties are behaving exactly as they would in the
+	// incident this PRD was written for.
+	registers := 0
+	for now.Before(t0.Add(testWindow + 5*time.Minute)) {
+		now = now.Add(testTTL / 2)
+		// The agent restarts and re-registers. workers.version does NOT move (the new
+		// image never came up), so the anchor is untouched — this is the whole invariant.
+		registers++
+		sig = postUpgrading(sig, now, PhaseRolling, "0.11.7", "Pulling image")
+	}
+	now = now.Add(testTTL / 2)
+	registers++
+	sig = postUpgrading(sig, now, PhaseRolling, "0.11.7", "Pulling image")
+
+	status, detail := ClassifyUpgrade(fleetInput(now, sig), ceilingParams())
+	if status == UpgradeStatusUpgrading {
+		t.Fatalf("after %d re-registrations on an UNCHANGED version across %v (window %v), the worker "+
+			"is still %q. This is the anchor being cleared by a register rather than by a version MOVE — "+
+			"a crash-looping agent re-registers on every start, so the worst-off worker in the fleet "+
+			"would be the one most able to suppress its own alert, forever.",
+			registers, now.Sub(t0), testWindow, status)
+	}
+	if status != UpgradeStatusOutdated {
+		t.Errorf("want %q past the ceiling, got %q (%q)", UpgradeStatusOutdated, status, detail)
+	}
+
+	// CONTROL: a register that MOVES the version does clear it, so the assertion above is
+	// not passing against an anchor that can never be cleared at all.
+	cleared := postUpgrading(nil, now, PhaseRolling, "0.12.0", "Pulling image") // fresh anchor
+	in := fleetInput(now, cleared)
+	in.Reported = "0.11.7" // the worker came back on the new version
+	if status, _ := ClassifyUpgrade(in, ceilingParams()); status == UpgradeStatusOutdated {
+		t.Errorf("after a genuine version move the worker still reads outdated; the clear path is dead, "+
+			"which would make the assertion above vacuous. got %q", status)
+	}
+}
+
+// M7 — the COMPOSE DEGRADATION case the PRD names, and the configuration most users run:
+// no controller exists at all, so no roll-health row is ever written.
+//
+// The property is that classification degrades to version comparison and NOTHING cries
+// wolf: no `upgrading`, no `upgrade_failed`, and no attention count for anything a version
+// comparison would not already have flagged. A controller-shaped state appearing here would
+// be an assertion about a component that is not running.
+func TestComposeDegradationNoControllerMeansVersionCompareOnly(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	// A mixed fleet as a compose user would have it. Signal is nil for every one, because
+	// nothing posts reports.
+	for _, tc := range []struct {
+		name, reported, cp, kind, want string
+	}{
+		{"behind external", "0.11.0", "0.11.7", "external", UpgradeStatusOutdated},
+		{"behind hosted", "0.11.0", "0.11.7", "hosted", UpgradeStatusOutdated},
+		{"current", "0.11.7", "0.11.7", "external", UpgradeStatusUpToDate},
+		{"unstamped worker", "", "0.11.7", "external", UpgradeStatusUnknown},
+		// The whole-compose default: an unstamped local api build. Classification off.
+		{"dev control plane", "0.11.0", "dev", "external", UpgradeStatusUnknown},
+		{"dev control plane, hosted", "0.11.0", "dev", "hosted", UpgradeStatusUnknown},
+	} {
+		in := UpgradeInput{
+			Reported: tc.reported, Kind: tc.kind, CPVersion: tc.cp, Signal: nil, Now: now,
+			// Long ago: R8's grace must not be what produces the answer, or this test would
+			// silently be measuring the grace instead of the degradation.
+			APIStartedAt: now.Add(-24 * time.Hour),
+		}
+		status, _ := ClassifyUpgrade(in, ceilingParams())
+		if status != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, status, tc.want)
+		}
+		// No controller means no controller-derived state, ever.
+		if status == UpgradeStatusUpgrading || status == UpgradeStatusUpgradeFailed {
+			t.Errorf("%s: classified %q with NO controller signal — that is an assertion about a "+
+				"component that is not running", tc.name, status)
+		}
+	}
+}

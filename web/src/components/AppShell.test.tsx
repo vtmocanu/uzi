@@ -338,3 +338,66 @@ describe("Workers nav alert badge (PRD #113 M6)", () => {
     expect(judge.className).not.toContain("bg-danger");
   });
 });
+
+// M7 — the leak that was previously only a READ of the code.
+//
+// Two halves have to work, and a cleanup that does only one of them looks correct: clearing
+// the interval stops the timer, and `alive = false` stops an in-flight promise resolving into
+// a setState on an unmounted tree. A clearInterval-only cleanup passes an eyeball review and
+// still warns (or worse, keeps a reference alive) when a fetch was already in flight.
+//
+// web-ux cannot see either failure — a leak has no appearance — which is why this is a
+// fake-timer test and not a browser check.
+describe("the workers-attention poll's cleanup (PRD #113 M7)", () => {
+  it("stops polling after unmount, and does not fire again on the next interval", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 1, target_release: "0.6.0" });
+      const { unmount } = renderShell("/dashboard");
+      // Let the mount-time load run.
+      await vi.advanceTimersByTimeAsync(0);
+      const afterMount = mockApi.workerUpgradeSummary.mock.calls.length;
+      expect(afterMount).toBeGreaterThan(0);
+
+      // One interval tick while mounted: the poll is live, which is the control. Without
+      // this the assertion below would pass against a poll that never ticks at all.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const afterOneTick = mockApi.workerUpgradeSummary.mock.calls.length;
+      expect(afterOneTick).toBeGreaterThan(afterMount);
+
+      unmount();
+      // Two more intervals. A surviving timer would add calls here.
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(mockApi.workerUpgradeSummary.mock.calls.length).toBe(afterOneTick);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not setState from a request still in flight at unmount", async () => {
+    vi.useFakeTimers();
+    const errors: unknown[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a) => errors.push(a));
+    try {
+      // A request that resolves only AFTER unmount — the case `alive = false` exists for and
+      // the one clearInterval alone cannot cover.
+      let release: (v: { attention: number; target_release: string }) => void = () => {};
+      mockApi.workerUpgradeSummary.mockReturnValue(
+        new Promise((res) => {
+          release = res;
+        }),
+      );
+      const { unmount } = renderShell("/dashboard");
+      await vi.advanceTimersByTimeAsync(0);
+      unmount();
+      release({ attention: 5, target_release: "0.6.0" });
+      await vi.advanceTimersByTimeAsync(0);
+
+      const stateWarning = errors.filter((e) => JSON.stringify(e).includes("unmounted"));
+      expect(stateWarning).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});

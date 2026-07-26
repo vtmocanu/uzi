@@ -417,3 +417,89 @@ func TestExternalWorkerMuteIsKeyedOnItsOwnVersionLiveDB(t *testing.T) {
 			"thing it muted silences a row permanently, which is how an alert stops being trusted.")
 	}
 }
+
+// M7, closing the gap the M5/M6 warranty did not cover: the mute's EXTERNAL arm expiring.
+//
+// The composition that makes this the load-bearing case, and no single milestone stated it:
+// Decision 5 makes the mute the mitigation for exactly the external-worker problem — they
+// never auto-upgrade, so `outdated` fires forever and the badge becomes wallpaper. The nav
+// badge is the surface that would become wallpaper. So the badge depends on the one arm of
+// COALESCE(worker_image_tag, version, ”) that had no test.
+//
+// The earlier mute tests exercised per-user ISOLATION and jurisdiction, not key EXPIRY, and
+// the external worker they seeded was never muted. A hosted fixture passes every step here,
+// which is the same blindness B-2 itself was: "the mute cannot match for external workers"
+// became "the fix's external arm is untested, and external is the case it exists for".
+func TestExternalMuteExpiresOnVersionMoveAndTheCountReturnsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("mute-expiry-%s@e2e", userID))
+	workerID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, kind, version)
+		 VALUES ($1, $2, $3, $4, 'online', 'external', '0.11.0')`,
+		workerID, userID, "ext-"+workerID.String()[:8], []byte(workerID.String()))
+
+	// The count the nav badge would show: rows that are muted are subtracted, so this
+	// stands in for "does the badge go quiet, and does it come back".
+	mutedRows := func(what string) bool {
+		rows, err := q.GetWorkerUpgradeSummaryForUser(ctx, userID)
+		if err != nil {
+			t.Fatalf("summary (%s): %v", what, err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("summary (%s): %d rows, want 1", what, len(rows))
+		}
+		return rows[0].Muted
+	}
+
+	if err := q.MuteWorkerUpgrade(ctx, store.MuteWorkerUpgradeParams{
+		UserID: userID, WorkerID: workerID, Release: "0.11.0",
+	}); err != nil {
+		t.Fatalf("mute at 0.11.0: %v", err)
+	}
+	if !mutedRows("muted at its own version") {
+		t.Fatalf("the external worker's mute never applied, so the badge could not go quiet — the " +
+			"COALESCE fallback to w.version is not reaching the join")
+	}
+
+	// The owner upgrades it by hand. The muted FACT — "this worker runs 0.11.0" — is no
+	// longer true, so the mute must stop applying and the badge must come back.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: workerID, Version: pgtype.Text{String: "0.11.7", Valid: true},
+	}); err != nil {
+		t.Fatalf("register the upgraded version: %v", err)
+	}
+	if mutedRows("after the worker moved to 0.11.7") {
+		t.Errorf("the mute survived the worker moving 0.11.0 -> 0.11.7. A mute keyed on a release " +
+			"must expire when that release changes, or it silences the row permanently and the badge " +
+			"stops meaning anything — which is the alert-fatigue the mute exists to PREVENT, inverted.")
+	}
+
+	// CONTROL, so the assertion above cannot pass against a join that simply never matches:
+	// muting the NEW version silences it again.
+	if err := q.MuteWorkerUpgrade(ctx, store.MuteWorkerUpgradeParams{
+		UserID: userID, WorkerID: workerID, Release: "0.11.7",
+	}); err != nil {
+		t.Fatalf("mute at 0.11.7: %v", err)
+	}
+	if !mutedRows("re-muted at the new version") {
+		t.Errorf("muting the worker's NEW version did not apply; the previous assertion may have been " +
+			"passing because the join never matches at all rather than because the key expired")
+	}
+}
