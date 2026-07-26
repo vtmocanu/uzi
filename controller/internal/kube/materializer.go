@@ -174,9 +174,34 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// Unselected, for the same reason as the two lists above: a label selector would
 	// make the unmanaged-pod check below structurally blind to exactly what it looks
 	// for. Pods inherit the pod template's labels, so IsOurs works on them unchanged.
+	// A POD-LIST FAILURE IS LOGGED AND SWALLOWED. It must never abort the cycle, and
+	// this is the one asymmetry in this function that is worth reading carefully.
+	//
+	// The Deployment and PVC lists above return their errors, and that is CORRECT for
+	// them: they drive decisions, so reconciling against a view we just admitted we
+	// could not read is how a healthy worker gets clobbered. Nothing of the sort is
+	// true here. `.Roll` is written below and consumed in exactly ONE place — the
+	// display-only status report in reconcile.Tick. No create, patch, teardown or
+	// token-delivery decision reads it.
+	//
+	// So returning an error here would stop provisioning, teardown, patching and token
+	// delivery for the entire hosted fleet on account of a read whose only consumer is
+	// a badge. MEASURED, and this is not hypothetical: the controller ServiceAccount
+	// deployed on dev-cluster today answers `no` to `list pods` in both worker
+	// namespaces (with `list deployments` = yes as the positive control), and nothing
+	// in the chart orders worker-rbac.yaml ahead of controller-deployment.yaml — no
+	// sync-wave on either. So the first tick after this image becomes ready 403s. With
+	// the swallow, that is a few ticks of absent roll-health rows, which the api already
+	// reads as "no signal"; without it, the fleet wedges and the symptom points nowhere
+	// near roll health.
+	//
+	// The principle is the same one the report step in Tick states from the other side:
+	// an observability feature must never be able to take down the thing it observes.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list pods in %s: %w", ns, err)
+		m.log.Warn("listing pods for roll health failed; continuing without roll health for this namespace (reconciliation is unaffected)",
+			"namespace", ns, "error", err)
+		return nil
 	}
 	byWorker := map[string][]corev1.Pod{}
 	for i := range pods.Items {
@@ -188,12 +213,37 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 		byWorker[id] = append(byWorker[id], *p)
 	}
+	// Derive for every worker we have a DEPLOYMENT for, not merely for every worker we
+	// found pods for. The difference is the Recreate gap: between the old pod being
+	// deleted and the new one appearing there are no pods, and iterating pods alone
+	// would emit NO ROW for that worker.
+	//
+	// A missing row is not neutral. The api reads absence as "no signal", so the only
+	// thing keeping a healthy mid-roll worker from flashing `outdated` during the gap
+	// would be the 60s freshness TTL still holding the PREVIOUS report alive — an
+	// invisible dependency on one constant in another module, where shortening the TTL
+	// would produce cry-wolf that nobody would trace back to it. Emitting an explicit
+	// `rolling` row for a pod-less worker removes that coupling: the gap now asserts
+	// what it actually is. It is also what design §B-4 specifies.
 	now := m.now()
-	for id, ps := range byWorker {
-		o := get(id)
+	for _, o := range byID {
+		if o.Namespace != ns || !o.HasDeployment {
+			continue
+		}
 		// wantHash is what this worker's DEPLOYMENT currently asks for, already read
 		// off its pod template above. Passing it is what makes the derivation about
 		// pod readiness rather than deployment drift — see rollhealth.go's header.
+		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, now)
+		o.Roll.TargetImage = targetImages[o.ID]
+	}
+	// A worker seen ONLY as pods (its Deployment already gone, its pods still
+	// terminating) gets roll health too — teardown is in flight and the row is honest
+	// about what is there.
+	for id, ps := range byWorker {
+		o := get(id)
+		if o.HasDeployment {
+			continue // already derived above
+		}
 		o.Roll = deriveRollHealth(ps, o.SpecHash, now)
 		o.Roll.TargetImage = targetImages[id]
 	}

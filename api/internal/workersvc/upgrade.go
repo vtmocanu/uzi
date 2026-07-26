@@ -216,6 +216,15 @@ type UpgradeParams struct {
 	// `upgrading` decays mid-roll into `outdated`, turning the whole fleet's badge red,
 	// which is the exact failure Decision 1 forbids. Too long only leaves an
 	// informational badge after the controller dies. Asymmetric, so err long.
+	//
+	// It is NOT what covers the Recreate pod-gap, and that is worth stating because it
+	// briefly was. The controller emits an explicit `rolling` row for a worker whose
+	// Deployment exists and whose pods do not (kube/rollhealth.go's no-pod branch), so
+	// the gap asserts its own state. Had it emitted NO row instead, this TTL holding the
+	// previous report alive would have been the only thing keeping a healthy mid-roll
+	// worker from flashing `outdated` — a load-bearing dependency of a constant in this
+	// module on a loop in another, where shortening this value would produce cry-wolf
+	// nobody would trace back to it.
 	ControllerSignalTTL time.Duration
 	// HostedRollGrace is how long after api start a behind hosted worker is given the
 	// benefit of the doubt with NO controller signal at all.
@@ -256,6 +265,22 @@ const (
 	DefaultRegisterConvergenceGrace = 5 * time.Minute
 	// PLACEHOLDER PENDING MEASUREMENT. Do not cite as measured.
 	DefaultMaxUpgradingWindow = 45 * time.Minute
+
+	// ControllerStuckAge mirrors the controller's own `stuckAge` (kube/rollhealth.go),
+	// and it is declared here ONLY so the relationship below can be asserted. It is not
+	// a knob and nothing reads it as configuration.
+	//
+	// THE RELATIONSHIP: MaxUpgradingWindow MUST exceed this. The controller's reasonless
+	// arm keeps reporting `rolling` until a pod has been not-Ready for stuckAge; if the
+	// api's ceiling expired first, the two halves would disagree about the same worker —
+	// the controller still saying "rolling", the api having already reclassified — and
+	// NEITHER package would notice, because the constants live in two modules chosen
+	// independently. Asserted by TestMaxUpgradingWindowExceedsControllerStuckAge rather
+	// than left to 45 > 10 happening to be true today.
+	//
+	// Kept in sync by that test failing, not by anyone remembering. If the controller's
+	// stuckAge changes, this constant and that test are what surface it.
+	ControllerStuckAge = 10 * time.Minute
 )
 
 func (p UpgradeParams) withDefaults() UpgradeParams {
@@ -270,6 +295,21 @@ func (p UpgradeParams) withDefaults() UpgradeParams {
 	}
 	if p.MaxUpgradingWindow <= 0 {
 		p.MaxUpgradingWindow = DefaultMaxUpgradingWindow
+	}
+	// FLOOR, not a default: a window at or below the controller's stuckAge creates a
+	// silent disagreement between the two modules (the controller still reporting
+	// `rolling` for a reasonless-stuck pod that this api has already stopped believing),
+	// and neither can see the other's constant. Clamping makes the relationship
+	// ENFORCED rather than merely asserted — the test named in ControllerStuckAge's
+	// comment then checks the clamp instead of checking that two numbers happen to be
+	// ordered.
+	//
+	// Clamping up rather than rejecting, because this is a display path: a misconfigured
+	// window must not be able to fail a request. The value is deliberately not silently
+	// accepted either — it is raised to the smallest value that keeps the two halves
+	// consistent.
+	if p.MaxUpgradingWindow <= ControllerStuckAge {
+		p.MaxUpgradingWindow = ControllerStuckAge + time.Minute
 	}
 	return p
 }

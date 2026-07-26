@@ -336,3 +336,26 @@ func TestHostedTargetIsTheRolledTagWithFallback(t *testing.T) {
 		t.Errorf("an unparseable rolled tag must fall back to the api's release ⇒ outdated, got %q", status)
 	}
 }
+
+// The two halves of this feature pick their timeouts in two different modules, so the
+// relationship between them has to be asserted somewhere or it is not a relationship at
+// all — just two numbers that happen to be ordered correctly today.
+//
+// If the ceiling expired BEFORE the controller's reasonless-stuck arm fires, a worker
+// would be reported `rolling` by the controller while the api had already reclassified
+// it, and nothing in either package would notice the disagreement.
+func TestMaxUpgradingWindowExceedsControllerStuckAge(t *testing.T) {
+	if DefaultMaxUpgradingWindow <= ControllerStuckAge {
+		t.Fatalf("MaxUpgradingWindow (%v) must exceed the controller's stuckAge (%v). Below it, the "+
+			"controller keeps reporting `rolling` for a reasonless-stuck pod while this api has already "+
+			"stopped believing it — the two halves disagree about the same worker and neither module can "+
+			"see the other's constant.", DefaultMaxUpgradingWindow, ControllerStuckAge)
+	}
+	// And the value the TESTER eventually measures must satisfy it too, not just the
+	// default — so the check runs against whatever a caller configures.
+	p := UpgradeParams{MaxUpgradingWindow: ControllerStuckAge}.withDefaults()
+	if p.MaxUpgradingWindow <= ControllerStuckAge {
+		t.Errorf("a configured window of %v does not exceed the controller's stuckAge (%v); the "+
+			"measurement that replaces the placeholder must respect this floor", p.MaxUpgradingWindow, ControllerStuckAge)
+	}
+}

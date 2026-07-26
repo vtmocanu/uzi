@@ -97,8 +97,15 @@ rules:
     # a wholly different order than pod metadata. No `events` verb either: the mock's
     # "View pod events" button was dropped rather than widen this file (design 5c).
     # Everything the failed-worker strip renders — container, reason, restart count,
-    # exit code, pod phase — is in containerStatuses[].state.waiting.{reason,message}
-    # and lastTerminationState, i.e. free at this grant.
+    # exit code, pod phase — is in containerStatuses[].state.waiting.REASON and
+    # lastTerminationState, i.e. free at this grant.
+    #
+    # `.message` is deliberately NOT read, and this line used to name it as though it
+    # were. Reason is a short closed-ish k8s enum; message is FREE TEXT that routinely
+    # carries filesystem paths, image references and Secret names, and it reaches a
+    # browser badge and a terminal via the CLI. Adding it later needs a producer-side
+    # length bound (there is none today) on top of the api's sanitizer, so it is a
+    # decision rather than a field.
     #
     # Unlike the Secrets rule, this one HAS a mechanical gate on both sides:
     # controller/internal/kube asserts over the whole fake-client action log that pod

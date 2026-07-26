@@ -105,18 +105,33 @@ func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconci
 		return health
 	}
 
-	// Not Ready. Find what is holding it back, init containers first — that is where
-	// the motivating incident wedged (seed-nix reseeding the browser's nix closure),
-	// and an init container blocks the whole pod while an app container may not.
-	if b := blockingContainer(current); b != nil {
-		health.BlockingContainer = b.Name
-		health.RestartCount = b.RestartCount
-		if b.State.Waiting != nil {
-			health.BlockingReason = b.State.Waiting.Reason
-		} else if b.State.Terminated != nil {
-			health.BlockingReason = b.State.Terminated.Reason
+	// Not Ready. Find the container to blame, init containers first — that is where the
+	// motivating incident wedged (seed-nix reseeding the browser's nix closure), and an
+	// init container blocks everything behind it while an app container may not.
+	//
+	// THE FALLBACK IS NOT DEFENSIVE, it is the only way the restart arm below can ever
+	// fire. blockingContainer returns nil unless a container is Waiting or
+	// Terminated-nonzero, so for a container that is RUNNING right now this used to
+	// leave RestartCount at 0 and the arm evaluated `0 >= 3` forever. That is exactly
+	// the shape the arm exists for: k8s resets the restart backoff after ~10 minutes of
+	// running, so a container that runs a minute, dies, and repeats — with a failing
+	// readiness probe — is observed Running most of the time.
+	//
+	// The blanked DIAGNOSTIC was the worse half: a flapping worker reported 0 restarts
+	// and no container name, so it looked pristine to whoever was trying to fix it.
+	subject := blockingContainer(current)
+	if subject == nil {
+		subject = mostRestartedContainer(current)
+	}
+	if subject != nil {
+		health.BlockingContainer = subject.Name
+		health.RestartCount = subject.RestartCount
+		if subject.State.Waiting != nil {
+			health.BlockingReason = subject.State.Waiting.Reason
+		} else if subject.State.Terminated != nil {
+			health.BlockingReason = subject.State.Terminated.Reason
 		}
-		if term := lastTermination(b); term != nil {
+		if term := lastTermination(subject); term != nil {
 			code := term.ExitCode
 			health.LastExitCode = &code
 		}
@@ -134,11 +149,14 @@ func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconci
 	default:
 		health.Phase = protocol.PhaseRolling
 	}
-	if health.Phase == protocol.PhaseRolling {
-		health.PhaseSince = current.CreationTimestamp.Time
-	} else if !current.CreationTimestamp.IsZero() {
-		health.PhaseSince = current.CreationTimestamp.Time
-	}
+	// Both non-settled phases date from the same place, and it is NOT the moment the
+	// phase began — see the PhaseSince note on reconcile.RollHealth. A stateless
+	// controller has no memory of the transition, so the pod's creation is the only
+	// timestamp available. It is EARLIER than the event the field name implies, so any
+	// consumer computing `now - PhaseSince` overestimates the duration and any threshold
+	// keyed on it fires sooner than intended. Safe for catching a stuck worker,
+	// UNSAFE for anything that must not cry wolf.
+	health.PhaseSince = current.CreationTimestamp.Time
 	return health
 }
 
@@ -176,6 +194,27 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 		}
 	}
 	return nil
+}
+
+// mostRestartedContainer returns the container with the highest restart count, or nil
+// when nothing has restarted. It is what makes a FLAPPING container visible: such a
+// container is often observed Running, so blockingContainer cannot see it.
+//
+// Requires a non-zero count, so a pod that is simply not Ready yet gets no container
+// blamed — naming a container with 0 restarts would point an operator at innocent code.
+func mostRestartedContainer(p *corev1.Pod) *corev1.ContainerStatus {
+	var worst *corev1.ContainerStatus
+	for _, set := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
+		for i := range set {
+			if set[i].RestartCount == 0 {
+				continue
+			}
+			if worst == nil || set[i].RestartCount > worst.RestartCount {
+				worst = &set[i]
+			}
+		}
+	}
+	return worst
 }
 
 // lastTermination returns the container's most recent termination, preferring the

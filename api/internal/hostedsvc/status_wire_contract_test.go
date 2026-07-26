@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The CONSUMER half of the /status wire contract (PRD #113 M4).
@@ -96,5 +98,55 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	}
 	if settled.RestartCount != 0 {
 		t.Errorf("workers[1].RestartCount = %d, want 0 as a VALUE", settled.RestartCount)
+	}
+}
+
+// Pin the phase literals ON THIS SIDE too.
+//
+// Until this existed, the divergence window was one-directional: a rename in the
+// CONTROLLER's constants reddens its own golden test, but a rename on the API side could
+// not redden anything, because the api matches phases as STRINGS and nothing here
+// asserted what those strings are. So an api-side "tidy up" of the enum would have
+// silently emptied every worker's roll health — the classifier would stop matching, the
+// upsert would drop every entry as an unmodelled phase, and every gate would stay green.
+//
+// The golden is the shared artifact, so the literals are checked against IT rather than
+// against a copy of them: this asserts the api's constants equal what the controller
+// actually puts on the wire.
+func TestPhaseLiteralsMatchTheGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.FromSlash(statusGolden))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var got StatusReport
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+
+	// Every phase the golden carries must be one the api models, by the api's own
+	// constants — not by a literal retyped here.
+	seen := map[string]bool{}
+	for _, w := range got.Workers {
+		if !workersvc.ValidRollPhase(w.Phase) {
+			t.Errorf("the golden carries phase %q, which workersvc.ValidRollPhase rejects. The api "+
+				"DROPS an entry with an unmodelled phase, so this divergence would silently empty roll "+
+				"health for every worker while every gate stayed green.", w.Phase)
+		}
+		seen[w.Phase] = true
+	}
+	// And the golden must exercise both of the phases it claims to pair, or the check
+	// above passes on a fixture that only ever carried one.
+	for _, want := range []string{workersvc.PhaseStuck, workersvc.PhaseSettled} {
+		if !seen[want] {
+			t.Errorf("the golden does not carry phase %q; it is meant to pair a stuck worker with a "+
+				"settled one so a rename of either reddens", want)
+		}
+	}
+	// PhaseRolling is not in the golden (the sample pairs stuck+settled), so pin its
+	// literal directly — it is the phase a healthy roll spends all its time in, and an
+	// unpinned rename of it would be invisible to everything above.
+	if workersvc.PhaseRolling != "rolling" {
+		t.Errorf("PhaseRolling = %q, want \"rolling\" — the controller sends this string and the api "+
+			"matches on it", workersvc.PhaseRolling)
 	}
 }

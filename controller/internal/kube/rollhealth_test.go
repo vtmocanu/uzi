@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -9,8 +10,12 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
@@ -473,5 +478,166 @@ func TestObserveWarnsAboutAnUnmanagedPodInAWorkerNamespace(t *testing.T) {
 		if v != "list" {
 			t.Errorf("detecting an unmanaged pod used a %q; it must be visible from the list alone", v)
 		}
+	}
+}
+
+// running puts a container in the RUNNING state with a restart count — the fixture the
+// restart-threshold arm actually needs and which this file did not have, which is why
+// the arm's gap survived: the case was not constructible.
+//
+// k8s resets the restart backoff after ~10 minutes of running, so a container that runs
+// a minute, dies and repeats is observed Running most of the time. That is precisely the
+// shape the arm exists for.
+func running(p *corev1.Pod, container string, restarts int32, init bool) *corev1.Pod {
+	st := corev1.ContainerStatus{
+		Name:         container,
+		RestartCount: restarts,
+		State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(testNow.Add(-time.Minute))}},
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 137},
+		},
+	}
+	if init {
+		p.Status.InitContainerStatuses = append(p.Status.InitContainerStatuses, st)
+	} else {
+		p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, st)
+	}
+	return p
+}
+
+// The restart-threshold arm must fire for a container that is RUNNING right now.
+//
+// This was a real gap, not a comment problem: RestartCount was only populated inside the
+// blocking-container branch, and blockingContainer returns nil unless a container is
+// Waiting or Terminated-nonzero. So a flapping-but-currently-Running container left
+// RestartCount at 0 and the arm evaluated `0 >= 3` forever.
+//
+// The second consequence was worse than the first, and it is asserted here too: the
+// REPORTED restart count was 0 and no container was named, so a flapping worker looked
+// pristine to whoever was trying to fix it.
+func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
+	const want = "hash-new"
+
+	flapping := running(workerPod("w1", want, 5*time.Minute), "worker", stuckRestartThreshold, false)
+	h := deriveRollHealth([]corev1.Pod{*flapping}, want, testNow)
+
+	if h.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. The container is RUNNING with %d restarts, which is the case "+
+			"this arm exists for — a container that runs a minute, dies and repeats is observed Running "+
+			"most of the time, because k8s resets the restart backoff after ~10m.",
+			h.Phase, protocol.PhaseStuck, stuckRestartThreshold)
+	}
+	if h.RestartCount != stuckRestartThreshold {
+		t.Errorf("RestartCount = %d, want %d. This is the worse half of the bug: a blanked count makes "+
+			"a flapping worker look pristine in the failed-worker strip.", h.RestartCount, stuckRestartThreshold)
+	}
+	if h.BlockingContainer != "worker" {
+		t.Errorf("BlockingContainer = %q, want the flapping container's name; without it an operator has "+
+			"nothing to act on", h.BlockingContainer)
+	}
+	// The exit code comes from LastTerminationState, since the container is Running NOW
+	// and terminated before.
+	if h.LastExitCode == nil || *h.LastExitCode != 137 {
+		t.Errorf("LastExitCode = %v, want 137 from LastTerminationState", h.LastExitCode)
+	}
+
+	// CONTROL, and it is what makes the above evidence rather than a coincidence: a
+	// Running container BELOW the threshold must stay `rolling`, so the test is not
+	// simply passing because everything Running reads as stuck.
+	below := running(workerPod("w2", want, 5*time.Minute), "worker", stuckRestartThreshold-1, false)
+	if h := deriveRollHealth([]corev1.Pod{*below}, want, testNow); h.Phase != protocol.PhaseRolling {
+		t.Errorf("a Running container with %d restarts (below the threshold of %d) reads %q, want %q",
+			stuckRestartThreshold-1, stuckRestartThreshold, h.Phase, protocol.PhaseRolling)
+	}
+
+	// And a healthy not-yet-Ready pod with ZERO restarts must have NO container blamed —
+	// naming one with 0 restarts would point an operator at innocent code.
+	fresh := running(workerPod("w3", want, 10*time.Second), "worker", 0, false)
+	if h := deriveRollHealth([]corev1.Pod{*fresh}, want, testNow); h.BlockingContainer != "" {
+		t.Errorf("BlockingContainer = %q for a pod with no restarts, want empty", h.BlockingContainer)
+	}
+}
+
+// A-1: a pod-list failure must NOT abort the reconcile cycle.
+//
+// MEASURED on dev-cluster: the deployed controller ServiceAccount answers `no` to
+// `list pods` in both worker namespaces, with `list deployments` = yes as the positive
+// control. Nothing in the chart orders worker-rbac.yaml ahead of
+// controller-deployment.yaml. So this 403 is what the FIRST TICK after deployment does,
+// not a hypothetical — and if it aborted the cycle, provisioning, teardown, patching and
+// token delivery would all stop for the whole hosted fleet, on account of a read whose
+// only consumer is a badge.
+func TestPodListFailureDoesNotAbortObservation(t *testing.T) {
+	ctx := context.Background()
+	id := "w1"
+	ns := testConfig().Namespace
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "uzi-hw-" + id, Namespace: ns, Labels: objectLabels(id)},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: objectLabels(id), Annotations: map[string]string{AnnotationSpecHash: "h"}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName, Image: "img:1"}}},
+		}},
+	}
+	m, client := newMat(t, dep)
+
+	// Exactly what RBAC produces before the new Role lands.
+	client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Resource: "pods"}, "",
+			errors.New(`pods is forbidden: User "system:serviceaccount:uzi:uzi-controller" cannot list resource "pods"`))
+	})
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe returned %v. A pod-list failure must be logged and swallowed: `.Roll` feeds "+
+			"ONLY the display-only status report, and aborting here stops provisioning, teardown, "+
+			"patching and token delivery for the entire fleet.", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observed %d workers, want 1 — the deployment was read successfully, so the worker must "+
+			"still be observable", len(observed))
+	}
+	if observed[0].Roll.Phase != "" {
+		t.Errorf("Roll.Phase = %q, want empty: no pods could be read, so there is no roll health to "+
+			"report and the api must see absence rather than a guess", observed[0].Roll.Phase)
+	}
+
+	// The whole point: Reconcile still runs, so the fleet still converges.
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{{ID: id, Template: "base", Size: "m"}}, observed); err != nil {
+		t.Fatalf("Reconcile after a pod-list failure: %v", err)
+	}
+}
+
+// The Recreate gap: a worker with a Deployment and NO pods reports `rolling` explicitly.
+//
+// Emitting no row would make the api read "no signal", and the only thing then keeping a
+// healthy mid-roll worker from flashing `outdated` would be the freshness TTL holding the
+// PREVIOUS report alive — an invisible dependency on a constant in another module.
+func TestRecreateGapReportsRollingRatherThanNoRow(t *testing.T) {
+	ctx := context.Background()
+	id := "w1"
+	ns := testConfig().Namespace
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "uzi-hw-" + id, Namespace: ns, Labels: objectLabels(id)},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: objectLabels(id), Annotations: map[string]string{AnnotationSpecHash: "h"}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName, Image: "img:1"}}},
+		}},
+	}
+	m, _ := newMat(t, dep) // deployment present, no pods at all
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observed %d workers, want 1", len(observed))
+	}
+	if got := observed[0].Roll.Phase; got != protocol.PhaseRolling {
+		t.Errorf("Roll.Phase = %q for a worker whose Deployment exists and whose pods do not, want %q "+
+			"(the Recreate gap)", got, protocol.PhaseRolling)
+	}
+	if !observed[0].Roll.PhaseSince.IsZero() {
+		t.Errorf("PhaseSince = %v, want zero: there is no pod to date the gap from", observed[0].Roll.PhaseSince)
 	}
 }
