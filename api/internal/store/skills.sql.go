@@ -374,6 +374,54 @@ func (q *Queries) ListSkillsForViewer(ctx context.Context, arg ListSkillsForView
 	return items, nil
 }
 
+const seedSharedSkillAllocationByName = `-- name: SeedSharedSkillAllocationByName :execrows
+INSERT INTO agent_skill_allocations (template_id, skill_id, user_id)
+SELECT t.id, s.id, NULL
+FROM agent_templates t, skills s
+WHERE t.name = $1 AND t.scope <> 'user'
+  AND s.name = $2    AND s.scope <> 'user'
+ON CONFLICT DO NOTHING
+`
+
+type SeedSharedSkillAllocationByNameParams struct {
+	TemplateName string `json:"template_name"`
+	SkillName    string `json:"skill_name"`
+}
+
+// Seed one builtin skill's default shared allocation, the first time the
+// reconciler inserts that skill (PRD #72 M2, Decision 9). Mirrors
+// SeedSharedTemplateAllocationByName, with two deliberate differences.
+//
+// :execrows, not :exec. The precedent is :exec and so is structurally incapable
+// of reporting the case Decision 9 requires a warning on. This seed targets a
+// DIFFERENT row than the insert that triggered it — the agent template named
+// @template_name — so an absent template inserts nothing, returns no error, and
+// would log nothing. The row count is the only signal that exists.
+//
+// ONE TEMPLATE PER CALL, not `name = ANY(...)`. A set-valued form returning 1 of
+// 2 rows cannot say WHICH target was missing, and "which" is the entire content
+// of the warning.
+//
+// Reading a 0: because the caller runs this ONLY when it just inserted the skill,
+// and agent_skill_allocations.skill_id is an FK to that brand-new row, no
+// allocation for this skill can pre-exist. So ON CONFLICT can never be what
+// returned 0 here, and 0 means unambiguously "no such shared agent template".
+//
+// Both scope guards are load-bearing, and the skills one is the sharper:
+// uq_skills_shared_name is a PARTIAL unique index (WHERE scope <> 'user'), so
+// `WHERE name = @skill_name` alone matches every user's private skill of that
+// name too — N users, N rows, each a SHARED (user_id NULL) allocation pointing at
+// a private body. ListRunSkillAllocations' scope predicates would refuse to ship
+// those, but that is the second layer; this must not be the first-layer bug it
+// exists to backstop.
+func (q *Queries) SeedSharedSkillAllocationByName(ctx context.Context, arg SeedSharedSkillAllocationByNameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, seedSharedSkillAllocationByName, arg.TemplateName, arg.SkillName)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateSkill = `-- name: UpdateSkill :one
 UPDATE skills
 SET description = $1,

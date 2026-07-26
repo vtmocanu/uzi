@@ -1,0 +1,57 @@
+package skilltmpl
+
+// Default allocations for builtin skills (PRD #72 M2).
+//
+// An allocation is what makes a skill reachable AT ALL. `ListRunSkillAllocations`
+// builds the run union from `agent_skill_allocations`, so a builtin with no
+// allocation row reaches nobody — not the subagents it was scoped to, and not the
+// lead either (the lead receives the whole union, but an unallocated skill is not
+// in it). Builtin agent TEMPLATES have auto-seeded their global-default row since
+// PRD #18 M7 (`SeedSharedTemplateAllocationByName`); skills shipped without the
+// equivalent, which is why `docs/skills.md` told admins to click allocate by hand.
+//
+// Why this map lives in Go and not in the SKILL.md frontmatter (Decision 8):
+// `Definition` carries Name/Description/Body and `Parse` rejects every other
+// frontmatter key as an authoring error. That strictness is worth keeping — a key
+// like `allowed-tools` must never reach the model through an authoring channel —
+// and a default allocation is uzi's product decision rather than authored data.
+//
+// The VALUES are agent-template names (`agent_templates.name`), not skill names.
+// A name here that matches no template is not a compile error, so two things
+// guard it: a test in this package pins every entry against the shipped builtin
+// templates, and the reconciler warns at runtime on a seed that inserted no row
+// (Decision 9) — the second is what covers a template an ADMIN deleted, which no
+// test can see.
+var defaultAllocations = map[string][]string{
+	// The CI/CD playbook is for the roles that write and review pipeline changes.
+	// Backfilled onto existing instances by migration 00083, because the
+	// reconciler seeds only on FIRST insert and this row already exists
+	// everywhere — keep the two in sync by hand; SQL cannot read this map.
+	"ci-cd-norms": {"coder", "reviewer"},
+}
+
+// DefaultAllocationsFor returns the agent-template names a builtin skill is
+// allocated to by default, or nil when it declares none. The reconciler calls
+// this ONLY for a skill it just inserted, so an admin who later removes a default
+// keeps it removed (Decision 9, mirroring ReconcileBuiltinTemplates' `n > 0`
+// gate). The returned slice is a copy, so callers cannot mutate package state.
+func DefaultAllocationsFor(name string) []string {
+	src, ok := defaultAllocations[name]
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// DefaultAllocationNames returns the builtin skill names that declare a default
+// allocation. Test-facing: it lets the pin over the shipped templates enumerate
+// the map without exporting it (an exported map would be mutable by any caller).
+func DefaultAllocationNames() []string {
+	out := make([]string, 0, len(defaultAllocations))
+	for name := range defaultAllocations {
+		out = append(out, name)
+	}
+	return out
+}

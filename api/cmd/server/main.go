@@ -112,12 +112,21 @@ func run() error {
 
 	// Seed/refresh the builtin agent templates. Idempotent and edit-preserving:
 	// missing builtins are inserted, existing rows are left untouched.
-	if err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+	//
+	// This MUST precede the skills reconciler: a builtin skill's default
+	// allocation resolves its agent template BY NAME and is seeded only on the
+	// boot that first inserts the skill, so running skills first would seed
+	// nothing and never retry (PRD #72 M2, Decision 9). `templatesDone` is what
+	// makes that ordering a compile-time dependency rather than a convention —
+	// swapping these two blocks does not compile.
+	templatesDone, err := store.ReconcileBuiltinTemplates(ctx, q)
+	if err != nil {
 		return err
 	}
 	// Same for the builtin agent skills (PRD #16): missing builtin skills are
-	// inserted, admin edits survive restarts.
-	if err := store.ReconcileBuiltinSkills(ctx, q); err != nil {
+	// inserted, admin edits survive restarts. Newly-inserted builtins also get
+	// their default shared allocations (PRD #72 M2).
+	if err := store.ReconcileBuiltinSkills(ctx, q, templatesDone); err != nil {
 		return err
 	}
 

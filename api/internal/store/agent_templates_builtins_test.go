@@ -64,7 +64,7 @@ func TestReconcileWarnsOnCustomRowShadowingBuiltin(t *testing.T) {
 		},
 	}
 	logs := captureLogs(t, func() {
-		if err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
+		if _, err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 	})
@@ -101,7 +101,7 @@ func TestReconcileSilentWhenBuiltinAlreadySeeded(t *testing.T) {
 		},
 	}
 	logs := captureLogs(t, func() {
-		if err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
+		if _, err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 	})
@@ -115,7 +115,7 @@ func TestReconcileLogsReadBackErrorAtDebug(t *testing.T) {
 		getErr: map[string]error{"lead": errors.New("boom")},
 	}
 	logs := captureLogs(t, func() {
-		if err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
+		if _, err := ReconcileBuiltinTemplates(context.Background(), fake); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 	})
