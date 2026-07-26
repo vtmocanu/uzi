@@ -30,6 +30,20 @@ var defaultAllocations = map[string][]string{
 	// reconciler seeds only on FIRST insert and this row already exists
 	// everywhere — keep the two in sync by hand; SQL cannot read this map.
 	"ci-cd-norms": {"coder", "reviewer"},
+	// PRD #72 M3. `lead` is the semantic owner (it holds the PRD file and calls
+	// signal_done) and is guaranteed to exist under either agent source, since the
+	// lead always comes from the claim payload. But allocating to `lead` is NOT
+	// what delivers the skill to it: the lead is the main thread and receives the
+	// whole run union, so ANY allocation puts this in its context. What the entry
+	// buys is union membership at all (without which it reaches nobody) plus, on an
+	// own-template run, per-subagent scoping for `reviewer`, who is told to check
+	// the PRD diff. On a repo-source run the reviewer half is ignored — every repo
+	// subagent gets the whole surviving set (M1) — so it is an own-run control.
+	//
+	// This entry and builtins/prd-lifecycle/SKILL.md MUST land together: the init
+	// check above panics on a key with no shipped skill, so splitting them across
+	// commits does not boot.
+	"prd-lifecycle": {"lead", "reviewer"},
 }
 
 // The KEYS must name shipped builtin skills, and this is enforced at package

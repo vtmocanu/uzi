@@ -321,7 +321,7 @@ export class SdkExecutor implements Executor {
       // run has no skills disables all. Per-subagent scoping is each
       // AgentDefinition.skills; the lead is the main thread, covered by this union.
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
-      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt),
+      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { kind: ctx.kind }),
       agents: assembled.subagents,
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
@@ -512,7 +512,7 @@ export class SdkExecutor implements Executor {
       const implementOptions: SdkOptions = {
         ...baseOptions,
         agents: selectedSubagents,
-        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo" }),
+        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo", kind: ctx.kind }),
         hooks: { PreToolUse: preToolUse(selectedNames) },
       };
       ctx.emit({
