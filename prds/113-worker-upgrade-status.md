@@ -112,6 +112,34 @@ nav item** gains an alert badge = the count of workers needing attention.
    is a neutral backlog count. Same `NavItem badge` prop, a new `tone` so a
    red badge reads as "go look" and a grey one reads as "there's a queue."
 
+   **AMENDED 2026-07-26 — "red versus grey" describes a palette this product does not
+   have, and the real separation is about half what this decision assumes.** MEASURED
+   in a browser at `c57263ca`: **nothing in the sidebar is grey.** Both neutral badges
+   are brand orange `rgb(251,146,60)`; the alert is rose `rgb(251,113,133)`. ΔE2000
+   between them is **29.05**, hue separation 35.7° — both warm. Calibrated against this
+   palette's deliberately-distinct pairs (ok-green vs brand-orange **51.94**,
+   danger-rose vs info-cyan **56.60**), the alert/neutral pair carries roughly **half**
+   the separation of a real status contrast, with size, shape, radius, font and
+   position all identical — **hue is the only channel carrying the distinction.**
+   Above just-noticeable, so the badges *are* distinguishable and this is not a
+   blocking defect; they are not *categorically* distinct, which is what the decision
+   claims. **And it is theme-asymmetric:** in `mission` the same pair is rose-vs-cyan
+   at ΔE **77.64** — unmistakable. So the distinction that *is* the feature is weakest
+   in the default theme and excellent in the other.
+   Choosing a more separated alert hue is a design decision for the owner, recorded
+   here rather than taken. What must not stand is the decision's premise: any future
+   reader reasoning from "red vs grey" is reasoning about a UI that does not exist.
+
+   **Also amended: the collapsed rail conveyed neither count nor tone.** The
+   aria-labelled pill is gated `{!collapsed && hasBadge && …}` (`AppShell.tsx:165`)
+   so it is absent from the DOM when collapsed, and the dot is `aria-hidden="true"`
+   (`:155`) — measured, all three collapsed links exposed no `aria-label`, no
+   `innerText`, only `title`. An assistive-tech user got nothing in the layout where
+   the operator has least context. A validator had reported the opposite as a
+   structural property and the team lead relayed it as established, which set the
+   severity ceiling wrong until it was measured. Fixed by giving the collapsed state
+   its own accessible name.
+
 3. **Version becomes a real coordinate, not a new one.** We reuse the release
    SemVer that the image tag and chart `appVersion` already are (Model B). We do
    NOT invent a separate agent version scheme. `UZI_AGENT_VERSION` stops being a
