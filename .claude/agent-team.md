@@ -561,6 +561,27 @@ COUNT is four things to drift. Resolve a count disagreement by **deleting the
 tally and citing the mechanism**, never by picking the winner — picking one
 removes the only instrument that detected the defect.
 
+**PRD #72 then produced the cleanest instance of this rule being stated and
+broken by the same agent, in one afternoon, and it goes one step past the usual
+shape.** Two validators reported the gap between a retraction and its surviving
+copy in one file as **19 lines** (reviewer) and **160 lines** (architect). The
+lead had *both* numbers, *noticed* they disagreed, and wrote — correctly, citing
+this very rule — that it would therefore **cite the mechanism and drop the
+tally**. It then quoted "nineteen lines apart" in a later dispatch. The recipient
+ran `git show cfa1c0a3:api/internal/prdpath/prdpath.go` and measured the
+retraction at `:92-93` against the surviving copy at `:253`. (These two figures
+are quoted rather than dropped because **their disagreement is the finding** —
+which is the same reason the guard-count example above quotes six, five and
+seven. Bound to a SHA, per rule 2 below; a count that is the subject of the story
+is not a tally sitting in the text as a current fact.)
+So this is not "stated a rule and forgot it": the author **diagnosed its own
+instance, prescribed the correct remedy in writing, and then did the thing
+anyway** — with the disagreement it had already flagged sitting in its own notes.
+**The rule-holder is not the person best placed to notice their own instance**,
+and the gap between knowing a rule and applying it to yourself is not closed by
+knowing it harder. What closed it here was a recipient re-deriving a cited number
+before using it, which is a mechanism and costs one `git show`.
+
 **The operational check that would have caught all four comments** (sharper than
 "re-read nearby comments", and it is a grep of the CALLERS not the neighbours):
 when you add a guard, ask **"what did I just make unreachable, and what claims
