@@ -404,9 +404,32 @@ var shellSeparators = map[string]bool{
 // "not in executable position", which leaves a miss REPORTED — the conservative
 // direction, since over-suppression is the risk PRD #121 names and under-suppression
 // only preserves today's behaviour.
+//
+// 🔴 A HEREDOC LATCHES OFF EVERY SEPARATOR FOR THE REST OF THE COMMAND, and that is a
+// correctness fix, not tidiness. `\n` is a genuine command separator, so without this
+// every line of a heredoc BODY put its first word in executable position:
+//
+//	cat > build.sh <<'EOF'
+//	tsc --noEmit
+//	EOF
+//
+// parsed as [cat tsc EOF], the write succeeded, and a GENUINE `tsc` miss was suppressed
+// by an agent merely writing tsc into a file. Silent, and strictly worse than the false
+// positive this milestone removes. The two events are correlated rather than
+// independent: the tool an agent just failed to invoke is exactly the tool likely to
+// appear in the wrapper script it writes next.
+//
+// Latching off `; | & ( )` too, not just `\n`, is deliberate — a body line reading
+// `foo; tsc` would otherwise reopen the same hole one level down. Everything after a
+// `<<` is data as far as this scan is concerned, so no later token on that command can
+// be an executable. That under-suppresses a real command following a heredoc, which is
+// the safe direction and the philosophy stated above.
 func shellTokens(command string) []string {
 	var toks []string
 	var cur strings.Builder
+	// heredoc latches true at the first `<<` (or `<<-`) and never clears: from there
+	// the remainder of this command yields data tokens only.
+	heredoc := false
 	flush := func() {
 		if cur.Len() > 0 {
 			toks = append(toks, cur.String())
@@ -427,10 +450,22 @@ func shellTokens(command string) []string {
 					cur.WriteRune(runes[i])
 				}
 			}
+		case '<':
+			cur.WriteRune(c)
+			// `<<` and `<<-` open a heredoc; a single `<` is an ordinary redirect and
+			// `<<<` (herestring) latches too, which costs only under-suppression.
+			if i+1 < len(runes) && runes[i+1] == '<' {
+				cur.WriteRune('<')
+				i++
+				heredoc = true
+			}
 		case ' ', '\t', '\r':
 			flush()
 		case '\n', ';', '|', '&', '(', ')':
 			flush()
+			if heredoc {
+				continue // structure inside heredoc data is not structure
+			}
 			sep := string(c)
 			if i+1 < len(runes) && (c == ';' || c == '|' || c == '&') &&
 				(runes[i+1] == '|' || runes[i+1] == '&' || (c == ';' && runes[i+1] == ';')) {

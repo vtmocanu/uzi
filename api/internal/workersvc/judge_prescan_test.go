@@ -200,6 +200,18 @@ func TestPrescanSuppressionFixture(t *testing.T) {
 			},
 			want: []string{"terraform"},
 		},
+		{
+			name: "9_heredoc_body_is_data_not_invocation",
+			why: "writing a wrapper script CONTAINING tsc must not suppress the tsc miss — " +
+				"the write succeeds, tsc never runs, and the failure would be silent",
+			rows: []store.ListToolTraceForRunRow{
+				traceUse(9, "u1", "tsc --noEmit"),
+				traceResult(10, "u1", "sh: 1: tsc: not found", true),
+				traceUse(29, "u2", "cat > build.sh <<'EOF'\nnpx tsc --noEmit\nEOF"),
+				traceResult(30, "u2", "", false), // writing a file succeeds
+			},
+			want: []string{"tsc"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -284,6 +296,16 @@ func TestExecutablesInParsesExecutablePosition(t *testing.T) {
 		{"grep tsc package.json", []string{"grep"}},
 		{"echo 'run vitest later'", []string{"echo"}},
 		{"rg --files-with-matches eslint", []string{"rg"}},
+		// A heredoc BODY is data. `\n` is a real separator, so without the latch every
+		// body line's first word became an executable and writing a wrapper script
+		// suppressed a genuine miss.
+		{"cat > build.sh <<'EOF'\ntsc --noEmit\nEOF", []string{"cat"}},
+		{"cat > check.sh <<'EOF'\nnpx tsc --noEmit\nEOF", []string{"cat"}},
+		{"cat <<-EOF > f\nvitest run\nEOF", []string{"cat"}},
+		// The latch covers non-newline separators too — a body line can carry its own.
+		{"cat > s.sh <<'EOF'\nfoo; eslint .\nEOF", []string{"cat"}},
+		// A single `<` is an ordinary redirect and must NOT latch.
+		{"tsc < input.ts && vitest run", []string{"tsc", "vitest"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.command, func(t *testing.T) {
