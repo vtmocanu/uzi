@@ -457,3 +457,45 @@ func TestB1ControllerCanSuppressViaTheTargetWithoutLyingAboutPhase(t *testing.T)
 			"`upgrading` one it bypasses — M5 must surface the tag divergence", detail)
 	}
 }
+
+// The nav badge's count (PRD #113 M6). The attention set is the ONE definition, shared
+// with the per-worker badge, so the count and the list cannot disagree.
+func TestUpgradeAttentionSet(t *testing.T) {
+	for status, want := range map[string]bool{
+		UpgradeStatusUpgradeFailed: true,
+		UpgradeStatusOutdated:      true,
+		// `upgrading` is deliberately NOT an alert: a roll in progress is expected,
+		// transient and self-resolving, and counting it would turn the badge red on every
+		// release — the cry-wolf this whole PRD exists to prevent.
+		UpgradeStatusUpgrading: false,
+		UpgradeStatusUpToDate:  false,
+		// THE CASE THAT MATTERS MOST FOR A NAV BADGE. A `dev` control plane disables
+		// classification fleet-wide (D8), so every worker is `unknown` — and if `unknown`
+		// counted, every developer running a local stack would see their whole fleet
+		// reported as needing attention. A wrong sign here flips "nothing to see" into
+		// "everything is broken", on the surface designed to interrupt people.
+		UpgradeStatusUnknown: false,
+	} {
+		if got := InUpgradeAttentionSet(status); got != want {
+			t.Errorf("InUpgradeAttentionSet(%q) = %v, want %v", status, got, want)
+		}
+	}
+}
+
+// A `dev` control plane must produce a ZERO badge, end to end through the classifier —
+// not merely a status that is not in the set. Asserted through ClassifyUpgrade because
+// that is the path the summary endpoint actually takes.
+func TestDevControlPlaneProducesNoAttention(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	for _, kind := range []string{"hosted", "external"} {
+		in := fleetInput(now, nil)
+		in.Kind = kind
+		in.CPVersion = "dev" // an unstamped control plane, i.e. every local build
+		status, _ := ClassifyUpgrade(in, ceilingParams())
+		if InUpgradeAttentionSet(status) {
+			t.Errorf("kind=%s with a `dev` control plane classified %q, which is in the attention set. "+
+				"D8 disables classification fleet-wide there, so every worker of every local stack "+
+				"would badge the nav item red.", kind, status)
+		}
+	}
+}

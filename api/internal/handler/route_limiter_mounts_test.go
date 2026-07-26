@@ -167,6 +167,12 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/cli-tokens/", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
 	{"GET", "/api/me/judge/stats", noLimiter},
+	// noLimiter, same reasoning as /me/judge/stats beside it: an authenticated read that
+	// AppShell polls on a fixed interval for every logged-in user. A per-user budget here
+	// would throttle the app's own shell — the badge would silently stop updating for a
+	// user doing nothing wrong — and the endpoint spends nothing: one indexed
+	// user-scoped query, no forge call, no model call (PRD #113 M6).
+	{"GET", "/api/me/workers/upgrade-summary", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},

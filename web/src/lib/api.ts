@@ -1552,6 +1552,12 @@ const realApi = {
   // Server build version (Model B: the release git tag; "dev" on a local build).
   // Unauthenticated, like /health — the shell footer reads it.
   version: () => request<{ version: string }>("GET", "/version"),
+  // The Workers nav badge's count (PRD #113 M6). Its own endpoint rather than a fold over
+  // listWorkers: the Workers page's poll is page-local and visibility-gated, so a badge
+  // fed from it would be stale or absent exactly when the operator is not on that page,
+  // which is the only situation a nav badge exists for.
+  workerUpgradeSummary: () =>
+    request<{ attention: number; target_release: string }>("GET", "/me/workers/upgrade-summary"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),

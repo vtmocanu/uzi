@@ -135,6 +135,9 @@ type Store interface {
 	// Returns rows affected: 0 means the worker is unknown or external, which the
 	// query enforces rather than the caller.
 	UpsertWorkerRollHealth(ctx context.Context, arg store.UpsertWorkerRollHealthParams) (int64, error)
+	// GetWorkerUpgradeSummaryForUser is user-scoped BY CONSTRUCTION: roll health has no
+	// user_id, so the query joins through `workers`. See the query's own comment.
+	GetWorkerUpgradeSummaryForUser(ctx context.Context, userID uuid.UUID) ([]store.GetWorkerUpgradeSummaryForUserRow, error)
 	HeartbeatWorker(ctx context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error)
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)

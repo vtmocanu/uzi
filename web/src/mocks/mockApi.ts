@@ -932,6 +932,16 @@ export const mockApi = {
   // the literal "demo" made every badge and the whole Fleet panel unreachable in demo
   // mode. The demo-mode signal does not live here: AppShell renders a separate "demo"
   // pill, so nothing is lost by making this comparable.
+  // PRD #113 M6. Computed LIVE from the demo worker list rather than hardcoded, so the
+  // badge actually clears when a worker is deleted — web-ux needs to see it appear AND
+  // clear, and a constant would only ever show the first half.
+  workerUpgradeSummary: async () => {
+    const attention = workers.filter(
+      (w) => w.upgrade_status === "upgrade_failed" || w.upgrade_status === "outdated",
+    ).length;
+    return delay({ attention, target_release: "0.4.2" });
+  },
+
   version: async () => delay({ version: "0.4.2" }),
   logout: async () => {
     state.session = null;

@@ -19,6 +19,9 @@ vi.mock("../lib/api", () => ({
     unreadNotificationCount: vi.fn(),
     // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
     // backlog so the badge is absent unless a test overrides it.
+    // PRD #113 M6: AppShell now owns a workers-attention poll too. Zero by default so
+    // these navigation tests assert the nav STRUCTURE without an alert badge in the way.
+    workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
     getJudgeStats: vi
       .fn()
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
@@ -287,5 +290,51 @@ describe("forgeIcon (Decision 2 mapping)", () => {
     expect((forgeIcon("gitlab") as ReactElement).type).toBe(GitLabIcon);
     expect((forgeIcon("forgejo") as ReactElement).type).toBe(GitIcon);
     expect((forgeIcon(undefined) as ReactElement).type).toBe(GitIcon);
+  });
+});
+
+// PRD #113 M6: the Workers nav alert badge.
+describe("Workers nav alert badge (PRD #113 M6)", () => {
+  it("badges the Workers nav item with the attention count, alert-toned", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    // The aria-label says what the number MEANS. "2 unread" for a worker count would be
+    // wrong in a way a screen-reader user could not recover from.
+    const badge = await screen.findByLabelText("2 needing attention");
+    expect(badge.textContent).toBe("2");
+    // Alert tone, not the brand pill the Judge/unread badges use (Decision 2): red reads
+    // "go look", grey reads "there is a queue".
+    expect(badge.className).toContain("bg-danger");
+  });
+
+  it("renders NO badge at zero, rather than a badge showing 0", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 0, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    await screen.findByText("Workers");
+    // A permanent "0" is an ornament that means nothing, and it trains the reader to stop
+    // looking at the one place this feature has to be noticed.
+    expect(screen.queryByLabelText(/needing attention/)).toBeNull();
+  });
+
+  it("keeps the last known count when the poll fails, rather than blanking to zero", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 3, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    expect((await screen.findByLabelText("3 needing attention")).textContent).toBe("3");
+
+    // A transient failure must not read as "resolved" — that is the one wrong answer for
+    // an alert badge, because it looks exactly like the problem going away.
+    mockApi.workerUpgradeSummary.mockRejectedValue(new Error("network"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByLabelText("3 needing attention")).toBeTruthy();
+  });
+
+  it("does not use the Judge badge's tone, so the two are distinguishable", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 1, target_release: "0.6.0" });
+    mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 4, todo: 4 });
+    renderShell("/dashboard");
+    const workers = await screen.findByLabelText("1 needing attention");
+    const judge = await screen.findByLabelText("4 unread");
+    expect(workers.className).toContain("bg-danger");
+    expect(judge.className).not.toContain("bg-danger");
   });
 });

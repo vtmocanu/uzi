@@ -527,3 +527,97 @@ func pgInt4(v int) pgtype.Int4 {
 	}
 	return pgtype.Int4{Int32: int32(v), Valid: true}
 }
+
+// -------------------------------------------------------------------------
+// Fleet summary (PRD #113 M6): the number behind the Workers nav badge.
+// -------------------------------------------------------------------------
+
+// UpgradeFleetSummary is the AppShell's view of one user's fleet.
+type UpgradeFleetSummary struct {
+	// Attention is the count of the user's workers needing attention: upgrade_failed
+	// plus outdated, minus muted (Decision 1). `upgrading` is deliberately excluded —
+	// a roll in progress is expected, transient and self-resolving, and counting it
+	// would turn the badge red on every release, which is the cry-wolf the whole PRD
+	// exists to avoid.
+	Attention int `json:"attention"`
+	// TargetRelease is the control plane's own version, echoed so the client can label
+	// the badge's tooltip without a second request. Empty when unstamped.
+	TargetRelease string `json:"target_release"`
+}
+
+// UpgradeSummaryForUser counts the caller's workers needing attention.
+//
+// SCOPED BY CONSTRUCTION, not by a filter anyone has to remember: the query it calls
+// joins roll health THROUGH `workers`, which is the only table that knows an owner,
+// because worker_upgrade_reports deliberately carries no user_id. A fleet-scoped count
+// here would put other users' failing workers into this user's nav badge on every page
+// of the app.
+//
+// The classification is the SAME ClassifyUpgrade the worker DTO uses, over the same
+// inputs. That matters more than the small duplication it avoids: if this endpoint
+// counted with its own rules, the badge could say "1 needs attention" beside a list in
+// which nothing is badged, and no test comparing the two would exist to catch it.
+func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, cpVersion string, apiStartedAt time.Time, p UpgradeParams) (UpgradeFleetSummary, error) {
+	rows, err := s.q.GetWorkerUpgradeSummaryForUser(ctx, userID)
+	if err != nil {
+		return UpgradeFleetSummary{}, err
+	}
+	now := s.now()
+	out := UpgradeFleetSummary{TargetRelease: cpVersion}
+	for _, row := range rows {
+		var sig *RollSignal
+		if row.Phase.Valid && row.ObservedAt.Valid {
+			sig = &RollSignal{
+				Phase:             row.Phase.String,
+				ObservedAt:        row.ObservedAt.Time,
+				PodPhase:          row.PodPhase.String,
+				BlockingContainer: row.BlockingContainer.String,
+				BlockingReason:    row.BlockingReason.String,
+				RolledTag:         row.WorkerImageTag.String,
+			}
+			if row.RestartCount.Valid {
+				sig.RestartCount = row.RestartCount.Int32
+			}
+			if row.LastExitCode.Valid {
+				code := row.LastExitCode.Int32
+				sig.LastExitCode = &code
+			}
+			if row.PhaseSince.Valid {
+				t := row.PhaseSince.Time
+				sig.PhaseSince = &t
+			}
+			if row.UpgradingSince.Valid {
+				t := row.UpgradingSince.Time
+				sig.UpgradingSince = &t
+			}
+		}
+		status, _ := ClassifyUpgrade(UpgradeInput{
+			Reported:     row.Version.String,
+			Kind:         row.Kind,
+			CPVersion:    cpVersion,
+			Signal:       sig,
+			Now:          now,
+			APIStartedAt: apiStartedAt,
+		}, p)
+		if !InUpgradeAttentionSet(status) {
+			continue
+		}
+		// The mute subtraction is REAL, not decorative: `muted` comes from a join on
+		// worker_upgrade_mutes keyed per user, per worker, per release. No UI can set a
+		// mute yet, so in practice this never subtracts today — but it is a live branch
+		// over live data, so it starts working the moment the action ships rather than
+		// needing to be found and wired.
+		if row.Muted {
+			continue
+		}
+		out.Attention++
+	}
+	return out, nil
+}
+
+// InUpgradeAttentionSet is the ONE definition of "needs attention" on the server side
+// (Decision 1): failed or behind. Exported so the nav badge's count and any other
+// consumer cannot drift into two answers.
+func InUpgradeAttentionSet(status string) bool {
+	return status == UpgradeStatusUpgradeFailed || status == UpgradeStatusOutdated
+}

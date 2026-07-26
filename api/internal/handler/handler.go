@@ -397,6 +397,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Delete("/{id}", h.DeleteMyMemory)
 		})
 
+		// Fleet upgrade summary for the Workers nav badge (PRD #113 M6). Its own
+		// endpoint and its own poll, owned by AppShell: the Workers PAGE's poll is
+		// page-local and visibility-gated, so a badge fed from it would be stale or
+		// absent exactly when the operator is not on that page — the only situation a
+		// nav badge exists for. RequireUser mirrors /me/judge/stats.
+		r.Route("/me/workers", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/upgrade-summary", h.WorkerUpgradeSummary)
+		})
+
 		// Global judge-triage strip (PRD #94 Decision 8): the caller's "across all your
 		// runs" tally. RequireUser (mirrors /me/memory) so `uzi review stats` works from a
 		// CLI token; owner-scoped by the query's user_id filter, bucketed by the shared
