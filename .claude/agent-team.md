@@ -275,6 +275,16 @@ code. Every one was wrong, and reading could not have caught any of them.
 this very table — which is this file's own "duplicate the claim, never the count" rule catching
 an instance of itself. Add rows; never write a number.)*
 
+**READ THE TWO COLUMNS DIFFERENTLY, because they have different warrants.** A fact-check on
+2026-07-26 confirmed the technical content of every row that is checkable against the tree, and
+correctly returned **UNVERIFIABLE** for the *provenance* — who asserted what, when, and who caught
+it. That history lived in dispatches under `agent-team-tasks/`, which is gitignored and gone. So
+the claims and shapes are measurement; **the attributions are testimony**, and a later reader
+cannot re-derive them. Kept anyway, because "the author who had catalogued this class two
+revisions earlier" is the finding in several rows and a claim stripped of who made it loses it —
+but labelled, since this file's own rule is never to let a reasoned entry sit in the same column
+as a measured one.
+
 | claim | shape |
 |---|---|
 | "nothing stores the old PRD path" | a grep returned nothing |

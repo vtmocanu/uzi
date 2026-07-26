@@ -127,9 +127,14 @@ merge request with the code. The lead's own instructions carry a short
 version of the same step on every issue run, so it does not depend on this
 skill being allocated; the skill supplies the judgment. Both are instructions
 to a model rather than enforcement: whether a PRD update is honest is checked
-by the human reading the merge request. Only issue runs carry the step: a
-CI-fix or self-improvement run never gets it, and an issue that links no PRD
-file is a no-op (see [PRDLESS label](./prdless.md)).
+by the human reading the merge request. An issue that links no PRD file is a
+no-op (see [PRDLESS label](./prdless.md)).
+
+Only issue runs are **told** to do it. A CI-fix or self-improvement run never
+carries the instruction, and the machinery that records a move is closed to
+them as well. The skill itself is allocated per template, not per run kind, so
+it still appears in those runs' skill list: that is expected, and nothing there
+asks them to use it.
 
 ## Security notes
 
