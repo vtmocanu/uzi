@@ -771,14 +771,29 @@ func TestObserveReadsReplicaFailureOffTheDeployment(t *testing.T) {
 			Status: appsv1.DeploymentStatus{Conditions: conds},
 		}
 	}
-	// The reason is the replicaset controller's, copied onto the Deployment. The message is
-	// deliberately present in the fixture and deliberately NOT expected anywhere in the
-	// output — see the assertion below.
+	// MEASURED VERBATIM, 2026-07-26, dev-cluster / uzi-workers, on issue #148's own worker
+	// (d26fb0f9) while it was live and pod-less:
+	//
+	//	type=ReplicaFailure status=True reason=FailedCreate  message=<the 185 bytes below>
+	//
+	// A healthy hosted worker measured in the same sweep (uzi-hw-8e1fef71, ready 1/1) carried
+	// NO ReplicaFailure condition at all — only Available=True and Progressing=True. So
+	// ABSENCE is the healthy state, which is what replicaFailureReason's comment says and
+	// what the "gap" fixture below stands for. ConditionFalse was NOT observed on a real
+	// cluster; that case is kept anyway because it is the mutation target for the
+	// Status-check, and a defensive control that costs one fixture is worth having.
+	//
+	// The message is in the fixture deliberately and expected NOWHERE in the output. At 185
+	// bytes it is nearly 3x the api's 64-byte cap on controller-supplied display strings, and
+	// truncation lands mid-token before the cause is ever reached — measured, the cap would
+	// deliver `pods "uzi-hw-d26fb0f9-7158-42a5-9d9f-bed63526c217-65965d65fc-" i` and drop
+	// "serviceaccount ... not found" entirely. Forwarding it would be strictly worse than the
+	// reason.
 	failing := appsv1.DeploymentCondition{
 		Type:    appsv1.DeploymentReplicaFailure,
 		Status:  corev1.ConditionTrue,
 		Reason:  "FailedCreate",
-		Message: `pods "uzi-hw-blocked-abc-" is forbidden: error looking up service account uzi-workers/uzi-hosted-worker: serviceaccount "uzi-hosted-worker" not found`,
+		Message: `pods "uzi-hw-d26fb0f9-7158-42a5-9d9f-bed63526c217-65965d65fc-" is forbidden: error looking up service account uzi-workers/uzi-hosted-worker: serviceaccount "uzi-hosted-worker" not found`,
 	}
 	cleared := failing
 	cleared.Status = corev1.ConditionFalse

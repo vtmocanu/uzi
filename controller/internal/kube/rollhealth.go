@@ -130,10 +130,16 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 		// Only the REASON is carried, never the condition's `message`. That is the same
 		// line the pod path holds (see likelyCause's comment in the web): a k8s message is
 		// free text carrying namespaces, object names and paths. It would also not survive
-		// the trip — the api caps every controller-supplied display string at 64 bytes, and
-		// the replicaset controller's message ("Error creating: pods \"uzi-hw-…-\" is
-		// forbidden: …") is longer than that, so forwarding it would deliver its least
-		// informative prefix and drop the actual cause.
+		// the trip, and this is MEASURED rather than argued — the live message on #148's own
+		// worker was 185 bytes against the api's 64-byte cap on controller-supplied display
+		// strings, and the truncation lands before the cause is reached: `pods
+		// "uzi-hw-d26fb0f9-…-65965d65fc-" i`, with "serviceaccount … not found" gone. See
+		// rollhealth_test.go, which carries the string verbatim as a fixture.
+		//
+		// MEASURED the same day: reason is `FailedCreate` (the replicaset controller's, copied
+		// onto the Deployment by the deployment controller), and a HEALTHY worker's Deployment
+		// carries no ReplicaFailure condition at all. Nothing here hardcodes `FailedCreate`
+		// though — whatever reason the condition carries is what travels.
 		if replicaFailure != "" {
 			// No PhaseSince, for the same reason the gap has none: there is no pod to date
 			// this from. The condition's own LastTransitionTime is deliberately not used —
