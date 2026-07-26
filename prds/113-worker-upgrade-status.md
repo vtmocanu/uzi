@@ -359,6 +359,24 @@ nav item** gains an alert badge = the count of workers needing attention.
       controller report — the api grows no kube client) and the per-release
       **Mute** (per-user-per-release storage). `uzi workers` CLI gains an
       upgrade-status column.
+
+      **CORRECTED 2026-07-26 — THREE of those four "committed extras" did not ship,
+      and this bullet asserted them as delivered.** Measured against the landed code:
+      - **"rolled N ago" — NOT SHIPPED.** No component renders it; there is no
+        `rolled`/`rolledAt` field on the DTO. Deliberate: `PhaseSince` is the pod's
+        *creation* time for `rolling`/`stuck`, not when the failure began, so a
+        "rolled N ago" label would have stated something the controller cannot know.
+      - **View pod events — NOT SHIPPED, refused.** It needs `events: list`, which
+        this PRD does not grant. Replaced by a copy-the-`kubectl`-command affordance
+        (see the D10/§G-1 amendment). **Copy diagnostics** did ship.
+      - **Mute — STORAGE ONLY, no UI.** The table, the corrected release key and a
+        live-DB test landed; nothing can set a mute through the API, so the badge's
+        mute subtraction is a live branch that has never subtracted anything.
+      Left uncorrected, this bullet would have licensed a doc page promising a
+      timestamp and a mute button that do not exist — which is the same failure this
+      PRD's own amendments keep recording: a document asserting a state the system
+      cannot produce. Caught by the documenter grepping the shipped components rather
+      than reading this list.
 - [ ] **M6 — Workers nav alert badge**: the Workers nav item shows an alert-toned
       badge = count of workers needing attention (`upgrade_failed` + `outdated`,
       minus muted), visually distinct from the Judge count badge, fed by a small
