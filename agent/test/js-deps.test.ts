@@ -52,7 +52,9 @@ const execThatInstalls: InstallExec = async (cmd) => {
 };
 
 describe("installJsDeps: the installer is chosen by the lockfile", () => {
-  const cases: { name: string; lockfile: string; manager: string; argv: string[] }[] = [
+  // `label` is what the run feed shows: the argv, prefixed with any env overlay. It
+  // defaults to the argv and is spelled out only where an overlay exists (yarn).
+  const cases: { name: string; lockfile: string; manager: string; argv: string[]; label?: string }[] = [
     { name: "npm", lockfile: "package-lock.json", manager: "npm", argv: ["npm", "ci", "--ignore-scripts"] },
     { name: "npm (shrinkwrap)", lockfile: "npm-shrinkwrap.json", manager: "npm", argv: ["npm", "ci", "--ignore-scripts"] },
     {
@@ -73,6 +75,7 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
       lockfile: "yarn.lock",
       manager: "yarn",
       argv: ["yarn", "install", "--frozen-lockfile", "--ignore-scripts"],
+      label: "YARN_IGNORE_PATH=1 yarn install --frozen-lockfile --ignore-scripts",
     },
     {
       name: "bun (bun.lockb)",
@@ -99,7 +102,9 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
       assert.deepEqual([calls[0]!.command, ...calls[0]!.args], c.argv);
       assert.equal(calls[0]!.cwd, root);
       assert.equal(truncated, false);
-      assert.deepEqual(results, [{ dir: ".", manager: c.manager, ok: true, detail: `${c.argv.join(" ")} ok` }]);
+      assert.deepEqual(results, [
+        { dir: ".", manager: c.manager, ok: true, detail: `${c.label ?? c.argv.join(" ")} ok` },
+      ]);
       assert.ok(depsReadyFor(results, "."));
     });
   }
@@ -149,6 +154,15 @@ describe("installJsDeps: every measured repo-code-execution path is suppressed",
     );
     // The overlay is exactly one key on top of the caller's env — nothing else added.
     assert.deepEqual(calls[0]!.env, { ...caller, YARN_IGNORE_PATH: "1" });
+  });
+
+  it("the reported label SHOWS the env overlay, so the feed never displays the vulnerable command", async () => {
+    // A reader debugging a yarn install must be able to see that YARN_IGNORE_PATH was
+    // applied. An argv-only label displays exactly the command that, without the env key,
+    // executes a repo-committed yarnPath.
+    const root = mkClone({ "package.json": PKG, "yarn.lock": "" });
+    const { results } = await installJsDeps(root, {}, { exec: recorder().exec });
+    assert.equal(results[0]!.detail, "YARN_IGNORE_PATH=1 yarn install --frozen-lockfile --ignore-scripts ok");
   });
 
   it("pnpm carries --ignore-pnpmfile and disables packageManager version handoff", async () => {
@@ -352,6 +366,33 @@ describe("installJsDeps: a claimed success is corroborated against node_modules"
     const root = mkClone({ "package.json": PKG, "package-lock.json": "" });
     const { results } = await installJsDeps(root, {}, { exec: recorder().exec });
     assert.equal(results[0]!.ok, true, "a project with no declared dependencies needs no node_modules to be ready");
+  });
+
+  it("corroborates a WORKSPACE ROOT even when its own package.json declares no deps", async () => {
+    // The deps live in the members, and workspaceRoot PRUNES the subtree — so one false
+    // `ok` here would cover every member of the monorepo. Measured: `npm ci` at a
+    // workspace root creates a root node_modules even with zero deps declared anywhere,
+    // so requiring it here does not over-fire on a legitimately empty workspace.
+    const root = mkClone({
+      "package.json": '{"name":"mono","workspaces":["packages/*"]}',
+      "package-lock.json": "",
+      "packages/a/package.json": PKG_WITH_DEPS,
+    });
+    const { results } = await installJsDeps(root, {}, { exec: recorder().exec });
+    assert.deepEqual(results.map((r) => r.dir), ["."], "the subtree must still be pruned to one root install");
+    assert.equal(results[0]!.ok, false, "a pruned workspace root that produced no node_modules must not report ready");
+    assert.match(results[0]!.detail, /left no node_modules/);
+  });
+
+  it("reports ok for a workspace root whose install DID produce node_modules", async () => {
+    const root = mkClone({
+      "package.json": '{"name":"mono","workspaces":["packages/*"]}',
+      "package-lock.json": "",
+      "packages/a/package.json": PKG_WITH_DEPS,
+    });
+    const { results } = await installJsDeps(root, {}, { exec: execThatInstalls });
+    assert.equal(results[0]!.ok, true);
+    assert.ok(depsReadyFor(results, "."));
   });
 
   it("does NOT downgrade when the manifest is unreadable, since dependencies are then unknown", async () => {

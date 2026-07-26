@@ -54,8 +54,9 @@
 //
 // So the honest claim, in the register `self-improve.ts` already uses for the same
 // mechanism ("a defense-in-depth REDUCTION of the lifecycle-script code-exec path", "a
-// reduction, not a close"): the flags below suppress every repo-authored execution path
-// we found and measured, per manager. That is stronger than `--ignore-scripts` alone and
+// reduction, not a close"): the flags AND ENV KEY below suppress every repo-authored
+// execution path we found and measured, per manager. (Not all of it is flags — yarn's
+// half is an environment variable, because yarn reads `yarnPath` before it parses argv.) That is stronger than `--ignore-scripts` alone and
 // weaker than a proof. It is NOT an exhaustive audit of any package manager — a manager
 // that grows a new repo-file exec path would reopen this silently, which is why each flag
 // is documented with what it closes rather than left as folklore. Anything that survives
@@ -420,7 +421,12 @@ export async function installJsDeps(
     }
 
     const spec = INSTALL_COMMANDS[project.manager];
-    const label = `${spec.command} ${spec.args.join(" ")}`;
+    // Rendered shell-style, WITH any env overlay, because this string is what a human
+    // reads on the run feed and in the logs. Showing only the argv would display a yarn
+    // install as `yarn install --frozen-lockfile --ignore-scripts` — which, as displayed,
+    // is the command that executes a repo-committed yarnPath. The half that closes it
+    // would be invisible to exactly the person debugging whether it was applied.
+    const label = [...Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`), spec.command, ...spec.args].join(" ");
     // PRD #51 M4: the install runs repo-authored package.json/lockfile resolution — an
     // untrusted surface — so under the `runner` uid (setpriv wrapper); a #58 single-uid
     // start runs it directly.
@@ -454,13 +460,30 @@ export async function installJsDeps(
     // `node_modules` must not set it — a repo that can force exit 0 would otherwise mint
     // a false "deps ready".
     //
-    // Conditioned on the project DECLARING dependencies, and that condition is not
-    // caution — it is measured: `npm ci` on a zero-dependency project exits 0 and creates
-    // no `node_modules` at all (yarn and pnpm do create one). An unconditional check would
-    // turn that genuine success into a reported failure, which is the same class of lie in
-    // the other direction. When we cannot tell (no readable package.json, e.g. a pnpm
-    // workspace root without one), we do not downgrade.
-    if (outcome.ok && project.declaresDependencies && !existsSync(join(cwd, "node_modules"))) {
+    // The condition is not caution, it is measured, and it cuts BOTH ways:
+    //
+    //  - A project that declares NO dependencies legitimately ends up with no
+    //    `node_modules`: `npm ci` there exits 0 and creates nothing (yarn and pnpm do
+    //    create one). Corroborating unconditionally would turn that genuine success into
+    //    a reported failure — the same class of lie in the other direction.
+    //  - A WORKSPACE ROOT is corroborated even when its own package.json declares no
+    //    dependencies, because the deps live in the members and `workspaceRoot` PRUNES the
+    //    whole subtree — so one false `ok` here would cover every member of the monorepo,
+    //    which is the common shape rather than an exotic one. This does not over-fire:
+    //    measured, `npm ci` at a workspace root creates a root `node_modules` even with
+    //    zero dependencies declared anywhere in the workspace (it writes the member
+    //    symlinks), while the members get none of their own.
+    //
+    // When we genuinely cannot tell — no readable package.json and not a workspace root —
+    // we do not downgrade. Unknown is not a positive in either direction.
+    //
+    // WORTH RE-DECIDING WHEN M4 LANDS. This leans on an asymmetry that is true today: a
+    // false "not ready" costs an unnecessary honest skip, while a false "ready" is exactly
+    // the lie the corroboration exists to catch. Once gate honesty consumes this signal, a
+    // false "not ready" instead produces an "unverified" banner on a delivery that was
+    // fine — and banners that cry wolf train reviewers to ignore them, which is the
+    // failure mode M4's own design warns about. The asymmetry flips; revisit it there.
+    if (outcome.ok && (project.declaresDependencies || project.workspaceRoot) && !existsSync(join(cwd, "node_modules"))) {
       outcome = { ok: false, detail: "reported success but left no node_modules" };
     }
 
