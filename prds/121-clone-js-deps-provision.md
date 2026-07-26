@@ -105,13 +105,18 @@ Three coherent parts (the same judge reviews flagged all three):
   (`gatePlan` short-circuits with no wait, `runner.ts:587-607`) the overlap window is
   only the plan turn, so a slow install can add real wall-clock before implement —
   acceptable, and stated honestly rather than claimed away.
-- [ ] **M3 — Pre-scan accuracy (`scanCommandNotFound`).** Suppress a `ToolMiss` for a
-  tool the same run later ran successfully. Note: `judgeSignal` today fetches only
-  `tool_result` payloads (`ListToolResultPayloadsForRun`, `judge.go:231`) — no
-  `tool_use` rows or structured exit codes — so "later ran green" needs either widening
-  the query to the invocation side or a text heuristic over the payloads; scope that in
-  M3. The suppression itself is safe (a genuinely-absent tool cannot later run green).
-  Go unit tests with fumble-then-succeed traces.
+- [x] **M3 — Pre-scan accuracy (`scanCommandNotFound`).** Suppress a `ToolMiss` for a
+  tool the same run later ran successfully. **Resolved by widening the query to the
+  invocation side.** `judgeSignal` used to fetch `tool_result` payloads only, with no
+  `tool_use` rows and no structured exit codes anywhere; the text-heuristic alternative
+  was ruled out because the COMMAND lives only in `tool_use` and a successful
+  `tsc --noEmit` prints nothing, so the direct-invocation arm has no text to read.
+  `ListToolResultPayloadsForRun` was therefore REPLACED by `ListToolTraceForRun`
+  (`kind IN ('tool_use','tool_result')`, `seq` projected, `ORDER BY seq ASC`).
+  Suppression requires the tool to run green at a strictly later seq, off the
+  originating command's executable positions or an npm-script echo line. The
+  suppression itself is safe (a genuinely-absent tool cannot later run green).
+  Go unit tests with authored fumble-then-succeed traces, plus a live-DB assertion.
 - [ ] **M4 — Gate honesty (net-new machinery — heaviest milestone; may split).** This
   is NOT just surfacing an existing signal: the ran/failed/skipped mapping today lives
   only in self-improve's `defaultCheckRunner` (`self-improve.ts:227-249`) for hardcoded

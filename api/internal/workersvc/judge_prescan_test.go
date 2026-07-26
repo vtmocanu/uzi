@@ -3,6 +3,7 @@ package workersvc
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -304,6 +305,10 @@ func TestExecutablesInParsesExecutablePosition(t *testing.T) {
 		{"npx vitest run", []string{"npx", "vitest"}},
 		{"pnpm exec tsc --noEmit", []string{"pnpm", "tsc"}},
 		{"bunx eslint .", []string{"bunx", "eslint"}},
+		{"pnpm dlx tsc --noEmit", []string{"pnpm", "tsc"}},
+		{"yarn dlx eslint .", []string{"yarn", "eslint"}},
+		// `2>&1` is a redirect: the trailing 1 must not become a phantom executable.
+		{"tsc > out.txt 2>&1", []string{"tsc"}},
 		{"CI=1 NODE_ENV=test tsc", []string{"tsc"}},
 		{"cat x | jq .name", []string{"cat", "jq"}},
 		{"make build; helm lint", []string{"make", "helm"}},
@@ -336,6 +341,67 @@ func TestExecutablesInParsesExecutablePosition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestScriptEchoIgnoresOutputBelowTheHeaderBlock pins the bound on the script-echo
+// channel. A suite that prints a shell transcript — CLI usage goldens, README-driven
+// tests, markdown snapshots — must not fake a green for the tool in that transcript.
+// Live in this repo, which has a CLI with docs, not a hypothetical.
+func TestScriptEchoIgnoresOutputBelowTheHeaderBlock(t *testing.T) {
+	vitestOutput := "\n> uzi@1.0.0 test\n> vitest run\n\n" +
+		" ✓ src/docs.test.ts (3)\n" +
+		"   golden output:\n" +
+		"    $ shellcheck x.sh\n" + // a docs golden, NOT an invocation
+		"    (no issues found)\n" +
+		" Test Files  1 passed (1)\n"
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(9, "m1", "shellcheck x.sh"),
+		traceResult(10, "m1", "sh: 1: shellcheck: not found", true),
+		traceUse(29, "g1", "npm run test"),
+		traceResult(30, "g1", vitestOutput, false),
+	}
+	assertReported(t, rows, []string{"shellcheck"})
+
+	// The real echo, two lines up in the same output, still registers.
+	if _, ok := observedGreenTools(rows)["vitest"]; !ok {
+		t.Error("the package manager's own echo must still be read — bounding the " +
+			"channel must not disable it")
+	}
+}
+
+// TestScriptEchoReadsYarnAndBunHeaders: yarn 1 and bun prefix with `$ ` and, unlike
+// npm, emit no blank line before the command's output. They are why the channel needs
+// a LINE CAP and not only a blank-line stop.
+func TestScriptEchoReadsYarnAndBunHeaders(t *testing.T) {
+	for _, tc := range []struct{ name, output string }{
+		{"yarn1", "yarn run v1.22.19\n$ tsc --noEmit\nDone in 1.20s.\n"},
+		{"bun", "$ tsc --noEmit\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scriptEchoTools(tc.output); len(got) != 1 || got[0] != "tsc" {
+				t.Fatalf("scriptEchoTools = %v, want [tsc]", got)
+			}
+		})
+	}
+}
+
+// TestCommandIndexBudgetIsATrueBound: an oversized command is skipped rather than
+// admitted and then blinding every later invocation.
+func TestCommandIndexBudgetIsATrueBound(t *testing.T) {
+	huge := "tsc " + strings.Repeat("x", judgeCommandByteBudget*3)
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(1, "big", huge),
+		traceResult(2, "big", "", false),
+		traceUse(3, "small", "vitest run"),
+		traceResult(4, "small", "", false),
+	}
+	green := observedGreenTools(rows)
+	if _, ok := green["tsc"]; ok {
+		t.Error("a command exceeding the index budget must be skipped, not admitted in full")
+	}
+	if _, ok := green["vitest"]; !ok {
+		t.Error("an oversized command must not blind the index to every LATER invocation")
 	}
 }
 

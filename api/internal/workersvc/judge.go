@@ -50,6 +50,14 @@ const (
 	// collecting only 20 would let suppression shrink the reported set below what
 	// the cap was ever meant to allow (20 candidates, 15 suppressed → 5 reported,
 	// while 5 further genuine misses went unscanned). Collect double, then truncate.
+	//
+	// This NARROWS that gap; it does not close it, and the truncation is SILENT
+	// either way — nothing in JudgeSignal marks a run whose misses were cut off.
+	// With 25 of 40 candidates suppressed you report 15 while further genuine misses
+	// went unscanned. Measured: 60 distinct missing tools → 40 candidates → 20
+	// reported, no marker anywhere. The 20-cap silence is pre-existing behaviour
+	// (the old scan capped identically); doubling only makes it rarer. A run
+	// legitimately missing 40 tools is broken in a way one signal cannot convey.
 	judgeMissCandidateCap = 2 * judgeMaxMissingTools
 )
 
@@ -233,11 +241,17 @@ func observedGreenTools(rows []store.ListToolTraceForRunRow) map[string]int32 {
 	for _, row := range rows {
 		switch row.Kind {
 		case "tool_use":
-			if cmdBytes >= judgeCommandByteBudget {
-				continue
-			}
 			id, cmd := toolUseCommand(row.Payload)
 			if id == "" || cmd == "" {
+				continue
+			}
+			// Checked BEFORE the add, against this command's own length, so the
+			// constant is a true bound. Testing the running total first made the real
+			// bound "the budget plus one command": a single 384 KB command was indexed
+			// in full and every later invocation dropped. Skipping the oversized one
+			// instead keeps the rest of the run observable, and dropping an invocation
+			// only ever under-suppresses.
+			if cmdBytes+len(cmd) > judgeCommandByteBudget {
 				continue
 			}
 			cmdBytes += len(cmd)
@@ -309,7 +323,30 @@ var envAssignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 // npm and pnpm prefix with `> `, yarn 1 and bun with `$ `. The `> pkg@1.0.0 typecheck`
 // header yields a junk token that can never match a miss candidate — harmless, and
 // cheaper than trying to pick the right line out of the pair.
-var reScriptEcho = regexp.MustCompile(`(?m)^[ \t]*[>$][ \t]+(\S+)`)
+//
+// Applied per line inside the header block only — see judgeScriptEchoMaxLines.
+var reScriptEcho = regexp.MustCompile(`^[ \t]*[>$][ \t]+(\S+)`)
+
+// judgeScriptEchoMaxLines bounds how far into a result the script-echo channel reads.
+//
+// 🔴 SCANNING THE WHOLE RESULT LETS A TEST'S OWN OUTPUT FAKE A GREEN. Measured: an
+// `npm run test` whose vitest output contains a docs golden printing
+// `    $ shellcheck x.sh` marked shellcheck green and suppressed a real miss. Any
+// suite printing a shell transcript does this — CLI usage goldens, README-driven
+// tests, markdown snapshots — and uzi's own repo has a CLI with docs, so this is live
+// rather than hypothetical.
+//
+// A package manager's echo lives in the first few lines and nowhere else: npm and pnpm
+// emit a blank line, the `> pkg@1.0.0 script` header, the `> command` line, then a
+// blank line; yarn 1 emits `yarn run v1.x` then `$ command`; bun emits `$ command`
+// first. Five lines covers all four with room to spare, and the blank-line stop ends
+// the block earlier still for npm/pnpm — yarn is the one that needs the line cap,
+// since its command output follows with no blank line between.
+//
+// Residual: a nested script (`npm run build` whose script runs `npm run compile`)
+// pushes the inner echo past this window, so its tool is not observed. That
+// under-suppresses, which is the safe direction.
+const judgeScriptEchoMaxLines = 5
 
 // executablesIn returns the basenamed executables in EXECUTABLE POSITION of a shell
 // command: the first token, tokens after a command separator, and the token an exec
@@ -351,9 +388,22 @@ func isScriptRunnerCommand(command string) bool {
 // than the raw jsonb payload the regex scan reads (there, a newline is a literal \n).
 func scriptEchoTools(text string) []string {
 	var out []string
-	for _, m := range reScriptEcho.FindAllStringSubmatch(text, -1) {
-		if name := basenameToken(m[1]); name != "" {
-			out = append(out, name)
+	seenContent := false
+	for i, line := range strings.SplitN(text, "\n", judgeScriptEchoMaxLines+1) {
+		if i >= judgeScriptEchoMaxLines {
+			break // the final piece is the unsplit remainder; never inspect it
+		}
+		if strings.TrimSpace(line) == "" {
+			if seenContent {
+				break // the header block ended; the rest is the command's own output
+			}
+			continue // npm and pnpm open with a blank line
+		}
+		seenContent = true
+		if m := reScriptEcho.FindStringSubmatch(line); m != nil {
+			if name := basenameToken(m[1]); name != "" {
+				out = append(out, name)
+			}
 		}
 	}
 	return out
@@ -388,8 +438,12 @@ func execPositions(command string) [][2]string {
 		switch name := basenameToken(t); {
 		case execWrappers[name]:
 			execNext = true
-		case scriptRunners[name] && next == "exec":
-			i++ // consume `exec`; `pnpm exec tsc` puts tsc in executable position
+		case scriptRunners[name] && (next == "exec" || next == "dlx"):
+			// `dlx` is pnpm's and Berry's npx, so it wraps exactly like `exec`.
+			// The set is deliberately narrow otherwise: `time tsc`, `sudo helm`,
+			// `xargs -n1 tsc`, `sh -c "tsc"` all leave the tool unobserved, which
+			// under-suppresses — the safe direction this parser commits to.
+			i++ // consume the subcommand; `pnpm exec tsc` puts tsc in exec position
 			execNext = true
 		}
 	}
@@ -470,6 +524,14 @@ func shellTokens(command string) []string {
 		case ' ', '\t', '\r':
 			flush()
 		case '\n', ';', '|', '&', '(', ')':
+			// `2>&1` is a redirect, not a separator. Treating it as one flushed `2>`
+			// and put the trailing `1` in executable position — a phantom executable
+			// per redirect. Harmless downstream (noisyShToken drops pure digits, so it
+			// could never match a candidate) but the parser should not invent it.
+			if c == '&' && strings.HasSuffix(cur.String(), ">") {
+				cur.WriteRune(c)
+				continue
+			}
 			flush()
 			if heredoc {
 				continue // structure inside heredoc data is not structure
