@@ -146,10 +146,45 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
       assert.strictEqual(
         gitIn(repo, ["config", "--get", "gc.auto"]),
         "0",
-        `${label}: gc.auto=0 covers git predating the maintenance rework, where the detaching ` +
-          `process is \`git gc --auto\` itself`,
+        `${label}: gc.auto=0 is the key on 2.55+, where prepare_auto_maintenance gained a ` +
+          `gc.auto fallback. Neither key subsumes the other across the version range.`,
       );
     }
+  });
+
+  // The test above only proves the keys land on a FIRST clone. `cloneBare` runs once ever,
+  // and `/data` is persistent (a per-worker PVC in k8s, the `agentdata` volume under compose),
+  // so every bare on an already-deployed worker is reached ONLY through ensureClone's fetch
+  // branch. Writing the keys in cloneBare alone therefore applied them to none of the repos
+  // the change is actually about. Caught in review; this is the regression pin.
+  it("reasserts auto-maintenance-off on the WARM ensureClone path, not just the first clone (#134)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+
+    // Simulate a bare that predates the fix.
+    gitIn(bare, ["config", "--unset", "maintenance.auto"]);
+    gitIn(bare, ["config", "--unset", "gc.auto"]);
+    // `config --get` EXITS 1 on an unset key, and gitIn throws on non-zero — so read the
+    // precondition tolerantly rather than asserting through a throw.
+    const getOrEmpty = (repo: string, key: string): string => {
+      try {
+        return gitIn(repo, ["config", "--get", key]);
+      } catch {
+        return "";
+      }
+    };
+    assert.strictEqual(getOrEmpty(bare, "maintenance.auto"), "", "precondition: key is unset");
+
+    // Second call takes the isBareRepo branch — no cloneBare involved.
+    const again = await git.ensureClone(fx.originPath);
+    assert.strictEqual(again, bare, "precondition: same bare, so this exercised the warm path");
+
+    assert.strictEqual(
+      gitIn(bare, ["config", "--get", "maintenance.auto"]),
+      "false",
+      "an existing bare must be reconfigured on use — otherwise every deployed worker keeps " +
+        "racing a detached gc against its own claim fetch forever",
+    );
+    assert.strictEqual(gitIn(bare, ["config", "--get", "gc.auto"]), "0");
   });
 
   it("removes the runner clone but keeps the worker bare clone", async () => {
@@ -188,6 +223,29 @@ describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
     assert.equal(env.PATH, process.env.PATH);
     assert.equal(env.GIT_TERMINAL_PROMPT, "0");
     assert.ok(!JSON.stringify(env).includes("join-token-SECRET"), "no worker secret in the git env");
+  });
+
+  // Issue #134. Added because a negative control found these pins UNTESTED: removing them
+  // from gitEnv broke nothing, while the claim on them is that they close the whole class
+  // (highest precedence, warm or cold, unoverridable by a planted config file).
+  it("pins auto-maintenance off inline, so no git through this module spawns a detached gc (#134)", () => {
+    const cfg = configPairs(gitEnv());
+    assert.equal(
+      cfg["maintenance.auto"],
+      "false",
+      "the load-bearing key on git 2.54 (the shipped worker image), where " +
+        "prepare_auto_maintenance reads ONLY maintenance.auto",
+    );
+    assert.equal(
+      cfg["gc.auto"],
+      "0",
+      "the key on 2.55+, which gained a gc.auto fallback — neither subsumes the other across " +
+        "the version range, so both are pinned",
+    );
+    // Still present with a PAT: the credential branch appends and must not displace them.
+    const withPat = configPairs(gitEnv("secret-pat", "https://gitlab.example.com/", "bot"));
+    assert.equal(withPat["maintenance.auto"], "false");
+    assert.equal(withPat["gc.auto"], "0");
   });
 
   it("neutralizes hooks: core.hooksPath is the baked root-owned path, NOT a runtime dir", () => {
