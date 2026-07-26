@@ -732,8 +732,17 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   |---|---|
   | mutation addressed by LINE NUMBER, landed on a comment | address **by content**; assert the changed-line count |
   | census truncated by `head` | count with `rg -c` / `wc -l` / `--stat` and **reconcile the total against the rows shown** |
-  | pipeline broke; nothing mutated or measured | prove application with `git diff --numstat` **plus** a re-grep showing zero remaining |
+  | pipeline broke; nothing mutated or measured | prove application with `git diff --numstat` **plus** a re-grep showing zero remaining — but see the NEW-FILE caveat below, where `--numstat` is itself a blind instrument |
   | check asked the wrong QUESTION (presence, not behaviour) | assert **identity/behaviour** (`String(impl)`, `toBe(el)`, `git grep <sha>`), never presence |
+  **NEW-FILE CAVEAT, and it makes the prescribed remedy itself a blind instrument.** `git diff
+  --numstat` compares against the INDEX, so for a file created in the working tree and not yet
+  staged it reports **nothing** — the same empty output it gives when a mutation failed to apply.
+  A mutation-applied check that cannot distinguish "landed" from "never ran" is the exact defect
+  this table exists to catch, sitting inside the table's own remedy column. Measured 2026-07-26
+  (PRD #113 M2): a mutation on a newly-added `upgrade.go` "proved" itself with empty `--numstat`
+  output. Use a content hash before/after (`md5`/`shasum`) plus the one-line diff, or stage the
+  file first so `--numstat` has a baseline. Found by the coder that hit it, on a rule the lead had
+  put in its own brief.
   Before believing any verification step, ask *what would this print if it were broken?* If the
   answer matches what it prints when it passes, it is not evidence. **Naming the class buys no
   immunity:** three of the four were committed by the agents most fluent in these rules, on the
