@@ -47,7 +47,16 @@ function Td({ children, left, total, mono }: { children: ReactNode; left?: boole
         !total && "border-b border-edge/50",
       )}
     >
-      {children}
+      {/* A model id is an unbounded machine string, so the Model column clips like
+          the strip's own model line does. `max-w` on a bare <td> is not honored by
+          table layout — the constraint has to sit on an inner block-level span. */}
+      {mono ? (
+        <span className="block max-w-[220px] truncate" title={typeof children === "string" ? children : undefined}>
+          {children}
+        </span>
+      ) : (
+        children
+      )}
     </td>
   );
 }

@@ -1774,7 +1774,10 @@ const dm = (kind: string, agent: string | null, payload: unknown, minAgo: number
 });
 
 export const mockDoneMessages: RunMessage[] = [
-  dm("status", null, { event: "init", model: "claude-sonnet-4-6" }, 219),
+  // The init frame is the strip's model — the run's MAIN-THREAD model, i.e. the
+  // lead's — so it must match the lead's assistant frames below (opus), or the demo
+  // would show a strip model that no agent row accounts for.
+  dm("status", null, { event: "init", model: "claude-opus-4-8" }, 219),
   // PRD #93: `model` rides the same assistant frame as `usage` — the coder pinned
   // sonnet while lead/reviewer ran on opus, so the demo run shows a mixed column.
   dm("text", "lead", { text: "Reading the PRD and the current run-view rendering to scope the fold-results work.", model: "claude-opus-4-8", usage: { input_tokens: 38_200, cache_read_input_tokens: 401_500, cache_creation_input_tokens: 2_000, output_tokens: 14_800 } }, 218),
@@ -1853,7 +1856,7 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
 });
 
 export const mockFailedMessages: RunMessage[] = [
-  fm("status", null, { event: "init", model: "claude-sonnet-4-6" }),
+  fm("status", null, { event: "init", model: "claude-opus-4-8" }), // matches the lead's frames below
   fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings.", model: "claude-opus-4-8", usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 } }),
   fm("tool_use", "lead", { id: "f-1", name: "Bash", input: { command: "go test -bench=Pool ./internal/store/..." } }),
   fm("tool_result", "lead", { tool_use_id: "f-1", content: "benchmark hung — no output after 40m", is_error: true }),

@@ -154,13 +154,16 @@ describe("deriveRunUsage", () => {
 
   it("picks the most frequent model as an agent's primary, with the others counted", () => {
     beforeEachReset();
+    // The minority model is deliberately seen FIRST, so this fixture discriminates:
+    // an implementation that returned the first-seen (or insertion-ordered) entry
+    // instead of the most frequent one would answer opus here and fail.
     const d = deriveRunUsage([
-      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
       assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
       assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
     ]);
     expect(d.agents[0]).toMatchObject({
-      model: "claude-sonnet-5", // 2 frames beats opus's 1, despite opus sorting first
+      model: "claude-sonnet-5", // 2 frames beats opus's 1, despite opus being first
       otherModels: 1, // rendered "+1"
       modelCounts: { "claude-sonnet-5": 2, "claude-opus-4-8": 1 },
     });
@@ -207,5 +210,37 @@ describe("deriveRunUsage", () => {
     expect(d.agents[0].modelCounts).toEqual({});
     expect(d.agentModels).toEqual([]);
     expect(d.model).toBe("claude-opus-4-8"); // the init-frame path is untouched
+  });
+
+  // A model id is untrusted payload data, so it must never collide with
+  // Object.prototype's keys — the count map is null-prototype (see newModelCounts).
+
+  it("counts a model named after an Object.prototype key without inheriting it", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("coder", { input: 100, output: 10, model: "constructor" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+    ]);
+    // With a plain `{}` accumulator this count would be `<function constructor>1`
+    // (a string), the b[1]-a[1] sort would go NaN, and the primary would be wrong.
+    expect(d.agents[0].modelCounts["constructor"]).toBe(1);
+    expect(d.agents[0].modelCounts["claude-sonnet-5"]).toBe(3);
+    expect(d.agents[0]).toMatchObject({ model: "claude-sonnet-5", otherModels: 1 });
+    expect(d.agentModels).toEqual(["claude-sonnet-5", "constructor"]);
+  });
+
+  it("counts a model named __proto__ and leaves Object.prototype unpolluted", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([assistantUsage("coder", { input: 100, output: 10, model: "__proto__" })]);
+    // On a plain `{}` the write is a silent no-op and the count vanishes entirely.
+    expect(d.agents[0].modelCounts["__proto__"]).toBe(1);
+    expect(Object.keys(d.agents[0].modelCounts)).toEqual(["__proto__"]);
+    expect(d.agents[0]).toMatchObject({ model: "__proto__", otherModels: 0 });
+    expect(d.agentModels).toEqual(["__proto__"]);
+    // The map itself has no prototype, and nothing leaked onto Object.prototype.
+    expect(Object.getPrototypeOf(d.agents[0].modelCounts)).toBeNull();
+    expect(({} as Record<string, unknown>)["__proto__"]).toBe(Object.prototype);
   });
 });

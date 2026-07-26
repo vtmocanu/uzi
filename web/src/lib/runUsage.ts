@@ -48,7 +48,8 @@ export interface AgentUsage {
   out: number;
   /** PRD #93 Decision 4: how many counted usage frames carried each model. A COUNT
    *  map, not a Set, because the primary is the most frequent one and the tie-break
-   *  needs the frequencies. Empty for a pre-feature run (no frame carried a model). */
+   *  needs the frequencies. Empty for a pre-feature run (no frame carried a model).
+   *  Always a NULL-PROTOTYPE object — see `newModelCounts`. */
   modelCounts: Record<string, number>;
   /** The derived primary: highest count, ties broken lexicographically ascending.
    *  null when no frame carried a model — never fabricated from the strip's init
@@ -115,6 +116,21 @@ const clampDelta = (cur: number, prev: number): number => Math.max(0, cur - prev
 
 /** An agent row mid-reduction: the model display is derived once, after the fold. */
 type AgentAcc = Omit<AgentUsage, "model" | "otherModels">;
+
+/**
+ * The per-agent model tally, keyed by a model id that is UNTRUSTED payload data (it
+ * comes off the wire, from the worker's frame mapper). A plain `{}` inherits
+ * `Object.prototype`, so a model literally named `constructor` / `toString` /
+ * `valueOf` would read back the inherited FUNCTION — `(counts[m] ?? 0) + 1` becomes
+ * a string, `primaryModel`'s numeric sort goes NaN, and frequency ordering silently
+ * dies — while `__proto__` would make the write a no-op and lose the count entirely.
+ * A null-prototype map has no inherited keys, so every model id is just a key.
+ * `Object.entries` / `Object.keys` / spread all read own enumerable props only, so
+ * the rest of the module is unaffected.
+ */
+function newModelCounts(): Record<string, number> {
+  return Object.create(null) as Record<string, number>;
+}
 
 /**
  * PRD #93 Decision 4: the primary model is the one seen on the most counted frames;
@@ -186,7 +202,7 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
       const u = readUsage(payload["usage"]);
       if (u) {
         const agent = m.agent ?? "lead";
-        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: {} };
+        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
         acc.fresh += u.fresh;
         acc.cached += u.cached;
         acc.out += u.out;

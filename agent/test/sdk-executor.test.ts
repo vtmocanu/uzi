@@ -707,9 +707,13 @@ describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
     assert.strictEqual(withUsage(probe.emits).length, 1);
+    // Non-status emits only: a system `init` STATUS payload legitimately carries a
+    // `model` (sdk-messages.ts mapSystem), so asserting over every emit would redden
+    // this test for an unrelated reason the day the fixture turns gain an init frame.
+    // The neighbouring PRD #40 result-frame test scopes itself the same way.
     assert.ok(
-      !probe.emits.some((m) => "model" in m.payload),
-      "no emitted payload has a `model` key at all",
+      !probe.emits.some((m) => m.kind !== "status" && "model" in m.payload),
+      "no emitted non-status payload has a `model` key at all",
     );
   });
 
