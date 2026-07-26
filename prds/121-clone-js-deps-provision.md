@@ -75,6 +75,15 @@ Three coherent parts (the same judge reviews flagged all three):
    or an `npm run <script>` / `node_modules/.bin/X` invocation that wraps it).
    This kills the tsc/vitest/eslint false positives. (Part 1 also shrinks these
    naturally — with `node_modules` present the agent stops fumbling bare `tsc`.)
+
+   **Clarification added 2026-07-26 after implementation, because this wording misleads.**
+   "An `npm run <script>` … that wraps it" reads as though the wrapping alone is what
+   suffices. It is not. Suppression of a wrapped tool depends **entirely on the package
+   manager's echo (`> tsc --noEmit`) surviving into the captured `tool_result`** — it is
+   never inferred from "npm ran green". Measured: the same trace with real npm output
+   suppresses `tsc`, and with a hand-written empty `tool_result` does not. The code is
+   correct and documents its residual; this sentence was the thing that could have sent
+   someone looking for an inference the implementation deliberately does not make.
 3. **Gate honesty.** When a plan *declared* gate commands that ended up
    **unrunnable** (install failed: no registry egress, lockfile drift), don't let
    the run `signal_done` with a green MR implying tests ran — annotate the MR /
@@ -160,6 +169,20 @@ Three coherent parts (the same judge reviews flagged all three):
   finding the right dirs and the install succeeding under the runner uid with the scrubbed
   env are different claims, and only the second one is M5. A live uzi instance is reachable
   via the `uzi` CLI, so the verification itself is cheap once deployed.
+
+  **⚠ A GREEN `./e2e/run-e2e.sh` DOES NOT COVER THIS MILESTONE, and the branch shipped with
+  one.** Measured 2026-07-26: e2e passed 201/0 on this work, and it executed **zero lines of
+  the agent-side change.** The harness runs `UZI_E2E_EXECUTOR=stub` → `StubExecutor`, while
+  the entire M2 install lives in `SdkExecutor.execute`. Recorded here because a 201-PASS e2e
+  sitting next to a PRD whose headline criterion is about agent behaviour is precisely the
+  artifact a later reader cites as proof — and it would be a false claim, from a genuinely
+  green gate, with nothing in the gate's own output to reveal it.
+
+  What e2e *did* prove is worth stating so the run is not dismissed either: the judge funnel
+  is still full-wire green with the widened `ListToolTraceForRun` inside `judgeSignal`, and
+  the merge broke no part of the run lifecycle. Note also that e2e does **not** exercise the
+  pre-scan's suppression path — the `jq: command not found` plant that would have was dropped
+  by PRD #97 M4.
 - [ ] **M6 — Docs.** Update the relevant docs/specs (`specs/ai.md` design note per
   repo convention; `CLAUDE.md`/`ARCHITECTURE.md` if the run lifecycle description
   needs it).
@@ -230,8 +253,18 @@ never the claim this section was making.
 
 Two limits, stated because their absence is what made the old text dangerous:
 
-1. **This is not an exhaustive audit of any package manager.** It is the set of vectors
-   three agents probed. What was deliberately NOT probed, recorded as clearly as what was:
+1. **This is not an exhaustive audit of any package manager, and NO SINGLE ENVIRONMENT HAS
+   EXECUTED ALL FOUR.** That is the sharpest limit here and it is easy to miss, because the
+   coverage looks complete when the reports are read together. The shipped worker image has
+   **npm and yarn** and lacks pnpm and bun; the machine that ran the independent installer
+   validation had **npm, pnpm and bun** and lacked yarn. So the manager the shipped image
+   actually uses is the one whose install arm was never executed end-to-end by the validator
+   — `YARN_IGNORE_PATH` is pinned as argv+env by a mutation fold, and the vector probes were
+   run inside `node:22-alpine` by other agents, but that is two partial coverages rather than
+   one complete one. **Treat yarn as the residual that matters most.**
+
+   It is the set of vectors three agents probed. What was deliberately NOT probed, recorded
+   as clearly as what was:
    **bun entirely** (no binary in the image, so the bun row rests on a single uncorroborated
    probe; `bunfig.toml` `preload` is the obvious untested candidate — this is the largest
    gap); **corepack shims** (present in the image but not enabled — `corepack enable` would
