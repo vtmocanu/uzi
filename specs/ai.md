@@ -11417,7 +11417,13 @@ Recorded as a decision rather than left to read as an omission, following §364'
   finds nothing, which looks like the worker having gone" — a silent wrong answer. **Measured: the
   failure is the opposite kind.** `<` and `>` are shell redirection, so the shell fails on the missing
   redirect target (`no such file or directory: worker-namespace`) and `kubectl` never runs at all. Loud,
-  not silent, and before any cluster call. Second, "the exit code separates permission-denied from
+  not silent, and before any cluster call. **And the sentence is not merely wrong, it describes what the
+  OBVIOUS FIX would do** — which is why it is recorded rather than only deleted. Quoting the
+  placeholder is the natural correction, and measured, quoting makes it survive as one literal
+  argument, so `kubectl` *does* run, against a namespace literally named `<worker-namespace>`, and
+  answers `No resources found` with **exit 0**. So the silent wrong answer the page wrongly attributed
+  to the unquoted form is exactly what quoting manufactures. Neither form is safe to paste, and they
+  fail in opposite ways. Second, "the exit code separates permission-denied from
   `/nix` running out of space" is false: GNU `tar` exits 2 for *every* fatal error, so both cases exit
   2. What actually discriminates them is the stderr line — which this architecture deliberately refuses
   to carry (§393). Recorded here rather than only fixed in the page, because both read as *diagnostics
