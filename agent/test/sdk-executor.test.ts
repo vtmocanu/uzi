@@ -1550,6 +1550,86 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     );
   });
 
+  // Local: `revise`/`approve` live in the PRD #41 describe block, not at file scope.
+  const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+
+  it("JOINS before implement on the REVISE path too, not just the single-gate path", async () => {
+    // The gate can be re-entered N times (PRD #41), and each re-entry runs another
+    // PLANNING turn. The sibling test above covers one gate call; this covers two, so
+    // a join that moved inside the revision loop — or a second entry into implement
+    // that skipped it — cannot pass unnoticed.
+    const RELEASE_MS = 400;
+    const deferred = deferredInstall([{ dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" }]);
+
+    // Observed INSIDE each turn, so the assertions read the real interleaving rather
+    // than a post-hoc reconstruction (same discipline as the sibling test).
+    const doneAtTurn: Record<number, boolean> = {};
+    const startedAtTurn: Record<number, number> = {};
+    let turn = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      turn++;
+      const t = turn;
+      doneAtTurn[t] = deferred.isDone();
+      startedAtTurn[t] = Date.now();
+      return (async function* () {
+        for await (const _ of params.prompt) void _;
+        // turns 1 and 2 are PLANNING turns — a revision turn must submit a plan too.
+        if (t <= 2) yield submitPlan(`# Plan v${t}`);
+        else yield signalDone();
+        yield resultSuccess();
+      })();
+    };
+
+    const probe = makeCtx({}, [revise("add a rollback step"), approve]);
+    // Release from the APPROVING (second) gate, on a later macrotask: without a join
+    // the implement turn would start on this same tick chain and observe it unfinished.
+    const gated = probe.ctx.gatePlan!;
+    let gateCalls = 0;
+    let releasedAt = 0;
+    probe.ctx.gatePlan = async (planMd) => {
+      gateCalls++;
+      if (gateCalls === 2) {
+        releasedAt = Date.now();
+        setTimeout(() => deferred.release(), RELEASE_MS);
+      }
+      return gated(planMd);
+    };
+
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps: deferred.installDeps }).run(probe.ctx);
+
+    assert.strictEqual(gateCalls, 2, "the gate must have been re-entered once (revise → approve)");
+    assert.strictEqual(turn, 3, "expected plan turn, revision turn, then one implement turn");
+    assert.strictEqual(deferred.calls.length, 1, "the install must be started ONCE, not restarted per gate round");
+
+    assert.strictEqual(
+      doneAtTurn[1],
+      false,
+      "the plan turn ran only after the install finished — the install was awaited at kick-off instead of overlapping",
+    );
+    assert.strictEqual(
+      doneAtTurn[2],
+      false,
+      "the REVISION turn ran only after the install finished — the revise path is not overlapping the install",
+    );
+    assert.strictEqual(
+      doneAtTurn[3],
+      true,
+      "the first implement turn started while the dependency install was still running: on the revise path the agent " +
+        "can run its own `npm ci` in the same dir as the worker-side install, and npm has no cross-process node_modules lock",
+    );
+
+    // The control. `doneAtTurn[3] === true` is satisfiable by coincidence (a fast
+    // install, a scheduling accident); a gap at least as long as the release delay is
+    // not — it proves the implement turn actually BLOCKED at the join.
+    const gap = startedAtTurn[3]! - releasedAt;
+    assert.ok(
+      gap >= RELEASE_MS - 25,
+      `the implement turn started ${gap}ms after the approving gate but the install was not released until ` +
+        `${RELEASE_MS}ms — it did not wait at the join, it merely observed an install that had already finished`,
+    );
+  });
+
   it("is best-effort: a failed install does NOT fail the run, and the skip is reported honestly", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
