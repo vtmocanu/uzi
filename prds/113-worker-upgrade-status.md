@@ -271,7 +271,8 @@ nav item** gains an alert badge = the count of workers needing attention.
   poll, since the Workers page poll is page-local/visibility-gated),
   `web/src/lib/api.ts` (`Worker` DTO fields + fleet-summary type), a new
   `WorkerUpgradeBadge` component, a `tone` on `NavItem`'s badge.
-- **docs**: `docs/configuration.md:198` (the "informational only" note is now
+- **docs**: ~~`docs/configuration.md:198`~~ **`:199`, and DONE in M1 `803de924`** — see
+  the M8 milestone note (the "informational only" note is now
   false in two ways — the value is not informational, and it does not update on
   heartbeat, only register), a worker-versioning/upgrade-status doc section, and
   `ARCHITECTURE.md` worker-lifecycle notes.
@@ -336,10 +337,16 @@ nav item** gains an alert badge = the count of workers needing attention.
       mute), and the compose-degradation case (no controller → version-compare only).
 - [ ] **M8 — Docs**: a worker-versioning & upgrade-status doc (what each state
       means, why external workers do not auto-upgrade, what to do on a failed
-      upgrade), plus the mandated corrections — `docs/configuration.md:198`'s
-      "informational only / register+heartbeat" `UZI_AGENT_VERSION` note is now
-      false on both counts and must be fixed, and `ARCHITECTURE.md` worker
-      -lifecycle notes updated.
+      upgrade), plus `ARCHITECTURE.md` worker-lifecycle notes.
+      ~~the mandated corrections — `docs/configuration.md:198`'s "informational only
+      / register+heartbeat" note is now false on both counts~~ **DONE in M1
+      (`803de924`), not M8.** `CLAUDE.md` requires a disproved doc to be corrected in
+      the commit that disproved it, and M1 is that commit. It was `:199` not `:198`,
+      and it was false on **three** counts, not two: the note, the heartbeat claim,
+      **and** the default column, which after M1 advertises a value that no longer
+      exists — so a reader configuring a worker was actively misled rather than
+      merely under-informed. M8 must NOT redo this row; re-correcting a correct row
+      is how it gets un-corrected.
 
 ## Success Criteria
 
