@@ -31,6 +31,15 @@ describe("loadConfig version (PRD #113 M1)", () => {
     assert.strictEqual(loadConfig(baseEnv({ UZI_AGENT_VERSION: "0.11.7" })).version, "0.11.7");
   });
 
+  it("passes the +g<short-sha> build-metadata suffix through verbatim", () => {
+    // CI stamps `<release>+g<short-sha>`. SemVer §10 excludes build metadata from
+    // precedence (x/mod/semver: Compare("v0.11.7+g1a2b3c4","v0.11.7") == 0), so the
+    // suffix costs the api's compare nothing, but the worker must report it
+    // UNTOUCHED or the commit it identifies is unrecoverable from the UI. No
+    // trimming, no normalization, no stripping of the `+` on this side.
+    assert.strictEqual(loadConfig(baseEnv({ UZI_AGENT_VERSION: "0.11.7+g1a2b3c4" })).version, "0.11.7+g1a2b3c4");
+  });
+
   it("is EMPTY when unstamped — never a fake SemVer", () => {
     // The retired "0.1.0-m4" default is the whole point of this milestone: an
     // unstamped image must report nothing (the api classifies it `unknown`)
