@@ -212,7 +212,7 @@ func suppressResolved(cands []missCandidate, green map[string]int32) []ToolMiss 
 }
 
 // observedGreenTools indexes the executables a run demonstrably RAN without error,
-// mapping each to the EARLIEST seq at which it did (PRD #121 M3). It walks the trace
+// mapping each to the LATEST seq at which it did (PRD #121 M3). It walks the trace
 // once, joining tool_result rows back to their originating tool_use by tool_use_id —
 // never by "some later row mentions X", which an invocation with no result would
 // satisfy without anything having executed.
@@ -264,7 +264,15 @@ func observedGreenTools(rows []store.ListToolTraceForRunRow) map[string]int32 {
 				if vetoed[tool] {
 					continue
 				}
-				if at, ok := green[tool]; !ok || row.Seq < at {
+				// LATEST, not earliest. suppressResolved asks an EXISTENTIAL — "is
+				// there a green at a seq above this candidate's?" — and max is that
+				// question's reduction; min answers the stricter "is the FIRST green
+				// above it?", which is wrong for green → miss → green. Measured:
+				// helm green @10, miss @30, helm green @50 kept reporting helm under
+				// min, though helm demonstrably ran after the miss. The two agree
+				// everywhere except that shape, which is why fixture case 10 is the
+				// gate here and not a unit assertion on the map.
+				if at, ok := green[tool]; !ok || row.Seq > at {
 					green[tool] = row.Seq
 				}
 			}

@@ -212,6 +212,23 @@ func TestPrescanSuppressionFixture(t *testing.T) {
 			},
 			want: []string{"tsc"},
 		},
+		{
+			name: "10_green_miss_green_suppresses",
+			why: "helm demonstrably ran green AFTER the miss; recording the EARLIEST green " +
+				"answered the wrong question and kept reporting it",
+			// Isolated from the combined trace for the same reason as case 7: it reuses
+			// helm, which case 4 expects REPORTED. green → miss → green and
+			// green → miss are opposite expectations for one tool.
+			rows: []store.ListToolTraceForRunRow{
+				traceUse(9, "g1", "helm version"),
+				traceResult(10, "g1", "version.BuildInfo{Version:\"v3.16.2\"}", false),
+				traceUse(29, "m1", "helm template ."),
+				traceResult(30, "m1", "bash: helm: command not found", true),
+				traceUse(49, "g2", "helm version"),
+				traceResult(50, "g2", "version.BuildInfo{Version:\"v3.16.2\"}", false),
+			},
+			want: []string{},
+		},
 	}
 
 	for _, tc := range cases {
@@ -322,10 +339,15 @@ func TestExecutablesInParsesExecutablePosition(t *testing.T) {
 	}
 }
 
-// TestObservedGreenToolsRecordsEarliestSeq pins the min-seq rule: suppression asks
-// "did X run green LATER than the miss", so recording the last green rather than the
-// first would silently widen suppression.
-func TestObservedGreenToolsRecordsEarliestSeq(t *testing.T) {
+// TestObservedGreenToolsRecordsLatestSeq is a companion to fixture case 10, NOT the
+// gate for it. It asserts the map's shape, which is an implementation choice; case 10
+// asserts the behaviour that choice exists to produce, and that is what must redden.
+//
+// Recorded because the distinction was earned: while this map held the EARLIEST green,
+// the min→max fold reddened only this test and moved no fixture case, since no fixture
+// then had two greens straddling a miss. A test that pins the choice rather than the
+// consequence is exactly the test that goes green on a broken rewrite.
+func TestObservedGreenToolsRecordsLatestSeq(t *testing.T) {
 	rows := []store.ListToolTraceForRunRow{
 		traceUse(1, "a", "tsc --noEmit"),
 		traceResult(2, "a", "", false),
@@ -333,8 +355,9 @@ func TestObservedGreenToolsRecordsEarliestSeq(t *testing.T) {
 		traceResult(4, "b", "", false),
 	}
 	green := observedGreenTools(rows)
-	if at, ok := green["tsc"]; !ok || at != 2 {
-		t.Fatalf("green[tsc] = %v (present=%v), want the EARLIEST green seq 2", at, ok)
+	if at, ok := green["tsc"]; !ok || at != 4 {
+		t.Fatalf("green[tsc] = %v (present=%v), want the LATEST green seq 4 — suppression "+
+			"asks whether ANY green sits above the miss, and max is that existential", at, ok)
 	}
 }
 
