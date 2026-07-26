@@ -112,6 +112,17 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// written straight onto ObservedWorker.Roll because the pod pass REPLACES Roll
 	// wholesale, which would drop anything stashed there first.
 	targetImages := map[string]string{}
+	// The reason on each worker Deployment's ReplicaFailure condition when it is True —
+	// the Deployment controller saying a pod create FAILED, as opposed to a pod merely
+	// not existing yet (issue #148). Collected in the same pass as targetImages, and for
+	// the same reason: the pod pass below replaces Roll wholesale.
+	//
+	// This is read off an object ALREADY IN HAND and needs no RBAC beyond the `get/list
+	// deployments` this loop is built on. That is what makes the fix cheap: the cause of a
+	// pod that can never be created is on the Deployment's own status, not in Events —
+	// which PRD #113 declined to grant (`events: list` was refused) and which this does
+	// not reopen.
+	replicaFailures := map[string]string{}
 
 	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -128,6 +139,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.HasDeployment = true
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
+		}
+		if reason := replicaFailureReason(d); reason != "" {
+			replicaFailures[id] = reason
 		}
 		// Read the drift signals off the POD TEMPLATE's annotations — where we stamped
 		// them, and where they have to be for a change to roll the pod at all.
@@ -233,7 +247,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// wantHash is what this worker's DEPLOYMENT currently asks for, already read
 		// off its pod template above. Passing it is what makes the derivation about
 		// pod readiness rather than deployment drift — see rollhealth.go's header.
-		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, now)
+		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, replicaFailures[o.ID], now)
 		o.Roll.TargetImage = targetImages[o.ID]
 	}
 	// A worker seen ONLY as pods (its Deployment already gone, its pods still
@@ -244,10 +258,37 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		if o.HasDeployment {
 			continue // already derived above
 		}
-		o.Roll = deriveRollHealth(ps, o.SpecHash, now)
+		// replicaFailures is empty here by construction — this loop is the workers with NO
+		// Deployment, so there is no Deployment status to have read a condition off.
+		// Indexed rather than passed as a literal "" so the two call sites cannot drift.
+		o.Roll = deriveRollHealth(ps, o.SpecHash, replicaFailures[id], now)
 		o.Roll.TargetImage = targetImages[id]
 	}
 	return nil
+}
+
+// replicaFailureReason returns the reason on a worker Deployment's ReplicaFailure
+// condition when that condition is True, and "" otherwise — including when the condition
+// is absent, which is what a healthy Deployment shows (the Deployment controller REMOVES
+// the condition on a successful sync rather than setting it False, so absence is the
+// healthy state and this must not read it as unknown).
+//
+// The REASON only. The condition's `message` is not returned and must not be: see the
+// pod-less branch in rollhealth.go for both halves of why (free text, and a 64-byte cap
+// downstream that would keep only its prefix).
+//
+// Deployment, not ReplicaSet, and that matters for RBAC: the Deployment controller copies
+// its newest ReplicaSet's ReplicaFailure condition onto the Deployment, so the signal is
+// readable from the object this controller already lists. Nothing here needs
+// `replicasets: list`.
+func replicaFailureReason(d *appsv1.Deployment) string {
+	for i := range d.Status.Conditions {
+		c := &d.Status.Conditions[i]
+		if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
+			return c.Reason
+		}
+	}
+	return ""
 }
 
 // workerImage returns the agent container's image from a worker Deployment's pod

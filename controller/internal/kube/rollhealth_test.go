@@ -80,11 +80,15 @@ func TestDeriveRollHealth(t *testing.T) {
 	const want = "hash-new"
 
 	cases := []struct {
-		name       string
-		pods       []corev1.Pod
-		wantPhase  string
-		wantReason string
-		check      func(t *testing.T, h reconcile.RollHealth)
+		name string
+		pods []corev1.Pod
+		// replicaFailure is the reason on the Deployment's ReplicaFailure condition when
+		// True, as observeNamespace reads it. Empty on every pre-#148 case, which is what
+		// keeps them asserting what they always did.
+		replicaFailure string
+		wantPhase      string
+		wantReason     string
+		check          func(t *testing.T, h reconcile.RollHealth)
 	}{
 		{
 			name:      "no pod at all is the Recreate gap, and dates from nothing",
@@ -98,9 +102,52 @@ func TestDeriveRollHealth(t *testing.T) {
 			},
 		},
 		{
+			// #148. The case above is this one's NEGATIVE CONTROL and they must be read as a
+			// pair: same empty pod list, opposite answers, and the only difference is the
+			// condition. TestPodlessIsStuckOnlyWithReplicaFailure asserts the pair inside one
+			// function, because two independent subtests can both be satisfied by code that
+			// ignores the pods and keys on nothing at all.
+			name:           "a pod-less worker whose Deployment reports ReplicaFailure=True is STUCK, not rolling",
+			pods:           nil,
+			replicaFailure: "FailedCreate",
+			wantPhase:      protocol.PhaseStuck,
+			wantReason:     "FailedCreate",
+			check: func(t *testing.T, h reconcile.RollHealth) {
+				if !h.PhaseSince.IsZero() {
+					t.Errorf("PhaseSince = %v, want zero: there is still no pod to date this from, and the "+
+						"condition's own LastTransitionTime must not be smuggled into a field documented "+
+						"as a pod timestamp everywhere else", h.PhaseSince)
+				}
+				if h.BlockingContainer != "" {
+					t.Errorf("BlockingContainer = %q, want empty: no container exists — no pod was ever "+
+						"created. Naming one would invent a subject", h.BlockingContainer)
+				}
+			},
+		},
+		{
+			// The OTHER way the case above could pass vacuously: an implementation that keys
+			// on replicaFailure alone and never looks at the pods. A Deployment can carry
+			// ReplicaFailure=True from a create that failed while a healthy pod from the
+			// previous generation is still Ready, and that worker is NOT failed.
+			name:           "ReplicaFailure alongside a Ready pod does not override the pod",
+			pods:           []corev1.Pod{*ready(workerPod("w1", want, time.Hour), testNow.Add(-5*time.Minute))},
+			replicaFailure: "FailedCreate",
+			wantPhase:      protocol.PhaseSettled,
+		},
+		{
 			name:      "only the OLD pod is left: the new one is not up yet, so rolling",
 			pods:      []corev1.Pod{*workerPod("w1", "hash-old", time.Minute)},
 			wantPhase: protocol.PhaseRolling,
+		},
+		{
+			// The stale-pod branch is deliberately NOT gated on the condition — see its
+			// comment in rollhealth.go. Under Recreate a stale pod still being present means
+			// the delete is in flight, which is transient by construction, so gating it would
+			// add a cry-wolf window for no coverage the pod-less branch does not already give.
+			name:           "ReplicaFailure with only a STALE pod stays rolling: that branch is transient by construction",
+			pods:           []corev1.Pod{*workerPod("w1", "hash-old", time.Minute)},
+			replicaFailure: "FailedCreate",
+			wantPhase:      protocol.PhaseRolling,
 		},
 		{
 			name:      "the current pod is Ready: settled, dated from the Ready transition",
@@ -186,7 +233,7 @@ func TestDeriveRollHealth(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := deriveRollHealth(tc.pods, want, testNow)
+			h := deriveRollHealth(tc.pods, want, tc.replicaFailure, testNow)
 			if h.Phase != tc.wantPhase {
 				t.Errorf("Phase = %q, want %q", h.Phase, tc.wantPhase)
 			}
@@ -519,7 +566,7 @@ func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
 	const want = "hash-new"
 
 	flapping := running(workerPod("w1", want, 5*time.Minute), "worker", stuckRestartThreshold, false)
-	h := deriveRollHealth([]corev1.Pod{*flapping}, want, testNow)
+	h := deriveRollHealth([]corev1.Pod{*flapping}, want, "", testNow)
 
 	if h.Phase != protocol.PhaseStuck {
 		t.Errorf("Phase = %q, want %q. The container is RUNNING with %d restarts, which is the case "+
@@ -545,7 +592,7 @@ func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
 	// Running container BELOW the threshold must stay `rolling`, so the test is not
 	// simply passing because everything Running reads as stuck.
 	below := running(workerPod("w2", want, 5*time.Minute), "worker", stuckRestartThreshold-1, false)
-	if h := deriveRollHealth([]corev1.Pod{*below}, want, testNow); h.Phase != protocol.PhaseRolling {
+	if h := deriveRollHealth([]corev1.Pod{*below}, want, "", testNow); h.Phase != protocol.PhaseRolling {
 		t.Errorf("a Running container with %d restarts (below the threshold of %d) reads %q, want %q",
 			stuckRestartThreshold-1, stuckRestartThreshold, h.Phase, protocol.PhaseRolling)
 	}
@@ -553,7 +600,7 @@ func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
 	// And a healthy not-yet-Ready pod with ZERO restarts must have NO container blamed —
 	// naming one with 0 restarts would point an operator at innocent code.
 	fresh := running(workerPod("w3", want, 10*time.Second), "worker", 0, false)
-	if h := deriveRollHealth([]corev1.Pod{*fresh}, want, testNow); h.BlockingContainer != "" {
+	if h := deriveRollHealth([]corev1.Pod{*fresh}, want, "", testNow); h.BlockingContainer != "" {
 		t.Errorf("BlockingContainer = %q for a pod with no restarts, want empty", h.BlockingContainer)
 	}
 }
@@ -639,5 +686,151 @@ func TestRecreateGapReportsRollingRatherThanNoRow(t *testing.T) {
 	}
 	if !observed[0].Roll.PhaseSince.IsZero() {
 		t.Errorf("PhaseSince = %v, want zero: there is no pod to date the gap from", observed[0].Roll.PhaseSince)
+	}
+}
+
+// ===========================================================================
+// ISSUE #148 — THE DISCRIMINATOR, ASSERTED AS A PAIR IN ONE FUNCTION.
+// ===========================================================================
+//
+// The bug: a hosted worker whose Deployment can NEVER produce a pod was never alerted
+// on. Not at MaxUpgradingWindow, not ever. It took the pod-less branch, reported
+// `rolling`, became api R2 `upgrading` — which Decision 1 deliberately excludes from the
+// attention set — and past the INV-5 ceiling fell through to `unknown`, also silent.
+//
+// The fix is one condition lookup. The DANGER in the fix is the opposite failure: a
+// healthy Recreate roll passes through pod-less for ~1.4s on every release, so reporting
+// `stuck` for pod-lessness as such would turn the whole fleet red every time uzi ships.
+//
+// So the only thing worth testing is that the two are SEPARATED, and that is a claim
+// about a pair, not about either case alone. Two independent subtests each asserting one
+// half are both satisfied by an implementation that ignores its inputs in some way; this
+// function is red unless the condition — and nothing else — is what moves the answer.
+func TestPodlessIsStuckOnlyWithReplicaFailure(t *testing.T) {
+	const want = "hash-new"
+
+	// The healthy Recreate gap. MEASURED at ~1.4s on a real roll, on every release.
+	gap := deriveRollHealth(nil, want, "", testNow)
+	// The permanently-blocked worker. Same empty pod list, same hash, same clock.
+	blocked := deriveRollHealth(nil, want, "FailedCreate", testNow)
+
+	if gap.Phase != protocol.PhaseRolling {
+		t.Errorf("the healthy Recreate gap reports %q, want %q. Reporting stuck for pod-lessness AS SUCH "+
+			"cries wolf on every release — which is the failure PRD #113 exists to prevent, arriving "+
+			"through the branch that fixes #148.", gap.Phase, protocol.PhaseRolling)
+	}
+	if blocked.Phase != protocol.PhaseStuck {
+		t.Errorf("a pod-less worker whose Deployment asserts ReplicaFailure=True reports %q, want %q. "+
+			"This is issue #148: %q becomes api R2 `upgrading`, which Decision 1 excludes from the "+
+			"attention set, so the worker is never alerted on at all.",
+			blocked.Phase, protocol.PhaseStuck, blocked.Phase)
+	}
+	if gap.Phase == blocked.Phase {
+		t.Fatalf("both pod-less cases report %q. The condition is not the discriminator — whatever this "+
+			"implementation keys on, it is not ReplicaFailure, and one of the two failure modes "+
+			"(silent broken worker, or a red fleet on every release) is live.", gap.Phase)
+	}
+	if blocked.BlockingReason != "FailedCreate" {
+		t.Errorf("BlockingReason = %q, want the condition's reason forwarded. Without it the api's "+
+			"stuckDetail renders \"pod: not ready\" and the operator learns nothing about WHY no pod "+
+			"exists", blocked.BlockingReason)
+	}
+	if gap.BlockingReason != "" {
+		t.Errorf("the healthy gap carries BlockingReason = %q, want empty: nothing is blocking a roll "+
+			"that is simply between pods", gap.BlockingReason)
+	}
+}
+
+// The WIRING, which the table above cannot reach: that the reason actually comes off the
+// Deployment's own `.status.conditions` through Observe, with no new RBAC.
+//
+// This is the half most likely to be silently absent — deriveRollHealth can be perfectly
+// correct while observeNamespace never reads the condition, and every unit test above
+// still passes because they pass the string in by hand.
+//
+// Three Deployments, all pod-less, differing ONLY in the condition, so the negative
+// controls are aimed at the two ways this could pass without reading anything:
+//
+//   - ReplicaFailure=True   -> stuck. The bug's own shape.
+//   - ReplicaFailure=False  -> rolling. Aimed at code that matches on the condition TYPE
+//     and forgets the status, which would fire on any Deployment that ever recorded one.
+//   - no conditions at all  -> rolling. The healthy Recreate gap, and what a healthy
+//     Deployment really shows: the Deployment controller REMOVES the condition on a
+//     successful sync rather than setting it False.
+func TestObserveReadsReplicaFailureOffTheDeployment(t *testing.T) {
+	ctx := context.Background()
+	ns := testConfig().Namespace
+
+	dep := func(id string, conds ...appsv1.DeploymentCondition) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "uzi-hw-" + id, Namespace: ns, Labels: objectLabels(id)},
+			Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: objectLabels(id), Annotations: map[string]string{AnnotationSpecHash: "h"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName, Image: "img:1"}}},
+			}},
+			Status: appsv1.DeploymentStatus{Conditions: conds},
+		}
+	}
+	// The reason is the replicaset controller's, copied onto the Deployment. The message is
+	// deliberately present in the fixture and deliberately NOT expected anywhere in the
+	// output — see the assertion below.
+	failing := appsv1.DeploymentCondition{
+		Type:    appsv1.DeploymentReplicaFailure,
+		Status:  corev1.ConditionTrue,
+		Reason:  "FailedCreate",
+		Message: `pods "uzi-hw-blocked-abc-" is forbidden: error looking up service account uzi-workers/uzi-hosted-worker: serviceaccount "uzi-hosted-worker" not found`,
+	}
+	cleared := failing
+	cleared.Status = corev1.ConditionFalse
+
+	// No pods for any of them: every one of these is the pod-less branch.
+	m, _ := newMat(t, dep("blocked", failing), dep("cleared", cleared), dep("gap"))
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	byID := map[string]reconcile.RollHealth{}
+	for _, o := range observed {
+		byID[o.ID] = o.Roll
+	}
+	if len(byID) != 3 {
+		t.Fatalf("observed %d workers, want 3: %v", len(byID), byID)
+	}
+
+	if got := byID["blocked"].Phase; got != protocol.PhaseStuck {
+		t.Errorf("the worker whose Deployment carries ReplicaFailure=True reports %q, want %q. The "+
+			"condition is on an object observeNamespace ALREADY reads for SpecHash and TargetImage, so "+
+			"a %q here means the lookup is not wired in — issue #148 is live even though "+
+			"deriveRollHealth handles it", got, protocol.PhaseStuck, got)
+	}
+	if got := byID["blocked"].BlockingReason; got != "FailedCreate" {
+		t.Errorf("BlockingReason = %q, want %q read off the condition", got, "FailedCreate")
+	}
+	// The MESSAGE must not travel. Same line the pod path holds: a k8s message is free text
+	// carrying namespaces, object names and paths, and the api caps every controller-supplied
+	// display string at 64 bytes — so forwarding this one would deliver its least
+	// informative prefix and drop the actual cause. Asserted over every string on the row,
+	// not only BlockingReason, so a later "helpful" assignment to any display field trips it.
+	for field, v := range map[string]string{
+		"BlockingReason":    byID["blocked"].BlockingReason,
+		"BlockingContainer": byID["blocked"].BlockingContainer,
+		"PodPhase":          byID["blocked"].PodPhase,
+	} {
+		if v != "" && strings.Contains(failing.Message, v) && len(v) > len("FailedCreate") {
+			t.Errorf("%s = %q, which is a slice of the condition's MESSAGE. Only the reason may be "+
+				"forwarded", field, v)
+		}
+	}
+
+	if got := byID["cleared"].Phase; got != protocol.PhaseRolling {
+		t.Errorf("a pod-less worker whose ReplicaFailure condition is FALSE reports %q, want %q. "+
+			"Matching the condition TYPE without checking its STATUS fires on any Deployment that "+
+			"ever recorded a create failure, long after it was fixed", got, protocol.PhaseRolling)
+	}
+	if got := byID["gap"].Phase; got != protocol.PhaseRolling {
+		t.Errorf("a pod-less worker with NO conditions reports %q, want %q. This is the healthy Recreate "+
+			"gap — measured at ~1.4s and traversed on every release — so a %q here turns the whole "+
+			"fleet's badge red every time uzi ships", got, protocol.PhaseRolling, got)
 	}
 }
