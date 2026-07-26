@@ -1,7 +1,11 @@
 # PRD #120: web-ux browser reliability — stop runs fighting the SUID sandbox & SPA navigation after PRD #87
 
 **GitLab Issue**: [#120](https://gitlab.example.com/vtmocanu/uzi/-/issues/120)
-**Status**: Draft (created 2026-07-22; revised same day after a fable adversarial review that verified all 8 load-bearing claims against code/git/live state — calibrated toward Hypothesis A as the strong prior, added the deploy-lag hedge, and recorded that the #87 builtin shares the repo template's missing `--no-sandbox` note; see the Decision Log)
+**Status**: **RESOLVED (Hypothesis B) — fix MERGED to `main` as `6cac089c` (MR !109, 2026-07-25), NOT YET PROVEN ON A LIVE WORKER.** M5 is the only thing that closes this, and it needs a release → Harbor → ArgoCD → pod roll → a clean `web-ux` run. **Until M5 runs, `main` carries a fix nobody has seen work.** The next release ships it either way, so run M5 deliberately rather than discovering the outcome later.
+
+> **This header used to say "Draft … calibrated toward Hypothesis A as the strong prior" (deploy lag onto a mid-upgrade worker). That calibration was WRONG and the PRD #87 M7 gate run (issue #128, run `1dfc65b4`) disproved it** on a worker running `agent-base:0.11.6` — i.e. carrying every relevant fix, which is exactly what rules deploy lag out. `web-ux` still took 4 tool calls, the first launch died on `setuid_sandbox_host.cc:166`, and the launch resolved `/app/node_modules/.bin/agent-browser` rather than the shim. **Hypothesis B: a real delivery gap.** Left visible rather than rewritten, because the prior was reasonable and the evidence that killed it is the point. (Created 2026-07-22; a fable review that day verified all 8 load-bearing claims and added the release-time≠image-on-worker-time hedge — that hedge is what kept Hypothesis A alive long enough to be tested properly.)
+>
+> **Two caveats travel with the verdict and must not be dropped.** 4 tool calls is far milder than the 15+ this PRD recorded on run `2ebc093e`, and the flag came from `agent-browser`'s own error hint rather than blind trial. Real and structural, but cheaper than feared. Hypothesis A is dead as the *sole* explanation, not necessarily as an aggravating factor in `2ebc093e`'s severity — that run hit the worker #113 documents as mid-failed-upgrade.
 **Priority**: Medium
 
 ## Problem
@@ -135,9 +139,9 @@ efficiency + reliability fix, so Medium priority.
 - [ ] **M4 — Reconcile repo web-ux agent vs the #87 builtin.** Ensure the shipping
   guidance is identical/equivalent across `agent_source: repo` and `own`/builtin,
   and note the single source of truth so they cannot drift.
-- [ ] **M5 — Verified clean run.** A web-ux browser validation run on a current
-  worker completes with no sandbox abort and no SPA hard-nav dead-end. Capture the
-  evidence (activity log / judge review) showing the friction is gone.
+- [ ] **M5 — Verified clean run. THE ONLY REMAINING GATE, and the fix is merged-but-unproven until it passes.** A `web-ux` browser validation run on a worker carrying `6cac089c` completes with **no sandbox abort** and no SPA hard-nav dead-end. Requires a release → Harbor → ArgoCD → pod roll first; a `main` merge does not reach a worker.
+  **The measurement that matters is the tool-call count**, compared against the gate run's **4** (issue #128, run `1dfc65b4`): a clean first-try launch is the pass. Capture the activity log / judge review.
+  **Also re-check `which -a agent-browser` inside the AGENT shell, not the worker shell** — that distinction is the whole bug, and an operator probe on 2026-07-25 got a clean result from the worker shell while the agent shell was still broken.
 - [ ] **M6 — Tests & docs.** Unit/integration coverage for the M2 guarantee;
   update the relevant docs/specs to match (`specs/ai.md` if a design decision
   lands, per repo convention).
@@ -265,7 +269,9 @@ This also explains why an operator probe on 2026-07-25 found a *clean* launch: i
 
 (1) is the recommendation; the shim's header assertion must be corrected in the same change, since it is currently false.
 
-## FIXED 2026-07-25 — option (1) implemented (branch `fix/120-shim-path-shadowing`)
+## FIXED 2026-07-25 — option (1), MERGED as `6cac089c` (MR !109)
+
+> **Merged ≠ proven.** This section describes a change that is on `main` and nowhere else. It has never run on a real worker. M5 below is the gate; everything here is mechanism plus unit coverage.
 
 **The change (one line of behaviour).** `agent/templates/entrypoint.sh`, non-root branch:
 `export UZI_RUNNER_PATH="$PATH"` — placed **after** the existing
