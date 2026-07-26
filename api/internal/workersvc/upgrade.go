@@ -231,9 +231,17 @@ type UpgradeParams struct {
 	HostedRollGrace time.Duration
 	// RegisterConvergenceGrace bounds the gap between "the controller says the new pod
 	// is Ready" and "the worker has re-registered with its new version". A fresh pod
-	// registers on boot, so this is seconds in the healthy case; the window is
-	// generous enough that a pod whose container is Ready while the agent inside
-	// crash-loops still surfaces.
+	// registers on boot, so this is seconds in the healthy case.
+	//
+	// CORRECTED 2026-07-26 by live validation on 0.11.8. This comment used to claim
+	// the window is "generous enough that a pod whose container is Ready while the
+	// agent inside crash-loops still surfaces". It is NOT: R3 additionally requires
+	// isBehind(), and a crash-looping agent re-registers at the CURRENT release on
+	// every start, so it is never behind and R3 never fires — the row falls through
+	// to up_to_date. The grace bounds the register gap and nothing more. The
+	// crash-looping-agent case is a real gap tracked separately (issue #145), and it
+	// is not fixable here: it needs the controller to stop reporting `settled` on
+	// Ready alone, since the worker container ships with no readiness probe.
 	RegisterConvergenceGrace time.Duration
 	// MaxUpgradingWindow is the INV-5 ceiling: the longest a controller may be
 	// believed about one roll. A TTL bounds a controller that STOPS talking; nothing

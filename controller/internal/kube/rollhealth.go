@@ -42,16 +42,30 @@ import (
 
 const (
 	// stuckRestartThreshold is when repeated restarts alone mean stuck, with no
-	// blocking reason visible. REASONED, not measured: the reason arm below already
-	// catches CrashLoopBackOff, so this arm exists for a container that restarts
-	// repeatedly while flickering through Running, where the waiting reason is only
-	// intermittently present. Three strikes, matching the three missed beats that
+	// blocking reason visible. Three strikes, matching the three missed beats that
 	// mark a worker offline.
+	//
+	// MEASURED 2026-07-26 on 0.11.8, and this arm is LOAD-BEARING FOR THE MOTIVATING
+	// INCIDENT — not only for the exotic case this comment used to describe. It said
+	// the arm "exists for a container that restarts repeatedly while flickering
+	// through Running". That case is real and was reproduced, but a fast-failing
+	// seed-nix ALTERNATES between waiting:CrashLoopBackOff and terminated:Error, and
+	// `Error` is NOT in blockingReasons — measured steady-state split 71% / 29%. On
+	// every Error tick the reason arm is silent and only restartCount >= 3 holds the
+	// `stuck` verdict.
+	//
+	// So raising or removing this threshold makes the badge for PRD #113's own
+	// motivating incident flicker indefinitely. Do not treat it as covering only a
+	// rare shape.
 	stuckRestartThreshold = 3
 	// stuckAge is the fallback arm ONLY, for the reasonless cases: Pending with
 	// FailedScheduling or FailedMount, where no container exists yet to carry a
-	// waiting reason at all. REASONED: the real incident (seed-nix CrashLoopBackOff)
-	// fires on the reason arm within a couple of minutes. (This used to say k8s reports
+	// waiting reason at all. MEASURED 2026-07-26 at 2s resolution on 0.11.8: the real
+	// incident (seed-nix CrashLoopBackOff) first reports `stuck` at **37 seconds** from
+	// pod creation, via the reason arm — this used to say "within a couple of minutes",
+	// which was wrong by ~3x, though in the safe direction. The conclusion is unchanged
+	// and now measured rather than assumed: the reason arm is fast, so the age arm can
+	// afford to be generous. (This used to say k8s reports
 	// CrashLoopBackOff "from the second restart"; per kubelet's doBackOff the backoff
 	// starts on the FIRST termination. Harmless downstream — the arm fires sooner, not
 	// later — but it was a false mechanism in a comment.) This governs only what that
