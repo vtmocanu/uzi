@@ -126,6 +126,32 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.strictEqual(gitIn(second.path, ["rev-parse", "HEAD"]), sha1);
   });
 
+  // Issue #134 (the production half of #127). Any git that writes into a repo spawns a
+  // DETACHED `git maintenance run --auto --detach` that outlives the awaited process and keeps
+  // writing inside `.git`. removeRunnerClone() (runner.ts:454) `fs.rm`s the clone moments after
+  // the agent's last commit and our push, and `force: true` suppresses ENOENT, not ENOTEMPTY.
+  // Pinning the CONFIG rather than trying to observe a race: the config is deterministic, the
+  // race is not — and #127 spent two agents' effort failing to reproduce the race on demand.
+  it("disables git auto-maintenance in BOTH repos it creates, so no detached gc races their removal (#134)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 77);
+
+    for (const [label, repo] of [["worker bare", bare], ["runner clone", rc.path]] as const) {
+      assert.strictEqual(
+        gitIn(repo, ["config", "--get", "maintenance.auto"]),
+        "false",
+        `${label}: maintenance.auto must be false — it is the load-bearing key on git 2.54 ` +
+          `(the worker image's own version), where gc.auto=0 alone leaves the detached spawn intact`,
+      );
+      assert.strictEqual(
+        gitIn(repo, ["config", "--get", "gc.auto"]),
+        "0",
+        `${label}: gc.auto=0 covers git predating the maintenance rework, where the detaching ` +
+          `process is \`git gc --auto\` itself`,
+      );
+    }
+  });
+
   it("removes the runner clone but keeps the worker bare clone", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 5);

@@ -305,6 +305,21 @@ export class GitCache {
       // skips populating the stale default so we check the agent branch out at the
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
       await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      // Issue #134 (production half of #127). Every git that writes into a repo ends by
+      // spawning a DETACHED `git maintenance run --auto --detach`, unconditionally: the child
+      // detaches and takes `objects/maintenance.lock` BEFORE it evaluates whether gc.auto's
+      // threshold is met, so a small repo does not avoid it. That daemonized grandchild
+      // outlives the git process we awaited. removeRunnerClone() then `fs.rm`s this tree at
+      // runner.ts:454, moments after the agent's last commit and our push — and `force: true`
+      // suppresses ENOENT, not ENOTEMPTY. A throwaway per-run clone has nothing to maintain,
+      // so disabling beats racing it. Measured in the WORKER image itself (git 2.54.0, not
+      // just CI's): 4 detached children per commit by default, 0 with these two keys.
+      // `maintenance.auto` is the load-bearing one on 2.54 — `gc.auto=0` alone leaves the
+      // spawn intact; it is kept for git predating the maintenance rework, where the
+      // detaching process is `git gc --auto` itself.
+      // As RUNNER, matching the clone: the config must land in the runner-owned clone.
+      await this.runGitAsRunner(clonePath, ["config", "maintenance.auto", "false"]);
+      await this.runGitAsRunner(clonePath, ["config", "gc.auto", "0"]);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
       return { path: clonePath, branch, priorCommits };
     });
@@ -401,6 +416,15 @@ export class GitCache {
     // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
     // and lands back in refs/uzi-runner/* (fetchAgentBranch), never the bare's heads.
     await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    // Issue #134, same reasoning as the runner clone above — but the trade differs here and
+    // the difference is worth stating. The bare is LONG-LIVED and shared across runs, so
+    // auto-maintenance is arguably wanted. It is disabled anyway because (a) the bare lives
+    // inside the same `dataDir` tree a fixture/teardown removes, and (b) a detached gc can
+    // run CONCURRENTLY with a claim's fetch, which is a race nobody chose. If a future
+    // change wants the bare packed, run maintenance DELIBERATELY on a schedule rather than
+    // re-enabling an unsynchronised background daemon.
+    await this.runGit(dest, ["config", "maintenance.auto", "false"]);
+    await this.runGit(dest, ["config", "gc.auto", "0"]);
     await this.fetch(dest, pat, scope, username);
   }
 
