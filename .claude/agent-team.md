@@ -326,6 +326,27 @@ the residual appended. A fifth carried a *different*, narrower claim that the re
 touch, and correctly changed nothing — **a mechanical sweep would have "fixed" it into being wrong**,
 which is the `grep`-then-classify rule from the citing section arriving here from the other end.
 
+**A THIRD instance, in ONE FILE rather than across four.** At `cfa1c0a3`, `prdpath.go` carried the
+retraction at `:92-93` — *"the design note calling the explicit `.`/`..` check 'the traversal fix'
+and `path.Clean` 'belt-and-braces' has it the wrong way round"* — while the retracted sentence was
+still live 160 lines below at `:253`: *"The explicit `.`/`..` rejection is the traversal fix."* One
+file, one commit, one author; found independently by the reviewer and the architect, fixed in
+`b3c1e188`. Its underlying claim is the traversal row in the table above; this is that row's other
+half. **Distance inside one file is not distance from your own attention** — the author had both
+sentences in the same buffer.
+
+**⚑ THE PATTERN YOU CHOOSE ENCODES WHAT YOU EXPECT, SO A NULL RESULT CONFIRMS YOUR EXPECTATION
+RATHER THAN TESTING IT.** This is the sharper form of the flagged rule above, and it was earned by
+two searches that missed two of these instances for *opposite* reasons, neither careless. One agent
+searched **at HEAD** for a claim that had been fixed two commits earlier, so no pattern could have
+found it, and read the silence as "the instance is not real". Another ran `grep -c 'both counts'`
+**case-sensitively** for a lead written in this file's uppercase house form, read the `0` as "the
+amendment did not land", and dispatched that as an instruction to go write it — which would have
+committed a second copy of an entry that was already there. Both zeros read as findings.
+**The countermeasure is not a better pattern.** It is the positive control this file already demands
+everywhere else: before believing a zero, run your pattern against a string you KNOW is present. A
+search you have not calibrated is a mirror.
+
 **⚑ The unifying error is treating a null result as an observation of the world when it is an
 observation of your instrument.** A grep that finds nothing tells you about your pattern. A test
 that stays green tells you about your fixture. A search that finds no precedent tells you about
@@ -395,6 +416,18 @@ quotes it, names a line number, or says a fix "did not land". Evidence:
   implementer, relayed by the lead as an instruction, and accepted by an auditor
   **who had the two-line file open earlier in the same session**. Three agents,
   none of whom opened it. False — the name is `uzi-store-it-$$`.
+- **A dispatch saying an amendment "is not in", from a case-sensitive grep** —
+  `grep -c 'both counts'` against a lead written in this file's uppercase house
+  form. It returned `0`; the amendment had landed one commit earlier, under the
+  shouted lead `BOTH COUNTS READING ZERO IS THE TELL` — quoted here rather than
+  cited by line, per rule 2 below, and because seeing the casing is the whole
+  point. The recipient opened the file at HEAD and reported the refutation
+  instead of complying. **Complying would have committed a SECOND copy of the
+  entry**, into the file whose neighbouring rule is *duplicate the claim, never
+  the count*. Recorded because of where it happened: the dispatch was itself
+  about this file's section on false claims of absence, and quoted it. **Fluency
+  in a rule is not exemption from it, and the instructor is the one who cannot
+  see their own instance.**
 
 The mechanism that caught both: **the recipient opened the file before acting**,
 instead of assuming the instructor's read was current. Note the asymmetry that
