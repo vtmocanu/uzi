@@ -300,6 +300,11 @@ func TestPipelineDTOTags(t *testing.T) {
 var workerDTOKeys = []string{
 	"id", "name", "status", "kind", "hosted_size", "docker", "busy", "active_runs",
 	"max_concurrent_runs", "template_declared", "template_reported", "version",
+	// PRD #113: derived upgrade health, computed at read time from `version` against
+	// the control-plane release. Derived rather than stored, so nothing in the store
+	// layer pins it — this tag set is the only wire contract these two fields have.
+	"upgrade_status", "upgrade_detail", "upgrade_target",
+	"upgrade_blocking_container", "upgrade_blocking_reason", "upgrade_last_exit_code",
 	"last_heartbeat_at", "created_at", "stats_cpu_pct", "stats_mem_bytes",
 	"stats_mem_limit_bytes", "stats_source",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.

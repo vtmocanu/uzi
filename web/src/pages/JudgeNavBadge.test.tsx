@@ -33,6 +33,10 @@ vi.mock("../lib/api", () => ({
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
     unreadNotificationCount: vi.fn().mockResolvedValue({ count: 0 }),
     getJudgeStats: vi.fn(),
+    // PRD #113 M6. Zero, so these tests keep measuring the JUDGE badge: a non-zero
+    // workers count would put a second badge in the same nav and any loose
+    // getByText(/\d/) here would start matching the wrong one.
+    workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // Notifications inbox — the THIRD triage.todo consumer (PRD #98 M5).
     listNotifications: vi.fn(),

@@ -39,7 +39,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout, cfg.APICAPool)
+	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout, cfg.APICAPool, log)
 
 	resolver, err := preset.NewResolver(cfg.WorkerImageRepo, cfg.WorkerImageTag)
 	if err != nil {
@@ -88,7 +88,7 @@ func main() {
 		APICAPEM:           cfg.APICAPEM,
 	}, resolver, log)
 
-	loop := reconcile.New(client, materializer, cfg.PollInterval, log)
+	loop := reconcile.New(client, materializer, client, cfg.PollInterval, cfg.WorkerImageTag, log)
 
 	log.Info("controller starting",
 		"api_base_url", cfg.APIBaseURL,

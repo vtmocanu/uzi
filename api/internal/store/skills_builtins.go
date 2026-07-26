@@ -119,7 +119,7 @@ func ReconcileBuiltinSkills(ctx context.Context, db BuiltinSkillTxer, templates 
 				// A newly-inserted builtin gets its default allocations (PRD #72 M2).
 				// Seeded HERE, not on every boot, so a default an admin later removes
 				// stays removed — the same gate ReconcileBuiltinTemplates applies, and
-				// the reason `ci-cd-norms` needs migration 00083 instead: its row
+				// the reason `ci-cd-norms` needs migration 00084 instead: its row
 				// already exists on every live instance, so n is 0 there forever.
 				for _, tmpl := range skilltmpl.DefaultAllocationsFor(def.Name) {
 					rows, err := q.SeedSharedSkillAllocationByName(ctx, SeedSharedSkillAllocationByNameParams{

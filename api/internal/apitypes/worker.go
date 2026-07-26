@@ -39,6 +39,47 @@ type WorkerDTO struct {
 	Version          *string    `json:"version"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
 	CreatedAt        time.Time  `json:"created_at"`
+	// Derived upgrade health (PRD #113): "up_to_date" | "outdated" | "unknown" |
+	// "upgrading" | "upgrade_failed". Computed at read time from Version against the
+	// control plane's release — never stored, so it cannot go stale against the row
+	// it describes. UpgradeDetail is the human sentence behind the badge ("running
+	// 0.11.0, target 0.11.7"), null in the steady up_to_date case where there is
+	// nothing to explain.
+	//
+	// Version is written ONLY at register, so a worker that is offline mid-roll keeps
+	// reporting its old version — which is why "upgrading"/"upgrade_failed" cannot come
+	// from this field and arrive from the controller's roll report instead.
+	UpgradeStatus string  `json:"upgrade_status"`
+	UpgradeDetail *string `json:"upgrade_detail"`
+	// UpgradeTarget is the coordinate this worker was compared AGAINST — the
+	// controller's rolled tag for a hosted worker with a fresh report (Decision 9,
+	// because values.yaml may pin the worker image independently of the api's release),
+	// otherwise the control plane's own version.
+	//
+	// On the wire so the UI can state the divergence when a hosted target sits below
+	// the control-plane version. That divergence is a supported operation (a deliberate
+	// pin) AND the shape of a fleet-wide alert-suppression attack, and the api cannot
+	// tell them apart — so it is surfaced rather than judged. Empty when the control
+	// plane has no version stamp, i.e. when classification is off entirely.
+	UpgradeTarget string `json:"upgrade_target"`
+	// The blocking container and the k8s waiting REASON behind an upgrade_failed, split
+	// out from UpgradeDetail so the UI can key a lookup on them rather than parsing a
+	// sentence. Null for every other status.
+	//
+	// The reason ONLY — `state.waiting.message` is deliberately never sent. Reason is a
+	// short k8s enum; message is free text that routinely carries filesystem paths,
+	// image references and Secret names, and this field reaches a browser badge and a
+	// terminal via the CLI.
+	UpgradeBlockingContainer *string `json:"upgrade_blocking_container"`
+	UpgradeBlockingReason    *string `json:"upgrade_blocking_reason"`
+	// The blocking container's last exit code, when it has one. Null for "never
+	// terminated", which is a different fact from "exited 0".
+	//
+	// On the wire because it DISCRIMINATES causes the reason alone conflates: a
+	// seed-nix CrashLoopBackOff is produced both by a permissions error unpacking the
+	// nix store and by that volume running out of space, and the exit code is what tells
+	// them apart. Without it the UI can only name both and guess.
+	UpgradeLastExitCode *int32 `json:"upgrade_last_exit_code"`
 	// Latest container resource sample (PRD #49), all null until the worker reports
 	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
 	// is unlimited or the sample came from the process fallback; StatsCPUPct is null

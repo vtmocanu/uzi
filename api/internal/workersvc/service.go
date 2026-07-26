@@ -127,7 +127,17 @@ type Store interface {
 	GetWorkerByID(ctx context.Context, id uuid.UUID) (store.Worker, error)
 	GetWorkerByIDForUser(ctx context.Context, arg store.GetWorkerByIDForUserParams) (store.Worker, error)
 	ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]store.ListWorkersByUserRow, error)
-	RegisterWorker(ctx context.Context, arg store.RegisterWorkerParams) (store.Worker, error)
+	// RegisterWorker returns a Row rather than a Worker because the query is a CTE
+	// (it clears the INV-5 ceiling anchor in the same round trip). The Row is
+	// field-identical to store.Worker and is converted at the call site.
+	RegisterWorker(ctx context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error)
+	// UpsertWorkerRollHealth records a controller roll-health report (PRD #113 M4).
+	// Returns rows affected: 0 means the worker is unknown or external, which the
+	// query enforces rather than the caller.
+	UpsertWorkerRollHealth(ctx context.Context, arg store.UpsertWorkerRollHealthParams) (int64, error)
+	// GetWorkerUpgradeSummaryForUser is user-scoped BY CONSTRUCTION: roll health has no
+	// user_id, so the query joins through `workers`. See the query's own comment.
+	GetWorkerUpgradeSummaryForUser(ctx context.Context, userID uuid.UUID) ([]store.GetWorkerUpgradeSummaryForUserRow, error)
 	HeartbeatWorker(ctx context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error)
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
@@ -592,12 +602,18 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
 	// NULL (an older image, or M3a before the M2 agent sends it). Observability
 	// only — the server never enforces it, so it is stored exactly as reported.
-	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
+	row, err := s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		Version:           pgText(version),
 		TemplateReported:  pgText(template),
 		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
 		ID:                wkr.ID,
 	})
+	if err != nil {
+		return store.Worker{}, err
+	}
+	// Field-identical structs; the conversion keeps Register's signature — and so
+	// every handler and DTO builder above it — unchanged.
+	return store.Worker(row), nil
 }
 
 // WorkerStats is a validated, clamped container resource sample (PRD #49). The

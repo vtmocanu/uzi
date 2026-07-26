@@ -118,7 +118,7 @@ func TestReconcileSkillsSeedsDefaultAllocationsOnFirstInsert(t *testing.T) {
 }
 
 func TestReconcileSkillsDoesNotReseedAnExistingBuiltin(t *testing.T) {
-	// The whole reason `ci-cd-norms` needs migration 00083: an already-present
+	// The whole reason `ci-cd-norms` needs migration 00084: an already-present
 	// row inserts 0, so the reconciler must NOT seed — otherwise a default an admin
 	// deleted would come back on the next boot (Decision 9).
 	name, _ := firstSkillWithDefaults(t)

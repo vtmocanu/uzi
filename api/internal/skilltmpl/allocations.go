@@ -26,7 +26,7 @@ import "fmt"
 // test can see.
 var defaultAllocations = map[string][]string{
 	// The CI/CD playbook is for the roles that write and review pipeline changes.
-	// Backfilled onto existing instances by migration 00083, because the
+	// Backfilled onto existing instances by migration 00084, because the
 	// reconciler seeds only on FIRST insert and this row already exists
 	// everywhere — keep the two in sync by hand; SQL cannot read this map.
 	"ci-cd-norms": {"coder", "reviewer"},

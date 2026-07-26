@@ -152,13 +152,13 @@ func TestSeedSharedSkillAllocationScopeGuardsLiveDB(t *testing.T) {
 // migrationFile is the backfill this test exercises. Named as a constant so a
 // renumber at landing (goose numbers are drafts until merge, per CLAUDE.md
 // §Conventions) fails loudly here rather than silently skipping the test.
-const migrationFile = "migrations/00083_seed_builtin_skill_allocations.sql"
+const migrationFile = "migrations/00084_seed_builtin_skill_allocations.sql"
 
 // prdDonePathMigrationFile is M4's. Named here so the non-LiveDB guard below
 // covers BOTH migrations this branch adds — they renumber together.
-const prdDonePathMigrationFile = "migrations/00084_run_prd_done_path.sql"
+const prdDonePathMigrationFile = "migrations/00085_run_prd_done_path.sql"
 
-// upStatement returns 00083's `-- +goose Up` body, read from the REAL file.
+// upStatement returns the backfill's `-- +goose Up` body, read from the REAL file.
 //
 // This indirection is the point of the test. The first draft embedded a
 // hand-copied constant, which meant editing the migration — dropping ON CONFLICT,
@@ -180,7 +180,7 @@ func upStatement(t *testing.T) string {
 	return body[up:down]
 }
 
-// The migration half: 00083's backfill must be idempotent against an instance
+// The migration half: the backfill must be idempotent against an instance
 // that already has the allocation, and must apply the same scope guards. Goose
 // records the version so re-running Migrate cannot exercise this — the statement
 // is therefore executed directly, which is what "the migration is idempotent"
@@ -288,7 +288,7 @@ func TestBuiltinSkillAllocationBackfillIsIdempotentLiveDB(t *testing.T) {
 // LiveDB test.
 //
 // The renumber guard inside TestBuiltinSkillAllocationBackfillIsIdempotentLiveDB
-// is silent on the gate a person actually runs. Measured: renaming 00083 to 00090
+// is silent on the gate a person actually runs. Measured: renaming the file
 // leaves `go test -count=1 ./internal/store/...` GREEN with UZI_TEST_DATABASE_URL
 // unset, because the t.Skip fires before upStatement ever opens the file. Only the
 // live sweep catches it.

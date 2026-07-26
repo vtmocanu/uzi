@@ -65,7 +65,9 @@ re-provision it.
 
 A hosted worker's online/offline/busy status works exactly like any other
 worker's — a heartbeat, nothing pod-level. If one never comes online, there's
-no in-app diagnostic yet; ask an admin to check the pod directly
+no in-app diagnostic yet; ask an admin to check the pod directly. (A worker that came online
+once and then failed an upgrade DOES have one now — see
+[Worker versions and upgrades](worker-upgrades.md).)
 (`kubectl -n <worker namespace> get pods`).
 
 ## How this differs from running your own worker

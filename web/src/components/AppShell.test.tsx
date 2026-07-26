@@ -19,6 +19,9 @@ vi.mock("../lib/api", () => ({
     unreadNotificationCount: vi.fn(),
     // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
     // backlog so the badge is absent unless a test overrides it.
+    // PRD #113 M6: AppShell now owns a workers-attention poll too. Zero by default so
+    // these navigation tests assert the nav STRUCTURE without an alert badge in the way.
+    workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
     getJudgeStats: vi
       .fn()
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
@@ -287,5 +290,140 @@ describe("forgeIcon (Decision 2 mapping)", () => {
     expect((forgeIcon("gitlab") as ReactElement).type).toBe(GitLabIcon);
     expect((forgeIcon("forgejo") as ReactElement).type).toBe(GitIcon);
     expect((forgeIcon(undefined) as ReactElement).type).toBe(GitIcon);
+  });
+});
+
+// PRD #113 M6: the Workers nav alert badge.
+describe("Workers nav alert badge (PRD #113 M6)", () => {
+  it("badges the Workers nav item with the attention count, alert-toned", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    // The aria-label says what the number MEANS. "2 unread" for a worker count would be
+    // wrong in a way a screen-reader user could not recover from.
+    const badge = await screen.findByLabelText("2 needing attention");
+    expect(badge.textContent).toBe("2");
+    // Alert tone, not the brand pill the Judge/unread badges use (Decision 2): red reads
+    // "go look", grey reads "there is a queue".
+    expect(badge.className).toContain("bg-danger");
+  });
+
+  it("renders NO badge at zero, rather than a badge showing 0", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 0, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    await screen.findByText("Workers");
+    // A permanent "0" is an ornament that means nothing, and it trains the reader to stop
+    // looking at the one place this feature has to be noticed.
+    expect(screen.queryByLabelText(/needing attention/)).toBeNull();
+  });
+
+  it("keeps the last known count when the poll fails, rather than blanking to zero", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 3, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    expect((await screen.findByLabelText("3 needing attention")).textContent).toBe("3");
+
+    // A transient failure must not read as "resolved" — that is the one wrong answer for
+    // an alert badge, because it looks exactly like the problem going away.
+    mockApi.workerUpgradeSummary.mockRejectedValue(new Error("network"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByLabelText("3 needing attention")).toBeTruthy();
+  });
+
+  it("does not use the Judge badge's tone, so the two are distinguishable", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 1, target_release: "0.6.0" });
+    mockApi.getJudgeStats.mockResolvedValue({ ...emptyTriage, total: 4, todo: 4 });
+    renderShell("/dashboard");
+    const workers = await screen.findByLabelText("1 needing attention");
+    const judge = await screen.findByLabelText("4 unread");
+    expect(workers.className).toContain("bg-danger");
+    expect(judge.className).not.toContain("bg-danger");
+  });
+});
+
+// M7 — the leak that was previously only a READ of the code.
+//
+// Two halves have to work, and a cleanup that does only one of them looks correct: clearing
+// the interval stops the timer, and `alive = false` stops an in-flight promise resolving into
+// a setState on an unmounted tree. A clearInterval-only cleanup passes an eyeball review and
+// still warns (or worse, keeps a reference alive) when a fetch was already in flight.
+//
+// web-ux cannot see either failure — a leak has no appearance — which is why this is a
+// fake-timer test and not a browser check.
+describe("the workers-attention poll's cleanup (PRD #113 M7)", () => {
+  it("stops polling after unmount, and does not fire again on the next interval", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 1, target_release: "0.6.0" });
+      const { unmount } = renderShell("/dashboard");
+      // Let the mount-time load run.
+      await vi.advanceTimersByTimeAsync(0);
+      const afterMount = mockApi.workerUpgradeSummary.mock.calls.length;
+      expect(afterMount).toBeGreaterThan(0);
+
+      // One interval tick while mounted: the poll is live, which is the control. Without
+      // this the assertion below would pass against a poll that never ticks at all.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const afterOneTick = mockApi.workerUpgradeSummary.mock.calls.length;
+      expect(afterOneTick).toBeGreaterThan(afterMount);
+
+      unmount();
+      // Two more intervals. A surviving timer would add calls here.
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(mockApi.workerUpgradeSummary.mock.calls.length).toBe(afterOneTick);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not setState from a request still in flight at unmount", async () => {
+    vi.useFakeTimers();
+    const errors: unknown[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a) => errors.push(a));
+    try {
+      // A request that resolves only AFTER unmount — the case `alive = false` exists for and
+      // the one clearInterval alone cannot cover.
+      let release: (v: { attention: number; target_release: string }) => void = () => {};
+      mockApi.workerUpgradeSummary.mockReturnValue(
+        new Promise((res) => {
+          release = res;
+        }),
+      );
+      const { unmount } = renderShell("/dashboard");
+      await vi.advanceTimersByTimeAsync(0);
+      unmount();
+      release({ attention: 5, target_release: "0.6.0" });
+      await vi.advanceTimersByTimeAsync(0);
+
+      const stateWarning = errors.filter((e) => JSON.stringify(e).includes("unmounted"));
+      expect(stateWarning).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+// BLK-4 — the count must survive collapse.
+//
+// The expanded pill is gated on `!collapsed` and the rail's dot is `aria-hidden`, so before
+// this an assistive-tech user in the collapsed rail got no count and no tone at all — only
+// `title="Workers"`. That is the information not being there rather than a visual
+// degradation, and it happens in the layout where the operator has least context.
+//
+// Note what this test does NOT claim: it asserts an accessible NAME exists and carries the
+// count and the tone. Whether a screen reader announces it usefully in this nav structure is
+// the thing jsdom cannot see — correctness is not reachability.
+describe("the collapsed rail keeps the badge's meaning (BLK-4)", () => {
+  it("exposes the count and tone when collapsed, not just a decorative dot", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    await screen.findByText("Workers");
+
+    // Collapse the rail. getByRole, NOT queryByRole with an early return — an early return
+    // here is exactly the vacuous escape hatch this suite keeps finding elsewhere: the test
+    // would pass by never reaching its assertion if the toggle were ever renamed.
+    fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
+
+    // The tone-bearing string must still be reachable by name.
+    expect(await screen.findByText("2 needing attention")).toBeTruthy();
   });
 });

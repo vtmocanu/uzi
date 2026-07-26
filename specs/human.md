@@ -503,6 +503,24 @@ Tracked as GitLab issue vtmocanu/uzi#102; PRD at `prds/102-board-v2.md`.
   - A `Promote` action adds the `PRD` label, making the card a normal one.
 - Authorized behavior change: the board can also DISPLAY open issues without the `PRD` label (opt-in, off by default); agents still work only `PRD`-labeled issues. [user 2026-07-20, narrows the Feature #2 line "Board/agents work only issues carrying the `PRD` label"]
 
+## Feature #113 — Worker upgrade & version health
+
+Tracked as GitLab issue vtmocanu/uzi#113; PRD at `prds/113-worker-upgrade-status.md`.
+Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
+
+- A worker's reported version must be the release it is actually running — no more a frozen informational string. [user, accepted from the mock 2026-07-22]
+- Workers needing attention are those that **failed to upgrade** or are **behind**; a worker mid-upgrade is informational and must not raise an alert. [user 2026-07-22]
+- Diagnostics are **read-only** in v1: no restart, retry, or auto-rollback of a failed upgrade. [user 2026-07-22]
+- Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22]
+- The mock is the accepted design for the fleet panel, the per-worker badges, the failed-worker detail strip, and the Workers-menu alert badge. [user 2026-07-22]
+
+**Deviations from the accepted mock, taken by the team during implementation — ratified [user 2026-07-26]:**
+
+- The raw pod-log pane is **dropped** and `pods/log` is refused: worker logs carry agent output over a user's cloned private repo, so granting it would make the controller a channel for customer source.
+- **"View pod events"** is a copy-the-`kubectl`-command affordance, not live in-app events (no `events: list` grant). Restorable later for one RBAC line plus a handler.
+- The **"1 release behind"** ordinal is dropped as not derivable (uzi knows two version strings, not the release sequence). Both versions are rendered instead.
+- **Mute** shipped as storage only — there is no way to set a mute from the UI in v1.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
