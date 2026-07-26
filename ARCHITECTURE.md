@@ -263,9 +263,12 @@ model); this section is the map. User-facing usage is
   `skills` option is always sent as an explicit list — omitting it is not
   "skills off" — set to the run's full plugin-qualified union; the `lead`
   template runs on the main thread (not a subagent), so this union is also
-  its only allocation surface. Each subagent's `AgentDefinition.skills` scopes
-  it to its own allocated skills, re-filtered to what actually survived
-  materialization.
+  its only allocation surface. On an **own-template** run each subagent's
+  `AgentDefinition.skills` scopes it to its own allocated skills, re-filtered
+  to what actually survived materialization. On a **repo-source** run
+  (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72) there are no
+  template rows to allocate against, so every repo subagent receives the run's
+  whole surviving set instead — the same all-templates rule repo skills follow.
 - **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only
   when `ClaimRepo.skills_enabled`, the worker enumerates
   `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name`

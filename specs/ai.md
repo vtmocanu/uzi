@@ -2773,9 +2773,12 @@ defense — `settingSources: []` — never loosens).
   orchestrator visibility (the `lead` is the main session, routed there by
   `assembleAgents`, so it has no `AgentDefinition.skills` slot — allocating a skill
   specifically to `lead` only affects union membership).
-- **Per-subagent scoping via each `AgentDefinition.skills`** (delivered/allocated skills
-  are per-template), re-filtered to what actually survived precedence + caps. Repo skills
-  are the exception (all-templates, §105).
+- **Per-subagent scoping via each `AgentDefinition.skills`**, re-filtered to what actually
+  survived precedence + caps. Delivered/allocated skills are per-template on an
+  **own-template** run. Two all-templates exceptions: repo skills always (§105, they carry
+  no allocation), and on a **repo-source** run the delivered skills too — a repo roster has
+  no template rows, so there is no allocation to honour and every repo subagent gets the
+  run's whole surviving set (PRD #72 M1 Decision 6, `subagentsFromTemplates`).
 - Shared assembly path `agent/src/skills-run.ts` is used by **both** the SDK executor
   (production) and the stub executor (E2E) so they can't drift into two lenient
   implementations.

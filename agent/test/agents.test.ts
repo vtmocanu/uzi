@@ -195,17 +195,19 @@ describe("delivered skills reach repo-sourced subagents (PRD #72 M1)", () => {
     }
   });
 
-  it("lists each skill exactly once when a repo survivor is also in the run set", () => {
-    // The repo survivors are members of the run union, so the two lists OVERLAP
-    // and a plain concat would list deploy-notes twice. NOTE the de-dup lives in
-    // TWO places (subagentsFromTemplates' union and toDefinition's), redundant
-    // with each other: measured by mutation 2026-07-26, only removing BOTH reddens
-    // this. A single-line mutation here is NOT a control — mutate both.
-    const skills = subagentsFromTemplates([repoAuditor], new Set(), survivors, repoSurvivors).auditor!.skills!;
-    assert.deepStrictEqual([...new Set(skills)], skills, `duplicate skill entries: ${JSON.stringify(skills)}`);
+  it("takes the repo survivors from the survivor set, not from repoSkillNames", () => {
+    // The PRECONDITION: availableSkills already CONTAINS the repo survivors, so
+    // passing them again must change nothing. Reintroducing the union would make
+    // this pass too — what it pins is that the repo half is not the SOURCE of
+    // deploy-notes here, which is why the fallback case below is the one that
+    // exercises repoSkillNames at all.
+    const withRepoNames = subagentsFromTemplates([repoAuditor], new Set(), survivors, repoSurvivors).auditor!.skills;
+    const withoutRepoNames = subagentsFromTemplates([repoAuditor], new Set(), survivors).auditor!.skills;
+    assert.deepStrictEqual(withRepoNames, ["uzi:cicd", "uzi:kb", "uzi:deploy-notes"]);
+    assert.deepStrictEqual(withoutRepoNames, withRepoNames, "the survivor set is the whole answer");
   });
 
-  it("never lists a skill dropped by the per-run cap or a name collision", () => {
+  it("never lists a skill absent from the survivor set (dropped by cap or collision)", () => {
     // `kb` is allocated + repo-requested but is NOT in the survivor set (the worker
     // dropped it), so it must be absent from the repo roster AND the own roster.
     const dropped = new Set(["cicd"]);
@@ -239,10 +241,15 @@ describe("delivered skills reach repo-sourced subagents (PRD #72 M1)", () => {
   });
 
   it("degrades to the repo-borne names when no survivor set is supplied", () => {
-    // A caller with no skills at all (sdk-resume-honors-agents.test.ts calls this
-    // shape) must not crash or invent names.
-    const subagents = subagentsFromTemplates([repoCoder], new Set());
-    assert.deepStrictEqual(subagents.coder!.skills, []);
+    // The `: repoSkillNames` fallback is now the ONLY way to reach pre-#72
+    // behaviour, and no other assertion enters that branch. The previous version of
+    // this case passed no repo names either, so it asserted [] out of empty in and
+    // stayed green under every mutation — it tested nothing.
+    const subagents = subagentsFromTemplates([repoCoder], new Set(), undefined, ["deploy-notes"]);
+    assert.deepStrictEqual(subagents.coder!.skills, ["uzi:deploy-notes"]);
+
+    // And with neither, the empty case still holds (no crash, no invented names).
+    assert.deepStrictEqual(subagentsFromTemplates([repoCoder], new Set()).coder!.skills, []);
   });
 });
 

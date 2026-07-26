@@ -119,15 +119,19 @@ function toDefinition(
   // explicitly (possibly []). The lead is the main thread, covered by the
   // top-level union, so it is not registered here.
   //
-  // De-dup: since PRD #72 the two lists can OVERLAP on the repo path (the repo
-  // survivors are members of the run's surviving set), and a plain concat would
-  // put a duplicate `uzi:<name>` on the SDK. This Set and the one
-  // subagentsFromTemplates builds its list with are REDUNDANT WITH EACH OTHER —
-  // measured 2026-07-26 by mutation, removing either ALONE changes no output and
-  // only removing BOTH reddens the tests. Both are kept deliberately: this one
-  // predates #72 and also covers allocated ∩ all-templates, that one collapses the
-  // overlap at the point where #72 creates it. Do not "simplify" one away on the
-  // grounds that a test still passes — no single test can hold it.
+  // NOTE for anyone mutation-testing this: the `new Set` is PROVABLY EQUIVALENT to
+  // a plain concat today, so that mutant cannot be killed and its survival is not a
+  // gap. Proof that `allocated ∩ allTemplateSkillNames` is empty on both paths:
+  //   - repo path: repo templates carry no allocations at all (`t.skills` is never
+  //     populated by repoagents.ts), so `allocated` is [];
+  //   - own path: `allTemplateSkillNames` is the repo-borne survivors, and a repo
+  //     skill whose name collides with a delivered one is dropped upstream at
+  //     `agent/src/skills-run.ts` (the DROP_REPO_COLLISION branch), so the two lists
+  //     are disjoint by construction.
+  // It is kept as a boundary guard — this is the single place `def.skills` is built
+  // for the SDK, both invariants live in another file, and a duplicate `uzi:<name>`
+  // would go straight to the enable-list. What IS pinned is the CONTENT and ORDER of
+  // this list (agents.test.ts, sdk-executor.test.ts), not the de-dup.
   const allocated = (t.skills ?? []).filter((n) => !availableSkills || availableSkills.has(n));
   const names =
     allTemplateSkillNames.length > 0 ? [...new Set([...allocated, ...allTemplateSkillNames])] : allocated;
@@ -175,15 +179,27 @@ export function assembleAgents(
  * Skill scoping DIFFERS from assembleAgents (PRD #72 M1 / Decision 6): every
  * subagent here gets the run's whole SURVIVING skill set, not a per-template
  * slice. Allocations key on `template_id` and a repo roster has no template rows,
- * so `t.skills` is always absent (repoagents.ts builds name/description/
- * prompt_body only) and per-template scoping would deliver nothing at all — a run
- * started with agents from git would silently lose every delivered skill its owner
- * allocated. With no allocation signal to honor, honoring none is the honest
- * reading, and it is exactly the all-templates rule repo-borne skills already
- * follow. `availableSkills` IS that surviving set (built from the materialized run
- * union), so a skill dropped by the per-run cap or a name collision is not in it
- * and therefore reaches nobody. Passing no survivor set (a caller with no skills)
- * degrades to the repo-borne names alone.
+ * so `t.skills` is always absent (repoagents.ts never populates `.skills`) and
+ * per-template scoping would deliver nothing at all — a run started with agents
+ * from git would silently lose every delivered skill its owner allocated. With no
+ * allocation signal to honor, honoring none is the honest reading, and it is
+ * exactly the all-templates rule repo-borne skills already follow. A skill dropped
+ * by the per-run cap or a name collision is not in the survivor set and therefore
+ * reaches nobody.
+ *
+ * PRECONDITION: `availableSkills`, when given, is the run's WHOLE survivor set —
+ * delivered survivors ∪ repo survivors. Both callers derive it from the same
+ * `runSkills` the repo names are filtered out of (`agent/src/skills-run.ts`), so
+ * `repoSkillNames ⊆ availableSkills` structurally, and passing a delivered-only
+ * set here would silently drop the repo-borne skills.
+ *
+ * `repoSkillNames` is therefore used ONLY when no survivor set is supplied. That
+ * fallback is the pre-#72 behaviour and the reason the parameter survives.
+ *
+ * NOT run-kind gated, deliberately. Decision 13 gates M3/M4/M5 to `kind ===
+ * "issue"`; Decision 6 draws no kind distinction, so a `ci_fix` or `self_improve`
+ * run that resolves to the repo roster gets this rule too. Correct as written —
+ * do not "fix" it into a gate to match the surrounding milestones.
  */
 export function subagentsFromTemplates(
   templates: AgentTemplate[],
@@ -191,12 +207,11 @@ export function subagentsFromTemplates(
   availableSkills?: ReadonlySet<string>,
   repoSkillNames: readonly string[] = [],
 ): Record<string, AgentDefinition> {
-  // Union order follows the run union (delivered survivors, then repo survivors),
-  // since availableSkills is built from it; the repo names are already members in
-  // production and are unioned in only so a caller passing a delivered-only set
-  // still gets them. That membership is exactly why this de-dups — see the
-  // matching note in toDefinition for why BOTH Sets stay despite being redundant.
-  const allTemplateSkillNames = availableSkills ? [...new Set([...availableSkills, ...repoSkillNames])] : repoSkillNames;
+  // The survivor set already CONTAINS the repo survivors (see PRECONDITION), so
+  // unioning `repoSkillNames` back in would append a subset to its own superset —
+  // manufacturing a duplicate hazard that then needs guarding. Order follows the
+  // run union: delivered survivors, then repo survivors.
+  const allTemplateSkillNames = availableSkills ? [...availableSkills] : repoSkillNames;
   const subagents: Record<string, AgentDefinition> = {};
   for (const t of templates) {
     if (exclude.has(t.name)) continue;

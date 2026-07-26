@@ -1098,11 +1098,13 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
 });
 
 // PRD #72 M1: delivered skills reach REPO-SOURCED subagents. This is net-new
-// surface, not an extension of the two blocks above: every `.skills` assertion
-// there reads turns[0] — the PLAN turn — which always runs the OWN roster
-// (PRD #37 Decision 5), so none of them ever reached the repo path. The gap M1
-// closes is that a repo roster has no template rows, so `t.skills` is absent on
-// every repo agent and per-template scoping delivered nothing at all.
+// surface, not an extension of the two blocks above: every SUBAGENT-DEFINITION
+// `.skills` assertion there reads turns[0] — the PLAN turn — which always runs the
+// OWN roster (PRD #37 Decision 5), so none of them ever reached the repo path.
+// (Test "4) resume re-applies plugins + skills" does read turns[1], but of the
+// TOP-LEVEL `options.skills`, not of any agent definition.) The gap M1 closes is
+// that a repo roster has no template rows, so `t.skills` is absent on every repo
+// agent and per-template scoping delivered nothing at all.
 describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () => {
   const coderS: AgentTemplate = { ...coder, skills: ["ci-cd-norms"] };
   const reviewerS: AgentTemplate = { ...reviewer, skills: ["prd-lifecycle"] };
@@ -1193,11 +1195,9 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
 
   it("a repo-borne skill colliding with a delivered one is listed once, from the delivered side", async () => {
     // The repo ships two skills: one valid, one whose name collides with a
-    // delivered skill (dropped worker-side). The repo survivor is ALSO a member of
-    // the run's surviving set, so the two lists M1 unions OVERLAP and a plain
-    // concat would send `uzi:deploy-notes` to the SDK twice. The de-dup is in TWO
-    // redundant places (agents.ts: subagentsFromTemplates + toDefinition) — only
-    // removing BOTH reddens this, so mutate both when checking it is still live.
+    // delivered skill (dropped worker-side by DROP_REPO_COLLISION). What this pins
+    // is the full run-union CONTENT and ORDER reaching a repo subagent: delivered
+    // survivors first, the surviving repo skill last, the shadowed one absent.
     const skillsDir = path.join(worktree, ".claude", "skills");
     const mkskill = (dir: string, body: string) => {
       fs.mkdirSync(path.join(skillsDir, dir), { recursive: true });
@@ -1215,7 +1215,6 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
         ["uzi:ci-cd-norms", "uzi:prd-lifecycle", "uzi:deploy-notes"],
         `${name}: delivered survivors first, repo survivor last, each exactly once`,
       );
-      assert.deepStrictEqual([...new Set(skills)], skills, `${name} lists a duplicate: ${JSON.stringify(skills)}`);
     }
   });
 });
