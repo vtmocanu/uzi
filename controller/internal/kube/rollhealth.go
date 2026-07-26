@@ -1,0 +1,190 @@
+package kube
+
+import (
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
+)
+
+// Roll-health derivation (PRD #113 M3, design §B-4). Stateless: every value comes
+// from fields the pod itself carries, so a controller restart changes no answer.
+//
+// ============================================================================
+// READ THIS BEFORE CHANGING ANYTHING HERE: `rolling` COMES FROM POD READINESS,
+// NEVER FROM THE DRIFT PREDICATE.
+// ============================================================================
+//
+// The tempting implementation is one line shorter and reads better:
+//
+//	if obs.SpecHash != wantHash { phase = rolling } else { phase = settled }
+//
+// It is wrong, and it is wrong in the confident direction. Reconcile patches a
+// drifted Deployment, and the patch body IS the pod template carrying
+// AnnotationSpecHash — so the moment the patch returns, the live Deployment's
+// annotation equals wantHash and the next tick hits the early return in
+// materializer.go's drift check. MEASURED: drift is true for exactly ONE tick, ten
+// seconds at the default cadence. The drift-driven version therefore reports
+// `settled` for every mid-roll worker from tick two onwards, the api's convergence
+// grace expires against a version that has not moved, and the whole fleet reads
+// `outdated` during a perfectly healthy roll. That is the cry-wolf failure the PRD
+// exists to prevent, reintroduced through the back door.
+//
+// A single-tick test cannot catch it, because the drift-driven version is CORRECT on
+// tick one. The test that separates them advances two ticks with the pod still not
+// Ready — see rollhealth_test.go.
+//
+// The correct question is "does a pod matching what the deployment ASKED FOR exist
+// and is it Ready?", which is why every branch below reads pod status and the only
+// use of the deployment is supplying wantHash to match pods against.
+
+const (
+	// stuckRestartThreshold is when repeated restarts alone mean stuck, with no
+	// blocking reason visible. REASONED, not measured: the reason arm below already
+	// catches CrashLoopBackOff, so this arm exists for a container that restarts
+	// repeatedly while flickering through Running, where the waiting reason is only
+	// intermittently present. Three strikes, matching the three missed beats that
+	// mark a worker offline.
+	stuckRestartThreshold = 3
+	// stuckAge is the fallback arm ONLY, for the reasonless cases: Pending with
+	// FailedScheduling or FailedMount, where no container exists yet to carry a
+	// waiting reason at all. REASONED: the real incident (seed-nix CrashLoopBackOff)
+	// fires on the reason arm within ~2 minutes, since k8s reports CrashLoopBackOff
+	// from the second restart. This governs only what that arm cannot see, so it is
+	// deliberately generous — a slow image pull of the browser-inflated agent image
+	// must not read as stuck.
+	stuckAge = 10 * time.Minute
+)
+
+// blockingReasons are the container waiting reasons that mean stuck immediately,
+// with no age or restart threshold. Each is a state k8s does not exit on its own:
+// waiting longer cannot fix a missing image or an unparseable config.
+var blockingReasons = map[string]bool{
+	"CrashLoopBackOff":           true,
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"CreateContainerConfigError": true,
+	"CreateContainerError":       true,
+	"InvalidImageName":           true,
+}
+
+// deriveRollHealth folds a worker's pods into one RollHealth, given wantHash — the
+// spec hash the worker's Deployment currently asks for.
+//
+// pods are this worker's pods only (label-selected by the caller). now is injected
+// rather than read from the clock so the age arm is testable without sleeping.
+func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconcile.RollHealth {
+	// No pod at all is the Recreate gap: the old pod is terminating or gone and the
+	// new one has not been created. Rolling, with no phase_since — there is nothing
+	// to date it from, and inventing now() would restart the clock every tick.
+	if len(pods) == 0 {
+		return reconcile.RollHealth{Phase: protocol.PhaseRolling}
+	}
+
+	// Prefer a pod matching what the deployment asks for. A pod carrying a different
+	// hash is the OLD one still terminating, which says nothing about the new one.
+	var current *corev1.Pod
+	for i := range pods {
+		if pods[i].Annotations[AnnotationSpecHash] == wantHash {
+			current = &pods[i]
+			break
+		}
+	}
+	if current == nil {
+		// Only stale pods: the new one is not up yet. Same state as the gap.
+		return reconcile.RollHealth{Phase: protocol.PhaseRolling}
+	}
+
+	health := reconcile.RollHealth{PodPhase: string(current.Status.Phase)}
+
+	if ready, at := readyCondition(current); ready {
+		health.Phase = protocol.PhaseSettled
+		health.PhaseSince = at
+		return health
+	}
+
+	// Not Ready. Find what is holding it back, init containers first — that is where
+	// the motivating incident wedged (seed-nix reseeding the browser's nix closure),
+	// and an init container blocks the whole pod while an app container may not.
+	if b := blockingContainer(current); b != nil {
+		health.BlockingContainer = b.Name
+		health.RestartCount = b.RestartCount
+		if b.State.Waiting != nil {
+			health.BlockingReason = b.State.Waiting.Reason
+		} else if b.State.Terminated != nil {
+			health.BlockingReason = b.State.Terminated.Reason
+		}
+		if term := lastTermination(b); term != nil {
+			code := term.ExitCode
+			health.LastExitCode = &code
+		}
+	}
+
+	switch {
+	case blockingReasons[health.BlockingReason]:
+		health.Phase = protocol.PhaseStuck
+	case health.RestartCount >= stuckRestartThreshold:
+		health.Phase = protocol.PhaseStuck
+	case !current.CreationTimestamp.IsZero() && now.Sub(current.CreationTimestamp.Time) > stuckAge:
+		// The reasonless arm: Pending with FailedScheduling or FailedMount, where no
+		// container status exists to carry a reason.
+		health.Phase = protocol.PhaseStuck
+	default:
+		health.Phase = protocol.PhaseRolling
+	}
+	if health.Phase == protocol.PhaseRolling {
+		health.PhaseSince = current.CreationTimestamp.Time
+	} else if !current.CreationTimestamp.IsZero() {
+		health.PhaseSince = current.CreationTimestamp.Time
+	}
+	return health
+}
+
+// readyCondition reports whether the pod's Ready condition is True, and when it last
+// transitioned — the honest answer to "since when has this been settled?", which the
+// pod records and the controller must not invent.
+func readyCondition(p *corev1.Pod) (bool, time.Time) {
+	for i := range p.Status.Conditions {
+		c := &p.Status.Conditions[i]
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue, c.LastTransitionTime.Time
+		}
+	}
+	return false, time.Time{}
+}
+
+// blockingContainer returns the first container holding the pod back: one that is
+// Waiting, else one Terminated with a non-zero exit code. Init containers are
+// searched before app containers because an init container blocks everything behind
+// it, so it is the honest thing to name.
+//
+// A nil result means nothing identifiable is blocking — a pod Pending before any
+// container status exists (FailedScheduling), which the age arm covers instead.
+func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
+	for _, set := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
+		for i := range set {
+			if set[i].State.Waiting != nil {
+				return &set[i]
+			}
+		}
+		for i := range set {
+			if t := set[i].State.Terminated; t != nil && t.ExitCode != 0 {
+				return &set[i]
+			}
+		}
+	}
+	return nil
+}
+
+// lastTermination returns the container's most recent termination, preferring the
+// current state over the remembered one. CrashLoopBackOff carries the exit code in
+// LastTerminationState (the container is Waiting NOW, and terminated before), which
+// is exactly the incident this feature was built for.
+func lastTermination(c *corev1.ContainerStatus) *corev1.ContainerStateTerminated {
+	if c.State.Terminated != nil {
+		return c.State.Terminated
+	}
+	return c.LastTerminationState.Terminated
+}
