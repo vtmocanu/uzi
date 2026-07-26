@@ -290,6 +290,9 @@ type Run struct {
 	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
 	TargetRunID          pgtype.UUID        `json:"target_run_id"`
 	MrWebUrl             pgtype.Text        `json:"mr_web_url"`
+	PrdDonePath          pgtype.Text        `json:"prd_done_path"`
+	// When the PRD-link patch edge was consumed (patched, no-match, MR closed unmerged, or superseded). NULL with prd_done_path set = still pending.
+	PrdPatchSettledAt pgtype.Timestamptz `json:"prd_patch_settled_at"`
 }
 
 type RunMessage struct {

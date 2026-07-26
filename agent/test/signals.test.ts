@@ -107,6 +107,88 @@ describe("scanSignals", () => {
   });
 });
 
+describe("scanSignals prd_done_path (PRD #72 M4)", () => {
+  const DONE = "mcp__uzi__signal_done";
+
+  it("extracts a declared PRD path alongside done", () => {
+    assert.deepStrictEqual(scanSignals(toolUse(DONE, { prd_done_path: "prds/done/72-x.md" })), {
+      done: true,
+      prdDonePath: "prds/done/72-x.md",
+    });
+  });
+
+  it("omits the key entirely when signal_done carries no path", () => {
+    const r = scanSignals(toolUse(DONE, {})) as Record<string, unknown>;
+    assert.deepStrictEqual(r, { done: true });
+    assert.ok(!("prdDonePath" in r), "absent, not undefined-valued");
+  });
+
+  it("forwards a path VERBATIM — the worker does not validate shape", () => {
+    // Transport hygiene only. The grammar lives in api/internal/prdpath, once; a
+    // second implementation here would drift silently in both directions, and
+    // neither direction would ever be loud (the api is authoritative either way).
+    const hostile = "prds/../../../etc/passwd";
+    assert.strictEqual((scanSignals(toolUse(DONE, { prd_done_path: hostile })) as { prdDonePath?: string }).prdDonePath, hostile);
+  });
+
+  it("ignores a non-string path and still reports done", () => {
+    // A malformed declaration must never throw and must never cost the run its
+    // completion signal.
+    for (const bad of [42, null, {}, ["prds/x.md"], true]) {
+      const r = scanSignals(toolUse(DONE, { prd_done_path: bad })) as Record<string, unknown>;
+      assert.strictEqual(r["done"], true, `done must survive input ${JSON.stringify(bad)}`);
+      assert.ok(!("prdDonePath" in r), `non-string ${JSON.stringify(bad)} must not be captured`);
+    }
+  });
+
+  it("IGNORES a subagent-borne declaration entirely (the main-thread guard covers the new field)", () => {
+    // The single extraction point sits inside the SIGNAL_DONE branch, which is
+    // only reached after isSubagentFrame has already returned {}. This field
+    // drives a forge write against the run's issue, so a prompt-injected subagent
+    // reaching it would re-open that threat model from inside the run.
+    assert.deepStrictEqual(scanSignals(subagentToolUse(DONE, { prd_done_path: "prds/done/evil.md" })), {});
+    // Both subagent markers independently, matching the existing done/plan cases.
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { prd_done_path: "prds/done/evil.md" }, { subagent_type: "coder" })),
+      {},
+    );
+    assert.deepStrictEqual(
+      scanSignals(subagentToolUse(DONE, { prd_done_path: "prds/done/evil.md" }, { parent_tool_use_id: "toolu_x" })),
+      {},
+    );
+  });
+});
+
+describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
+  // Gating the SCHEMA is the strongest layer available: on a non-issue run the
+  // model never sees the parameter, rather than seeing it and having the value
+  // dropped two hops downstream.
+  const doneToolShape = (server: unknown): Record<string, unknown> => {
+    const s = server as { instance?: unknown };
+    const tools = (s.instance as { _registeredTools?: Record<string, { inputSchema?: unknown }> } | undefined)?._registeredTools;
+    assert.ok(tools, "expected the sdk server to expose its registered tools");
+    const done = tools!["signal_done"];
+    assert.ok(done, `expected a signal_done tool; got ${Object.keys(tools!).join(", ")}`);
+    const shape = (done.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+    assert.ok(shape, "expected a zod object schema with a shape");
+    return shape!;
+  };
+
+  it("omits prd_done_path by default (and so on ci_fix / self_improve)", () => {
+    for (const server of [buildSignalMcpServer(), buildSignalMcpServer({}), buildSignalMcpServer({ prdDonePath: false })]) {
+      const shape = doneToolShape(server);
+      assert.ok(!("prd_done_path" in shape), `prd_done_path must be absent; got ${Object.keys(shape).join(", ")}`);
+      assert.ok("summary" in shape, "the pre-existing summary param is unchanged");
+    }
+  });
+
+  it("exposes prd_done_path when enabled", () => {
+    const shape = doneToolShape(buildSignalMcpServer({ prdDonePath: true }));
+    assert.ok("prd_done_path" in shape, `expected prd_done_path; got ${Object.keys(shape).join(", ")}`);
+    assert.ok("summary" in shape);
+  });
+});
+
 describe("isSignalToolName", () => {
   it("matches the qualified signal tools only", () => {
     assert.strictEqual(isSignalToolName("mcp__uzi__submit_plan"), true);

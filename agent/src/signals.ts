@@ -30,6 +30,21 @@ export interface ScannedSignals {
   plan?: string;
   /** true if the message carried a signal_done call. */
   done?: boolean;
+  /** PRD #72 M4: the repo-relative path the lead says it moved its PRD to.
+   *  Forwarded verbatim; the api validates it (`api/internal/prdpath`) and drops
+   *  it if it does not hold. Absent unless signal_done carried a string. */
+  prdDonePath?: string;
+}
+
+/** Options for the signal server's tool schemas. */
+export interface SignalServerOptions {
+  /** PRD #72 M4: expose `prd_done_path` on signal_done. Issue runs only — a
+   *  `ci_fix` run has no issue and a `self_improve` run's issue is a reused
+   *  backlog container whose description must never be rewritten (Decision 13).
+   *  Gating the SCHEMA is the strongest layer available: the model never sees the
+   *  parameter on a non-issue run, rather than seeing it and having the value
+   *  silently dropped two hops downstream. */
+  prdDonePath?: boolean;
 }
 
 /**
@@ -37,7 +52,23 @@ export interface ScannedSignals {
  * the SDK via `options.mcpServers`. The handlers return terse guidance; the
  * worker's stream scan is what actually drives the workflow.
  */
-export function buildSignalMcpServer(): McpSdkServerConfigWithInstance {
+export function buildSignalMcpServer(opts: SignalServerOptions = {}): McpSdkServerConfigWithInstance {
+  // PRD #72 M4. The describe text carries Decision 5's CONDITIONAL in its own
+  // wording: an unconditional instruction handed to a PRDLESS run in a repo that
+  // nonetheless has a prds/ directory invites the model to pick one and declare it.
+  const doneShape: Record<string, z.ZodTypeAny> = {
+    summary: z.string().optional().describe("One-line summary of what was implemented."),
+  };
+  if (opts.prdDonePath) {
+    doneShape["prd_done_path"] = z
+      .string()
+      .optional()
+      .describe(
+        "ONLY if the issue description links a prds/*.md file AND you moved that file to prds/done/ in this run: " +
+          "its new repo-relative path, e.g. prds/done/72-thing.md. Omit it entirely otherwise — including when the " +
+          "PRD is only partially complete and stayed where it was, and when the issue links no PRD at all.",
+      );
+  }
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
@@ -58,7 +89,7 @@ export function buildSignalMcpServer(): McpSdkServerConfigWithInstance {
       tool(
         SIGNAL_DONE_TOOL,
         "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then pushes the branch and opens the merge request; you never push.",
-        { summary: z.string().optional().describe("One-line summary of what was implemented.") },
+        doneShape,
         async () => ({
           content: [
             {
@@ -134,6 +165,20 @@ export function scanSignals(message: unknown): ScannedSignals {
       else out.plan = out.plan ?? ""; // a submit_plan with no/blank body still counts as "a plan was submitted"
     } else if (name === SIGNAL_DONE_QUALIFIED) {
       out.done = true;
+      // PRD #72 M4. THE ONLY extraction point for prd_done_path, deliberately.
+      // It sits inside this branch so it inherits the main-thread guard above
+      // (isSubagentFrame returns {} before the content loop is reached) — the same
+      // guarantee that keeps a prompt-injected subagent from latching `done`. This
+      // field drives a forge write against the run's issue, so a second extraction
+      // point anywhere in the stream re-opens that whole threat model from inside
+      // the run. Do not add one.
+      //
+      // Defensive in the same register as submit_plan: a non-string or absent
+      // value leaves prdDonePath undefined and must never throw, and must never
+      // affect `done` — a malformed declaration still means the run finished.
+      const input = asRecord(block["input"]);
+      const declared = input?.["prd_done_path"];
+      if (typeof declared === "string") out.prdDonePath = declared;
     }
   }
   return out;

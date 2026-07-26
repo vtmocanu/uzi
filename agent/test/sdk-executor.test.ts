@@ -55,11 +55,11 @@ function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
     message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
   } as unknown as SDKMessage;
 }
-function signalDone(sessionId = "sess-1"): SDKMessage {
+function signalDone(sessionId = "sess-1", input: Record<string, unknown> = {}): SDKMessage {
   return {
     type: "assistant",
     session_id: sessionId,
-    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }] },
+    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input }] },
   } as unknown as SDKMessage;
 }
 function resultSuccess(sessionId = "sess-1"): SDKMessage {
@@ -1218,6 +1218,91 @@ describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () =>
     }
   });
 });
+
+// PRD #72 M4: the lead declares the PRD path it moved, on signal_done. What the
+// executor owns is the run-kind gate, the length clamp, and getting the value out
+// of the TERMINATING turn — which is the one `break` would otherwise discard.
+describe("SdkExecutor prd_done_path (PRD #72 M4)", () => {
+  const PATH = "prds/done/72-prd-lifecycle-in-run.md";
+
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { result, turns, probe };
+  }
+
+  it("carries the declared path off the TERMINATING turn into the result", async () => {
+    // The turn that sets done is the same turn that declares the path, and
+    // `const turn` is scoped INSIDE the implement loop — so without hoisting the
+    // capture above the loop, `break` discards it and this reads undefined.
+    const { result } = await runDeclaring({ prd_done_path: PATH });
+    assert.strictEqual(result.prdDonePath, PATH);
+  });
+
+  it("omits the field when the lead declares nothing", async () => {
+    const { result } = await runDeclaring({});
+    assert.strictEqual(result.prdDonePath, undefined);
+    assert.ok(!("prdDonePath" in result) || result.prdDonePath === undefined);
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", async () => {
+    // makeCtx sets no kind. `?? "issue"` mirrors runner.ts's own
+    // `kind: claim.kind ?? "issue"`; a fail-closed default here would silently
+    // break every test that omits kind, and the api's gate is the authoritative one.
+    const { result } = await runDeclaring({ prd_done_path: PATH }, {});
+    assert.strictEqual(result.prdDonePath, PATH);
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never puts the field on the result, even when declared`, async () => {
+      // Decision 13. self_improve is the dangerous one: it runs against uzi's own
+      // repo, which HAS a prds/ directory, so its lead is the most likely to
+      // declare a path — and its issue is a reused backlog container.
+      const { result } = await runDeclaring({ prd_done_path: PATH }, { kind });
+      assert.strictEqual(result.prdDonePath, undefined, `${kind} must not forward a declared path`);
+    });
+
+    it(`a ${kind} run is not even OFFERED the parameter`, async () => {
+      const { turns } = await runDeclaring({}, { kind });
+      const shape = doneToolShapeOf(turns[0]!.options);
+      assert.ok(!("prd_done_path" in shape), `${kind}: the schema must not expose prd_done_path`);
+    });
+  }
+
+  it("an issue run IS offered the parameter", async () => {
+    const { turns } = await runDeclaring({}, { kind: "issue" });
+    assert.ok("prd_done_path" in doneToolShapeOf(turns[0]!.options));
+  });
+
+  it("clamps an absurd declaration to the transport bound without validating shape", async () => {
+    // Transport hygiene only: the worker must not second-guess the grammar (the
+    // api owns it), but it must not put an unbounded string on the wire either.
+    const huge = "prds/done/" + "a".repeat(4000) + ".md";
+    const { result } = await runDeclaring({ prd_done_path: huge });
+    assert.strictEqual(result.prdDonePath!.length, 512);
+    assert.ok(result.prdDonePath!.startsWith("prds/done/aaa"));
+  });
+
+  it("forwards a hostile path unchanged — validation is the api's job, not a second implementation", async () => {
+    const hostile = "prds/../../../etc/passwd";
+    const { result } = await runDeclaring({ prd_done_path: hostile });
+    assert.strictEqual(result.prdDonePath, hostile);
+  });
+});
+
+/** The signal server's signal_done zod shape, read off a turn's options. */
+function doneToolShapeOf(o: SdkOptions): Record<string, unknown> {
+  const server = (o.mcpServers as Record<string, unknown>)["uzi"] as { instance?: unknown };
+  const tools = (server.instance as { _registeredTools?: Record<string, { inputSchema?: unknown }> } | undefined)?._registeredTools;
+  assert.ok(tools, "expected the uzi sdk server to expose its registered tools");
+  const shape = (tools!["signal_done"]!.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+  assert.ok(shape, "expected a zod object schema with a shape");
+  return shape!;
+}
 
 describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
   it("provisions before the SDK and folds the tool env into the SDK env", async () => {

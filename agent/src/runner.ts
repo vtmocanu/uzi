@@ -422,7 +422,17 @@ export class RunRunner {
       // links it directly instead of reconstructing the URL by string surgery. Omit
       // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
       // the legacy forgeUrls.ts reconstruction still applies (R8, additive+optional).
-      await reportState({ status: "completed", branch: result.branch, mr_iid: mr.iid, mr_web_url: mr.webUrl || undefined });
+      // prd_done_path (PRD #72 M4) rides the same terminal report. Omitted when the
+      // executor set nothing — same `|| undefined` shape as mr_web_url on this line,
+      // so "old worker" and "moved no PRD" are indistinguishable on the wire by
+      // design, and the api treats both as NULL.
+      await reportState({
+        status: "completed",
+        branch: result.branch,
+        mr_iid: mr.iid,
+        mr_web_url: mr.webUrl || undefined,
+        prd_done_path: result.prdDonePath,
+      });
       runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {
       // failure_reason goes straight to reportState, bypassing the batcher's
