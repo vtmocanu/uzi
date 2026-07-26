@@ -216,8 +216,11 @@ argument here would be dishonest:
 
 **For run-wide.**
 
-- **Precedent.** Repo-borne skills already work this way: "repo skills carry no
-  allocation, so they go to every template" (`agent/src/agents.ts:111-113`). The
+- **Precedent.** Repo-borne skills already work this way — the comment in
+  `agent/src/agents.ts` reads "repo skills carry no allocation and are enabled for
+  ALL templates in the run". *(Corrected 2026-07-26: this was presented as a
+  verbatim quote and was a paraphrase. Same substance; the quotation marks were not
+  earned.)* The
   same reasoning applies for the same reason — with a repo roster there is no
   allocation signal to honor, so honoring none is the honest reading.
 - **Smaller.** The bodies are already materialized run-wide (`Skills:
@@ -242,7 +245,7 @@ currently the *only* way a subagent can read a delivered skill body — and repo
 subagents do not have it.
 
 M1 grants it, for every delivered skill. Those can be admin-authored
-org-internal playbooks: today's single builtin documents `harbor.example.com`,
+org-internal playbooks: `ci-cd-norms` documents `harbor.example.com`,
 `myorg/pipelines`, `argo-apps`, the Infisical operator, and ArgoCD's
 group-scoped deploy-token model. A repo-authored subagent can be written to
 expand a skill and write its contents into the worktree, which the worker then
@@ -271,13 +274,20 @@ the run's **configured** cap (`skills_max_per_run` from the claim; the constant 
 only when the claim omits config) skills. Accepted there because no alternative
 exists; refused on own runs because one does.
 
-*(Corrected 2026-07-26: this read "`SKILLS_MAX_PER_RUN` (32)". That identifier
-does not exist; the enforced value is server-supplied, so 32 is wrong for any
-instance whose admin raised it — and raising it raises the very exposure this
-sentence bounds. Note also that a cap is not a containment: `enforceSkillCaps`
-evicts a precedence-ordered tail, bounding how many a repo subagent sees, never
-which. The honest bound is the content one — a repo subagent receives exactly the
-run's materialized union, the same set the lead already receives.)*
+*(Corrected 2026-07-26, then corrected again the same day. This originally read
+"`SKILLS_MAX_PER_RUN` (32, `agent/src/skills-run.ts:15`)". The **citation** was
+wrong: the identifier at that line is `DEFAULT_SKILLS_MAX_PER_RUN`, and its own
+comment calls it a fallback used only when the claim omits config.
+`SKILLS_MAX_PER_RUN` itself **does** exist — it is the api-side env var
+(`api/internal/config/config.go`, defaulting to 32, documented for admins in
+`docs/skills.md`), and the enforced value is whatever the claim carries, so 32 is
+wrong for any instance whose admin raised it. The first correction said "that
+identifier does not exist", which over-corrected a scoped observation into a false
+universal; a fact-checker refuted it. Note also that a cap is not a containment:
+`enforceSkillCaps` evicts a precedence-ordered tail, bounding how many a repo
+subagent sees, never which. The honest bound is the content one — a repo subagent
+receives exactly the run's materialized union, the same set the lead already
+receives.)*
 
 ### Decision 7 — Default allocation targets `lead`, and what that actually does
 
@@ -488,7 +498,9 @@ untouched; its content gets one line.
       template logs a warning instead of failing silently; the migration is
       idempotent against an instance that already has the row.
 
-- [x] **M3 — The `prd-lifecycle` skill + the prompt clauses**: new builtin skill
+- [ ] **M3 — The `prd-lifecycle` skill + the prompt clauses** — **SHIPPED, NOT
+      VERIFIED. Deliberately left unticked; see the note under this milestone.**
+      New builtin skill
       (adapted per Decision 4; reviewer instruction per Decision 3; already-in-
       `done/` is a no-op per Decision 2), defaulted to `lead` + `reviewer` via
       M2's map; `prompt.ts` gains the done-condition clause, conditional on a
@@ -499,6 +511,19 @@ untouched; its content gets one line.
       `prds/done/` in the same branch; a run that completes part of it does not; a
       PRDLESS run and a `ci_fix` run touch no PRD file; a submitted plan names the
       PRD-update step.
+
+      **Why this box is unticked while the code shipped.** Every clause in that
+      Verified list except the last is a claim about **what a live model does**,
+      and the Validation section below marks that run "Manual, and required". It
+      has not been performed. Ticking this box would assert a verification that did
+      not occur — which is precisely the over-claim the skill shipped in this
+      milestone exists to prevent, and it was caught by a fact-checker after the
+      lead had ticked all six. The mechanically testable parts **are** proven and
+      mutation-pinned: the clause is emitted iff `kind === "issue"`, its wording
+      carries the Decision 5 conditional, the plan prompt carries the Decision 15
+      line, the `mkdir -p` precedes the `git mv`, and the four stripped steps are
+      pinned as absent. `specs/ai.md` §384 states the same boundary. **Tick this
+      box when the manual run happens, not before.**
 
 - [x] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
       the tool, extracted by `scanSignals` (which discards `signal_done` input
