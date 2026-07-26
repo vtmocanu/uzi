@@ -266,6 +266,15 @@ export class SdkExecutor implements Executor {
     // throw the overlap away, which is the entire wall-clock argument for doing this.
     const depsAbort = new AbortController();
     const depsInstall = this.startDepsInstall(ctx, toolEnv, depsAbort.signal);
+    // The install's per-dir verdicts, kept alive to the END of the run rather than
+    // consumed and dropped at the join. The install fires BEFORE the plan turn, so by
+    // the time anything downstream asks "were the deps actually there?" the answer is
+    // long out of scope — and that question is precisely what gate honesty (PRD #121 M4,
+    // split out) has to answer to write a reason line a reviewer can act on. Deliberately
+    // INTERNAL: `ExecutorResult` gains no field for it while nothing in this PRD consumes
+    // one. The precedent for opening that door cheaply is `toolEnv`, which rides
+    // ExecutorResult for exactly this kind of executor-computed state (runner.ts).
+    let depsResults: JsDepsResult[] = [];
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
@@ -512,7 +521,7 @@ export class SdkExecutor implements Executor {
       // corrupt the tree. Joining here is what makes that impossible — and it is placed
       // AFTER the not_code return above, so a ci_fix that never implements anything
       // does not wait for deps it will not use.
-      await this.joinDepsInstall(ctx, depsInstall);
+      depsResults = await this.joinDepsInstall(ctx, depsInstall);
 
       // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
       // The plan turn ran with the OWN subagents; the approved selection now decides
@@ -582,7 +591,15 @@ export class SdkExecutor implements Executor {
         followUp = ctx.pullFollowUp?.();
       }
 
-      this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch, agent_source: selection.source });
+      // js_deps rides the completion log so a finished run's record says whether its
+      // gates were runnable — the same question M4 will have to answer from a durable
+      // source. It is also what keeps depsResults READ rather than merely assigned.
+      this.log.info("SDK run completed", {
+        run_id: ctx.runId,
+        branch: ctx.branch,
+        agent_source: selection.source,
+        js_deps: depsResults.map((r) => ({ dir: r.dir, ok: r.ok })),
+      });
       // toolEnv (PRD #46 M9): the allowlisted provisioned tool env, so the self_improve
       // check runner can put the run's provisioned toolchains on its subprocess PATH.
       const result: ExecutorResult = { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
@@ -666,11 +683,11 @@ export class SdkExecutor implements Executor {
    * throws: the promise carries its own catch, and a provisioning result — however bad —
    * is information for the user, not a run failure.
    */
-  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsResult[]>): Promise<void> {
+  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsResult[]>): Promise<JsDepsResult[]> {
     const results = await depsInstall;
     if (results.length === 0) {
       ctx.emit({ kind: "status", agent: "worker", payload: { text: "no JS dependencies to install (no lockfile found)" } });
-      return;
+      return results;
     }
     // One line, naming every dir and — for anything that did not install — why. A
     // silent skip here resurfaces later as an inexplicable `vitest: not found`.
@@ -681,6 +698,7 @@ export class SdkExecutor implements Executor {
     for (const s of skipped) parts.push(`${s.dir}: ${s.detail}`);
     ctx.emit({ kind: "status", agent: "worker", payload: { text: parts.join(" — ") } });
     this.log.info("JS dependency provisioning", { run_id: ctx.runId, results });
+    return results;
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
