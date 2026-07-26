@@ -3,10 +3,10 @@
 //
 // A worker seeds a FRESH clone per run, so the target repo's `node_modules` is absent
 // when the agent starts and its first gate command (`npm test`, `vitest`, `tsc`) dies
-// with `command not found`. `prepareCheckDeps` (self-improve.ts) already solves that —
-// but only for `self_improve` runs, only AFTER the agent finished, and only for uzi's
-// own hardcoded `["web", "agent"]` layout. This module is that routine RELOCATED and
-// GENERALIZED: same sandbox, same flags, same best-effort/honest-skip contract, now
+// with `command not found`. `prepareCheckDeps` (self-improve.ts, now deleted) already
+// solved that — but only for `self_improve` runs, only AFTER the agent finished, and only
+// for uzi's own hardcoded `["web", "agent"]` layout. This module is that routine
+// RELOCATED and GENERALIZED: same sandbox, same best-effort/honest-skip contract, now
 // driven by whatever lockfiles the cloned repo actually has.
 //
 // SANDBOX — UNCHANGED, and deliberately so. Every install subprocess goes through
@@ -18,17 +18,65 @@
 // ever reach repo-authored install code. This module widens WHICH dirs get installed; it
 // widens nothing about who runs the install or what it can see.
 //
-// `--ignore-scripts` IS SETTLED (PRD #121 "install-flags decision"). An earlier draft
-// argued for a full install on the theory that `--ignore-scripts` leaves `esbuild`
-// unbuilt; that premise was tested and DISPROVEN (esbuild ≥0.16 ships its platform
-// binary via `optionalDependencies`, so a `--ignore-scripts` install yields a runnable
-// esbuild). Keeping the flag is also what lets provisioning run PRE-APPROVAL without a
-// new opt-in gate: a frozen `--ignore-scripts` install resolves the lockfile and unpacks
-// published tarballs, and runs NO repo-authored script — the same bar `repo_devbox_opt_in`
-// (migration 00047) holds devbox `init_hook`s to. Dropping it breaks that reasoning and
-// makes auto-install opt-in. Do not "improve" it.
+// ─── Repo-authored code execution: a REDUCTION, not a close ───────────────────
+//
+// `--ignore-scripts` IS SETTLED (PRD #121 "install-flags decision") and stays: the esbuild
+// premise that argued against it was tested and disproven, and the flag is what lets
+// provisioning run PRE-APPROVAL without a new opt-in gate.
+//
+// But `--ignore-scripts` ALONE DOES NOT MEAN "no repo-authored code runs". An earlier
+// version of this header claimed exactly that, in absolute terms, and it was FALSE for
+// yarn and pnpm. Both were measured (PRD #121 M1 review, 2026-07-26; probes run offline
+// with `--network none`, yarn inside the pinned `node:22-alpine` base image):
+//
+//   yarn   `.yarnrc.yml` `yarnPath:` — and the classic `.yarnrc` `yarn-path` — make yarn
+//          EXEC a repo-committed .cjs as the package manager BEFORE it parses any flag.
+//          Measured: repo JS executed, exit 0, both spellings. This is the layout
+//          `yarn set version berry` produces, i.e. the standard one, not a contrived one.
+//          CLOSED by `YARN_IGNORE_PATH=1` (yarn's own mechanism) — measured: repo JS not
+//          executed, both spellings.
+//   pnpm   a repo-local `.pnpmfile.cjs` executes under `--ignore-scripts`; pnpm's own docs
+//          say `ignorePnpmfile` is what you need "together with --ignore-scripts when you
+//          want to make sure that no script gets executed during install". Measured with
+//          pnpm 10.34.5: executed without the flag, not executed with `--ignore-pnpmfile`.
+//          SECOND vector, same class as yarnPath: `manage-package-manager-versions`
+//          (default ON since 9.7) FETCHES AND RUNS the pnpm version a repo declares in
+//          `packageManager`. Measured offline: without the flag pnpm tried
+//          `GET https://registry.npmjs.org/pnpm` and failed; with
+//          `--config.manage-package-manager-versions=false` it ran the installed pnpm and
+//          exited 0. CLOSED by that flag.
+//   npm    no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
+//          handoff (offline, exit 0), and the auditor separately measured that a repo
+//          `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
+//   bun    no handoff observed (a `packageManager: "bun@1.0.0"` field caused none,
+//          offline, exit 0).
+//
+// So the honest claim, in the register `self-improve.ts` already uses for the same
+// mechanism ("a defense-in-depth REDUCTION of the lifecycle-script code-exec path", "a
+// reduction, not a close"): the flags below suppress every repo-authored execution path
+// we found and measured, per manager. That is stronger than `--ignore-scripts` alone and
+// weaker than a proof. It is NOT an exhaustive audit of any package manager — a manager
+// that grows a new repo-file exec path would reopen this silently, which is why each flag
+// is documented with what it closes rather than left as folklore. Anything that survives
+// still lands inside the SAME sandbox that already runs the repo's tests (runner uid +
+// scrubbed env), which is what bounds the blast radius.
+//
+// If you add a manager, or drop one of these flags, you are moving the PRD's *Trust
+// posture* line — the one that says auto-install "needs no new opt-in gate" BECAUSE no
+// repo-authored script runs. Say so out loud; do not cross it silently.
+//
+// ─── What the shipped worker image can actually run ───────────────────────────
+// Probed on the pinned base (`agent/templates/base/Dockerfile` → `node:22-alpine`):
+// npm ✓ and yarn 1.22.22 ✓ are present; **pnpm and bun are NOT**, and neither the
+// Dockerfile's `apk add` nor `devbox-global/devbox.json` supplies them. So on a stock
+// worker a pnpm or bun repo ENOENTs into an honest skip, and this module's headline
+// generalization delivers nothing there today. They become reachable when a run's
+// toolchain provisions them (tier-1 `tool_packages`, or the repo's own devbox under
+// `repo_devbox_opt_in`), since `buildCheckEnv` puts `toolEnv.PATH` first — which is
+// exactly why their flags are wired now rather than later.
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
@@ -44,23 +92,25 @@ export type JsPackageManager = "npm" | "pnpm" | "yarn" | "bun";
 /** Max directory depth below the clone root that discovery descends. Real JS layouts
  *  put their projects shallow (`web/`, `packages/<name>/`, `apps/<name>/`); a
  *  package.json at depth >4 is far more likely to be a test fixture or a vendored copy
- *  than a project whose deps the agent's gates need. Caps the walk's BREADTH-per-level
- *  blowup. */
+ *  than a project whose deps the agent's gates need. It bounds how DEEP the walk goes,
+ *  nothing else — a single level can still be arbitrarily wide, which is what
+ *  MAX_SCAN_DIRS is for. */
 export const MAX_SCAN_DEPTH = 4;
 
 /** Max project dirs discovery reports (and therefore max installs attempted). Each
  *  install is a subprocess with its own wall-clock cap, so this is what bounds total
  *  provisioning time: worst case MAX_PROJECT_DIRS × timeoutMs. A repo with 400 nested
  *  package.json files gets its first 12 (root-most first — see the BFS order below),
- *  not 400 subprocesses. */
+ *  not 400 subprocesses. Hitting it sets `truncated`. */
 export const MAX_PROJECT_DIRS = 12;
 
-/** Max directories READ during the walk. The two bounds above do not cap this on their
- *  own: a repo with 50k directories at depth ≤4 and no package.json anywhere would still
- *  readdir() all of them. This caps the walk itself. */
+/** Max directories READ during the walk. The two bounds above do not cap this: a repo
+ *  with 50k directories at depth ≤4 and no package.json anywhere would still readdir()
+ *  all of them. This is the only bound on the walk's own cost. Hitting it sets
+ *  `truncated`. */
 export const MAX_SCAN_DIRS = 2000;
 
-/** Per-install wall-clock cap. Matches `prepareCheckDeps`' default; overridable. */
+/** Per-install wall-clock cap. Inherited from `prepareCheckDeps`' default; overridable. */
 export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Directories never descended into. `node_modules` is the requirement (a dependency's
@@ -68,39 +118,80 @@ export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
  *  can hold thousands); `.git` is pure walk cost with nothing installable inside. */
 const SKIP_DIRS = new Set(["node_modules", ".git"]);
 
+/** The pnpm workspace manifest. Doubles as a workspace-root marker AND, uniquely among
+ *  the managers, as evidence of an installable dir with no `package.json` of its own —
+ *  measured: `pnpm install --frozen-lockfile` at such a root exits 0. */
+const PNPM_WORKSPACE = "pnpm-workspace.yaml";
+
 // LOCKFILES maps a lockfile to its package manager, IN PRECEDENCE ORDER — a dir with
-// more than one takes the first match. npm's is last deliberately: a repo that migrated
+// more than one takes the first match. npm's are last deliberately: a repo that migrated
 // to pnpm/yarn/bun commonly leaves a stale `package-lock.json` behind, so when both are
 // present the non-npm lockfile is the likelier current truth.
-export const LOCKFILES: readonly { file: string; manager: JsPackageManager }[] = [
+// Not exported: nothing outside this module has a use for it, and the observable
+// behaviour (which lockfile selects which manager, and in what precedence) is pinned
+// through `discoverJsProjects` where a consumer would actually meet it.
+const LOCKFILES: readonly { file: string; manager: JsPackageManager }[] = [
   { file: "pnpm-lock.yaml", manager: "pnpm" },
   { file: "yarn.lock", manager: "yarn" },
   // bun ≥1.2 writes the text `bun.lock` by default; `bun.lockb` is the older binary form.
   { file: "bun.lockb", manager: "bun" },
   { file: "bun.lock", manager: "bun" },
+  // `npm ci` accepts a shrinkwrap as a lockfile, and prefers it over package-lock.json
+  // when both exist — so it is listed first of the two for the same reason.
+  { file: "npm-shrinkwrap.json", manager: "npm" },
   { file: "package-lock.json", manager: "npm" },
 ];
 
-// INSTALL_COMMANDS is the frozen, script-suppressed install per manager.
+/** How one manager is invoked. `env` is a per-manager OVERLAY on the caller's scrubbed
+ *  env — see the note on INSTALL_COMMANDS for why it exists at all. */
+interface InstallSpec {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+// INSTALL_COMMANDS is the frozen, execution-suppressed install per manager. Every flag
+// here closes a MEASURED repo-authored execution path (the header records each probe);
+// none is decoration, and removing one is a security change, not a cleanup.
 //
-// Script suppression per manager, stated honestly rather than implied to be uniform:
-//   npm  — `--ignore-scripts`: full parity, and the settled default (see the header).
-//   pnpm — `--ignore-scripts`: full parity (pnpm implements the same flag).
-//   bun  — `--ignore-scripts`: parity for dependency lifecycle scripts. (bun additionally
-//          gates them behind a `trustedDependencies` allowlist by default, so this is
-//          belt-and-braces there.)
-//   yarn — `--ignore-scripts` exists in yarn CLASSIC (1.x) only, which is also the only
-//          line that accepts `--frozen-lockfile`. Yarn BERRY (2+) renamed the flag to
-//          `--immutable` and moved script suppression into `.yarnrc.yml`
-//          (`enableScripts: false`), with NO CLI equivalent. So there is no parity on
-//          Berry: this command FAILS there, which produces an honest skip (no
-//          node_modules, reported as such). That is the safe direction to fail — we
-//          never silently downgrade to a scripts-enabled install — but it does mean a
-//          Berry repo gets no pre-provisioning today.
-const INSTALL_COMMANDS: Record<JsPackageManager, { command: string; args: string[] }> = {
+//   npm  — `--ignore-scripts` suppresses lifecycle scripts. Nothing further was found.
+//   pnpm — `--ignore-scripts` (lifecycle) + `--ignore-pnpmfile` (a repo `.pnpmfile.cjs`,
+//          which runs DESPITE --ignore-scripts) + `--config.manage-package-manager-
+//          versions=false` (stops pnpm fetching and running the pnpm build a repo names
+//          in `packageManager`).
+//   yarn — `--ignore-scripts` covers lifecycle scripts on yarn CLASSIC (1.x), which is
+//          also the only line that accepts `--frozen-lockfile`. It does NOT cover
+//          `yarnPath`, so the env overlay carries `YARN_IGNORE_PATH=1`.
+//   bun  — `--ignore-scripts` here suppresses the scripts in the PROJECT'S OWN
+//          package.json. That is the load-bearing case and the reason the flag matters
+//          MORE on bun than elsewhere, not less: bun already declines to run a
+//          *dependency's* scripts unless it is in `trustedDependencies`, so the untrusted
+//          thing this flag stops is the cloned repo's own `postinstall`. Measured with bun
+//          1.3.14: without the flag the repo's own postinstall ran; with it, it did not.
+//
+// THE ENV OVERLAY IS AN EXCEPTION, AND A NARROW ONE. The module otherwise adds, defaults
+// and merges NO environment key — it passes the caller's scrubbed env through verbatim,
+// which is a property an audit checked and which the tests pin. `YARN_IGNORE_PATH` is a
+// deliberate hardening key in the same register as `buildCheckEnv`'s own
+// `GIT_TERMINAL_PROMPT=0`, it carries no secret, and it applies ONLY to the yarn arm — the
+// other three managers still receive the caller's env unchanged, byte for byte.
+const INSTALL_COMMANDS: Record<JsPackageManager, InstallSpec> = {
   npm: { command: "npm", args: ["ci", "--ignore-scripts"] },
-  pnpm: { command: "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts"] },
-  yarn: { command: "yarn", args: ["install", "--frozen-lockfile", "--ignore-scripts"] },
+  pnpm: {
+    command: "pnpm",
+    args: [
+      "install",
+      "--frozen-lockfile",
+      "--ignore-scripts",
+      "--ignore-pnpmfile",
+      "--config.manage-package-manager-versions=false",
+    ],
+  },
+  yarn: {
+    command: "yarn",
+    args: ["install", "--frozen-lockfile", "--ignore-scripts"],
+    env: { YARN_IGNORE_PATH: "1" },
+  },
   bun: { command: "bun", args: ["install", "--frozen-lockfile", "--ignore-scripts"] },
 };
 
@@ -108,14 +199,19 @@ const INSTALL_COMMANDS: Record<JsPackageManager, { command: string; args: string
 export interface JsProject {
   /** Path relative to the clone root; "." is the root itself. */
   dir: string;
-  /** null when the dir has a package.json but NO recognized lockfile — such a dir is
-   *  never installed (we will not guess a manager or write a lockfile). */
+  /** null when the dir has no recognized lockfile — such a dir is never installed (we
+   *  will not guess a manager or write a lockfile). */
   manager: JsPackageManager | null;
   /** The lockfile that selected the manager, or null when there is none. */
   lockfile: string | null;
   /** True when this dir declares workspaces AND has a lockfile, so its subtree was
    *  pruned and it resolves to a single root install. */
   workspaceRoot: boolean;
+  /** True when the dir's package.json declares at least one dependency of any kind.
+   *  Load-bearing for the post-install corroboration: a project that declares NONE
+   *  legitimately ends up with no `node_modules` (measured: `npm ci` on a zero-dependency
+   *  project exits 0 and creates nothing), so absence there must not be read as failure. */
+  declaresDependencies: boolean;
 }
 
 /** The outcome of provisioning one project dir. `ok` is the only "deps are there" signal;
@@ -127,6 +223,26 @@ export interface JsDepsResult {
   manager: JsPackageManager | "none";
   ok: boolean;
   detail: string;
+}
+
+/** What discovery found, and whether it saw the whole tree. */
+export interface JsProjectScan {
+  projects: JsProject[];
+  /** True when the walk stopped at MAX_PROJECT_DIRS or MAX_SCAN_DIRS with directories
+   *  left unexamined — i.e. the project list is a PREFIX, not the full set. Reported
+   *  because a silent cap reads exactly like full coverage, which is the class of lie
+   *  this PRD exists to remove. MAX_SCAN_DEPTH does NOT set it: depth is a standing
+   *  policy about which trees are in scope at all, so folding it in here would make the
+   *  flag fire on ordinary repos and mean nothing. */
+  truncated: boolean;
+}
+
+/** The result of a provisioning sweep. */
+export interface JsDepsInstall {
+  results: JsDepsResult[];
+  /** Carried up from discovery: `results` covers only the dirs discovery reached. A
+   *  caller logging "installed everything" must consult this first. */
+  truncated: boolean;
 }
 
 /** One install invocation, already wrapped for the runner uid. */
@@ -144,36 +260,64 @@ export interface InstallCommand {
 }
 
 /** The `detail` an install reports when it was aborted rather than run to a verdict.
- *  Distinguished from a genuine failure so a log never reads a cancel as npm erroring. */
-const DETAIL_CANCELLED = "cancelled";
+ *  Distinguished from a genuine failure so a log never reads a cancel as npm erroring.
+ *  EXPORTED because it is part of the `InstallExec` contract: `installJsDeps` renders
+ *  this value differently from a failure, so an alternative exec boundary must use it
+ *  for cancellation and must not return it for an ordinary error. */
+export const DETAIL_CANCELLED = "cancelled";
 
-/** The exec boundary. Injectable so tests drive the composition without spawning a real
- *  package manager or touching a registry. Resolves — never rejects — in the default
- *  implementation; `installJsDeps` still guards against an injected one that throws. */
+/**
+ * The exec boundary. Injectable so tests drive the composition without spawning a real
+ * package manager or touching a registry. Resolves — never rejects — in the default
+ * implementation; `installJsDeps` still guards against an injected one that throws.
+ *
+ * CONTRACT for an alternative implementation: `detail` is a SHORT status note that ends
+ * up on the run's activity feed. It must never carry the subprocess's output. The
+ * shipped `execInstall` cannot leak any (`stdio: "ignore"`), but an `execFile`-style
+ * boundary embeds `Command failed: <cmd>\n<stderr>` in its Error, which would put
+ * third-party install stderr in front of a user.
+ */
 export type InstallExec = (cmd: InstallCommand) => Promise<{ ok: boolean; detail: string }>;
 
 /**
- * Find the JS project dirs in a clone: every dir with a `package.json`, bounded by
- * MAX_SCAN_DEPTH / MAX_PROJECT_DIRS / MAX_SCAN_DIRS and never descending into
- * `node_modules`. Breadth-first, children in sorted order, so results are deterministic
- * and ROOT-MOST FIRST — which is what makes truncation at MAX_PROJECT_DIRS keep the dirs
- * most likely to matter.
+ * Find the JS project dirs in a clone, bounded by MAX_SCAN_DEPTH / MAX_PROJECT_DIRS /
+ * MAX_SCAN_DIRS and never descending into `node_modules`. Breadth-first, children in
+ * sorted order, so results are deterministic and ROOT-MOST FIRST — which is what makes
+ * truncation at MAX_PROJECT_DIRS keep the dirs most likely to matter.
  *
- * MONOREPOS: a dir that declares workspaces (a `workspaces` field in its package.json,
- * or a sibling `pnpm-workspace.yaml`) AND has a lockfile resolves to a SINGLE install at
- * that dir — its subtree is pruned, so workspace members are not installed individually
- * (that is the package manager's job, and a member install would fight the root one).
- * A workspace declaration WITHOUT a lockfile prunes nothing: there is no root install to
- * do, so any member that carries its own lockfile is still worth finding.
+ * A dir is a project when it has a `package.json`, OR when it is a pnpm workspace root
+ * (`pnpm-workspace.yaml`) that has a lockfile — pnpm installs such a root fine with no
+ * root `package.json` of its own (measured), and skipping it would mean the one install
+ * that would have worked is never attempted.
+ *
+ * MONOREPOS: a dir that declares workspaces (a non-empty `workspaces` field in its
+ * package.json, or a `pnpm-workspace.yaml`) AND has a lockfile resolves to a SINGLE
+ * install at that dir — its subtree is pruned, so workspace members are not installed
+ * individually (that is the package manager's job, and a member install would fight the
+ * root one). A workspace declaration WITHOUT a lockfile prunes nothing: there is no root
+ * install to do, so any member that carries its own lockfile is still worth finding.
+ *
+ * SYMLINKS ARE NOT FOLLOWED, and that is load-bearing rather than incidental: it is what
+ * keeps the walk — and therefore every install `cwd` — inside the clone. A repo can
+ * commit a symlink to `/` or to `..`; `Dirent.isDirectory()` is lstat-based, so such an
+ * entry is not a directory to this walk and is never enqueued. A refactor to
+ * `readdir` + `stat`, or to `readdir(..., { recursive: true })`, would silently reopen
+ * it — there is a test pinning this, keep it.
  *
  * Best-effort by construction: an unreadable directory is skipped, never thrown.
  */
-export async function discoverJsProjects(rootPath: string): Promise<JsProject[]> {
-  const found: JsProject[] = [];
+export async function discoverJsProjects(rootPath: string): Promise<JsProjectScan> {
+  const projects: JsProject[] = [];
   const queue: { abs: string; rel: string; depth: number }[] = [{ abs: rootPath, rel: ".", depth: 0 }];
   let scanned = 0;
+  let truncated = false;
 
-  while (queue.length > 0 && found.length < MAX_PROJECT_DIRS && scanned < MAX_SCAN_DIRS) {
+  while (queue.length > 0) {
+    if (projects.length >= MAX_PROJECT_DIRS || scanned >= MAX_SCAN_DIRS) {
+      // Stopped with dirs still queued: the list is a prefix, and the caller must know.
+      truncated = true;
+      break;
+    }
     const cur = queue.shift()!;
     scanned++;
 
@@ -184,16 +328,22 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProject[]>
       continue; // unreadable/vanished dir: skip it, provisioning is best-effort
     }
 
+    // isDirectory() is lstat-based, so a symlink lands here rather than in `subdirs`.
     const files = new Set(entries.filter((e) => !e.isDirectory()).map((e) => e.name));
+    const hit = LOCKFILES.find((l) => files.has(l.file));
+    const hasPkg = files.has("package.json");
+    const pnpmWorkspace = files.has(PNPM_WORKSPACE);
+
     let pruned = false;
-    if (files.has("package.json")) {
-      const hit = LOCKFILES.find((l) => files.has(l.file));
-      const workspaceRoot = hit !== undefined && (await declaresWorkspaces(cur.abs, files));
-      found.push({
+    if (hasPkg || (pnpmWorkspace && hit !== undefined)) {
+      const manifest = hasPkg ? await readManifest(cur.abs) : null;
+      const workspaceRoot = hit !== undefined && (pnpmWorkspace || (manifest?.declaresWorkspaces ?? false));
+      projects.push({
         dir: cur.rel,
         manager: hit?.manager ?? null,
         lockfile: hit?.file ?? null,
         workspaceRoot,
+        declaresDependencies: manifest?.declaresDependencies ?? false,
       });
       pruned = workspaceRoot;
     }
@@ -212,7 +362,7 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProject[]>
     }
   }
 
-  return found;
+  return { projects, truncated };
 }
 
 /**
@@ -229,7 +379,8 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProject[]>
  * @param rootPath the clone root.
  * @param env      the SCRUBBED replacement env for the subprocess (buildCheckEnv) — never
  *                 a `process.env` spread; the worker's join token must be absent by
- *                 construction.
+ *                 construction. Passed through verbatim except for the documented
+ *                 per-manager hardening overlay (INSTALL_COMMANDS).
  * @param opts.signal aborts the sweep: the in-flight install is killed and every dir not
  *                 yet reached is reported cancelled. Cancelling is still a normal return,
  *                 never a throw — the caller gets the partial results.
@@ -238,21 +389,24 @@ export async function installJsDeps(
   rootPath: string,
   env: NodeJS.ProcessEnv,
   opts: { timeoutMs?: number; exec?: InstallExec; signal?: AbortSignal } = {},
-): Promise<JsDepsResult[]> {
+): Promise<JsDepsInstall> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
   const exec = opts.exec ?? execInstall;
 
-  let projects: JsProject[];
+  let scan: JsProjectScan;
   try {
-    projects = await discoverJsProjects(rootPath);
+    scan = await discoverJsProjects(rootPath);
   } catch (err) {
     // discoverJsProjects is already non-throwing; this is the belt to its braces, so a
     // surprise here degrades to "nothing provisioned" rather than failing the run.
-    return [{ dir: ".", manager: "none", ok: false, detail: `discovery failed: ${errText(err)}` }];
+    return {
+      results: [{ dir: ".", manager: "none", ok: false, detail: `discovery failed: ${errText(err)}` }],
+      truncated: false,
+    };
   }
 
   const results: JsDepsResult[] = [];
-  for (const project of projects) {
+  for (const project of scan.projects) {
     if (project.manager === null) {
       results.push({
         dir: project.dir,
@@ -270,6 +424,8 @@ export async function installJsDeps(
     // start runs it directly.
     const wrapped = runnerCommand(spec.command, spec.args);
     const cwd = project.dir === "." ? rootPath : join(rootPath, project.dir);
+    // The caller's env, untouched, unless this manager needs a hardening key.
+    const installEnv = spec.env ? { ...env, ...spec.env } : env;
 
     let outcome: { ok: boolean; detail: string };
     if (opts.signal?.aborted) {
@@ -278,10 +434,32 @@ export async function installJsDeps(
       outcome = { ok: false, detail: DETAIL_CANCELLED };
     } else {
       try {
-        outcome = await exec({ command: wrapped.command, args: wrapped.args, cwd, env, timeoutMs, signal: opts.signal });
+        outcome = await exec({
+          command: wrapped.command,
+          args: wrapped.args,
+          cwd,
+          env: installEnv,
+          timeoutMs,
+          signal: opts.signal,
+        });
       } catch (err) {
         outcome = { ok: false, detail: `could not run: ${errText(err)}` };
       }
+    }
+
+    // CORROBORATE a claimed success against the filesystem. `ok` is the signal a caller
+    // (and, later, gate honesty) reads as "the deps are there", so an exit 0 that left no
+    // `node_modules` must not set it — a repo that can force exit 0 would otherwise mint
+    // a false "deps ready".
+    //
+    // Conditioned on the project DECLARING dependencies, and that condition is not
+    // caution — it is measured: `npm ci` on a zero-dependency project exits 0 and creates
+    // no `node_modules` at all (yarn and pnpm do create one). An unconditional check would
+    // turn that genuine success into a reported failure, which is the same class of lie in
+    // the other direction. When we cannot tell (no readable package.json, e.g. a pnpm
+    // workspace root without one), we do not downgrade.
+    if (outcome.ok && project.declaresDependencies && !existsSync(join(cwd, "node_modules"))) {
+      outcome = { ok: false, detail: "reported success but left no node_modules" };
     }
 
     results.push({
@@ -295,7 +473,7 @@ export async function installJsDeps(
           : `${label} failed (${outcome.detail}) — node_modules absent, gates skip honestly`,
     });
   }
-  return results;
+  return { results, truncated: scan.truncated };
 }
 
 /** True when `dir` (relative to the clone root, "." for the root) was provisioned
@@ -313,17 +491,26 @@ export function depsReadyFor(results: readonly JsDepsResult[], dir: string): boo
  * disciplinary: the run-message redactor does not cover a third-party install's stdout,
  * so the safest place for it is nowhere.
  *
- * `spawn` rather than `execFile`, for two reasons that both come back to the uid split:
+ * THE `spawn` + `detached: true` + `killRunnerGroup` TRIO IS LOAD-BEARING. A revert to
+ * `execFile` — which looks like a simplification and reads like one — silently
+ * reintroduces a measured defect: `execFile`'s own `timeout` (and its `signal` option)
+ * kill from the WORKER uid, which is EPERM against a process running as `runner`, so
+ * under the PRD #51 split NEITHER the cap NOR a cancel could kill anything. Measured
+ * in-container before this shape: `kill EPERM`, the runner's process still alive 6s after
+ * the timeout fired, up to MAX_PROJECT_DIRS orphans able to accumulate.
  *
- *  - `detached: true` makes the child a process-GROUP leader. That is the shape
- *    `killRunnerGroup` documents, and it is what lets a kill reach any grandchild the
- *    package manager spawned. `execFile` does NOT forward `detached` to spawn (it copies
- *    a fixed subset of options), so the flag would have been silently dropped there.
- *  - Cancellation must NOT go through a plain `child.kill()` — from the WORKER that is
- *    EPERM against a process running as `runner`, the same wall `killRunnerGroup` exists
- *    to cross (runner-uid.ts). It would fail silently and leave the install running. Both
- *    the abort path and the timeout path therefore route through `killRunnerGroup`, which
- *    reuids via setpriv under the split and signals directly on a #58 single-uid start.
+ *  - `detached: true` makes the child a process-GROUP leader, which is the shape
+ *    `killRunnerGroup` documents and what lets a kill reach any grandchild the package
+ *    manager spawned. `execFile` does not even forward `detached` (it copies a fixed
+ *    subset of options to spawn), so the flag would be dropped without a word.
+ *  - `killRunnerGroup` reuids via setpriv under the split and signals directly on a #58
+ *    single-uid start, so both modes can actually reap.
+ *
+ * WHAT `detached` COSTS, since it is a real behaviour change: the install is its own
+ * process group and session leader, so it NO LONGER receives a signal sent to the
+ * worker's process group. Reaping it depends entirely on the abort path, the timeout, or
+ * container teardown — which is why the executor aborts on every path that does not join
+ * (sdk-executor.ts), rather than trusting process-group semantics it no longer has.
  */
 export const execInstall: InstallExec = (cmd) =>
   new Promise((resolve) => {
@@ -376,23 +563,46 @@ export const execInstall: InstallExec = (cmd) =>
     }
   });
 
-/** True when the dir declares a workspace layout: a `workspaces` field in package.json
- *  (npm/yarn/bun) or a `pnpm-workspace.yaml` beside it. An unreadable or malformed
- *  package.json is treated as "not a workspace root" — the conservative answer, since it
- *  only means we do not prune. */
-async function declaresWorkspaces(absDir: string, files: ReadonlySet<string>): Promise<boolean> {
-  if (files.has("pnpm-workspace.yaml")) return true;
+/** The two facts we need out of a dir's package.json. An unreadable or malformed file
+ *  yields `null`, which every caller treats as "cannot tell" — never as a positive: not
+ *  a workspace root (so we do not prune), and dependencies unknown (so we do not
+ *  downgrade a successful install). */
+async function readManifest(absDir: string): Promise<{ declaresWorkspaces: boolean; declaresDependencies: boolean } | null> {
   try {
     const raw = await readFile(join(absDir, "package.json"), "utf8");
-    const parsed = JSON.parse(raw) as { workspaces?: unknown };
-    const ws = parsed.workspaces;
-    // npm/bun/yarn accept an array; yarn classic also accepts `{ packages: [...] }`.
-    if (Array.isArray(ws)) return ws.length > 0;
-    if (ws !== null && typeof ws === "object") return true;
-    return false;
+    const parsed = JSON.parse(raw) as {
+      workspaces?: unknown;
+      dependencies?: unknown;
+      devDependencies?: unknown;
+      optionalDependencies?: unknown;
+      peerDependencies?: unknown;
+    };
+    return {
+      declaresWorkspaces: workspacePatternCount(parsed.workspaces) > 0,
+      declaresDependencies: [
+        parsed.dependencies,
+        parsed.devDependencies,
+        parsed.optionalDependencies,
+        parsed.peerDependencies,
+      ].some((d) => d !== null && typeof d === "object" && Object.keys(d as object).length > 0),
+    };
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** How many workspace patterns a `workspaces` field declares. npm/bun/yarn accept a bare
+ *  array; yarn classic also accepts `{ packages: [...] }`. Counting rather than
+ *  truthiness is what keeps the two spellings SYMMETRIC — `workspaces: []` and
+ *  `workspaces: {}` must both mean "declares nothing", where an `Array.isArray` test
+ *  followed by a bare `typeof === "object"` made the empty object prune a whole subtree. */
+function workspacePatternCount(ws: unknown): number {
+  if (Array.isArray(ws)) return ws.length;
+  if (ws !== null && typeof ws === "object") {
+    const packages = (ws as { packages?: unknown }).packages;
+    return Array.isArray(packages) ? packages.length : 0;
+  }
+  return 0;
 }
 
 function errText(err: unknown): string {

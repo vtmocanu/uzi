@@ -1482,7 +1482,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
       calls.push({ root, env, signal: opts?.signal });
       await gate;
       done = true;
-      return results;
+      return { results, truncated: false };
     };
     return { calls, installDeps, release: () => release(), isDone: () => done };
   }
@@ -1555,9 +1555,12 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
       [submitPlan("# plan"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
-    const installDeps: SdkExecutorOptions["installDeps"] = async () => [
-      { dir: "web", manager: "npm", ok: false, detail: "npm ci --ignore-scripts failed (exit 1) — node_modules absent, gates skip honestly" },
-    ];
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [
+        { dir: "web", manager: "npm", ok: false, detail: "npm ci --ignore-scripts failed (exit 1) — node_modules absent, gates skip honestly" },
+      ],
+      truncated: false,
+    });
     const probe = makeCtx();
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
 
@@ -1589,7 +1592,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
       new Promise((resolve) => {
         sawSignal = opts?.signal;
-        opts?.signal?.addEventListener("abort", () => resolve([]), { once: true });
+        opts?.signal?.addEventListener("abort", () => resolve({ results: [], truncated: false }), { once: true });
       });
     const probe = makeCtx({}, { kind: "reject", reason: "no" });
 
@@ -1607,7 +1610,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
       new Promise((resolve) => {
         sawSignal = opts?.signal;
-        opts?.signal?.addEventListener("abort", () => resolve([]), { once: true });
+        opts?.signal?.addEventListener("abort", () => resolve({ results: [], truncated: false }), { once: true });
       });
     const probe = makeCtx({ signal: controller.signal }, { kind: "cancel" });
     // Cancel lands while the gate is deciding, exactly as a user cancel does.
@@ -1628,7 +1631,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     const seen: NodeJS.ProcessEnv[] = [];
     const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
       seen.push(env);
-      return [];
+      return { results: [], truncated: false };
     };
     const probe = makeCtx({
       runId: "51210000-0000-4000-8000-000000000002",
@@ -1654,7 +1657,7 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
       [submitPlan("# plan"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
-    const installDeps: SdkExecutorOptions["installDeps"] = async () => [];
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({ results: [], truncated: false });
     const probe = makeCtx();
     await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
     assert.ok(

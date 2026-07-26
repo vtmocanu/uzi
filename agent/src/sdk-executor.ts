@@ -32,7 +32,7 @@ import { buildSdkEnv } from "./sdk-env.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
-import { installJsDeps, type JsDepsResult } from "./js-deps.js";
+import { installJsDeps, type JsDepsInstall, type JsDepsResult } from "./js-deps.js";
 import { buildCheckEnv } from "./self-improve.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
 import { resolveAgentSelection, type ClaimConfig } from "./protocol.js";
@@ -664,7 +664,7 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     toolEnv: Record<string, string> | undefined,
     signal: AbortSignal,
-  ): Promise<JsDepsResult[]> {
+  ): Promise<JsDepsInstall> {
     ctx.emit({ kind: "status", agent: "worker", payload: { text: "installing the repo's JS dependencies (in the background)" } });
     return this.installDeps(ctx.worktreePath, buildCheckEnv(process.env, this.homeDir, toolEnv), { signal }).catch(
       (err: unknown) => {
@@ -673,7 +673,7 @@ export class SdkExecutor implements Executor {
         // missing its declared toolchain), a missing node_modules degrades to the
         // agent installing them itself, exactly as it does today.
         this.log.warn("JS dependency provisioning failed", { run_id: ctx.runId, error: errMessage(err) });
-        return [];
+        return { results: [], truncated: false };
       },
     );
   }
@@ -683,21 +683,24 @@ export class SdkExecutor implements Executor {
    * throws: the promise carries its own catch, and a provisioning result — however bad —
    * is information for the user, not a run failure.
    */
-  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsResult[]>): Promise<JsDepsResult[]> {
-    const results = await depsInstall;
+  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsInstall>): Promise<JsDepsResult[]> {
+    const { results, truncated } = await depsInstall;
     if (results.length === 0) {
       ctx.emit({ kind: "status", agent: "worker", payload: { text: "no JS dependencies to install (no lockfile found)" } });
       return results;
     }
     // One line, naming every dir and — for anything that did not install — why. A
     // silent skip here resurfaces later as an inexplicable `vitest: not found`.
-    const installed = results.filter((r) => r.ok).map((r) => r.dir);
+    const installed = results.filter((r) => r.ok).map((r) => safeDirLabel(r.dir));
     const skipped = results.filter((r) => !r.ok);
     const parts: string[] = [];
     if (installed.length > 0) parts.push(`installed JS dependencies in ${installed.join(", ")}`);
-    for (const s of skipped) parts.push(`${s.dir}: ${s.detail}`);
+    for (const s of skipped) parts.push(`${safeDirLabel(s.dir)}: ${s.detail}`);
+    // Truncation goes on the FEED, not just in a log: without it the line above reads as
+    // full coverage, and a `vitest: not found` in dir 13 becomes unexplainable.
+    if (truncated) parts.push("discovery hit its directory bound — some project dirs were not installed");
     ctx.emit({ kind: "status", agent: "worker", payload: { text: parts.join(" — ") } });
-    this.log.info("JS dependency provisioning", { run_id: ctx.runId, results });
+    this.log.info("JS dependency provisioning", { run_id: ctx.runId, results, truncated });
     return results;
   }
 
@@ -933,4 +936,17 @@ function describeSkillDrop(name: string, reason: string): string {
  */
 export function resolveLeadModel(configModel?: string, templateModel?: string): string | undefined {
   return configModel || templateModel || undefined;
+}
+
+/**
+ * Render a discovered directory name for the run's activity feed. `dir` comes from
+ * `readdir`, i.e. it is REPO-CONTROLLED text: a repo can commit a directory whose name
+ * contains newlines, backticks, or instruction-shaped prose, and this string is
+ * persisted to `run_messages` and rendered to a human. Not a path escape and React
+ * escapes the HTML, but untrusted text should not be able to shape a status line, so the
+ * charset is clamped to what a real project dir needs and the length is bounded.
+ */
+function safeDirLabel(dir: string): string {
+  const cleaned = dir.replace(/[^A-Za-z0-9._/@-]/g, "?");
+  return cleaned.length > 120 ? `${cleaned.slice(0, 120)}…` : cleaned;
 }

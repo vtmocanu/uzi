@@ -395,8 +395,17 @@ export class RunRunner {
         // the agent may have edited a package.json or lockfile during the run and the
         // checks must test what it actually left behind.
         const checkEnv = buildCheckEnv(process.env, runHome ?? os.tmpdir(), result.toolEnv);
-        for (const note of await installJsDeps(runnerClone.path, checkEnv).catch(() => [])) {
+        const deps = await installJsDeps(runnerClone.path, checkEnv).catch(() => ({ results: [], truncated: false }));
+        for (const note of deps.results) {
           runLog.info("self-improve: dependency install", { ...note });
+        }
+        // A truncated scan means `results` is a PREFIX of the repo's project dirs, so a
+        // check may be about to run somewhere provisioning never reached. Say so rather
+        // than let the notes above read as full coverage.
+        if (deps.truncated) {
+          runLog.warn("self-improve: dependency discovery hit its bound; some dirs were not installed", {
+            installed_dirs: deps.results.length,
+          });
         }
         const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
         const checks = await runSelfImproveChecks(runnerClone.path, checkRunner);
