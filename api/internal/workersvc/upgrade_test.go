@@ -3,6 +3,7 @@ package workersvc
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // PRD #113 M2. The version-compare classification, driven ONLY by the bare forms the
@@ -93,7 +94,7 @@ func TestClassifyUpgrade(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			status, detail := ClassifyUpgrade(tc.reported, tc.target)
+			status, detail := classifyNoSignal(tc.reported, tc.target)
 			if status != tc.wantStatus {
 				t.Errorf("ClassifyUpgrade(%q, %q) status = %q, want %q (detail %q)",
 					tc.reported, tc.target, status, tc.wantStatus, detail)
@@ -137,7 +138,7 @@ func TestClassifyUpgradeUnparseableReportedVersionIsNeverCompared(t *testing.T) 
 	for _, reported := range []string{
 		"v", "vdev", "dev", "-1.0.0", "0.11.7\n0.11.8", "%s", "'; DROP TABLE workers; --",
 	} {
-		status, detail := ClassifyUpgrade(reported, "0.11.7")
+		status, detail := classifyNoSignal(reported, "0.11.7")
 		if status != UpgradeStatusUnknown {
 			t.Errorf("ClassifyUpgrade(%q, \"0.11.7\") = %q (%q), want unknown: an unparseable version "+
 				"must not be compared, since semver.Compare sorts an invalid operand BELOW a valid one",
@@ -163,7 +164,7 @@ func TestClassifyUpgradePartialVersionsAreValidAndOrdered(t *testing.T) {
 		{"0", UpgradeStatusOutdated},    // == 0.0.0
 		{"999", UpgradeStatusUpToDate},  // == 999.0.0, ahead
 	} {
-		if status, detail := ClassifyUpgrade(tc.reported, "0.11.7"); status != tc.want {
+		if status, detail := classifyNoSignal(tc.reported, "0.11.7"); status != tc.want {
 			t.Errorf("ClassifyUpgrade(%q, \"0.11.7\") = %q (%q), want %q",
 				tc.reported, status, detail, tc.want)
 		}
@@ -175,8 +176,24 @@ func TestClassifyUpgradePartialVersionsAreValidAndOrdered(t *testing.T) {
 // would report `unknown` for a worker that is demonstrably current.
 func TestClassifyUpgradeTrimsPadding(t *testing.T) {
 	for _, reported := range []string{"0.11.7 ", " 0.11.7", "\t0.11.7\n"} {
-		if status, detail := ClassifyUpgrade(reported, "0.11.7"); status != UpgradeStatusUpToDate {
+		if status, detail := classifyNoSignal(reported, "0.11.7"); status != UpgradeStatusUpToDate {
 			t.Errorf("ClassifyUpgrade(%q, \"0.11.7\") = %q (%q), want up_to_date", reported, status, detail)
 		}
 	}
+}
+
+// classifyNoSignal drives the full decision table with NO controller report, which is
+// what every version-compare assertion above is about: an external worker, a
+// compose deployment with no controller, or a hosted worker the controller has not
+// reached. Kind is deliberately "external" so the hosted-only no-signal grace (R8)
+// cannot soften an `outdated` into `upgrading` and quietly change these answers.
+func classifyNoSignal(reported, target string) (string, string) {
+	return ClassifyUpgrade(UpgradeInput{
+		Reported:  reported,
+		Kind:      "external",
+		CPVersion: target,
+		Now:       time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
+		// APIStartedAt long ago, so no grace is in play even if Kind changed.
+		APIStartedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}, UpgradeParams{})
 }

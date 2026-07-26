@@ -70,9 +70,28 @@ SELECT w.*,
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
              AND r.kind <> 'chat'
-       ) AS active_runs
+       ) AS active_runs,
+       -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
+       -- external worker, any hosted worker the controller has not reached, and the
+       -- entire fleet under docker-compose where no controller runs — still lists.
+       -- The join direction is the tenancy control: worker_upgrade_reports carries no
+       -- user_id, so it is reachable only THROUGH this already-per-user query.
+       rh.phase              AS roll_phase,
+       rh.phase_since        AS roll_phase_since,
+       rh.pod_phase          AS roll_pod_phase,
+       rh.blocking_container AS roll_blocking_container,
+       rh.blocking_reason    AS roll_blocking_reason,
+       rh.restart_count      AS roll_restart_count,
+       rh.last_exit_code     AS roll_last_exit_code,
+       -- observed_at is the API's own receipt time and the ONLY input to freshness.
+       -- controller_reported_at is deliberately NOT selected here: it is display-only,
+       -- and not handing it to the classifier is how it stays that way.
+       rh.observed_at        AS roll_observed_at,
+       rh.upgrading_since    AS roll_upgrading_since,
+       rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
 
@@ -85,15 +104,54 @@ ORDER BY w.created_at ASC;
 -- the worker advertises none (an older image, or before the M2 agent sends it), and
 -- overwritten to the current report on every register (the fresh-start signal). It is
 -- observability only — the server never enforces it.
-UPDATE workers SET
-    status              = 'online',
-    version             = @version,
-    template_reported   = @template_reported,
-    max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
-    last_heartbeat_at   = now(),
-    updated_at          = now()
-WHERE id = @id
-RETURNING *;
+--
+-- It also CLEARS THE INV-5 CEILING ANCHOR, and only when the version actually MOVES
+-- (PRD #113 M4). The distinction is the invariant, not a refinement of it:
+--
+--   a register is evidence the POD CAME BACK.
+--   a version MOVE is evidence the ROLL COMPLETED.
+--
+-- `upgrading_since` means "a roll is in progress", so only the second may end it.
+-- Clearing on any register opens an unbounded re-arm path, and it is most available
+-- exactly where a stuck worker lives: a crash-looping agent re-registers on every
+-- start, so "clear on register" would let the worst-off worker in the fleet reset
+-- the ceiling several times a minute, forever.
+--
+-- It lives in THIS statement, in one round trip with the version write, so the two
+-- cannot be separated by a later refactor and cannot interleave with a concurrent
+-- report. The three CTEs share one snapshot, so `prev` reads the version as it was
+-- BEFORE `upd` writes it — that is what makes the comparison possible at all.
+-- A data-modifying CTE runs even though nothing selects from it.
+--
+-- Deliberately NOT in MarkHostedWorkerTokenDelivered: its guard makes a repeat
+-- registration a no-op rather than a re-stamp (correct for token delivery, since a
+-- pod rescheduled onto another node presents the same token again), which would
+-- swallow exactly the clear we need.
+WITH prev AS (
+    SELECT workers.id, workers.version AS old_version FROM workers WHERE workers.id = @id
+), upd AS (
+    UPDATE workers SET
+        status              = 'online',
+        version             = @version,
+        template_reported   = @template_reported,
+        max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+        last_heartbeat_at   = now(),
+        updated_at          = now()
+    WHERE workers.id = @id
+    RETURNING *
+), cleared AS (
+    UPDATE worker_upgrade_reports r
+       SET upgrading_since = NULL, updated_at = now()
+      FROM prev
+     WHERE r.worker_id = prev.id
+       AND r.upgrading_since IS NOT NULL
+       -- IS DISTINCT FROM, not <>: the old version is NULL for a worker that has
+       -- never reported one, and <> would evaluate NULL there and clear nothing —
+       -- silently skipping the first register of exactly the worker whose version
+       -- just became knowable.
+       AND @version IS DISTINCT FROM prev.old_version
+)
+SELECT * FROM upd;
 
 -- name: HeartbeatWorker :one
 -- Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The

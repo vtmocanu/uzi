@@ -38,8 +38,8 @@ func (r *registerStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRu
 // RegisterWorker returns the POST-register row. rotatedHash simulates a rotation
 // committing during this round trip: RETURNING * would carry the NEW hash, which is
 // exactly the value the handler must NOT pass to NoteRegistered.
-func (r *registerStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
-	return store.Worker{ID: arg.ID, Status: "online", Kind: r.kind, TokenHash: r.rotatedHash}, nil
+func (r *registerStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
+	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Kind: r.kind, TokenHash: r.rotatedHash}, nil
 }
 
 // noteStore records NoteRegistered's reach into the hosted-token table, including

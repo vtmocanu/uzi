@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -98,6 +99,30 @@ type Handler struct {
 	// /api/version so the SPA footer and the uzi CLI report one coordinate. Defaults
 	// to "dev" on an un-stamped local/compose build. Set via SetVersion.
 	version string
+	// now / startedAt serve PRD #113's upgrade classification. startedAt anchors the
+	// no-controller-signal grace for hosted workers: Model B rolls the api in the same
+	// release as the workers, so process start is a free proxy for "a release just
+	// happened" and needs no stored column. now is the clock seam — a bare time.Now()
+	// in the classification path would make the graces testable only by sleeping.
+	now       func() time.Time
+	startedAt time.Time
+}
+
+// clock reads the classification clock seam, nil-safe.
+//
+// Nil-safe because many tests build a Handler as a struct literal rather than through
+// New, and a nil func would panic on a path that only renders a badge. A test that
+// needs a fixed clock sets h.now; one that does not gets the real one.
+//
+// A zero startedAt (the same struct-literal case) makes now-startedAt enormous, so the
+// hosted no-signal grace simply does not apply. That is the safe direction: the grace
+// only ever SOFTENS `outdated` into `upgrading`, so its absence can never invent an
+// alert, only decline to suppress one.
+func (h *Handler) clock() time.Time {
+	if h.now == nil {
+		return time.Now()
+	}
+	return h.now()
 }
 
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
@@ -180,7 +205,7 @@ type Reconciler interface {
 
 // New constructs a Handler.
 func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub, set *settings.Cache) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, version: "dev"}
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
@@ -897,5 +922,7 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 	r.Route("/controller", func(r chi.Router) {
 		r.Use(mw.RequireController(h.cfg.ControllerTokenSHA256))
 		r.Get("/poll", h.ControllerPoll)
+		// Roll-health report (PRD #113 M4). Display-only; see ControllerStatus.
+		r.Post("/status", h.ControllerStatus)
 	})
 }

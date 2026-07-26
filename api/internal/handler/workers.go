@@ -123,8 +123,21 @@ var runInputKinds = map[string]bool{
 // the Handler because that is this file's convention for these builders, and because
 // it keeps the classification a pure function of its inputs. Passing "" yields
 // `unknown`, which is also what a genuinely unstamped build produces.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string) apitypes.WorkerDTO {
-	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(w.Version.String, cpVersion)
+//
+// NO ROLL SIGNAL on this path, deliberately (PRD #113 M4). The bare-row callers —
+// register, heartbeat, create, admin list — hold a worker row with no roll-health
+// join, so they classify by version comparison alone. That is honest rather than
+// degraded: passing a nil signal says "this row carries no controller report", which
+// is exactly what it carries. The per-user LIST path has the join and folds it.
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(workersvc.UpgradeInput{
+		Reported:     w.Version.String,
+		Kind:         w.Kind,
+		CPVersion:    cpVersion,
+		Signal:       nil,
+		Now:          now,
+		APIStartedAt: apiStartedAt,
+	}, workersvc.UpgradeParams{})
 	return apitypes.WorkerDTO{
 		UpgradeStatus:        upgradeStatus,
 		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
@@ -151,8 +164,15 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}
 }
 
-func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string) apitypes.WorkerDTO {
-	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(w.Version.String, cpVersion)
+func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(workersvc.UpgradeInput{
+		Reported:     w.Version.String,
+		Kind:         w.Kind,
+		CPVersion:    cpVersion,
+		Signal:       rollSignalFromRow(w),
+		Now:          now,
+		APIStartedAt: apiStartedAt,
+	}, workersvc.UpgradeParams{})
 	return apitypes.WorkerDTO{
 		UpgradeStatus:        upgradeStatus,
 		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
@@ -177,6 +197,46 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string) apitypes.W
 		StatsMemLimitBytes:   int8PtrValue(w.StatsMemLimitBytes),
 		StatsSource:          textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
+}
+
+// rollSignalFromRow lifts the LEFT-JOINed roll-health columns into the classifier's
+// input, or nil when no report exists for this worker.
+//
+// The nil is the important half: absent is a distinct state from any phase value, and
+// it is what lets a report DECAY — the api falls back to version comparison rather
+// than keeping the last thing the controller said forever. A zero-valued struct here
+// instead of nil would read as a signal with an empty phase and an epoch timestamp.
+//
+// controller_reported_at is not among the columns selected, so it cannot reach this
+// struct and therefore cannot reach freshness. That is structural, not a rule.
+func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
+	if !w.RollPhase.Valid || !w.RollObservedAt.Valid {
+		return nil
+	}
+	sig := &workersvc.RollSignal{
+		Phase:             w.RollPhase.String,
+		ObservedAt:        w.RollObservedAt.Time,
+		PodPhase:          w.RollPodPhase.String,
+		BlockingContainer: w.RollBlockingContainer.String,
+		BlockingReason:    w.RollBlockingReason.String,
+		RolledTag:         w.RollWorkerImageTag.String,
+	}
+	if w.RollRestartCount.Valid {
+		sig.RestartCount = w.RollRestartCount.Int32
+	}
+	if w.RollLastExitCode.Valid {
+		code := w.RollLastExitCode.Int32
+		sig.LastExitCode = &code
+	}
+	if w.RollPhaseSince.Valid {
+		t := w.RollPhaseSince.Time
+		sig.PhaseSince = &t
+	}
+	if w.RollUpgradingSince.Valid {
+		t := w.RollUpgradingSince.Time
+		sig.UpgradingSince = &t
+	}
+	return sig
 }
 
 func runToDTO(r store.Run) apitypes.RunDTO {
@@ -332,7 +392,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version),
+		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.clock(), h.startedAt),
 		"token":  token,
 	})
 }
@@ -352,7 +412,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row, h.version))
+		out = append(out, workerDTOFromRow(row, h.version, h.clock(), h.startedAt))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -461,7 +521,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.clock(), h.startedAt)})
 }
 
 // -------------------------------------------------------------------------

@@ -48,6 +48,10 @@ func TestTLSListenerServesOnlyTheWorkerAndControllerSurface(t *testing.T) {
 		{http.MethodPost, "/api/worker/heartbeat"},
 		{http.MethodPost, "/api/worker/runs/claim"},
 		{http.MethodGet, "/api/controller/poll"},
+		// The controller also POSTs roll health here (PRD #113 M4). It dials the SAME
+		// TLS listener, so a route reachable on the plain listener but not this one
+		// would 404 in production while every unit test passed.
+		{http.MethodPost, "/api/controller/status"},
 	} {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
@@ -91,6 +95,10 @@ func TestThePlainListenerStillServesEverything(t *testing.T) {
 		{http.MethodGet, "/api/health"},
 		{http.MethodPost, "/api/worker/register"},
 		{http.MethodGet, "/api/controller/poll"},
+		// The controller also POSTs roll health here (PRD #113 M4). It dials the SAME
+		// TLS listener, so a route reachable on the plain listener but not this one
+		// would 404 in production while every unit test passed.
+		{http.MethodPost, "/api/controller/status"},
 	} {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))

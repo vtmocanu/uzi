@@ -2,6 +2,7 @@ package handler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -28,7 +29,7 @@ func TestWorkerDTODockerMapping(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dto := workerDTOFromWorker(store.Worker{DockerEnabled: tc.col}, 0, false, "", "")
+			dto := workerDTOFromWorker(store.Worker{DockerEnabled: tc.col}, 0, false, "", "", time.Now(), time.Now())
 			if tc.wantNil {
 				if dto.Docker != nil {
 					t.Fatalf("Docker = %v, want nil for a NULL docker_enabled column", *dto.Docker)
@@ -58,8 +59,8 @@ func TestWorkerDTOCarriesUpgradeClassification(t *testing.T) {
 	const cpVersion = "0.11.7"
 	behind := pgtype.Text{String: "0.11.0", Valid: true}
 
-	fromWorker := workerDTOFromWorker(store.Worker{Version: behind}, 0, false, "", cpVersion)
-	fromRow := workerDTOFromRow(store.ListWorkersByUserRow{Version: behind}, cpVersion)
+	fromWorker := workerDTOFromWorker(store.Worker{Version: behind}, 0, false, "", cpVersion, time.Now(), time.Now())
+	fromRow := workerDTOFromRow(store.ListWorkersByUserRow{Version: behind}, cpVersion, time.Now(), time.Now())
 
 	for name, dto := range map[string]struct {
 		status string
@@ -82,7 +83,7 @@ func TestWorkerDTOCarriesUpgradeClassification(t *testing.T) {
 
 	// The steady state serializes as JSON null rather than an empty string, so the UI
 	// renders no explanatory line at all instead of an empty one.
-	current := workerDTOFromWorker(store.Worker{Version: pgtype.Text{String: cpVersion, Valid: true}}, 0, false, "", cpVersion)
+	current := workerDTOFromWorker(store.Worker{Version: pgtype.Text{String: cpVersion, Valid: true}}, 0, false, "", cpVersion, time.Now(), time.Now())
 	if current.UpgradeStatus != workersvc.UpgradeStatusUpToDate {
 		t.Errorf("UpgradeStatus = %q, want %q", current.UpgradeStatus, workersvc.UpgradeStatusUpToDate)
 	}
@@ -92,7 +93,7 @@ func TestWorkerDTOCarriesUpgradeClassification(t *testing.T) {
 
 	// A NULL version column must not reach the classifier as a comparable value: the
 	// pgtype zero value is the empty string, which is the unreported case.
-	never := workerDTOFromWorker(store.Worker{Version: pgtype.Text{Valid: false}}, 0, false, "", cpVersion)
+	never := workerDTOFromWorker(store.Worker{Version: pgtype.Text{Valid: false}}, 0, false, "", cpVersion, time.Now(), time.Now())
 	if never.UpgradeStatus != workersvc.UpgradeStatusUnknown {
 		t.Errorf("UpgradeStatus = %q for a worker that never registered a version, want %q",
 			never.UpgradeStatus, workersvc.UpgradeStatusUnknown)

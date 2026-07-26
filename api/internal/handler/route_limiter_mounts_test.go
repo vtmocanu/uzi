@@ -216,6 +216,16 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},
+	// noLimiter, and this is a reasoned choice rather than the default (PRD #113 M4).
+	// The per-user limiters key on the authenticated USER, and a controller request has
+	// no user in context — it carries the fleet-scoped bearer credential, so
+	// PerUserMiddleware cannot apply at all rather than being merely unhelpful. What is
+	// left would be a per-IP budget, which is meaningless here: there is exactly one
+	// controller principal, on a fixed ~10s cadence, dialing from a pod CIDR that is a
+	// trusted proxy by construction. The real bounds on this endpoint are the ones that
+	// fit it — a 1 MiB body cap and an explicit 512-entry cap — not a request rate.
+	// Same reasoning, same answer as GET /api/controller/poll above.
+	{"POST", "/api/controller/status", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},

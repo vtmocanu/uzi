@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -263,14 +264,14 @@ func TestPatchWorkerRequiresAuth(t *testing.T) {
 // (unbound ⇒ the owner's default), a set column is the id string.
 func TestWorkerDTOCarriesBinding(t *testing.T) {
 	id := uuid.New()
-	bound := workerDTOFromWorker(store.Worker{AnthropicSecretID: pgtype.UUID{Bytes: id, Valid: true}}, 0, false, "console-key", "")
+	bound := workerDTOFromWorker(store.Worker{AnthropicSecretID: pgtype.UUID{Bytes: id, Valid: true}}, 0, false, "console-key", "", time.Now(), time.Now())
 	if bound.AnthropicSecretID == nil || *bound.AnthropicSecretID != id.String() {
 		t.Fatalf("bound id = %v, want %s", bound.AnthropicSecretID, id)
 	}
 	if bound.AnthropicSecretLabel == nil || *bound.AnthropicSecretLabel != "console-key" {
 		t.Fatalf("bound label = %v, want console-key", bound.AnthropicSecretLabel)
 	}
-	unbound := workerDTOFromWorker(store.Worker{}, 0, false, "", "")
+	unbound := workerDTOFromWorker(store.Worker{}, 0, false, "", "", time.Now(), time.Now())
 	if unbound.AnthropicSecretID != nil || unbound.AnthropicSecretLabel != nil {
 		t.Fatalf("unbound worker must serialize both fields as null, got %v/%v",
 			unbound.AnthropicSecretID, unbound.AnthropicSecretLabel)

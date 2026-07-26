@@ -1,8 +1,15 @@
 package workersvc
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 
 	"golang.org/x/mod/semver"
 )
@@ -22,6 +29,35 @@ const (
 	UpgradeStatusUpgrading     = "upgrading"      // M4 (controller roll-health)
 	UpgradeStatusUpgradeFailed = "upgrade_failed" // M4 (controller roll-health)
 )
+
+// The controller's roll phases, re-declared on this side (PRD #113 M4).
+//
+// Re-declared rather than imported: the contract between the api and the controller is
+// the JSON on the wire, not a Go package, and the controller is a separate module whose
+// dependency graph the api must not pull in. The same split the agent's TypeScript
+// protocol lives with. Drift is caught by the shared golden wire contract, not trusted
+// — controller/internal/protocol/testdata/controller_status_wire.json is parsed by a
+// test on this side and marshalled by one on that side.
+//
+// CLOSED SET, validated at ingest. A phase outside it means the api does not model that
+// state: the ENTRY IS DROPPED, never persisted and never rendered, and the rest of the
+// report still lands. One garbage row must not blind the fleet, and a free string must
+// never reach the badge.
+const (
+	PhaseRolling = "rolling"
+	PhaseStuck   = "stuck"
+	PhaseSettled = "settled"
+)
+
+// ValidRollPhase reports whether a controller-supplied phase is one this api models.
+func ValidRollPhase(phase string) bool {
+	switch phase {
+	case PhaseRolling, PhaseStuck, PhaseSettled:
+		return true
+	default:
+		return false
+	}
+}
 
 // legacyFrozenAgentVersion is the hardcoded default every agent image reported before
 // PRD #113 M1 retired it. It is treated as NO REPORT, and that is a correctness
@@ -73,11 +109,11 @@ func normSemver(v string) string {
 // x/mod/semver implements that, so M1's `<release>+g<short-sha>` stamp compares equal
 // to the bare release it was built from.
 //
-// M4 extends this with the controller roll-health rows (R1/R2/R3/R8), which need the
-// persisted signal, the worker kind and a clock. It will take a struct then; the two
-// arguments here are what the version-compare rows actually read, and an input
-// carrying fields no rule consults would be a claim that they are honoured.
-func ClassifyUpgrade(reported, target string) (status string, detail string) {
+// This is the VERSION-COMPARE core (rows R4-R7 and R9). ClassifyUpgrade below wraps it
+// with the controller roll-health rows, which sit above it in the table and can
+// override its answer — but never the other way round: no controller signal can turn
+// an unparseable version into a comparison.
+func classifyByVersion(reported, target string) (status string, detail string) {
 	reported = strings.TrimSpace(reported)
 	target = strings.TrimSpace(target)
 
@@ -106,4 +142,330 @@ func ClassifyUpgrade(reported, target string) (status string, detail string) {
 		// R9 — genuinely behind.
 		return UpgradeStatusOutdated, fmt.Sprintf("running %s, target %s", reported, target)
 	}
+}
+
+// -------------------------------------------------------------------------
+// The full decision table (PRD #113 M4): version compare + controller roll health.
+// -------------------------------------------------------------------------
+
+// RollSignal is a persisted controller report, as the classifier reads it. Nil means
+// no report exists for this worker — the normal state for an external worker, for any
+// hosted worker the controller has not reached, and for the whole fleet under
+// docker-compose where no controller runs at all.
+type RollSignal struct {
+	// Phase is the controller's phase, already validated against the closed enum at
+	// ingest. A value outside the enum never reaches persistence, so a non-empty Phase
+	// here is one of rolling|stuck|settled.
+	Phase string
+	// ObservedAt is the API's OWN now() at receipt. Freshness is computed from this and
+	// never from the wire's controller_reported_at, which the reporting party controls:
+	// a future timestamp there — clock skew is enough, malice makes it permanent —
+	// would produce a signal that never goes stale, and staleness is the only thing
+	// bounding a controller that has stopped talking.
+	ObservedAt time.Time
+	// UpgradingSince anchors the INV-5 ceiling. Set-if-NULL at ingest, cleared ONLY by
+	// the worker's own authenticated re-registration moving workers.version. Nil means
+	// no roll is currently anchored.
+	UpgradingSince *time.Time
+	// PhaseSince is the controller's timestamp, and ⚠ IT MEANS TWO DIFFERENT THINGS.
+	// For `settled` it is the pod's Ready-condition transition — genuine, and what R3
+	// uses. For `stuck` it is the pod's CREATION time, NOT when it became stuck: a
+	// stateless controller has no memory to record the transition in. So no rule here
+	// may treat it as "how long has this been broken" — that would measure something
+	// else and err toward looking worse for longer. R3 is the only rule that reads it,
+	// and only in the `settled` arm where the meaning is sound.
+	PhaseSince *time.Time
+	// RolledTag is the tag the controller actually rolls to. For a HOSTED worker this
+	// is the authoritative target (Decision 9), because values.yaml may pin the worker
+	// image independently of the api's own release.
+	RolledTag string
+	// Display fields for the failed-worker strip. Already sanitized at ingest.
+	PodPhase          string
+	BlockingContainer string
+	BlockingReason    string
+	RestartCount      int32
+	LastExitCode      *int32
+}
+
+// UpgradeInput is everything the decision table reads.
+type UpgradeInput struct {
+	// Reported is workers.version — written only at register, so a worker offline
+	// mid-roll still carries its OLD version. That single fact is why roll health
+	// cannot be derived from this field and has to come from the controller.
+	Reported string
+	// Kind is "hosted" or "external". Roll health exists only for hosted workers; an
+	// external worker's owner runs it by hand and nothing upgrades it for them.
+	Kind string
+	// CPVersion is the control plane's own release ("dev" on an unstamped build).
+	CPVersion string
+	// Signal is the persisted controller report, or nil.
+	Signal *RollSignal
+	// Now and APIStartedAt come from the caller. APIStartedAt anchors the no-signal
+	// hosted grace: Model B rolls the api in the same release as the workers, so
+	// process start is a free proxy for "a release just happened" and needs no column.
+	Now          time.Time
+	APIStartedAt time.Time
+}
+
+// UpgradeParams are the durations the table compares against. Named fields following
+// the Params.WorkerHeartbeatStale precedent — never literals at the comparison site,
+// because a literal cannot be overridden in a test without sleeping.
+type UpgradeParams struct {
+	// ControllerSignalTTL is how long a report stays fresh. Sized to tolerate several
+	// consecutive failed reports rather than the minimum: too short and a live
+	// `upgrading` decays mid-roll into `outdated`, turning the whole fleet's badge red,
+	// which is the exact failure Decision 1 forbids. Too long only leaves an
+	// informational badge after the controller dies. Asymmetric, so err long.
+	ControllerSignalTTL time.Duration
+	// HostedRollGrace is how long after api start a behind hosted worker is given the
+	// benefit of the doubt with NO controller signal at all.
+	HostedRollGrace time.Duration
+	// RegisterConvergenceGrace bounds the gap between "the controller says the new pod
+	// is Ready" and "the worker has re-registered with its new version". A fresh pod
+	// registers on boot, so this is seconds in the healthy case; the window is
+	// generous enough that a pod whose container is Ready while the agent inside
+	// crash-loops still surfaces.
+	RegisterConvergenceGrace time.Duration
+	// MaxUpgradingWindow is the INV-5 ceiling: the longest a controller may be
+	// believed about one roll. A TTL bounds a controller that STOPS talking; nothing
+	// but this bounds one that KEEPS talking, and a compromised or wedged controller
+	// re-posting `upgrading` every poll would otherwise suppress every `outdated` and
+	// `upgrade_failed` alert in the fleet indefinitely.
+	//
+	// This is a BACKSTOP, not the primary detector — the pod-phase path catches
+	// ordinary stuck rolls — so it can afford to be generous and must not be tuned as
+	// though it were catching them. It needs a p99 healthy-roll measurement on a real
+	// cluster; the default below is a starting point for that measurement, NOT a
+	// measured value, and it should not be described as one.
+	MaxUpgradingWindow time.Duration
+}
+
+// Defaults. Each is REASONED from a measured cadence, not measured itself.
+const (
+	// 6x the controller's 10s default poll, so five consecutive failed reports are
+	// tolerated. The repo's other staleness window is 3x its cadence (heartbeat);
+	// this one goes wider deliberately, per the asymmetry above.
+	DefaultControllerSignalTTL = 60 * time.Second
+	// Must exceed a healthy Recreate of the browser-inflated agent image (cold pull
+	// plus /nix reseed) and sit below the ~14 minutes the motivating incident ran
+	// before a human noticed.
+	DefaultHostedRollGrace = 10 * time.Minute
+	// ~7x the 45s offline threshold: generous for a slow first register, short enough
+	// that a container-Ready pod with a crash-looping agent inside surfaces on the
+	// same order as the incident.
+	DefaultRegisterConvergenceGrace = 5 * time.Minute
+	// PLACEHOLDER PENDING MEASUREMENT. Do not cite as measured.
+	DefaultMaxUpgradingWindow = 45 * time.Minute
+)
+
+func (p UpgradeParams) withDefaults() UpgradeParams {
+	if p.ControllerSignalTTL <= 0 {
+		p.ControllerSignalTTL = DefaultControllerSignalTTL
+	}
+	if p.HostedRollGrace <= 0 {
+		p.HostedRollGrace = DefaultHostedRollGrace
+	}
+	if p.RegisterConvergenceGrace <= 0 {
+		p.RegisterConvergenceGrace = DefaultRegisterConvergenceGrace
+	}
+	if p.MaxUpgradingWindow <= 0 {
+		p.MaxUpgradingWindow = DefaultMaxUpgradingWindow
+	}
+	return p
+}
+
+// ClassifyUpgrade evaluates the decision table top to bottom, first match wins.
+//
+// Rule numbers match the design's table so a reviewer can read one against the other.
+// The ordering carries two decisions that are not obvious:
+//
+//   - R1/R2 (roll health) sit ABOVE R4 (unparseable target), so a `dev` control plane
+//     disables VERSION COMPARISON but not roll health. A stuck pod is a direct
+//     observation, not a comparison; suppressing it because the api was built without
+//     a version stamp would throw away the incident's own signal.
+//   - R8 (no-signal grace) sits BELOW the compare rows, so it can only ever soften
+//     `outdated` — never override `up_to_date` or `unknown`.
+func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail string) {
+	p = p.withDefaults()
+	hosted := in.Kind == "hosted"
+	s := in.Signal
+
+	// A signal is fresh when the API's OWN receipt time is inside the TTL. Note what
+	// is NOT consulted: the wire's controller_reported_at. See RollSignal.ObservedAt.
+	signalFresh := s != nil && s.Phase != "" && in.Now.Sub(s.ObservedAt) <= p.ControllerSignalTTL
+
+	// The INV-5 ceiling. Gates ONLY the two rows a controller can assert (R1/R2): past
+	// the window the controller stops being believed about this roll and the row
+	// classifies by version compare alone, so a suppressed `outdated` re-appears.
+	ceilingOK := s == nil || s.UpgradingSince == nil || in.Now.Sub(*s.UpgradingSince) < p.MaxUpgradingWindow
+
+	// Decision 9: for a hosted worker the target is the tag the controller actually
+	// rolls to, since values.yaml can pin it independently of the api's release. An
+	// unparseable tag falls back to the api's own version rather than blinding the
+	// fleet — the PHASE half of the signal is still honoured.
+	target := in.CPVersion
+	if hosted && signalFresh && semver.IsValid(normSemver(s.RolledTag)) {
+		target = s.RolledTag
+	}
+
+	if hosted && signalFresh && ceilingOK && s.Phase == PhaseStuck {
+		return UpgradeStatusUpgradeFailed, stuckDetail(s) // R1
+	}
+	if hosted && signalFresh && ceilingOK && s.Phase == PhaseRolling {
+		return UpgradeStatusUpgrading, rollingDetail(s) // R2
+	}
+
+	// R3 — the controller says the new pod is Ready but workers.version has not caught
+	// up yet. A fresh pod registers on boot, so this is a seconds-long transient in the
+	// healthy case; bounding it stops a pod that is container-Ready with a dead agent
+	// inside from reading `upgrading` forever. This is the ONLY rule that reads
+	// PhaseSince, and only here is its meaning sound (the Ready transition).
+	if hosted && signalFresh && s.Phase == PhaseSettled && s.PhaseSince != nil &&
+		in.Now.Sub(*s.PhaseSince) <= p.RegisterConvergenceGrace &&
+		isBehind(in.Reported, target) {
+		return UpgradeStatusUpgrading, fmt.Sprintf("rolled to %s; awaiting re-registration", target)
+	}
+
+	// R4-R7, R9: the version-compare core.
+	status, detail = classifyByVersion(in.Reported, target)
+
+	// R8 — behind, hosted, and NO fresh signal, within the grace after api start.
+	// Model B rolls the api in the same release, so a recently started api means a
+	// release just happened and an unconfirmed roll is the likeliest explanation for a
+	// behind hosted worker. Strictly a softener: it fires only where the compare
+	// already said `outdated`.
+	if status == UpgradeStatusOutdated && hosted && !signalFresh &&
+		in.Now.Sub(in.APIStartedAt) < p.HostedRollGrace {
+		return UpgradeStatusUpgrading, "roll in progress (unconfirmed — no controller signal)"
+	}
+	return status, detail
+}
+
+// isBehind reports whether reported is a usable version strictly below target. Used by
+// R3, which must not fire for an unparseable or absent version — that is R5's answer
+// and `unknown` outranks a guess about a roll.
+func isBehind(reported, target string) bool {
+	reported = strings.TrimSpace(reported)
+	if reported == "" || reported == legacyFrozenAgentVersion {
+		return false
+	}
+	if !semver.IsValid(normSemver(reported)) || !semver.IsValid(normSemver(target)) {
+		return false
+	}
+	return semver.Compare(normSemver(reported), normSemver(target)) < 0
+}
+
+// stuckDetail is the failed-worker strip's sentence: which container, why, and the
+// numbers an operator needs before opening a terminal. Every field is
+// controller-supplied and was sanitized at ingest.
+func stuckDetail(s *RollSignal) string {
+	who := s.BlockingContainer
+	if who == "" {
+		who = "pod"
+	}
+	why := s.BlockingReason
+	if why == "" {
+		why = "not ready"
+	}
+	out := fmt.Sprintf("%s: %s", who, why)
+	if s.RestartCount > 0 {
+		out += fmt.Sprintf(" (%d restarts", s.RestartCount)
+		if s.LastExitCode != nil {
+			out += fmt.Sprintf(", last exit %d", *s.LastExitCode)
+		}
+		out += ")"
+	} else if s.LastExitCode != nil {
+		out += fmt.Sprintf(" (last exit %d)", *s.LastExitCode)
+	}
+	return out
+}
+
+// rollingDetail names what the pod is waiting on when it can, so "upgrading" is not
+// an opaque state.
+func rollingDetail(s *RollSignal) string {
+	if s.BlockingReason != "" {
+		return s.BlockingReason
+	}
+	if s.PodPhase != "" {
+		return s.PodPhase
+	}
+	return "roll in progress"
+}
+
+// -------------------------------------------------------------------------
+// Persistence (PRD #113 M4).
+// -------------------------------------------------------------------------
+
+// RollHealthReport is one validated, sanitized entry from a controller report, ready
+// to persist. The handler does the decoding, enum validation and sanitizing; this
+// layer only writes.
+type RollHealthReport struct {
+	WorkerID   uuid.UUID
+	Phase      string
+	PhaseSince *time.Time
+	// TargetImage / PodPhase / Blocking* are controller-supplied display strings,
+	// already passed through the 64-byte control-character-stripping sanitizer.
+	TargetImage       string
+	PodPhase          string
+	BlockingContainer *string
+	BlockingReason    *string
+	RestartCount      int32
+	LastExitCode      *int32
+	// ControllerReportedAt is the wire's timestamp: persisted for display, never used
+	// for freshness. ObservedAt is the api's own receipt time and is what freshness
+	// reads. Keeping both named here rather than one "timestamp" is what stops the two
+	// being collapsed by a later tidy-up.
+	ControllerReportedAt time.Time
+	ObservedAt           time.Time
+	PollIntervalSeconds  int
+	WorkerImageTag       string
+}
+
+// RecordRollHealth persists one worker's roll health and returns how many rows the
+// upsert touched — 0 when the worker id is unknown or belongs to an EXTERNAL worker.
+//
+// The confinement to existing hosted rows lives in the SQL, not here (see
+// queries/worker_roll_health.sql). The service returns the count rather than an error
+// for a non-match because "the controller reported a worker we do not host" is not an
+// error condition: it is a skew or a lie, both of which are handled by ignoring the row.
+func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (int64, error) {
+	return s.q.UpsertWorkerRollHealth(ctx, store.UpsertWorkerRollHealthParams{
+		WorkerID:             rep.WorkerID,
+		Phase:                rep.Phase,
+		PhaseSince:           timestamptzPtr(rep.PhaseSince),
+		TargetImage:          pgText(rep.TargetImage),
+		PodPhase:             pgText(rep.PodPhase),
+		BlockingContainer:    textParam(rep.BlockingContainer),
+		BlockingReason:       textParam(rep.BlockingReason),
+		RestartCount:         rep.RestartCount,
+		LastExitCode:         int4Ptr(rep.LastExitCode),
+		ControllerReportedAt: pgtype.Timestamptz{Time: rep.ControllerReportedAt, Valid: !rep.ControllerReportedAt.IsZero()},
+		ObservedAt:           pgtype.Timestamptz{Time: rep.ObservedAt, Valid: true},
+		PollIntervalSeconds:  pgInt4(rep.PollIntervalSeconds),
+		WorkerImageTag:       pgText(rep.WorkerImageTag),
+	})
+}
+
+// timestamptzPtr / int4Ptr render an optional wire value as SQL NULL rather than a
+// zero. A zero time would claim a phase began at the epoch; a zero exit code would
+// claim a clean exit for a container that never terminated.
+func timestamptzPtr(t *time.Time) pgtype.Timestamptz {
+	if t == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *t, Valid: true}
+}
+
+func int4Ptr(v *int32) pgtype.Int4 {
+	if v == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: *v, Valid: true}
+}
+
+func pgInt4(v int) pgtype.Int4 {
+	if v <= 0 {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(v), Valid: true}
 }

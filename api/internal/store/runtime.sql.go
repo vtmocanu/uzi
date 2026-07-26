@@ -2332,38 +2332,67 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
              AND r.kind <> 'chat'
-       ) AS active_runs
+       ) AS active_runs,
+       -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
+       -- external worker, any hosted worker the controller has not reached, and the
+       -- entire fleet under docker-compose where no controller runs — still lists.
+       -- The join direction is the tenancy control: worker_upgrade_reports carries no
+       -- user_id, so it is reachable only THROUGH this already-per-user query.
+       rh.phase              AS roll_phase,
+       rh.phase_since        AS roll_phase_since,
+       rh.pod_phase          AS roll_pod_phase,
+       rh.blocking_container AS roll_blocking_container,
+       rh.blocking_reason    AS roll_blocking_reason,
+       rh.restart_count      AS roll_restart_count,
+       rh.last_exit_code     AS roll_last_exit_code,
+       -- observed_at is the API's own receipt time and the ONLY input to freshness.
+       -- controller_reported_at is deliberately NOT selected here: it is display-only,
+       -- and not handing it to the classifier is how it stays that way.
+       rh.observed_at        AS roll_observed_at,
+       rh.upgrading_since    AS roll_upgrading_since,
+       rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 WHERE w.user_id = $1
 ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID                   uuid.UUID          `json:"id"`
-	UserID               uuid.UUID          `json:"user_id"`
-	Name                 string             `json:"name"`
-	TokenHash            []byte             `json:"token_hash"`
-	Status               string             `json:"status"`
-	LastHeartbeatAt      pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version              pgtype.Text        `json:"version"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared     pgtype.Text        `json:"template_declared"`
-	TemplateReported     pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns    pgtype.Int4        `json:"max_concurrent_runs"`
-	StatsCpuPct          pgtype.Float4      `json:"stats_cpu_pct"`
-	StatsMemBytes        pgtype.Int8        `json:"stats_mem_bytes"`
-	StatsMemLimitBytes   pgtype.Int8        `json:"stats_mem_limit_bytes"`
-	StatsSource          pgtype.Text        `json:"stats_source"`
-	Kind                 string             `json:"kind"`
-	HostedSize           pgtype.Text        `json:"hosted_size"`
-	HostedGeneration     int64              `json:"hosted_generation"`
-	DockerEnabled        pgtype.Bool        `json:"docker_enabled"`
-	AnthropicSecretID    pgtype.UUID        `json:"anthropic_secret_id"`
-	AnthropicSecretLabel pgtype.Text        `json:"anthropic_secret_label"`
-	Busy                 bool               `json:"busy"`
-	ActiveRuns           int64              `json:"active_runs"`
+	ID                    uuid.UUID          `json:"id"`
+	UserID                uuid.UUID          `json:"user_id"`
+	Name                  string             `json:"name"`
+	TokenHash             []byte             `json:"token_hash"`
+	Status                string             `json:"status"`
+	LastHeartbeatAt       pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version               pgtype.Text        `json:"version"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared      pgtype.Text        `json:"template_declared"`
+	TemplateReported      pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns     pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct           pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes         pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes    pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource           pgtype.Text        `json:"stats_source"`
+	Kind                  string             `json:"kind"`
+	HostedSize            pgtype.Text        `json:"hosted_size"`
+	HostedGeneration      int64              `json:"hosted_generation"`
+	DockerEnabled         pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
+	Busy                  bool               `json:"busy"`
+	ActiveRuns            int64              `json:"active_runs"`
+	RollPhase             pgtype.Text        `json:"roll_phase"`
+	RollPhaseSince        pgtype.Timestamptz `json:"roll_phase_since"`
+	RollPodPhase          pgtype.Text        `json:"roll_pod_phase"`
+	RollBlockingContainer pgtype.Text        `json:"roll_blocking_container"`
+	RollBlockingReason    pgtype.Text        `json:"roll_blocking_reason"`
+	RollRestartCount      pgtype.Int4        `json:"roll_restart_count"`
+	RollLastExitCode      pgtype.Int4        `json:"roll_last_exit_code"`
+	RollObservedAt        pgtype.Timestamptz `json:"roll_observed_at"`
+	RollUpgradingSince    pgtype.Timestamptz `json:"roll_upgrading_since"`
+	RollWorkerImageTag    pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
 // Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
@@ -2418,6 +2447,16 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
+			&i.RollPhase,
+			&i.RollPhaseSince,
+			&i.RollPodPhase,
+			&i.RollBlockingContainer,
+			&i.RollBlockingReason,
+			&i.RollRestartCount,
+			&i.RollLastExitCode,
+			&i.RollObservedAt,
+			&i.RollUpgradingSince,
+			&i.RollWorkerImageTag,
 		); err != nil {
 			return nil, err
 		}
@@ -2494,22 +2533,62 @@ func (q *Queries) RecordRunColumnMove(ctx context.Context, arg RecordRunColumnMo
 }
 
 const registerWorker = `-- name: RegisterWorker :one
-UPDATE workers SET
-    status              = 'online',
-    version             = $1,
-    template_reported   = $2,
-    max_concurrent_runs = $3,
-    last_heartbeat_at   = now(),
-    updated_at          = now()
-WHERE id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+WITH prev AS (
+    SELECT workers.id, workers.version AS old_version FROM workers WHERE workers.id = $1
+), upd AS (
+    UPDATE workers SET
+        status              = 'online',
+        version             = $2,
+        template_reported   = $3,
+        max_concurrent_runs = $4,
+        last_heartbeat_at   = now(),
+        updated_at          = now()
+    WHERE workers.id = $1
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+), cleared AS (
+    UPDATE worker_upgrade_reports r
+       SET upgrading_since = NULL, updated_at = now()
+      FROM prev
+     WHERE r.worker_id = prev.id
+       AND r.upgrading_since IS NOT NULL
+       -- IS DISTINCT FROM, not <>: the old version is NULL for a worker that has
+       -- never reported one, and <> would evaluate NULL there and clear nothing —
+       -- silently skipping the first register of exactly the worker whose version
+       -- just became knowable.
+       AND $2 IS DISTINCT FROM prev.old_version
+)
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM upd
 `
 
 type RegisterWorkerParams struct {
+	ID                uuid.UUID   `json:"id"`
 	Version           pgtype.Text `json:"version"`
 	TemplateReported  pgtype.Text `json:"template_reported"`
 	MaxConcurrentRuns pgtype.Int4 `json:"max_concurrent_runs"`
-	ID                uuid.UUID   `json:"id"`
+}
+
+type RegisterWorkerRow struct {
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	Name               string             `json:"name"`
+	TokenHash          []byte             `json:"token_hash"`
+	Status             string             `json:"status"`
+	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version            pgtype.Text        `json:"version"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared   pgtype.Text        `json:"template_declared"`
+	TemplateReported   pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns  pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct        pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource        pgtype.Text        `json:"stats_source"`
+	Kind               string             `json:"kind"`
+	HostedSize         pgtype.Text        `json:"hosted_size"`
+	HostedGeneration   int64              `json:"hosted_generation"`
+	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
+	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -2520,14 +2599,37 @@ type RegisterWorkerParams struct {
 // the worker advertises none (an older image, or before the M2 agent sends it), and
 // overwritten to the current report on every register (the fresh-start signal). It is
 // observability only — the server never enforces it.
-func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (Worker, error) {
+//
+// It also CLEARS THE INV-5 CEILING ANCHOR, and only when the version actually MOVES
+// (PRD #113 M4). The distinction is the invariant, not a refinement of it:
+//
+//	a register is evidence the POD CAME BACK.
+//	a version MOVE is evidence the ROLL COMPLETED.
+//
+// `upgrading_since` means "a roll is in progress", so only the second may end it.
+// Clearing on any register opens an unbounded re-arm path, and it is most available
+// exactly where a stuck worker lives: a crash-looping agent re-registers on every
+// start, so "clear on register" would let the worst-off worker in the fleet reset
+// the ceiling several times a minute, forever.
+//
+// It lives in THIS statement, in one round trip with the version write, so the two
+// cannot be separated by a later refactor and cannot interleave with a concurrent
+// report. The three CTEs share one snapshot, so `prev` reads the version as it was
+// BEFORE `upd` writes it — that is what makes the comparison possible at all.
+// A data-modifying CTE runs even though nothing selects from it.
+//
+// Deliberately NOT in MarkHostedWorkerTokenDelivered: its guard makes a repeat
+// registration a no-op rather than a re-stamp (correct for token delivery, since a
+// pod rescheduled onto another node presents the same token again), which would
+// swallow exactly the clear we need.
+func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (RegisterWorkerRow, error) {
 	row := q.db.QueryRow(ctx, registerWorker,
+		arg.ID,
 		arg.Version,
 		arg.TemplateReported,
 		arg.MaxConcurrentRuns,
-		arg.ID,
 	)
-	var i Worker
+	var i RegisterWorkerRow
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
