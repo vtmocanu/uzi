@@ -105,13 +105,28 @@ Three coherent parts (the same judge reviews flagged all three):
   (`gatePlan` short-circuits with no wait, `runner.ts:587-607`) the overlap window is
   only the plan turn, so a slow install can add real wall-clock before implement —
   acceptable, and stated honestly rather than claimed away.
-- [ ] **M3 — Pre-scan accuracy (`scanCommandNotFound`).** Suppress a `ToolMiss` for a
-  tool the same run later ran successfully. Note: `judgeSignal` today fetches only
-  `tool_result` payloads (`ListToolResultPayloadsForRun`, `judge.go:231`) — no
-  `tool_use` rows or structured exit codes — so "later ran green" needs either widening
-  the query to the invocation side or a text heuristic over the payloads; scope that in
-  M3. The suppression itself is safe (a genuinely-absent tool cannot later run green).
-  Go unit tests with fumble-then-succeed traces.
+- [x] **M3 — Pre-scan accuracy (`scanCommandNotFound`).** Suppress a `ToolMiss` for a
+  tool the same run later ran successfully. **RESOLVED: widened the query to the invocation
+  side.** As drafted, this note said `judgeSignal` "today fetches only `tool_result`
+  payloads (`ListToolResultPayloadsForRun`)" and left the choice open between widening and a
+  text heuristic over the payloads. *(That sentence is now historical — the query it names
+  no longer exists; it was replaced by `ListToolTraceForRun`, which returns `seq, kind,
+  payload` for `tool_use` and `tool_result` ordered by `seq ASC`.)*
+
+  The heuristic option was ruled out on a fact that settles it: **the command lives only in
+  `tool_use`** — `tool_result` carries `{tool_use_id, content, is_error}` and no command —
+  and **a successful `tsc --noEmit` prints nothing**, so its `tool_result` has no text to
+  heuristic over. A heuristic could therefore only ever catch the npm-wrapper arm, leaving
+  direct invocation false-flagged permanently — and direct invocation gets *more* common
+  after M1/M2, not less.
+
+  A latent defect surfaced while ruling on it, worth keeping: the old query carried
+  `ORDER BY seq ASC` in SQL and then **discarded the guarantee at the type boundary** by
+  returning `[][]byte`, so "later" meant "larger slice index" and folding `ASC→DESC`
+  reddened nothing. Under the widened row type `seq` enters the function and "later" is
+  assertable. Go unit tests use authored fumble-then-succeed traces rather than a captured
+  one, deliberately: after M2 lands, real traces stop fumbling, so a snapshot fixture would
+  have nothing to suppress and would read as full coverage while discriminating nothing.
 - [ ] **M4 — Gate honesty (net-new machinery — heaviest milestone; may split).** This
   is NOT just surfacing an existing signal: the ran/failed/skipped mapping today lives
   only in self-improve's `defaultCheckRunner` (`self-improve.ts:227-249`) for hardcoded
@@ -151,16 +166,69 @@ escalation, not the default. Full-scripts install is NOT adopted.
 
 ## Trust posture — why auto-install is OK by default
 
+> **REWRITTEN 2026-07-26, during implementation. The original version of this section was
+> WRONG, and the error was load-bearing.** It argued that auto-install clears uzi's
+> repo-borne-config bar "*because of the `--ignore-scripts` default*: … no repo-authored
+> script runs". That premise is **false for yarn and pnpm**. It was believed by everyone
+> who read it, including the coder who then wrote the same claim, as an absolute, into the
+> module header; two validators found it independently, each by a different route.
+>
+> Rewritten rather than annotated, because the defect was not a missing caveat. A reader of
+> the old text concluded the safety property *falls out of* `--ignore-scripts` — precisely
+> the belief that produced the bug, and the one that invites the next person to drop a
+> mitigation as redundant.
+
 Repo-borne provisioning config is deliberately gated in uzi: `repo_devbox_opt_in`
 (migration `00047`) is per-repo opt-in, default OFF, and a repo's devbox
 `init_hook`/scripts are NEVER executed by a run. Auto-running a repo's lockfile install
-pre-approval must clear the same bar — and it does, *because of the `--ignore-scripts`
-default*: a frozen `--ignore-scripts` install does lockfile resolution + fetches
-published package tarballs into `node_modules`; no repo-authored script runs, unlike a
-devbox `init_hook`. It also runs under the same `runner` uid + scrubbed env that already
-executes the repo's tests. So it needs no new opt-in gate. (If we ever default to
-full-scripts install, that reasoning breaks and auto-install must become opt-in —
-recorded here so the tradeoff is never silently crossed.)
+pre-approval must clear the same bar.
+
+**`--ignore-scripts` alone does not clear it.** It suppresses *lifecycle* scripts, but
+every package manager except npm has a second, separate channel by which a repo-committed
+file becomes executable code during `install`. Measured offline (`--network none`) inside
+the pinned `node:22-alpine` base image, running the exact commands this feature issues:
+
+| manager | repo-controlled vector | under `--ignore-scripts` alone | what closes it |
+|---|---|---|---|
+| yarn 1.22.22 | `.yarnrc.yml` `yarnPath:` (also classic `.yarnrc` `yarn-path`) | **repo JS executed, exit 0** — before any flag is parsed | `YARN_IGNORE_PATH=1` |
+| pnpm | `.pnpmfile.cjs` | **executed** | `--ignore-pnpmfile` |
+| pnpm | `packageManager:` + `manage-package-manager-versions` (on by default) | **fetches and executes a declared pnpm** | `--config.manage-package-manager-versions=false` |
+| bun | the repo's own `postinstall` | ran without the flag | `--ignore-scripts` — here it is the *only* thing stopping it |
+| npm | `packageManager:` handoff | no handoff | — |
+
+The yarn case is the sharpest: `yarnPath` wins over the corepack `packageManager` check, so
+the layout `yarn set version berry` produces **is** the exploit, not a contrived fixture.
+`enableScripts: false` is irrelevant there, because the release file *is* the code.
+
+**The bar is therefore cleared by the mitigations in that right-hand column, not by
+`--ignore-scripts`.** Each is load-bearing; none is redundant. Removing any one re-opens a
+path by which a cloned repo executes its own code, pre-approval, on every run touching that
+manager. The install still runs under the same `runner` uid + scrubbed env that already
+executes the repo's tests, so the blast radius stays bounded — but bounded blast radius was
+never the claim this section was making.
+
+Two limits, stated because their absence is what made the old text dangerous:
+
+1. **This is not an exhaustive audit of any package manager.** It is the set of vectors
+   three agents probed. What was deliberately NOT probed, recorded as clearly as what was:
+   **bun entirely** (no binary in the image, so the bun row rests on a single uncorroborated
+   probe; `bunfig.toml` `preload` is the obvious untested candidate — this is the largest
+   gap); **corepack shims** (present in the image but not enabled — `corepack enable` would
+   make `packageManager` drive a download-and-execute for yarn *and* npm); **a real Berry as
+   the `yarn` on PATH** (`YARN_IGNORE_PATH` is a yarn-1 mechanism and Berry's behaviour is
+   untested, though Berry's rejection of `--frozen-lockfile` makes an honest failure the
+   likely outcome); and **lockfile-embedded specifiers** (`git:`, `file:`, `link:`,
+   arbitrary `resolved` URLs) plus `.npmrc` registry redirection.
+
+   **`--ignore-scripts` bounds what runs at install time, not what the install PLACES on
+   disk.** Attacker-chosen code landing in `node_modules` executes when the agent later runs
+   a gate. That is not a *new* exposure — the repo's own test files already execute under
+   the same uid — but it is a different claim from "no repo code runs", and conflating the
+   two is how this section went wrong the first time.
+2. **If we ever default to a full-scripts install, the reasoning breaks entirely** and
+   auto-install must become opt-in. Recorded so the tradeoff is never silently crossed —
+   and note that the original text carried exactly that sentence *while its main claim was
+   already false*, which is why "we wrote the tradeoff down" is not by itself a defence.
 
 ## Success Criteria
 
@@ -192,6 +260,32 @@ recorded here so the tradeoff is never silently crossed.)
 - **Pre-scan over-suppression.** M3 must only suppress a miss when the *same* tool
   later ran green — not blanket-ignore 127s (a genuinely absent tool must still be
   reported).
+- **The overlap leaves a plan-turn race that CANNOT be closed, only named** (found
+  2026-07-26 in the M2 architectural-fit pass). M2 joins the install before the first
+  implement turn, so the agent never races it *while implementing*. But the **plan turn**
+  runs with `permissionMode: "bypassPermissions"` and full Bash, and `guardrails.ts` has
+  **no package-manager rules of any kind** (verified: `grep -c` for `npm|pnpm|yarn|bun
+  install` returns 0). So a planning agent exploring the repo can run its own `npm ci` in
+  the same directory while the worker's install is mid-flight — the exact `node_modules`
+  corruption the join exists to prevent, moved one phase earlier.
+
+  **This is inherent to the design, not an oversight.** The overlap with the plan turn *is*
+  the wall-clock argument for the whole feature; closing the race means giving up the
+  benefit. So it is documented rather than fixed.
+
+  The failure is worse than "no deps", which is why it is worth naming rather than
+  shrugging at: a half-written `node_modules` still EXISTS, so `defaultCheckRunner`'s
+  `requires: "node_modules"` pre-flight passes, the check runs against a corrupt tree, and
+  it reports a real-looking failure — "accusing good code of failing", the precise outcome
+  `self-improve.ts` is written to prevent. It shares that coupling with a separate
+  pre-existing bug found three times independently during this PRD (a *failed* `npm ci`
+  also leaves the directory behind, and the same pre-flight passes); both are filed
+  separately.
+
+  Exposure is one turn, and the blast radius is a failed install rather than a security
+  property. Mitigating it properly would mean either a guardrail denying package-manager
+  invocations during the plan turn, or a lock the agent's own `npm` would have to respect —
+  neither is in scope here.
 
 ## Related Work
 
@@ -228,3 +322,67 @@ recorded here so the tradeoff is never silently crossed.)
   corrected "exit-127" → "command-not-found text match". Confirmed non-issues: deferring
   lockfile-hash caching is right (the runner clone is torn down each run,
   `runner.ts:453-456`; only the bare clone persists — caching is separate work).
+  **⚠ Item (4) of this entry is now RETRACTED in part** — "`--ignore-scripts` clears the
+  bar without a new opt-in" is false as stated; see the 2026-07-26 entry below. Left in
+  place rather than edited, because the entry is the record of what was decided that day
+  and the retraction is more useful than a clean-looking log.
+
+- 2026-07-26 — **Implemented. M1–M3 landed; M4 split out; the trust-posture premise was
+  found false and closed.** Decisions taken during implementation, in descending order of
+  consequence:
+
+  1. **The Trust posture section's central premise was FALSE, and is rewritten above.**
+     `--ignore-scripts` does not mean "no repo-authored code runs": yarn execs a
+     repo-committed `yarnPath` before parsing any flag, and pnpm executes `.pnpmfile.cjs`
+     and (via `manage-package-manager-versions`) a `packageManager`-declared pnpm. Found
+     independently by a reviewer and an auditor, each measuring offline inside the pinned
+     `node:22-alpine` image; a third measurement by the coder confirmed all four managers
+     and turned the auditor's *inferred* second pnpm vector into a fact. **Ruling: restore
+     the premise, do not renegotiate it** — crossing that tradeoff is a decision about
+     uzi's security posture and belongs to the owner, not to a milestone. Closed with
+     per-manager mitigations; all four managers retained, none dropped. Consequence for the
+     module's contract: it now adds exactly one env key on exactly one arm (`YARN_IGNORE_PATH`),
+     where previously it added none — pinned per-manager by a test so the property stays
+     checkable rather than becoming folklore.
+  2. **M4 split into its own increment**, exercising this PRD's own pre-authorization.
+     M4 is the safety net for a residual whose size is unknown until M5 measures it, and
+     its load-bearing dependency is a *product* question (`submit_plan` gaining a structured
+     `gates` field changes what a human approves at the gate). Free-text extraction of
+     declared gates was assessed and rejected in both directions: it harvests `git checkout
+     -b` out of fenced blocks as a "gate" (false banners, which reviewers learn to ignore)
+     and yields zero gates from "I'll run the repo's test suites" (passes vacuously — the
+     exact failure M4 exists to prevent). Full design preserved for the follow-up increment.
+  3. **M3 widens the query to the invocation side** rather than using a text heuristic. The
+     deciding fact: the command lives only in `tool_use`, and a successful `tsc --noEmit`
+     prints nothing, so `tool_result` has no text to heuristic over. A latent defect
+     surfaced on the way: the old query ordered by `seq` in SQL and then discarded the
+     guarantee by returning `[][]byte`, so folding `ASC→DESC` reddened nothing.
+  4. **M5 is a POST-DEPLOY step**, not completable in the PRD run that writes the code: it
+     needs the worker image built and deployed (merge → `v*` tag → Harbor → ArgoCD). Ticking
+     it from unit tests would conflate "discovery finds the right dirs" with "the install
+     succeeds under the runner uid with the scrubbed env".
+  5. **The post-agent self-improve install stays UNCONDITIONAL.** A skip guard was proposed
+     and then retracted after a case analysis: `npm install <pkg>` reconciles `node_modules`
+     in place (a presence probe is *correct* there), a hand-edited `package.json` leaves the
+     lockfile untouched (so a lockfile-diff guard skips it), and `npm ci` refuses with
+     `EUSAGE` while `node_modules` SURVIVES — so that case is already broken today,
+     independent of this PRD. Every predicate is wrong on some case, and a wrong skip runs
+     the checks against stale deps, producing a failure that looks real and is the harness's
+     fault. Correctness dominates the bounded latency of one extra install on one run kind.
+  6. **`--frozen-lockfile` added to the bun arm**, where the milestone bullet said bare
+     `bun install`: a non-frozen install rewrites the lockfile *in the clone*, dirtying the
+     tree the agent diffs and the MR shows. The M1 prose already said "the frozen
+     `--ignore-scripts` install", so the bullet was an oversight, not a decision.
+  7. **Deps-ready is corroborated only for projects that DECLARE dependencies.** An
+     unconditional `node_modules` existence check was instructed and correctly refused:
+     `npm ci` on a zero-dependency project exits 0 creating no `node_modules`, so the
+     unconditional form turns a genuine success into a reported failure — the same lie as a
+     false ready, pointing the other way.
+  8. **`prepareCheckDeps` deleted, not shimmed.** Two install paths for one job is the drift
+     this PRD removes, and its hardcoded `["web","agent"]` was the bug.
+
+  Filed separately, each found independently by two or more agents: the
+  `requires: "node_modules"` pre-flight passing on a *failed* install (three discoveries);
+  and `defaultCheckRunner` carrying the same `execFile`+`timeout` defect under the uid split
+  that this PRD fixed in `js-deps` (measured: the timeout kills from the worker uid and gets
+  `EPERM`, leaving the runner process alive past its cap).
