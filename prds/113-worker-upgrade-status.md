@@ -150,6 +150,25 @@ nav item** gains an alert badge = the count of workers needing attention.
    then fall back to version-compare with a short grace so a routine roll does not
    flash `outdated`. State machine, not two independent booleans.
 
+   **AMENDED 2026-07-26, two ways.** (a) *Freshness is server-stamped.* The wire's
+   `reported_at` is supplied by the untrusted party, so a future timestamp means the
+   signal never goes stale — clock skew achieves this accidentally, malice
+   permanently. The api stamps `observed_at` at receipt and computes freshness from
+   that; the controller's value is kept for display only. (b) *An absolute ceiling
+   no controller signal can extend (INV-5).* A TTL bounds a controller that **stops**
+   reporting; it does nothing about one that **keeps** reporting something false,
+   which at any TTL value permanently suppresses the fleet's alerts. So the api
+   records `upgrading_since` on the first report putting a worker into a non-terminal
+   roll state, and past `MaxUpgradingWindow` classifies by version-compare alone
+   whatever the controller says. The clock is cleared **only when the worker's own
+   authenticated re-registration moves `workers.version`** — not on any register.
+   A register is evidence the *pod* came back; version movement is evidence the
+   *roll completed*, and only the latter should end "a roll is in progress".
+   Clearing on any register would open an unbounded re-arm path, most available
+   exactly where a stuck worker lives, since a crash-looping agent re-registers on
+   every start. TTL and ceiling are different instruments for different failures and
+   neither substitutes for the other.
+
 8. **Version-compare rules, spelled out.** Compare on parsed release SemVer.
    Reported **>** release (a per-cluster pinned worker tag, a hand-built image) is
    **never** `outdated` → `up_to_date` (or `unknown`), never a false alert.
@@ -157,6 +176,31 @@ nav item** gains an alert badge = the count of workers needing attention.
    (`"dev"` — a local `go build`, `api/cmd/server/main.go:53`), classification is
    **disabled** for the whole fleet (everything `unknown`, no alerts): there is no
    trustworthy "latest" to compare against.
+
+   **AMENDED 2026-07-26 — as originally written this rule was unimplementable and
+   failed OPEN.** `golang.org/x/mod/semver` requires a leading `v`, and every version
+   this project ships is bare: `api/Dockerfile:20` stamps `${UZI_VERSION#v}`
+   deliberately, `deploy/chart/Chart.yaml` is bare. MEASURED on the literal shipped
+   forms: `Compare("0.11.0","0.11.7") = 0`, both `IsValid=false`. Un-normalized, every
+   worker reads `up_to_date` forever and the feature is silently dead — failing open,
+   never alerting. Three consequences now binding:
+   (a) **Normalize before comparing**, per the in-repo precedent at
+   `api/internal/forge/forgejo.go:173-185` (re-prefix, `IsValid` guard, then compare).
+   (b) **The `IsValid` guards are load-bearing, not defensive.** MEASURED:
+   `Compare("v0.11.7.1","v0.11.7") = -1` while `IsValid` is false — an invalid operand
+   sorts *below*, so dropping a guard makes garbage classify `outdated`, precisely what
+   this decision forbids.
+   (c) **The retired `0.1.0-m4` default is NOT caught by the unparseable rule.**
+   MEASURED: `IsValid("v0.1.0-m4") = true` and it sorts below every release, so it
+   classifies `outdated`, not `unknown`. Fixing (a) is exactly what *activates* this:
+   with normalization absent the fleet reads `up_to_date`, with it present every
+   pre-M1 image reads `outdated` and the nav badge goes red fleet-wide on the very
+   release that introduces the anti-cry-wolf machinery. The classifier must treat the
+   exact literal as unreported ⇒ `unknown`, **in the same commit as the normalizer**.
+   (d) Test fixtures must use the **bare** form, and the discriminating row must be
+   *behind* (`0.11.0` vs `0.11.7`), never equal: `Compare("0.11.7","0.11.7") = 0` is
+   the right answer from a broken comparison, so an all-current fixture set passes
+   against the broken implementation.
 
 9. **Hosted "latest" = the tag that actually rolls.** `values.yaml` permits
    pinning `workers.image.tag` independently of the api image, so the api's own
@@ -176,6 +220,27 @@ nav item** gains an alert badge = the count of workers needing attention.
     (`controller/internal/protocol/protocol.go:11-14`); the api tolerates the
     controller sending an unknown field and the controller tolerates a 404 (old
     api) as non-fatal.
+
+    **AMENDED 2026-07-26, two false claims above.** (a) *"The worst a lying controller
+    achieves is a wrong badge" holds ONLY with D7's ceiling in place.* Without it, a
+    controller re-posting `upgrading` every poll always satisfies the TTL and thereby
+    permanently suppresses `upgrade_failed` + `outdated` for the whole fleet. That is
+    alert suppression, and it is materially worse than the wrong-delete #58 refused,
+    because nobody sees an alert that never fires. The display-only property bounds
+    what the controller can **write**; INV-5 is what bounds how long it can be
+    **believed**, and the safety claim needs both.
+    (b) *"The api tolerates the controller sending an unknown field" is false against
+    the house decoder.* Both shared helpers set `DisallowUnknownFields`
+    (`api/internal/httpx/respond.go:51,78`), so a newer controller talking to an older
+    api gets a 400 — half the skew tolerance this decision budgets for. The route must
+    use a deliberate route-local lenient decoder, commented, or the next reader
+    "fixes" it back and silently converts a forward-compatible endpoint into a brittle
+    one. Additional constraints the implementation owes: the upsert is confined to
+    existing **hosted** worker rows (no INSERT of an unknown id, or the controller can
+    assert failures against external workers it has no jurisdiction over), the phase is
+    a closed server-validated enum, every controller-supplied display string is
+    sanitized (it reaches a terminal via `api/cmd/uzi/worker.go`), and the entry count
+    is explicitly capped (a 1 MiB body bounds bytes, not upserts).
 
 ## Touchpoints
 
@@ -226,9 +291,13 @@ nav item** gains an alert badge = the count of workers needing attention.
       `outdated`; unparseable → `unknown`; `dev` control plane → classification
       off). Covers `up_to_date` / `outdated` / `unknown` for hosted **and**
       external workers, and register-only version semantics. Store/query + handler
-      + CLI DTO. **Useful on its own**: the motivating stuck-roll worker already
+      + CLI DTO. ~~**Useful on its own**: the motivating stuck-roll worker already
       surfaces here as `outdated` + offline (in the attention set) before any
-      controller work.
+      controller work.~~ **Corrected 2026-07-26**: M2 changes only the DTO, so it has
+      no user-visible surface until M5, and the motivating worker surfaces as
+      `outdated` only if its image carries a real stamp — i.e. only after a release
+      built with M1. The example works two releases after M1, not one. M2 must also
+      ship the D8 normalization and the `0.1.0-m4` special case together (see D8).
 - [ ] **M3 — Controller roll-health: observe + report**: add `pods: get,list` RBAC
       in both worker namespaces (the reserved V2 hook); extend the controller's
       observation with pod phase + blocking-container waiting reason, deriving
@@ -379,3 +448,35 @@ nav item** gains an alert badge = the count of workers needing attention.
   (7) Fixed three factual nits: the version-report path, the `NavItem badge` prop
   origin (PRD #46, not #98), and the `configuration.md:198` note being wrong about
   heartbeat too.
+- 2026-07-26 (AI, adversarial pre-implementation pass — auditor pre-flag, architect
+  design, reviewer M1 pre-flag; every load-bearing claim re-derived against the code
+  and the semver claims re-run by the team lead): **five of this PRD's own assertions
+  were disproved before a line was written.** D8 was unimplementable and failed open
+  (bare version strings compare equal); the retired `0.1.0-m4` default is valid semver
+  classifying `outdated` rather than `unknown`, and fixing D8 is what *activates* that
+  cry-wolf; D10's "worst case is a wrong badge" was false, since a live liar
+  permanently suppresses fleet alerts at any TTL; D7 sourced freshness from the
+  untrusted party; and D10's unknown-field tolerance was false against the house
+  decoder. Each is written into the decision it corrects, with its measurement. The
+  fixes: normalization plus the `0.1.0-m4` special case (D8), server-stamped
+  `observed_at` plus the INV-5 ceiling anchored on version movement at authenticated
+  re-registration (D7), and a route-local lenient decoder plus the display-only
+  constraint list (D10).
+  Also settled: **M5's "View pod events" and its raw-log pane demanded RBAC M3 never
+  grants.** `pods/log` is REFUSED — worker logs carry agent output over a user's cloned
+  private repo, so granting it makes the controller a channel for customer source. The
+  events button becomes a copy-the-`kubectl`-command affordance and "Likely cause"
+  becomes a closed lookup table in web; "Copy diagnostics" stays. Net: no new RBAC
+  beyond `pods: list` (LIST only — `get`-by-name has no call site, since pod names are
+  Deployment-generated). **This edits the owner-accepted mock and was the team lead's
+  call**, taken to keep the branch moving; either affordance is restorable at the cost
+  of one RBAC line plus a handler, a far cheaper reversal than un-shipping a `pods/log`
+  grant. Mute scope settled as per-user-per-worker-per-release (a release-wide mute
+  would hide a *different* worker failing later, the case the badge exists for).
+  Two milestone claims corrected: **"M2 is useful on its own" is false** (it changes
+  only the DTO, with no surface until M5, and its motivating example needs a real stamp
+  so it works two releases after M1, not one), and **M3/M4 are re-split** — M3
+  controller-only and standalone-shippable since the controller already tolerates a
+  404, M4 api-only.
+  Citation drift fixed: `docs/configuration.md` is `:199`; the `worker-rbac.yaml` pods
+  block is `:81-93`; `forgejo.go` is `:173-185`; `NoteRegistered` is `:117-128`.
