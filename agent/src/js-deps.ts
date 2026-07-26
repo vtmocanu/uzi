@@ -3,11 +3,12 @@
 //
 // A worker seeds a FRESH clone per run, so the target repo's `node_modules` is absent
 // when the agent starts and its first gate command (`npm test`, `vitest`, `tsc`) dies
-// with `command not found`. `prepareCheckDeps` (self-improve.ts, now deleted) already
-// solved that — but only for `self_improve` runs, only AFTER the agent finished, and only
+// with `command not found`. A routine called `prepareCheckDeps` (self-improve.ts) used to
+// solve that — but only for `self_improve` runs, only AFTER the agent finished, and only
 // for uzi's own hardcoded `["web", "agent"]` layout. This module is that routine
 // RELOCATED and GENERALIZED: same sandbox, same best-effort/honest-skip contract, now
-// driven by whatever lockfiles the cloned repo actually has.
+// driven by whatever lockfiles the cloned repo actually has. PRD #121 M2 deleted the
+// original once both call sites moved here, so nothing by that name exists any more.
 //
 // SANDBOX — UNCHANGED, and deliberately so. Every install subprocess goes through
 // `runnerCommand` (setpriv → the cap-less `runner` uid under the PRD #51 A1 split;
@@ -110,7 +111,8 @@ export const MAX_PROJECT_DIRS = 12;
  *  `truncated`. */
 export const MAX_SCAN_DIRS = 2000;
 
-/** Per-install wall-clock cap. Inherited from `prepareCheckDeps`' default; overridable. */
+/** Per-install wall-clock cap. Inherited from the routine this module replaced (which
+ *  used the same 10 minutes); overridable per call. */
 export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Directories never descended into. `node_modules` is the requirement (a dependency's

@@ -28,12 +28,11 @@ import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
-import { buildSdkEnv } from "./sdk-env.js";
+import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { installJsDeps, type JsDepsInstall, type JsDepsResult } from "./js-deps.js";
-import { buildCheckEnv } from "./self-improve.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
 import { resolveAgentSelection, type ClaimConfig } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
@@ -515,12 +514,27 @@ export class SdkExecutor implements Executor {
       }
 
       // --- Join the JS dependency install (PRD #121 M2) ---------------------
-      // Past this point the agent may run `npm test` / `vitest` / `tsc`, and may run
-      // its own `npm ci` if it thinks deps are missing. npm has NO cross-process
-      // `node_modules` lock, so a concurrent worker-side install in the same dir would
-      // corrupt the tree. Joining here is what makes that impossible — and it is placed
-      // AFTER the not_code return above, so a ci_fix that never implements anything
-      // does not wait for deps it will not use.
+      // The IMPLEMENT phase must never race the install. Past this point the agent
+      // runs `npm test` / `vitest` / `tsc`, and will run its own `npm ci` if it thinks
+      // deps are missing; npm has NO cross-process `node_modules` lock, so a concurrent
+      // worker-side install in the same dir would corrupt the tree. Joining here is what
+      // makes that impossible FOR THE IMPLEMENT TURNS — placed after the not_code return
+      // above, so a ci_fix that never implements does not wait for deps it will not use.
+      //
+      // RESIDUAL, AND IT IS NOT CLOSED BY THIS JOIN: the PLAN turn can do the same thing.
+      // It runs under `permissionMode: "bypassPermissions"` with full Bash, and
+      // guardrails.ts has no package-manager rule of any kind (verified: it screens git
+      // push/history/config, credential reads, /proc, secret paths, `env` and docker —
+      // nothing about npm/pnpm/yarn/bun). So a planning agent exploring the repo can run
+      // `npm ci` in a dir this install is mid-flight in. That window is DELIBERATE — the
+      // overlap is the entire wall-clock argument for starting before the plan turn — so
+      // it is named here rather than fixed; closing it would mean giving the overlap up.
+      //
+      // Worth knowing what it costs, because it is worse than "the deps are missing": a
+      // half-written `node_modules` still EXISTS, so `defaultCheckRunner`'s
+      // `requires: "node_modules"` pre-flight passes, the check runs against a corrupt
+      // tree, and it FAILS — accusing good code of failing, which is the one thing
+      // self-improve.ts's status mapping exists to prevent.
       depsResults = await this.joinDepsInstall(ctx, depsInstall);
 
       // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
