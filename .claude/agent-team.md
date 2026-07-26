@@ -130,6 +130,24 @@ decides where the next person spends their time. Re-derive those too.
 - **`web/` has two `role="status"` regions** — `RateLimitAnnouncer` (app-wide,
   always-present, empty) comes first in the DOM, so any `querySelector("[role=status]")`
   silently grabs the wrong one. Selector-by-role here is ambiguous by construction.
+- **PLAIN `$?` AFTER A PIPE READS THE LAST COMMAND, NOT YOURS — and this caught FOUR agents on
+  one branch, every one of them citing this file at each other while doing it.** Simpler than the
+  `PIPESTATUS` entry below and far more common, because `cmd | head` is how everyone bounds
+  output. Measured instances, PRD #113: the lead reported `BUILD EXIT: 0` from `head` and nearly
+  told a worker its build was fine without knowing; the lead again on a `go build`; a reviewer
+  read `head`'s exit while verifying a `docker tag` claim, in a report that cites this trap; and
+  the fact-checker published **busybox tar exit 0** for both failure paths — the real answer is
+  **1** — because it piped tar's stderr through `tail`. That last one briefly contradicted a
+  correct finding.
+  **The remedy is not vigilance, it is not piping when you need the status.** Redirect to a file,
+  read `$?` on the very next line, then grep the file — which also proves the stage you care
+  about actually ran rather than that the wrapper exited 0. Where you need both the message and
+  the code, run it **twice**: once piped for the message, once clean for `$?`. The coder that did
+  exactly that said it was for readability rather than because it had the trap in mind, which is
+  the honest version — the habit protected it, not the knowledge.
+  **Why this belongs above the `PIPESTATUS` entry:** that one fails LOUDLY-ish (an empty string
+  where a number belongs). This one always yields a plausible integer, so a broken check and a
+  passing one are typographically identical.
 - **`${PIPESTATUS[0]}` IS A BASH-ISM AND THIS SHELL IS zsh — IT EXPANDS TO NOTHING,
   SILENTLY.** zsh's array is `$pipestatus` and it is **1-indexed** (`$pipestatus[1]` is the
   first command; bash's `PIPESTATUS` is 0-indexed). In zsh, `${PIPESTATUS[0]}` is simply an
