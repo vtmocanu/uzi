@@ -208,20 +208,38 @@ decides where the next person spends their time. Re-derive those too.
   **separate** standing rule below and must stay one. A reader who believes the
   control covers all three will drop the tree comparison as duplicated effort,
   and that is the one of the three that has already produced a false green here.
-  **THE SAME FALSE `PASS=0` SIGNATURE HAS A SECOND CAUSE ON THE OTHER TWO TOOLCHAINS, AND IT IS
-  YOUR GREP RATHER THAN THE SUITE.** Neither `agent/` (`node --test` via tsx) nor `web/`
-  (vitest) emits TAP, and neither emits Go's `--- PASS` either. `node --test`'s spec reporter
-  prints `✔ name (1.2ms)` per test and an `ℹ tests` / `ℹ pass` / `ℹ fail` / `ℹ skipped` summary;
-  vitest prints `✓ name` and `Tests  N passed (N)`. **The two ticks are not even the same
-  character** — U+2714 `✔` for node, U+2713 `✓` for vitest — so a glyph copied from one report
-  matches nothing in the other. Measured 2026-07-26 at `cfa1c0a3`: over a fully healthy `agent/`
-  run (`ℹ pass 851`, `ℹ fail 0`, exit 0) both `grep -c '^ok '` and `grep -c '^# tests'` return
-  **0**, and the same two return **0** over a green `web/` run — the identical `RUN=0 PASS=0`
-  signature the entry above documents, produced by a run in which every assertion executed. The
-  durable finding is that a TAP-shaped tally reads zero from a healthy non-TAP runner; the pass
-  counts are that tree's inventory. Anchor on the reporter you actually invoked, and apply the
-  Go-side rule in the other direction too: before concluding a suite ran nothing, confirm your
-  pattern matches the runner it was pointed at.
+  **THE SAME FALSE `PASS=0` HAS A SECOND CAUSE — YOUR GREP RATHER THAN THE SUITE — AND
+  BOTH COUNTS READING ZERO IS THE TELL, WHATEVER THE RUNNER.** A pattern shaped for one
+  runner's output produces `PASS=0 FAIL=0` over a perfectly healthy run of another, and
+  that is indistinguishable from a suite that executed nothing. **A zero from a broken
+  pattern and a zero from a dead suite look identical, so treat a double zero as an
+  instrument fault until you have proved otherwise, not as a result.** Note it has at
+  least three innocent-looking causes, which is why "prove otherwise" means checking the
+  pattern rather than reasoning: a broken pattern, the skipped suite the entry above
+  documents, and a suite that never compiled.
+  **The shapes below are illustration, not the lesson — there will be a fourth, and a
+  reader who has memorised three is caught by it.** Before believing either number,
+  confirm your pattern matches *this* runner. Three measured here:
+  - **Go prints `--- PASS` only under `-v`.** Without it a healthy run emits nothing for
+    a `grep -c '^--- PASS'` to count, so the tally reads `RUN=0 PASS=0` at `EXIT=0`.
+  - **`node --test` and vitest emit neither TAP nor Go's `--- PASS`.** node's spec
+    reporter prints `✔ name (1.2ms)` and an `ℹ tests` / `ℹ pass` / `ℹ fail` / `ℹ skipped`
+    summary; vitest prints `✓ name` and `Tests  N passed (N)`. **The two ticks are not
+    even the same character** — U+2714 `✔` for node, U+2713 `✓` for vitest — so a glyph
+    copied from one report matches nothing in the other. Measured 2026-07-26 at
+    `cfa1c0a3`: over a fully healthy `agent/` run (`ℹ pass 851`, `ℹ fail 0`, exit 0) both
+    `grep -c '^ok '` and `grep -c '^# tests'` return **0**, and the same two return **0**
+    over a green `web/` run.
+  - **`./e2e/run-e2e.sh` colour-codes, so ANSI bytes sit between the whitespace and the
+    token**: `pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }`. A `(^|\s)PASS\b`
+    anchor cannot match, and note that **both** halves fail, not just the obvious one —
+    the byte before `PASS` is the CSI sequence's terminating `m`, a WORD character, so
+    `\s` fails and the `\b` does not exist either. Measured 2026-07-26: a count over a
+    525-line log of a **passing** run returned `PASS-ish: 0 FAIL-ish: 0`.
+  The durable finding in each is that a tally shaped for the wrong runner reads zero from
+  a healthy one; the pass counts are that tree's inventory. Same rule as the Go side, run
+  in the other direction: before concluding a suite ran nothing, confirm your pattern
+  matches the runner it was pointed at.
 - **A fixture whose users or runs DELIBERATELY SHARE coordinate strings pins the
   `review_id` join halves FOR FREE — and "tidying" it silently deletes that
   coverage.** The pinning comes from the row-count guards (`rows != 2`,
@@ -567,6 +585,16 @@ security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap)
 long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
+
+**The `~30 min` above is left as written, deliberately, and here is the one measurement
+against it.** *(Measured 2026-07-26 on one machine at `53d0f222`: **7m55s** wall clock,
+reaching the final `All E2E checks passed.` banner and the `down -v` teardown, so not a
+truncated run. Roughly 4× faster than the figure recorded here, most likely because the
+image build was largely cached. **One sample, not a correction** — replacing a figure on
+one sample is how the stale-tally problem starts over, in the file that documents it.
+Worth re-deriving deliberately, because the answer changes what the gate costs: if the
+real number is ~8 min then the exemption from the tester's 5-minute wait bound is
+unnecessary, and the gate is cheap enough to run far more often than it is.)*
 
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.
