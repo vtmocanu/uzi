@@ -48,10 +48,10 @@ The copyable **kubectl command** is read-only (`describe pod`). Replace `<worker
 with the namespace that worker runs in — docker-capable workers live in a separate one. Pasted
 unsubstituted the command succeeds and finds nothing, which looks like the worker having gone.
 
-**On the timestamp shown:** for a settled worker it is when its container became ready; for one
-rolling or stuck, **it is when the pod was created**, not when it went wrong. Nothing records
-when a worker started failing — the component watching pods keeps no memory between checks —
-so read "created 12 minutes ago", never "broken for 12 minutes".
+**Reading `Start Time` in that output:** it is when the pod was created, not when it went
+wrong. Nothing in uzi records when a worker started failing — the component watching pods
+keeps no memory between checks — so a pod created twelve minutes ago has been *failing* for
+some unknown part of those twelve minutes, not all of them.
 
 ## Pinned worker images, and the CLI
 
@@ -60,7 +60,7 @@ separately rather than folded into a percentage that would mean nothing. If host
 target a different release than the api, the panel says so — that is supported, since the
 worker image tag can be pinned independently and hosted workers are compared against the tag
 the controller reports rolling to, so a pinned worker reads *up to date* at its pinned tag.
-Both coordinates are stated, so a deliberate pin is visible as one.
-
-`uzi worker list` carries the same states in an `UPGRADE` column: `FAILED` is the one to act
-on, `-` is the no-badge state. See [uzi CLI](cli.md).
+Both coordinates are stated, so a deliberate pin is visible as one. `uzi worker list` carries
+the same states in an `UPGRADE` column rendered for that surface (`FAILED`, and `-` for no
+badge); it is documented in [uzi CLI](cli.md#upgrade-status), a second definition of these
+states rather than a deferral, so a state added or renamed must be edited in both.
