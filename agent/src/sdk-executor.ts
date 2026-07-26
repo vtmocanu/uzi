@@ -56,6 +56,10 @@ const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5
 // enforces it at submit time (rejects the 4th revise), so the worker counter is a
 // belt-and-suspenders guard that rarely trips.
 const DEFAULT_MAX_REVISIONS = 3;
+// PRD #72 M4: transport clamp on a declared PRD path. Mirrors
+// `prdpath.MaxPathLen` (api/internal/prdpath), which is the AUTHORITY — this
+// copy only keeps an absurd string off the wire. Keep the two in step.
+const PRD_DONE_PATH_MAX_LEN = 512;
 
 // Static (content-free) failure reasons — safe to persist as failure_reason.
 const REASON_WALL = "run exceeded its wall-clock timeout";
@@ -120,6 +124,8 @@ interface TurnResult {
   sessionId?: string;
   plan?: string;
   done: boolean;
+  /** PRD #72 M4: the PRD path the lead declared on signal_done, if any. */
+  prdDonePath?: string;
 }
 
 /** Run-level watchdog/cancel state shared across the plan turn and every loop turn. */
@@ -285,8 +291,14 @@ export class SdkExecutor implements Executor {
     // `mcp__memory__save_memory`. Registered under a DISTINCT key from the signal
     // server so neither disturbs the other; the lead sets no `tools` allowlist, so a
     // registered MCP tool is callable, and save_memory is not in disallowedTools.
+    // PRD #72 M4: `prd_done_path` is exposed on signal_done for `issue` runs only
+    // (Decision 13). `?? "issue"` matches runner.ts's own `kind: claim.kind ??
+    // "issue"` default; a stricter fail-closed default here would silently break
+    // every test that omits kind, and the AUTHORITATIVE gate is the api's, where
+    // runs.kind is NOT NULL.
+    const isIssueRun = (ctx.kind ?? "issue") === "issue";
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
-      [SIGNAL_SERVER_NAME]: buildSignalMcpServer(),
+      [SIGNAL_SERVER_NAME]: buildSignalMcpServer({ prdDonePath: isIssueRun }),
     };
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({ client: this.client, runId: ctx.runId, log: this.log }).server;
@@ -309,7 +321,7 @@ export class SdkExecutor implements Executor {
       // run has no skills disables all. Per-subagent scoping is each
       // AgentDefinition.skills; the lead is the main thread, covered by this union.
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
-      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt),
+      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { kind: ctx.kind }),
       agents: assembled.subagents,
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
@@ -483,6 +495,11 @@ export class SdkExecutor implements Executor {
       const resolved = resolveAgentSelection(verdict.selection, repoAvailable);
       if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
       const selection = resolved.selection;
+      // Skill scoping is source-dependent from here (PRD #72 M1): `own` keeps the
+      // per-template allocations assembled above; `repo` gives every subagent the
+      // full survivor set, since a repo roster has no template rows to allocate
+      // against. survivorNames is the filter in both cases, so a skill dropped by
+      // the cap or a collision is unreachable either way.
       const selectedSubagents = selectSubagents(
         selection.source,
         assembled.subagents,
@@ -495,7 +512,7 @@ export class SdkExecutor implements Executor {
       const implementOptions: SdkOptions = {
         ...baseOptions,
         agents: selectedSubagents,
-        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo" }),
+        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo", kind: ctx.kind }),
         hooks: { PreToolUse: preToolUse(selectedNames) },
       };
       ctx.emit({
@@ -512,6 +529,9 @@ export class SdkExecutor implements Executor {
       // --- Phase 2: implement ⇄ review loop --------------------------------
       let iteration = 0;
       let followUp: string | undefined;
+      // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
+      // it and the terminating turn's declaration would be discarded by `break`.
+      let declaredPrdPath: string | undefined;
       for (;;) {
         iteration++;
         ctx.reportIteration?.(iteration);
@@ -524,6 +544,7 @@ export class SdkExecutor implements Executor {
           followUp,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
+        if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
         if (turn.done) break;
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
         // Fold any queued correction into the next turn (FIFO, one per turn).
@@ -533,7 +554,20 @@ export class SdkExecutor implements Executor {
       this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch, agent_source: selection.source });
       // toolEnv (PRD #46 M9): the allowlisted provisioned tool env, so the self_improve
       // check runner can put the run's provisioned toolchains on its subprocess PATH.
-      return { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
+      const result: ExecutorResult = { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
+      // PRD #72 M4: forward the declared PRD path on `issue` runs only, clamped to
+      // length. TRANSPORT HYGIENE ONLY — no path-shape checks here. The api owns
+      // the grammar (api/internal/prdpath), and a second implementation of it would
+      // drift silently in both directions.
+      //
+      // The key is OMITTED, never set to undefined: `runner.ts` spreads this into
+      // the state report, and an own `prdDonePath: undefined` would both change the
+      // shape every existing deepStrictEqual on this result asserts and blur the
+      // wire distinction between "declared nothing" and "field present but empty".
+      if (isIssueRun && declaredPrdPath !== undefined) {
+        result.prdDonePath = declaredPrdPath.slice(0, PRD_DONE_PATH_MAX_LEN);
+      }
+      return result;
     } finally {
       this.disarmWall(state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);
@@ -650,6 +684,10 @@ export class SdkExecutor implements Executor {
         const sig = scanSignals(msg);
         if (sig.plan !== undefined) result.plan = sig.plan;
         if (sig.done) result.done = true;
+        // Last-wins within the turn, mirroring `plan` rather than `done`'s latch:
+        // if the lead somehow signals twice, the LAST declaration is the one that
+        // describes the tree the worker is about to push (PRD #72 M4).
+        if (sig.prdDonePath !== undefined) result.prdDonePath = sig.prdDonePath;
 
         if (isResult(msg)) {
           if (isErrorResult(msg)) {

@@ -45,6 +45,23 @@ are **never** loaded, and the primary-directive guardrails always apply: no repo
 agent can push to `main`, rewrite history, spawn nested agents, or schedule
 deferred work, whatever its file says.
 
+## What skills the repo's agents get
+
+[Skill](./skills.md) allocations attach to your agent templates, and a repo
+roster has no templates, so there is nothing to scope against. Every repo
+subagent therefore receives exactly the run's materialized skill union: every
+delivered skill its owner allocated to any template in the run, minus drops for
+oversize, name collision, and the per-run cap. That is the same set the run's
+lead already receives, so a repo subagent gets no superset of what the run
+already materializes.
+
+- **Nothing is lost by choosing repo agents.** A run started with repo agents
+  carries the same delivered skills as one started with your own templates.
+- **Per-template scoping does not apply.** Allocating a skill to `coder` alone
+  is your scoping surface on a template run; on a repo-agent run every subagent
+  sees it. Repo skills (`.claude/skills/`, opt-in per repo) already worked this
+  way, for the same reason.
+
 ## The trust trade-off — read before you pick repo agents
 
 Repo agents are **the repository's code, not uzi's reviewed templates.** Choosing
@@ -66,6 +83,13 @@ Two consequences are worth stating plainly:
   guardrail is your choice of which repos to trust. (Locking the agent container's
   network down is a planned follow-up; see
   [proc-hardening](./proc-hardening.md).)
+- **A repo agent can read every skill body the run carries.** Skill bodies are
+  never secrets by product policy (a skill's description and body must never
+  carry a credential, see [Agent skills](./skills.md)), but an admin-authored
+  playbook about your internal infrastructure is readable by a repo-authored
+  subagent, which can write it into the worktree and push it to the run's
+  branch. Keep out of skill bodies anything you would not want in a merge
+  request on that repo.
 
 For how detection, validation, and the gate-boundary rebuild work, see
 [ARCHITECTURE.md](../ARCHITECTURE.md#agent-templates).

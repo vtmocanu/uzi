@@ -1689,6 +1689,12 @@ type StateRequest struct {
 	// diagnosis and no MR. Only 'not_code' is expected here — verified/fix_failed are
 	// stamped later by the pipeline sync; a completed report on an issue run omits it.
 	FixVerdict *string `json:"fix_verdict"`
+	// PrdDonePath is the repo-relative path a run's lead declared it moved its PRD
+	// to (PRD #72 M4), reported on the `completed` transition. It is a DECLARATION
+	// by an untrusted worker, not something derived server-side, and it drives a
+	// later forge write against the issue description, so it is gated on the run's
+	// kind and validated before it is stored — see clampWirePRDDonePath.
+	PrdDonePath *string `json:"prd_done_path"`
 	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
 	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
 	// a slice, because the three states differ: absent (nil) = this report says
@@ -1740,7 +1746,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: stripNULParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
-			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
+			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
+			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
+			ID:          runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{

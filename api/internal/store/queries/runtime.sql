@@ -528,6 +528,16 @@ UPDATE runs SET
     -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its
     -- verdict is stamped verified/fix_failed later by the pipeline sync).
     fix_verdict        = COALESCE(sqlc.narg('fix_verdict'), fix_verdict),
+    -- The PRD path this run's lead declared it moved (PRD #72 M4), NULL unless an
+    -- issue run declared one that validated. Plain assignment for the same reason
+    -- mr_web_url above gives: the branch, the MR and the declared path are ONE fact
+    -- reported by one worker in one payload, so they must not persist under
+    -- different conventions.
+    prd_done_path      = @prd_done_path,
+    -- Arm the M5 patch marker. Explicit rather than left to the column default,
+    -- because SetRunCompleted can in principle run on a row that already carries a
+    -- stamp from an earlier terminal transition.
+    prd_patch_settled_at = NULL,
     move_pending_since = now(),
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.

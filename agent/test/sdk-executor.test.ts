@@ -55,11 +55,11 @@ function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
     message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
   } as unknown as SDKMessage;
 }
-function signalDone(sessionId = "sess-1"): SDKMessage {
+function signalDone(sessionId = "sess-1", input: Record<string, unknown> = {}): SDKMessage {
   return {
     type: "assistant",
     session_id: sessionId,
-    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }] },
+    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input }] },
   } as unknown as SDKMessage;
 }
 function resultSuccess(sessionId = "sess-1"): SDKMessage {
@@ -1096,6 +1096,213 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     assert.deepStrictEqual(subagent(o, "reviewer").skills, []);
   });
 });
+
+// PRD #72 M1: delivered skills reach REPO-SOURCED subagents. This is net-new
+// surface, not an extension of the two blocks above: every SUBAGENT-DEFINITION
+// `.skills` assertion there reads turns[0] — the PLAN turn — which always runs the
+// OWN roster (PRD #37 Decision 5), so none of them ever reached the repo path.
+// (Test "4) resume re-applies plugins + skills" does read turns[1], but of the
+// TOP-LEVEL `options.skills`, not of any agent definition.) The gap M1 closes is
+// that a repo roster has no template rows, so `t.skills` is absent on every repo
+// agent and per-template scoping delivered nothing at all.
+describe("SdkExecutor delivered skills on a repo-source run (PRD #72 M1)", () => {
+  const coderS: AgentTemplate = { ...coder, skills: ["ci-cd-norms"] };
+  const reviewerS: AgentTemplate = { ...reviewer, skills: ["prd-lifecycle"] };
+  const delivered: ClaimSkill[] = [
+    { name: "ci-cd-norms", description: "cicd norms.", body: "# CICD\n" },
+    { name: "prd-lifecycle", description: "prd playbook.", body: "# PRD\n" },
+  ];
+
+  let worktree: string;
+  beforeEach(() => {
+    worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-p72-"));
+  });
+  afterEach(() => {
+    fs.rmSync(worktree, { recursive: true, force: true });
+    fs.rmSync(skillsPluginDir(worktree), { recursive: true, force: true });
+  });
+
+  /** Plan turn (own roster) + one implement turn under `verdict`. */
+  async function runSourced(verdict: PlanVerdict, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx(
+      {
+        worktreePath: worktree,
+        agents: [lead, coderS, reviewerS],
+        repoAgents: [repoCoder, repoAuditor],
+        skills: delivered,
+        config: { skill_max_bytes: 65536, skills_max_per_run: 32 },
+        ...overrides,
+      },
+      verdict,
+    );
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { probe, turns };
+  }
+  const subagent = (o: SdkOptions, name: string) => o.agents![name] as { tools?: string[]; skills?: string[] };
+
+  it("repo source: EVERY repo subagent gets the run's whole delivered set; the plan turn still scopes per template", async () => {
+    const { turns } = await runSourced(approveWith("repo"));
+
+    // The PLAN turn is the OWN roster and is UNCHANGED — each own subagent still
+    // sees only its own allocation. If M1 had been applied run-wide, these two
+    // would both list both skills and the admin's scoping surface would be gone.
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(subagent(plan, "coder").skills, ["uzi:ci-cd-norms"]);
+    assert.deepStrictEqual(subagent(plan, "reviewer").skills, ["uzi:prd-lifecycle"]);
+
+    // The IMPLEMENT turn runs the repo roster — neither repo agent carries any
+    // allocation, and both receive every surviving delivered skill.
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
+    for (const name of ["coder", "auditor"]) {
+      assert.deepStrictEqual(
+        subagent(impl, name).skills,
+        ["uzi:ci-cd-norms", "uzi:prd-lifecycle"],
+        `repo subagent ${name} must receive the delivered skills its owner allocated`,
+      );
+    }
+    // The read-only shape is untouched: no `Skill` grant, declared tools verbatim.
+    assert.deepStrictEqual(subagent(impl, "coder").tools, ["Read", "Edit", "Bash", "WebFetch"]);
+    assert.strictEqual(subagent(impl, "auditor").tools, undefined, "inherit-all repo agent stays inherit-all");
+  });
+
+  it("own source: the implement turn keeps per-template scoping (Decision 6 leaves it alone)", async () => {
+    const { turns } = await runSourced(approveWith("own"));
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(subagent(impl, "coder").skills, ["uzi:ci-cd-norms"]);
+    assert.deepStrictEqual(subagent(impl, "reviewer").skills, ["uzi:prd-lifecycle"]);
+  });
+
+  it("a delivered skill evicted by the per-run cap reaches NEITHER roster", async () => {
+    // maxPerRun=1 keeps ci-cd-norms and evicts prd-lifecycle worker-side. The
+    // repo path must be filtered to the SURVIVORS, not to the claim's delivered
+    // list — hand it the unfiltered set and this reddens.
+    const { turns } = await runSourced(approveWith("repo"), { config: { skill_max_bytes: 65536, skills_max_per_run: 1 } });
+
+    const plan = turns[0]!.options;
+    assert.deepStrictEqual(plan.skills, ["uzi:ci-cd-norms"], "top-level union carries the survivor only");
+    assert.deepStrictEqual(subagent(plan, "reviewer").skills, [], "own reviewer's evicted allocation is gone");
+
+    const impl = turns[1]!.options;
+    for (const name of ["coder", "auditor"]) {
+      assert.deepStrictEqual(subagent(impl, name).skills, ["uzi:ci-cd-norms"], `${name} must not list the evicted skill`);
+    }
+  });
+
+  it("a repo-borne skill colliding with a delivered one is listed once, from the delivered side", async () => {
+    // The repo ships two skills: one valid, one whose name collides with a
+    // delivered skill (dropped worker-side by DROP_REPO_COLLISION). What this pins
+    // is the full run-union CONTENT and ORDER reaching a repo subagent: delivered
+    // survivors first, the surviving repo skill last, the shadowed one absent.
+    const skillsDir = path.join(worktree, ".claude", "skills");
+    const mkskill = (dir: string, body: string) => {
+      fs.mkdirSync(path.join(skillsDir, dir), { recursive: true });
+      fs.writeFileSync(path.join(skillsDir, dir, "SKILL.md"), body);
+    };
+    mkskill("deploy-notes", "---\nname: deploy-notes\ndescription: repo deploy.\n---\n\nrepo body\n");
+    mkskill("collide", "---\nname: ci-cd-norms\ndescription: repo shadow attempt.\n---\n\nshadow body\n");
+
+    const { turns } = await runSourced(approveWith("repo"), { repoSkillsEnabled: true });
+    const impl = turns[1]!.options;
+    for (const name of ["coder", "auditor"]) {
+      const skills = subagent(impl, name).skills!;
+      assert.deepStrictEqual(
+        skills,
+        ["uzi:ci-cd-norms", "uzi:prd-lifecycle", "uzi:deploy-notes"],
+        `${name}: delivered survivors first, repo survivor last, each exactly once`,
+      );
+    }
+  });
+});
+
+// PRD #72 M4: the lead declares the PRD path it moved, on signal_done. What the
+// executor owns is the run-kind gate, the length clamp, and getting the value out
+// of the TERMINATING turn — which is the one `break` would otherwise discard.
+describe("SdkExecutor prd_done_path (PRD #72 M4)", () => {
+  const PATH = "prds/done/72-prd-lifecycle-in-run.md";
+
+  async function runDeclaring(input: Record<string, unknown>, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone("sess-1", input), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], ...overrides });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { result, turns, probe };
+  }
+
+  it("carries the declared path off the TERMINATING turn into the result", async () => {
+    // The turn that sets done is the same turn that declares the path, and
+    // `const turn` is scoped INSIDE the implement loop — so without hoisting the
+    // capture above the loop, `break` discards it and this reads undefined.
+    const { result } = await runDeclaring({ prd_done_path: PATH });
+    assert.strictEqual(result.prdDonePath, PATH);
+  });
+
+  it("omits the field when the lead declares nothing", async () => {
+    const { result } = await runDeclaring({});
+    assert.strictEqual(result.prdDonePath, undefined);
+    assert.ok(!("prdDonePath" in result) || result.prdDonePath === undefined);
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", async () => {
+    // makeCtx sets no kind. `?? "issue"` mirrors runner.ts's own
+    // `kind: claim.kind ?? "issue"`; a fail-closed default here would silently
+    // break every test that omits kind, and the api's gate is the authoritative one.
+    const { result } = await runDeclaring({ prd_done_path: PATH }, {});
+    assert.strictEqual(result.prdDonePath, PATH);
+  });
+
+  for (const kind of ["self_improve", "ci_fix"] as const) {
+    it(`a ${kind} run never puts the field on the result, even when declared`, async () => {
+      // Decision 13. self_improve is the dangerous one: it runs against uzi's own
+      // repo, which HAS a prds/ directory, so its lead is the most likely to
+      // declare a path — and its issue is a reused backlog container.
+      const { result } = await runDeclaring({ prd_done_path: PATH }, { kind });
+      assert.strictEqual(result.prdDonePath, undefined, `${kind} must not forward a declared path`);
+    });
+
+    it(`a ${kind} run is not even OFFERED the parameter`, async () => {
+      const { turns } = await runDeclaring({}, { kind });
+      const shape = doneToolShapeOf(turns[0]!.options);
+      assert.ok(!("prd_done_path" in shape), `${kind}: the schema must not expose prd_done_path`);
+    });
+  }
+
+  it("an issue run IS offered the parameter", async () => {
+    const { turns } = await runDeclaring({}, { kind: "issue" });
+    assert.ok("prd_done_path" in doneToolShapeOf(turns[0]!.options));
+  });
+
+  it("clamps an absurd declaration to the transport bound without validating shape", async () => {
+    // Transport hygiene only: the worker must not second-guess the grammar (the
+    // api owns it), but it must not put an unbounded string on the wire either.
+    const huge = "prds/done/" + "a".repeat(4000) + ".md";
+    const { result } = await runDeclaring({ prd_done_path: huge });
+    assert.strictEqual(result.prdDonePath!.length, 512);
+    assert.ok(result.prdDonePath!.startsWith("prds/done/aaa"));
+  });
+
+  it("forwards a hostile path unchanged — validation is the api's job, not a second implementation", async () => {
+    const hostile = "prds/../../../etc/passwd";
+    const { result } = await runDeclaring({ prd_done_path: hostile });
+    assert.strictEqual(result.prdDonePath, hostile);
+  });
+});
+
+/** The signal server's signal_done zod shape, read off a turn's options. */
+function doneToolShapeOf(o: SdkOptions): Record<string, unknown> {
+  const server = (o.mcpServers as Record<string, unknown>)["uzi"] as { instance?: unknown };
+  const tools = (server.instance as { _registeredTools?: Record<string, { inputSchema?: unknown }> } | undefined)?._registeredTools;
+  assert.ok(tools, "expected the uzi sdk server to expose its registered tools");
+  const shape = (tools!["signal_done"]!.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape;
+  assert.ok(shape, "expected a zod object schema with a shape");
+  return shape!;
+}
 
 describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
   it("provisions before the SDK and folds the tool env into the SDK env", async () => {

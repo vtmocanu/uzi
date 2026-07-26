@@ -276,3 +276,96 @@ SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
 -- empty keep-set deletes everything for the repo (all PRD issues gone forge-side).
 DELETE FROM issues
 WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
+
+-- name: ListPRDLinkPatchCandidates :many
+-- The PRD-link patch pass's working set for one repo (PRD #72 M5): completed runs
+-- that declared a moved PRD path whose issue link has not yet been reconciled.
+--
+-- Each predicate, and why:
+--
+--   * r.repo_id = @repo_id::uuid — the poller's own repo row. The ::uuid cast keeps
+--     the generated Go parameter non-nullable (the ListFiledIssueCloseEdges
+--     precedent). This is the ONLY tenancy scope here, and it is load-bearing in a
+--     way a badge query is not: the watcher holds ONE repo's PAT and performs a
+--     description WRITE, so a mis-scoped candidate is a cross-tenant forge write.
+--     Its test fixture therefore carries TWO repos sharing an issue IID; on a
+--     single-repo fixture this predicate is unpinned and deleting it stays green.
+--
+--   * r.prd_done_path IS NOT NULL AND r.prd_patch_settled_at IS NULL — THE EDGE.
+--     Matches idx_runs_prd_patch_pending exactly. Edge-triggered, not level: once
+--     settled it never re-fires, so a human who edits the description afterwards is
+--     not fought by the poller.
+--
+--   * r.kind = 'issue' — DELIBERATELY REDUNDANT with clampWirePRDDonePath's gate,
+--     and do not "simplify" it away. Today that clamp is the only writer of
+--     prd_done_path, so the invariant lives in exactly ONE place, while
+--     idx_runs_prd_patch_pending carries no kind predicate at all — a backfill, a
+--     manual row edit, or any future second writer arms a non-issue run and this
+--     read site would not notice. Decision 13's stated failure mode is rewriting the
+--     self_improve backlog issue, which is a LIVE control document.
+--     Note "there is no issue to patch" does NOT save self_improve: selfimprove.sql
+--     supplies repo_id, kind, issue_iid, issue_title and issue_description, so such
+--     a run is issue-shaped and carries a real iid. Only this predicate excludes it.
+--     Written as `= 'issue'`, NEVER as a `<>` exclusion list: RunKind has FOUR
+--     values (issue | ci_fix | judge | self_improve) while Decision 13's prose
+--     enumerates three, so an exclusion list written from that prose would admit
+--     `judge`. A positive predicate is closed by construction against a fifth kind.
+--
+--   * r.mr_iid IS NOT NULL AND r.issue_iid IS NOT NULL — nothing to read, nothing
+--     to patch.
+--
+--   * NO i.state predicate, and NO join to `issues` at all. This is Decision 10's
+--     whole point: a merge CLOSES the issue via the `Closes #N` in the MR
+--     description, and the poller runs the issue sync BEFORE SyncMRStates, so by the
+--     time a merge is observable the issue is already state='closed'.
+--     ListMRWatchCandidates requires i.state = 'opened' and would therefore miss
+--     this deterministically — which is why PRD #24's prefilter is not reused here
+--     and must not be widened to cover it.
+--
+-- issue_description is the run's QUEUE-TIME snapshot, pulled in the candidate scan
+-- rather than by a second read per candidate. It is what binds the patch target:
+-- the agent's declaration says where the file went, never which link to touch.
+SELECT r.id,
+       r.issue_iid,
+       r.mr_iid,
+       r.prd_done_path,
+       r.issue_description,
+       -- superseded: a LATER issue run exists on this same issue, so this run's
+       -- branch is stale. Every conjunct here is load-bearing, and an EXISTS does
+       -- NOT inherit the outer WHERE, so each has to be restated:
+       --   n.repo_id    — without it, ANY repo's newer run on a colliding issue IID
+       --                  marks this candidate superseded and the watcher settles
+       --                  the edge WITHOUT patching. Not a cross-tenant write; a
+       --                  cross-tenant SUPPRESSION, where repo B's activity
+       --                  silently cancels repo A's pending forge write. Issue IIDs
+       --                  collide across repos constantly, so this is an ordinary
+       --                  shape rather than an exotic one.
+       --   n.issue_iid  — supersession is per issue, not per repo.
+       --   n.kind       — a self_improve run DOES carry an issue_iid
+       --                  (selfimprove.sql sets it), so without this a self_improve
+       --                  run on the same issue would count as superseding an issue
+       --                  run. Same `= 'issue'` form and same reasoning as the outer
+       --                  predicate: positive, never a `<>` exclusion list.
+       --   created_at   — strictly later; a run never supersedes itself.
+       EXISTS (
+           SELECT 1 FROM runs n
+           WHERE n.repo_id = r.repo_id
+             AND n.issue_iid = r.issue_iid
+             AND n.kind = 'issue'
+             AND n.created_at > r.created_at
+       ) AS superseded
+FROM runs r
+WHERE r.repo_id = @repo_id::uuid
+  AND r.prd_done_path IS NOT NULL
+  AND r.prd_patch_settled_at IS NULL
+  AND r.kind = 'issue'
+  AND r.mr_iid IS NOT NULL
+  AND r.issue_iid IS NOT NULL
+ORDER BY r.created_at ASC
+LIMIT @lim;
+
+-- name: SettlePRDLinkPatch :execrows
+-- Consume one PRD-link patch edge. Guarded on IS NULL so two concurrent pollers
+-- cannot both consume it — the same guard ApplyFiledIssueCloseEdge's stamp uses.
+UPDATE runs SET prd_patch_settled_at = now()
+WHERE id = @id AND prd_patch_settled_at IS NULL;

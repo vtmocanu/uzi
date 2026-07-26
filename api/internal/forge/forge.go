@@ -318,6 +318,12 @@ type Forge interface {
 	// GitLab this is atomic (a single add_labels/remove_labels update);
 	// single-column enforcement relies on that atomicity.
 	UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error
+	// UpdateIssueDescription replaces an issue's description wholesale (PRD #72 M5).
+	// It is a read-modify-write from the CALLER's point of view — the caller reads
+	// via GetIssue, rewrites, and writes back — because no forge here offers a patch
+	// primitive. A driver may additionally need its own internal read to satisfy its
+	// forge's API shape; that is the driver's business, not the interface's.
+	UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error
 	// UserExists reports whether a user with the given username exists on the
 	// forge. It backs the best-effort verification of a user's self-declared
 	// human_username (PRD #19 M3): a false — or an error — downgrades a save to

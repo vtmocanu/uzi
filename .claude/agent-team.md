@@ -194,6 +194,24 @@ decides where the next person spends their time. Re-derive those too.
   log file and the grep that ran against the wrong working tree: *the verification mechanism
   failed silently while the thing it was verifying looked fine.* In all three, the output of a
   broken check is indistinguishable from the output of a passing one.
+- **THE zsh WORD-SPLITTING TRAP HAS A VERIFICATION-LOOP FORM, AND IT IS WORSE THAN THE
+  COMMAND FORM `CLAUDE.md` ALREADY DOCUMENTS.** Measured on PRD #72: an auditor building a
+  mutation table ran `for g in $combo` over a space-joined string. zsh does **not** word-split
+  unquoted variables, so the loop iterated **once, on the whole string**, and every pair- and
+  triple-mutant silently never applied — while those rows still printed a confident
+  **"reject"**. The output is indistinguishable from a guard that works. It was caught only by
+  an applied-versus-expected substitution counter.
+  Same shape as the `${PIPESTATUS[0]}` entry above and it belongs beside it: **a shell-ism in a
+  command fails loudly and you fix it; a shell-ism in the check that proves the command passed
+  fails silent, and the surrounding output still looks like success.** Use a real array
+  (`combo=(g1 g2); for g in "${combo[@]}"`), and give any mutation loop a counter asserting the
+  expected number of substitutions actually applied.
+- **DIRECTORY-WIDE `gofmt -w` IS A TRAP IN THIS REPO, BECAUSE `gofmt -l ./api` IS NOT EMPTY.**
+  `gofmt -w internal/<pkg>/` reformats that pre-existing drift and sweeps files
+  you never touched into your commit, under your commit message. Scope it to your own files, by
+  name. The check that matters is `comm -12` between `gofmt -l` and your commit's file list being
+  **empty** — deliberately not a count, per the `format` slot in Quality gates, where a tally has
+  already produced one truncated-view error.
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
@@ -219,6 +237,38 @@ decides where the next person spends their time. Re-derive those too.
   **separate** standing rule below and must stay one. A reader who believes the
   control covers all three will drop the tree comparison as duplicated effort,
   and that is the one of the three that has already produced a false green here.
+  **THE SAME FALSE `PASS=0` HAS A SECOND CAUSE — YOUR GREP RATHER THAN THE SUITE — AND
+  BOTH COUNTS READING ZERO IS THE TELL, WHATEVER THE RUNNER.** A pattern shaped for one
+  runner's output produces `PASS=0 FAIL=0` over a perfectly healthy run of another, and
+  that is indistinguishable from a suite that executed nothing. **A zero from a broken
+  pattern and a zero from a dead suite look identical, so treat a double zero as an
+  instrument fault until you have proved otherwise, not as a result.** Note it has at
+  least three innocent-looking causes, which is why "prove otherwise" means checking the
+  pattern rather than reasoning: a broken pattern, the skipped suite the entry above
+  documents, and a suite that never compiled.
+  **The shapes below are illustration, not the lesson — there will be a fourth, and a
+  reader who has memorised three is caught by it.** Before believing either number,
+  confirm your pattern matches *this* runner. Three measured here:
+  - **Go prints `--- PASS` only under `-v`.** Without it a healthy run emits nothing for
+    a `grep -c '^--- PASS'` to count, so the tally reads `RUN=0 PASS=0` at `EXIT=0`.
+  - **`node --test` and vitest emit neither TAP nor Go's `--- PASS`.** node's spec
+    reporter prints `✔ name (1.2ms)` and an `ℹ tests` / `ℹ pass` / `ℹ fail` / `ℹ skipped`
+    summary; vitest prints `✓ name` and `Tests  N passed (N)`. **The two ticks are not
+    even the same character** — U+2714 `✔` for node, U+2713 `✓` for vitest — so a glyph
+    copied from one report matches nothing in the other. Measured 2026-07-26 at
+    `cfa1c0a3`: over a fully healthy `agent/` run (`ℹ pass 851`, `ℹ fail 0`, exit 0) both
+    `grep -c '^ok '` and `grep -c '^# tests'` return **0**, and the same two return **0**
+    over a green `web/` run.
+  - **`./e2e/run-e2e.sh` colour-codes, so ANSI bytes sit between the whitespace and the
+    token**: `pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }`. A `(^|\s)PASS\b`
+    anchor cannot match, and note that **both** halves fail, not just the obvious one —
+    the byte before `PASS` is the CSI sequence's terminating `m`, a WORD character, so
+    `\s` fails and the `\b` does not exist either. Measured 2026-07-26: a count over a
+    525-line log of a **passing** run returned `PASS-ish: 0 FAIL-ish: 0`.
+  The durable finding in each is that a tally shaped for the wrong runner reads zero from
+  a healthy one; the pass counts are that tree's inventory. Same rule as the Go side, run
+  in the other direction: before concluding a suite ran nothing, confirm your pattern
+  matches the runner it was pointed at.
 - **A fixture whose users or runs DELIBERATELY SHARE coordinate strings pins the
   `review_id` join halves FOR FREE — and "tidying" it silently deletes that
   coverage.** The pinning comes from the row-count guards (`rows != 2`,
@@ -240,6 +290,128 @@ decides where the next person spends their time. Re-derive those too.
   the `triage.todo` consumer, reading visibly inflated counts under the same
   fold. Same reason assertion *counts* are not citable: a tally drifts exactly
   like a line number.
+
+## A claim about what would happen if you removed it is not readable from the code
+
+*The generalization of "a failed grep is not evidence the text is absent" past greps.
+Recorded on PRD #72 (2026-07-26).*
+
+Repeatedly on PRD #72, across every agent on the branch including the lead, someone asserted a
+**counterfactual** — *if X were absent, Y would happen* — on the strength of having read the
+code. Every one was wrong, and reading could not have caught any of them.
+
+*(No tally here, deliberately. Two authors already disagreed on the count while adding rows to
+this very table — which is this file's own "duplicate the claim, never the count" rule catching
+an instance of itself. Add rows; never write a number.)*
+
+**READ THE TWO COLUMNS DIFFERENTLY, because they have different warrants.** A fact-check on
+2026-07-26 confirmed the technical content of every row that is checkable against the tree, and
+correctly returned **UNVERIFIABLE** for the *provenance* — who asserted what, when, and who caught
+it. That history lived in dispatches under `agent-team-tasks/`, which is gitignored and gone. So
+the claims and shapes are measurement; **the attributions are testimony**, and a later reader
+cannot re-derive them. Kept anyway, because "the author who had catalogued this class two
+revisions earlier" is the finding in several rows and a claim stripped of who made it loses it —
+but labelled, since this file's own rule is never to let a reasoned entry sit in the same column
+as a measured one.
+
+| claim | shape |
+|---|---|
+| "nothing stores the old PRD path" | a grep returned nothing |
+| "the only honest control is re-adding the join; that is expensive" | no cheaper precedent was looked for — the repo already had one |
+| "this Set is the load-bearing one" | the two were redundant with each other |
+| "the `.`/`..` check is the traversal fix; `path.Clean` is belt-and-braces" | three guards, mutually redundant, and the dotfile rule was the sole guard for two other cases |
+| "`prds/x.md.bak` → not matched" as evidence the boundary check works | green against a matcher that never matches anything |
+| "`prds/../../../etc/passwd` proves the traversal guards fire" | it fails the `.md` suffix rule, so it stays red with all three traversal guards deleted |
+| "an `init()` panic fires at boot, so it is later than the Go gate" | an `init()` is a **package-load** check — it fires during `go test` too, in every importing package |
+| "a test-only guard lets the bad map entry silently never fire" | it reddens CI on the MR that introduces it; measured by removing the panic and running the suite |
+| "the fixture rows exist, so the guard is pinned" | an inference about a mutation that was never run, drawn from a fixture that *was* read |
+| "never an unrelated entry in a Related PRDs list" | such an entry IS a link the issue carried, so a basename match repoints it — see the retraction note below, which this row is also an instance of |
+
+The last row has a sharper self-diagnosis than any of the others, from the reviewer that
+produced it: **"I checked the conjuncts of one statement and the row-inventory of another."** It
+ran three of four guard×site mutation combinations and skipped the one that was defective — and
+it had both fixtures open, having explicitly noted that the *query* test's fixture carried the
+hostile row it then never looked for in the *backfill* test's. **Testing around the defect is
+the normal shape of this error, not an unlucky one:** the combinations you skip are the ones
+that felt already-answered.
+
+Note also how one of these travelled. *"Silently never fires"* was written by its author,
+retracted by that same author after measurement, and then **re-emitted by the lead from a copy
+taken before the retraction arrived**. A retraction propagates only as far as the people holding
+copies. If you correct a claim you have already sent, chase the copies.
+
+**THE INTERVAL BETWEEN WRITING A RULE AND BREAKING IT CAN BE ZERO, and the sharpest instance on
+this branch has both in the SAME COMMIT.** `53d0f222` added this entire section, including the
+sentence directly above about chasing copies — and in that same commit copied a claim out of
+`prd_link_patch.go`'s binding comment into four user-facing files: *"never an unrelated entry in a
+Related PRDs list"*. `b3c1e188` retracted it hours later as false, and `45fb222f` chased the four
+copies. So the rule and four live violations of it shipped together, authored by the same agent in
+one commit. Nothing about having just written the rule prevented it — which is the argument for
+mechanisms over care, made against the author who had just made that argument.
+
+**What actually surfaced it is the reusable part, and it was not vigilance.** The copies were found
+during a routine *"what landed since my commit"* read of `b3c1e188`'s message, done before starting
+unrelated work in the same tree. That read is cheap, it is owed anyway on a moving tree, and it is
+the only reason a stale claim in four shipped files did not survive to the MR. **Read the commits
+that landed under you, not just the diff of the file you are about to touch.**
+
+**And "chase the copies" does NOT mean "paste the same correction".** The four sites needed four
+different answers, because a correction inherits the audience of the page it lands on, not the
+wording of the retraction: an orientation page took the simple true statement with no residual; the
+page whose whole subject is unattended behaviour took the residual in full; a changelog entry needed
+the bound restated from the reader's side (*"a run cannot introduce a link, not that it cannot pick
+among the ones already there"*); a fourth site was already the weaker correct form and needed only
+the residual appended. A fifth carried a *different*, narrower claim that the retraction did not
+touch, and correctly changed nothing — **a mechanical sweep would have "fixed" it into being wrong**,
+which is the `grep`-then-classify rule from the citing section arriving here from the other end.
+
+**A THIRD instance, in ONE FILE rather than across four.** At `cfa1c0a3`, `prdpath.go` carried the
+retraction at `:92-93` — *"the design note calling the explicit `.`/`..` check 'the traversal fix'
+and `path.Clean` 'belt-and-braces' has it the wrong way round"* — while the retracted sentence was
+still live 160 lines below at `:253`: *"The explicit `.`/`..` rejection is the traversal fix."* One
+file, one commit, one author; found independently by the reviewer and the architect, fixed in
+`b3c1e188`. Its underlying claim is the traversal row in the table above; this is that row's other
+half. **Distance inside one file is not distance from your own attention** — the author had both
+sentences in the same buffer.
+
+**⚑ THE PATTERN YOU CHOOSE ENCODES WHAT YOU EXPECT, SO A NULL RESULT CONFIRMS YOUR EXPECTATION
+RATHER THAN TESTING IT.** This is the sharper form of the flagged rule above, and it was earned by
+two searches that missed two of these instances for *opposite* reasons, neither careless. One agent
+searched **at HEAD** for a claim that had been fixed two commits earlier, so no pattern could have
+found it, and read the silence as "the instance is not real". Another ran `grep -c 'both counts'`
+**case-sensitively** for a lead written in this file's uppercase house form, read the `0` as "the
+amendment did not land", and dispatched that as an instruction to go write it — which would have
+committed a second copy of an entry that was already there. Both zeros read as findings.
+**The countermeasure is not a better pattern.** It is the positive control this file already demands
+everywhere else: before believing a zero, run your pattern against a string you KNOW is present. A
+search you have not calibrated is a mirror.
+
+**⚑ The unifying error is treating a null result as an observation of the world when it is an
+observation of your instrument.** A grep that finds nothing tells you about your pattern. A test
+that stays green tells you about your fixture. A search that finds no precedent tells you about
+your search. In each case what was measured was the instrument, and what was concluded was about
+the code.
+
+**⚑ The evidence for a counterfactual is the counterfactual.** Remove the guard and watch the
+test redden; delete the line and watch the build fail; gut the fixture and confirm the gate goes
+red. If actually removing it is too expensive, then you do not know — say "I did not check"
+rather than asserting.
+
+The same rule covers **when** a mechanism fires, not just **whether** it does. "This is an
+`init()`, so it runs at boot" is a counterfactual about a state you have not instantiated — Go
+loads the package during `go test` too, so it also runs there, in every importing package. And
+the inverse trap is real: a check placed in its own `init()` in a file that sorts **earlier**
+reads empty data and panics on a healthy tree. Neither is visible at the call site; each costs
+one build to settle.
+
+Two corollaries this branch paid for: a **negative** test case must sit in a fixture containing a
+**positive** match, or its green is satisfiable by a mechanism that never fires at all; and an
+**absence** assertion needs a guard that the thing it asserts about still exists under that name
+(`TestMRStateIsWatcherOwned`'s `sawWriter` flag is the in-repo pattern).
+
+The last row is the one to keep if you keep only one: it was **written by the author who had
+catalogued this exact class two revisions earlier**, in the same document, and caught only on a
+re-derivation they volunteered. Fluency in the rule buys no immunity from it.
 
 ## Citing and dispatching across a moving tree (CRITICAL)
 
@@ -296,6 +468,18 @@ quotes it, names a line number, or says a fix "did not land". Evidence:
   implementer, relayed by the lead as an instruction, and accepted by an auditor
   **who had the two-line file open earlier in the same session**. Three agents,
   none of whom opened it. False — the name is `uzi-store-it-$$`.
+- **A dispatch saying an amendment "is not in", from a case-sensitive grep** —
+  `grep -c 'both counts'` against a lead written in this file's uppercase house
+  form. It returned `0`; the amendment had landed one commit earlier, under the
+  shouted lead `BOTH COUNTS READING ZERO IS THE TELL` — quoted here rather than
+  cited by line, per rule 2 below, and because seeing the casing is the whole
+  point. The recipient opened the file at HEAD and reported the refutation
+  instead of complying. **Complying would have committed a SECOND copy of the
+  entry**, into the file whose neighbouring rule is *duplicate the claim, never
+  the count*. Recorded because of where it happened: the dispatch was itself
+  about this file's section on false claims of absence, and quoted it. **Fluency
+  in a rule is not exemption from it, and the instructor is the one who cannot
+  see their own instance.**
 
 The mechanism that caught both: **the recipient opened the file before acting**,
 instead of assuming the instructor's read was current. Note the asymmetry that
@@ -344,7 +528,10 @@ section before reporting "not found". Same family as *a measurement is bound to 
 tree*: in both, the tool's SILENCE reads as a finding when it is only a limit of the query.
 Evidence: the lead quoted an anchor for this very amendment that did not match the coder's
 grep because the sentence wrapped; the coder read the section and landed it correctly instead
-of replying "anchor not found".
+of replying "anchor not found". **The general form of this — every null result being an
+observation of your instrument, not of the world — has its own section above** (*A claim about
+what would happen if you removed it is not readable from the code*), because on PRD #72 the same
+error arrived through a green test and an empty precedent search as often as through a grep.
 
 **A TRUNCATED VIEW IS NOT THE OUTPUT.** `| head -N` / `| tail -N` produce something that
 looks complete — output that stops at your limit is indistinguishable from output that
@@ -415,6 +602,27 @@ duplicated CLAIM is a cross-check that fires when reality moves; a duplicated
 COUNT is four things to drift. Resolve a count disagreement by **deleting the
 tally and citing the mechanism**, never by picking the winner — picking one
 removes the only instrument that detected the defect.
+
+**PRD #72 then produced the cleanest instance of this rule being stated and
+broken by the same agent, in one afternoon, and it goes one step past the usual
+shape.** Two validators reported the gap between a retraction and its surviving
+copy in one file as **19 lines** (reviewer) and **160 lines** (architect). The
+lead had *both* numbers, *noticed* they disagreed, and wrote — correctly, citing
+this very rule — that it would therefore **cite the mechanism and drop the
+tally**. It then quoted "nineteen lines apart" in a later dispatch. The recipient
+ran `git show cfa1c0a3:api/internal/prdpath/prdpath.go` and measured the
+retraction at `:92-93` against the surviving copy at `:253`. (These two figures
+are quoted rather than dropped because **their disagreement is the finding** —
+which is the same reason the guard-count example above quotes six, five and
+seven. Bound to a SHA, per rule 2 below; a count that is the subject of the story
+is not a tally sitting in the text as a current fact.)
+So this is not "stated a rule and forgot it": the author **diagnosed its own
+instance, prescribed the correct remedy in writing, and then did the thing
+anyway** — with the disagreement it had already flagged sitting in its own notes.
+**The rule-holder is not the person best placed to notice their own instance**,
+and the gap between knowing a rule and applying it to yourself is not closed by
+knowing it harder. What closed it here was a recipient re-deriving a cited number
+before using it, which is a mechanism and costs one `git show`.
 
 **The operational check that would have caught all four comments** (sharper than
 "re-read nearby comments", and it is a grep of the CALLERS not the neighbours):
@@ -503,12 +711,22 @@ test           cd api && go test -count=1 ./...
                cd web && npm test
                cd agent && npm test
                cd web && npm run check-docs
-dead code      none (gap)
+dead code      none (gap, noted 2026-07-26)
 coverage       none (gap)
 security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap)
 long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
+
+**The `~30 min` above is left as written, deliberately, and here is the one measurement
+against it.** *(Measured 2026-07-26 on one machine at `53d0f222`: **7m55s** wall clock,
+reaching the final `All E2E checks passed.` banner and the `down -v` teardown, so not a
+truncated run. Roughly 4× faster than the figure recorded here, most likely because the
+image build was largely cached. **One sample, not a correction** — replacing a figure on
+one sample is how the stale-tally problem starts over, in the file that documents it.
+Worth re-deriving deliberately, because the answer changes what the gate costs: if the
+real number is ~8 min then the exemption from the tester's 5-minute wait bound is
+unnecessary, and the gate is cheap enough to run far more often than it is.)*
 
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.

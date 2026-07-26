@@ -31,12 +31,19 @@ type builtinReconcilerQueries interface {
 // inserted with is_builtin=true, an existing row (builtin or admin-edited) is
 // never overwritten. It runs at startup alongside Migrate so future releases
 // can add or improve builtins without a re-run-unsafe SQL seed.
-func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) error {
+//
+// The TemplatesReconciled return is the ordering proof ReconcileBuiltinSkills
+// demands (PRD #72 M2, Decision 9): builtin skills seed their default allocations
+// by TEMPLATE NAME, so they must run second. See that type for why the dependency
+// is structural rather than a comment. A failed reconcile returns the zero token,
+// which ReconcileBuiltinSkills rejects — but callers should be failing on the
+// error anyway.
+func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) (TemplatesReconciled, error) {
 	var inserted int
 	for _, def := range agenttmpl.Builtins() {
 		model, tools, err := builtinColumns(def)
 		if err != nil {
-			return fmt.Errorf("encode builtin %q: %w", def.Name, err)
+			return TemplatesReconciled{}, fmt.Errorf("encode builtin %q: %w", def.Name, err)
 		}
 		n, err := q.InsertBuiltinAgentTemplate(ctx, InsertBuiltinAgentTemplateParams{
 			Name:        def.Name,
@@ -46,14 +53,14 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			PromptBody:  def.PromptBody,
 		})
 		if err != nil {
-			return fmt.Errorf("insert builtin %q: %w", def.Name, err)
+			return TemplatesReconciled{}, fmt.Errorf("insert builtin %q: %w", def.Name, err)
 		}
 		if n > 0 {
 			// A newly-inserted builtin becomes a global default (PRD #18 M7). Seed
 			// its shared allocation row here, not on every boot, so a default an
 			// admin later removes stays removed. Idempotent (ON CONFLICT DO NOTHING).
 			if err := q.SeedSharedTemplateAllocationByName(ctx, def.Name); err != nil {
-				return fmt.Errorf("seed default allocation for builtin %q: %w", def.Name, err)
+				return TemplatesReconciled{}, fmt.Errorf("seed default allocation for builtin %q: %w", def.Name, err)
 			}
 		}
 		if n == 0 {
@@ -79,7 +86,7 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 		inserted += int(n)
 	}
 	slog.Info("reconciled builtin agent templates", "builtins", len(agenttmpl.Builtins()), "inserted", inserted)
-	return nil
+	return TemplatesReconciled{done: true}, nil
 }
 
 // builtinColumns converts a definition's model/tools into their DB column types:

@@ -10,6 +10,7 @@ import {
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
+  PRD_LIFECYCLE_APPEND,
   NOT_CODE_MARKER,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
 } from "../src/prompt.js";
@@ -213,17 +214,42 @@ describe("buildLeadSystemPrompt", () => {
     const sp = buildLeadSystemPrompt(undefined);
     assert.strictEqual(sp.type, "preset");
     assert.strictEqual(sp.preset, "claude_code");
-    assert.strictEqual(sp.append, LEAD_GUARDRAIL_APPEND);
+    assert.ok(sp.append.includes(LEAD_GUARDRAIL_APPEND));
+    // TWO exact composition pins, one per path, and BOTH are needed.
+    //
+    // I first replaced the original `strictEqual(sp.append, LEAD_GUARDRAIL_APPEND)`
+    // with the ci_fix pin alone and called that "strictly stronger". It is not.
+    // Measured by the reviewer: a stray `parts.push(...)` gated to
+    // `kind === "issue"` leaves the suite GREEN with only the ci_fix pin, and
+    // reddens only when applied unconditionally. So the ci_fix pin is stronger
+    // against UNCONDITIONAL additions and WEAKER against issue-gated ones — and
+    // issue-gated is the direction this PRD adds content in. The assertion I
+    // removed sat on the default call, which IS the issue path.
+    //
+    // This is the lead's SYSTEM PROMPT, so an unreviewed clause reaching the model
+    // unnoticed is exactly what the original equality was buying. Both pins stay:
+    // adding anything to either path without updating this test reddens it.
+    assert.strictEqual(
+      buildLeadSystemPrompt(undefined, { kind: "issue" }).append,
+      [LEAD_GUARDRAIL_APPEND, PRD_LIFECYCLE_APPEND].join("\n\n"),
+    );
+    assert.strictEqual(buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append, LEAD_GUARDRAIL_APPEND);
   });
 
   it("appends the template body ahead of the guardrail reminder", () => {
     const sp = buildLeadSystemPrompt("  custom lead prompt  ");
     assert.match(sp.append, /^custom lead prompt\n\n/);
-    assert.ok(sp.append.endsWith(LEAD_GUARDRAIL_APPEND));
+    // The property is ORDERING (body first, guardrail after), which `endsWith`
+    // used to express only because the guardrail happened to be last. It is not
+    // last on an issue run any more, so assert the ordering directly.
+    assert.ok(sp.append.indexOf("custom lead prompt") < sp.append.indexOf(LEAD_GUARDRAIL_APPEND));
+    assert.ok(sp.append.includes(LEAD_GUARDRAIL_APPEND));
   });
 
   it("falls back to the reminder only when the body is blank", () => {
-    assert.strictEqual(buildLeadSystemPrompt("   ").append, LEAD_GUARDRAIL_APPEND);
+    // A blank body must contribute nothing, whatever else the options add.
+    assert.strictEqual(buildLeadSystemPrompt("   ").append, buildLeadSystemPrompt(undefined).append);
+    assert.strictEqual(buildLeadSystemPrompt("   ", { kind: "ci_fix" }).append, LEAD_GUARDRAIL_APPEND);
   });
 
   it("appends the untrusted-review passage ONLY when the run is repo-sourced (PRD #37)", () => {
@@ -446,5 +472,70 @@ describe("plan prompts — prior-work note (issue #105)", () => {
     // The note precedes the untrusted frame entirely, so no fenced content can
     // impersonate or suppress it.
     assert.ok(p.indexOf("already carries 2 commits") < p.indexOf("<issue_description>"));
+  });
+});
+
+// PRD #72 M3. What is mechanically provable here is the GATING and the WORDING;
+// whether a live model then does the right thing is a manual check the PRD
+// mandates and no test reaches.
+describe("PRD lifecycle clause (PRD #72 M3)", () => {
+  const append = (kind?: "issue" | "ci_fix" | "self_improve" | "judge") =>
+    (buildLeadSystemPrompt(undefined, kind ? { kind } : {}) as { append: string }).append;
+
+  it("is present on an issue run", () => {
+    assert.ok(append("issue").includes(PRD_LIFECYCLE_APPEND));
+  });
+
+  it("is ABSENT on ci_fix, self_improve and judge (Decision 13)", () => {
+    // self_improve is the dangerous one: it runs against uzi's own repo, which HAS
+    // a prds/ directory, and its issue is a reused backlog container.
+    for (const kind of ["ci_fix", "self_improve", "judge"] as const) {
+      assert.ok(!append(kind).includes(PRD_LIFECYCLE_APPEND), `${kind} must not carry the PRD clause`);
+      assert.ok(!append(kind).toLowerCase().includes("prds/done"), `${kind} must not mention prds/done at all`);
+    }
+  });
+
+  it("defaults an absent kind to issue, matching runner.ts", () => {
+    assert.ok(append().includes(PRD_LIFECYCLE_APPEND));
+  });
+
+  it("is CONDITIONAL in its own wording, not merely in intent (Decision 5)", () => {
+    // The load-bearing property: a PRDLESS run in a repo that HAS a prds/
+    // directory must not be invited to pick a file. So the clause has to open on
+    // the condition and state the no-op, not just be omitted when uzi knows there
+    // is no PRD — uzi does not know that here.
+    assert.match(PRD_LIFECYCLE_APPEND, /If the issue description links a `prds\/\*\.md` file/);
+    assert.match(PRD_LIFECYCLE_APPEND, /links no such file, skip all of this/);
+  });
+
+  it("names the mkdir, the partial-completion no-move rule, and prd_done_path", () => {
+    assert.match(PRD_LIFECYCLE_APPEND, /create the directory first/);
+    assert.match(PRD_LIFECYCLE_APPEND, /only partly complete, update the checkboxes and leave the file where it is/);
+    assert.match(PRD_LIFECYCLE_APPEND, /prd_done_path/);
+  });
+
+  it("coexists with the repo-sourced passage without either replacing the other", () => {
+    const both = (buildLeadSystemPrompt(undefined, { kind: "issue", repoSourced: true }) as { append: string }).append;
+    assert.ok(both.includes(PRD_LIFECYCLE_APPEND));
+    assert.ok(both.includes("UNVERIFIED"));
+    assert.ok(both.includes(LEAD_GUARDRAIL_APPEND));
+  });
+});
+
+describe("plan prompt names the PRD update (PRD #72 Decision 15)", () => {
+  const plan = (description: string) =>
+    buildPlanPrompt({ issueIid: 5, issueTitle: "t", issueDescription: description, branch: "b", subagentNames: ["coder"] });
+
+  it("asks the plan to state the PRD update and any move", () => {
+    // Without this the gate approves a plan that never mentions the run also
+    // rewriting and `git mv`-ing the repo's own spec file — a change to the
+    // deliverable the approver never saw.
+    const p = plan("implements prds/72-x.md");
+    assert.match(p, /your plan must say/);
+    assert.match(p, /prds\/done\//);
+  });
+
+  it("is conditional in its wording, like the system-prompt clause", () => {
+    assert.match(plan("no prd here"), /If the issue description above links a `prds\/\*\.md` file/);
   });
 });

@@ -1,7 +1,9 @@
 # PRD #72: PRD lifecycle inside the run — progress updates, move-to-done, and the issue link that follows
 
 **GitLab Issue**: [#72](https://gitlab.example.com/vtmocanu/uzi/-/issues/72)
-**Status**: Draft (created 2026-07-25; revised same day after an adversarial review that opened every citation and traced each design decision against the code — it found three critical gaps, all folded in: the repo-source/autopilot completion path, the missing run-kind gate, and an under-specified description rewrite. See the Decision Log.)
+**Status**: Implemented — all six milestones landed, reviewed, audited and scenario-validated (2026-07-26). **One acceptance item remains open**: the "Manual, and required" run in the Validation section has not been performed, so the headline behaviour (an agent ticking checkboxes and moving the file) is shipped and specified but **not demonstrated**. It is a prompt clause plus a skill body — instructions to a model — and no automated test can reach it. The mechanical guarantees (run-kind gating, path validation, the target binding, seed-once) are test-proven; see `specs/ai.md` §384 for the boundary.
+
+*(Created 2026-07-25; revised same day after an adversarial review that opened every citation and traced each design decision against the code — it found three critical gaps, all folded in: the repo-source/autopilot completion path, the missing run-kind gate, and an under-specified description rewrite. See the Decision Log.)*
 **Priority**: Medium
 **Related**: [#96](https://gitlab.example.com/vtmocanu/uzi/-/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://gitlab.example.com/vtmocanu/uzi/-/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://gitlab.example.com/vtmocanu/uzi/-/issues/16) (skills), [#37](https://gitlab.example.com/vtmocanu/uzi/-/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://gitlab.example.com/vtmocanu/uzi/-/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://gitlab.example.com/vtmocanu/uzi/-/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
 
@@ -66,7 +68,8 @@ shipped playbook silently absent:
   `agent/src/protocol.ts:161-162`, filled by
   `agentsFromTemplates(templates, skills.perTemplate)` at
   `workersvc/service.go:942`) — it builds `{name, description, prompt_body}` and
-  nothing else (`agent/src/repoagents.ts:289`). So `toDefinition` computes
+  conditionally adds `tools` and `model`, but never a skills field
+  (`agent/src/repoagents.ts:289`). So `toDefinition` computes
   `allocated = (t.skills ?? []).filter(…)` = empty (`agent/src/agents.ts:116`)
   and a repo-sourced subagent receives **only** repo-borne skills. A run started
   with agents from git silently loses every delivered skill its owner allocated.
@@ -213,8 +216,11 @@ argument here would be dishonest:
 
 **For run-wide.**
 
-- **Precedent.** Repo-borne skills already work this way: "repo skills carry no
-  allocation, so they go to every template" (`agent/src/agents.ts:111-113`). The
+- **Precedent.** Repo-borne skills already work this way — the comment in
+  `agent/src/agents.ts` reads "repo skills carry no allocation and are enabled for
+  ALL templates in the run". *(Corrected 2026-07-26: this was presented as a
+  verbatim quote and was a paraphrase. Same substance; the quotation marks were not
+  earned.)* The
   same reasoning applies for the same reason — with a repo roster there is no
   allocation signal to honor, so honoring none is the honest reading.
 - **Smaller.** The bodies are already materialized run-wide (`Skills:
@@ -239,7 +245,7 @@ currently the *only* way a subagent can read a delivered skill body — and repo
 subagents do not have it.
 
 M1 grants it, for every delivered skill. Those can be admin-authored
-org-internal playbooks: today's single builtin documents `harbor.example.com`,
+org-internal playbooks: `ci-cd-norms` documents `harbor.example.com`,
 `myorg/pipelines`, `argo-apps`, the Infisical operator, and ArgoCD's
 group-scoped deploy-token model. A repo-authored subagent can be written to
 expand a skill and write its contents into the worktree, which the worker then
@@ -263,8 +269,25 @@ scopes a skill to `coder`, `docs/skills.md:42-52`). It would also degrade
 routing — the one-line description is what the model routes on, so more
 candidates in every agent's context means more wrong pulls. **That routing cost
 is paid on repo-source runs**, where a subagent may now list up to
-`SKILLS_MAX_PER_RUN` (32, `agent/src/skills-run.ts:15`) skills. Accepted there
-because no alternative exists; refused on own runs because one does.
+the run's **configured** cap (`skills_max_per_run` from the claim; the constant at
+`agent/src/skills-run.ts` is `DEFAULT_SKILLS_MAX_PER_RUN` = 32, a fallback used
+only when the claim omits config) skills. Accepted there because no alternative
+exists; refused on own runs because one does.
+
+*(Corrected 2026-07-26, then corrected again the same day. This originally read
+"`SKILLS_MAX_PER_RUN` (32, `agent/src/skills-run.ts:15`)". The **citation** was
+wrong: the identifier at that line is `DEFAULT_SKILLS_MAX_PER_RUN`, and its own
+comment calls it a fallback used only when the claim omits config.
+`SKILLS_MAX_PER_RUN` itself **does** exist — it is the api-side env var
+(`api/internal/config/config.go`, defaulting to 32, documented for admins in
+`docs/skills.md`), and the enforced value is whatever the claim carries, so 32 is
+wrong for any instance whose admin raised it. The first correction said "that
+identifier does not exist", which over-corrected a scoped observation into a false
+universal; a fact-checker refuted it. Note also that a cap is not a containment:
+`enforceSkillCaps` evicts a precedence-ordered tail, bounding how many a repo
+subagent sees, never which. The honest bound is the content one — a repo subagent
+receives exactly the run's materialized union, the same set the lead already
+receives.)*
 
 ### Decision 7 — Default allocation targets `lead`, and what that actually does
 
@@ -451,7 +474,7 @@ untouched; its content gets one line.
 
 ## Milestones
 
-- [ ] **M1 — Repo-sourced agents receive delivered skills** (worker only): on
+- [x] **M1 — Repo-sourced agents receive delivered skills** (worker only): on
       `source === "repo"`, `subagentsFromTemplates` enables the run's surviving
       delivered skills on every repo subagent, matching the repo-skill rule.
       Own-template assembly is untouched. **Verified**: a repo-source run with an
@@ -464,7 +487,7 @@ untouched; its content gets one line.
       (`sdk-executor.ts:265-268`), and `agent/test/agents.test.ts` has no skill
       assertions at all.
 
-- [ ] **M2 — Builtin skills carry a default allocation**: a Go-side map from
+- [x] **M2 — Builtin skills carry a default allocation**: a Go-side map from
       builtin skill name to default template names; `ReconcileBuiltinSkills`
       seeds a shared allocation when — and only when — it inserted the row, and
       **warns on a zero-row seed** (Decision 9); the boot ordering against
@@ -475,7 +498,9 @@ untouched; its content gets one line.
       template logs a warning instead of failing silently; the migration is
       idempotent against an instance that already has the row.
 
-- [ ] **M3 — The `prd-lifecycle` skill + the prompt clauses**: new builtin skill
+- [ ] **M3 — The `prd-lifecycle` skill + the prompt clauses** — **SHIPPED, NOT
+      VERIFIED. Deliberately left unticked; see the note under this milestone.**
+      New builtin skill
       (adapted per Decision 4; reviewer instruction per Decision 3; already-in-
       `done/` is a no-op per Decision 2), defaulted to `lead` + `reviewer` via
       M2's map; `prompt.ts` gains the done-condition clause, conditional on a
@@ -487,7 +512,20 @@ untouched; its content gets one line.
       PRDLESS run and a `ci_fix` run touch no PRD file; a submitted plan names the
       PRD-update step.
 
-- [ ] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
+      **Why this box is unticked while the code shipped.** Every clause in that
+      Verified list except the last is a claim about **what a live model does**,
+      and the Validation section below marks that run "Manual, and required". It
+      has not been performed. Ticking this box would assert a verification that did
+      not occur — which is precisely the over-claim the skill shipped in this
+      milestone exists to prevent, and it was caught by a fact-checker after the
+      lead had ticked all six. The mechanically testable parts **are** proven and
+      mutation-pinned: the clause is emitted iff `kind === "issue"`, its wording
+      carries the Decision 5 conditional, the plan prompt carries the Decision 15
+      line, the `mkdir -p` precedes the `git mv`, and the four stripped steps are
+      pinned as absent. `specs/ai.md` §384 states the same boundary. **Tick this
+      box when the manual run happens, not before.**
+
+- [x] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
       the tool, extracted by `scanSignals` (which discards `signal_done` input
       today), threaded through `TurnResult` → `ExecutorResult` → the finish
       report, persisted on the run with a pending-patch marker, `issue` kind only.
@@ -501,7 +539,7 @@ untouched; its content gets one line.
       neither; a traversal, absolute, or non-`prds/` path is rejected without
       failing the run; a `self_improve` or `ci_fix` run never sets the field.
 
-- [ ] **M5 — Patch the issue link on merge**: `UpdateIssueDescription` on the
+- [x] **M5 — Patch the issue link on merge**: `UpdateIssueDescription` on the
       `Forge` interface and both drivers (each wrapping its own errors through the
       PAT-scrubbing redactor, as `gitlab.go:57`/`:74` do — redaction is per-method,
       not automatic), plus the five test fakes; a dedicated watcher over `issue`
@@ -530,7 +568,7 @@ untouched; its content gets one line.
       untouched; an unmerged or closed MR never rewrites and does not poll
       forever; a forge error retries.
 
-- [ ] **M6 — Docs + specs + CLI**: `docs/skills.md` (default allocations, the
+- [x] **M6 — Docs + specs + CLI**: `docs/skills.md` (default allocations, the
       repo-agent rule), `docs/repo-agents.md` (which mentions skills nowhere
       today and is the user-facing page for what M1 changes), `docs/prdless.md`,
       `docs/autopilot.md` (unattended move-to-done, Decision 14), plus the two

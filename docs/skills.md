@@ -20,7 +20,7 @@ and drops the rest):
 1. **Your own skills** ("Mine"): private playbooks only you can see or
    allocate.
 2. **Global**: admin-authored, visible to everyone.
-3. **Builtin**: shipped with uzi, starting with `ci-cd-norms` (below).
+3. **Builtin**: shipped with uzi (`ci-cd-norms` and `prd-lifecycle`, below).
 4. **Repo skills**: opt-in per repo, lowest precedence (see below).
 
 ## Create or edit a skill
@@ -40,8 +40,9 @@ and drops the rest):
 
 ## Allocate a skill to an agent
 
-Skills only reach a run if they are allocated to the template that run uses.
-Open an agent template's detail page for the allocation panel:
+Skills only reach a run if they are allocated to one of the agent templates
+that run carries. Open an agent template's detail page for the allocation
+panel:
 
 - **Shared** (admin-managed): applies to everyone's runs on that template.
 - **Mine** (self-service): your own overlay on top of the shared set,
@@ -50,6 +51,17 @@ Open an agent template's detail page for the allocation panel:
 Your runs get the **union** of the two, shown at the top of the panel. A
 shared allocation may only reference builtin or global skills; your overlay
 may also reference your own user skills.
+
+**Builtin skills arrive already allocated.** Each one ships with a default
+shared allocation, seeded the first time uzi inserts the skill, so a fresh
+instance needs no allocation clicks to make a builtin reach a run. The seed
+runs only on that first insert: an allocation an admin removes afterwards
+stays removed across restarts, and resetting the skill's body does not bring
+it back. Re-add it from the same allocation panel if you want it back.
+
+**A run that uses [repo agents](./repo-agents.md) does not scope skills per
+template** (a repo roster has no templates to scope against). See that page
+for what each repo subagent receives.
 
 ## Name shadowing
 
@@ -94,10 +106,35 @@ any other skill.
 
 Ships with uzi: the example CI/CD norm (`myorg/pipelines` includes, Harbor,
 ArgoCD GitOps via `argo-apps`), how to recognize a repo that
-deviates from it, and example-app as the worked exception. Allocate it to `coder`
-or `reviewer` so agents extend a pipeline the example way instead of
-fighting it. Like any builtin, an admin can edit it in place or reset it to
-the shipped version.
+deviates from it, and example-app as the worked exception. Allocated to `coder`
+and `reviewer` by default, so agents extend a pipeline the example way
+instead of fighting it. Like any builtin, an admin can edit it in place,
+reset it to the shipped version, or drop the allocation if your repos do not
+follow that norm.
+
+## The `prd-lifecycle` builtin
+
+Ships with uzi, allocated to `lead` and `reviewer` by default. It carries the
+playbook for the end of an issue run: scan every unchecked item in the
+issue's linked `prds/*.md` file, tick only what direct evidence supports, and
+move the file to `prds/done/` when (and only when) every item is complete. A
+partly-completed PRD keeps its ticks and stays where it is. The reviewer half
+tells a reviewer to check the PRD diff against what the branch actually
+changed and to send back an unsupported completion claim.
+
+The PRD edit is an ordinary commit on the run's branch, so it arrives in the
+merge request with the code. The lead's own instructions carry a short
+version of the same step on every issue run, so it does not depend on this
+skill being allocated; the skill supplies the judgment. Both are instructions
+to a model rather than enforcement: whether a PRD update is honest is checked
+by the human reading the merge request. An issue that links no PRD file is a
+no-op (see [PRDLESS label](./prdless.md)).
+
+Only issue runs are **told** to do it. A CI-fix or self-improvement run never
+carries the instruction, and the machinery that records a move is closed to
+them as well. The skill itself is allocated per template, not per run kind, so
+it still appears in those runs' skill list: that is expected, and nothing there
+asks them to use it.
 
 ## Security notes
 

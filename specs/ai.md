@@ -2689,6 +2689,10 @@ agent templates".
   row. Builtin lifecycle: **editable; resettable** (`POST /:id/reset` re-applies the
   embedded definition, builtins only); **never deletable** (409). Guarantees the core
   skills always exist.
+  - **PRD #72 M2 extended this**, because inserting the row was not enough: a builtin
+    with no allocation row reaches nobody. The reconciler now also seeds each builtin's
+    default allocation, in the same transaction as the insert, only on the boot that
+    inserts it, and only after the agent-template reconciler has run — see §383.
 
 ## 101. Read + allocation-read authz (viewer-scoped, NOT the templates all-shared read)
 
@@ -2773,9 +2777,12 @@ defense — `settingSources: []` — never loosens).
   orchestrator visibility (the `lead` is the main session, routed there by
   `assembleAgents`, so it has no `AgentDefinition.skills` slot — allocating a skill
   specifically to `lead` only affects union membership).
-- **Per-subagent scoping via each `AgentDefinition.skills`** (delivered/allocated skills
-  are per-template), re-filtered to what actually survived precedence + caps. Repo skills
-  are the exception (all-templates, §105).
+- **Per-subagent scoping via each `AgentDefinition.skills`**, re-filtered to what actually
+  survived precedence + caps. Delivered/allocated skills are per-template on an
+  **own-template** run. Two all-templates exceptions: repo skills always (§105, they carry
+  no allocation), and on a **repo-source** run the delivered skills too — a repo roster has
+  no template rows, so there is no allocation to honour and every repo subagent gets the
+  run's whole surviving set (PRD #72 M1 Decision 6, `subagentsFromTemplates`).
 - Shared assembly path `agent/src/skills-run.ts` is used by **both** the SDK executor
   (production) and the stub executor (E2E) so they can't drift into two lenient
   implementations.
@@ -2861,6 +2868,11 @@ Serves human: "users allocate global or their own skills to each agent"; skills 
 
 Serves human: "the first builtin skill is ci-cd-norms, researched from internal-kb
 and the example-app repos, covering the example CI/CD norm and example-app as the worked exception".
+
+*(Title kept as history: this was the first, and for a long time the only, builtin skill.
+A **second** shipped with PRD #72 — `prd-lifecycle`, §384 — and builtins now carry default
+allocations, §383. Read this section as "what PRD #16 shipped", not as "the builtin skill
+inventory".)*
 
 - Authored at `api/internal/skilltmpl/builtins/ci-cd-norms/SKILL.md` (researched from
   internal-kb `shared/infrastructure/ci-pipeline.md`, `organizations/myorg/infrastructure/
@@ -11025,6 +11037,280 @@ See [prds/done/98-judge-menu.md](../prds/done/98-judge-menu.md) for the Decision
 [prds/done/98-judge-menu-m8-w3-rulings.md](../prds/done/98-judge-menu-m8-w3-rulings.md) for the wave-3
 rulings these sections record.
 
+# PRD #72 — PRD lifecycle inside the run (update, move-to-done, and the issue link that follows)
+
+Serves human Feature #72: the user's ask on the issue was to "bundle relevant prd
+skills", and the user decided two things directly — **patch the issue description on
+merge**, and **let autopilot move PRDs to `done/` unattended** — then ratified the
+exposure that combination creates (*"allow it, we review the MR by human anyway"*).
+Everything else below is an AI design decision inside those constraints. Design
+record: `prds/72-prd-lifecycle-in-run.md` (fifteen Decisions, with the adversarial
+review that forced five of them).
+
+**Read §384 first if you are rebuilding this.** The headline behaviour — an agent
+ticking checkboxes and moving the file — is a prompt clause plus a skill body, i.e.
+instructions to a model. Four things around it are mechanical, and they are the ones a
+rebuild must actually reproduce: the run-kind gate (§385), the path validation (§385),
+the patch-target binding (§386), and the seed-once allocation semantics (§383).
+
+## 382. M1 — a repo-source run delivers the run's WHOLE surviving skill set to every subagent; own-template runs are untouched
+
+Allocations key on `template_id`. A repo's `.claude/agents/*.md` roster has no template
+rows, `detectRepoAgents` never populates `.skills`, so per-template scoping delivered
+**nothing at all**: a run started with agents from git silently lost every delivered
+skill its owner had allocated. That is the gap that made the rest of this PRD
+untestable — a skill that cannot reach an agent cannot be exercised.
+
+- **Run-wide, not name-matching.** The rejected alternative was "a repo agent named
+  `coder` inherits the `coder` template's allocations". Run-wide follows the precedent
+  repo-borne skills already set (no allocation signal ⇒ honour none, §105), is smaller
+  (the survivor set is already in scope at the call site — an argument, not a lookup
+  table), and closes an influence channel: name-matching would let a repo *choose*
+  which of your allocated skills load by naming its agents to match yours.
+- **The disclosure cost is real and accepted.** Delivered skill bodies are materialized
+  to a sibling of the worktree, outside the file-tool path jail, so SDK skill expansion
+  was previously the only read path and repo subagents did not have it. M1 grants it. A
+  repo-authored subagent can expand a skill and write its contents into the worktree,
+  which the worker then commits and pushes to a branch the repo's author can read. **On
+  this axis run-wide is strictly worse than name-matching.** Accepted because skill
+  bodies are not secrets by product policy (`docs/skills.md` §Security notes says a
+  skill must never carry a credential) and because enabling a repo-source run is
+  already an explicit act of trust in that repo. Recorded so a future genuinely
+  sensitive builtin triggers a revisit rather than a surprise.
+- **The honest bound is the CONTENT, not the count.** A repo subagent receives exactly
+  the run's materialized union — the same set the lead already receives. The per-run cap
+  bounds *how many* survive, never *which*, so citing it as containment is wrong.
+- **Own-template assembly is deliberately unchanged.** Per-template allocation is the
+  admin's scoping surface there, and widening it would also degrade routing (the
+  one-line description is what the model routes on, so more candidates per agent means
+  more wrong pulls). That routing cost is paid on repo-source runs because no
+  alternative exists; refused on own runs because one does.
+- **Not run-kind gated**, unlike M3/M4/M5. Decision 6 draws no kind distinction, so a
+  `ci_fix` or `self_improve` run resolving to the repo roster gets this rule too.
+  Correct as written; the code says so at the function, because it reads like an
+  oversight next to the gated milestones.
+- The `AgentDefinition.skills` de-dup at the single build site is a boundary guard, not
+  a live invariant: on both paths the allocated list and the all-templates list are
+  provably disjoint. What is pinned by tests is the content and order of that list.
+
+## 383. M2 — builtin skills carry a default allocation: a Go map, seeded ONCE, in ONE transaction, behind a compile-time ordering token
+
+`ReconcileBuiltinSkills` inserted the skill row and stopped. Builtin agent *templates*
+have auto-seeded their global-default allocation row since PRD #18 M7; skills shipped
+without the equivalent, so `ci-cd-norms` was unallocated on every instance until an
+admin clicked — and an unallocated skill reaches **nobody**, not even the lead, because
+the union the lead receives is itself built from allocation rows.
+
+- **Defaults live in a Go map in `skilltmpl`, not in SKILL.md frontmatter** (Decision
+  8). `Parse` rejects every unknown frontmatter key as an authoring error and that
+  strictness is worth keeping — a key like `allowed-tools` must never reach the model
+  through an authoring channel — and a default allocation is uzi's product decision
+  rather than authored data. Values are agent-template *names*.
+- **Seeded only on the boot that INSERTS the skill** (`n > 0`), mirroring
+  `ReconcileBuiltinTemplates` and for its stated reason: a default an admin later
+  removes stays removed. `ci-cd-norms` cannot be reached that way — its row already
+  exists everywhere, so `n` is 0 there forever — so it gets a one-off goose migration
+  (`00084`) instead, following the precedent `00049` set. Reconciler logic that
+  special-cased it would resurrect the allocation on every boot after a removal.
+- **Insert + seeds are ONE transaction per builtin** (`BuiltinSkillTxer`/`PoolTxer`).
+  Without it the gap between the two loses the default *permanently*: the insert
+  commits, the seed errors, the next boot sees `n == 0` and skips — re-creating the
+  exact bug this milestone removes, through a different door. A later retry cannot
+  repair it, because nothing can distinguish "the seed never ran" from "an admin removed
+  it", and the seed-once rule turns on precisely that distinction. Per builtin rather
+  than per loop, so one skill's failure does not roll back another's seed.
+- **The seed can MISS where the template analogue cannot**, because it targets a
+  different row (the template named `lead`/`reviewer`) — an `INSERT … SELECT … WHERE
+  name = …` inserts zero rows, errors nothing, logs nothing. So a zero-row seed
+  **warns**, naming the skill and the absent template, and is not an error: a missing
+  template is an operator/authoring problem, and refusing to boot would be worse than
+  shipping the skill unallocated and saying so loudly.
+- **The boot ordering is a COMPILE-TIME dependency, not a comment.**
+  `ReconcileBuiltinSkills` takes a `store.TemplatesReconciled` token that only
+  `ReconcileBuiltinTemplates` returns, with an unexported field so no package outside
+  `store` can forge one, and a runtime rejection of the zero value. Of the three ways to
+  hold the ordering (a test that reads `main.go`, a comment plus a runtime guard, a
+  structural dependency) this is the only one that cannot regress silently or be
+  defeated by a helper-extraction refactor. Swapping the two calls does not compile.
+- **A map key naming no shipped builtin skill PANICS at package init**, and an entry
+  with no targets likewise. It fires exactly one milestone out: M3's map entry and its
+  `SKILL.md` must land in the same commit, and with only a test guarding it, a split
+  would leave an entry that silently never fires. The check is called from
+  `skilltmpl.go`'s init *after* the builtins are parsed, not from its own `init()` —
+  Go runs a package's inits in filename order and `allocations.go` sorts first, so an
+  own `init()` reads an empty builtin set and panics on a healthy tree (measured).
+  Values cannot be checked there without importing `agenttmpl` into production code, so
+  they are pinned by a package-external test plus the runtime warning — which is also
+  the only layer that can see a template an *admin* deleted.
+
+## 384. M3 — the headline behaviour is a PROMPT CLAUSE plus a SKILL BODY, and it is NOT enforced
+
+This is the honest boundary of the whole PRD, recorded here rather than left for a
+reader to infer from green tests.
+
+- **What is instruction to a model, not enforcement.** That the agent scans every
+  unchecked item, ticks only on direct evidence, moves the file when (and only when)
+  every box is checked, treats an already-`done/` PRD as a no-op, and that the reviewer
+  checks the PRD diff — all of it lives in `PRD_LIFECYCLE_APPEND` (one clause on the
+  lead's system prompt) and the `prd-lifecycle` builtin skill body. Nothing in uzi
+  verifies any of it. A confidently wrong completion claim is possible and, once
+  written, is believed by the next reader.
+- **The mandated manual validation has not been run.** The PRD requires a real run
+  against a repo with a linked PRD, taken through merge, confirming the file moved and
+  the issue link resolves. No automated test can prove a skill body reached a live
+  model, so until that run happens the behavioural half of this PRD is **specified and
+  shipped, not demonstrated**. Everything in §385/§386 is proven by tests; this is not.
+- **Two placements, deliberately.** The done-condition clause needs no allocation, so
+  it reaches every run — the intended degradation is that with the skill missing or
+  unallocated the behaviour still happens, with less guidance. The playbook lives in the
+  skill because skills are progressive-disclosure: putting it in the prompt would tax
+  every run's context for a step that occupies its last few minutes.
+- **The conditional is in the WORDING, not the intent.** Both the prompt clause and the
+  tool's parameter description open on "if the issue description links a `prds/*.md`
+  file". An unconditional instruction handed to a PRDLESS run in a repo that nonetheless
+  *has* a `prds/` directory invites the model to pick one and edit it. (The PRDLESS
+  no-op is also mechanical downstream — see §386's target binding — but the prompt-level
+  half is what stops the wrong *file edit*, which no server-side gate can see.)
+- **Two of eight `dot-ai` prompts adapted, and only two**: `prd-update-progress` (the
+  unchecked-item scan + evidence policy) and the `git mv` half of `prd-done`. The rest
+  are human-loop or pre-run and would fight machinery uzi already owns — `prd-start`
+  creates the branch and edits the issue, `prd-next` is what uzi's plan gate is,
+  `prd-create` runs before the issue exists. Stripped from the adapted pair: the git-log
+  archaeology, the "wait for user confirmation" step (uzi has exactly one human gate),
+  the prescribed `git add .` + commit message, and the `/prd-next` handoff.
+- **The `mkdir -p prds/done` in the skill is required, not defensive.** Git tracks no
+  empty directories, so in a repo that has never archived a PRD the bare `git mv` fails
+  with exit 128 — the first-use case in every such repo, at the very end of the run.
+- **Move-to-done is completion-conditional, not per-MR.** A PRD routinely outlives its
+  first merge request (this repo's own history shows it, and a seven-milestone PRD trips
+  `RUN_MAX_ITERATIONS` anyway), so "one PRD, several runs" is the expected shape.
+- **The plan gate's mechanics are untouched; its CONTENT gains one line** (Decision 15).
+  `buildPlanPrompt` asks the plan to say how the PRD will be updated and whether it is
+  expected to move. Without it a human approves a plan and the run then also rewrites
+  and `git mv`s the repo's own spec file — a change to the deliverable the approver
+  never saw, which "this does not change the plan gate" would have made mechanically
+  true and substantively misleading.
+- **The reviewer control is strong on own-template runs and weak on repo-source ones**,
+  and the skill body says so in its own text. On a repo-source run the reviewer is
+  repo-authored, and uzi's own lead prompt already calls such sign-offs unverified and
+  possibly adversarial. There, the human MR review is the control — which is exactly
+  what the user ratified.
+
+## 385. M4 — `prd_done_path` is a DECLARATION; one Go validator, clamp-never-error, and the api owns the run-kind gate
+
+The api cannot derive the path (it does not read repo files) and the worker cannot read
+the issue (its `ForgeClient` is deliberately one method), so the agent declares where
+the file went and the api decides what to do with it.
+
+- **`api/internal/prdpath` is the one definition of the grammar**, stdlib-only so
+  neither consumer can create an import cycle. M4 validates what the lead declares and
+  M5 finds and rewrites that path inside a description; the agreement between them *is*
+  the contract, so it gets one home rather than two implementations that drift. One
+  validator for both languages — the worker's length clamp is a transport convenience
+  whose drift costs nothing, because the api validates what it *receives*.
+- **`forgesvc.prdLinkRe` is unusable as a validator and must not be reached for.** It is
+  a link *detector* for prose: unexported, unanchored (so `rm -rf / prds/x.md` passes by
+  substring), accepts a blob-URL prefix and `#`/`?` suffixes, and its segment class
+  matches `..`. `prdpath.Validate` is anchored, rooted at `prds/`, `.md`-suffixed, and
+  traversal-rejecting. Changing `prdLinkRe` was out of scope; this package is its
+  natural eventual home.
+- **The api CLAMPS, never errors.** `clampWirePRDDonePath` drops a bad value and warns.
+  This runs on the `completed` transition — the terminal report, sent after the branch
+  is pushed and the MR opened — so a 4xx would strand a published run with no terminal
+  state. Follows `clampWireFixVerdict` on the same path, never `validateRepoAgents`
+  (which correctly *does* error, because it rides a `running` report where failing costs
+  nothing).
+- **The api is the authoritative run-kind gate** (`runs.kind = 'issue'`, NOT NULL). The
+  worker gates the *tool schema* — the model never sees the parameter on a non-issue run
+  — which is a strictly better failure mode than seeing it and having the value dropped
+  two hops later, but the worker is untrusted input reachable with a join token and this
+  field drives a forge write.
+- **`self_improve` is the kind most likely to trip this into a wrong write**, which is
+  why the gate is positive (`= 'issue'`) rather than an exclusion list: it runs against
+  uzi's own repo (which has a `prds/` directory), it is issue-shaped and carries a real
+  IID, and its issue's description is the accumulated `improve_uzi` backlog — a live
+  control document. `RunKind` has four values while the reasoning enumerates three, so
+  an exclusion list written from the prose would admit `judge` and would silently admit
+  a fifth kind later.
+- **One extraction point in the stream scan, inside the `signal_done` branch**, so it
+  inherits the main-thread guard that keeps a prompt-injected subagent from latching
+  `done`. A second extraction point anywhere would re-open that threat model from inside
+  the run. A non-string or absent value leaves the field undefined, never throws, and
+  never affects `done` — a malformed declaration still means the run finished.
+- Both columns land in **one migration** (`00084`): the declared path and the pending
+  marker are the same fact. No `CHECK` constraint on the path — a file path is not a
+  closed domain like `stop_kind`, so a CHECK could only restate the grammar in a second,
+  drifting place.
+
+## 386. M5 — the post-merge patch is EDGE-triggered, BOUND to the run's queue-time issue snapshot, and deliberately not `mr_watch`
+
+The one forge write this PRD performs, and the only mechanical control over what the
+agent's declaration can reach.
+
+- **On merge, not at MR creation.** At MR time the file has moved only on the branch, so
+  rewriting the description then points it at a path that does not exist on the default
+  branch — the same broken link, inverted. It also means the human's merge decision is
+  what authorizes the write, which is half of why Decision 14 is a real control.
+- **A dedicated pass, not `mr_watch`.** `ListMRWatchCandidates` requires `i.state =
+  'opened'`; a merge closes the issue through the MR's `Closes #N`, and the poller runs
+  the issue sync *before* `SyncMRStates`, so the candidate is evicted **deterministically**
+  — not a race that sometimes bites. Widening PRD #24's prefilter for an unrelated
+  purpose was refused. The new query has no `issues` join at all.
+- **THE BINDING, which is the security property.** The agent's declaration says *where
+  the file went*; it never says *which link to touch*. Targets are computed from the
+  run's own **queue-time `issue_description` snapshot**, which is forge-authoritative
+  and neither caller- nor agent-supplied, matched by basename, before any network
+  access. So an agent can only ever redirect a link the issue itself already carried.
+  This was added after a security finding during implementation; it is not in the
+  original PRD text. Its honest limit: if the snapshot lists several PRDs (a "Related
+  PRDs" list is a normal shape), a declaration whose basename matches any of them can
+  repoint that one. Bounded to the same issue, and the damage is description integrity
+  rather than security; tightening further is a design question, since uzi has no notion
+  of *the* PRD when an issue links several.
+- **The same gate makes the PRDLESS no-op mechanical** rather than prompt-level: a
+  PRDLESS run's snapshot carries no PRD link, so no forge write can happen even if the
+  lead declares a path anyway. It is load-bearing for two independent decisions, so
+  weakening it to "the path just has to look like a PRD path" would silently revert one
+  of them while appearing to touch only target selection.
+- **Terminal states are explicit, and their ORDER is load-bearing.** MR state is read
+  *before* supersession is consulted, so a superseded run whose MR actually merged still
+  gets its patch. `merged` → patch and settle; `closed` unmerged → settle without
+  patching; `opened` + superseded → settle without patching (this is what bounds the
+  pass); `opened` → leave the marker; forge error → leave the marker; **`locked` or an
+  unknown state → leave the marker, never settle** — `locked` is transient during merge
+  processing, so folding it into "any known non-opened state settles" would drop the
+  patch for an MR that is about to merge. Without these, an abandoned branch is an
+  unbounded per-tick forge call forever.
+- **Forge write first, then settle.** A crash between them re-fires the edge, and the
+  re-run finds the description already carrying the new path (zero matches → settle and
+  log), so it is idempotent by construction. `changed == 0` is one terminal state
+  covering three causes — already patched, a human edited it, the link was already under
+  `done/` — because the action is the same and distinguishing them needs evidence we do
+  not have.
+- **Marker naming follows the edge, not the outcome**: `prd_patch_settled_at` (after
+  `close_synced_at`), because three of its four settle reasons involve no forge write.
+- **The `kind = 'issue'` predicate is duplicated at the read site on purpose.** Today
+  `clampWirePRDDonePath` is the only writer, but the partial index carries no kind
+  predicate, and a backfill or a future second writer would arm a non-issue run that
+  this read would otherwise happily patch.
+- **Supersession's `EXISTS` restates every scope conjunct** because an `EXISTS` does not
+  inherit the outer `WHERE`. Dropping `n.repo_id` is not a cross-tenant *write* but a
+  cross-tenant **suppression**: any repo's newer run on a colliding issue IID would
+  cancel this repo's pending write, and issue IIDs collide across repos constantly.
+  `repo_id` is likewise the only tenancy scope on the outer query, and the watcher holds
+  one repo's PAT and performs a write — so its fixture carries two repos sharing an
+  issue IID, because on a single-repo fixture that predicate is unpinned.
+- **Residual exposure, recorded rather than discovered later**: a run that is superseded,
+  whose MR is still open when the tick settles it, and which merges later, loses its
+  patch. Narrow (the follow-up run normally moves the PRD itself and patches through its
+  own marker) and the alternative is polling an abandoned open MR forever.
+- **The read-modify-write window is unavoidable**: a human editing the description
+  between `GetIssue` and the write is clobbered. Narrowed to one poller tick and to only
+  the occurrences of this run's own PRD path. The description is never cached, so
+  `GetIssue` is the only source.
+- `UpdateIssueDescription` lands on the `Forge` interface and **both** drivers, each
+  wrapping its own errors through the PAT-scrubbing redactor — redaction is per-method,
+  not automatic — plus the five test fakes that implement the interface.
 # PRD #113 — Worker upgrade & version health (fleet status, per-worker badges, Workers-menu alert badge)
 
 Serves human (Feature #113, owner-accepted from the mock 2026-07-22): a worker's reported version must

@@ -123,6 +123,13 @@ export interface ExecutorResult {
    *  go/vitest/tsc on its subprocess PATH. Absent (or `{}`) when nothing was
    *  provisioned; the check env then falls back to the worker's base PATH. */
   toolEnv?: Record<string, string>;
+  /** PRD #72 M4: the repo-relative path the lead declared its PRD moved to (e.g.
+   *  `prds/done/72-x.md`), from `signal_done`. ISSUE RUNS ONLY (Decision 13) and
+   *  forwarded VERBATIM — the worker clamps length and nothing else. The api
+   *  validates the shape (`api/internal/prdpath`) and drops the value if it does
+   *  not hold, without ever failing the terminal report. Absent when the run moved
+   *  no PRD, which is the common case. StubExecutor never sets it. */
+  prdDonePath?: string;
 }
 
 /**

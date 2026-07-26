@@ -48,6 +48,24 @@ The first time the label is applied from uzi, it's auto-created on the
 GitLab project (amber) — no manual setup needed. Applying it from GitLab's
 own UI instead still requires creating the label there yourself first.
 
+## PRD updates with no PRD link
+
+On an ordinary issue run the lead is asked to update the issue's linked
+`prds/*.md` file before it finishes, and to move it to `prds/done/` if the PRD
+is now fully complete (see [Agent skills](./skills.md)). An issue with no PRD
+link has nothing to update, and the instruction is written to say so: it opens
+on "if the issue description links a `prds/*.md` file".
+
+Two different properties, protected differently:
+
+| Property | How it is protected |
+|---|---|
+| The issue description is never rewritten | Mechanically. uzi only ever redirects a `prds/*.md` link the description already carried, so an issue carrying none cannot be rewritten, whatever the agent reports. |
+| No PRD file in the repo is edited or committed | By the instruction alone. Nothing stops an agent that goes looking for a PRD anyway. |
+
+So if your repo has a `prds/` directory and you want to be sure a PRDLESS run
+left it alone, the merge request diff is where you check.
+
 ## Combining with autopilot
 
 An issue can carry the PRD label, the autopilot label, and the PRDLESS label

@@ -245,7 +245,7 @@ import (
 // runtime.sql (65), users.sql (21), user_secrets.sql (18) and slack.sql (18) are all higher
 // risk than some of the above and too large to investigate honestly in one sitting; forge.sql
 // (31) likewise. Best next candidates on size-versus-risk: user_vaults.sql (3) and
-// settings.sql (3) are small enough to finish properly; skills.sql (13) and chat.sql (16) are
+// settings.sql (3) are small enough to finish properly; skills.sql (14) and chat.sql (16) are
 // the largest that still look tractable.
 //
 // WHAT THE LAST TWO FILES CHANGED ABOUT HOW TO READ THIS TABLE. agent_memory.sql came out with

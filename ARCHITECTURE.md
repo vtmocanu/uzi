@@ -60,7 +60,7 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 1. Loads config (`config.Load`), including the `UZI_SECRET_KEY` boot guard (`secretbox.LoadKey`): boot fails here, before any DB connection is attempted, if the key is missing, malformed, or a low-entropy placeholder (e.g. an all-zero key).
 2. Waits for `db` to accept connections (bounded retry loop; compose's `depends_on: condition: service_healthy` on `db`'s `pg_isready` healthcheck already gates container start, this is a second, in-process guard).
 3. Runs all pending **goose** migrations, embedded in the binary via `go:embed` (`api/internal/store/migrate.go`, `api/internal/store/migrations/`) — no separate migration step or tool needed at deploy time.
-4. Opens the `pgx` connection pool, then reconciles the builtin agent templates through it (`store.ReconcileBuiltinTemplates`, see below): idempotent, so this is safe to run on every boot.
+4. Opens the `pgx` connection pool, then reconciles the builtin agent templates through it and, **after them**, the builtin skills (`store.ReconcileBuiltinTemplates` → `store.ReconcileBuiltinSkills`, see below): idempotent, so this is safe to run on every boot. That order is a requirement, not a convention — a builtin skill's default allocation resolves its agent template *by name* and is seeded only on the boot that inserts the skill — so the second call takes a token the first returns, and swapping the two blocks does not compile.
 5. Builds the `secretbox.Box` from the already-validated key.
 6. Only then starts the HTTP server.
 
@@ -72,7 +72,7 @@ uzi's second surface connects each user to a git forge (**GitLab and Forgejo**, 
 
 ### Forge abstraction
 
-`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`, the four CI reads, plus the guardrail reads `ProjectRole`/`DefaultBranchProtection`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`, `Role`, `BranchProtection`); `forge.New` selects a driver by `forge.Type` — **`gitlab.go` or `forgejo.go`** — so no other package ever imports a driver directly. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — closing the untimeouted-`http.DefaultClient` wart the `multica` inspiration carries — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN`/`token`-scheme header value before the error can reach a log line or an HTTP response body.
+`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`, `UpdateIssueDescription`, the four CI reads, plus the guardrail reads `ProjectRole`/`DefaultBranchProtection`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`, `Role`, `BranchProtection`); `forge.New` selects a driver by `forge.Type` — **`gitlab.go` or `forgejo.go`** — so no other package ever imports a driver directly. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — closing the untimeouted-`http.DefaultClient` wart the `multica` inspiration carries — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN`/`token`-scheme header value before the error can reach a log line or an HTTP response body.
 
 The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds both vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on both forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); #65 **reports** it, and **enforcement — refusing runs when the bot can push or merge to `main` — is deferred to [PRD #66](prds/66-guardrail-enforcement.md)**, because that is a GitLab-behaviour change with no Forgejo content.
 
@@ -100,6 +100,8 @@ Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connecti
 `api/internal/poller.Engine` (`main.go`) is started as a single background goroutine alongside the HTTP server. Each tick, for every enabled repo, it either runs an incremental pull (`ListIssues(labels=["PRD"], state=all, updated_after=HWM)`, high-water-mark = the max `updated_at` the forge itself returned, never the client clock) or, every `FORGE_RECONCILE_EVERY`-th tick (and always on a repo's first poll after being enabled), a full reconcile: fetch the complete `PRD`-labeled set with no lower bound, upsert everything, and evict cache rows the forge no longer returns. Eviction is the only way to observe de-labeling, closing-with-label-removed, or deletion, which an `updated_after`-filtered query structurally cannot report. Per-repo state (`hwm`, poll count) lives only in the `Engine`'s in-memory map — a disabled repo simply drops out and a re-enabled one starts over with a fresh full reconcile.
 
 Writes are forge-first: a board move (`POST /api/repos/:id/issues/:iid/move`) calls `UpdateIssueLabels` before touching the cache, and only updates the cache on success — a failed forge write leaves the card where it was (snap-back), never an optimistically-moved card the forge disagrees with.
+
+**PRD-link patch** (`forgesvc.SyncPRDLinkPatches`, PRD #72 M5) rides the same tick and is the one place uzi rewrites an issue's *description*. An `issue` run whose lead reports it moved the PRD file the issue links stores that path plus a pending marker on the run; once the run's MR is observed `merged`, the pass reads the live description (`GetIssue` — the cache has no description column), substitutes only the occurrences matching that path, writes back via `UpdateIssueDescription`, and settles the marker. Edge-triggered, so it never re-fires and never fights a human's later edit; `closed`-unmerged and superseded-while-open settle without patching, so an abandoned branch is not polled forever. Two properties are load-bearing: it is scoped `kind = 'issue'` (a `self_improve` run's issue is a reused backlog container whose description is a live control document), and the **targets come from the run's own queue-time issue snapshot, never from the agent's declaration** — the agent says where the file went, not which link to touch, so it can only ever redirect a link the issue already carried. That bound is the whole claim and it is easy to overstate: targeting is by *basename* against the snapshot's links, so on an issue that links several PRDs the declaration does pick which one is repointed, and nothing verifies the move happened. Bounded to one issue's own links, basename-matched, `prdpath.Validate`-passing — description integrity, not security; tightening it is a design question (uzi has no notion of *the* PRD when an issue links several) rather than a fix. It deliberately does not reuse `mr_watch`'s candidate prefilter: that requires `i.state = 'opened'`, and a merge closes the issue through the MR's `Closes #N` before `SyncMRStates` runs, so the candidate would be evicted deterministically rather than occasionally.
 
 Shutdown ordering matters here specifically because of the poller: `main.go`'s `run()` calls `srv.Shutdown` to drain in-flight HTTP requests, cancels the root context (stopping the poller's next tick), then `pollerWG.Wait()`s for any in-flight sync to finish — all *before* the deferred `pool.Close()` runs, so a mid-tick database query never races the pool shutting down underneath it.
 
@@ -231,7 +233,21 @@ model); this section is the map. User-facing usage is
   below. Builtins are seeded/repaired by the same reconciler pattern as agent
   templates (editable, resettable, never deletable), Go-embedded from
   `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
-  builtins convention above) — starting with `ci-cd-norms`.
+  builtins convention above) — `ci-cd-norms` and `prd-lifecycle`.
+- **Default allocations** (PRD #72 M2). A builtin with no allocation row
+  reaches *nobody* — not its scoped subagents and not the lead either, since
+  the union `ListRunSkillAllocations` builds is what the lead receives. So
+  each builtin carries a default target list (a Go-side map in `skilltmpl`
+  keyed by skill name, deliberately not frontmatter: `skilltmpl.Parse`
+  rejects every unknown key and that strictness is worth keeping), seeded in
+  the **same transaction** as the insert and **only** on the boot that
+  inserts the skill — `ReconcileBuiltinTemplates`' `n > 0` rule, for its
+  reason: a default an admin later removes stays removed. The targets are
+  agent-template *names*, so the template reconciler must run first (see
+  [Startup](#startup-and-migrations)), a zero-row seed warns rather than
+  failing silently, and `ci-cd-norms` — whose row predates the mechanism
+  on every live instance, so its insert can never return a row again — is
+  backfilled by a one-off migration instead.
 - **Read authz is deliberately not the agent-templates pattern.** Templates
   are all-shared; skills are not. Every read (`GET /api/skills*`) returns
   builtin ∪ global ∪ the caller's own user skills; admins additionally see
@@ -263,9 +279,12 @@ model); this section is the map. User-facing usage is
   `skills` option is always sent as an explicit list — omitting it is not
   "skills off" — set to the run's full plugin-qualified union; the `lead`
   template runs on the main thread (not a subagent), so this union is also
-  its only allocation surface. Each subagent's `AgentDefinition.skills` scopes
-  it to its own allocated skills, re-filtered to what actually survived
-  materialization.
+  its only allocation surface. On an **own-template** run each subagent's
+  `AgentDefinition.skills` scopes it to its own allocated skills, re-filtered
+  to what actually survived materialization. On a **repo-source** run
+  (`agent/src/agents.ts` `subagentsFromTemplates`, PRD #72) there are no
+  template rows to allocate against, so every repo subagent receives the run's
+  whole surviving set instead — the same all-templates rule repo skills follow.
 - **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only
   when `ClaimRepo.skills_enabled`, the worker enumerates
   `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name`

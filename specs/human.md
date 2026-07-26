@@ -440,6 +440,15 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
 - `uzi login` works on a password-only stack AND an OIDC-backed instance with no IdP configuration change. [Success Criterion 2]
 - Admin gets read-only verbs over the CLI; every admin write stays a webui action. [user override, PRD #64 Decision 5]
 
+## Feature #72 — PRD lifecycle inside the run
+
+Tracked as GitLab issue vtmocanu/uzi#72; PRD at `prds/72-prd-lifecycle-in-run.md`.
+
+- Bundle the relevant PRD skills so a run can update its own PRD. [user, the originating ask on #72]
+- After the MR merges, uzi patches the issue's own PRD link to follow the moved file. [user 2026-07-25]
+- Autopilot does this unattended — a run may move a completed PRD to `prds/done/` with no human in the loop. [user 2026-07-25]
+- Accepted exposure: a repo-source autopilot run may move a PRD to done with no uzi-controlled component checking it — *"allow it, we review the MR by human anyway"*. [user 2026-07-25, ratified verbatim]
+
 ## Feature #83 — Docker-capable worker
 
 Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/83-docker-capable-worker.md`.

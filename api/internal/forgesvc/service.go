@@ -76,6 +76,10 @@ type IssueStore interface {
 	// cache, the DO-NOTHING disposition insert, and the edge stamp (judge_issue_close.go).
 	ListFiledIssueCloseEdges(ctx context.Context, arg store.ListFiledIssueCloseEdgesParams) ([]store.ListFiledIssueCloseEdgesRow, error)
 	ApplyFiledIssueCloseEdge(ctx context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error)
+	// PRD-link patch (PRD #72 M5): the merged-MR edge over completed issue runs that
+	// declared a moved PRD path, and its settle (prd_link_patch.go).
+	ListPRDLinkPatchCandidates(ctx context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error)
+	SettlePRDLinkPatch(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // LabelConfig resolves the configured PRD label the sync filters query by

@@ -242,6 +242,17 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
 	}
 
+	// PRD-link patch (PRD #72 M5): once a run's MR has merged, rewrite the issue's
+	// own `prds/*.md` link to the path the run moved the file to. Placed HERE — after
+	// SyncMRStates, before the filed→close sync — because it needs a live forge
+	// client and must not run when the forge is unreachable, which the early returns
+	// above already guarantee. It makes NO use of the issue cache (it reads the
+	// description live via GetIssue, since the cache has no description column), so
+	// unlike SyncFiledIssueCloses it does not depend on the sync ordering.
+	if err := e.svc.SyncPRDLinkPatches(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+		slog.Error("poller: sync PRD link patches", "repo", r.PathWithNamespace, "error", err)
+	}
+
 	// Filed→Done judge sync (PRD #98 M6): with the issue cache fresh, move any
 	// recommendation whose filed issue (#68) has just been observed CLOSED to Done —
 	// once, on the open→closed edge, never overwriting a human's own verdict. Reads the

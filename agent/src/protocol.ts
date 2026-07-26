@@ -674,6 +674,13 @@ export interface StateRequest {
    *  alongside mr_iid. Additive + optional: an old worker omits it, the server stores
    *  NULL, and the web falls back to reconstructing the URL from mr_iid (forgeUrls.ts). */
   mr_web_url?: string;
+  /** The repo-relative path the lead declared its PRD moved to (PRD #72 M4),
+   *  reported on completion alongside branch/mr_iid. Additive + optional and
+   *  OMITTED ENTIRELY when there is none — never `null` or `""` — so an old
+   *  worker's payload and a new worker's "no move" payload stay the same shape on
+   *  the wire. Issue runs only; the server re-gates on `runs.kind` and validates
+   *  the path, dropping it rather than failing the report. */
+  prd_done_path?: string;
   /** failed carries a human-readable reason. */
   failure_reason?: string;
   /** implement⇄review loop counter, reported on running reports (M4). The
