@@ -65,6 +65,14 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // The worker's self-reported version is only meaningful if EVERY template
       // carries the stamp — a template that forgets it silently reports `unknown`
       // for a released image. jvm is NOT `FROM base`, so this is per-Dockerfile.
+      //
+      // THIS PINS DOCKERFILE TEXT, NOT BUILD BEHAVIOUR — like every other case in
+      // this file, and the distinction matters more here than elsewhere. `${VAR#v}`
+      // in an ENV is expanded by the Dockerfile PARSER, not by a shell, so
+      // api/Dockerfile's `${UZI_VERSION#v}` (which runs inside a RUN, i.e. POSIX sh)
+      // is no precedent for it: older buildkit lexers reject `#` as an unsupported
+      // modifier outright. The strip was therefore confirmed by an actual build
+      // under the kaniko digest CI pins, and a text assertion cannot replace that.
       assert.match(text, /^\s*ARG\s+UZI_AGENT_VERSION=\s*$/m, `${name}/Dockerfile must declare ARG UZI_AGENT_VERSION with an EMPTY default (unstamped -> unknown, never a fake SemVer)`);
       assert.match(
         text,

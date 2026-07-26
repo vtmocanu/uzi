@@ -236,7 +236,9 @@ ENV UZI_DATA_DIR=/data
 # templates/base, which jvm must carry itself (it is NOT `FROM base`, so no ENV is
 # inherited). CI passes the git tag; the ${...#v} strip yields the bare Model-B
 # coordinate; unset stays EMPTY so an unstamped build reports `unknown` rather
-# than a fake SemVer. See templates/base for the full rationale.
+# than a fake SemVer. See templates/base for the full rationale, including why this
+# ARG must stay BELOW the expensive nix/Chromium layers: its value changes every
+# release and a changed ARG invalidates the cache from its declaration down.
 ARG UZI_AGENT_VERSION=
 ENV UZI_AGENT_VERSION=${UZI_AGENT_VERSION#v}
 

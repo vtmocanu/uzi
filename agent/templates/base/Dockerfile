@@ -303,6 +303,14 @@ ENV UZI_DATA_DIR=/data
 # `unknown`. That is the honest answer, and the reason the frozen "0.1.0-m4"
 # default was retired — a fake SemVer is indistinguishable from a real report.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`); keep in lockstep.
+#
+# PLACEMENT IS DELIBERATE, not tidiness: this ARG changes value on EVERY release,
+# and a changed ARG invalidates the build cache from its declaration onward. Down
+# here it only invalidates the trailing cheap layers. Moved up, it would invalidate
+# the ~2.6 GiB nix/Chromium layers above, whose cache pressure already OOM'd a
+# runner at exit 137 (see --compressed-caching=false in .gitlab-ci.yml) — a
+# release-time build failure, not a style regression. ARG UZI_SRC_SHA sits just
+# above for the same reason; keep both below the expensive layers.
 ARG UZI_AGENT_VERSION=
 ENV UZI_AGENT_VERSION=${UZI_AGENT_VERSION#v}
 
