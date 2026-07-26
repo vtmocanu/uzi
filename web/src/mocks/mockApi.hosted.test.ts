@@ -22,31 +22,35 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     expect("token" in res).toBe(false);
   });
 
-  it("hardcodes hosting ON with a quota of 2 — a demo of a hidden feature is not a demo", async () => {
+  it("hardcodes hosting ON with a quota of 3 — a demo of a hidden feature is not a demo", async () => {
     // On a real stack the flag is off by default and there is no controller until M3,
     // so the mock is the only place M5 can be seen at all.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 2 });
+    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 3 });
   });
 
-  it("puts the at-quota journey three clicks away: one seeded hosted worker of two", async () => {
+  it("puts the at-quota journey three clicks away: two seeded hosted workers of three", async () => {
     // The point of the seed. web-ux drives provision → 2 of 2 → button disables →
     // delete → it enables again, which is the only way to prove the client-side gate
     // RELEASES. A component test asserting "disabled at quota" passes either way.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
     const seeded = (await api.listWorkers()).workers.filter((w) => w.kind === "hosted");
-    expect(seeded).toHaveLength(1);
+    // TWO seeded hosted workers against a quota of THREE since PRD #113 M5 added the
+    // failed roller. The numbers moved together deliberately: what this test exists to
+    // prove is that the gate RELEASES, which needs exactly one slot of headroom, and
+    // that is unchanged.
+    expect(seeded).toHaveLength(2);
     expect(seeded[0].hosted_size).toBe("m");
 
     const { worker } = await api.provisionHostedWorker("base", "l");
     const after = (await api.listWorkers()).workers.filter((w) => w.kind === "hosted");
-    expect(after).toHaveLength(2); // at quota
+    expect(after).toHaveLength(3); // at quota
 
     // Delete is kind-blind, exactly as the real DELETE /api/workers/{id} is.
     await api.deleteWorker(worker.id);
-    expect((await api.listWorkers()).workers.filter((w) => w.kind === "hosted")).toHaveLength(1);
+    expect((await api.listWorkers()).workers.filter((w) => w.kind === "hosted")).toHaveLength(2);
   });
 
   it("provisions offline, unreported, with the chosen size — the controller has not started it yet", async () => {

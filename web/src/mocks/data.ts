@@ -1103,6 +1103,48 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_label: null,
   },
   {
+    // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
+    // strip, the likely-cause copy and the copy-kubectl-command button — a state the
+    // product ships and the demo could not previously reach, which meant a browser pass
+    // could only ever validate the healthy path.
+    //
+    // The shape is the v0.11.0 incident: an init container wedged reseeding the nix
+    // store. Fictional ids and no registry path, deliberately.
+    id: "w-stuck",
+    name: "stuck-roller",
+    status: "offline",
+    kind: "hosted",
+    hosted_size: "m",
+    docker: false,
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
+    template_declared: "base",
+    template_reported: "base",
+    // Still reporting the OLD version: a worker whose new pod never became Ready is
+    // offline, so its stored version cannot move. That is the whole reason roll health
+    // has to come from the controller rather than from the worker.
+    version: "0.4.1",
+    upgrade_status: "upgrade_failed",
+    upgrade_detail: "seed-nix: CrashLoopBackOff (6 restarts, last exit 2)",
+    // Target BELOW the control plane's 0.4.2, so this one worker also renders the Fleet
+    // panel's B-1 divergence line. Coherent rather than contrived: the controller is
+    // rolling this worker to the PINNED tag 0.4.1 and the pod is wedged getting there.
+    // One worker carrying both states is what keeps PRD #58's quota headroom intact —
+    // see the note in mockApi.ts.
+    upgrade_target: "0.4.1",
+    upgrade_blocking_container: "seed-nix",
+    upgrade_blocking_reason: "CrashLoopBackOff",
+    last_heartbeat_at: minsAgo(14),
+    created_at: daysAgo(11),
+    stats_cpu_pct: null,
+    stats_mem_bytes: null,
+    stats_mem_limit_bytes: null,
+    stats_source: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+  },
+  {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
     // no percentage bar) and the "worker process only" label.
     id: "w-nas",

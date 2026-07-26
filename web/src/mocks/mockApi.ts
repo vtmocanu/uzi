@@ -927,7 +927,12 @@ export const mockApi = {
     });
   },
   // The in-browser demo build has no server; report "demo" to match the header pill.
-  version: async () => delay({ version: "demo" }),
+  // A real SemVer, not "demo" (PRD #113 M5). Upgrade classification compares against
+  // this, and a non-SemVer control-plane version turns classification OFF entirely — so
+  // the literal "demo" made every badge and the whole Fleet panel unreachable in demo
+  // mode. The demo-mode signal does not live here: AppShell renders a separate "demo"
+  // pill, so nothing is lost by making this comparable.
+  version: async () => delay({ version: "0.4.2" }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -1838,7 +1843,15 @@ export const mockApi = {
   // is not a demo — and quota 2 against one seeded hosted worker puts the whole
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
-  hostedConfig: async () => delay({ enabled: true, quota: 2 }),
+  // Quota 3 against TWO seeded hosted workers (PRD #113 M5 raised both by one). The
+  // load-bearing property is unchanged and is why the numbers moved together: there is
+  // exactly ONE slot of headroom, so web-ux can still drive provision -> at quota ->
+  // button disables -> delete -> it enables again, which is the only way to prove the
+  // client-side gate RELEASES rather than merely starting disabled.
+  //
+  // The second seeded worker is the failed roller, which the demo previously could not
+  // show at all — so a browser pass could only ever validate the healthy path.
+  hostedConfig: async () => delay({ enabled: true, quota: 3 }),
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
