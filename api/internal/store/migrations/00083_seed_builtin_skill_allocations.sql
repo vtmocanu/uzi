@@ -17,6 +17,15 @@
 -- migrations, per 00049's note), so the reconciler's own seed is what allocates
 -- there. The two paths are disjoint by construction.
 --
+-- Decision 9's "a migration preserves the same property" is OVERSTATED for this
+-- direction, and the Down block below already concedes the same limit for itself.
+-- The Up preserves seed-once for every FUTURE removal, but it overrides one past
+-- one: an admin who manually allocated `ci-cd-norms` and then deliberately
+-- un-allocated it gets it back. Very narrow — no admin can have removed an
+-- AUTO-seeded default here, since never having had one is the gap M2 closes — so
+-- it can only override a manual removal of a manual allocation. Stated because a
+-- reader checking Decision 9 against this file should not have to rediscover it.
+--
 -- The target list duplicates skilltmpl's defaultAllocations map, knowingly — SQL
 -- cannot read Go. Keep them in sync by hand; the map is the source of truth for
 -- fresh instances and this is the one-off catch-up for existing ones.

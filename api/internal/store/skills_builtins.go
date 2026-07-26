@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/skilltmpl"
 )
 
@@ -18,6 +20,48 @@ type builtinSkillReconcilerQueries interface {
 	// SeedSharedSkillAllocationByName seeds ONE default allocation row, called
 	// once per target template so a miss can name which template was absent.
 	SeedSharedSkillAllocationByName(ctx context.Context, arg SeedSharedSkillAllocationByNameParams) (int64, error)
+}
+
+// BuiltinSkillTxer runs one builtin's insert AND its default-allocation seeds in
+// a single transaction.
+//
+// Without it the two are separate autocommit statements, and the gap between them
+// loses the default PERMANENTLY: the insert commits (n=1), the seed errors, the
+// reconciler returns and boot aborts — but the skill row is already there, so the
+// next boot sees n=0, skips the seed, and the builtin ships unallocated forever.
+// That end state is precisely the bug M2 exists to fix (a builtin that reaches
+// nobody), re-created through a different door.
+//
+// A retry cannot repair it, which is why atomicity is the only clean fix: a later
+// pass cannot distinguish "the seed never ran" from "an admin removed the
+// default", and Decision 9 turns on exactly that distinction. Note this also
+// reaches the same end state the TemplatesReconciled token prevents, by a route
+// the token does not cover.
+type BuiltinSkillTxer interface {
+	InTx(ctx context.Context, fn func(q builtinSkillReconcilerQueries) error) error
+}
+
+// PoolTxer is the production BuiltinSkillTxer: a real transaction per call.
+type PoolTxer struct {
+	Pool *pgxpool.Pool
+	Q    *Queries
+}
+
+// InTx runs fn inside one transaction, committing only if fn returns nil. The
+// rollback is deferred, so a panic inside fn also unwinds the insert.
+func (p PoolTxer) InTx(ctx context.Context, fn func(q builtinSkillReconcilerQueries) error) error {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
+	if err := fn(p.Q.WithTx(tx)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 // TemplatesReconciled is proof that ReconcileBuiltinTemplates has already run.
@@ -51,50 +95,68 @@ type TemplatesReconciled struct{ done bool }
 // not an `is_builtin` flag, and the reconciler keys on (name, scope='builtin')
 // via uq_skills_shared_name. A builtin and a global therefore can never share a
 // name — intended, not a bug to "fix".
-func ReconcileBuiltinSkills(ctx context.Context, q builtinSkillReconcilerQueries, templates TemplatesReconciled) error {
+func ReconcileBuiltinSkills(ctx context.Context, db BuiltinSkillTxer, templates TemplatesReconciled) error {
 	if !templates.done {
 		return fmt.Errorf("reconcile builtin skills: agent templates have not been reconciled yet " +
 			"(default skill allocations resolve agent templates by name and would silently seed nothing)")
 	}
 	var inserted, allocated int
 	for _, def := range skilltmpl.Builtins() {
-		n, err := q.InsertBuiltinSkill(ctx, InsertBuiltinSkillParams{
-			Name:        def.Name,
-			Description: def.Description,
-			Body:        def.Body,
+		// ONE transaction per builtin: the insert and its seeds are a single fact.
+		// Per-builtin rather than one transaction for the whole loop, because the
+		// builtins are independent — one skill's failure should not roll back
+		// another's successful seed.
+		err := db.InTx(ctx, func(q builtinSkillReconcilerQueries) error {
+			n, err := q.InsertBuiltinSkill(ctx, InsertBuiltinSkillParams{
+				Name:        def.Name,
+				Description: def.Description,
+				Body:        def.Body,
+			})
+			if err != nil {
+				return fmt.Errorf("insert builtin skill %q: %w", def.Name, err)
+			}
+			if n > 0 {
+				// A newly-inserted builtin gets its default allocations (PRD #72 M2).
+				// Seeded HERE, not on every boot, so a default an admin later removes
+				// stays removed — the same gate ReconcileBuiltinTemplates applies, and
+				// the reason `ci-cd-norms` needs migration 00083 instead: its row
+				// already exists on every live instance, so n is 0 there forever.
+				for _, tmpl := range skilltmpl.DefaultAllocationsFor(def.Name) {
+					rows, err := q.SeedSharedSkillAllocationByName(ctx, SeedSharedSkillAllocationByNameParams{
+						SkillName:    def.Name,
+						TemplateName: tmpl,
+					})
+					if err != nil {
+						// Returning here rolls the INSERT back too, so the next boot
+						// sees n=1 again and retries the whole thing. That is the
+						// entire point of the transaction.
+						return fmt.Errorf("seed default allocation of skill %q to template %q: %w", def.Name, tmpl, err)
+					}
+					if rows == 0 {
+						// The seed targets a row it did not insert, so unlike the
+						// template analogue it CAN miss without erroring. No allocation
+						// for this skill can pre-exist (its row was just created, and
+						// skill_id is an FK), so 0 is never "already there" — the named
+						// agent template is absent, and this builtin is now shipping
+						// without the default it declares.
+						//
+						// NOT an error: a missing template is an operator/authoring
+						// problem, not a transient fault, so rolling the skill back
+						// and refusing to boot would be worse than shipping the skill
+						// unallocated and saying so loudly.
+						slog.Warn("builtin skill default allocation seeded no row; the agent template is missing",
+							"skill", def.Name, "template", tmpl)
+						continue
+					}
+					allocated += int(rows)
+				}
+			}
+			inserted += int(n)
+			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("insert builtin skill %q: %w", def.Name, err)
+			return err
 		}
-		if n > 0 {
-			// A newly-inserted builtin gets its default allocations (PRD #72 M2).
-			// Seeded HERE, not on every boot, so a default an admin later removes
-			// stays removed — the same gate ReconcileBuiltinTemplates applies, and
-			// the reason `ci-cd-norms` needs migration 00083 instead: its row
-			// already exists on every live instance, so n is 0 there forever.
-			for _, tmpl := range skilltmpl.DefaultAllocationsFor(def.Name) {
-				rows, err := q.SeedSharedSkillAllocationByName(ctx, SeedSharedSkillAllocationByNameParams{
-					SkillName:    def.Name,
-					TemplateName: tmpl,
-				})
-				if err != nil {
-					return fmt.Errorf("seed default allocation of skill %q to template %q: %w", def.Name, tmpl, err)
-				}
-				if rows == 0 {
-					// The seed targets a row it did not insert, so unlike the
-					// template analogue it CAN miss without erroring. No allocation
-					// for this skill can pre-exist (its row was just created, and
-					// skill_id is an FK), so 0 is never "already there" — the named
-					// agent template is absent, and this builtin is now shipping
-					// without the default it declares.
-					slog.Warn("builtin skill default allocation seeded no row; the agent template is missing",
-						"skill", def.Name, "template", tmpl)
-					continue
-				}
-				allocated += int(rows)
-			}
-		}
-		inserted += int(n)
 	}
 	slog.Info("reconciled builtin skills",
 		"builtins", len(skilltmpl.Builtins()), "inserted", inserted, "allocations_seeded", allocated)

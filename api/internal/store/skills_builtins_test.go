@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/skilltmpl"
 )
@@ -24,6 +27,26 @@ type skillReconcilerFake struct {
 	inserted         []string
 	seeded           []string // "skill->template" for each seed that inserted a row
 	attempted        []string // "skill->template" for every seed CALL, hit or miss
+	// Transaction bookkeeping. committed records the names that survived a
+	// COMMIT, as opposed to inserted, which records every attempt — the
+	// difference is the whole point of the atomicity fix.
+	committed []string
+	rollbacks int
+}
+
+// InTx mimics PoolTxer: run fn, and only publish its effects if it returns nil.
+// `inserted` is written by fn (the "uncommitted" view); `committed` is the
+// durable one, so a test can tell the two apart.
+func (f *skillReconcilerFake) InTx(ctx context.Context, fn func(q builtinSkillReconcilerQueries) error) error {
+	before := len(f.inserted)
+	if err := fn(f); err != nil {
+		// Roll back: discard everything fn appended in this transaction.
+		f.inserted = f.inserted[:before]
+		f.rollbacks++
+		return err
+	}
+	f.committed = append(f.committed, f.inserted[before:]...)
+	return nil
 }
 
 func (f *skillReconcilerFake) InsertBuiltinSkill(_ context.Context, arg InsertBuiltinSkillParams) (int64, error) {
@@ -166,6 +189,45 @@ func TestReconcileSkillsFailsOnSeedError(t *testing.T) {
 	}
 }
 
+func TestReconcileSkillsRollsTheInsertBackWhenTheSeedFails(t *testing.T) {
+	// The atomicity requirement, and the reason it is not a nice-to-have: with
+	// separate autocommit statements the insert survives, so the NEXT boot sees
+	// n=0, skips the seed, and the builtin ships permanently unallocated — which
+	// is exactly the bug M2 exists to fix, re-created through another door. A
+	// retry cannot repair it either, because no later pass can tell "never
+	// seeded" from "admin removed the default", the distinction Decision 9 turns
+	// on. So the insert must not outlive its failed seed.
+	name, _ := firstSkillWithDefaults(t)
+	fake := &skillReconcilerFake{seedErr: errors.New("connection reset")}
+	if err := ReconcileBuiltinSkills(context.Background(), fake, reconciled); err == nil {
+		t.Fatal("expected the reconcile to fail")
+	}
+	if fake.rollbacks == 0 {
+		t.Error("expected the failing builtin's transaction to roll back")
+	}
+	for _, got := range fake.committed {
+		if got == name {
+			t.Errorf("skill %q was COMMITTED despite its seed failing; the next boot would see n=0 "+
+				"and never seed the default again", name)
+		}
+	}
+}
+
+func TestReconcileSkillsCommitsEachBuiltinSeparately(t *testing.T) {
+	// One transaction PER builtin, not one for the loop: the builtins are
+	// independent, so a healthy one must not be rolled back by a sibling.
+	fake := &skillReconcilerFake{}
+	if err := ReconcileBuiltinSkills(context.Background(), fake, reconciled); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(fake.committed) != len(skilltmpl.Builtins()) {
+		t.Errorf("expected every builtin committed on its own; committed=%v", fake.committed)
+	}
+	if fake.rollbacks != 0 {
+		t.Errorf("a clean reconcile must not roll anything back; got %d", fake.rollbacks)
+	}
+}
+
 func TestReconcileSkillsRefusesAZeroOrderingToken(t *testing.T) {
 	// The compile-time dependency (main.go cannot call this without a token
 	// ReconcileBuiltinTemplates produced) leaves exactly one hole: passing the zero
@@ -207,4 +269,73 @@ func countString(hay []string, needle string) int {
 		}
 	}
 	return n
+}
+
+// TestPoolTxerRollsBackOnErrorLiveDB proves the REAL transaction, which the fake
+// above cannot: skillReconcilerFake implements the InTx contract by construction,
+// so it would stay green against a PoolTxer that forgot to roll back. This drives
+// the shipped implementation against a live database.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestPoolTxerRollsBackOnErrorLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	txer := PoolTxer{Pool: pool, Q: New(pool)}
+
+	name := "txer-skill-" + uuid.NewString()[:8]
+	insert := func(q builtinSkillReconcilerQueries) (int64, error) {
+		return q.InsertBuiltinSkill(ctx, InsertBuiltinSkillParams{
+			Name: name, Description: "rollback probe.", Body: "# body\n",
+		})
+	}
+	exists := func() bool {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM skills WHERE name = $1`, name).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n > 0
+	}
+
+	// fn errors AFTER a successful insert — the exact shape of a seed failing on a
+	// freshly-inserted builtin.
+	boom := errors.New("seed blew up")
+	err = txer.InTx(ctx, func(q builtinSkillReconcilerQueries) error {
+		if n, iErr := insert(q); iErr != nil || n != 1 {
+			t.Fatalf("probe insert: n=%d err=%v", n, iErr)
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("InTx must surface fn's error verbatim; got %v", err)
+	}
+	if exists() {
+		t.Fatal("the insert SURVIVED a failed transaction: the next boot would see n=0 and never seed the default")
+	}
+
+	// The positive control: without it, an InTx that rolled back unconditionally
+	// (or never inserted at all) would also pass the assertion above.
+	if err := txer.InTx(ctx, func(q builtinSkillReconcilerQueries) error {
+		n, iErr := insert(q)
+		if iErr != nil || n != 1 {
+			t.Fatalf("probe insert: n=%d err=%v", n, iErr)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("clean InTx: %v", err)
+	}
+	if !exists() {
+		t.Fatal("a committed transaction must persist the insert")
+	}
 }

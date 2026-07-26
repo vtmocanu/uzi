@@ -220,6 +220,19 @@ func TestBuiltinSkillAllocationBackfillIsIdempotentLiveDB(t *testing.T) {
 			`INSERT INTO agent_templates (id, name, description, prompt_body, scope) VALUES ($1, $2, 'd', 'b', 'global')`,
 			uuid.New(), name)
 	}
+	// The adversarial row for the TEMPLATE axis. Without it this fixture holds only
+	// `global` templates, so `t.name IN (…)` alone already selects every row and the
+	// `t.scope <> 'user'` guard is UNOBSERVABLE — deleting it from the migration
+	// leaves this test green (measured by the auditor).
+	//
+	// The asymmetry is the lesson, not the patch: the same test DID pin the sibling
+	// s.scope guard, because the fixture above carries a private same-name skill.
+	// One axis got the adversarial row and the other did not, and nothing in the
+	// test's name, shape, or green result distinguished them. A compound predicate
+	// needs one hostile row PER conjunct.
+	mustExec(ctx, t, pool,
+		`INSERT INTO agent_templates (id, name, description, prompt_body, scope, user_id) VALUES ($1, $2, 'd', 'b', 'user', $3)`,
+		uuid.New(), tmplA, owner)
 
 	// The REAL statement, with the shipped literals swapped for this fixture's
 	// names. Every substitution is verified, so a rename in the migration fails

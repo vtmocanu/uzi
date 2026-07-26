@@ -126,7 +126,7 @@ func run() error {
 	// Same for the builtin agent skills (PRD #16): missing builtin skills are
 	// inserted, admin edits survive restarts. Newly-inserted builtins also get
 	// their default shared allocations (PRD #72 M2).
-	if err := store.ReconcileBuiltinSkills(ctx, q, templatesDone); err != nil {
+	if err := store.ReconcileBuiltinSkills(ctx, store.PoolTxer{Pool: pool, Q: q}, templatesDone); err != nil {
 		return err
 	}
 
