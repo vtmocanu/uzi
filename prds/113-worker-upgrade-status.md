@@ -242,6 +242,27 @@ nav item** gains an alert badge = the count of workers needing attention.
     sanitized (it reaches a terminal via `api/cmd/uzi/worker.go`), and the entry count
     is explicitly capped (a 1 MiB body bounds bytes, not upserts).
 
+    **AMENDED AGAIN 2026-07-26 (third time), and the claim is STILL not "a wrong badge".**
+    MEASURED at `0f30ab07`: the INV-5 ceiling gates the *phase* assertions
+    (`upgrade.go:351,354`) but **not** the target assignment at `:347`, which is gated only
+    on freshness and SemVer validity. So a compromised controller need not lie about phase
+    at all: it reports `worker_image_tag` equal to the fleet's stale versions with
+    `phase = "settled"`, the compare comes out equal, and **every hosted worker reads
+    `up_to_date` indefinitely.** Same fleet-wide suppression MH-5/INV-5 exists to prevent,
+    reached by a different route, and **strictly worse** — `upgrading` at least renders a
+    badge, `up_to_date` renders nothing.
+    **Why it is not simply fixed:** Decision 9 exists *because* `values.yaml` may
+    legitimately pin `workers.image.tag` below the api's release, so from the api's side a
+    legitimate pin and this attack are indistinguishable. A monotonic floor would turn a
+    supported operation into a manual one.
+    **Resolution (v1): keep Decision 9's behaviour exactly and make the divergence
+    OBSERVABLE.** When the controller-reported tag is below the control plane's own version,
+    the Fleet panel says so — converting a silent suppression into a visible one, the same
+    move MH-13b made for parked pods, without removing a supported operation.
+    **So the honest form of this decision is: a lying controller cannot change api state and
+    cannot hide indefinitely, but it CAN suppress alerts for as long as nobody reads the
+    fleet panel.** Anything stronger requires taking away the pin.
+
 ## Touchpoints
 
 - **agent**: retire the frozen default (`agent/src/config.ts:239`); CI build-arg
