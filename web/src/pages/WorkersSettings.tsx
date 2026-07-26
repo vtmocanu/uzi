@@ -328,7 +328,7 @@ export function WorkersSettings() {
           />
         ) : (
           <>
-            <FleetUpgradePanel workers={workers} cpVersion={cpVersion ?? ""} />
+            <FleetUpgradePanel workers={workers} cpVersion={cpVersion} />
             <ul className="space-y-2">
             {workers.map((w) => (
               <li

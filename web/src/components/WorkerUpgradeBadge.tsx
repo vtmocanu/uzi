@@ -1,7 +1,17 @@
+import { useState } from "react";
 import type { Worker } from "../lib/api";
 
 /**
  * Per-worker upgrade badge and the Fleet upgrade summary (PRD #113 M5).
+ *
+ * ⚠ ONLY USE COLOUR TOKENS THAT EXIST IN tailwind.config.js. This file shipped with
+ * `accent`, `hair` and `base`, none of which are defined — the JIT scanned them and emitted
+ * NOTHING, so the classes were inert in every theme (the defect is the config, not the CSS
+ * variables, so no theme switch reveals it). Measured in a browser: the `upgrading` bar
+ * segment laid out at its full percentage width with a transparent background, painting a
+ * visible HOLE between the green and amber segments while the legend below counted it. The
+ * real tokens are `info`, `edge`, `ink`. jsdom cannot catch this class of bug — a class name
+ * is present and correct as a string either way.
  *
  * Everything here is derived from the workers list the page already fetches. There is
  * deliberately NO second read path: the roll-health table carries no `user_id`, so it is
@@ -35,7 +45,7 @@ const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone
 const TONE_CLASS: Record<Tone, string> = {
   alert: "border-danger/40 bg-danger/10 text-danger",
   warn: "border-warn/40 bg-warn/10 text-warn",
-  info: "border-accent/40 bg-accent/10 text-accent",
+  info: "border-info/40 bg-info/10 text-info",
   ok: "border-ok/40 bg-ok/10 text-ok",
 };
 
@@ -149,6 +159,10 @@ export function diagnosticsCommand(workerId: string): string {
  * `upgrade_failed` — there is no pod to inspect for a worker that is merely behind.
  */
 export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
+  // Copy feedback. Without it the button gives NO signal at all, so a reader cannot tell a
+  // successful copy from a no-op clipboard — and this command is the one thing they are
+  // meant to carry to a terminal.
+  const [copied, setCopied] = useState(false);
   if (!needsAttention(worker)) return null;
   const failed = worker.upgrade_status === "upgrade_failed";
   const cause = failed
@@ -169,15 +183,22 @@ export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              className="rounded border border-hair px-1.5 py-0.5 text-faint hover:text-fg"
-              onClick={() => void navigator.clipboard?.writeText(diagnosticsCommand(worker.id))}
+              className="rounded border border-edge px-1.5 py-0.5 text-faint hover:text-fg"
+              onClick={() => {
+                void navigator.clipboard?.writeText(diagnosticsCommand(worker.id));
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 2000);
+              }}
+              aria-live="polite"
             >
-              Copy kubectl command
+              {copied ? "Copied" : "Copy kubectl command"}
             </button>
-            {/* NOT truncated. `-n <worker-namespace>` is the PREFIX, so clipping would
-                hide exactly the part the reader has to replace — handing them a command
-                that looks complete and resolves the wrong namespace, or none. Wrapping is
-                the lesser evil for a string meant to be read and edited. */}
+            {/* NOT truncated, and the reason is the opposite of what this comment first
+                claimed. `text-overflow: ellipsis` elides the TAIL, so the placeholder
+                survives and the WORKER ID is what disappears — measured at 420px. That is
+                worse than losing the prefix: a reader who cannot see the id has no way to
+                tell which worker the command is even for, and the visible part looks
+                complete. Wrapping keeps both halves. */}
             <code className="break-all text-faint">{diagnosticsCommand(worker.id)}</code>
           </div>
           {/* The substitution instruction. Without it the placeholder is a trap: a user
@@ -199,10 +220,17 @@ export type FleetSummary = {
   counts: Record<Worker["upgrade_status"], number>;
   attention: number;
   /**
-   * The coordinate hosted workers are being rolled to, when it differs from the control
-   * plane's own version. Non-null is NOT an error — see the panel copy.
+   * Hosted workers whose target differs from the control plane's version. Non-empty is NOT
+   * an error — see the panel copy.
+   *
+   * A COUNT plus the distinct targets, not "the divergent target", because a partial pin is
+   * a real fleet state: keeping only the last one in list order and stating it categorically
+   * said "hosted workers target v0.4.1" on a screen that also showed a hosted worker badged
+   * up to date against v0.4.2. The suppression scenario this line exists for has UNIFORM
+   * targets, so it still names them; a mixed fleet gets a count instead of a false claim.
    */
-  divergentTarget: string | null;
+  divergentCount: number;
+  divergentTargets: string[];
 };
 
 /**
@@ -219,7 +247,8 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
     unknown: 0,
   };
   let attention = 0;
-  let divergentTarget: string | null = null;
+  let divergentCount = 0;
+  const divergentTargets = new Set<string>();
   for (const w of workers) {
     counts[w.upgrade_status] = (counts[w.upgrade_status] ?? 0) + 1;
     if (needsAttention(w)) attention++;
@@ -228,32 +257,53 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
     // alerts. The api cannot distinguish those (Decision 9 requires honouring the tag),
     // so the divergence is stated rather than judged.
     if (w.kind === "hosted" && w.upgrade_target && cpVersion && w.upgrade_target !== cpVersion) {
-      divergentTarget = w.upgrade_target;
+      divergentCount++;
+      divergentTargets.add(w.upgrade_target);
     }
   }
-  return { counts, attention, divergentTarget };
+  return { counts, attention, divergentCount, divergentTargets: [...divergentTargets] };
 }
 
-export function FleetUpgradePanel({ workers, cpVersion }: { workers: Worker[]; cpVersion: string }) {
-  const { counts, attention, divergentTarget } = fleetSummary(workers, cpVersion);
+export function FleetUpgradePanel({
+  workers,
+  cpVersion,
+}: {
+  workers: Worker[];
+  // null while GET /api/version is still in flight; "" once it resolved with no stamp. The
+  // DISTINCTION matters: they were conflated, and because the version fetch loses the race
+  // with the workers load by ~400ms, the panel rendered a full bar and five badges under a
+  // heading that said "no release stamp — classification off". Measured at T+270ms, flipping
+  // at T+670ms. Self-contradictory copy on every first paint, and structural rather than a
+  // demo artifact.
+  cpVersion: string | null;
+}) {
+  const { counts, attention, divergentCount, divergentTargets } = fleetSummary(workers, cpVersion ?? "");
+  const versionPending = cpVersion === null;
   const classified = workers.length - counts.unknown;
   if (workers.length === 0) return null;
 
   const segments: { key: Worker["upgrade_status"]; cls: string }[] = [
     { key: "up_to_date", cls: "bg-ok" },
-    { key: "upgrading", cls: "bg-accent" },
+    { key: "upgrading", cls: "bg-info" },
     { key: "outdated", cls: "bg-warn" },
     { key: "upgrade_failed", cls: "bg-danger" },
   ];
 
   return (
-    <section className="mb-4 rounded border border-hair bg-raised p-3" aria-labelledby="fleet-upgrade-heading">
+    <section className="mb-4 rounded border border-edge bg-raised p-3" aria-labelledby="fleet-upgrade-heading">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 id="fleet-upgrade-heading" className="text-sm font-medium text-fg">
           Fleet upgrade
         </h3>
         <span className="text-xs text-faint">
-          {cpVersion ? <>target release v{cpVersion}</> : <>no release stamp — classification off</>}
+          {versionPending ? (
+            // Say nothing rather than assert either state while the answer is in flight.
+            <>&nbsp;</>
+          ) : cpVersion ? (
+            <>target release v{cpVersion}</>
+          ) : (
+            <>no release stamp — classification off</>
+          )}
         </span>
       </div>
 
@@ -262,16 +312,27 @@ export function FleetUpgradePanel({ workers, cpVersion }: { workers: Worker[]; c
           compromised controller would suppress every alert in the fleet by reporting the
           fleet's own stale version as the target. A reader who pinned deliberately sees
           their pin confirmed; a reader who did not sees something to investigate. */}
-      {divergentTarget && (
-        <p className="mt-2 rounded border border-hair bg-base p-2 text-xs text-faint">
-          Hosted workers target <span className="text-fg">v{divergentTarget}</span>, not the control plane&rsquo;s{" "}
-          <span className="text-fg">v{cpVersion}</span>. Hosted workers are compared against the tag the controller
-          reports rolling to, so a pinned worker image reads as up to date at that tag.
+      {divergentCount > 0 && (
+        <p className="mt-2 rounded border border-edge bg-ink p-2 text-xs text-faint">
+          {divergentTargets.length === 1 ? (
+            <>
+              {divergentCount === 1 ? "One hosted worker targets" : `${divergentCount} hosted workers target`}{" "}
+              <span className="text-fg">v{divergentTargets[0]}</span>, not the control plane&rsquo;s{" "}
+              <span className="text-fg">v{cpVersion}</span>.
+            </>
+          ) : (
+            <>
+              {divergentCount} hosted workers target a pinned tag below the control plane&rsquo;s{" "}
+              <span className="text-fg">v{cpVersion}</span>.
+            </>
+          )}{" "}
+          A hosted worker is compared against the tag the controller reports rolling to, so a pinned image reads as up
+          to date at that tag. Each row shows its own target.
         </p>
       )}
 
       {classified > 0 && (
-        <div className="mt-2 flex h-1.5 overflow-hidden rounded bg-base" role="presentation">
+        <div className="mt-2 flex h-1.5 overflow-hidden rounded bg-ink" role="presentation">
           {segments.map(({ key, cls }) =>
             counts[key] > 0 ? (
               <div key={key} className={cls} style={{ width: `${(counts[key] / classified) * 100}%` }} />

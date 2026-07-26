@@ -170,7 +170,10 @@ function NavItem({
           aria-label={alert ? `${badge} needing attention` : `${badge} unread`}
           className={cx(
             "ml-auto min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none",
-            alert ? "bg-danger text-white" : "bg-brand text-on-brand",
+            // text-on-brand, NOT text-white: measured 2.69:1 for white on bg-danger at 10px/600
+            // against 8.27:1 for the Notifications and Judge badges. The badge whose entire
+            // purpose is to be noticed mid-incident was the only sidebar badge failing AA.
+            alert ? "bg-danger text-on-brand" : "bg-brand text-on-brand",
           )}
         >
           {badge > 99 ? "99+" : badge}

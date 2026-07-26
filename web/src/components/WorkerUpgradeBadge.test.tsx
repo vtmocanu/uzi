@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { Worker } from "../lib/api";
+// ?raw rather than node:fs — the web tsconfig has no node types, and adding @types/node to
+// widen a browser project's type surface for one test would be a poor trade. Vite inlines
+// these at build time, so the assertion runs against the real files in both tsc and vitest.
+import tailwindConfigSource from "../../tailwind.config.js?raw";
+import componentSource from "./WorkerUpgradeBadge.tsx?raw";
 import {
   FleetUpgradePanel,
   WorkerUpgradeBadge,
@@ -279,5 +284,82 @@ describe("diagnosticsCommand", () => {
     // The namespace is a visible placeholder, not a guess: a docker-tier worker lives in
     // a different namespace and naming the wrong one fails like a missing worker.
     expect(cmd).toContain("<worker-namespace>");
+  });
+});
+
+// BLK-1 — every colour class this component emits must EXIST in tailwind.config.js.
+//
+// jsdom cannot catch a phantom token: `bg-accent` is a present, correct-looking string
+// whether or not the JIT emitted a rule for it. This test reads the config and checks the
+// tokens, which is the cheapest thing that can fail — the browser pass found the real
+// consequence (the `upgrading` bar segment laid out at full width painting NOTHING, a
+// visible hole between segments while the legend counted it).
+describe("colour tokens exist in the Tailwind config (BLK-1)", () => {
+  it("emits no class naming a token the config does not define", () => {
+    // Only the code, not the comments — the header deliberately NAMES the dead tokens so
+    // nobody reintroduces them, and matching those would make this test unfixable.
+    const config = tailwindConfigSource;
+    const code = componentSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    const used = new Set<string>();
+    for (const m of code.matchAll(/\b(?:bg|text|border)-([a-z][a-z-]*)(?:\/\d+)?\b/g)) {
+      used.add(m[1]);
+    }
+    // Tailwind's own always-available colour names, plus the non-colour utilities that
+    // share the `text-` prefix (font sizes and alignment). Excluding those by name rather
+    // than by pattern keeps the check tight: a genuinely missing colour token cannot hide
+    // behind a loose exclusion.
+    const builtin = new Set([
+      "white", "black", "transparent", "current", "inherit",
+      "xs", "sm", "lg", "xl", "2xl", "3xl", "left", "right", "center", "justify",
+    ]);
+    const missing = [...used].filter((t) => !builtin.has(t) && !new RegExp(`["']?${t}["']?\\s*:`).test(config));
+    expect(missing).toEqual([]);
+  });
+});
+
+// BLK-2 — a mixed fleet must never be described categorically.
+describe("the divergence line on a MIXED fleet (BLK-2)", () => {
+  const hosted = (id: string, target: string) =>
+    aWorker({ id, kind: "hosted", upgrade_target: target, upgrade_status: "up_to_date" });
+
+  it("names the target when every divergent worker shares one", () => {
+    render(<FleetUpgradePanel workers={[hosted("a", "0.11.0"), hosted("b", "0.11.0")]} cpVersion="0.11.7" />);
+    const line = screen.getByText(/not the control plane/).closest("p") as HTMLElement;
+    expect(within(line).getByText("v0.11.0")).toBeTruthy();
+    expect(line.textContent).toContain("2 hosted workers target");
+  });
+
+  it("states a COUNT instead of a target when the fleet is partially pinned", () => {
+    // The demo's own state, and the one the old code lied about: it kept the LAST divergent
+    // target in list order and asserted "hosted workers target v0.11.0" on a screen that
+    // also showed a hosted worker up to date against 0.11.7.
+    render(
+      <FleetUpgradePanel
+        workers={[hosted("a", "0.11.0"), hosted("b", "0.11.5"), hosted("c", "0.11.7")]}
+        cpVersion="0.11.7"
+      />,
+    );
+    const line = screen.getByText(/pinned tag below/).closest("p") as HTMLElement;
+    expect(line.textContent).toContain("2 hosted workers");
+    // No single target may be named, because no single target is true of all of them.
+    expect(within(line).queryByText("v0.11.0")).toBeNull();
+    expect(within(line).queryByText("v0.11.5")).toBeNull();
+  });
+
+  it("says nothing while the control-plane version is still in flight", () => {
+    // Previously the panel rendered a full bar and badges under "classification off",
+    // because the version fetch loses the race with the workers load by ~400ms.
+    render(<FleetUpgradePanel workers={[hosted("a", "0.11.0")]} cpVersion={null} />);
+    expect(screen.queryByText(/classification off/)).toBeNull();
+    expect(screen.queryByText(/target release/)).toBeNull();
+  });
+});
+
+describe("copy feedback", () => {
+  it("confirms the copy rather than leaving the reader guessing", async () => {
+    render(<WorkerUpgradeDetail worker={aWorker({ upgrade_status: "upgrade_failed" })} />);
+    const btn = screen.getByRole("button", { name: /copy kubectl/i });
+    fireEvent.click(btn);
+    expect(await screen.findByRole("button", { name: /copied/i })).toBeTruthy();
   });
 });
