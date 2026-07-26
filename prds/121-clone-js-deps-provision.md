@@ -85,14 +85,14 @@ Three coherent parts (the same judge reviews flagged all three):
 
 ## Implementation Milestones
 
-- [ ] **M1 — Generalized dependency discovery + install (extract from
+- [x] **M1 — Generalized dependency discovery + install (extract from
   `prepareCheckDeps`).** A package-manager-aware, lockfile-driven installer that
   discovers JS project dirs in a clone (bounded), runs the **frozen `--ignore-scripts`
   install** (unchanged from `prepareCheckDeps` — a pure relocation, no flag change)
   under the runner uid + scrubbed env, and returns per-dir install/skip results. Unit
   tests over fixture clones (npm/pnpm/yarn/bun, monorepo workspaces, no-lockfile,
   install-failure → honest skip).
-- [ ] **M2 — Pre-agent provisioning at the right lifecycle point, with defined join
+- [x] **M2 — Pre-agent provisioning at the right lifecycle point, with defined join
   semantics.** Call the M1 installer inside the executor **after `provisionRunTools`
   (`sdk-executor.ts:240`) and before the plan turn (`:266`)** — NOT at `runner.ts:~210`,
   which predates `toolEnv` and would use the image's npm instead of the run's
@@ -135,10 +135,31 @@ Three coherent parts (the same judge reviews flagged all three):
   declares, track whether each actually ran, and annotate the MR / downgrade the
   delivery to "unverified" when they didn't. Given the cost, consider shipping M1–M3
   first and splitting M4 into its own increment/PRD.
+
+  **→ SPLIT OUT 2026-07-26**, taking the option this bullet offers. Not deferred for
+  cost: **M4's own premise is unmeasured.** It is the safety net for runs where the
+  install genuinely cannot happen, and nobody knows how large that residual is until M5
+  runs against real traffic — building the net before measuring the fall is the wrong
+  order. It also turns on a *product* decision rather than a design one (reliable gate
+  extraction needs `submit_plan` to gain a structured `gates` field, which changes **what
+  a human approves at the plan gate**), and it touches the exact `sdk-executor.ts` and
+  `runner.ts` regions M2 restructured. Free-text extraction was assessed and **rejected in
+  both directions**: it harvests `git checkout -b` out of fenced blocks as a "gate" (false
+  banners, and reviewers learn to ignore a banner that cries wolf — which destroys the only
+  thing M4 ships), and it yields zero gates from "I'll run the repo's test suites", passing
+  **vacuously** — the precise failure M4 exists to prevent. Full design preserved for the
+  follow-up increment.
 - [ ] **M5 — Verified on a real JS run.** A run touching `web/` completes with the
   agent never hitting `command not found` for a gate tool and never running a
   manual `npm ci`; the judge pre-scan no longer false-flags tsc/vitest. Capture
   the evidence (activity log / review).
+
+  **→ POST-DEPLOY, and not completable in the increment that writes the code.** It needs
+  the `agent/` changes built into the worker image and deployed: merge → `v*` tag → Harbor
+  publish → ArgoCD sync to dev-cluster. **Do not tick this from unit tests.** Discovery
+  finding the right dirs and the install succeeding under the runner uid with the scrubbed
+  env are different claims, and only the second one is M5. A live uzi instance is reachable
+  via the `uzi` CLI, so the verification itself is cheap once deployed.
 - [ ] **M6 — Docs.** Update the relevant docs/specs (`specs/ai.md` design note per
   repo convention; `CLAUDE.md`/`ARCHITECTURE.md` if the run lifecycle description
   needs it).
