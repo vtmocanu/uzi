@@ -138,9 +138,16 @@ and, once the field name is frozen by M1's contract, can proceed in parallel.
   any PRD-#40 usage doc gains a one-line note. `npm run build` (check-docs)
   green.
   - **The docs half was a genuine no-op**, not a skip: no page under `docs/`
-    documents PRD #40's usage panel at all (the only `per-agent` hit is
-    `docs/cli.md:245`, about steering being run-level). There was nothing to add
-    a line to, and this PRD's Touchpoints already said "No new doc page".
+    documents PRD #40's usage panel at all — the `per-agent` hits in `docs/` are
+    `docs/cli.md` (steering being run-level) and `docs/repo-agents.md`, neither
+    about usage. There was nothing to add a line to, and this PRD's Touchpoints
+    already said "No new doc page".
+  - **Caveat on M3's "full suites green".** The web suite is green outright
+    (1064/1064). The agent suite is 866/869 with two failures that are
+    environmental and pre-existing — `agent-browser-shim` (no chromium resolves
+    in the sandbox, exit 127) and `git.test.ts`'s hooks-dir assertion (the image
+    bakes the root-owned path this sandbox has) — both reproduced unchanged at
+    the parent commit, in files this work does not touch.
 
 ## Out of Scope
 
@@ -176,15 +183,19 @@ All three validation legs were actually run, not asserted:
   reading the source: strip `claude-opus-4-8`; rows lead/reviewer
   `claude-opus-4-8`, coder `claude-sonnet-5`; total row `2 models`. Column
   position, left alignment, monospace face and the dim step all match the mock.
+  (The demo run's init frame was moved `claude-sonnet-4-6` → `claude-opus-4-8`
+  as part of this work: the strip IS the lead's model, and leaving it as sonnet
+  showed a strip model no agent row accounted for. Fixture data only.)
 - **Regression** — a pre-feature run renders `—` on both an agent row and the
   total row, with the strip's init model still shown and never leaking into the
   column (Decision 6), and throws nothing.
 
-Two deliberate divergences from the mock, both confirmed correct: the mock's
-brand background tint and its `NEW` header pill sit under the mock's own
-`/* ---- the NEW model column highlight ---- */` comment — they exist to point
-the approver at the diff, so they were **not** shipped. The three rules in that
-same block that ARE the design (left align, monospace, `td.model.dim`) were kept.
+Three deliberate divergences from the mock, all confirmed correct: the mock's
+brand background tint, its brand-coloured header, and its `NEW` header pill sit
+under the mock's own `/* ---- the NEW model column highlight ---- */` comment —
+they exist to point the approver at the diff, so they were **not** shipped. The
+three rules in that same block that ARE the design (left align, monospace,
+`td.model.dim`) were kept.
 
 One addition to Decision 4's implementation: `modelCounts` is a **null-prototype**
 map. The key is an untrusted model id off the wire, and with a plain `{}` a model
