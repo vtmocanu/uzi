@@ -166,12 +166,13 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 		// Only stale pods: the new one is not up yet. Same state as the gap.
 		//
 		// DELIBERATELY NOT gated on replicaFailure, unlike the pod-less branch above. The
-		// worker Deployment's strategy is Recreate, so the old pod is deleted BEFORE the
-		// new one is created — a stale pod still being present therefore means the delete
-		// is in flight and the create has not been attempted for it yet, which is a
-		// transient by construction. The permanent case (the create attempted and refused)
-		// always arrives at the pod-less branch, which is why one gate is sufficient and
-		// two would add a cry-wolf window for no coverage.
+		// worker Deployment's strategy is Recreate — MEASURED off the live spec on
+		// dev-cluster, `strategy.type: Recreate`, not merely assumed from the renderer — so
+		// the old pod is deleted BEFORE the new one is created. A stale pod still being
+		// present therefore means the delete is in flight and the create has not been
+		// attempted for it yet, which is a transient by construction. The permanent case
+		// (the create attempted and refused) always arrives at the pod-less branch, which is
+		// why one gate is sufficient and two would add a cry-wolf window for no coverage.
 		return reconcile.RollHealth{Phase: protocol.PhaseRolling}
 	}
 

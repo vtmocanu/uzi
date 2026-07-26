@@ -110,7 +110,8 @@ func TestPodlessBlockedWorkerReachesTheAttentionSet(t *testing.T) {
 }
 
 // THE RESIDUAL HALF OF #148, PINNED RATHER THAN FIXED — read this before treating the
-// issue as closed.
+// issue as closed. IT IS TRACKED AS ISSUE #151, which already carries the owner's own
+// recommendation, so this test has a known expiry date.
 //
 // MEASURED, not predicted: past MaxUpgradingWindow the INV-5 ceiling stops gating R1 as
 // well as R2, so the api stops believing the controller about a worker it is asserting is
@@ -118,17 +119,27 @@ func TestPodlessBlockedWorkerReachesTheAttentionSet(t *testing.T) {
 // `unknown` — which is not in the attention set. So the fix above alerts for
 // MaxUpgradingWindow and then goes silent again, permanently.
 //
-// Why this is not fixed here. The ceiling is owner-accepted (Decision 7 / INV-5) and it is
-// correct for R2, which SUPPRESSES `outdated`: bounding how long a controller may suppress
-// an alert is the whole reason it exists. R1 is the opposite kind of row — it RAISES an
-// alert — so applying the same bound makes the system quieter the longer a worker stays
-// broken. Splitting the two is a design call on an invariant this branch was told not to
-// weaken, and it changes what a compromised controller can do (it could then badge the
-// fleet `upgrade_failed` indefinitely, where today every claim it makes expires).
+// MEASURED ON A REAL CLUSTER TOO, which is what makes this urgent rather than theoretical
+// (#151, dev-cluster, 0.11.8): the anchor armed at 20:10:28 while the worker was pod-less
+// and nothing was yet wrong, the pod finally appeared at 20:44:18 having spent 33m50s of the
+// budget, the age arm could not fire before 20:54:18, and the ceiling expired at 20:55:28 —
+// a 70-SECOND window out of 45 minutes in which `upgrade_failed` was reachable at all. The
+// flip to `unknown` was observed 73 seconds after the correct `upgrade_failed`, while the DB
+// row still said `phase=stuck`. So the ceiling measures "how long have we believed a roll is
+// in progress" and is being read as "how long may a pod be broken before we say so"; every
+// provisioning delay is charged against the detection budget.
 //
-// Pinned so the gap is a fact in the suite rather than a surprise, and so a later fix
-// REDDENS this test deliberately instead of finding it by accident. If you are here
-// because this test failed: that is probably correct — delete it and say so.
+// Why this branch does not fix it. #151's recommendation is to drop `ceilingOK` from R1 only
+// and leave R2 gated — a one-line change in upgrade.go — on the ground that the two threats
+// are NOT symmetric: a liar asserting `upgrading` is silent and indefinite, while a liar
+// asserting `upgrade_failed` is loud and self-limiting, because an operator looks, sees
+// healthy workers and escalates about the controller. That reasoning is sound and is the
+// owner's. It is still a change to an owner-accepted invariant, made in a different issue,
+// with its own test surface (INV-5's P1/P2 properties) — so it belongs to #151, not here.
+//
+// Pinned so the gap is a fact in the suite rather than a surprise, and so #151's fix
+// REDDENS this test deliberately instead of finding it by accident. If you are here because
+// this test failed while landing #151: that is exactly right — delete it and say so.
 func TestPodlessBlockedWorkerGoesSilentAgainPastTheCeiling(t *testing.T) {
 	t0 := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
 	anchor := t0

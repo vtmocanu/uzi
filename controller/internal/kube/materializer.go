@@ -268,19 +268,50 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 }
 
 // replicaFailureReason returns the reason on a worker Deployment's ReplicaFailure
-// condition when that condition is True, and "" otherwise — including when the condition
-// is absent, which is what a healthy Deployment shows (the Deployment controller REMOVES
-// the condition on a successful sync rather than setting it False, so absence is the
-// healthy state and this must not read it as unknown).
+// condition when that condition is True, and "" otherwise.
+//
+// "" INCLUDES THE ABSENT CASE, and absence is the healthy state rather than an unknown one.
+// MEASURED BY EXPERIMENT on dev-cluster, 2026-07-26: creating the missing ServiceAccount
+// made one pod create succeed and Kubernetes REMOVED the condition outright — it did not set
+// it False. Deleting the ServiceAccount again brought it back within ~15s. So there is no
+// ConditionFalse state to handle on a real cluster, and the condition tracks CURRENT state,
+// not history.
+//
+// That non-stickiness cuts both ways and both are load-bearing:
+//
+//   - It is why this is safe. The condition cannot be a stale accusation left over from a
+//     failure that was already fixed, so `stuck` here always means "creates are failing NOW".
+//   - It is why nothing may assume the condition persists. In the genuinely broken state it
+//     was present continuously for ~32 minutes (20:10→20:42), so a controller on the 10s
+//     default cadence sees it on essentially every tick — but one successful create clears
+//     it, and the next tick correctly reports the gap instead.
 //
 // The REASON only. The condition's `message` is not returned and must not be: see the
 // pod-less branch in rollhealth.go for both halves of why (free text, and a 64-byte cap
-// downstream that would keep only its prefix).
+// downstream that keeps only its prefix — measured to be pure pod name).
 //
 // Deployment, not ReplicaSet, and that matters for RBAC: the Deployment controller copies
 // its newest ReplicaSet's ReplicaFailure condition onto the Deployment, so the signal is
 // readable from the object this controller already lists. Nothing here needs
-// `replicasets: list`.
+// `replicasets: list`. (Confirmed on the live object: the ReplicaSet carries the identical
+// condition, same reason, same message. Either would do; only one is already granted.)
+//
+// CONSIDERED AND REJECTED as the discriminator: `Progressing=False` /
+// `ProgressDeadlineExceeded`, which sits on the same object and is Kubernetes' own canonical
+// "this rollout failed" signal. It is broader — it also catches a pod that exists and never
+// becomes Ready — and its message is 94 bytes rather than 185. But MEASURED on the same
+// worker, it is LATE: absent at 20:14 and 20:42 with `Progressing=True`, and appearing only
+// once `progressDeadlineSeconds` elapsed (600 on the live spec, the k8s default). Ten minutes
+// of silence is most of what #148 is complaining about, and the arm would also fire on a
+// genuinely slow cold pull of the browser-inflated agent image. ReplicaFailure is immediate
+// and names the actual cause, so it is the primary signal.
+//
+// Adding ProgressDeadlineExceeded as a SECOND, catch-all arm is a live option and is not
+// taken here — the stall shapes it would add are already covered by the pod path's three
+// arms, so its marginal coverage is "pod-less AND no ReplicaFailure AND stalled past the
+// deadline", against a real cry-wolf cost on slow pulls. Worth noting that its 600s deadline
+// happens to equal the controller's own stuckAge; that is two independent defaults matching,
+// NOT designed coupling, and neither may be tuned on the assumption the other follows.
 func replicaFailureReason(d *appsv1.Deployment) string {
 	for i := range d.Status.Conditions {
 		c := &d.Status.Conditions[i]
