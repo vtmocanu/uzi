@@ -286,6 +286,7 @@ an instance of itself. Add rows; never write a number.)*
 | "an `init()` panic fires at boot, so it is later than the Go gate" | an `init()` is a **package-load** check — it fires during `go test` too, in every importing package |
 | "a test-only guard lets the bad map entry silently never fire" | it reddens CI on the MR that introduces it; measured by removing the panic and running the suite |
 | "the fixture rows exist, so the guard is pinned" | an inference about a mutation that was never run, drawn from a fixture that *was* read |
+| "never an unrelated entry in a Related PRDs list" | such an entry IS a link the issue carried, so a basename match repoints it — see the retraction note below, which this row is also an instance of |
 
 The last row has a sharper self-diagnosis than any of the others, from the reviewer that
 produced it: **"I checked the conjuncts of one statement and the row-inventory of another."** It
@@ -299,6 +300,31 @@ Note also how one of these travelled. *"Silently never fires"* was written by it
 retracted by that same author after measurement, and then **re-emitted by the lead from a copy
 taken before the retraction arrived**. A retraction propagates only as far as the people holding
 copies. If you correct a claim you have already sent, chase the copies.
+
+**THE INTERVAL BETWEEN WRITING A RULE AND BREAKING IT CAN BE ZERO, and the sharpest instance on
+this branch has both in the SAME COMMIT.** `53d0f222` added this entire section, including the
+sentence directly above about chasing copies — and in that same commit copied a claim out of
+`prd_link_patch.go`'s binding comment into four user-facing files: *"never an unrelated entry in a
+Related PRDs list"*. `b3c1e188` retracted it hours later as false, and `45fb222f` chased the four
+copies. So the rule and four live violations of it shipped together, authored by the same agent in
+one commit. Nothing about having just written the rule prevented it — which is the argument for
+mechanisms over care, made against the author who had just made that argument.
+
+**What actually surfaced it is the reusable part, and it was not vigilance.** The copies were found
+during a routine *"what landed since my commit"* read of `b3c1e188`'s message, done before starting
+unrelated work in the same tree. That read is cheap, it is owed anyway on a moving tree, and it is
+the only reason a stale claim in four shipped files did not survive to the MR. **Read the commits
+that landed under you, not just the diff of the file you are about to touch.**
+
+**And "chase the copies" does NOT mean "paste the same correction".** The four sites needed four
+different answers, because a correction inherits the audience of the page it lands on, not the
+wording of the retraction: an orientation page took the simple true statement with no residual; the
+page whose whole subject is unattended behaviour took the residual in full; a changelog entry needed
+the bound restated from the reader's side (*"a run cannot introduce a link, not that it cannot pick
+among the ones already there"*); a fourth site was already the weaker correct form and needed only
+the residual appended. A fifth carried a *different*, narrower claim that the retraction did not
+touch, and correctly changed nothing — **a mechanical sweep would have "fixed" it into being wrong**,
+which is the `grep`-then-classify rule from the citing section arriving here from the other end.
 
 **⚑ The unifying error is treating a null result as an observation of the world when it is an
 observation of your instrument.** A grep that finds nothing tells you about your pattern. A test
