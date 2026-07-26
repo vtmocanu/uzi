@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantUsageOf, orphanInstanceKind } from "../src/sdk-messages.js";
+import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantModelOf, assistantUsageOf, orphanInstanceKind } from "../src/sdk-messages.js";
 
 // SDK stream events → run_messages (kinds + agent attribution). Built with
 // hand-rolled SDK-shaped objects; no live session.
@@ -206,6 +206,37 @@ describe("assistantUsageOf (PRD #40 Decision 11)", () => {
     assert.strictEqual(assistantUsageOf({ type: "assistant", message: { content: [] } }), undefined);
     assert.strictEqual(assistantUsageOf({ type: "assistant", message: { usage: 42, content: [] } }), undefined);
     assert.strictEqual(assistantUsageOf(null), undefined);
+  });
+});
+
+describe("assistantModelOf (PRD #93 Decision 2)", () => {
+  it("returns the assistant frame's message.model verbatim (no aliasing)", () => {
+    assert.strictEqual(
+      assistantModelOf({ type: "assistant", message: { model: "claude-opus-4-8", content: [{ type: "text", text: "hi" }] } }),
+      "claude-opus-4-8",
+    );
+  });
+
+  it("keeps working for subagent frames (model rides alongside subagent_type)", () => {
+    // The agent→model mapping only exists on this path, and subagents are exactly
+    // the case that makes the column worth showing (PRD #93 Decision 1).
+    assert.strictEqual(
+      assistantModelOf({ type: "assistant", subagent_type: "coder", message: { model: "claude-sonnet-5", content: [] } }),
+      "claude-sonnet-5",
+    );
+  });
+
+  it("returns undefined for non-assistant frames", () => {
+    // The result frame's own model info lives in its `modelUsage` map, a different
+    // (per-model, not per-agent) data path this helper must never touch.
+    assert.strictEqual(assistantModelOf({ type: "result", subtype: "success", model: "claude-opus-4-8" }), undefined);
+    assert.strictEqual(assistantModelOf({ type: "user", message: { model: "claude-opus-4-8" } }), undefined);
+  });
+
+  it("returns undefined for a missing or non-string model, and for null", () => {
+    assert.strictEqual(assistantModelOf({ type: "assistant", message: { content: [] } }), undefined);
+    assert.strictEqual(assistantModelOf({ type: "assistant", message: { model: 42, content: [] } }), undefined);
+    assert.strictEqual(assistantModelOf(null), undefined);
   });
 });
 

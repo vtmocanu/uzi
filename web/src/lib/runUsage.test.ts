@@ -34,10 +34,11 @@ function resultFrame(
 // An assistant frame carrying per-call usage (attached by the worker to one msg).
 function assistantUsage(
   agent: string,
-  u: { input: number; cacheRead?: number; cacheCreation?: number; output: number },
+  u: { input: number; cacheRead?: number; cacheCreation?: number; output: number; model?: string },
 ): RunMessage {
   return msg("text", agent, {
     text: "…",
+    ...(u.model ? { model: u.model } : {}), // PRD #93: co-gated with usage, same frame
     usage: {
       input_tokens: u.input,
       cache_read_input_tokens: u.cacheRead ?? null, // BetaUsage cache fields are nullable
@@ -128,5 +129,83 @@ describe("deriveRunUsage", () => {
     const d = deriveRunUsage(messages);
     expect(d.phases[1]).toMatchObject({ fresh: 0, out: 0 }); // clamped, not negative
     expect(d.phases[1].costUsd).toBe(0);
+  });
+
+  // ── PRD #93: per-agent model, read off the same frames that carry usage ──────
+
+  it("records each agent's model from its usage frames (one model per agent)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("lead", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("lead", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 200, output: 20, model: "claude-sonnet-5" }),
+    ]);
+    const byAgent = Object.fromEntries(d.agents.map((a) => [a.agent, a]));
+
+    expect(byAgent["lead"]).toMatchObject({
+      model: "claude-opus-4-8",
+      otherModels: 0,
+      modelCounts: { "claude-opus-4-8": 2 },
+    });
+    expect(byAgent["coder"]).toMatchObject({ model: "claude-sonnet-5", otherModels: 0 });
+    // Mixed run → the total row's distinct set, sorted ascending.
+    expect(d.agentModels).toEqual(["claude-opus-4-8", "claude-sonnet-5"]);
+  });
+
+  it("picks the most frequent model as an agent's primary, with the others counted", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }),
+    ]);
+    expect(d.agents[0]).toMatchObject({
+      model: "claude-sonnet-5", // 2 frames beats opus's 1, despite opus sorting first
+      otherModels: 1, // rendered "+1"
+      modelCounts: { "claude-sonnet-5": 2, "claude-opus-4-8": 1 },
+    });
+  });
+
+  it("breaks an equal-frequency model tie lexicographically (deterministic, not frame order)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-sonnet-5" }), // seen FIRST
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+    ]);
+    expect(d.agents[0]).toMatchObject({ model: "claude-opus-4-8", otherModels: 1 });
+  });
+
+  it("leaves the model null for a pre-feature agent (usage frames, no model key)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("lead", { input: 100, output: 10 }),
+      assistantUsage("lead", { input: 100, output: 10 }),
+    ]);
+    expect(d.agents[0]).toMatchObject({ model: null, otherModels: 0 });
+    expect(d.agents[0].modelCounts).toEqual({}); // toMatchObject({}) would match anything
+    expect(d.agentModels).toEqual([]); // total row renders "—", never a fabricated model
+  });
+
+  it("reports a single-model run as one distinct model", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      assistantUsage("lead", { input: 100, output: 10, model: "claude-opus-4-8" }),
+      assistantUsage("coder", { input: 100, output: 10, model: "claude-opus-4-8" }),
+    ]);
+    expect(d.agentModels).toEqual(["claude-opus-4-8"]);
+  });
+
+  it("ignores a model-only frame: no agent row, no model recorded (Decision 2 co-gating)", () => {
+    beforeEachReset();
+    const d = deriveRunUsage([
+      msg("status", "lead", { event: "init", model: "claude-opus-4-8" }), // the strip's model
+      msg("text", "ghost", { text: "…", model: "claude-haiku-9" }), // model without usage
+      assistantUsage("coder", { input: 100, output: 10 }),
+    ]);
+    expect(d.agents.map((a) => a.agent)).toEqual(["coder"]);
+    expect(d.agents[0]).toMatchObject({ model: null });
+    expect(d.agents[0].modelCounts).toEqual({});
+    expect(d.agentModels).toEqual([]);
+    expect(d.model).toBe("claude-opus-4-8"); // the init-frame path is untouched
   });
 });

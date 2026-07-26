@@ -46,6 +46,16 @@ export interface AgentUsage {
   fresh: number;
   cached: number;
   out: number;
+  /** PRD #93 Decision 4: how many counted usage frames carried each model. A COUNT
+   *  map, not a Set, because the primary is the most frequent one and the tie-break
+   *  needs the frequencies. Empty for a pre-feature run (no frame carried a model). */
+  modelCounts: Record<string, number>;
+  /** The derived primary: highest count, ties broken lexicographically ascending.
+   *  null when no frame carried a model — never fabricated from the strip's init
+   *  model, which is the run's main-thread model, not this agent's (Decision 6). */
+  model: string | null;
+  /** Distinct models beyond `model` (two distinct models → 1, rendered "+1"). */
+  otherModels: number;
 }
 
 export interface RunUsage {
@@ -68,6 +78,9 @@ export interface RunUsage {
   model: string | null;
   agents: AgentUsage[];
   agentTotal: { fresh: number; cached: number; out: number };
+  /** Distinct models across ALL agents, sorted ascending — the per-agent table's
+   *  "Attributed total" cell (one model → that string, >1 → "N models", none → —). */
+  agentModels: string[];
   /** Per-result-frame delta, keyed by seq (the finish line reads its own phase). */
   phaseUsageBySeq: Map<number, PhaseUsage>;
 }
@@ -100,6 +113,22 @@ function isResultFrame(m: RunMessage): boolean {
 
 const clampDelta = (cur: number, prev: number): number => Math.max(0, cur - prev);
 
+/** An agent row mid-reduction: the model display is derived once, after the fold. */
+type AgentAcc = Omit<AgentUsage, "model" | "otherModels">;
+
+/**
+ * PRD #93 Decision 4: the primary model is the one seen on the most counted frames;
+ * equal counts break lexicographically ascending, so the result is deterministic
+ * regardless of frame order. `otherModels` is what the "+K" suffix renders.
+ */
+function primaryModel(counts: Record<string, number>): { model: string | null; otherModels: number } {
+  const entries = Object.entries(counts);
+  if (entries.length === 0) return { model: null, otherModels: 0 };
+  // Plain codepoint compare (not localeCompare): the tie-break must not vary by locale.
+  entries.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return { model: entries[0][0], otherModels: entries.length - 1 };
+}
+
 /**
  * Reduce a run's message list into its usage surfaces. Pure: same messages →
  * same result, so React just re-runs it as the stream grows (Decision 9 live
@@ -108,7 +137,7 @@ const clampDelta = (cur: number, prev: number): number => Math.max(0, cur - prev
 export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   const phases: PhaseUsage[] = [];
   const phaseUsageBySeq = new Map<number, PhaseUsage>();
-  const agentMap = new Map<string, AgentUsage>();
+  const agentMap = new Map<string, AgentAcc>();
   let model: string | null = null;
 
   // Previous frame's CUMULATIVE totals, to difference into per-phase deltas.
@@ -157,10 +186,16 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
       const u = readUsage(payload["usage"]);
       if (u) {
         const agent = m.agent ?? "lead";
-        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0 };
+        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: {} };
         acc.fresh += u.fresh;
         acc.cached += u.cached;
         acc.out += u.out;
+        // PRD #93 Decision 2: `model` is CO-GATED with `usage` by the worker — it
+        // rides the same surviving frame — so it is read only here, inside the
+        // counted branch. A model-only frame therefore never creates an agent row,
+        // and the strip's init model (a different path) never leaks in.
+        const fm = str(payload["model"]);
+        if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
         agentMap.set(agent, acc);
       }
     }
@@ -180,11 +215,13 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
   );
 
   const inTotal = total.fresh + total.cached;
-  const agents = [...agentMap.values()];
+  const agents: AgentUsage[] = [...agentMap.values()].map((a) => ({ ...a, ...primaryModel(a.modelCounts) }));
   const agentTotal = agents.reduce(
     (t, a) => ({ fresh: t.fresh + a.fresh, cached: t.cached + a.cached, out: t.out + a.out }),
     { fresh: 0, cached: 0, out: 0 },
   );
+  // Run-wide distinct models: every model any agent was seen on, not just primaries.
+  const agentModels = [...new Set(agents.flatMap((a) => Object.keys(a.modelCounts)))].sort();
 
   return {
     hasUsage: phases.length > 0,
@@ -194,6 +231,7 @@ export function deriveRunUsage(messages: RunMessage[]): RunUsage {
     model,
     agents,
     agentTotal,
+    agentModels,
     phaseUsageBySeq,
   };
 }

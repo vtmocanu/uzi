@@ -57,6 +57,88 @@ describe("RunUsagePanel", () => {
   });
 });
 
+// PRD #93: the per-agent Model column. `model` rides the same frame as `usage`.
+function assistantFrame(agent: string, out: number, model?: string): RunMessage {
+  return m("text", agent, {
+    text: "…",
+    ...(model ? { model } : {}),
+    usage: { input_tokens: 1_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: out },
+  });
+}
+function resultFrame(): RunMessage {
+  return m("status", "lead", {
+    event: "result",
+    subtype: "success",
+    num_turns: 3,
+    duration_ms: 5_000,
+    total_cost_usd: 0.5,
+    usage: { input_tokens: 3_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 300 },
+  });
+}
+
+describe("RunUsagePanel model column (PRD #93)", () => {
+  it("renders each agent's model and 'N models' on the total row for a mixed run", () => {
+    seq = 0;
+    const { getByText, getAllByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          assistantFrame("lead", 100, "claude-opus-4-8"),
+          assistantFrame("coder", 200, "claude-sonnet-5"),
+          resultFrame(),
+        ])}
+      />,
+    );
+
+    expect(getByText("Model")).toBeTruthy(); // the new per-agent header
+    expect(getAllByText("claude-opus-4-8").length).toBe(1);
+    expect(getByText("claude-sonnet-5")).toBeTruthy();
+    expect(getByText("2 models")).toBeTruthy(); // the "Attributed total" cell
+  });
+
+  it("suffixes '+1' for an agent that ran on more than one model", () => {
+    seq = 0;
+    const { getByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          assistantFrame("coder", 100, "claude-sonnet-5"),
+          assistantFrame("coder", 100, "claude-sonnet-5"),
+          assistantFrame("coder", 100, "claude-opus-4-8"),
+          resultFrame(),
+        ])}
+      />,
+    );
+    expect(getByText("claude-sonnet-5 +1")).toBeTruthy();
+    // One agent, two distinct models → the total row still reads "2 models".
+    expect(getByText("2 models")).toBeTruthy();
+  });
+
+  it("shows the single model string on the total row when the run used exactly one", () => {
+    seq = 0;
+    const { getAllByText } = render(
+      <RunUsagePanel
+        usage={deriveRunUsage([
+          assistantFrame("lead", 100, "claude-opus-4-8"),
+          assistantFrame("coder", 200, "claude-opus-4-8"),
+          resultFrame(),
+        ])}
+      />,
+    );
+    // Two agent rows + the total row all read the same model string.
+    expect(getAllByText("claude-opus-4-8").length).toBe(3);
+  });
+
+  it("renders '—' in the Model column for a pre-feature run (usage, no models)", () => {
+    seq = 0;
+    const { getAllByText, getByText } = render(
+      <RunUsagePanel usage={deriveRunUsage([assistantFrame("lead", 100), resultFrame()])} />,
+    );
+    expect(getByText("Model")).toBeTruthy();
+    // The agent row and the "Attributed total" row both degrade to a dash, and the
+    // panel renders without throwing.
+    expect(getAllByText("—").length).toBeGreaterThanOrEqual(2);
+  });
+});
+
 describe("RunUsagePanel $0 cost (Decision 8)", () => {
   it("renders a $0 cost as '—' in the strip and per-phase total, never '$0.00'", () => {
     seq = 0;
