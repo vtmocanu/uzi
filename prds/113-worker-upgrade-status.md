@@ -279,6 +279,21 @@ nav item** gains an alert badge = the count of workers needing attention.
 
 ## Milestones
 
+> **BINDING ORDER: M5 and M6 must not land before M4, and here is the reason —
+> which matters more than the ordering, because an ordering without its reason is
+> the first thing a re-plan discards.**
+>
+> R8's grace (the rule that stops a healthy mid-roll worker reading as behind) needs
+> the controller signal, which does not exist until M4. So with M2 in and M4 out,
+> every hosted worker mid-roll classifies `outdated` — correctly, and harmlessly,
+> because M2 has no user-visible surface. M5 and M6 ARE that surface. Ship either
+> before M4 and the nav badge counts every normally-rolling worker as needing
+> attention on the next release: **Decision 1's cry-wolf, delivered by milestone
+> ordering rather than by any line of code.** No test would catch it, because every
+> milestone involved is individually correct.
+>
+> If this order ever needs to change, R8 must land first.
+
 - [ ] **M1 — Meaningful version signal (agent + CI only)**: the agent image stamps
       the release into `UZI_AGENT_VERSION` at build (CI build-arg = the release
       tag) so a worker's reported `version` is the release it runs; the frozen
