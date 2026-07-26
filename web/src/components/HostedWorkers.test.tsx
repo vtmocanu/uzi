@@ -34,6 +34,8 @@ const provisioned: Worker = {
   template_declared: "base",
   template_reported: null,
   version: null,
+  upgrade_status: "unknown",
+  upgrade_detail: null,
   last_heartbeat_at: null,
   created_at: "2026-07-16T00:00:00Z",
   stats_cpu_pct: null,

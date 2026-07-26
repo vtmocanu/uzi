@@ -1786,6 +1786,10 @@ export const mockApi = {
       template_declared: template ?? null,
       template_reported: null,
       version: null,
+      // No version reported until the worker registers, so nothing to compare
+      // against the control-plane release (PRD #113).
+      upgrade_status: "unknown" as const,
+      upgrade_detail: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       // No resource sample until the worker heartbeats (PRD #49) → no gauges yet.
@@ -1856,6 +1860,10 @@ export const mockApi = {
       template_declared: template,
       template_reported: null,
       version: null,
+      // No version reported until the worker registers, so nothing to compare
+      // against the control-plane release (PRD #113).
+      upgrade_status: "unknown" as const,
+      upgrade_detail: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       stats_cpu_pct: null,

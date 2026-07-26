@@ -39,6 +39,18 @@ type WorkerDTO struct {
 	Version          *string    `json:"version"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
 	CreatedAt        time.Time  `json:"created_at"`
+	// Derived upgrade health (PRD #113): "up_to_date" | "outdated" | "unknown" |
+	// "upgrading" | "upgrade_failed". Computed at read time from Version against the
+	// control plane's release — never stored, so it cannot go stale against the row
+	// it describes. UpgradeDetail is the human sentence behind the badge ("running
+	// 0.11.0, target 0.11.7"), null in the steady up_to_date case where there is
+	// nothing to explain.
+	//
+	// Version is written ONLY at register, so a worker that is offline mid-roll keeps
+	// reporting its old version — which is why "upgrading"/"upgrade_failed" cannot come
+	// from this field and arrive from the controller's roll report instead.
+	UpgradeStatus string  `json:"upgrade_status"`
+	UpgradeDetail *string `json:"upgrade_detail"`
 	// Latest container resource sample (PRD #49), all null until the worker reports
 	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
 	// is unlimited or the sample came from the process fallback; StatsCPUPct is null

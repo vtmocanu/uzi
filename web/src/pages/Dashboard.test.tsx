@@ -103,6 +103,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     template_declared: null,
     template_reported: null,
     version: null,
+    upgrade_status: "unknown",
+    upgrade_detail: null,
     last_heartbeat_at: null,
     created_at: "2026-07-05T12:00:00Z",
     stats_cpu_pct: null,

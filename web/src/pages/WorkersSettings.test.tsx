@@ -70,6 +70,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     template_declared: null,
     template_reported: "base",
     version: "0.4.2",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
     last_heartbeat_at: "2026-07-14T00:00:00Z",
     created_at: "2026-07-01T00:00:00Z",
     stats_cpu_pct: null,

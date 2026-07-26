@@ -118,8 +118,16 @@ var runInputKinds = map[string]bool{
 // callers that pass "" render a bound worker with an id and no label, which is
 // honest: this row carries no join to look it up. The list path uses
 // workerDTOFromRow, which does have the join.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel string) apitypes.WorkerDTO {
+// cpVersion is the control plane's own release (h.version) — the reference the
+// upgrade status is derived against. It is threaded explicitly rather than read off
+// the Handler because that is this file's convention for these builders, and because
+// it keeps the classification a pure function of its inputs. Passing "" yields
+// `unknown`, which is also what a genuinely unstamped build produces.
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string) apitypes.WorkerDTO {
+	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(w.Version.String, cpVersion)
 	return apitypes.WorkerDTO{
+		UpgradeStatus:        upgradeStatus,
+		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
 		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel: textPtrValue(secretLabel != "", secretLabel),
 		ID:                   w.ID.String(),
@@ -143,8 +151,11 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel 
 	}
 }
 
-func workerDTOFromRow(w store.ListWorkersByUserRow) apitypes.WorkerDTO {
+func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string) apitypes.WorkerDTO {
+	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(w.Version.String, cpVersion)
 	return apitypes.WorkerDTO{
+		UpgradeStatus:        upgradeStatus,
+		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
 		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel: textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
 		ID:                   w.ID.String(),
@@ -321,7 +332,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel),
+		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version),
 		"token":  token,
 	})
 }
@@ -341,7 +352,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, workerDTOFromRow(row))
+		out = append(out, workerDTOFromRow(row, h.version))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
 }
@@ -450,7 +461,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(wkr, 0, false, token.label, h.version)})
 }
 
 // -------------------------------------------------------------------------

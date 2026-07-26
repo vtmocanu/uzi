@@ -625,6 +625,22 @@ export interface Worker {
   template_declared: string | null;
   template_reported: string | null;
   version: string | null;
+  // Derived upgrade health (PRD #113), computed by the api at read time from `version`
+  // against the control plane's release — never stored, so it cannot disagree with the
+  // row it describes. upgrade_detail is the sentence behind the badge ("running 0.11.0,
+  // target 0.11.7"), null in the steady up_to_date case where there is nothing to say.
+  //
+  // Five states, but the api derives only three from a version comparison:
+  // up_to_date / outdated / unknown. "upgrading" and "upgrade_failed" require the
+  // controller's roll report, because `version` is written ONLY at register — a worker
+  // stuck offline mid-roll keeps reporting its OLD version and cannot self-report that
+  // it is stuck. Both arrive with the roll-health fold.
+  //
+  // "unknown" is the honest answer, not an error: an unstamped image, an unparseable
+  // report, or a "dev" control plane all land here, and none of them should raise an
+  // alert.
+  upgrade_status: "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
+  upgrade_detail: string | null;
   last_heartbeat_at: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
