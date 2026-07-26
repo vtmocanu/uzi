@@ -210,4 +210,8 @@ here**: `Td`'s `cx("text-muted", left && "text-fg")` emits both classes, and
 `text-muted` wins the cascade, so `text-fg` is dead. Every left-aligned cell in
 the panel — Agent and Phase included, both predating this PRD — renders muted
 where the mock has them at `fg`. Fixing it would change the per-phase table,
-which this PRD explicitly leaves untouched. Worth its own issue.
+which this PRD explicitly leaves untouched. Filed as
+[#152](https://gitlab.example.com/vtmocanu/uzi/-/issues/152), with the cascade
+order measured against the built stylesheet (`.text-fg` at offset 24294,
+`.text-muted` at 24536 in `dist/assets/index-CyMus4EH.css` on `b9d85633`) rather
+than inferred from the class list.
