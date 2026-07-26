@@ -1,7 +1,24 @@
 # PRD #120: web-ux browser reliability — stop runs fighting the SUID sandbox & SPA navigation after PRD #87
 
 **GitLab Issue**: [#120](https://gitlab.example.com/vtmocanu/uzi/-/issues/120)
-**Status**: **RESOLVED (Hypothesis B) — fix MERGED to `main` as `6cac089c` (MR !109, 2026-07-25), NOT YET PROVEN ON A LIVE WORKER.** M5 is the only thing that closes this, and it needs a release → Harbor → ArgoCD → pod roll → a clean `web-ux` run. **Until M5 runs, `main` carries a fix nobody has seen work.** The next release ships it either way, so run M5 deliberately rather than discovering the outcome later.
+**Status**: **DONE — M5 PASSED on a live worker 2026-07-26.** Fix merged as `6cac089c` (MR !109), released in **v0.11.7**, and verified by run `b64b98f3` (issue #140) on `agent-base:0.11.7`. Hypothesis B confirmed and closed.
+
+> **The measurement.** `web-ux`, dispatched **uncoached** (no mention of the shim, `--no-sandbox`, or PATH — matching the baseline's protocol exactly, or the number would not be comparable):
+>
+> | | baseline `1dfc65b4` (0.11.6) | M5 run `b64b98f3` (0.11.7) |
+> |---|---|---|
+> | browser-setup tool calls | **4** | **2** |
+> | `open` attempts | 2 (first died on `setuid_sandbox_host.cc:166`) | **1** |
+> | failed browser calls | 1 | **0** |
+> | `--no-sandbox` rediscovered? | yes, from the CLI's own error hint | **never mentioned by any agent** |
+>
+> `which -a agent-browser` returns **one line** — `/usr/local/bin/agent-browser` — in all three agent shells (lead, `web-ux`, fact-checker). `/app/node_modules/.bin` is **absent from PATH**, along with `/node_modules/.bin` and `node-gyp-bin`: the npm fingerprint that identified this bug is gone. The real CLI still exists on disk, so the shim wins on **PATH order**, which is exactly what the fix restores.
+>
+> **Evidence stronger than any self-report.** Only the shim sets `XDG_CONFIG_HOME` to `${TMPDIR}/uzi-agent-browser-$(id -u)` (`agent/bin/agent-browser:95`). That directory exists under uid 10001 — filesystem proof the launch went through the shim in the *agent* shell, independent of what an agent claims. The timeline rules out a warm attach: runtime start 07:37:29, browser dir first created 08:09:58, screenshot 08:10:11.
+>
+> **The lead corrected its own overclaim before reporting.** Its draft said "4 → 1"; its fact-checker caught that `agent-browser --help` is instructed by both templates and so was almost certainly inside the baseline's 4 as well. **4 → 2 is the honest like-for-like figure**, and the composition of the baseline's other two calls is not recoverable, so the comparison is anchored on a documented total rather than a reconstructed breakdown.
+>
+> *(Prior history left visible: this PRD was created 2026-07-22 calibrated toward **Hypothesis A** — deploy lag onto a mid-upgrade worker. The PRD #87 M7 gate run disproved it on an image carrying every fix, and the root cause turned out to be `npm run start` prepending `/app/node_modules/.bin` on the non-root k8s start only. The prior was reasonable; the fable review's release-time≠image-on-worker-time hedge is what kept it testable rather than assumed.)*
 
 > **This header used to say "Draft … calibrated toward Hypothesis A as the strong prior" (deploy lag onto a mid-upgrade worker). That calibration was WRONG and the PRD #87 M7 gate run (issue #128, run `1dfc65b4`) disproved it** on a worker running `agent-base:0.11.6` — i.e. carrying every relevant fix, which is exactly what rules deploy lag out. `web-ux` still took 4 tool calls, the first launch died on `setuid_sandbox_host.cc:166`, and the launch resolved `/app/node_modules/.bin/agent-browser` rather than the shim. **Hypothesis B: a real delivery gap.** Left visible rather than rewritten, because the prior was reasonable and the evidence that killed it is the point. (Created 2026-07-22; a fable review that day verified all 8 load-bearing claims and added the release-time≠image-on-worker-time hedge — that hedge is what kept Hypothesis A alive long enough to be tested properly.)
 >
@@ -139,7 +156,7 @@ efficiency + reliability fix, so Medium priority.
 - [ ] **M4 — Reconcile repo web-ux agent vs the #87 builtin.** Ensure the shipping
   guidance is identical/equivalent across `agent_source: repo` and `own`/builtin,
   and note the single source of truth so they cannot drift.
-- [ ] **M5 — Verified clean run. THE ONLY REMAINING GATE, and the fix is merged-but-unproven until it passes.** A `web-ux` browser validation run on a worker carrying `6cac089c` completes with **no sandbox abort** and no SPA hard-nav dead-end. Requires a release → Harbor → ArgoCD → pod roll first; a `main` merge does not reach a worker.
+- [x] **M5 — Verified clean run. PASSED 2026-07-26 (run `b64b98f3`, issue #140): 2 tool calls vs the baseline's 4, zero failed launches, no flag rediscovery.** ~~THE ONLY REMAINING GATE, and the fix is merged-but-unproven until it passes.** A `web-ux` browser validation run on a worker carrying `6cac089c` completes with **no sandbox abort** and no SPA hard-nav dead-end. Requires a release → Harbor → ArgoCD → pod roll first; a `main` merge does not reach a worker.
   **The measurement that matters is the tool-call count**, compared against the gate run's **4** (issue #128, run `1dfc65b4`): a clean first-try launch is the pass. Capture the activity log / judge review.
   **Also re-check `which -a agent-browser` inside the AGENT shell, not the worker shell** — that distinction is the whole bug, and an operator probe on 2026-07-25 got a clean result from the worker shell while the agent shell was still broken.
 - [ ] **M6 — Tests & docs.** Unit/integration coverage for the M2 guarantee;
