@@ -633,6 +633,25 @@ for the instruction nobody has written yet.
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
 compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
 
+- **A DELIVERED TASK DESCRIPTION CARRIES NEITHER ITS CURRENCY NOR ITS COMPLETION — check the
+  task's STATUS before acting on its text.** A `TaskUpdate` wakes the named idle agent, which
+  reads the description as a live assignment; the delivery says nothing about whether the
+  instruction is still true or whether it has already been carried out. Those are **two
+  different questions with two different fixes**, and this run produced both forms:
+  - **Stale** — task #14's description was written before the work it described happened, kept
+    `:198`/"both counts"/"M8 owns it" after all three were corrected, and would have had an
+    agent re-correct an already-correct doc row, the specific failure the PRD names. *Fix: put
+    a SHA or milestone in the description so its currency is checkable.*
+  - **Already-executed** — task #23 was created to dodge the staleness problem, its text was
+    accurate, and it was then re-delivered as if pending **after** being completed. Same root
+    cause, opposite symptom. *Fix: only checking status before acting catches this; no wording
+    can.*
+  Named by the agent that received both: *"'Is this instruction current?' and 'has this
+  instruction already been executed?' are two different questions, and the delivery carries
+  neither answer."* Corollary for the lead: do task-list bookkeeping **before** the dispatch,
+  or accept skipping it — an update sent to an idle agent is a dispatch whether you meant it
+  as one or not.
+
 - **AN EXECUTION ORACLE IS NOT A COVERAGE ORACLE: the log tells you a query RAN, never that anyone
   was WATCHING.** Postgres `log_statement='all'` on a throwaway container is the strongest
   instrument this repo has for "is this query exercised" — it observes execution instead of
