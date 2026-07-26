@@ -78,8 +78,13 @@ Two things worth knowing before you label an issue:
 - **The issue's own PRD link is corrected only after you merge.** If the run
   moved the file, uzi rewrites that link in the issue description once the
   merge request has merged, so your merge decision is what authorizes the edit.
-  It rewrites only the link the issue already pointed at and leaves any other
-  `prds/*.md` reference in the description alone.
+  It only ever repoints a `prds/*.md` link the description already carried, and
+  only one whose filename matches the file the run declared it moved, so a link
+  to a different PRD is left alone. What that bound does not cover: the run's
+  own declaration is what picks which link, and nothing verifies the file really
+  moved, so an issue linking several PRDs can end up with the wrong one pointing
+  at a path that does not exist. That costs a stale link on that one issue and
+  nothing wider.
 
 ## Retry
 

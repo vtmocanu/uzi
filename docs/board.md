@@ -136,5 +136,6 @@ displays in its highest-positioned column until the next move normalizes it.
 
 A run that finishes a PRD is asked to move the file to `prds/done/` in its own
 merge request (see [Agent skills](./skills.md)). Once that merge request
-merges, uzi rewrites the matching link in the issue description so it still
-resolves, leaving every other `prds/*.md` reference there untouched.
+merges, uzi rewrites that PRD's link in the issue description so it still
+resolves. It matches on the moved file's name, so a link to a *different* PRD
+in the same description is left alone.
