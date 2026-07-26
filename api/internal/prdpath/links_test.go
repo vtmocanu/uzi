@@ -109,6 +109,42 @@ func TestLinksIsPathAligned(t *testing.T) {
 	}
 }
 
+// The non-overlapping-match asymmetry (M5 review nit 1). FindAllStringIndex returns
+// NON-OVERLAPPING matches, so without rescanning from start+1 an ALIGNED path
+// nested inside a rejected span is lost entirely — which is what ReplacePath below
+// deliberately avoids.
+//
+// NOTE ON THE INPUT, because the obvious one does not demonstrate this. The review
+// cited `aprds/x.mdprds/y.md`, but the inner candidate there is preceded by `d`, so
+// it is a FRAGMENT of the token `x.mdprds` and the boundary rule rejects it
+// correctly — `[]` is the right answer for that string, not a bug. The loss needs
+// the nested candidate to be genuinely aligned, which means preceded by `/`.
+func TestLinksFindsAPathNestedInsideARejectedSpan(t *testing.T) {
+	// The regexp consumes `prds/a/prds/b.md` as ONE span (its `(seg/)*` swallows
+	// `a/` and `prds/`), and that span is misaligned because `x` precedes it. The
+	// inner `prds/b.md` at offset 8 IS aligned: a `/` precedes it.
+	const in = "xprds/a/prds/b.md"
+	got := prdpath.Links(in)
+	var found bool
+	for _, l := range got {
+		if l == "prds/b.md" {
+			found = true
+		}
+		if l == "prds/a/prds/b.md" {
+			t.Errorf("the misaligned outer span must still be rejected; got %v", got)
+		}
+	}
+	if !found {
+		t.Errorf("Links(%q) = %v, want it to contain prds/b.md — an ALIGNED path nested inside a rejected span",
+			in, got)
+	}
+	// The control: the outer span really is rejected, so this is not passing just
+	// because everything matches.
+	if len(prdpath.Links("xprds/a.md")) != 0 {
+		t.Errorf("a misaligned span must still be rejected on its own")
+	}
+}
+
 func TestReplacePath(t *testing.T) {
 	const old, nu = "prds/72-x.md", "prds/done/72-x.md"
 	for _, tc := range []struct {

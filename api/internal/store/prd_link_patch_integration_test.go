@@ -85,9 +85,18 @@ func TestListPRDLinkPatchCandidatesLiveDB(t *testing.T) {
 	// fixture and the flag assertion below would be measuring the fixture, not the
 	// query. (Caught by the assertion failing; the first draft had it at offset 0.)
 	wantA := mkRun(repoA, "issue", "prds/done/72-x.md", &mr, false, 7*time.Minute)
-	// Repo B's run is identical in every way except its repo. If the scope predicate
-	// were dropped, a scan for A would return this too.
-	crossTenant := mkRun(repoB, "issue", "prds/done/72-x.md", &mr, false, time.Minute)
+	// Repo B's run is identical in every way except its repo, and it sits LATER than
+	// wantA deliberately. Two predicates depend on that placement:
+	//   * the OUTER r.repo_id — dropping it makes this row appear in A's scan;
+	//   * the EXISTS's OWN n.repo_id — dropping THAT makes this row supersede wantA,
+	//     which the outer predicate cannot catch because an EXISTS does not inherit
+	//     the outer WHERE.
+	// At an EARLIER offset it pinned only the first: being older, it could not
+	// supersede anything, so the subquery's repo predicate was unpinned by the
+	// fixture and pinned only by RESIDUE on a reused database — which fails for a
+	// reason unrelated to any deliberate row, reads as flakiness, and invites
+	// "more isolation" as the fix, deleting the accidental coverage outright.
+	crossTenant := mkRun(repoB, "issue", "prds/done/72-x.md", &mr, false, 9*time.Minute)
 	// Excluded rows, one per predicate, all in repo A.
 	settled := mkRun(repoA, "issue", "prds/done/72-x.md", &mr, true, 2*time.Minute)
 	selfImprove := mkRun(repoA, "self_improve", "prds/done/72-x.md", &mr, false, 3*time.Minute)

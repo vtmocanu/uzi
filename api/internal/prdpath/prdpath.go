@@ -22,7 +22,15 @@ import (
 )
 
 // MaxPathLen bounds a declared PRD path. The worker mirrors this as a transport
-// clamp; THIS constant is the authority.
+// clamp (agent/src/sdk-executor.ts PRD_DONE_PATH_MAX_LEN); THIS constant is the
+// authority.
+//
+// The duplication crosses a language boundary and nothing can pin it, so it is
+// worth saying what drift actually costs: NOTHING that reaches a bypass. The api
+// validates the string it RECEIVES rather than trusting the worker's clamp, so a
+// worker clamping too long means the api rejects and warns, and a worker clamping
+// too short means the api never sees the tail. Both degrade to "the value is
+// dropped and logged", which is this field's designed failure mode anyway.
 const MaxPathLen = 512
 
 // Root is the directory every PRD path is rooted at, and Ext the required suffix.
@@ -96,13 +104,25 @@ func Validate(p string) error {
 // user's issue description, and depth is worth more here than a line count.
 //
 // Two further asymmetries worth knowing before trusting a red/green here, and the
-// first one is a trap rather than a curiosity: `prds/../../../etc/passwd` stays
-// rejected under the all-three mutant because it fails the `.md` SUFFIX rule — so
-// it is NOT evidence that any traversal guard fires, and the `.md` rule is NOT a
-// traversal backstop. Use `prds/../x.md`, which ends in `.md` and is therefore held
-// by the traversal rules alone. The second: `prds/.md` and `prds/.git/x.md` are
-// held ONLY by the dotfile rule, which is why removing that one alone does redden.
-// What is pinned is the accept/reject SETS in prdpath_test.go, not any one rule.
+// first one is a trap rather than a curiosity.
+//
+// `prds/../../../etc/passwd` proves NOTHING about traversal, in ANY configuration.
+// The reason is stronger than "it survives the all-three mutant" and stronger than
+// "all eight combinations agree": the `.md` SUFFIX check returns BEFORE the segment
+// loop and before `path.Clean`, so for that input the three traversal guards are
+// UNREACHABLE. That is provable by reading the control flow and holds for every
+// input of that shape, not just the ones anyone mutated. Use `prds/../x.md`, which
+// ends in `.md` and so actually reaches the traversal rules.
+//
+// (The general form, since this is the kind of thing that gets over-applied:
+// control flow proves REACHABILITY, and reachability settles behaviour only when
+// the skipped code is side-effect-free. It is here — Validate is pure and the
+// guards only return errors. Where that does not hold, control flow narrows what
+// you must mutate; it does not replace mutating it.)
+//
+// The second asymmetry: `prds/.md` and `prds/.git/x.md` are held ONLY by the
+// dotfile rule, which is why removing that one alone does redden. What is pinned is
+// the accept/reject SETS in prdpath_test.go, not any one rule.
 
 // linkRe finds CANDIDATE PRD-path spans in free text. Its charset is the same one
 // validateSegment enforces, which is what makes a path M4 accepts a path M5 can
@@ -132,6 +152,14 @@ func pathByte(c byte) bool {
 //     does not match).
 //   - The byte AFTER must be outside the charset, which stops `prds/72-x.md.bak`
 //     while letting `#L4`, `?ref=main`, `)`, whitespace and end-of-string through.
+//
+// KNOWN RESIDUAL MISSES, measured across 27 realistic prose shapes (24 matched):
+// an ellipsis (`see prds/72-x.md...`) and a period with no following character of
+// any kind other than another period. The rule below handles exactly ONE trailing
+// `.`; a second one looks like a token continuation. Both are rare and both fail
+// SAFE — a missed link yields empty targets, which settles without a forge write.
+// The ellipsis is the one that actually occurs in prose if this is ever worth
+// closing.
 //
 // ONE REFINEMENT ON THE DESIGN, and it is not cosmetic: a trailing `.` that is NOT
 // itself followed by a path byte is a SENTENCE TERMINATOR, not a token
@@ -179,12 +207,25 @@ func boundaryAligned(s string, start, end int) bool {
 func Links(description string) []string {
 	var out []string
 	seen := make(map[string]bool)
-	for _, loc := range linkRe.FindAllStringIndex(description, -1) {
-		start, end := loc[0], loc[1]
+	// Rescan from start+1 after a rejected span, rather than continuing from the
+	// end of it. FindAllStringIndex returns NON-OVERLAPPING matches, so a
+	// well-formed path nested inside a misaligned one would otherwise be lost:
+	// `aprds/x.mdprds/y.md` yielded [] and missed `prds/y.md` at offset 10. The
+	// failure direction was safe (a missed link means empty targets, which settles
+	// without a forge write), but ReplacePath eleven lines below deliberately does
+	// rescan, and an unexplained asymmetry between the two reads as an oversight.
+	for i := 0; i < len(description); {
+		loc := linkRe.FindStringIndex(description[i:])
+		if loc == nil {
+			break
+		}
+		start, end := i+loc[0], i+loc[1]
+		cand := description[start:end]
 		if !boundaryAligned(description, start, end) {
+			i = start + 1
 			continue
 		}
-		cand := description[start:end]
+		i = end
 		if Validate(cand) != nil || seen[cand] {
 			continue
 		}
@@ -250,8 +291,9 @@ func ReplacePath(description, oldPath, newPath string) (string, int) {
 // creates paths that validate and then never match, which fails silently in both
 // directions. Do not widen one without the other.
 //
-// The explicit `.`/`..` rejection is the traversal fix. The character class alone
-// admits `..` — that is precisely `prdLinkRe`'s bug, so the class is NOT the guard.
+// The `.`/`..` rejection here is ONE OF THREE independent traversal rejections —
+// see the NOTE above Links for the measured table. The character class alone
+// admits `..`, which is precisely `prdLinkRe`'s bug, so the class is not the guard.
 func validateSegment(seg string) error {
 	if seg == "" {
 		return fmt.Errorf("path contains an empty segment")

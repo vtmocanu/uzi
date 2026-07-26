@@ -124,7 +124,16 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, f f
 	// WHICH LINK TO TOUCH. Targets come from the run's own queue-time issue snapshot,
 	// which is forge-authoritative on both creation paths and is neither
 	// caller- nor agent-supplied — so an agent can only ever redirect a link the
-	// ISSUE ITSELF already carried, never an unrelated entry in a "Related PRDs" list.
+	// ISSUE ITSELF already carried.
+	//
+	// THAT BOUND IS THE WHOLE CLAIM, and an earlier version of this comment
+	// overstated it by adding "never an unrelated entry in a Related PRDs list".
+	// That is false: a Related-PRDs entry IS a link the issue carried. If the
+	// snapshot lists several PRDs, a declaration whose basename matches any of them
+	// can repoint that one. Bounded — same issue, basename must match, must pass
+	// Validate, no disclosure, no cross-tenant reach — so the damage is description
+	// integrity, not security. Tightening it further is a design question rather
+	// than a fix: uzi has no notion of THE PRD when an issue links several.
 	//
 	// This gate ALSO makes Decision 12's PRDLESS no-op mechanical rather than
 	// prompt-level: a PRDLESS run's snapshot carries no PRD link, so `linked` is

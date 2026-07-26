@@ -215,12 +215,24 @@ describe("buildLeadSystemPrompt", () => {
     assert.strictEqual(sp.type, "preset");
     assert.strictEqual(sp.preset, "claude_code");
     assert.ok(sp.append.includes(LEAD_GUARDRAIL_APPEND));
-    // Exact equality no longer holds for the DEFAULT call: an absent kind means
-    // `issue`, which appends the PRD-lifecycle clause (PRD #72 M3). A non-issue
-    // run is now the pure case, and pinning it here is strictly stronger than the
-    // equality this replaced — it says the guardrail is the ONLY content when
-    // nothing else applies, which the old assertion could not distinguish from
-    // "nothing else exists yet".
+    // TWO exact composition pins, one per path, and BOTH are needed.
+    //
+    // I first replaced the original `strictEqual(sp.append, LEAD_GUARDRAIL_APPEND)`
+    // with the ci_fix pin alone and called that "strictly stronger". It is not.
+    // Measured by the reviewer: a stray `parts.push(...)` gated to
+    // `kind === "issue"` leaves the suite GREEN with only the ci_fix pin, and
+    // reddens only when applied unconditionally. So the ci_fix pin is stronger
+    // against UNCONDITIONAL additions and WEAKER against issue-gated ones — and
+    // issue-gated is the direction this PRD adds content in. The assertion I
+    // removed sat on the default call, which IS the issue path.
+    //
+    // This is the lead's SYSTEM PROMPT, so an unreviewed clause reaching the model
+    // unnoticed is exactly what the original equality was buying. Both pins stay:
+    // adding anything to either path without updating this test reddens it.
+    assert.strictEqual(
+      buildLeadSystemPrompt(undefined, { kind: "issue" }).append,
+      [LEAD_GUARDRAIL_APPEND, PRD_LIFECYCLE_APPEND].join("\n\n"),
+    );
     assert.strictEqual(buildLeadSystemPrompt(undefined, { kind: "ci_fix" }).append, LEAD_GUARDRAIL_APPEND);
   });
 

@@ -35,7 +35,12 @@ func TestClampWirePRDDonePathDropsEveryNonIssueKind(t *testing.T) {
 	// self_improve is the sharpest: it runs against uzi's own repo (which HAS a
 	// prds/ directory) and its issue is a reused backlog container whose
 	// description an ungated patch would overwrite.
-	for _, kind := range []string{"self_improve", "ci_fix", "judge"} {
+	// A SNAPSHOT, not a derivation, and there is nothing to derive from: runs.kind is
+	// a text column with a CHECK constraint (00058) and RunKind is a TypeScript type,
+	// so no Go-side enum exists to enumerate. The list was already incomplete when
+	// written — it named three of the five kinds the DB has known since 00058 —
+	// which is why `chat` is here now. Add any future kind by hand.
+	for _, kind := range []string{"self_improve", "ci_fix", "judge", "chat"} {
 		run := store.Run{ID: uuid.New(), Kind: kind}
 		got := clampWirePRDDonePath(run, strp("prds/done/72-x.md"))
 		if got.Valid {

@@ -704,10 +704,28 @@ SELECT r.id,
        r.mr_iid,
        r.prd_done_path,
        r.issue_description,
+       -- superseded: a LATER issue run exists on this same issue, so this run's
+       -- branch is stale. Every conjunct here is load-bearing, and an EXISTS does
+       -- NOT inherit the outer WHERE, so each has to be restated:
+       --   n.repo_id    — without it, ANY repo's newer run on a colliding issue IID
+       --                  marks this candidate superseded and the watcher settles
+       --                  the edge WITHOUT patching. Not a cross-tenant write; a
+       --                  cross-tenant SUPPRESSION, where repo B's activity
+       --                  silently cancels repo A's pending forge write. Issue IIDs
+       --                  collide across repos constantly, so this is an ordinary
+       --                  shape rather than an exotic one.
+       --   n.issue_iid  — supersession is per issue, not per repo.
+       --   n.kind       — a self_improve run DOES carry an issue_iid
+       --                  (selfimprove.sql sets it), so without this a self_improve
+       --                  run on the same issue would count as superseding an issue
+       --                  run. Same ` + "`" + `= 'issue'` + "`" + ` form and same reasoning as the outer
+       --                  predicate: positive, never a ` + "`" + `<>` + "`" + ` exclusion list.
+       --   created_at   — strictly later; a run never supersedes itself.
        EXISTS (
            SELECT 1 FROM runs n
            WHERE n.repo_id = r.repo_id
              AND n.issue_iid = r.issue_iid
+             AND n.kind = 'issue'
              AND n.created_at > r.created_at
        ) AS superseded
 FROM runs r
