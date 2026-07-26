@@ -4,11 +4,11 @@
 // description carries its OWN test-suite evidence (the worker's own proof,
 // alongside uzi's CI which independently verifies it since PRD #52); and it flags
 // changes to guard-critical paths for extra-careful human review. The check
-// evidence + `npm ci` run under the cap-less `runner` uid (PRD #51 M4, buildCheckEnv
-// / prepareCheckDeps below), so a hostile self-improvement change's test code cannot
-// read the worker's 0400 token file — the same-OS-user residual this used to carry
-// is closed for the local (A1) path. The primary directive is untouched — the bot
-// still never merges to main.
+// evidence + the dependency install run under the cap-less `runner` uid (PRD #51 M4,
+// buildCheckEnv below; the install itself is js-deps.ts since PRD #121 M1/M2), so a
+// hostile self-improvement change's test code cannot read the worker's 0400 token
+// file — the same-OS-user residual this used to carry is closed for the local (A1)
+// path. The primary directive is untouched — the bot still never merges to main.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -84,9 +84,11 @@ export interface SelfImproveCheck {
 // its toolchain is present in the worker. `go` (and `nodejs`) reach the worker only
 // if the connected uzi repo's tool profile provisions them (PRD #18 devbox tooling,
 // threaded to the checks via buildCheckEnv's toolEnv). With an empty tool profile the
-// Go check honest-skips (ENOENT) and the npm checks depend on prepareCheckDeps having
-// installed node_modules. M9 makes real evidence POSSIBLE; the honest skip (M8) is the
-// fallback whenever a toolchain/dep is genuinely absent — never a false pass/fail.
+// Go check honest-skips (ENOENT) and the npm checks depend on the js-deps installer
+// (PRD #121) having installed node_modules — which now happens BEFORE the agent's
+// first turn as well as before these checks. M9 makes real evidence POSSIBLE; the
+// honest skip (M8) is the fallback whenever a toolchain/dep is genuinely absent —
+// never a false pass/fail.
 //
 // The npm checks declare `requires: "node_modules"`. A fresh clone has none, and
 // running `npm test` there does NOT fail with ENOENT (npm itself exists) — it exits
@@ -133,7 +135,7 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 }
 
 // ─── Check subprocess environment (M9 + audit, security load-bearing) ─────────
-// The checks below (and prepareCheckDeps' `npm ci`) execute AGENT-AUTHORED code as
+// The checks below (and the js-deps install, PRD #121) execute AGENT-AUTHORED code as
 // the WORKER uid — worktree test files, package.json scripts, vite/tsc/go test —
 // ENTIRELY OUTSIDE the SDK hook system (guardrails.ts constrains only the AGENT's
 // Bash, not a worker-spawned execFile child). The worker process holds the decrypted
@@ -148,8 +150,9 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 // under the cap-less `runner` uid (runnerCommand, below), and the join-token FILE at
 // /run/secrets/worker_token is 0400 worker-owned, so agent-authored test code — even
 // though it executes model-written code the SDK hook system never sees — CANNOT read
-// the worker's token at all. `npm ci` still runs with --ignore-scripts (prepareCheckDeps)
-// as a defense-in-depth REDUCTION of the lifecycle-script code-exec path. What the
+// the worker's token at all. The install still runs with --ignore-scripts (js-deps.ts,
+// every package manager) as a defense-in-depth REDUCTION of the lifecycle-script
+// code-exec path. What the
 // same-uid residual used to expose (join token → claim → bot forge PAT + the user's
 // Anthropic token) is no longer reachable by these checks on the A1 (root-started) path.
 // On a #58 single-uid (non-root) start there is no split and the checks run as the sole
@@ -189,38 +192,13 @@ export function buildCheckEnv(
   return env;
 }
 
-// prepareCheckDeps installs node deps so the npm checks can actually run (M9),
-// best-effort. `npm ci --ignore-scripts` in each dir under the SCRUBBED env:
-// --ignore-scripts deletes the lifecycle-script code-exec entry path (a reduction,
-// not a close). On any failure (no registry egress, lockfile drift) it leaves
-// node_modules absent, so the check pre-flight reports an honest "skipped" — never a
-// false pass, never a fabricated failure. Returns per-dir notes for logging only.
-export async function prepareCheckDeps(
-  worktreePath: string,
-  env: NodeJS.ProcessEnv,
-  dirs: string[] = ["web", "agent"],
-  timeoutMs = 10 * 60 * 1000,
-): Promise<{ dir: string; ok: boolean; detail: string }[]> {
-  const out: { dir: string; ok: boolean; detail: string }[] = [];
-  for (const dir of dirs) {
-    const cwd = `${worktreePath}/${dir}`;
-    if (!existsSync(`${cwd}/package.json`)) {
-      out.push({ dir, ok: false, detail: "no package.json" });
-      continue;
-    }
-    // PRD #51 M4: `npm ci` runs agent-authored package.json (even with --ignore-scripts,
-    // the lockfile resolution + any allowed binary) — an untrusted surface, so under the
-    // `runner` uid (setpriv wrapper). Single-uid (#58) runs it directly.
-    const nci = runnerCommand("npm", ["ci", "--ignore-scripts"]);
-    const ok = await new Promise<boolean>((resolve) => {
-      execFile(nci.command, nci.args, { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
-        resolve(!error),
-      );
-    });
-    out.push({ dir, ok, detail: ok ? "npm ci --ignore-scripts ok" : "npm ci failed → checks skip honestly" });
-  }
-  return out;
-}
+// The dependency install that made the npm checks runnable used to live here as
+// `prepareCheckDeps` (a hardcoded `npm ci --ignore-scripts` in `["web", "agent"]`).
+// PRD #121 M1/M2 generalized it into js-deps.ts — lockfile-driven, bounded discovery,
+// same sandbox and same flags — and both call sites (the executor's pre-plan install and
+// the self-improve check prep in runner.ts) now use that one implementation. It was
+// DELETED rather than left as a shim: two install paths for the same job is exactly the
+// drift this PRD set out to remove, and the hardcoded dir list was the bug.
 
 // defaultCheckRunner runs a check via execFile under the SCRUBBED env (buildCheckEnv)
 // with a wall-clock cap. It captures only the exit status, never the (potentially

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,6 @@ import {
   buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
-  prepareCheckDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -262,23 +261,10 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
   });
 });
 
-describe("prepareCheckDeps (M9: best-effort npm ci → honest skip on failure)", () => {
-  it("reports per-dir outcomes and never throws when npm ci fails", async () => {
-    const wt = mkdtempSync(join(tmpdir(), "si-deps-"));
-    mkdirSync(join(wt, "web"), { recursive: true });
-    // web/ has a package.json but a broken lockfile-less state → npm ci fails; agent/
-    // has no package.json → reported as such. Neither throws; both leave node_modules
-    // absent so the checks skip honestly.
-    writeFileSync(join(wt, "web", "package.json"), '{"name":"x","version":"1.0.0"}');
-    const notes = await prepareCheckDeps(wt, { PATH: process.env.PATH, HOME: wt }, ["web", "agent"], 30_000);
-    const web = notes.find((n) => n.dir === "web");
-    const agent = notes.find((n) => n.dir === "agent");
-    assert.ok(web && !web.ok, "npm ci without a lockfile must fail, reported honestly");
-    assert.ok(agent && !agent.ok && agent.detail.includes("no package.json"));
-    // The failure left no node_modules → a real check there would pre-flight to skipped.
-    assert.ok(!existsSync(join(wt, "web", "node_modules")));
-  });
-});
+// The `prepareCheckDeps` block that stood here went with the function (PRD #121 M2):
+// the dependency install is now js-deps.ts's `installJsDeps`, and its best-effort /
+// honest-skip contract is covered there — including the no-lockfile and failed-install
+// cases this block asserted.
 
 describe("selfImproveMrSection skip disclosure (M8)", () => {
   it("states plainly that skipped is not passed when any check was skipped", () => {
