@@ -315,12 +315,16 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-users", func(c *HTTPClient) error { _, e := c.AdminListUsers(context.Background()); return e }},
 		{"admin-runs", func(c *HTTPClient) error { _, e := c.AdminListRuns(context.Background()); return e }},
 		{"admin-workers", func(c *HTTPClient) error { _, e := c.AdminListWorkers(context.Background()); return e }},
+		{"admin-cli-tokens", func(c *HTTPClient) error { _, e := c.AdminListCLITokens(context.Background()); return e }},
 		{"admin-usage", func(c *HTTPClient) error { _, e := c.AdminUsage(context.Background()); return e }},
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
 		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7); return e }},
-		{"submit-run-input", func(c *HTTPClient) error { _, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil); return e }},
+		{"submit-run-input", func(c *HTTPClient) error {
+			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
+			return e
+		}},
 	}
 
 	// Three failure surfaces: 5xx, malformed 200 body, and unreachable server.

@@ -399,8 +399,54 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 		// actually did, which no later read reconstructs. Note the re-read itself is
 		// unanchored by construction (BulkSetDispositions passes uuid.Nil), so --run narrows
 		// a FOLLOW-UP look, it does not retroactively widen this response.
+		//
+		// THE REMEDY IS PRINTED AS RUNNABLE LINES, ONE PER RUN THIS CALL SETTLED — it used
+		// to be a single line carrying the LITERAL text `uzi review backlog --run <run-id>`,
+		// with `<run-id>` a placeholder in the emitted output rather than a value
+		// substituted at emit time. That is not an instruction a user (or a test) can run
+		// verbatim: it is a template, and the difference is exactly what the printed-
+		// instruction backstop exists to catch. The e2e helper's character allowlist
+		// rejects it on the `<`, which is the mechanical statement of the same thing.
+		//
+		// Naming every settled run also makes the advice strictly better: a write that
+		// spanned three runs used to tell the user to guess one of them. Mirrors the
+		// `uzi review undo %s %s` emission below, which already substitutes.
 		p.Println("warning: the post-write re-read hit the server's row cap — counts may be understated, and a coordinate it did not return is UNKNOWN, not settled")
-		p.Println("         --json on THIS call is the only complete record of what was written; `uzi review backlog --run <run-id>` narrows a re-check below the cap (--bucket cannot: it filters after the cut)")
+		if runs := distinctSettledRuns(res.Settled); len(runs) > 0 {
+			p.Println("         --json on THIS call is the only complete record of what was written; --bucket cannot narrow a re-check (it filters after the cut), but --run can — one per run this call settled:")
+			for _, id := range runs {
+				p.Printf("         uzi review backlog --run %s\n", id)
+			}
+			// AN EMPTY RESULT IS THE ANSWER, AND SAYING SO IS NOT REASSURANCE — IT CLOSES AN
+			// INFERENCE THE USER WAS BEING LEFT TO MAKE UNAIDED.
+			//
+			// The warning above frames the risk as "a coordinate it did not return is UNKNOWN,
+			// not settled" — i.e. DID MY WRITE LAND. The remedy answers a different question:
+			// what is still un-triaged on that run. They connect only through a step the reader
+			// has to take alone (todo empty ⟹ nothing un-settled ⟹ the dismiss covered
+			// everything). Sound, and never stated. That is the same class as the two false
+			// printed instructions this file exists because of, one notch milder: advice that
+			// parses, runs, and answers a question adjacent to the one just posed.
+			//
+			// WHAT MAKES AN EMPTY TRUSTWORTHY is a property of renderBacklog, not of this
+			// advice: it prints the truncation warning BEFORE the empty line, unconditionally
+			// on b.Truncated. So "no recommendations in this bucket" with NO warning above it
+			// is a COMPLETE empty rather than a possibly-cut one. Give the reason, not just the
+			// assertion — a reader who has it does not need to trust this sentence.
+			//
+			// Deliberately no --bucket here, not even --bucket all. The line directly above
+			// says --bucket cannot narrow a re-check; naming a --bucket flag one line later
+			// invites the next reader to re-derive that it narrows something. `--bucket all`
+			// was the SECOND false printed instruction this path already paid to remove.
+			p.Println("         (an empty result from one of these is the answer, not a dead end: nothing on that run is")
+			p.Println("          still un-triaged. A cut re-read prints its own truncation warning above the listing, so")
+			p.Println("          an empty result with no warning is complete.)")
+		} else {
+			// Nothing was settled, so there is no run to anchor on. Deliberately prints no
+			// command at all rather than a placeholder: an unrunnable line here is the
+			// defect this branch was split out to avoid.
+			p.Println("         --json on THIS call is the only complete record of what was written. Nothing was settled, so there is no run to anchor a re-check on (--bucket cannot help either: it filters after the cut)")
+		}
 	}
 	// `settled` names the exact (run, rec) coordinates this call wrote — the ONLY correct
 	// basis for a revert. Be precise about what is and is not recoverable, because the loose
@@ -448,6 +494,30 @@ func runGroupDisposition(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.C
 		}
 	}
 	return nil
+}
+
+// distinctSettledRuns returns the run ids a bulk disposition wrote to, first-appearance
+// order, without duplicates.
+//
+// Deduping is not tidiness: Settled carries one member per settled COORDINATE, and a single
+// run commonly carries several, so a naive loop would print the same remedy line two or
+// three times. The e2e row asserts the printed COUNT before executing anything, so a
+// duplicate would either break that assertion or — worse, if the count were relaxed to
+// match — make it satisfiable by output nobody checked.
+//
+// Order is first-appearance rather than sorted so the lines follow the order the server
+// reported, which is the same order the `to revert` block below prints.
+func distinctSettledRuns(settled []apitypes.JudgeSettledMemberDTO) []string {
+	seen := make(map[string]bool, len(settled))
+	out := make([]string, 0, len(settled))
+	for _, m := range settled {
+		if m.RunID == "" || seen[m.RunID] {
+			continue
+		}
+		seen[m.RunID] = true
+		out = append(out, m.RunID)
+	}
+	return out
 }
 
 // dispositionOutcome is the human label for a triage verdict, shared by the group verbs so

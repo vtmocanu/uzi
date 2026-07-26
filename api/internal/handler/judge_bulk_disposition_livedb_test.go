@@ -329,6 +329,29 @@ func TestBulkDispositionScopeLiveDB(t *testing.T) {
 // predicate the PRD's Remaining Work records as asserted-but-unexercised on the M1 read
 // query; this pins the bulk query's own copy of it, which is a different query body.
 //
+// ✅ RE-DERIVED AT `041c5291`, AND THE REASON IS THE POINT. The two folds above were first
+// measured at `31080a40`; FIVE migrations from main landed between there and the landing merge
+// (six paths appear in the diff — the sixth is PRD #98's own file renumbered 00075 -> 00081 with
+// identical content, which `git diff --name-status -M` separates as R100 from the five A lines), so
+// by the expiry rule in .claude/agent-team.md they had been measured against DDL the suite no
+// longer applies and certified nothing about today's tree. Re-run, one fold per run, each on
+// its OWN fresh throwaway Postgres, each confirmed present in both the .sql and the
+// regenerated .sql.go by `git diff --numstat`, each compiled (`sqlc generate` + `go vet`)
+// before being believed:
+//
+//	drop `AND f.category = rr.category AND f.target = rr.target`  RED, updated = 0
+//	`(f.filed_at IS NOT NULL)::bool` -> `false::bool`             RED, updated = 2
+//
+// Both still redden, both still with the SAME `updated` signature, and each reddened EXACTLY
+// this one test — measured as FAIL=1 against a whole-sweep RUN=141 PASS=140 SKIP=0, with the
+// unmutated baseline RUN=141 PASS=141 FAIL=0 SKIP=0 on the same tree. The 141 is `041c5291`'s
+// inventory and nothing more: it was 126 at `8c6be2b8`, 128 at `c1fcdfce`, 129 at `31080a40`.
+// "each fold reddens exactly one test" is the claim; the tally is only its receipt.
+//
+// Record the unchanged result rather than deleting the note: "re-derived after six migrations,
+// unchanged" is a stronger artifact than the original measurement, and it is the evidence for
+// re-folding rather than the excuse to skip it next time. Surviving once is not a licence.
+//
 // The scope=all leg is not decoration: it proves the skip above was the LADDER refusing an
 // already-filed member, not a resolve that silently failed to find it. Same argument as leg
 // (c) of the owner-only matrix.

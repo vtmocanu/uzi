@@ -564,6 +564,26 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/rate-limits", h.AdminRateLimits)
 				// Self-improvement config (PRD #46 M5): read the autonomous improvement job.
 				r.Get("/selfimprove", h.GetSelfimproveConfig)
+				// Factory-wide standing-credential inventory: every CLI token with its
+				// owner. Closes the gap that `workers` has not had since PRD #42 — a CLI
+				// token was visible to its owner and to NOBODY else, and a user-scope token
+				// never expires, so nobody could answer "who holds credentials to this
+				// instance?". Metadata only; the query projects columns explicitly so the
+				// sha256 is not even in the Go type (see cli_tokens.sql).
+				//
+				// READ-ONLY BY DECISION, not by omission: there is no admin revoke. Taking
+				// someone's credential away is a different blast radius from looking at the
+				// list, and only visibility was authorised.
+				//
+				// The limiter is authLimiter, and the reuse is deliberate. PerUserMiddleware
+				// keys buckets by (route pattern, user id), so sharing the OBJECT shares only
+				// the rate configuration — this route's bucket is disjoint from /vault/unlock's
+				// and cannot contend with it. authLimiter's budget is the credential-surface
+				// one (RATE_LIMIT_MAX, default 10/min), which is the right shape for enumerating
+				// credentials; a ninth limiter parameter would change Routes' signature, and
+				// with it the position-to-name mapping the mount tests pin, for no behavioural
+				// gain.
+				r.With(authLimiter.PerUserMiddleware).Get("/cli-tokens", h.AdminListCLITokens)
 			})
 			// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 			r.Group(func(r chi.Router) {

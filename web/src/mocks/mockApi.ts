@@ -31,6 +31,7 @@ import {
   type Notification,
   type NotificationList,
   type PrivilegeReport,
+  type RecommendationCategory,
   type Run,
   type SelfimproveConfig,
   type SelfimproveUpdate,
@@ -258,16 +259,27 @@ function reviewDTO(review: MockReview): MockReview {
   };
 }
 
-// bucketOfRec buckets ONE recommendation through the shared ladder (dismissed > done >
-// filed > todo), the same precedence recomputeTriage uses — extracted so the Judge
-// backlog (PRD #98) and the stats tally cannot disagree on what a coordinate's state is.
+// bucketOf is the ladder itself (dismissed > done > filed(settled) > todo), and it mirrors
+// workersvc.BucketOf(dispositionStatus string, filedSettled bool) argument for argument.
+// The signature is the point: the server's ladder is a function of TWO SQL-resolved
+// values, so a version of it that takes a mock review object cannot be handed the server's
+// input and cannot be compared against it. This one can — fixtures/judge-fidelity feeds
+// the identical (disposition_status, filed_settled) pair to both.
+export function bucketOf(dispositionStatus: string | null, filedSettled: boolean): JudgeBacklogBucket {
+  if (dispositionStatus === "dismissed") return "dismissed";
+  if (dispositionStatus === "done") return "done";
+  if (filedSettled) return "filed";
+  return "todo";
+}
+
+// bucketOfRec resolves ONE recommendation's coordinate against a mock review's dispositions
+// and filed issues, then defers to bucketOf. It is the mock's stand-in for the SQL join —
+// the two LEFT JOINs that produce disposition_status and filed_settled — and deliberately
+// contains no precedence of its own, so the ladder exists exactly once on this side.
 function bucketOfRec(review: MockReview, category: string, target: string): JudgeBacklogBucket {
   const disp = review.dispositions.find((d) => d.category === category && d.target === target);
   const filed = review.filed_issues.some((f) => f.category === category && f.target === target);
-  if (disp?.status === "dismissed") return "dismissed";
-  if (disp?.status === "done") return "done";
-  if (filed) return "filed";
-  return "todo";
+  return bucketOf(disp?.status ?? null, filed);
 }
 
 // computeTriage sums the per-recommendation ladder over EVERY review the caller owns —
@@ -287,98 +299,283 @@ function computeTriage(): TriageCounts {
   return total;
 }
 
-// RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280) so the mock's
-// preview truncation matches. Counted in code units here (the demo text is ASCII); the
-// server counts runes.
+// RATIONALE_PREVIEW_MAX mirrors the server's RationalePreviewMaxRunes (280), and the count
+// is in RUNES — Array.from iterates code points, exactly as Go's []rune(s) does in
+// workersvc.rationalePreview. `s.length` / `s.slice` count UTF-16 code units, which is a
+// different number for anything outside the BMP.
+//
+// This was a live divergence, not a hypothetical, and it produced THREE distinct defects
+// (measured against the Go implementation, PRD #98 seam 6):
+//   1. a different answer to "was this cut" — at 200 rocket emoji the server returns the
+//      string whole and the code-unit mock truncated it;
+//   2. a different cut LENGTH when both cut — at 300 emoji the server yields 281 runes and
+//      the code-unit mock yielded 141;
+//   3. a LONE SURROGATE when the cut landed mid-pair — precisely the broken glyph
+//      judge_backlog.go:64-67 says the rune count exists to prevent.
+// Pinned by fixtures/judge-fidelity, cases preview-multibyte-cut and
+// preview-multibyte-no-cut; the second is the one that can tell this version from the
+// code-unit one, because past 280 runes both cut in the same place.
 const RATIONALE_PREVIEW_MAX = 280;
 function rationalePreview(s: string): string {
-  if (s.length <= RATIONALE_PREVIEW_MAX) return s;
-  return s.slice(0, RATIONALE_PREVIEW_MAX).replace(/[\s]+$/, "") + "…";
+  const runes = Array.from(s);
+  if (runes.length <= RATIONALE_PREVIEW_MAX) return s;
+  // The character class is SPELLED OUT to match Go's TrimRight cutset " \t\r\n" exactly,
+  // and it is a SEPARATE divergence from the rune count above — switching to Array.from
+  // does nothing for it. JS `\s` is much wider than that cutset: it also matches U+00A0
+  // (NBSP), U+FEFF, U+2028, U+2029, U+000B, U+000C and the U+2000-U+200A run. Measured:
+  // with rune 280 padded to each of NBSP / U+FEFF / U+2028, the server KEEPS the character
+  // and `\s` stripped it, so the two previews differed by one rune with no cut-position
+  // disagreement at all. Pinned by fixtures/judge-fidelity, case preview-trim-boundary.
+  return runes.slice(0, RATIONALE_PREVIEW_MAX).join("").replace(/[ \t\r\n]+$/, "") + "…";
 }
 
 const BUCKET_RANK: Record<string, number> = { dismissed: 3, done: 2, filed: 1, todo: 0 };
 const RANK_BUCKET: JudgeBacklogBucket[] = ["todo", "filed", "done", "dismissed"];
 
-// computeBacklog mirrors the server's grouped read (workersvc.GroupJudgeRecommendations):
-// flatten every occurrence, order by review updated_at DESC (a re-judge counts as recent),
-// dedup by (category, target), roll up (todo if any open, else the highest member rung),
-// then sort by frequency (run_count, then open_count). The ?run= anchor keeps only groups
-// that recur in that run (a coordinate-level semi-join) while preserving each kept group's
-// other-run occurrences; ?bucket= filters the GROUP ROLLUP. triage is the canonical
-// aggregate, NEVER tallied from the returned groups.
-function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
-  const ordered = [...reviews].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+// JudgeBacklogRow is ONE ROW of the server's grouped read — the JSON shape of
+// store.ListJudgeRecommendationRowsForUserRow. The keys are BYTE-IDENTICAL to that
+// generated struct's json tags on purpose, because this type is the wire between the two
+// implementations: fixtures/judge-fidelity/cases.json is decoded straight into the Go
+// struct on one side and cast to this on the other, so the two graders are fed the same
+// bytes rather than two hand-built adapters.
+//
+// Note which fields are JOIN OUTPUTS: disposition_status, set_via, filed_settled and the
+// three filed-issue columns arrive already resolved from SQL. The mock's own review
+// objects never reach groupJudgeRecommendations; backlogRowsFromReviews is the mock's
+// stand-in for the join and it runs first.
+export type JudgeBacklogRow = {
+  review_id: string;
+  run_id: string;
+  verdict: string;
+  run_title: string;
+  rec_id: string;
+  category: RecommendationCategory;
+  target: string;
+  rationale_md: string;
+  confidence: JudgeOccurrence["confidence"];
+  disposition_status: string | null;
+  // dismiss_reason is projected by the query but the grouper never reads it (only the #94
+  // triage tally does), so it is optional here — matching the Go decoder, which accepts a
+  // fixture row that omits the key.
+  dismiss_reason?: string | null;
+  set_via: string | null;
+  filed_settled: boolean;
+  filed_issue_iid: number | null;
+  filed_issue_url: string | null;
+  filed_at: string | null;
+};
+
+// groupJudgeRecommendations mirrors workersvc.GroupJudgeRecommendations one-to-one: dedup
+// the flat rows by (category, target), roll up (todo if any member is open, else the
+// highest member rung), and sort by frequency (run_count DESC, then open_count DESC).
+//
+// It expects the query's order — most-recently-JUDGED review first — so a group's FIRST
+// row is its most-recent occurrence and supplies rationale_preview.
+//
+// The ?run= anchor is NOT here, and neither is the row cap: on the server both live in SQL
+// (a coordinate-level semi-join and a LIMIT that cuts rows BEFORE grouping), so a mock that
+// put them inside the grouper would be comparable to nothing. computeBacklog applies its
+// anchor around this call, and says there why that is not the same algorithm.
+export function groupJudgeRecommendations(rows: JudgeBacklogRow[]): JudgeRecommendationGroup[] {
   const byCoord = new Map<string, JudgeRecommendationGroup>();
   const runsSeen = new Map<string, Set<string>>();
   const topRung = new Map<string, number>();
 
-  for (const review of ordered) {
-    for (const rec of review.recommendations) {
-      const key = coordKey(rec.category, rec.target);
-      const b = bucketOfRec(review, rec.category, rec.target);
-      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
-      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
-      const occ: JudgeOccurrence = {
-        run_id: review.target_run_id,
-        run_title: getRun(review.target_run_id)?.issue_title ?? "",
-        review_id: review.id,
-        rec_id: rec.id,
-        verdict: review.verdict as ReviewVerdict,
-        confidence: rec.confidence,
-        bucket: b,
-        // Provenance rides alongside the bucket, because both a hand-marked and an
-        // auto-done are bucket "done" (PRD #98 Decision 6 / review B3).
-        ...(disp?.set_via ? { set_via: disp.set_via } : {}),
-        ...(filed
-          ? { filed_issue: { issue_iid: filed.issue_iid, issue_url: filed.issue_url, filed_at: filed.filed_at } }
-          : {}),
+  for (const row of rows) {
+    const key = coordKey(row.category, row.target);
+    const b = bucketOf(row.disposition_status, row.filed_settled);
+    const occ: JudgeOccurrence = {
+      run_id: row.run_id,
+      run_title: row.run_title,
+      review_id: row.review_id,
+      rec_id: row.rec_id,
+      verdict: row.verdict as ReviewVerdict,
+      confidence: row.confidence,
+      bucket: b,
+      // Provenance rides alongside the bucket, because both a hand-marked and an
+      // auto-done are bucket "done" (PRD #98 Decision 6 / review B3). Omitted rather than
+      // nulled when absent, matching Go's `json:"set_via,omitempty"` on a "" string.
+      ...(row.set_via ? { set_via: row.set_via as JudgeOccurrence["set_via"] } : {}),
+      // filed_settled is the gate, not the presence of an iid — the same test
+      // workersvc.filedIssueRef makes. filed_settled is `(f.filed_at IS NOT NULL)` in SQL,
+      // so the ?? fallbacks below are unreachable through the query; they exist because Go
+      // reads .Int64/.String off a NULL pgtype as the zero value rather than erroring, and
+      // a fixture that hand-wrote that combination must not diverge over it.
+      ...(row.filed_settled
+        ? {
+            filed_issue: {
+              issue_iid: row.filed_issue_iid ?? 0,
+              issue_url: row.filed_issue_url ?? "",
+              filed_at: row.filed_at ?? "",
+            },
+          }
+        : {}),
+    };
+    let g = byCoord.get(key);
+    if (!g) {
+      g = {
+        category: row.category,
+        target: row.target,
+        bucket: "todo",
+        open_count: 0,
+        run_count: 0,
+        // The first row of a group is its most-recent occurrence (query order).
+        rationale_preview: rationalePreview(row.rationale_md),
+        occurrences: [],
       };
-      let g = byCoord.get(key);
-      if (!g) {
-        g = {
-          category: rec.category,
-          target: rec.target,
-          bucket: "todo",
-          open_count: 0,
-          run_count: 0,
-          // First occurrence is the most-recent (ordered above) → its rationale is the preview.
-          rationale_preview: rationalePreview(rec.rationale_md),
-          occurrences: [],
-        };
-        byCoord.set(key, g);
-        runsSeen.set(key, new Set());
-        topRung.set(key, 0);
-      }
-      g.occurrences.push(occ);
-      if (b === "todo") g.open_count += 1;
-      const seen = runsSeen.get(key)!;
-      if (!seen.has(occ.run_id)) {
-        seen.add(occ.run_id);
-        g.run_count += 1;
-      }
-      topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
+      byCoord.set(key, g);
+      runsSeen.set(key, new Set());
+      topRung.set(key, 0);
     }
+    g.occurrences.push(occ);
+    if (b === "todo") g.open_count += 1;
+    const seen = runsSeen.get(key)!;
+    if (!seen.has(occ.run_id)) {
+      seen.add(occ.run_id);
+      g.run_count += 1;
+    }
+    topRung.set(key, Math.max(topRung.get(key)!, BUCKET_RANK[b]));
   }
 
-  let groups = [...byCoord.values()];
+  const groups = [...byCoord.values()];
   for (const g of groups) {
     const key = coordKey(g.category, g.target);
     g.bucket = g.open_count > 0 ? "todo" : RANK_BUCKET[topRung.get(key)!];
   }
+  // Array.prototype.sort has been REQUIRED to be stable since ES2019, so ties keep the
+  // first-seen (most-recent-first) order the query established — the same guarantee Go
+  // buys with sort.SliceStable. The difference is where it comes from: here it is a
+  // language guarantee, there it is a call-site choice that can be edited away.
+  groups.sort((a, b) => b.run_count - a.run_count || b.open_count - a.open_count);
+  return groups;
+}
+
+// filterGroups applies the ?bucket= filter to the grouped rows, mirroring
+// workersvc.filterGroups: it matches the GROUP ROLLUP, so "todo" is exactly
+// "open_count >= 1" and the settled rungs are mutually exclusive with it.
+//
+// Go additionally treats an EMPTY bucket as unfiltered, a route-level default this side
+// cannot express — JudgeBacklogBucket is a closed union with no "" member — so that one
+// branch is out of the fixture's reach. It is reachable in Go only from an internal caller
+// that passes "", never from the wire.
+export function filterGroups(
+  groups: JudgeRecommendationGroup[],
+  bucket: JudgeBacklogBucket,
+): JudgeRecommendationGroup[] {
+  return bucket === "all" ? [...groups] : groups.filter((g) => g.bucket === bucket);
+}
+
+// backlogRowsFromReviews flattens the mock's review objects into the server's row shape,
+// in the query's order (rv.updated_at DESC — a re-judge counts as recent). This is the
+// mock's stand-in for the SQL join, and it is deliberately OUTSIDE the grouper: the two
+// LEFT JOINs that resolve disposition_status / filed_settled are the part seam 6 cannot
+// compare, because on the server they are SQL and here they are two array lookups.
+function backlogRowsFromReviews(): JudgeBacklogRow[] {
+  const ordered = [...reviews].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const rows: JudgeBacklogRow[] = [];
+  for (const review of ordered) {
+    for (const rec of review.recommendations) {
+      const disp = review.dispositions.find((d) => d.category === rec.category && d.target === rec.target);
+      const filed = review.filed_issues.find((f) => f.category === rec.category && f.target === rec.target);
+      rows.push({
+        review_id: review.id,
+        run_id: review.target_run_id,
+        verdict: review.verdict,
+        run_title: getRun(review.target_run_id)?.issue_title ?? "",
+        rec_id: rec.id,
+        category: rec.category,
+        target: rec.target,
+        rationale_md: rec.rationale_md,
+        confidence: rec.confidence,
+        disposition_status: disp?.status ?? null,
+        dismiss_reason: disp?.reason ?? null,
+        set_via: disp?.set_via ?? null,
+        // The mock has no unsettled-claim state: an entry in filed_issues IS a settled
+        // link, which is what the query's (f.filed_at IS NOT NULL) computes.
+        filed_settled: filed !== undefined,
+        filed_issue_iid: filed?.issue_iid ?? null,
+        filed_issue_url: filed?.issue_url ?? null,
+        filed_at: filed?.filed_at ?? null,
+      });
+    }
+  }
+  return rows;
+}
+
+// MOCK_BACKLOG_MAX_ROWS is the demo's stand-in for the server's JudgeBacklogMaxRows (2000).
+// It is small because the demo is: data.ts carries 11 rows across 3 reviews, and 6 is the
+// value that cuts through the MIDDLE of a recurring coordinate rather than at a group
+// boundary. A cut at a group boundary would only remove whole groups, which is the easy half
+// of the state and not the half the banner is warning about.
+export const MOCK_BACKLOG_MAX_ROWS = 6;
+
+// capBacklogRows mirrors the cut in JudgeRecommendationBacklog (judge_backlog.go): rows are
+// cut BEFORE grouping, and `truncated` says the cut actually removed something.
+//
+// THE ORDER IS THE ENTIRE POINT, and flipping a boolean instead would demo a lie. The banner
+// means "there are groups you are not seeing, and a coordinate that did not come back is
+// UNKNOWN rather than settled". A `truncated: true` sitting above COMPLETE data shows that
+// warning over a screen that is in fact the whole truth, which teaches the reader the
+// opposite of what the state means. Cutting rows first is also what makes a SURVIVING group
+// under-report run_count and possibly roll up to the wrong bucket -- the subtlety the flag
+// exists to warn about, and the reason the state is worth demoing at all.
+//
+// The comparison is `>` and not `>=` on purpose: a backlog of exactly `max` rows is NOT
+// truncated. That off-by-one is the same one the server buys by reading `max + 1` rows, so
+// that a full page is distinguishable from an exactly-full one without a second COUNT.
+export function capBacklogRows(
+  rows: JudgeBacklogRow[],
+  max: number,
+): { rows: JudgeBacklogRow[]; truncated: boolean } {
+  if (rows.length <= max) return { rows, truncated: false };
+  return { rows: rows.slice(0, max), truncated: true };
+}
+
+// backlogMaxRows returns the row cap in force. There is none by default, so an ordinary demo
+// visitor can never reach this state by accident; the `truncated-backlog` demo scenario turns
+// it on (`?mock=truncated-backlog`, or the uzi_mock_scenario localStorage key -- the same
+// PRD #45 mechanism the OIDC demo states use). The scenario is a single string, so this state
+// and the OIDC ones are mutually exclusive by construction; nothing needs both.
+//
+// WHY A DELIBERATE TOGGLE, rather than a permanently-capped demo or a test-only hook. M3's
+// requirement is that the mock renders EVERY state, and truncation is the one a person most
+// needs to SEE, because it is the only state in which the screen is not the truth -- and the
+// one whose CLI remedy was measured outright false earlier in this PRD. A test-only hook
+// satisfies "every state has a test" while leaving a human clicking the demo unable to reach
+// it; a permanent cap would make the demo permanently wrong about everything else.
+function backlogMaxRows(): number {
+  return mockScenario() === "truncated-backlog" ? MOCK_BACKLOG_MAX_ROWS : Number.POSITIVE_INFINITY;
+}
+
+// computeBacklog assembles GET /me/judge/recommendations out of the pieces above, in the
+// server's order: join (backlogRowsFromReviews) → cap → group → anchor → bucket filter.
+// triage is the canonical aggregate, NEVER tallied from the returned groups.
+function computeBacklog(bucket: JudgeBacklogBucket, runAnchor: string): JudgeBacklog {
+  // The cap sits between the join and the grouper, which is where the server's LIMIT sits.
+  const capped = capBacklogRows(backlogRowsFromReviews(), backlogMaxRows());
+  let groups = groupJudgeRecommendations(capped.rows);
   // ?run= anchor: a coordinate-level semi-join — keep a group iff it recurs in the anchor
   // run, but keep ALL its occurrences (so a notification still shows the other runs it
   // recurs in). A foreign/unknown run matches nothing → empty, no existence oracle.
+  //
+  // This filters GROUPS after grouping; the server filters ROWS before it, inside the
+  // query's WHERE. The two read as equivalent and are NOT the same algorithm, which is why
+  // the anchor is excluded from the fidelity fixture (see fixtures/judge-fidelity/README.md)
+  // and belongs to the e2e leg instead.
   if (runAnchor) {
     groups = groups.filter((g) => g.occurrences.some((o) => o.run_id === runAnchor));
   }
-  groups.sort((a, b) => (b.run_count - a.run_count) || (b.open_count - a.open_count));
-  const filtered = bucket === "all" ? groups : groups.filter((g) => g.bucket === bucket);
 
   return {
     bucket,
     run: runAnchor,
-    groups: filtered,
-    truncated: false,
+    groups: filterGroups(groups, bucket),
+    truncated: capped.truncated,
+    // triage is the canonical /me/judge/stats aggregate and is deliberately NOT affected by
+    // the cut, exactly as on the server, where it comes from a separate query with no LIMIT.
+    // That divergence is not a bug to reconcile: it is what the truncated state LOOKS like.
+    // The badge keeps saying how many coordinates are actually open while the page shows
+    // fewer, and a reader who trusted the page would be wrong.
     triage: computeTriage(),
   };
 }
@@ -1979,7 +2176,12 @@ export const mockApi = {
       updated: writtenTriples.size,
       settled,
       groups,
-      truncated: false,
+      // Carried through from the re-read, exactly as BulkSetDispositions does
+      // (judge_bulk_disposition.go: `Truncated: backlog.Truncated`). It is NOT independently
+      // computed here: the re-read is bounded by the same cap, so a second source for this
+      // flag would be a second implementation of the cut, and the two could disagree about
+      // the very response they are describing.
+      truncated: backlog.truncated,
       triage: backlog.triage,
     };
     return delay(result, 120);

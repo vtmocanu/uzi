@@ -161,8 +161,8 @@ format         none (gap)          # gofmt -l ./api reports 26 drifted files tod
 lint           none (gap)          # no golangci-lint, no eslint; `go vet` runs in CI only
 typecheck      cd web && npm run typecheck
                cd agent && npm run typecheck
-test           cd api && go test ./...
-               cd controller && go test ./...
+test           cd api && go test -count=1 ./...
+               cd controller && go test -count=1 ./...
                cd web && npm test          # vitest
                cd agent && npm test        # node --test via tsx
                cd web && npm run check-docs
@@ -176,7 +176,17 @@ long-running   ./e2e/run-e2e.sh    # ~30 min, see the exception below
 In linked worktrees a bare `go build`/`go test` can fail on VCS stamping; use
 `-buildvcs=false` locally, never commit it.
 
-Real suites: `go test ./...` (api), `npm test` (web = vitest, agent = node --test
+`-count=1` on the two Go lines is part of the gate, not a habit: Go's test cache
+hashes only files INSIDE the module root, and this repo reads test inputs across
+module boundaries in both directions (`fixtures/judge-fidelity/` at the repo root
+by `api/internal/workersvc`, and the api's goldens by `controller/`). Without it a
+fixture-only edit leaves the gate printing `ok (cached)` having run nothing.
+**The control is a mutation, not an absence: gut the fixture and confirm the gate
+reddens.** Do not substitute "no `(cached)` lines appeared" — that is satisfied by
+passing the flag at all, and it was measured PASSING in the exact broken
+configuration it would be claimed to detect. See `CLAUDE.md`'s api section.
+
+Real suites: `go test -count=1 ./...` (api), `npm test` (web = vitest, agent = node --test
 via tsx). The end-to-end gate is `./e2e/run-e2e.sh` (isolated stack, dummy creds,
 stub executor; `KEEP_STACK=1` to inspect) and `./scripts/smoke.sh` (auth-API smoke;
 needs a FRESH stack — `docker compose down -v` first). `run-e2e.sh` re-execs itself

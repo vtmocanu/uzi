@@ -531,6 +531,42 @@ const server = https.createServer(
       log("_e2e label event", iid, action, ev.label.name, "by", ev.user.username, "id", ev.id);
       return send(res, 201, ev);
     }
+    // Flip an ISSUE's state — the harness stand-in for a human closing an issue on
+    // the forge (PRD #98 M6/M8b). Mirrors the MR mutator below, and exists for the
+    // same reason: uzi never closes an issue itself, it only ever READS the state,
+    // so without this route `state` is write-once at creation and the whole
+    // filed→closed→Done edge is unreachable from the harness.
+    //
+    // MEASURED before adding it: makeIssue stamps state:"opened" and NOTHING else in
+    // this file assigns issue.state — the GitLab PUT /issues/{iid} handler applies
+    // only add_labels/remove_labels, by design, and the Forgejo lane's PATCH does the
+    // same. So this is a new capability, not a second way to do an existing one.
+    //
+    // LANE-NEUTRAL BY CONSTRUCTION: it mutates the shared state.issues store, and the
+    // Forgejo lane serves the same objects through toForgejoIssue (which maps
+    // state via forgejoIssueState). No lane gate is needed here or at the call site.
+    //
+    // updated_at is bumped because a REAL forge does it on a close — not because
+    // anything in the harness needs it. Nothing here reads updated_after: GET /issues
+    // returns Object.values(state.issues) wholesale, deliberately, so a reconcile pass
+    // cannot evict the cache. That is a fidelity LIMIT of this fake and the phase
+    // consuming this route says so at its own site.
+    const issueState = method === "POST" && path.match(/^\/_e2e\/issues\/(\d+)\/state$/);
+    if (issueState) {
+      const body = await readBody(req);
+      const want = String(body.state || "");
+      if (!["opened", "closed"].includes(want)) {
+        return send(res, 400, { message: `bad issue state ${JSON.stringify(want)}` });
+      }
+      const issue = state.issues[Number(issueState[1])];
+      if (!issue) return send(res, 404, { message: "404 Not found (no such issue)" });
+      issue.state = want;
+      issue.updated_at = new Date().toISOString();
+      persist();
+      log("issue", issue.iid, "state ->", want);
+      return send(res, 200, issue);
+    }
+
     // Flip an MR's state — the harness stand-in for a reviewer closing, reopening,
     // or merging an MR (uzi itself only ever GETs the MR). E2E-only mutator,
     // matching the /_e2e/* introspection style.

@@ -193,12 +193,73 @@ func TestRecommendationFiledIssuesLiveDB(t *testing.T) {
 	}
 	mustExec(ctx, t, pool, `UPDATE recommendation_filed_issues SET filing_since = now() - interval '1 hour' WHERE id = $1`, sweepClaim)
 	swept, err := q.SweepStrandedRecommendationClaims(ctx, pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true})
-	if err != nil || swept != 1 {
-		t.Fatalf("sweep should reap exactly the 1 stranded claim, got swept=%d err=%v", swept, err)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// 🔴 THIS USED TO ASSERT `swept != 1` — A TABLE-WIDE EQUALITY ON A QUERY WITH NO SCOPE.
+	// SweepStrandedRecommendationClaims deletes by cutoff across the WHOLE table, and the
+	// live-DB packages share one database, so that number counted every stranded claim any
+	// other fixture had left behind. It is the standing "scope live-DB assertions to the
+	// fixture" rule, broken by the assertion written to enforce the sweep.
+	//
+	// Not hypothetical: measured 2026-07-21 at `swept=23` against `want 1`, on a database that
+	// had accumulated claims across repeated runs of a NEIGHBOURING test. It fails on what other
+	// tests left behind, which is the definition of a flake, and it would have gone off in CI
+	// the first time two fixtures overlapped. Worse than flaky, it was ALSO weak: an equality on
+	// a global count says nothing about WHICH row went.
+	//
+	// Replaced by three fixture-scoped facts, which are strictly stronger. Each names the
+	// predicate it pins, because a sweep has three and the old assertion reached none of them:
+	//
+	//   1. the STRANDED claim is gone            -> `filing_since < @cutoff` fires when it should
+	//   2. the FRESH claim SURVIVES              -> `filing_since < @cutoff` does NOT over-fire
+	//   3. the SETTLED row survives              -> `filed_at IS NULL` protects a filed link
+	//
+	// BE PRECISE ABOUT WHAT (2) ADDS, because the tempting claim is bigger than the measurement.
+	// It is NOT that over-firing was previously undetectable: on a clean database the old global
+	// count would have read 2 and tripped `!= 1`. What (2) adds is that the detection no longer
+	// rides on THE SAME NUMBER that made the assertion flaky — a count that other fixtures move
+	// in both directions can mask an over-fire as easily as it can invent one — and that the
+	// failure now names the row and the consequence instead of printing an integer.
+	//
+	// It is still the assertion that matters most, because it pins the cutoff in the direction
+	// that costs money. The query's own comment explains why: the sweep is a DELETE, so reaping a
+	// slow-but-alive CreateIssue lets a retry re-INSERT and file a SECOND forge issue, the exact
+	// duplicate the claim-first design exists to prevent. The fixture already held a live,
+	// unstranded claim (improve_agent/coder, re-claimed just above) and nothing had ever asserted
+	// it must survive.
+	//
+	// MEASURED, both directions, one fold per run against a fresh database, each compiled first:
+	//
+	//	`filing_since < @cutoff` -> `filing_since > @cutoff`            RED at (1), that one only
+	//	`AND filing_since < @cutoff` -> `AND (filing_since < @cutoff
+	//	    OR filing_since IS NOT NULL)`                               RED at (2), that one only
+	//
+	// The obvious over-fire fold — DELETING the `AND filing_since < @cutoff` clause — does NOT
+	// work here, and the reason is the sqlc trap in CLAUDE.md wearing a new costume: dropping the
+	// clause drops the only use of @cutoff, so the generated function loses its parameter and the
+	// TEST FILE stops compiling ("too many arguments in call"). A build error, not a red
+	// assertion. The always-true disjunction keeps the parameter referenced and its type intact.
+	if n := countFiledForCoord(ctx, t, pool, reviewID, "install_worker_tool", "shellcheck"); n != 0 {
+		t.Fatalf("the stranded claim (filing_since backdated an hour, cutoff a minute) must be "+
+			"reaped; %d row(s) survive — the cutoff comparison is not firing", n)
+	}
+	if n := countFiledForCoord(ctx, t, pool, reviewID, "improve_agent", "coder"); n != 1 {
+		t.Fatalf("a claim stamped seconds ago must SURVIVE a cutoff of now()-1m; got %d row(s). "+
+			"An over-eager sweep DELETEs a claim whose CreateIssue is still in flight, and the retry "+
+			"then files a SECOND forge issue — the duplicate claim-first exists to prevent", n)
 	}
 	// The settled improve_uzi row (filing_since NULL) must be untouched by any sweep.
 	if n := countFiledForCoord(ctx, t, pool, reviewID, "improve_uzi", ""); n != 1 {
 		t.Fatalf("the sweep must never touch a settled row (filing_since NULL); got %d", n)
+	}
+	// Kept only as a sanity floor, deliberately NOT an equality: this test's own stranded row
+	// makes >=1 true regardless of what else shares the database, while `== 1` was a statement
+	// about every other fixture in the suite. It catches a sweep that deleted nothing at all.
+	if swept < 1 {
+		t.Fatalf("sweep reported %d rows deleted; it must have reaped at least this fixture's "+
+			"stranded claim", swept)
 	}
 }
 

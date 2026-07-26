@@ -83,7 +83,7 @@ uzi review undo <id> <rec> | stats [--json]
 uzi token list
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
 uzi repo list
-uzi admin users | runs | workers | usage | rate-limits
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi tui [run-id]
 uzi version
@@ -160,6 +160,19 @@ A few worth knowing:
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports
   `is_admin: false` even for an admin — that's the credential's own
   authority, not your résumé.
+- **`admin cli-tokens` is the factory-wide standing-credential inventory** —
+  every CLI token, whoever owns it, with `OWNER`, `PREFIX`, `NAME`, `SCOPE`,
+  `STATE`, `USED` (last-use, capped to once a minute) and `EXPIRES` (blank
+  means never — the webui-minted `uzc_` the agent/CI path depends on). It
+  never prints a token value or its hash: the value isn't stored anywhere
+  after mint, and the hash is excluded by the query's own column projection,
+  so it's absent from the Go type this reads, not merely dropped at render
+  time. It **does** carry the same `last_used_ip` a user sees for their own
+  tokens — factory-wide, so an `admin_ro` holder can see every user's source
+  IPs. That's the deliberate point of `admin_ro` being a factory-wide read,
+  not an oversight, but worth knowing before you mint or hand out one of
+  these tokens. Read-only: there's no admin revoke here, the same write/read
+  split as every other `admin` verb.
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).
@@ -298,16 +311,34 @@ Three things to know before acting on a group action's output:
 - **`updated` counts coordinates, not recommendations.** One review can carry
   the same `(category, target)` twice and both share a single disposition row,
   so dismissing a group of 5 can correctly report 4.
-- **`updated: 0` succeeded and wrote nothing**, and *why* is deliberately
-  unknowable: a coordinate that doesn't exist, one already settled, and one
-  belonging to another user are the same answer, so nothing leaks whether it
-  exists. Re-read `backlog` rather than guessing.
+- **`updated: 0` succeeded and wrote nothing.** The `--json` field itself is
+  `0` for three different causes, but the printed message no longer treats
+  them as one answer: when the write's own re-read comes back untruncated and
+  still holds the coordinate, it says **"that coordinate is already
+  settled"** — that's your own data, so naming it leaks nothing. A coordinate
+  that's misspelt and one belonging to another user still give the identical
+  **"no open member of yours matched"** message; the server refuses to tell
+  those two apart on purpose (distinguishing them would let you enumerate
+  which coordinates exist for other users), and a truncated re-read folds
+  "already settled" back into that same ambiguous message too, since a
+  settled coordinate can simply have fallen outside the read window. Re-read
+  `backlog` if the message doesn't already tell you which case you're in.
 - **`truncated: true` means a missing group is unknown, not settled** — the row
   cap applies before grouping, so a surviving group's counts can be understated
   too. Narrow with **`--run <run-id>`**: the anchor is the only filter applied
   *before* the cap, so it is the only one that changes what gets cut. `--bucket`
   filters the surviving rows and cannot reach the missing ones. The `triage` tally is exempt: it's the canonical all-time aggregate and
   matches `uzi review stats` and the web nav badge exactly.
+- **When the write's own re-read is truncated, the CLI prints the `--run`
+  remedy for you** — one ready-to-paste `uzi review backlog --run <run-id>`
+  line per run *this call actually settled* (read off the write's own record,
+  never off the truncated re-read), not a placeholder to fill in yourself. An
+  empty result from following one of those lines is the answer, not a dead
+  end: nothing on that run is still un-triaged. If the follow-up read is
+  itself cut, it prints its own truncation warning above the listing, so an
+  empty result with no warning above it is complete. `--json` on the
+  *original* write call is the only complete record of what that call did;
+  neither `--bucket` nor a later re-read can reconstruct it.
 
 Passing only one of `--category`/`--target` is a usage error (exit 2). An empty
 half is a literal empty string, not a wildcard, so sending it would report a
@@ -343,10 +374,12 @@ The **group** form is owner-only too, but it refuses *silently* rather than
 with a 404, and the difference is a contract, not an oversight. Its unit is a
 `(category, target)` coordinate, not an id, so there is nothing to report as
 not-found: another user's coordinate simply resolves to zero of *your* rows and
-comes back `200`, `updated: 0` — the same answer a misspelt or already-settled
-coordinate gives. That indistinguishability is the point; a per-item outcome
-would rebuild exactly the existence oracle the 404-on-everything rule removes.
-Don't read `updated: 0` as an error, and don't read it as success either.
+comes back `200`, `updated: 0` — the same answer a misspelt coordinate gives
+(an already-settled coordinate of your own is told apart by its message; see
+above). That indistinguishability between "misspelt" and "someone else's" is
+the point; a per-item outcome would rebuild exactly the existence oracle the
+404-on-everything rule removes. Don't read `updated: 0` as an error, and don't
+read it as success either.
 
 ## Anthropic tokens
 

@@ -59,6 +59,7 @@ type Client interface {
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
+	AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 
@@ -674,6 +675,18 @@ func (c *HTTPClient) AdminListWorkers(ctx context.Context) ([]apitypes.AdminWork
 		return nil, err
 	}
 	return env.Workers, nil
+}
+
+// AdminListCLITokens reads the factory-wide standing-credential inventory. The
+// response carries no token value and no hash — see apitypes.AdminCLITokenDTO.
+func (c *HTTPClient) AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error) {
+	var env struct {
+		Tokens []apitypes.AdminCLITokenDTO `json:"tokens"`
+	}
+	if err := c.get(ctx, "/api/admin/cli-tokens", &env); err != nil {
+		return nil, err
+	}
+	return env.Tokens, nil
 }
 
 func (c *HTTPClient) AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error) {

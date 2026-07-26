@@ -317,6 +317,17 @@ func TestAdminWorkerDTOTags(t *testing.T) {
 	assertTags(t, "AdminWorkerDTO", AdminWorkerDTO{}, want...)
 }
 
+// TestAdminCLITokenDTOTags is a security pin, not only a wire pin. The admin
+// credential inventory must never carry the token value or its sha256, and this is
+// the mechanism that makes adding one a build failure rather than a review catch —
+// assertTags demands the key set match EXACTLY, so a stray "token_hash" or "token"
+// field fails here even though nothing else in the stack would notice.
+func TestAdminCLITokenDTOTags(t *testing.T) {
+	assertTags(t, "AdminCLITokenDTO", AdminCLITokenDTO{},
+		"id", "user_id", "owner_email", "name", "token_prefix", "scope", "revoked",
+		"created_at", "last_used_at", "last_used_ip", "expires_at")
+}
+
 func TestUsageDTOTags(t *testing.T) {
 	assertTags(t, "UsageDTO", UsageDTO{},
 		"input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd")

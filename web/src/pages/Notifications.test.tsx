@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Notifications } from "./Notifications";
 import { api, type Notification } from "../lib/api";
@@ -224,10 +224,12 @@ describe("Notifications inbox (PRD #46 M2)", () => {
   });
 
   it("collapses consecutive judge reviews into one expandable header (Decision 5)", async () => {
+    // DISTINCT run ids per row, which is what makes the href assertions below
+    // discriminating rather than decorative — see the comment at those assertions.
     const rows = [
-      aNotif({ id: "j1", payload: { title: "review one", body: "" }, created_at: "2026-07-20T12:00:00Z" }),
-      aNotif({ id: "j2", payload: { title: "review two", body: "" }, created_at: "2026-07-20T11:59:00Z" }),
-      aNotif({ id: "j3", payload: { title: "review three", body: "" }, created_at: "2026-07-20T11:58:00Z" }),
+      aNotif({ id: "j1", run_id: "run-one", payload: { title: "review one", body: "" }, created_at: "2026-07-20T12:00:00Z" }),
+      aNotif({ id: "j2", run_id: "run-two", payload: { title: "review two", body: "" }, created_at: "2026-07-20T11:59:00Z" }),
+      aNotif({ id: "j3", run_id: "run-three", payload: { title: "review three", body: "" }, created_at: "2026-07-20T11:58:00Z" }),
     ];
     mockApi.listNotifications.mockResolvedValue({ notifications: rows, unread: 3, total: 3 });
 
@@ -251,6 +253,45 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(screen.getByText("review two")).toBeTruthy();
     expect(screen.getByText("review three")).toBeTruthy();
     expect(screen.getAllByText("Mark read")).toHaveLength(3);
+
+    // THE ANCHORED DEEP-LINK'S RENDER PATH, asserted where it is actually taken.
+    // `notificationLink` is pinned as a pure function (lib/notifications.test.ts) and the
+    // ungrouped DOM path is pinned by "deep-links a judge review …" above — but judge pings
+    // arrive in BURSTS and get grouped, so the anchored row a user really clicks is one
+    // inside this expander, and nothing here asserted an href. (The expander does render the
+    // per-notification anchor: it renders the same NotificationRow. The claim that the
+    // anchored path was "reachable only from an ungrouped row" was false — this is the
+    // assertion that keeps it that way.)
+    //
+    // The three run ids DIFFER on purpose. With one shared id, folding every member's anchor
+    // to the group's first row would satisfy a per-row assertion unchanged; distinct ids are
+    // what make these three lines discriminate.
+    //
+    // Queried by SCOPED row rather than by index into `getAllByText`. The unscoped
+    // `getByText("· Open in Judge")` idiom the ungrouped test uses THROWS here (three
+    // matches), and the obvious repair — taking `[0]` — re-tests one row while reading as
+    // coverage of all three.
+    const rowLink = (title: string) =>
+      within(screen.getByText(title).closest("li")!).getByText("· Open in Judge").closest("a");
+    // Every member row carries one, so no row is silently link-less.
+    expect(screen.getAllByText("· Open in Judge")).toHaveLength(3);
+    expect(rowLink("review one")?.getAttribute("href")).toBe("/judge?run=run-one");
+    expect(rowLink("review two")?.getAttribute("href")).toBe("/judge?run=run-two");
+    expect(rowLink("review three")?.getAttribute("href")).toBe("/judge?run=run-three");
+    // The distinctness property spelled out. Against PRODUCTION code it is strictly WEAKER
+    // than the three lines above (differing-but-wrong satisfies it, and they already catch a
+    // constant anchor) — but its gate is the FIXTURE, and that is a failure mode the three
+    // cannot cover. Measured: collapse the rows back onto one shared run id and then repair
+    // only the assertions that went red — the fix-what-failed-and-stop workflow, production
+    // code untouched — and this line is the one that still fails, `expected 1 to be 3`. It
+    // is the last thing standing between a tidy-looking edit and the silent loss of the
+    // discrimination the whole test depends on.
+    const hrefs = screen.getAllByText("· Open in Judge").map((el) => el.closest("a")?.getAttribute("href"));
+    expect(new Set(hrefs).size).toBe(3);
+    // …and the HEADER deliberately carries NO anchor: it spans several runs, so anchoring it
+    // to any one of them would misrepresent what was clicked. Header → `/judge` (todo bucket),
+    // row → `/judge?run={id}` (all bucket): the two are different claims and this pins both.
+    expect(screen.getByText("Open Judge").closest("a")?.getAttribute("href")).toBe("/judge");
   });
 
   it("pages the inbox with Load more (offset paging), then hides the button", async () => {

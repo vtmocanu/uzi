@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/clitoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
@@ -211,4 +212,42 @@ func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// AdminListCLITokens returns every CLI token in the factory with its owner, for the
+// admin standing-credential inventory. Read-only: there is deliberately no admin
+// revoke here (see the route comment).
+//
+// Admin-gating is the route group's (RequireUser + RequireAdminRO), which resolves
+// admin-ness LIVE from the user row and has already masked any non-admin_ro token to
+// IsAdmin=false — so this handler must not re-check scope, exactly as the other
+// admin reads do not. One mechanism, one place.
+func (h *Handler) AdminListCLITokens(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.q.ListAllCLITokensForAdmin(r.Context())
+	if err != nil {
+		slog.Error("admin list cli tokens", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]apitypes.AdminCLITokenDTO, 0, len(rows))
+	for _, t := range rows {
+		dto := apitypes.AdminCLITokenDTO{
+			ID:          t.ID.String(),
+			UserID:      t.UserID.String(),
+			OwnerEmail:  t.OwnerEmail,
+			Name:        t.Name,
+			TokenPrefix: t.TokenPrefix,
+			Scope:       t.Scope,
+			Revoked:     t.Revoked,
+			CreatedAt:   t.CreatedAt.Time,
+			LastUsedAt:  timePtr(t.LastUsedAt.Valid, t.LastUsedAt.Time),
+			ExpiresAt:   timePtr(t.ExpiresAt.Valid, t.ExpiresAt.Time),
+		}
+		if t.LastUsedIp != nil {
+			s := t.LastUsedIp.String()
+			dto.LastUsedIP = &s
+		}
+		out = append(out, dto)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": out})
 }

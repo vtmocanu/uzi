@@ -183,9 +183,23 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 		t.Errorf("the read-path warning still names --bucket, which cannot reach the cut:\n%s", out)
 	}
 
-	// The post-write path.
+	// The post-write path. THE FIXTURE NOW CARRIES SETTLED MEMBERS, and that is a fix rather
+	// than a detail: it used to set only Updated:2 with an empty Settled, and the old code
+	// printed its remedy anyway — because the remedy was a LITERAL `uzi review backlog --run
+	// <run-id>` that needed no data to render. A test whose fixture cannot distinguish "the
+	// remedy names a real run" from "the remedy names a placeholder" was pinning the string,
+	// not the behaviour. Three members across TWO runs, one run deliberately repeated, so
+	// the dedup is exercised too.
 	fc2 := backlogFake()
-	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 2, Truncated: true}
+	fc2.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated:   3,
+		Truncated: true,
+		Settled: []apitypes.JudgeSettledMemberDTO{
+			{RunID: "run-aaa", RecID: "rec-1"},
+			{RunID: "run-aaa", RecID: "rec-2"},
+			{RunID: "run-bbb", RecID: "rec-3"},
+		},
+	}
 	out2, _, code2 := runCLI(t, fakeEnv(fc2), "review", "resolve", "--category", "tests", "--target", "unit")
 	if code2 != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code2)
@@ -193,10 +207,100 @@ func TestReviewTruncationWarningsNameAWorkingRemedy(t *testing.T) {
 	if strings.Contains(out2, "--bucket all") {
 		t.Errorf("the post-write warning still names the remedy that cannot work:\n%s", out2)
 	}
-	for _, want := range []string{"--json on THIS call", "--run"} {
-		if !strings.Contains(out2, want) {
-			t.Errorf("the post-write warning is missing %q:\n%s", want, out2)
+	if !strings.Contains(out2, "--json on THIS call") {
+		t.Errorf("the post-write warning is missing %q:\n%s", "--json on THIS call", out2)
+	}
+	// THE RUN ID IS SUBSTITUTED, NOT A PLACEHOLDER. This is the assertion the old fixture
+	// could not make and the reason the printed text changed at all: `<run-id>` in the
+	// OUTPUT is a template, and a template cannot be executed verbatim by the user it is
+	// printed for or by the e2e row that lifts it.
+	if strings.Contains(out2, "<run-id>") {
+		t.Errorf("the remedy still prints the <run-id> PLACEHOLDER rather than substituting a real "+
+			"run id — nothing can run that verbatim:\n%s", out2)
+	}
+	// One line per DISTINCT settled run, in first-appearance order. The count matters: the
+	// e2e row asserts it before executing anything, and a duplicate would make that
+	// assertion either fail or (if relaxed) satisfiable by output nobody checked.
+	remedies := []string{}
+	for _, line := range strings.Split(out2, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "uzi review backlog --run ") {
+			remedies = append(remedies, strings.TrimSpace(line))
 		}
+	}
+	want := []string{"uzi review backlog --run run-aaa", "uzi review backlog --run run-bbb"}
+	if !reflect.DeepEqual(remedies, want) {
+		t.Errorf("remedy lines = %q, want %q (one per DISTINCT settled run, first-appearance order)\n%s",
+			remedies, want, out2)
+	}
+	// THE EMPTY-RESULT CLAUSE, pinned because it is what stops a correct empty from reading as
+	// a dead end. The warning above asks "did my write land"; the remedy answers "what is
+	// still un-triaged", and the step between them was left to the reader.
+	if !strings.Contains(out2, "an empty result from one of these is the answer") {
+		t.Errorf("the remedy does not say an empty result is the answer, so a correct empty reads as "+
+			"a dead end:\n%s", out2)
+	}
+	// And it gives the REASON, which is a property of renderBacklog rather than of the advice:
+	// the truncation warning prints BEFORE the listing, so an empty with no warning is complete.
+	if !strings.Contains(out2, "no warning is complete") {
+		t.Errorf("the clause asserts an empty is trustworthy without giving the reason a reader could "+
+			"check (the warning precedes the listing):\n%s", out2)
+	}
+	// NO --bucket in the remedy block, not even --bucket all. The line above says --bucket
+	// cannot narrow a re-check; naming one a line later invites the reader to re-derive that it
+	// can. `--bucket all` was the second false printed instruction this path paid to remove.
+	for _, line := range strings.Split(out2, "\n") {
+		if strings.Contains(line, "empty result") && strings.Contains(line, "--bucket") {
+			t.Errorf("the empty-result clause names --bucket, one line below the sentence saying "+
+				"--bucket cannot narrow a re-check:\n%s", line)
+		}
+	}
+
+	// THE ONE-RUN CASE, written because nothing else covers it and it is the shape a real
+	// single-run write takes. Two runs exercises the loop and the dedup; zero exercises the
+	// else branch; one is the middle the e2e row cannot reach (its fixture settles two on
+	// purpose, so a single-address regression cannot pass as a green there).
+	fcOne := backlogFake()
+	fcOne.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{
+		Updated:   2,
+		Truncated: true,
+		Settled: []apitypes.JudgeSettledMemberDTO{
+			{RunID: "run-solo", RecID: "rec-1"},
+			{RunID: "run-solo", RecID: "rec-2"},
+		},
+	}
+	outOne, _, codeOne := runCLI(t, fakeEnv(fcOne), "review", "resolve", "--category", "tests", "--target", "unit")
+	if codeOne != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", codeOne)
+	}
+	soloLines := 0
+	for _, line := range strings.Split(outOne, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "uzi review backlog --run ") {
+			soloLines++
+		}
+	}
+	if soloLines != 1 {
+		t.Errorf("two coordinates on ONE run printed %d remedy lines, want exactly 1 — the dedup is "+
+			"what makes the count a property of the RUNS rather than of the coordinates:\n%s", soloLines, outOne)
+	}
+	if !strings.Contains(outOne, "uzi review backlog --run run-solo") {
+		t.Errorf("the single remedy line does not name the settled run:\n%s", outOne)
+	}
+
+	// A truncated write that settled NOTHING must print no command at all. The template form
+	// printed one regardless, which is how an unrunnable instruction reaches a user in the
+	// one state where it is also useless — there is no run to anchor on.
+	fc3 := backlogFake()
+	fc3.BulkDispositionResult = apitypes.JudgeDispositionResultDTO{Updated: 0, Truncated: true}
+	out3, _, code3 := runCLI(t, fakeEnv(fc3), "review", "resolve", "--category", "tests", "--target", "unit")
+	if code3 != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code3)
+	}
+	if strings.Contains(out3, "uzi review backlog --run") {
+		t.Errorf("a truncated write that settled nothing still printed a --run remedy, which can only "+
+			"be a placeholder — there is no run id to name:\n%s", out3)
+	}
+	if !strings.Contains(out3, "row cap") {
+		t.Errorf("the truncation warning itself must survive even when nothing was settled:\n%s", out3)
 	}
 }
 

@@ -195,11 +195,39 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
 cleanup() {
   local code=$?
+  # 🔴 BREADCRUMB FIRST, BEFORE ANYTHING THAT CAN FAIL. It exists to answer one question
+  # that was unanswerable after a real run: did the EXIT trap fire at all?
+  #
+  #   breadcrumb + a teardown/KEEP_STACK line  -> cleanup ran to completion
+  #   breadcrumb + NEITHER                     -> cleanup ran and DIED INSIDE
+  #   NEITHER                                  -> the trap never fired (signal, or the
+  #                                               capture ended before this point)
+  #
+  # A run ended with no margin report and no teardown line, and none of the three could be
+  # distinguished from the log. Three structural hypotheses were eliminated by minimal
+  # repro — `set -e` from a failing pipeline in a function, the `env -i` re-exec, and
+  # `set -u` in a function all fire the trap normally — and the cause is still unknown.
+  # One line converts the next occurrence from an investigation into a reading.
+  printf '\n[cleanup] EXIT trap entered (code %s)\n' "$code"
   # Margin report BEFORE teardown (PRD #97 M9) — on the failure path too, where it is
   # most useful: a red run's margins usually show the whole suite running hot, which is
-  # the difference between "this assertion is wrong" and "this host was slow". Wrapped
-  # so a broken diagnostic can never change the exit code we are about to return.
-  report_margins 2>/dev/null || true
+  # the difference between "this assertion is wrong" and "this host was slow".
+  #
+  # 🔴 THE `2>/dev/null` THAT USED TO BE HERE IS GONE, AND ITS REMOVAL IS THE FIX. The
+  # wrapper written to stop a broken diagnostic from doing harm was what made its own
+  # failure unreportable. `|| true` is what protects the exit code; the stderr suppression
+  # protected nothing and cost the only evidence. REPRODUCED: with MARGINS_FILE unbound,
+  # `report_margins 2>/dev/null || true` under `set -u` kills the shell MID-CLEANUP and
+  # prints nothing at all — `|| true` does not catch it, because an unbound variable is a
+  # fatal shell error rather than a command failure, and the redirect eats the one message
+  # that would have named it. Empty log, no teardown, no cause.
+  #
+  # That was not merely hypothetical here: the trap is registered ~200 lines ABOVE
+  # MARGINS_FILE's first assignment, so any failure in that window — which covers stack
+  # bring-up, where failures are COMMON — hit exactly this. `${MARGINS_FILE:-}` in
+  # report_margins closes it at the source; dropping the redirect is what makes the next
+  # one visible.
+  report_margins || true
   # KEEP_STACK leaves the whole stack running (containers + volumes + rundir) so
   # the auditor can inspect logs, the claim payload path, and the worker's /data
   # against a live run. Tear it down manually with the printed command.
@@ -231,11 +259,32 @@ WTOKEN=""
 # transient curl/exec blip does not abort the ~20-min run under `set -euo pipefail` (a
 # bare point-in-time GET that hiccups would otherwise kill the whole suite). RESTRICTED to
 # idempotent GETs — only apiget + fake_state are wrapped below. A retried WRITE could
-# double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch/
-# apidelete, fake_post) and db_psql (also used for INSERTs, :2087/:2191/:2843) are
-# deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
+# double-execute after an ambiguous failure, so the write helpers (apipost/apiput/apipatch,
+# fake_post) and db_psql (also used for WRITES, in the #32, #68, #98 and rate-limit phases)
+# are deliberately NOT wrapped (PRD #97 M3, fable review). Still returns the last attempt's
 # non-zero after 3 tries: this smooths a blip, it never masks a persistent failure. curl -f
 # writes nothing to stdout on a failed attempt, so a retry cannot double the captured body.
+#
+# TWO CORRECTIONS TO THIS COMMENT, both found while building PRD #98 M8b, both the kind of
+# defect the comment's own subject matter is about. (1) It listed `apidelete` among the
+# helpers "deliberately NOT wrapped". There is no apidelete — it appeared nowhere else in
+# this file and was never defined; the harness's single DELETE is an inline `curl -X DELETE`
+# against /api/me/secrets/anthropic_token/. It is struck rather than defined, because a
+# helper nothing calls is dead code PLUS a comment that has become true about a function
+# nobody uses. (2) It cited the db_psql writes by LINE (`:2087/:2191/:2843`), and at the
+# time of this edit all three pointed at unrelated text — one blank line, one wait_status,
+# and one line of a comment written minutes earlier. This repo's own rule is that a line
+# number is meaningless without a SHA; naming the PHASES survives edits.
+#
+# THEN A THIRD, because the second repair introduced the same family of defect it was
+# fixing — one abstraction up. It read "INSERTs, in the #46, #68, #98 and rate-limit
+# phases", and both halves were wrong. The `user_secrets` write belongs to **#32**, the
+# per-user vault phase; the #46 phase contains no db_psql write at all, only two SELECTs.
+# And db_psql performs DELETEs as well, so enumerating only INSERTs understates this
+# comment's own argument — which is that a retried WRITE could double-execute. `writes` is
+# both accurate and edit-proof. Re-derived by listing the `say "` phase headers and the
+# `db_psql "INSERT|DELETE|UPDATE` sites and reading the line numbers against each other,
+# rather than by trusting the previous sentence.
 retry_read() {
   local n=1 rc
   while :; do
@@ -400,7 +449,7 @@ wait_http() {
 # never bodies, tokens, or vault material.
 MARGINS_FILE=""   # assigned once RUNROOT exists (see the mkdir below)
 record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
-  [ -n "$MARGINS_FILE" ] || return 0
+  [ -n "${MARGINS_FILE:-}" ] || return 0
   printf '%s\t%s\t%s\n' "$2" "$3" "$1" >> "$MARGINS_FILE" 2>/dev/null || true
 }
 
@@ -410,7 +459,10 @@ record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
 # over twice the population hides exactly the newly-visible tight waits it was added
 # to expose.
 report_margins() {
-  [ -n "$MARGINS_FILE" ] && [ -s "$MARGINS_FILE" ] || return 0
+  # ${MARGINS_FILE:-}, not $MARGINS_FILE: cleanup calls this, and cleanup can fire BEFORE the
+  # assignment ~200 lines below the trap. Under `set -u` a bare reference there is a FATAL
+  # shell error, not a return — it kills cleanup mid-flight with no teardown and no message.
+  [ -n "${MARGINS_FILE:-}" ] && [ -s "${MARGINS_FILE:-}" ] || return 0
   say "PRD #97 M9 — wait_* margin report (tightest first; headroom = ceiling - actual)"
   # Emit "<headroom>\t<line>", numeric-sort on the leading key, then strip it — sorting
   # the rendered text directly does not work (the number is not at a field boundary).
@@ -497,8 +549,28 @@ wait_status() {
 fake_post() { curl -fsSk -X POST "$FAKE_BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 
 # flip_mr IID STATE — the harness stand-in for a reviewer closing/reopening/
-# merging an MR (PRD #24).
+# merging an MR (PRD #24). Takes a STATE because the MR-close watcher acts in BOTH
+# directions and this file calls it both ways (closed and reopened, in the #24 phase).
+# Its issue counterpart is `close_issue` and takes no state — see there for why the
+# asymmetry tracks a real product difference rather than an oversight.
 flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')" >/dev/null; }
+
+# close_issue IID — the harness stand-in for a human closing an issue on the forge
+# (PRD #98 M6). Deliberately NOT a two-argument `flip_issue IID STATE` mirroring
+# flip_mr, even though the route accepts "opened": the product consumes the
+# open→closed EDGE ONLY, and a reopen is explicitly not acted on
+# (judge_issue_close.sql: close_synced_at stays stamped, so a flapping issue cannot
+# ping-pong a user's backlog). A helper spelled `flip_issue` would advertise a
+# round trip the product does not make, and the next reader would write a reopen
+# assertion against a guarantee that does not exist.
+#
+# THE HARNESS DEMONSTRATES THAT BETTER THAN THE ARGUMENT DOES: `flip_mr` is genuinely
+# called BOTH ways in the #24 phase (closed, then reopened), because the MR-close
+# watcher acts in both directions. Nothing in the product acts on an issue reopen, and
+# TestFiledIssueCloseReopenDoesNotReopenLiveDB already pins that NON-behaviour at the
+# live-DB layer. So the asymmetry between these two helpers is the product's, not a
+# gap in this one.
+close_issue() { fake_post "/_e2e/issues/$1/state" '{"state":"closed"}' >/dev/null; }
 
 # fake_state — the fake's recorded state (issues, MRs, notes, label events). Read-only
 # GET, wrapped in retry_read (like apiget) so a transient blip on a point-in-time read
@@ -2926,6 +2998,812 @@ for _ in $(seq 1 60); do
 done
 pass "cleaned up the filed-issue run (cancelled) so it frees worker capacity for later sections"
 
+# =============================================================================
+# PRD #98 M8c — the printed-instruction backstop, EXECUTING half.
+#
+# WHY THIS EXISTS. Three strings in api/cmd/uzi told a user what command to run next and
+# none had ever been run by a test. TWO WERE FALSE, and BOTH PARSED PERFECTLY — a
+# hand-written copy of either would have gone green. `instructions_test.go` closes the
+# static half (nothing new can be printed without an entry) but it can never verify
+# execution: it reads source literals, and a literal cannot say whether the command works.
+# This phase is the only place in the repo where the printed text is EXECUTED.
+#
+# WHY HERE and not a build-tagged Go test: the instructions are emitted against a LIVE api
+# (the undo addresses come from the server's `settled` array), so a Go test would need this
+# same booted stack — at which point it is this harness with more machinery. The harness
+# already has `uzi_cli` (:1407, hermetic under env -i), `db_psql`, and — by this line — a
+# judged run with a review. NO NEW ENV VAR: the :103-107 allowlist is untouched, because
+# widening it is the change that made two e2e runs meaningless on 2026-07-17.
+#
+# THE ONE RULE: extract from the EMITTING COMMAND'S OWN OUTPUT, never a hand-written argv.
+say "PRD #98 M8c: printed instructions EXECUTED verbatim from the emitting command's own output"
+
+# run_printed_instructions LABEL SHAPE WANT OUT — the shared runner every row goes through.
+#
+#   OUT   the emitting command's own captured output (stdout AND stderr — two of the three
+#         instructions below arrive via Exitf, i.e. on stderr with a non-zero exit).
+#   SHAPE an ERE describing the WHOLE instruction, UUID-shaped where applicable.
+#   WANT  the exact number of instructions the row expects.
+#
+# Four mechanisms, in descending strength:
+#  1. ONE helper. A row that hand-writes argv has to visibly bypass this function, which is
+#     reviewable in a way that a subtly-wrong string is not.
+#  2. A SHAPE-GUARDED eval. `eval` never sees text that did not come out of the command in
+#     the expected form — which is what makes it safe here rather than reckless. It is also
+#     what keeps the execution VERBATIM: any hand-splitting reintroduces the copy the
+#     mechanism exists to forbid.
+#  3. The COUNT is asserted before any match is used. Never `head -1`: output that stops at
+#     your limit is indistinguishable from output that ended.
+#  4. A CHARACTER ALLOWLIST INSIDE THE HELPER, checked immediately before the eval.
+#
+# WHY 4 EXISTS WHEN 2 ALREADY GUARDS THE SHAPE. It is not that the helper ignores content —
+# every match already satisfied the caller's ERE, and the `case` below already requires the
+# span to start `uzi `. The exposure is that the ENTIRE safety burden sat on each caller's
+# `$shape`, with NO FLOOR in the helper: a future row passing a loose ERE (`.*`, an
+# unanchored class, a `[^ ]+` that happens to admit a metacharacter) hands unreviewed text
+# to an `eval` that runs in the HARNESS's own shell on the developer's host — before
+# uzi_cli's `env -i`, so an injected `;` runs as the user rather than inside the sandbox.
+# All FOUR shapes today are closed EREs, which is why this is a floor and not a fix. (A count
+# in a comment is a thing this wave keeps deciding not to write; it is here because the
+# argument depends on EVERY caller being closed, so the number is the claim, not decoration —
+# and it was already wrong once, saying three after the fourth row landed.)
+#
+# IT IS AN ALLOWLIST, NOT A BLACKLIST, and that is the whole point. Blacklisting shell
+# metacharacters is famously incomplete — you find out which one you forgot by being bitten
+# by it. A positive class excludes `< > | ; $ backtick ' " \ newline` and every glob
+# character BY CONSTRUCTION, without anyone having to enumerate them.
+#
+# THIS CLASS IS NARROWER THAN THE STATIC EXTRACTOR'S, DELIBERATELY, AND THE GAP HAS A
+# CONSEQUENCE. api/cmd/uzi/instructions_test.go's instructionRE reads SOURCE literals, so it
+# must admit format verbs and placeholders (`%<>-`); this one reads EMITTED text, which has
+# to be runnable verbatim in a shell. So an instruction whose emitted form carries any
+# character outside this class can be REGISTERED there and never EXECUTED here —
+# evidenceNotExecuted by construction rather than by choice. `%`, `+`, `@`, `,` and `~` are
+# all outside it, so a judge target containing one would fail here with a message about the
+# allowlist rather than about the target. Loud rather than silent, and low probability. The
+# extractor's comment points back at this one.
+#
+# SCOPE, so a later comment does not blur it: this is a SHELL-INJECTION floor, not an
+# AUTHORIZATION one. It cannot stop an admitted span from naming a destructive `uzi`
+# subcommand — nothing here inspects the verb. That is bounded today by the three explicit
+# shapes each caller passes plus each row's own outcome assertion, not by this check.
+#
+# The property worth naming: it makes the wrong option STRUCTURALLY IMPOSSIBLE rather than
+# discouraged. A row that tried to substitute a placeholder into the printed text cannot
+# pass this floor, because `<` cannot pass it. That is why the sibling change in review.go
+# had to be a real format verb rather than a helper special case.
+#
+# HONEST RESIDUAL, stated rather than papered over, AND NOT CLOSED BY 4: shell cannot make
+# the shortcut STRUCTURALLY unavailable. A determined author can still assign a literal to
+# the variable passed as OUT, and the allowlist would happily accept it. What these four buy
+# is that the shortcut becomes visible in review rather than invisible in a passing test.
+# That is a real improvement and it is not the same as impossible.
+#
+# The `|| fail` on the exec below is a FLOOR (an instruction that errors is definitionally
+# false), not the row's assertion — every caller asserts an OUTCOME afterwards.
+PRINTED_OUT="$RUNROOT/.printed-instruction.out"
+run_printed_instructions() {
+  local label="$1" shape="$2" want="$3" out="$4" matches n cmd
+  matches="$(printf '%s\n' "$out" | grep -oE "$shape" || true)"
+  n="$(printf '%s' "$matches" | grep -c . || true)"
+  [ "$n" = "$want" ] || fail "$label: expected exactly $want printed instruction(s) matching /$shape/ in the emitting command's OWN output, got $n. The output was:
+$out"
+  : > "$PRINTED_OUT"
+  # PER-INSTRUCTION CAPTURE, alongside the concatenated $PRINTED_OUT the older rows grep.
+  #
+  # WHY BOTH. $PRINTED_OUT is the UNION of every execution, so a `grep -q` over it is
+  # satisfied by the FIRST instruction alone: N lifted, N executed, ONE certified. That is
+  # the same shape as a loop that runs with one element actually checked, and it is the
+  # weakness these rows exist to close — the undo row seeds a coordinate on TWO reviews
+  # precisely so a single-address regression cannot pass as a green.
+  #
+  # A COUNT OVER THE UNION IS NOT THE FIX, and that was learned by shipping it: the B4' row
+  # replaced `grep -q` with `grep -c … -ge 2` and turned a check satisfiable by ONE line into
+  # one satisfiable by NONE, because the two anchored re-reads legitimately print DIFFERENT
+  # things. Per-instruction files let a caller assert what is true of EACH execution instead
+  # of guessing a number that is true of the pile.
+  rm -f "$PRINTED_OUT".[0-9]* 2>/dev/null || true
+  PRINTED_N=0
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    case "$cmd" in
+      "uzi "*) ;;
+      *) fail "$label: lifted span is not a uzi instruction: $cmd" ;;
+    esac
+    # THE FLOOR (mechanism 4 above). Anchored at both ends, positive class only. Every span
+    # the FOUR current rows lift already satisfies it, so it reddens nothing today — which
+    # is exactly why it was exercised deliberately rather than assumed; see the commit.
+    #
+    # 🔴 `[[ =~ ]]`, NOT `grep -qE`, AND THAT IS THE WHOLE POINT OF THE GUARD. grep is
+    # LINE-oriented: `^…$` anchors per LINE, so `grep -q` returns 0 when ANY line matches
+    # and the rest of the span is never examined. Measured against the first version of this
+    # check: the span "uzi repo list\n; touch /tmp/PWNED" was ACCEPTED, because line 1
+    # matched. Bash's `=~` matches the WHOLE STRING and `$` is end-of-string; the same span
+    # is rejected and the legal `review undo <uuid> <uuid>` span still passes.
+    #
+    # Reachability of that hole today is ZERO — `while IFS= read -r cmd` yields one line per
+    # iteration, so `cmd` cannot contain a newline. But the floor exists precisely because
+    # the safety burden sat on an invariant OUTSIDE the helper, and for newline the grep form
+    # left it outside: it moved from the caller's ERE to the read loop. Newline is the one
+    # excluded character that is itself a command separator, and a future edit to the lift
+    # path (`grep -oEz`, `mapfile`, a `for` over $matches) re-opens it silently while the
+    # comment above still reads as if it could not. This form owes nothing to the read loop.
+    [[ "$cmd" =~ ^uzi\ [A-Za-z0-9\ ._:/=-]+$ ]] \
+      || fail "$label: lifted span carries a character outside the executable allowlist, so it is not runnable verbatim: $cmd"
+    PRINTED_N=$((PRINTED_N + 1))
+    eval "uzi_cli ${cmd#uzi }" > "$PRINTED_OUT.$PRINTED_N" 2>&1 \
+      || fail "$label: the printed instruction FAILED when run VERBATIM: $cmd
+$(cat "$PRINTED_OUT.$PRINTED_N")"
+    cat "$PRINTED_OUT.$PRINTED_N" >> "$PRINTED_OUT"
+    # THE HEREDOC BELOW IS LOAD-BEARING — do not "tidy" it into `printf … | while read`.
+    # `fail` ends in `exit 1`. Fed by a heredoc, this loop runs in the CURRENT shell, so a
+    # `fail` inside it kills the script. Fed by a PIPE, the loop would run in a subshell and
+    # that `exit 1` would kill only the subshell — the run would continue past a failed
+    # instruction with its diagnostic swallowed. That is not hypothetical: the probe written
+    # to verify this very guard had exactly that bug in its stub, and read as "the floor did
+    # not fire" when it had.
+  done <<PI_EOF
+$matches
+PI_EOF
+}
+
+# --- arrange: one coordinate on TWO reviews ----------------------------------
+# The undo row needs the group dismiss to settle TWO members, because the count assertion
+# is the mechanism and a count of 1 makes it indistinguishable from `head -1`. Two members
+# means two REVIEWS: BulkSetDispositions resolves with SELECT DISTINCT ON (rv.id,
+# rr.category, rr.target), so the same coordinate twice on ONE review collapses to one
+# member. Rather than pay ~2 min for a second judged run, direct-seed a review on a run
+# that completed earlier (RUN_CLI, :1426) — the harness's own direct-seed fixture pattern
+# (:2732). user_id is copied off F_REVIEW so ownership cannot drift from the token driving
+# uzi_cli.
+PI_CAT=improve_agent
+PI_TGT=e2e-printed-instruction
+PI_TODO_PRESEED="$(uzi_cli review stats --json | jq -r '.todo')"
+[ -n "$PI_TODO_PRESEED" ] && [ "$PI_TODO_PRESEED" != null ] \
+  || fail "PRD #98 M8c: could not read the pre-seed triage todo count via uzi review stats --json"
+db_psql "INSERT INTO run_reviews (target_run_id, user_id, verdict, summary_md)
+         SELECT '$RUN_CLI', user_id, 'ok', 'PRD #98 M8c printed-instruction fixture'
+         FROM run_reviews WHERE id='$F_REVIEW'" >/dev/null
+# NOT `RETURNING id`, and this is a measured trap rather than a style choice: db_psql is
+# `psql -tAc … | tr -d '\r\n'`, and psql writes the command TAG to stdout alongside the
+# returned row, so `tr` welds them into `<uuid>INSERT 0 1` — a string that is non-empty,
+# passes a bare -n guard, and only explodes three statements later inside an unrelated
+# INSERT. Read the id back with a SELECT, and assert its SHAPE, not merely that it is set.
+PI_REVIEW2="$(db_psql "SELECT id FROM run_reviews WHERE target_run_id='$RUN_CLI'")"
+printf '%s' "$PI_REVIEW2" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+  || fail "PRD #98 M8c: the seeded review id is not a bare uuid: '$PI_REVIEW2'"
+db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+         VALUES ('$F_REVIEW','$PI_CAT','$PI_TGT','printed-instruction fixture: member A','low'),
+                ('$PI_REVIEW2','$PI_CAT','$PI_TGT','printed-instruction fixture: member B','low')" >/dev/null
+
+# PRECONDITIONS, or the row is vacuous. Two rows on two DISTINCT reviews is what makes
+# "exactly 2 printed addresses" a property of the code rather than of the fixture; and a
+# pre-existing disposition would make the post-undo "0 rows" assertion pass without the
+# undo having done anything.
+[ "$(db_psql "SELECT count(DISTINCT review_id) FROM review_recommendations WHERE category='$PI_CAT' AND target='$PI_TGT'")" = 2 ] \
+  || fail "PRD #98 M8c: the fixture coordinate must span exactly 2 reviews, or the group dismiss settles fewer members than the row asserts"
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$PI_CAT' AND target='$PI_TGT'")" = 0 ] \
+  || fail "PRD #98 M8c: the fixture coordinate already carries a disposition — the undo outcome assertion would be vacuous"
+PI_TODO_BEFORE="$(uzi_cli review stats --json | jq -r '.todo')"
+[ "$PI_TODO_BEFORE" = "$((PI_TODO_PRESEED + 2))" ] \
+  || fail "PRD #98 M8c: seeding the coordinate did not raise the wire triage todo by 2 ($PI_TODO_PRESEED -> $PI_TODO_BEFORE) — the fixture never reached the API"
+pass "seeded one coordinate ($PI_CAT/$PI_TGT) across 2 reviews; wire todo $PI_TODO_PRESEED -> $PI_TODO_BEFORE"
+
+# --- printed-instruction row: uzi review undo --------------------------------
+# The flagship. runGroupDisposition prints one undo address per settled member; both are
+# lifted from THAT command's stdout and run verbatim.
+PI_LABEL_UNDO="printed-instruction row: uzi review undo"
+PI_OUT_UNDO="$(uzi_cli review dismiss --category "$PI_CAT" --target "$PI_TGT" --reason wont-do)" \
+  || fail "$PI_LABEL_UNDO: the group dismiss that EMITS the instruction failed (exit $?)"
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$PI_CAT' AND target='$PI_TGT'")" = 2 ] \
+  || fail "$PI_LABEL_UNDO: the group dismiss did not write 2 dispositions, so there are not 2 addresses to undo. Output was:
+$PI_OUT_UNDO"
+run_printed_instructions "$PI_LABEL_UNDO" 'uzi review undo [0-9a-f-]{36} [0-9a-f-]{36}' 2 "$PI_OUT_UNDO"
+# THE OUTCOME, not the exit code: both dispositions gone, and the wire's own triage count
+# back where it started. A `uzi review undo` that exited 0 and deleted nothing fails here.
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$PI_CAT' AND target='$PI_TGT'")" = 0 ] \
+  || fail "$PI_LABEL_UNDO: the printed undo addresses ran clean but left $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$PI_CAT' AND target='$PI_TGT'") disposition row(s) behind"
+PI_TODO_AFTER="$(uzi_cli review stats --json | jq -r '.todo')"
+[ "$PI_TODO_AFTER" = "$PI_TODO_BEFORE" ] \
+  || fail "$PI_LABEL_UNDO: triage todo did not return to $PI_TODO_BEFORE after executing both printed undo addresses (got $PI_TODO_AFTER)"
+pass "$PI_LABEL_UNDO — 2 addresses lifted from the dismiss's own stdout, both executed verbatim, both dispositions gone and todo back to $PI_TODO_BEFORE"
+
+# --- printed-instruction row: uzi review show --------------------------------
+# resolveRecID's refresh hint, emitted through Exitf — STDERR, exit 4 (ExitNotFound). The
+# naive form of this row would abort the whole harness under `set -euo pipefail`, and a row
+# that "passes" because it never ran is the exact false green this mechanism exists to
+# prevent: capture stderr and tolerate the non-zero exit explicitly.
+PI_LABEL_SHOW="printed-instruction row: uzi review show"
+PI_RC=0
+PI_OUT_SHOW="$(uzi_cli review resolve "$J_RUN" 00000000-0000-0000-0000-000000000000 2>&1)" || PI_RC=$?
+# The exit code here is ARRANGE, not the assertion: it is how we know the no-match branch
+# that emits the hint is the branch that ran. 0 would mean the bogus id matched something.
+[ "$PI_RC" = 4 ] \
+  || fail "$PI_LABEL_SHOW: expected exit 4 (ExitNotFound) from resolving a bogus rec id, got $PI_RC. Output was:
+$PI_OUT_SHOW"
+run_printed_instructions "$PI_LABEL_SHOW" 'uzi review show [0-9a-f-]{36}' 1 "$PI_OUT_SHOW"
+# THE OUTCOME: the refreshed read names the coordinate seeded on THAT run's review. Exit 0
+# alone would also be satisfied by `review show` printing "not judged".
+grep -q "recommendations (" "$PRINTED_OUT" \
+  || fail "$PI_LABEL_SHOW: the printed refresh command ran but rendered no recommendations block:
+$(cat "$PRINTED_OUT")"
+grep -q "$PI_TGT" "$PRINTED_OUT" \
+  || fail "$PI_LABEL_SHOW: the printed refresh command did not name the $PI_TGT coordinate that lives on run $J_RUN's review — it read the wrong run:
+$(cat "$PRINTED_OUT")"
+pass "$PI_LABEL_SHOW — hint lifted from Exitf's STDERR (exit 4 tolerated), executed verbatim, and its output names the coordinate on run $J_RUN"
+
+# --- printed-instruction row: uzi repo list ----------------------------------
+# `uzi run create` with --repo omitted: Exitf(ExitUsage) — STDERR, exit 2, and no byte
+# crosses the wire (the check runs before a client is built).
+PI_LABEL_REPO="printed-instruction row: uzi repo list"
+PI_RC=0
+PI_OUT_REPO="$(uzi_cli run create --issue 1 2>&1)" || PI_RC=$?
+[ "$PI_RC" = 2 ] \
+  || fail "$PI_LABEL_REPO: expected exit 2 (ExitUsage) from \`uzi run create\` without --repo, got $PI_RC. Output was:
+$PI_OUT_REPO"
+run_printed_instructions "$PI_LABEL_REPO" 'uzi repo list' 1 "$PI_OUT_REPO"
+# THE OUTCOME: the instruction hands back an id that answers the question that produced it.
+grep -q "$REPO_ID" "$PRINTED_OUT" \
+  || fail "$PI_LABEL_REPO: the printed instruction ran but its output does not name the enabled repo id $REPO_ID it exists to supply:
+$(cat "$PRINTED_OUT")"
+pass "$PI_LABEL_REPO — instruction lifted from Exitf's STDERR (exit 2 tolerated), executed verbatim, and it names repo $REPO_ID"
+
+# --- containment + positive control ------------------------------------------
+# Remove the fixture so later sections see the triage counts they would have seen without
+# it, and assert the count returns to the PRE-SEED value. That delete-and-recheck is the
+# positive control for the +2/-2 arithmetic above: without it, a todo count that moved for
+# some unrelated reason is indistinguishable from one this fixture moved.
+db_psql "DELETE FROM run_reviews WHERE id='$PI_REVIEW2'" >/dev/null
+db_psql "DELETE FROM review_recommendations WHERE review_id='$F_REVIEW' AND category='$PI_CAT' AND target='$PI_TGT'" >/dev/null
+PI_TODO_CLEAN="$(uzi_cli review stats --json | jq -r '.todo')"
+[ "$PI_TODO_CLEAN" = "$PI_TODO_PRESEED" ] \
+  || fail "PRD #98 M8c: after deleting the fixture the wire triage todo is $PI_TODO_CLEAN, not the pre-seed $PI_TODO_PRESEED — the fixture was not what moved the count, so the +2/-2 assertions above proved nothing about it"
+pass "printed-instruction fixture removed; wire todo back to the pre-seed $PI_TODO_PRESEED (positive control for the +2/-2 arithmetic)"
+
+# =============================================================================
+# PRD #98 M8b / B6' — the close→Done WIRING leg. THE POLLER ACTUALLY RUNS IT.
+# =============================================================================
+#
+# WHAT THIS ROW IS FOR, AND WHAT IT DELIBERATELY DOES NOT RE-ASSERT. The behaviour
+# matrix — auto-Done once, Undo sticks, a dismissed verdict is not overwritten, repo
+# scoping, unsettled/orphaned rows skipped, a reopen does not reopen — is pinned by the
+# six TestFiledIssueClose*LiveDB tests against a real Postgres, and re-asserting any of
+# it here would buy nothing but harness minutes. Every one of those six calls
+# svc.SyncFiledIssueCloses(ctx, repoID) DIRECTLY. What NOTHING in the repo does is RUN
+# THE POLLER: its call site is covered only by forgesvc's TestSyncFiledIssueClosesWiring,
+# which runs against a FAKE store. So the chain
+#
+#   a forge issue is closed → the issue cache reflects it → the poller's tick calls
+#   SyncFiledIssueCloses → a disposition with the right provenance appears
+#
+# is unpinned end to end, and it is the one assertion neither a fake nor a live-DB store
+# test can make. This block asserts exactly that.
+#
+# PLACEMENT. It rides $F_IID — the issue the #68 phase already filed against $F_REC on
+# $F_REVIEW — so it costs no second judged run and no second forge issue. It sits BEFORE
+# the judge-disable restore below, which is safe because the poller's call takes only the
+# repo id and is NOT gated on judge_enabled, unlike the funnel above it.
+#
+# LANE. No gate is needed and none is added, and the argument is STRUCTURAL rather than
+# "it is a long way above". Five facts, each checkable: `$FORGE` is validated at parse time
+# to be exactly `gitlab` or `forgejo`, so there is no third value that skips both branches;
+# the forgejo lane's `if` opens at column 0; the harness's ONLY bare `exit 0` sits at the
+# TOP LEVEL of that block, directly under its closing `pass` — not nested in a deeper
+# conditional that might not fire; the matching `fi` is at column 0 with no column-0 `fi`
+# between, so the block is continuous; and the #98 phases open ~2000 lines below it.
+# Adding `[ "$FORGE" = gitlab ] || fail` here would therefore guard a state the control
+# flow cannot produce. The forge-fake mutator is lane-neutral in any case — it mutates the
+# shared state.issues, which the Forgejo lane serves through toForgejoIssue.
+#
+# 🔴 FIDELITY LIMIT, stated here rather than left for a reader to infer, because it bounds
+# what a green means. forge-fake contains ZERO occurrences of `updated_after`: GET /issues
+# returns every recorded issue wholesale, by deliberate design ("Keeps a reconcile pass
+# from evicting the cache"), and the Forgejo lane does the same. The real IncrementalSync
+# DOES send UpdatedAfter (forgesvc/service.go, forge/gitlab.go). SO: this block proves the
+# poller WIRES THE EDGE UP GIVEN A CACHE THAT REFLECTS THE CLOSE. It does NOT prove a real
+# incremental sync would ever OBSERVE the close. That hole is deliberately not closed
+# inside #98 — changing GET /issues' semantics would change them for every phase that
+# depends on "return all recorded issues" — and it is raised separately instead.
+say "PRD #98 M8b/B6': a closed forge issue reaches Done THROUGH THE POLLER (M6's wiring)"
+
+B6_CAT=install_worker_tool
+B6_TGT=jq
+
+# 🔴 THIS FILE HAS TWO BOOLEAN IDIOMS AND YOU MUST NOT UNIFY THEM. `psql -tAc` renders a
+# bare boolean as `t`/`f`, and `(expr)::text` as `true`/`false` — measured, not assumed:
+# `SELECT (1 IS NULL)::text, 1 IS NULL` returns `false|f`. Both spellings are live and both
+# are CORRECT where they sit: the PRD #68 and #104 phases compare bare booleans to `t`, and
+# the #98 blocks below cast to ::text and compare to `true`. A "consistency" sweep that
+# unifies them is a REGRESSION, because it changes the value without changing the comparison.
+# The coexistence is also what produced a real defect here: a failure legend written for one
+# convention against a value produced by the other, naming `f`/`t` for a message that could
+# only ever print `false`/`true`. Read which form the projection uses before writing the
+# expected value, every time.
+
+# One-shot getter for wait_eq, in this file's own idiom.
+b6_issue_state() { db_psql "SELECT state FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID"; }
+
+# wait_disposition REVIEW CAT TGT WANT [TIMEOUT] — poll for the auto-Done and, ON
+# TIMEOUT, SAY WHICH OF THE TWO CAUSES IT IS. "No disposition after N seconds" has two
+# explanations that need opposite fixes — the poller never ran, or it ran and did not
+# consume the edge — and a message that does not separate them routes the next reader
+# into the wrong subsystem with evidence attached, which is worse than a vague one.
+# B6a's probe fixtures went with the dropped matrix, so there is no separate positive
+# control left; the DIAGNOSIS is gathered at failure time from the two rows that
+# discriminate. Reads $REPO_ID and $F_IID from the enclosing phase.
+#
+# TIMEOUT FLOOR: the chain crosses two stages inside ONE poller tick (the issue sync
+# writes the cache, then SyncFiledIssueCloses reads it), so one tick suffices only if
+# the close lands before that tick's sync; land it mid-tick and the cache write is next
+# tick and the disposition the tick after. The reconcile period here is
+# E2E_FORGE_POLL_INTERVAL=2s x FORGE_RECONCILE_EVERY=2 = 4s, so the floor is 2 periods
+# = 8s. The default below is 20s: the floor plus real slack, and report_margins will
+# show the headroom actually used rather than leaving the ceiling to guesswork.
+wait_disposition() {
+  local review="$1" cat="$2" tgt="$3" want="$4" timeout="${5:-20}"
+  local start=$SECONDS deadline=$((SECONDS + timeout)) got="" cache stamp
+  while [ $SECONDS -lt $deadline ]; do
+    got="$(db_psql "SELECT status FROM recommendation_dispositions WHERE review_id='$review' AND category='$cat' AND target='$tgt'")"
+    if [ "$got" = "$want" ]; then
+      record_margin "disposition $cat/$tgt -> $want" "$((SECONDS - start))" "$timeout"
+      return 0
+    fi
+    sleep 0.3
+  done
+  cache="$(db_psql "SELECT state FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
+  stamp="$(db_psql "SELECT (close_synced_at IS NOT NULL)::text FROM recommendation_filed_issues WHERE review_id='$review' AND category='$cat' AND target='$tgt'")"
+  fail "PRD #98 M8b/B6': no '$want' disposition on $cat/$tgt after ${timeout}s (status is '${got:-<none>}').
+  DIAGNOSIS — issue cache state for #$F_IID: '${cache:-<no cached row>}'; edge consumed (close_synced_at IS NOT NULL): '${stamp:-<no filed row>}'.
+    cache 'closed' + edge 'false' -> the poller's ISSUE SYNC ran but SyncFiledIssueCloses did not consume the edge. Look at the poller call site and ListFiledIssueCloseEdges' filters. NOT a forge-fake problem.
+    cache 'opened' or empty       -> the poller's ISSUE SYNC did not run or did not see the close, so SyncFiledIssueCloses was never in a position to act. Look at the poll interval and the forge-fake state route. NOT a judge problem.
+    cache 'closed' + edge 'true'  -> the edge WAS consumed and the insert wrote nothing, i.e. a competing disposition already existed on this coordinate. The precondition below exists to have caught that first.
+  WHAT THIS CANNOT RULE OUT: an api that is dead or wedged, which presents as the second case. What DOES separate it is the synced_at liveness probe armed after close_issue — that one moves only when a poller tick touches this repo's issue cache, so if it passed and this failed, the poller RAN. (The cache precondition earlier proves the FILING landed; it is written by the file-issue handler in its own transaction and says nothing about the poller.)"
+}
+
+# PRECONDITION 1: the issue cache reflects #$F_IID as OPEN.
+#
+# 🔴 THIS IS A STATE CHECK, NOT A LIVENESS CHECK, and it was labelled as one. The cache row
+# is written by the FILE-ISSUE HANDLER, not by the poller: settleFiledIssue
+# (handler/review_issue_file.go) calls UpsertIssue in the SAME TRANSACTION as settling the
+# filed link, with State: created.State, and its own comment says why — "so the board card
+# appears without a poll". forge-fake creates issues state:"opened". So this wait is
+# satisfied instantly by a row the #68 phase's own API call wrote, and IT PASSES AGAINST A
+# STONE-DEAD POLLER. Two reviewers derived that independently, from different starting
+# points, after it had been written here as a liveness control.
+#
+# It still earns its place — it proves the filing reached the cache, and it pairs with the
+# wire check below — but the liveness question is answered by the probe underneath.
+wait_eq opened 20 "the issue cache reflects filed issue #$F_IID as open (the FILING landed; not a poller check)" b6_issue_state
+
+# PRECONDITION 2, or the assertion below is vacuous. The coordinate must be SETTLED-filed
+# with the edge unconsumed, and must carry NO disposition — a pre-existing verdict would
+# make ApplyFiledIssueCloseEdge's ON CONFLICT DO NOTHING write nothing while still
+# stamping the edge, and the row would then be asserting a disposition it did not cause.
+[ "$(db_psql "SELECT count(*) FROM recommendation_filed_issues WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT' AND filed_at IS NOT NULL AND close_synced_at IS NULL")" = 1 ] \
+  || fail "PRD #98 M8b/B6': the $B6_CAT/$B6_TGT coordinate on review $F_REVIEW is not a settled filed link with an unconsumed edge (want exactly 1 row with filed_at NOT NULL and close_synced_at NULL)"
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")" = 0 ] \
+  || fail "PRD #98 M8b/B6': the $B6_CAT/$B6_TGT coordinate already carries a disposition — the auto-Done assertion below would pass without the poller having done anything"
+# And the WIRE agrees it is filed, not merely the tables: this is the rung the shared
+# BucketOf ladder puts a settled filed link on, read through the API the panel reads.
+apiget "/api/me/judge/recommendations?bucket=filed" \
+  | jq -e --arg c "$B6_CAT" --arg t "$B6_TGT" 'any(.groups[]?; .category == $c and .target == $t)' >/dev/null \
+  || fail "PRD #98 M8b/B6': $B6_CAT/$B6_TGT does not bucket 'filed' on GET /api/me/judge/recommendations — the precondition the close edge acts on is not what the wire reports"
+pass "precondition: #$F_IID cached open, $B6_CAT/$B6_TGT filed on the wire, edge unconsumed, no disposition"
+
+# THE HUMAN ACTION M6 REACTS TO. uzi never closes an issue itself — it only ever reads
+# the state — which is why this needs the /_e2e mutator at all.
+B6_SYNC0="$(db_psql "SELECT to_char(synced_at,'YYYYMMDDHH24MISSUS') FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
+close_issue "$F_IID"
+pass "closed forge issue #$F_IID on the fake forge (issue-cache synced_at before the close: ${B6_SYNC0:-<none>})"
+
+# THE LIVENESS PROBE, which is the positive control B6a's dropped probe fixtures were going
+# to buy — recovered for free, with no probe coordinate, no second issue and no perturbation
+# of triage.todo.
+#
+# MECHANISM: UpsertIssue's conflict path sets `synced_at = now()` UNCONDITIONALLY, not only
+# when a column changed (queries/forge.sql), and the poller's sync runs it for every issue
+# the forge returns — and forge-fake returns every recorded issue wholesale on every poll.
+# So synced_at advances on EVERY tick whether or not anything changed. Re-derived here: after
+# the filing, the only callers that re-upsert this row are the poller's three sync paths in
+# forgesvc/service.go; the two non-poller callers are the file-issue handler (one-shot, above)
+# and the manual /issues endpoint, which nothing in this phase touches. So a moving synced_at
+# is the poller and nothing else.
+#
+# to_char because that is this file's own idiom for making a timestamp shell-comparable.
+# Armed AFTER close_issue so it bounds the window from below by OBSERVED poller work rather
+# than by elapsed time.
+#
+# 🔴 THIS PROBE WAS INFERRED FROM THE QUERY AND THE SYNC PATH, NOT EXECUTED — nobody has run
+# it against a live stack. Its failure message says so, because a new wait that has never run
+# is exactly the thing that turns into a confident wrong diagnosis on someone else's night.
+b6_synced_advanced() {
+  local now; now="$(db_psql "SELECT to_char(synced_at,'YYYYMMDDHH24MISSUS') FROM issues WHERE repo_id='$REPO_ID' AND forge_issue_iid=$F_IID")"
+  [ -n "$now" ] && [ "$now" != "$B6_SYNC0" ] && echo advanced || echo same
+}
+B6_LIVE_START=$SECONDS
+B6_LIVE_DEADLINE=$((SECONDS + 20))
+while [ $SECONDS -lt $B6_LIVE_DEADLINE ]; do
+  [ "$(b6_synced_advanced)" = advanced ] && break
+  sleep 0.3
+done
+[ "$(b6_synced_advanced)" = advanced ] || fail "PRD #98 M8b/B6': issues.synced_at for #$F_IID has not moved off '$B6_SYNC0' in 20s, so no poller tick has touched this repo's issue cache — the close→Done chain below cannot start.
+  BEFORE CONCLUDING THE POLLER IS DEAD: this probe was INFERRED from UpsertIssue's unconditional 'synced_at = now()' on the conflict path and from forge-fake returning every issue wholesale. It has never been executed against a live stack. If the incremental sync short-circuits before the upsert — or forge-fake's list route changed — the probe is wrong and the poller may be perfectly healthy. Check a second issue's synced_at before touching the judge code."
+record_margin "issues.synced_at advances (poller liveness)" "$((SECONDS - B6_LIVE_START))" 20
+pass "poller liveness: issues.synced_at for #$F_IID advanced off '$B6_SYNC0' — a tick has run since the close"
+
+wait_disposition "$F_REVIEW" "$B6_CAT" "$B6_TGT" done
+
+# THE PROVENANCE TRIPLE, and it is the assertion that makes this row about the POLLER
+# rather than about a disposition existing. status='done' alone is equally satisfied by a
+# human clicking Done; set_via='issue_close' with a NULL actor is reachable only from
+# ApplyFiledIssueCloseEdge, whose provenance is fixed in the query text rather than
+# parameterised precisely so no call site can forge it.
+B6_PROV="$(db_psql "SELECT COALESCE(status,'?') || '|' || COALESCE(set_via,'?') || '|' || (set_by_user_id IS NULL)::text
+                      FROM recommendation_dispositions
+                     WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")"
+[ "$B6_PROV" = "done|issue_close|true" ] \
+  || fail "PRD #98 M8b/B6': the auto-Done's provenance is '$B6_PROV', want 'done|issue_close|true' (status|set_via|set_by_user_id IS NULL). A 'done|manual|false' here means a HUMAN path wrote it and the poller proved nothing"
+# The other half of the atomic statement: the edge is consumed, so a second tick cannot
+# re-apply after an Undo. The six live-DB tests pin what that guarantees; this only
+# asserts the poller's own run left the marker.
+[ "$(db_psql "SELECT (close_synced_at IS NOT NULL)::text FROM recommendation_filed_issues WHERE review_id='$F_REVIEW' AND category='$B6_CAT' AND target='$B6_TGT'")" = true ] \
+  || fail "PRD #98 M8b/B6': the disposition landed but close_synced_at was never stamped — the two halves of ApplyFiledIssueCloseEdge are no longer atomic"
+pass "PRD #98 M8b/B6': closing #$F_IID drove the POLLER to auto-Done $B6_CAT/$B6_TGT with provenance done|issue_close|<null actor>, edge consumed"
+
+# NOT CLEANED UP, deliberately: the disposition IS the outcome, and deleting it would
+# delete the evidence. It shifts the global triage `todo` by one, which is why every
+# later count assertion in this file is a DELTA against its own pre-seed reading rather
+# than an absolute. The issue is left CLOSED for the same reason a reopen is not tested:
+# close_synced_at stays stamped and the product does not act on a reopen.
+
+# =============================================================================
+# PRD #98 M8b / B4' — the ROW CAP, and Part C's truncation remedy EXECUTED against it.
+# =============================================================================
+#
+# RUNS LAST IN THIS PHASE, so its teardown is the single owner of the cleanup.
+#
+# WHY IT HAS TO BE HERE AND CANNOT BE CHEAPER. JudgeBacklogMaxRows is a compile-time const
+# (2000) with no env override, and the service reads Lim = cap+1 then slices — so the ONLY
+# arrangement in the repo that reaches `truncated: true` is a seed above the cap. The
+# largest Lim any live-DB test passes is 1000, and the one cap assertion in the tree
+# (handler/judge_recommendations_test.go) feeds a FAKE store 2001 rows, which proves the
+# service's slice and says nothing about the query's LIMIT. This block is the only place
+# the real SQL meets the real cap.
+#
+# THE SEED'S SHAPE IS THE WHOLE DESIGN — four reviews at three ages, each on a run this
+# fixture mints for itself, because `ORDER BY rv.updated_at DESC …` decides what the cut
+# keeps and `run_reviews.target_run_id` is UNIQUE (see the seeding note below):
+#
+#   B4_OLD  (-3d, on B4_RUN_OLD)   1 coordinate, `b4-cut-me`. MUST be cut.
+#   B4_BIG  (-2d, on B4_RUN_BIG)   2001 distinct coordinates. The cap.
+#   B4_SA   (now, on B4_RUN_A)     $B4_TGT + `b4-dup` twice
+#   B4_SB   (now, on B4_RUN_B)     $B4_TGT again, on a SECOND run
+#
+# so the returned window is B4_SA/B4_SB first, then most of B4_BIG, and `b4-cut-me` falls
+# off the end. A `truncated` boolean on its own is satisfiable by a flag flip over complete
+# data; the absent coordinate is what makes it a claim about the CUT.
+#
+# WHY B4_BIG SITS ON A RUN THE REMEDY NEVER ANCHORS TO, and this is the non-obvious part:
+# the ?run= anchor is a COORDINATE semi-join, so anchoring to a run returns every coordinate
+# appearing in ANY of that run's reviews. Had the 2001 rows shared a run with a settled
+# coordinate, the anchored re-read would return all 2001 again — still truncated — and the
+# remedy the CLI prints would be FALSE. Two runs carry the settled coordinate and neither
+# carries the bulk seed.
+#
+# TWO SETTLED RUNS, NOT ONE, for the reason the undo row above states: a count of 1 cannot
+# distinguish the real behaviour from a `head -1` regression. Dismissing $B4_CAT/$B4_TGT
+# fans out to both reviews, so the CLI prints exactly two remedy lines.
+#
+# THE TARGET IS A VARIABLE, and that is a fix rather than a flourish. This block hardcoded
+# the literal at the dismiss call site while using $B4_CAT for the category, and the two
+# halves drifted: the seed said `b4-remedy` and the dismiss said `remedy`. Matching is exact
+# equality — reviewCoord only TrimSpaces the flag, and the bulk query joins
+# `want.target = rr.target` with no LIKE and no prefix match — so nothing would have
+# settled, and the dismiss STILL EXITS 0 because the CLI treats a no-match as a legal
+# updated=0. It would then have failed twice over, at the arrange count and again with the
+# lift seeing 0 matches against want=2, neither message naming the typo. The M8c row three
+# phases up already does this correctly through $PI_TGT; this now matches it.
+#
+# FOLDS IN B2's ONE UNCOVERED SHAPE at no extra cost: `dup` is seeded TWICE on ONE review,
+# which is `occurrences > run_count` (occurrences 2, run_count 1). It costs one INSERT row.
+# review_recommendations has no UNIQUE on (review_id, category, target), which is what makes
+# it expressible at all — the same absence the #68 phase's count-first guard exists for.
+say "PRD #98 M8b/B4': the server's row cap, and the truncation remedy executed against it"
+
+# THE CATEGORY IS NOT FREE-FORM, and this cost a rewrite: review_recommendations carries
+# CHECK (category IN ('enable_tool','install_worker_tool','adjust_template','improve_agent',
+# 'add_agent','improve_uzi')), so the invented `e2e_b4` this block first used would have
+# aborted the run on its very first INSERT. Measured against a throwaway Postgres before
+# committing, not discovered by a 30-minute harness run.
+#
+# `adjust_template` is chosen because it is the only one of the six that NO other phase in
+# this file uses (measured: the harness's sole other category is install_worker_tool), so
+# the teardown below can assert on the category and be exact. NOT `improve_uzi`: that feeds
+# the self-improvement backlog, whose ListOpenImproveUziRecommendations selects across the
+# WHOLE table with no review or user scope, and this repo has already lost time to a fixture
+# that seeded an open improve_uzi row. Every target additionally carries a `b4-` prefix.
+B4_CAT=adjust_template
+B4_TGT=b4-remedy
+B4_OWNER="$(db_psql "SELECT user_id FROM run_reviews WHERE id='$F_REVIEW'")"
+printf '%s' "$B4_OWNER" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+  || fail "PRD #98 M8b/B4': could not resolve the fixture owner off review $F_REVIEW (got '$B4_OWNER')"
+
+# 🔴 THE FIXTURE SEEDS ITS OWN RUNS, AND IT MUST. `run_reviews.target_run_id` is
+# `NOT NULL UNIQUE` (migration 00059, whose own comment says "One review per reviewed run …
+# so a re-judge UPSERTs"). ONE REVIEW PER RUN, by design. The first version of this block
+# reused the harness's existing runs and aborted at the second INSERT with
+#
+#   ERROR: duplicate key value violates unique constraint "run_reviews_target_run_id_key"
+#
+# broken twice over: it put TWO of its reviews on RUN_CLI, and J_RUN already owns F_REVIEW
+# from the #68 phase. Found by RUNNING the harness. Five validators read this block
+# statically and three attacked the fixture arrangement specifically; none of us saw it,
+# because "are the runs distinct enough for the semi-join" and "may these runs carry a
+# review at all" are different questions and only the first was asked. That is the argument
+# for the e2e leg existing, made by the leg on its first execution.
+#
+# Four dedicated runs also make the arrangement SELF-CONTAINED rather than dependent on what
+# earlier phases left behind: the separation the anchor needs is now a property of this
+# fixture, not a coincidence of the harness's history.
+#
+# Direct-seeded as `completed`, which is safe rather than merely convenient: a judge run is
+# enqueued by maybeEnqueueJudge on a just-committed TERMINAL TRANSITION, never by a scan for
+# unjudged completed runs, so a row inserted straight into the terminal state is never
+# judged and its review slot stays free. `kind` is omitted — it defaults to 'issue'
+# (migration 00043). The iid range is far above anything forge-fake mints, and no `issues`
+# row is created for them, so they cannot appear on a board or collide with a phase that
+# addresses an issue by iid.
+#
+# b4_seed_run VAR IID — insert a completed run owned by the fixture owner, assign its id.
+b4_seed_run() {
+  local var="$1" iid="$2" id
+  db_psql "INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, status)
+           VALUES ('$B4_OWNER', '$REPO_ID', $iid, 'PRD98-B4 fixture run $iid', 'B4 fixture; never executed', 'completed')" >/dev/null
+  id="$(db_psql "SELECT id FROM runs WHERE repo_id='$REPO_ID' AND issue_iid=$iid")"
+  printf '%s' "$id" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || fail "PRD #98 M8b/B4': seeded run for iid $iid did not read back as a bare uuid: '$id'"
+  printf -v "$var" '%s' "$id"
+}
+b4_seed_run B4_RUN_OLD 990001
+b4_seed_run B4_RUN_BIG 990002
+b4_seed_run B4_RUN_A   990003
+b4_seed_run B4_RUN_B   990004
+# The separation the ?run= anchor depends on, asserted rather than assumed: the bulk seed's
+# run must not be one of the two the remedy anchors to. All four are freshly minted here, so
+# this cannot fail today — which is exactly why it is cheap to keep. It fires the moment
+# someone "simplifies" the fixture back onto shared runs, which is how it broke the first time.
+[ "$B4_RUN_BIG" != "$B4_RUN_A" ] && [ "$B4_RUN_BIG" != "$B4_RUN_B" ] && [ "$B4_RUN_A" != "$B4_RUN_B" ] \
+  || fail "PRD #98 M8b/B4': the bulk-seed run must differ from BOTH runs the remedy anchors to. The anchor is a COORDINATE semi-join, so an anchored re-read returns every coordinate in any of that run's reviews — sharing a run would return all 2001 rows again, the re-read would still be truncated, and the remedy the CLI prints would be FALSE"
+pass "seeded 4 dedicated runs for the B4' fixture (run_reviews.target_run_id is UNIQUE: one review per run)"
+
+# b4_seed_review VAR TARGET_RUN SUMMARY AGE_INTERVAL — insert a review and ASSIGN its id
+# to VAR.
+#
+# It assigns rather than echoing, and that is not style. A `fail` inside `$( )` runs in a
+# SUBSHELL: its `exit 1` kills only that subshell, and its message goes to the subshell's
+# STDOUT, which is exactly what the caller is capturing — so the diagnostic ends up INSIDE
+# the variable instead of on screen. `set -e` would still stop the run, on an assignment,
+# with no message. Assigning through `printf -v` keeps the check in the caller's shell.
+#
+# NOT `RETURNING id` either: db_psql is `psql -tAc … | tr -d '\r\n'`, so psql's command TAG
+# is welded onto the returned row and yields `<uuid>INSERT 0 1` — non-empty, passes a bare
+# -n guard, and explodes several statements later. Read it back with a SELECT and assert the
+# SHAPE. (Measured on this branch by the M8c fixture above; repeated here because the trap
+# belongs to the helper, not to one call site.)
+b4_seed_review() {
+  local var="$1" run="$2" summary="$3" age="$4" id
+  db_psql "INSERT INTO run_reviews (target_run_id, user_id, verdict, summary_md, updated_at)
+           VALUES ('$run', '$B4_OWNER', 'ok', '$summary', now() - interval '$age')" >/dev/null
+  id="$(db_psql "SELECT id FROM run_reviews WHERE summary_md='$summary'")"
+  printf '%s' "$id" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    || fail "PRD #98 M8b/B4': seeded review '$summary' did not read back as a bare uuid: '$id'"
+  printf -v "$var" '%s' "$id"
+}
+b4_seed_review B4_OLD "$B4_RUN_OLD" 'PRD98-B4-oldest'  '3 days'
+b4_seed_review B4_BIG "$B4_RUN_BIG" 'PRD98-B4-bulk'    '2 days'
+b4_seed_review B4_SA  "$B4_RUN_A"   'PRD98-B4-small-a' '0 days'
+b4_seed_review B4_SB  "$B4_RUN_B"   'PRD98-B4-small-b' '0 days'
+
+db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+         VALUES ('$B4_OLD','$B4_CAT','b4-cut-me','B4 oldest-review coordinate: it must fall outside the cap','low')" >/dev/null
+B4_SEED_START=$SECONDS
+db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+         SELECT '$B4_BIG', '$B4_CAT', 'b4-bulk-' || g, 'B4 bulk seed row ' || g, 'low'
+           FROM generate_series(1, 2001) g" >/dev/null
+B4_SEED_SECS=$((SECONDS - B4_SEED_START))
+db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+         VALUES ('$B4_SA','$B4_CAT','$B4_TGT','B4 remedy coordinate, run A','low'),
+                ('$B4_SA','$B4_CAT','b4-dup','B4 duplicate coordinate on ONE review, member 1','low'),
+                ('$B4_SA','$B4_CAT','b4-dup','B4 duplicate coordinate on ONE review, member 2','low'),
+                ('$B4_SB','$B4_CAT','$B4_TGT','B4 remedy coordinate, run B','low')" >/dev/null
+pass "seeded 2001 bulk coordinates (${B4_SEED_SECS}s) plus the oldest-review, duplicate and remedy fixtures"
+
+# The design ASSUMED this seed is sub-second and asked for that to be measured rather than
+# inherited. MEASURED before this landed, against a throwaway Postgres 17 on the real table
+# shape: ~27 ms (median, Execution Time; the 8.4 ms figure this line used to carry is the
+# Insert node's BEST CASE) for the 2001-row insert. Still two orders of magnitude under a
+# second, so the assumption holds and the added harness time is the round trip, not the write.
+#
+# 🔴 CORRECTED, AND BOTH HALVES OF THE CORRECTION ARE REUSABLE. Measured properly against the
+# live stack: five samples, each inside BEGIN…ROLLBACK so nothing persists.
+#   Insert node     8.497 – 25.655 ms   (median ~11.9)
+#   Execution Time 21.454 – 42.940 ms   (median ~26.7)
+# (1) The old number was not WRONG, it was measured ONCE — 8.497 ms came back on sample 1,
+#     within 0.1 ms of it. Drawing the good end of an 8.5–25.7 ms spread is what a single
+#     sample does; "measured once" is the finding, not "measured wrong".
+# (2) THE NODE IS NOT THE STATEMENT. `Insert on …` excludes planning-adjacent setup,
+#     constraint and index work, and returning; Execution Time is the statement. Quoting the
+#     node was quoting the most flattering slice of what was measured — the same discipline
+#     the tally corrections in this wave turned on numerals, applied to a profile.
+#
+# B4_SEED_SECS ABOVE DOES NOT CORROBORATE ANY OF THIS AND MUST NOT BE READ AS DOING SO. It
+# comes from $SECONDS — WHOLE-SECOND resolution — so it reads 0 or 1 whether the true cost
+# is 8 ms or 900 ms, and it includes docker exec and psql startup besides. What it is good
+# for is a floor check across runs: if it ever climbs, the seed stopped being cheap and that
+# is worth knowing. Say so rather than lowering the cap — the cap is the thing under test.
+
+# --- the cap itself ----------------------------------------------------------
+B4_ALL="$(apiget "/api/me/judge/recommendations?bucket=all")"
+echo "$B4_ALL" | jq -e '.truncated == true' >/dev/null \
+  || fail "PRD #98 M8b/B4': 2001+ owned recommendation rows did not set truncated on GET /api/me/judge/recommendations?bucket=all — the query's LIMIT or the service's slice is not what the cap claims (truncated=$(echo "$B4_ALL" | jq -c '.truncated'), groups=$(echo "$B4_ALL" | jq '.groups|length'))"
+# THE CUT, not just the flag. A `truncated: true` alone is satisfied by a flag flip over
+# complete data; this is the assertion that the rows were actually dropped, and dropped
+# from the OLDEST review, which is the ordering the cut depends on.
+echo "$B4_ALL" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and .target == "b4-cut-me") | not' >/dev/null \
+  || fail "PRD #98 M8b/B4': the coordinate seeded on the OLDEST review still came back under a truncated read — the cap is reporting truncation without cutting, or the ORDER BY no longer decides what survives"
+echo "$B4_ALL" | jq -e --arg c "$B4_CAT" --arg t "$B4_TGT" 'any(.groups[]?; .category == $c and .target == $t)' >/dev/null \
+  || fail "PRD #98 M8b/B4': the remedy coordinate is not in the truncated window, so the dismiss below would settle nothing"
+# B2's uncovered shape, live: the same coordinate twice on ONE review is 2 occurrences
+# behind 1 run. This is the SQLSTATE 21000 shape the grouper's own comment names, and the
+# only place in the tree it is exercised against the real query.
+echo "$B4_ALL" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and .target == "b4-dup" and (.occurrences|length) == 2 and .run_count == 1)' >/dev/null \
+  || fail "PRD #98 M8b/B4': the duplicate coordinate did not group as 2 occurrences behind 1 run (got $(echo "$B4_ALL" | jq -c --arg c "$B4_CAT" '.groups[]? | select(.category == $c and .target == "b4-dup") | {occ: (.occurrences|length), run_count}'))"
+pass "row cap reached: truncated=true, the oldest review's coordinate is CUT, and the duplicate coordinate is 2 occurrences behind 1 run"
+
+# --- printed-instruction row: uzi review backlog --run -----------------------
+# THE FOURTH ROW. Part C declared this one evidenceNotExecuted with the reason "needs the
+# 2001-row seed, which is M8b's"; that seed now exists, so the entry flips to evidenceE2E in
+# the SAME commit as this row. The flip is what couples them: the registry check reads THIS
+# FILE for the label below, so flipping without the row goes red and landing the row without
+# the flip leaves a stale not-executed claim.
+#
+# The printed text CHANGED to make this expressible at all (user-approved). It used to be a
+# single line carrying the literal `uzi review backlog --run <run-id>` — a placeholder in
+# the OUTPUT, not a value substituted at emit time — which cannot be executed verbatim by
+# anyone. It is now one runnable line per settled run.
+PI_LABEL_TRUNC="printed-instruction row: uzi review backlog --run"
+PI_OUT_TRUNC="$(uzi_cli review dismiss --category "$B4_CAT" --target "$B4_TGT" --reason wont-do)" \
+  || fail "$PI_LABEL_TRUNC: the group dismiss that EMITS the remedy failed (exit $?)"
+# ARRANGE, not the assertion: the write must have settled BOTH members, or there is only one
+# run to name and the count below stops discriminating.
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='$B4_TGT'")" = 2 ] \
+  || fail "$PI_LABEL_TRUNC: the group dismiss settled $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT' AND target='$B4_TGT'") coordinate(s), want 2 (one per review, on two different runs). Output was:
+$PI_OUT_TRUNC"
+run_printed_instructions "$PI_LABEL_TRUNC" 'uzi review backlog --run [0-9a-f-]{36}' 2 "$PI_OUT_TRUNC"
+# THE OUTCOME, and it is the whole point of the remedy: the anchored re-read is NOT
+# truncated. Exit 0 alone would be satisfied by an anchored read that truncates identically,
+# which is exactly what `--bucket all` does and why naming it was the false instruction.
+#
+# Spelled as an `if`, not as `grep … && fail`, because an `if` condition is exempt from
+# `set -e` in every position. The rewrite stays; the REASON it originally carried was too
+# broad and is corrected here, since a wrong explanation of a shell rule is worse than none
+# — one reviewer nearly filed three false findings against the other sites on the strength
+# of it.
+#
+# MEASURED under `set -euo pipefail`, three positions:
+#   top level                             echo hi | grep -qF nope && fail "x"   SURVIVES
+#   inside a for loop                     same                                  SURVIVES
+#   LAST COMMAND OF A FUNCTION, called
+#   at top level                          same                                  ABORTS
+# So the AND-list IS exempt — except as a function's last command, where the FUNCTION
+# returns the list's non-zero status and the call becomes an ordinary top-level command that
+# `set -e` does not exempt. Much narrower than "a failing final command in an AND-list is
+# not exempt", which is what this comment used to say.
+#
+# The other `grep … && fail` sites in this file were checked against that rule and left
+# alone: none is a function's last command. Rewriting them would be a mechanical sweep on a
+# mechanism that does not reach them.
+# 🔴 THE ASSERTION IS `truncated == false`, PER EXECUTION, AND IT IS NOT A COORDINATE GREP.
+# Architect's ruling, and it was already in the design note (§2.4, B4' step 3): "execute it
+# verbatim, assert the re-read is NOT truncated".
+#
+# THAT IS THE REMEDY'S ACTUAL PROMISE. The warning said the read was cut; the remedy claims
+# to get you below the cap; not-truncated is exactly that claim discharged. A COORDINATE GREP
+# ASSERTS FIXTURE SHAPE; THIS ASSERTS THE PROPERTY — and it is immune to which bucket the
+# coordinate lands in, which is precisely how the previous marker broke.
+#
+# The history, because two corrections in a row missed and the sequence is the lesson: the
+# original `grep -q <coordinate>` over the concatenation was correctly found too WEAK
+# (satisfiable by the FIRST re-read alone — N lifted, N executed, ONE certified). The fix, a
+# count over the same concatenation with `-ge 2`, moved it from satisfiable-by-one to
+# satisfiable-by-NONE and reddened on the first run that reached it: `uzi review backlog
+# --run <id>` renders the TODO bucket, and the dismissed coordinate has left todo BY
+# CONSTRUCTION, so zero was the correct answer. Neither proposed replacement marker could
+# have carried `-ge 2` either — renderBacklog never prints the run id, and `b4-dup` survives
+# on ONE of the two runs only. The weakness was real, both coordinate-shaped remedies were
+# wrong, and the property was the answer all along.
+#
+# PER EXECUTION is the half that must not be lost while swapping the marker — but NOT for the
+# reason it is tempting to write, and getting this exactly right matters because it is a claim
+# about shell semantics:
+#
+#   * the NEGATIVE (`! grep -q "row cap"`) is ALREADY union-equivalent. If the warning appears
+#     in any re-read it appears in the concatenation, so per-file buys it nothing. Measured:
+#     a truncated re-read #1 with a clean #2 reddens either way.
+#   * the POSITIVE companion is where the split does the work. Over the concatenation,
+#     "some output rendered a backlog" is satisfied by re-read #1 alone — so #2 erroring, or
+#     printing NOTHING, passes. Measured: both of those go GREEN on a union check and RED
+#     per-file.
+#
+# And the two are a PAIR, which is the point: absence of a truncation warning is trivially
+# true of output that does not exist, so the negative is vacuous without a per-execution
+# positive beside it. That is why run_printed_instructions writes $PRINTED_OUT.$i.
+[ "$PRINTED_N" = 2 ] \
+  || fail "$PI_LABEL_TRUNC: $PRINTED_N instruction(s) executed, want 2 — the per-execution assertions below cannot certify what did not run"
+for i in 1 2; do
+  # truncated == false, read off the CLI's own rendering: renderBacklog prints the "row cap"
+  # warning if and only if b.Truncated, so its ABSENCE is the flag being false.
+  if grep -q "row cap" "$PRINTED_OUT.$i"; then
+    fail "$PI_LABEL_TRUNC: anchored re-read #$i came back TRUNCATED — the anchor did not narrow it below the cap, so the remedy the CLI printed is FALSE:
+$(cat "$PRINTED_OUT.$i")"
+  fi
+  # And it rendered a BACKLOG rather than erroring or printing nothing. Both spellings are
+  # legitimate — an empty result is an ANSWER here, not a dead end (nothing on that run is
+  # still un-triaged) — so accepting either is correct rather than lax. This is what makes
+  # the not-truncated check above meaningful: absence of a warning in EMPTY output would
+  # otherwise be satisfied by a command that printed nothing at all.
+  grep -qE "groups \(|no recommendations in this bucket" "$PRINTED_OUT.$i" \
+    || fail "$PI_LABEL_TRUNC: anchored re-read #$i produced neither a groups listing nor the empty-bucket line, so it did not render a backlog at all — and 'no row cap warning' is trivially true of output that does not exist:
+$(cat "$PRINTED_OUT.$i")"
+done
+# NOT ASSERTED HERE, deliberately: that the re-reads name any particular coordinate. That the
+# dismissed one has left todo is the BULK DISPOSITION's property, pinned by the `= 2`
+# disposition count above and by the four TestBulkDisposition*LiveDB tests; that a given
+# coordinate is still present is fixture shape, which is what the ruling above removes.
+pass "$PI_LABEL_TRUNC — 2 remedy lines lifted from the dismiss's own stdout, both executed verbatim, and EACH came back NOT truncated with a rendered backlog"
+
+# --- positive control + teardown ---------------------------------------------
+# Delete the bulk review and re-assert BOTH directions. Without this, a truncated:true from
+# some unrelated cause is indistinguishable from one this fixture produced — and the
+# reappearance of `cut-me` is the second half: it proves the coordinate was cut by the CAP
+# rather than being absent for any other reason.
+db_psql "DELETE FROM run_reviews WHERE id='$B4_BIG'" >/dev/null
+B4_AFTER="$(apiget "/api/me/judge/recommendations?bucket=all")"
+echo "$B4_AFTER" | jq -e '.truncated == false' >/dev/null \
+  || fail "PRD #98 M8b/B4': deleting the 2001-row review left truncated still true — the flag was not this fixture's, so every assertion above proved nothing about it"
+echo "$B4_AFTER" | jq -e --arg c "$B4_CAT" 'any(.groups[]?; .category == $c and .target == "b4-cut-me")' >/dev/null \
+  || fail "PRD #98 M8b/B4': the oldest review's coordinate is STILL absent after the cap was removed, so its earlier absence was not the cut"
+pass "positive control: bulk review deleted -> truncated=false AND the previously-cut coordinate returns"
+
+# TEARDOWN BY RUN, so the fixture's own runs go too and nothing it created survives into the
+# later phases. One DELETE, three cascade levels: runs -> run_reviews (target_run_id ON
+# DELETE CASCADE, migration 00059) -> review_recommendations and
+# recommendation_dispositions. The bulk review was already deleted by the positive control
+# above; its run is removed here with the rest.
+db_psql "DELETE FROM runs WHERE id IN ('$B4_RUN_OLD','$B4_RUN_BIG','$B4_RUN_A','$B4_RUN_B')" >/dev/null
+# Assert all three levels, and assert them on the CATEGORY, which is exact because no other
+# phase uses adjust_template. Asserting the cascaded tables is asserting the CASCADE rather
+# than a second DELETE — the point being that a fixture leaving dispositions behind moves
+# every later triage count, and one leaving runs behind moves every later run count.
+[ "$(db_psql "SELECT count(*) FROM review_recommendations WHERE category='$B4_CAT'")" = 0 ] \
+  || fail "PRD #98 M8b/B4': the fixture teardown left $(db_psql "SELECT count(*) FROM review_recommendations WHERE category='$B4_CAT'") $B4_CAT recommendation row(s) behind; later sections would read them"
+[ "$(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT'")" = 0 ] \
+  || fail "PRD #98 M8b/B4': the teardown left $(db_psql "SELECT count(*) FROM recommendation_dispositions WHERE category='$B4_CAT'") $B4_CAT disposition row(s) behind — the ON DELETE CASCADE from run_reviews did not fire"
+[ "$(db_psql "SELECT count(*) FROM runs WHERE issue_iid BETWEEN 990001 AND 990004")" = 0 ] \
+  || fail "PRD #98 M8b/B4': the teardown left $(db_psql "SELECT count(*) FROM runs WHERE issue_iid BETWEEN 990001 AND 990004") fixture run(s) behind; every later assertion counting runs would read them"
+pass "PRD #98 M8b/B4' fixtures removed — 4 runs, and their reviews, recommendations and dispositions by cascade"
+
+# STILL NOT PROVEN HERE, deliberately: `uzi login`, the device-auth polling hint. It is
+# permanently unreachable from a harness — the command declares no flags, it is a
+# device-authorization flow, and the hint fires inside the polling loop on a terminal or
+# timed-out approval, so executing it verbatim means driving a browser approval. That is
+# declared, with that reason, in api/cmd/uzi/instructions_test.go, where an honest
+# evidenceNotExecuted is a legal, green and permanent state.
+#
+# ONE WRITER FOR THIS FILE. That was true while #98's phases were being built and it stays
+# true: two concurrent agents editing run-e2e.sh is the conflict the note this replaces
+# existed to prevent.
+
 # Restore the default (judge OFF) so later sections' runs are not auto-judged and the
 # PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
 apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
@@ -3965,4 +4843,8 @@ apiget /api/workers \
   || fail "deleting a bound token nulled workers.user_id — the composite FK's SET NULL is missing its column list"
 pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user_id intact"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+# This line enumerates every phase the run covered, and it is the only place a reader
+# who did not watch the output learns what was in it — so a phase that lands without
+# being named here is invisible in exactly the summary people quote. PRD #98 was missing:
+# its M8c printed-instruction phase landed at 4b94f714 without touching this line.
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"

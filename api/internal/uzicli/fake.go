@@ -18,19 +18,20 @@ import (
 // so a test can exercise the "not judged" (nil) path WITHOUT reusing the 404
 // path — the two are deliberately distinct (PRD #64 M7).
 type FakeClient struct {
-	User         apitypes.UserDTO
-	Runs         []apitypes.RunListItemDTO
-	RunByID      map[string]apitypes.RunDTO
-	LogsByID     map[string][]apitypes.MessageDTO
-	InputsByID   map[string][]apitypes.SteerInputDTO
-	Reviews      map[string]*apitypes.ReviewDTO
-	Workers      []apitypes.WorkerDTO
-	Repos        []apitypes.RepoDTO
-	AdminUsers   []apitypes.UserDTO
-	AdminRuns    []apitypes.RunListItemDTO
-	AdminWorkers []apitypes.AdminWorkerDTO
-	AdminUsageV  apitypes.AdminUsageDTO
-	RateLimits   []apitypes.AdminRateLimitRowDTO
+	User           apitypes.UserDTO
+	Runs           []apitypes.RunListItemDTO
+	RunByID        map[string]apitypes.RunDTO
+	LogsByID       map[string][]apitypes.MessageDTO
+	InputsByID     map[string][]apitypes.SteerInputDTO
+	Reviews        map[string]*apitypes.ReviewDTO
+	Workers        []apitypes.WorkerDTO
+	Repos          []apitypes.RepoDTO
+	AdminUsers     []apitypes.UserDTO
+	AdminRuns      []apitypes.RunListItemDTO
+	AdminWorkers   []apitypes.AdminWorkerDTO
+	AdminCLITokens []apitypes.AdminCLITokenDTO
+	AdminUsageV    apitypes.AdminUsageDTO
+	RateLimits     []apitypes.AdminRateLimitRowDTO
 
 	// Auth-flow canned replies (uzi login). StartCLIAuth returns AuthStart;
 	// PollCLIAuth pops the front of AuthPolls each call (and repeats the last entry
@@ -295,6 +296,13 @@ func (f *FakeClient) AdminListWorkers(context.Context) ([]apitypes.AdminWorkerDT
 		return nil, f.Err
 	}
 	return f.AdminWorkers, nil
+}
+
+func (f *FakeClient) AdminListCLITokens(context.Context) ([]apitypes.AdminCLITokenDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.AdminCLITokens, nil
 }
 
 func (f *FakeClient) AdminUsage(context.Context) (apitypes.AdminUsageDTO, error) {

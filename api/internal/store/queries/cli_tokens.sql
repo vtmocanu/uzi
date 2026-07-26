@@ -46,3 +46,37 @@ WHERE id = $1 AND user_id = $2 AND NOT revoked;
 -- over idx_cli_tokens_user. Idempotent — a second call touches zero rows. Scoped to
 -- $1, so it revokes the caller's tokens and nobody else's.
 UPDATE cli_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked;
+
+-- name: ListAllCLITokensForAdmin :many
+-- The factory-wide standing-credential inventory (admin read-only). The question it
+-- exists to answer is "who holds credentials to this instance, and are any stale or
+-- unexpected?" — which nothing could answer before: every other query in this file is
+-- scoped to one user_id or to one token_hash, so a token was visible to its owner and
+-- to nobody else, while `workers` has had an admin-wide view since PRD #42.
+--
+-- COLUMNS ARE PROJECTED EXPLICITLY, AND THAT IS A SECURITY BOUNDARY, NOT A STYLE
+-- CHOICE. token_hash is omitted here rather than dropped in the DTO, so it is absent
+-- from the generated Go struct and a future DTO edit CANNOT leak it — the sha256 of a
+-- credential is offline-crackable, and an admin-wide list of them would turn a
+-- visibility fix into a credential-disclosure surface. Contrast ListCLITokens above,
+-- which is `SELECT *` and relies on cliTokenDTO to drop the hash: that is safe today
+-- because the row never leaves the handler, but it is one careless marshal away from
+-- not being. Do not "simplify" this to SELECT * or sqlc.embed.
+--
+-- Revoked rows are INCLUDED: a revoked token is the incident trail (the whole reason
+-- this table soft-deletes), so an audit view that hid them would hide exactly what an
+-- investigation needs. They sort last.
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.name,
+       t.token_prefix,
+       t.scope,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM cli_tokens t
+  JOIN users u ON u.id = t.user_id
+ ORDER BY t.revoked ASC, u.email ASC, t.created_at DESC, t.id ASC;

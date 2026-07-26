@@ -34,7 +34,7 @@ Default flow for a typical task:
    coupling, and independent shippability when reviewing. Open design questions
    it flags go to the user, not to the coder as guesses.
 1. Spawn coder with the full task context. The coder runs the project's
-   test/lint gates before reporting done: `cd api && go test ./...`;
+   test/lint gates before reporting done: `cd api && go test -count=1 ./...`;
    `cd web && npm test && npm run typecheck`;
    `cd agent && npm test && npm run typecheck` (plus `./e2e/run-e2e.sh` +
    `./scripts/smoke.sh` for stack-level changes).
@@ -456,8 +456,8 @@ format         none (gap)          # gofmt -l ./api reports pre-existing drift; 
 lint           none (gap)          # no golangci-lint, no eslint; go vet in CI only
 typecheck      cd web && npm run typecheck
                cd agent && npm run typecheck
-test           cd api && go test ./...
-               cd controller && go test ./...
+test           cd api && go test -count=1 ./...
+               cd controller && go test -count=1 ./...
                cd web && npm test
                cd agent && npm test
                cd web && npm run check-docs
@@ -471,9 +471,22 @@ long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.
 
+**`-count=1` on the two Go lines is part of the gate, not decoration — without it a
+green can mean the suite never ran.** Go's test cache hashes only files inside the
+module root, and this repo reads test inputs ACROSS module boundaries in both
+directions: `api/internal/workersvc/judge_backlog_fidelity_test.go` reads
+`fixtures/judge-fidelity/` at the repo ROOT, and the controller's contract tests read
+`api/`'s goldens. Measured 2026-07-25: deleting a whole case from `cases.json` left
+`cd api && go test ./internal/workersvc/` printing `ok (cached)`; `-count=1` reddened
+the same tree naming the broken fixture. Two aggravations, same day — the build cache
+is content-addressed and **shared across worktrees**, so even a fresh throwaway
+worktree can serve `(cached)`; and CI's `test:api` was armed the same way by
+`.go_job`'s persisted `.gocache/`. It costs the test-result cache only; compilation is
+still reused. See `CLAUDE.md`'s api section for the full measurement.
+
 ## Project signals
 
-- Test commands (see CLAUDE.md for detail): `cd api && go test ./...`;
+- Test commands (see CLAUDE.md for detail): `cd api && go test -count=1 ./...`;
   `cd web && npm test && npm run typecheck`; `cd agent && npm test && npm run typecheck`;
   integration: `./e2e/run-e2e.sh` (isolated stack, dummy creds) and
   `./scripts/smoke.sh` (needs a fresh stack). Never bare `docker compose up`

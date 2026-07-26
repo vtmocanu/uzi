@@ -334,6 +334,19 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
   the (attacker-influencable) text. [user 2026-07-17]
 - Works on **every existing recommendation**, with no backfill and no re-judge.
   [user 2026-07-17]
+- **When a backlog read is truncated the page says so**, in a plain warning
+  banner naming the two consequences (understated counts, missing groups) and
+  the two remedies — **no dismiss control and no warning icon**. A banner that
+  says the screen is not the truth must not be silenceable. [user 2026-07-25]
+- After a bulk disposition on a truncated backlog, the CLI prints **one runnable
+  `uzi review backlog --run <id>` line per settled run**, not a single line
+  carrying a `<run-id>` placeholder — naming every affected run beats making the
+  user guess one. A write that settled nothing prints no command.
+  [user 2026-07-25]
+- Truncation is **reachable in demo mode** through the existing demo-scenario
+  mechanism (`?mock=truncated-backlog` / `uzi_mock_scenario`), never a build flag
+  and never by accident: it is the one state where the screen is not the truth,
+  so a person needs to be able to see it. [user 2026-07-25]
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 

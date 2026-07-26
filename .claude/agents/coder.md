@@ -71,7 +71,7 @@ Gate slots here are: **format `none (gap)`, lint `none (gap)`, dead code
 yet (PRD #103 builds them), so "run every slot" currently means typecheck + test
 + build. Do not go hunting for a lint command; there isn't one.
 
-Gates before reporting done: api — `cd api && go build ./... && go test ./...`
+Gates before reporting done: api — `cd api && go build ./... && go test -count=1 ./...`
 (after editing `internal/store/migrations/` or `queries/`, regenerate with the
 pinned `sqlc generate`); web — `cd web && npm run typecheck && npm test && npm run build`;
 agent — `cd agent && npm run typecheck && npm test`. Full-stack proof is

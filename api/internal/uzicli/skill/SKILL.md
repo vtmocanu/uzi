@@ -109,6 +109,7 @@ uzi admin runs
 uzi admin workers
 uzi admin usage
 uzi admin rate-limits
+uzi admin cli-tokens
 uzi skill status
 uzi skill install [--force]
 uzi skill install-hook
