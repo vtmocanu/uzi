@@ -39,6 +39,11 @@ func (f *fakeUserForge) GetIssue(context.Context, int64, int64) (forge.Issue, er
 func (f *fakeUserForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
 	return forge.Issue{}, nil
 }
+// PRD #72 M5: no-op stub — this fake's tests never patch a description.
+func (f *fakeUserForge) UpdateIssueDescription(context.Context, int64, int64, string) error {
+	return nil
+}
+
 func (f *fakeUserForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }

@@ -317,6 +317,17 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	return nil
 }
 
+// UpdateIssueDescription sends only the description (PRD #72 M5).
+// gitlab.UpdateIssueOptions.Description is a *string with `omitempty`, so no other
+// field of the issue is transmitted and nothing else can be clobbered.
+func (g *gitLab) UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error {
+	opt := &gitlab.UpdateIssueOptions{Description: &description}
+	if _, _, err := g.client.Issues.UpdateIssue(projectID, issueIID, opt, gitlab.WithContext(ctx)); err != nil {
+		return g.redact.error(fmt.Errorf("gitlab: update issue description: %w", err))
+	}
+	return nil
+}
+
 func (g *gitLab) UserExists(ctx context.Context, username string) (bool, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {

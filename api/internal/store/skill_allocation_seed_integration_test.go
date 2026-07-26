@@ -154,6 +154,10 @@ func TestSeedSharedSkillAllocationScopeGuardsLiveDB(t *testing.T) {
 // §Conventions) fails loudly here rather than silently skipping the test.
 const migrationFile = "migrations/00083_seed_builtin_skill_allocations.sql"
 
+// prdDonePathMigrationFile is M4's. Named here so the non-LiveDB guard below
+// covers BOTH migrations this branch adds — they renumber together.
+const prdDonePathMigrationFile = "migrations/00084_run_prd_done_path.sql"
+
 // upStatement returns 00083's `-- +goose Up` body, read from the REAL file.
 //
 // This indirection is the point of the test. The first draft embedded a
@@ -277,5 +281,29 @@ func TestBuiltinSkillAllocationBackfillIsIdempotentLiveDB(t *testing.T) {
 	}
 	if onPrivate != 0 {
 		t.Errorf("the backfill allocated a user-scoped skill; got %d rows", onPrivate)
+	}
+}
+
+// TestMigrationFileConstantsResolve is LANDING-CRITICAL and deliberately NOT a
+// LiveDB test.
+//
+// The renumber guard inside TestBuiltinSkillAllocationBackfillIsIdempotentLiveDB
+// is silent on the gate a person actually runs. Measured: renaming 00083 to 00090
+// leaves `go test -count=1 ./internal/store/...` GREEN with UZI_TEST_DATABASE_URL
+// unset, because the t.Skip fires before upStatement ever opens the file. Only the
+// live sweep catches it.
+//
+// That matters because this branch adds TWO migrations, goose numbers are assigned
+// at MERGE time (CLAUDE.md §Conventions), and renumbering is a landing-rebase
+// activity — done by someone running the ordinary gate, not the sweep. So the guard
+// has to hold without a database. It uses the SAME constant, so the two cannot
+// drift.
+func TestMigrationFileConstantsResolve(t *testing.T) {
+	for _, f := range []string{migrationFile, prdDonePathMigrationFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Errorf("migration %s is missing: %v\n"+
+				"If this branch was rebased and the migrations renumbered, update the constant "+
+				"in this file to match. Renumber BOTH together — renumbering one reorders them.", f, err)
+		}
 	}
 }

@@ -351,6 +351,44 @@ func (f *forgejo) GetIssue(ctx context.Context, projectID, issueIID int64) (Issu
 	return toForgejoIssue(i), nil
 }
 
+// UpdateIssueDescription replaces an issue's body (PRD #72 M5).
+//
+// THE INTERNAL READ IS NOT OPTIONAL, and this is the hazard the whole method
+// exists to work around. In code.gitea.io/sdk/gitea, EditIssueOption.Title is a
+// plain `string` with the json tag "title" and NO `omitempty`, so a naive call
+// PATCHes `"title": ""` and can wipe the issue's title. Whether Forgejo happens to
+// ignore an empty title is not verifiable from this tree, and "probably ignores
+// it" is not a basis for a write against a user's issue. So: read the issue first
+// and send its current title back unchanged.
+//
+// A driver absorbing its own forge's quirk is the established shape here —
+// UpdateIssueLabels above does a read-then-full-PUT for the same kind of reason
+// (Forgejo has no add/remove delta). The interface stays neutral, which is the
+// point; the GitLab driver sends the description alone.
+func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return err
+	}
+	cur, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
+	if err != nil {
+		// Redaction is per-method and not automatic, so the INTERNAL read's error
+		// needs wrapping too — it carries the same client and the same PAT.
+		return f.redact.error(fmt.Errorf("forgejo: update issue description: read current issue: %w", err))
+	}
+	if _, _, err := c.EditIssue(slug.owner, slug.repo, issueIID, gitea.EditIssueOption{
+		Title: cur.Title,
+		Body:  &description,
+	}); err != nil {
+		return f.redact.error(fmt.Errorf("forgejo: update issue description: %w", err))
+	}
+	return nil
+}
+
 func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {

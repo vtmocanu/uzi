@@ -24,36 +24,41 @@ func TestValidateAccepts(t *testing.T) {
 	}
 }
 
+// rejected is the ONE rejection table. TestValidateRejects asserts Validate refuses
+// each row; TestLinksNeverReturnsSomethingValidateRejects asserts Links never
+// surfaces one. Two consumers, one source of truth — which is the whole point of
+// Links calling Validate rather than maintaining a parallel charset.
+var rejected = []struct {
+	p   string
+	why string
+}{
+	{"prds/../../../etc/passwd", "traversal"},
+	{"prds/../x.md", "traversal, single hop"},
+	{"prds/./x.md", "dot segment"},
+	{"/prds/x.md", "absolute"},
+	{"docs/x.md", "not rooted at prds/"},
+	{"prds/x.txt", "wrong extension"},
+	// The headline `prdLinkRe` failure: it validates by SUBSTRING, so this
+	// passes it. An anchored whole-string predicate is what kills it.
+	{"rm -rf / prds/x.md", "unanchored prefix"},
+	{"https://host/g/p/-/blob/main/prds/x.md", "a URL is not a repo path"},
+	{"prds/", "no file"},
+	{"prds/.md", "dotfile segment"},
+	{"prds/x.md#L4", "fragment suffix"},
+	{"prds/x.md?ref=main", "query suffix"},
+	{"prds//x.md", "empty segment"},
+	{"./prds/x.md", "leading ./"},
+	{"prds/.git/x.md", "dotfile directory"},
+	{"prds/x.md\n", "trailing newline"},
+	{"prds/a\nb.md", "embedded newline"},
+	{"prds/a\x00b.md", "NUL"},
+	{"prds\\x.md", "backslash separator"},
+	{"prds/sub\\..\\x.md", "backslash traversal"},
+	{"", "empty"},
+}
+
 func TestValidateRejects(t *testing.T) {
-	cases := []struct {
-		p   string
-		why string
-	}{
-		{"prds/../../../etc/passwd", "traversal"},
-		{"prds/../x.md", "traversal, single hop"},
-		{"prds/./x.md", "dot segment"},
-		{"/prds/x.md", "absolute"},
-		{"docs/x.md", "not rooted at prds/"},
-		{"prds/x.txt", "wrong extension"},
-		// The headline `prdLinkRe` failure: it validates by SUBSTRING, so this
-		// passes it. An anchored whole-string predicate is what kills it.
-		{"rm -rf / prds/x.md", "unanchored prefix"},
-		{"https://host/g/p/-/blob/main/prds/x.md", "a URL is not a repo path"},
-		{"prds/", "no file"},
-		{"prds/.md", "dotfile segment"},
-		{"prds/x.md#L4", "fragment suffix"},
-		{"prds/x.md?ref=main", "query suffix"},
-		{"prds//x.md", "empty segment"},
-		{"./prds/x.md", "leading ./"},
-		{"prds/.git/x.md", "dotfile directory"},
-		{"prds/x.md\n", "trailing newline"},
-		{"prds/a\nb.md", "embedded newline"},
-		{"prds/a\x00b.md", "NUL"},
-		{"prds\\x.md", "backslash separator"},
-		{"prds/sub\\..\\x.md", "backslash traversal"},
-		{"", "empty"},
-	}
-	for _, c := range cases {
+	for _, c := range rejected {
 		if err := prdpath.Validate(c.p); err == nil {
 			t.Errorf("Validate(%q) = nil, want an error (%s)", c.p, c.why)
 		}

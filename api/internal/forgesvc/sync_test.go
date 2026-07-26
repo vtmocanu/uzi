@@ -47,6 +47,26 @@ type fakeForge struct {
 	// SetIssueLabel (PRD #22 M4) scripting + capture.
 	ensureErr   error           // makes SetIssueLabel's EnsureLabels fail
 	ensureCalls [][]forge.Label // one entry per EnsureLabels call, for the apply path
+
+	// PRD link patch (PRD #72 M5) scripting + capture. issueByIID is what GetIssue
+	// returns (the LIVE description, deliberately distinct from the run's queue-time
+	// snapshot so a test can tell which one the watcher read); getIssueErrByIID
+	// forces a read error. descriptionUpdates records every write, by identity.
+	issueByIID         map[int64]forge.Issue
+	getIssueErrByIID   map[int64]error
+	getIssueCalls      []int64
+	updateDescErr      error
+	descriptionUpdates []descUpdateCall
+}
+
+// descUpdateCall records one UpdateIssueDescription invocation. Captured whole so
+// assertions can be made by IDENTITY (which issue, what text) rather than by a
+// tally, which is satisfiable by the wrong write happening the right number of
+// times.
+type descUpdateCall struct {
+	projectID   int64
+	issueIID    int64
+	description string
 }
 
 // mrUpdateCall records one UpdateIssueLabels invocation so the watcher tests can
@@ -54,6 +74,16 @@ type fakeForge struct {
 type mrUpdateCall struct {
 	add    []string
 	remove []string
+}
+
+func (f *fakeForge) UpdateIssueDescription(_ context.Context, projectID, issueIID int64, description string) error {
+	if f.updateDescErr != nil {
+		return f.updateDescErr
+	}
+	f.descriptionUpdates = append(f.descriptionUpdates, descUpdateCall{
+		projectID: projectID, issueIID: issueIID, description: description,
+	})
+	return nil
 }
 
 func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
@@ -74,7 +104,14 @@ func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssues
 	}
 	return f.issues, nil
 }
-func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
+func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.Issue, error) {
+	f.getIssueCalls = append(f.getIssueCalls, issueIID)
+	if err := f.getIssueErrByIID[issueIID]; err != nil {
+		return forge.Issue{}, err
+	}
+	if i, ok := f.issueByIID[issueIID]; ok {
+		return i, nil
+	}
 	return forge.Issue{}, nil
 }
 func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
@@ -186,6 +223,13 @@ type fakeStore struct {
 	closeApplied   []store.ApplyFiledIssueCloseEdgeParams
 	closeApplyErr  error
 	closeApplyRows store.ApplyFiledIssueCloseEdgeRow
+
+	// PRD-link patch (PRD #72 M5) scripting + capture.
+	prdCandidates    []store.ListPRDLinkPatchCandidatesRow
+	prdCandidatesErr error
+	prdCandidateArgs []store.ListPRDLinkPatchCandidatesParams
+	prdSettled       []uuid.UUID
+	prdSettleErr     error
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -243,6 +287,37 @@ func (s *fakeStore) ListFiledIssueCloseEdges(_ context.Context, arg store.ListFi
 func (s *fakeStore) ApplyFiledIssueCloseEdge(_ context.Context, arg store.ApplyFiledIssueCloseEdgeParams) (store.ApplyFiledIssueCloseEdgeRow, error) {
 	s.closeApplied = append(s.closeApplied, arg)
 	return s.closeApplyRows, s.closeApplyErr
+}
+
+func (s *fakeStore) ListPRDLinkPatchCandidates(_ context.Context, arg store.ListPRDLinkPatchCandidatesParams) ([]store.ListPRDLinkPatchCandidatesRow, error) {
+	s.prdCandidateArgs = append(s.prdCandidateArgs, arg)
+	return s.prdCandidates, s.prdCandidatesErr
+}
+
+// SettlePRDLinkPatch ACTUALLY APPLIES the settle by removing the row from the
+// candidate set, mimicking the query's `prd_patch_settled_at IS NULL` predicate.
+//
+// This is not fake-realism for its own sake. §3.7's "run a second tick, expect zero
+// further forge calls" passes VACUOUSLY against a fake whose settle is a no-op —
+// tick 2 would re-enumerate the same row, re-patch it, and the test would still see
+// "no NEW calls" only if it counted wrongly. Applying the settle is what makes tick
+// 2 return nothing BECAUSE OF tick 1, which is the property under test.
+func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, error) {
+	if s.prdSettleErr != nil {
+		return 0, s.prdSettleErr
+	}
+	s.prdSettled = append(s.prdSettled, id)
+	kept := s.prdCandidates[:0]
+	var n int64
+	for _, c := range s.prdCandidates {
+		if c.ID == id {
+			n = 1
+			continue
+		}
+		kept = append(kept, c)
+	}
+	s.prdCandidates = kept
+	return n, nil
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.
