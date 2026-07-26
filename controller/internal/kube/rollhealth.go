@@ -51,8 +51,11 @@ const (
 	// stuckAge is the fallback arm ONLY, for the reasonless cases: Pending with
 	// FailedScheduling or FailedMount, where no container exists yet to carry a
 	// waiting reason at all. REASONED: the real incident (seed-nix CrashLoopBackOff)
-	// fires on the reason arm within ~2 minutes, since k8s reports CrashLoopBackOff
-	// from the second restart. This governs only what that arm cannot see, so it is
+	// fires on the reason arm within a couple of minutes. (This used to say k8s reports
+	// CrashLoopBackOff "from the second restart"; per kubelet's doBackOff the backoff
+	// starts on the FIRST termination. Harmless downstream — the arm fires sooner, not
+	// later — but it was a false mechanism in a comment.) This governs only what that
+	// arm cannot see, so it is
 	// deliberately generous — a slow image pull of the browser-inflated agent image
 	// must not read as stuck.
 	stuckAge = 10 * time.Minute

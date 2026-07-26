@@ -55,37 +55,73 @@ export function WorkerUpgradeBadge({ worker }: { worker: Worker }) {
 }
 
 /**
- * A closed lookup from (container, reason) to a human cause.
+ * A closed lookup from (container, reason, exit code) to a human cause.
  *
  * It lives in the WEB, and that placement is the point: it reads as product copy rather
  * than as something we measured on the cluster. The api forwards only the container name
  * and the k8s waiting REASON — never `message`, which is free text carrying paths and
- * Secret names — so a guess dressed up as a diagnosis would be a claim we cannot support.
+ * Secret names.
+ *
+ * FEWER ENTRIES THAT ARE TRUE, rather than more that are plausible. An entry naming a
+ * mechanism these pods cannot exhibit is worse than no entry: it arrives with authority
+ * and sends an operator into the wrong subsystem during an incident. Two entries were
+ * removed for exactly that reason — see the notes below — and `null` is a correct answer,
+ * because `upgrade_detail` already states the container, the reason, the restart count and
+ * the exit code.
  */
-export function likelyCause(container: string | null, reason: string | null): string | null {
+export function likelyCause(container: string | null, reason: string | null, lastExitCode?: number | null): string | null {
   if (reason === "ImagePullBackOff" || reason === "ErrImagePull") {
-    return "The image tag may not exist in the registry, or the pull secret is missing.";
-  }
-  if (reason === "CreateContainerConfigError") {
-    return "A referenced Secret or ConfigMap is missing — most often the worker's join token.";
+    // NOT an exhaustive two-item list, which is what this said before. Worker images come
+    // from Harbor, so an unreachable registry and a pull rate-limit are as live as a bad
+    // tag or a missing pull secret.
+    return "The image could not be pulled: the tag may not exist, the pull secret may be missing, or the registry may be unreachable or rate-limiting.";
   }
   if (reason === "CrashLoopBackOff" && container === "seed-nix") {
-    return "The nix store reseed is failing. This is the shape of the v0.11.0 incident: a permissions error unpacking the browser closure.";
+    // Faithful to the v0.11.0 incident WITHOUT generalising from it. The earlier version
+    // asserted a permissions error as the cause, which is false as a rule: under
+    // `set -eu -o pipefail` the tar pipeline is the only failing step, so ENOSPC on the
+    // /nix PVC produces the IDENTICAL (seed-nix, CrashLoopBackOff) pair — and the store is
+    // ~1.7 GB, so that is not a remote possibility. The exit code is what separates them,
+    // which is why it is named rather than guessed at.
+    const code = typeof lastExitCode === "number" ? ` Its last exit code was ${lastExitCode}.` : "";
+    return `The nix store reseed is failing. Two causes produce this exact signature: a permissions error unpacking the store (the shape of the v0.11.0 incident), or the /nix volume running out of space.${code}`;
   }
-  if (reason === "CrashLoopBackOff") {
-    return "The container starts and exits repeatedly. Its last exit code is the best next clue.";
-  }
+  // DELIBERATELY ABSENT — do not add back without grounding them:
+  //
+  //   * CreateContainerConfigError, previously "a referenced Secret or ConfigMap is
+  //     missing, most often the join token". REFUTED: this reason comes from kubelet's
+  //     ENV resolution, and the worker pod has no env sourced from a Secret or ConfigMap
+  //     at all — verified zero ValueFrom/SecretKeyRef/EnvFrom in the renderer, which a
+  //     test actively enforces because a secretKeyRef token would reopen a
+  //     /proc/<pid>/environ leak. The token is a VOLUME, and a missing Secret behind a
+  //     volume surfaces as FailedMount with the container still ContainerCreating — which
+  //     the controller classifies on its reasonless arm, not here. So the most specific
+  //     and most actionable line in this table pointed at a failure mode these pods
+  //     cannot produce.
+  //
+  //   * a generic CrashLoopBackOff line. It restated the reason code ("the container
+  //     starts and exits repeatedly") without naming a cause, which is what "likely
+  //     cause" promises. `upgrade_detail` already says that, with the numbers.
+  //
+  //   * CreateContainerError and InvalidImageName are in the controller's blocking set
+  //     with no copy here. That is the honest state: nobody has grounded a cause for them
+  //     on these pods.
   return null;
 }
 
 /**
  * The kubectl command an operator can copy. Read-only.
  *
- * `describe pod` rather than `logs`: worker logs carry agent output over a user's cloned
- * private repo, so `pods/log` is refused for the controller and offering it here would
- * imply access uzi does not grant itself. The label selector is the one the controller
- * actually stamps on the pod template, so this resolves the same pods roll health was
- * derived from.
+ * `describe pod` rather than `logs`, and the reason is about the DATA, not about RBAC.
+ * This command runs under the operator's own kubeconfig, so the controller's Role does not
+ * constrain it — an earlier version of this comment cited "pods/log is refused for the
+ * controller", which is a true fact about the wrong subject. The actual reason to prefer
+ * describe: worker logs carry agent output over a user's cloned private repo, so putting a
+ * log command in the product UI invites reading it, and pod metadata answers the question
+ * ("why is this pod not Ready?") without that exposure.
+ *
+ * The label selector is the one the controller actually stamps on the pod template, so
+ * this resolves the same pods roll health was derived from.
  *
  * The namespace is NOT guessed. A docker-tier worker lives in a different namespace, and a
  * command naming the wrong one fails in a way that looks like the worker is gone — so the
@@ -115,7 +151,9 @@ export function diagnosticsCommand(workerId: string): string {
 export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
   if (!needsAttention(worker)) return null;
   const failed = worker.upgrade_status === "upgrade_failed";
-  const cause = failed ? likelyCause(worker.upgrade_blocking_container ?? null, worker.upgrade_blocking_reason ?? null) : null;
+  const cause = failed
+    ? likelyCause(worker.upgrade_blocking_container ?? null, worker.upgrade_blocking_reason ?? null, worker.upgrade_last_exit_code)
+    : null;
   const tone = failed ? "border-danger/30 bg-danger/5" : "border-warn/30 bg-warn/5";
   return (
     <div className={`mt-2 rounded border p-2 text-xs ${tone}`}>

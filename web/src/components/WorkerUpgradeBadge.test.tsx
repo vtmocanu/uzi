@@ -32,6 +32,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     upgrade_target: "0.11.7",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: null,
     created_at: new Date().toISOString(),
     stats_cpu_pct: null,
@@ -207,6 +208,7 @@ describe("the detail strip", () => {
           upgrade_detail: "seed-nix: CrashLoopBackOff (6 restarts, last exit 2)",
           upgrade_blocking_container: "seed-nix",
           upgrade_blocking_reason: "CrashLoopBackOff",
+          upgrade_last_exit_code: null,
         })}
       />,
     );
@@ -218,16 +220,48 @@ describe("the detail strip", () => {
 
 describe("likelyCause", () => {
   it("is a closed table and says nothing when it has nothing to say", () => {
-    // Silence is the correct output for an unmapped reason. A generic sentence would read
-    // as a diagnosis, and the api forwards only the k8s reason — never `message` — so
-    // there is nothing to base one on.
+    // Silence is the correct output. `upgrade_detail` already states the container, the
+    // reason, the restart count and the exit code, so an ungrounded sentence adds nothing
+    // and reads as a diagnosis.
     expect(likelyCause("worker", "SomeReasonWeDoNotModel")).toBeNull();
     expect(likelyCause(null, null)).toBeNull();
   });
 
-  it("distinguishes the seed-nix crash-loop from a generic one", () => {
-    expect(likelyCause("seed-nix", "CrashLoopBackOff")).toMatch(/nix store reseed/);
-    expect(likelyCause("worker", "CrashLoopBackOff")).toMatch(/starts and exits repeatedly/);
+  it("does NOT claim a missing Secret for CreateContainerConfigError", () => {
+    // REFUTED and removed: that reason comes from kubelet's ENV resolution, and the
+    // worker pod has no env sourced from a Secret or ConfigMap at all — the renderer has
+    // zero ValueFrom/SecretKeyRef/EnvFrom, enforced by a test, because a secretKeyRef
+    // token would reopen a /proc/<pid>/environ leak. The token is a VOLUME, and a missing
+    // Secret behind a volume surfaces as FailedMount with the container still
+    // ContainerCreating. So the old copy sent an operator hunting a token Secret for a
+    // failure these pods cannot produce — with authority, mid-incident.
+    expect(likelyCause("worker", "CreateContainerConfigError")).toBeNull();
+  });
+
+  it("names BOTH causes of a seed-nix crash-loop and uses the exit code to separate them", () => {
+    const withCode = likelyCause("seed-nix", "CrashLoopBackOff", 2);
+    expect(withCode).toMatch(/permissions error/);
+    // The generalisation this replaced was false: under `set -eu -o pipefail` the tar
+    // pipeline is the only failing step, so ENOSPC on /nix yields the IDENTICAL
+    // (seed-nix, CrashLoopBackOff) pair, and the store is ~1.7 GB.
+    expect(withCode).toMatch(/out of space/);
+    expect(withCode).toMatch(/exit code was 2/);
+    // Without a code it still names both, and claims no code it does not have.
+    const noCode = likelyCause("seed-nix", "CrashLoopBackOff", null);
+    expect(noCode).toMatch(/out of space/);
+    expect(noCode).not.toMatch(/exit code/);
+  });
+
+  it("does not present the image-pull causes as an exhaustive pair", () => {
+    // Worker images come from Harbor, so unreachable and rate-limited are as live as a
+    // bad tag or a missing pull secret.
+    expect(likelyCause("worker", "ImagePullBackOff")).toMatch(/unreachable or rate-limiting/);
+  });
+
+  it("says nothing for a generic crash-loop rather than restating the reason code", () => {
+    // "The container starts and exits repeatedly" is the reason code in words, not a
+    // cause — and `upgrade_detail` already says it with the numbers.
+    expect(likelyCause("worker", "CrashLoopBackOff")).toBeNull();
   });
 });
 

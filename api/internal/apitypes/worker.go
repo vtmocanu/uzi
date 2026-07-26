@@ -72,6 +72,14 @@ type WorkerDTO struct {
 	// terminal via the CLI.
 	UpgradeBlockingContainer *string `json:"upgrade_blocking_container"`
 	UpgradeBlockingReason    *string `json:"upgrade_blocking_reason"`
+	// The blocking container's last exit code, when it has one. Null for "never
+	// terminated", which is a different fact from "exited 0".
+	//
+	// On the wire because it DISCRIMINATES causes the reason alone conflates: a
+	// seed-nix CrashLoopBackOff is produced both by a permissions error unpacking the
+	// nix store and by that volume running out of space, and the exit code is what tells
+	// them apart. Without it the UI can only name both and guess.
+	UpgradeLastExitCode *int32 `json:"upgrade_last_exit_code"`
 	// Latest container resource sample (PRD #49), all null until the worker reports
 	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
 	// is unlimited or the sample came from the process fallback; StatsCPUPct is null

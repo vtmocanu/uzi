@@ -1064,6 +1064,7 @@ export const mockWorkers: Worker[] = [
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.2),
     created_at: daysAgo(14),
     // cgroup sample with a limit → CPU bar + "used / limit · %" memory bar (ok tone).
@@ -1092,6 +1093,7 @@ export const mockWorkers: Worker[] = [
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: daysAgo(2),
     created_at: daysAgo(21),
     // Offline → its last-known cgroup sample renders dimmed, never live-looking.
@@ -1135,6 +1137,9 @@ export const mockWorkers: Worker[] = [
     upgrade_target: "0.4.1",
     upgrade_blocking_container: "seed-nix",
     upgrade_blocking_reason: "CrashLoopBackOff",
+    // The incident's exit code, so the strip's cause line can discriminate a permissions
+    // failure from the volume filling up rather than naming both.
+    upgrade_last_exit_code: 2,
     last_heartbeat_at: minsAgo(14),
     created_at: daysAgo(11),
     stats_cpu_pct: null,
@@ -1163,6 +1168,7 @@ export const mockWorkers: Worker[] = [
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.4),
     created_at: daysAgo(6),
     stats_cpu_pct: 8.3,
@@ -1195,6 +1201,7 @@ export const mockWorkers: Worker[] = [
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.3),
     created_at: daysAgo(3),
     stats_cpu_pct: 21.5,
@@ -1230,6 +1237,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.5),
     created_at: daysAgo(9),
     stats_cpu_pct: 96.4,

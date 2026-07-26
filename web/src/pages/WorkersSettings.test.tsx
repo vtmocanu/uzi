@@ -80,6 +80,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     upgrade_target: "0.4.2",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: "2026-07-14T00:00:00Z",
     created_at: "2026-07-01T00:00:00Z",
     stats_cpu_pct: null,

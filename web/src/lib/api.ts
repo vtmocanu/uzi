@@ -657,6 +657,11 @@ export interface Worker {
   // carries paths and Secret names.
   upgrade_blocking_container: string | null;
   upgrade_blocking_reason: string | null;
+  // The blocking container's last exit code, null when it never terminated (a different
+  // fact from "exited 0"). It DISCRIMINATES causes the reason alone conflates — a
+  // seed-nix CrashLoopBackOff comes both from a permissions error unpacking the nix store
+  // and from that volume filling up.
+  upgrade_last_exit_code: number | null;
   last_heartbeat_at: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports

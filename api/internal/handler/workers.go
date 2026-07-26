@@ -182,6 +182,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		// carries them at all.
 		UpgradeBlockingContainer: textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
 		UpgradeBlockingReason:    textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
+		UpgradeLastExitCode:      int32PtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
 		AnthropicSecretID:        uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel:     textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
 		ID:                       w.ID.String(),
@@ -243,6 +244,15 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		sig.UpgradingSince = &t
 	}
 	return sig
+}
+
+// int32PtrValue applies the JSON-null vs value convention to a nullable int4 whose zero
+// is meaningful — an exit code of 0 and "never terminated" are different facts.
+func int32PtrValue(valid bool, v int32) *int32 {
+	if !valid {
+		return nil
+	}
+	return &v
 }
 
 func runToDTO(r store.Run) apitypes.RunDTO {

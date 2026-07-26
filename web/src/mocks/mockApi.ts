@@ -1808,6 +1808,7 @@ export const mockApi = {
       upgrade_target: "" as const,
       upgrade_blocking_container: null,
       upgrade_blocking_reason: null,
+      upgrade_last_exit_code: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       // No resource sample until the worker heartbeats (PRD #49) → no gauges yet.
@@ -1893,6 +1894,7 @@ export const mockApi = {
       upgrade_target: "" as const,
       upgrade_blocking_container: null,
       upgrade_blocking_reason: null,
+      upgrade_last_exit_code: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       stats_cpu_pct: null,

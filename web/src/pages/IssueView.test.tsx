@@ -209,6 +209,7 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     upgrade_target: "",
     upgrade_blocking_container: null,
     upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
     last_heartbeat_at: null,
     created_at: "2026-01-01T00:00:00Z",
     stats_cpu_pct: null,
