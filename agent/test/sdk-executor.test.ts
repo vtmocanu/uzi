@@ -532,6 +532,29 @@ describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
     return emits.filter((m) => m.payload["usage"] !== undefined);
   }
 
+  // PRD #93: the model attach rides the same seam and the same latch as usage, so
+  // it is exercised with the same frames — these two helpers only decorate them.
+  const MODEL = "claude-opus-4-8";
+
+  /** Emitted messages that carry an attached `model` payload key. */
+  function withModel(emits: EmittedMessage[]): EmittedMessage[] {
+    return emits.filter((m) => m.payload["model"] !== undefined);
+  }
+
+  /** Puts the SDK's per-call `message.model` on a frame built by `assistantUsage`. */
+  function addModel(frame: SDKMessage, model: string = MODEL): SDKMessage {
+    const message = (frame as unknown as Record<string, unknown>)["message"] as Record<string, unknown>;
+    message["model"] = model;
+    return frame;
+  }
+
+  /** Removes the per-call usage, leaving a model-only frame (the co-gate case). */
+  function dropUsage(frame: SDKMessage): SDKMessage {
+    const message = (frame as unknown as Record<string, unknown>)["message"] as Record<string, unknown>;
+    delete message["usage"];
+    return frame;
+  }
+
   it("attaches the frame's usage to EXACTLY ONE emitted message (the first surviving block)", async () => {
     // A multi-block frame explodes into thinking + text; usage must land once, on
     // the first — never multiplied across both (which would double the run total).
@@ -631,6 +654,105 @@ describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
       !probe.emits.some((m) => m.kind !== "status" && m.payload["usage"] !== undefined),
       "no non-status message got an executor-side attach from the result frame",
     );
+  });
+
+  // PRD #93 Decision 2: `model` is co-gated with `usage` — same surviving message,
+  // same latch — so that the web derive can read it inside its existing
+  // `"usage" in payload` branch and never invent a zero-token agent row.
+  it("attaches the frame's model to EXACTLY ONE message — the SAME one that carries usage", async () => {
+    const frame = addModel(assistantUsage([
+      { type: "thinking", thinking: "weighing options" },
+      { type: "text", text: "the answer" },
+    ]));
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const modelCarriers = withModel(probe.emits);
+    const usageCarriers = withUsage(probe.emits);
+    assert.strictEqual(modelCarriers.length, 1, "model attaches exactly once per frame");
+    assert.strictEqual(modelCarriers[0]!.payload["model"], MODEL);
+    // Identity, not just equality of counts: one message carries both keys.
+    assert.strictEqual(usageCarriers.length, 1);
+    assert.strictEqual(modelCarriers[0], usageCarriers[0], "model rides the usage-carrying message");
+  });
+
+  it("signal-only frame: the model is dropped with the usage, without error", async () => {
+    // Every message of this frame is filtered, so neither key has a surviving
+    // carrier — the accepted loss is symmetric (Decision 2, mirroring #40 11a).
+    const frame = addModel(assistantUsage([{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }]));
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(withModel(probe.emits).length, 0, "no message carries the dropped frame's model");
+    assert.strictEqual(withUsage(probe.emits).length, 0);
+  });
+
+  it("usage but NO model: the usage still attaches and no `model` key is invented", async () => {
+    // A pre-feature / model-less frame must not gain an empty or undefined model
+    // key — the web renders `—` from an ABSENT key (Decision 6).
+    const frame = assistantUsage([{ type: "text", text: "no model on this one" }]);
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(withUsage(probe.emits).length, 1);
+    // Non-status emits only: a system `init` STATUS payload legitimately carries a
+    // `model` (sdk-messages.ts mapSystem), so asserting over every emit would redden
+    // this test for an unrelated reason the day the fixture turns gain an init frame.
+    // The neighbouring PRD #40 result-frame test scopes itself the same way.
+    assert.ok(
+      !probe.emits.some((m) => m.kind !== "status" && "model" in m.payload),
+      "no emitted non-status payload has a `model` key at all",
+    );
+  });
+
+  it("model but NO usage: the co-gate attaches NEITHER key", async () => {
+    // THE co-gate proof. The frame carries a perfectly good model, but with no
+    // per-call usage there is no token row for it to annotate, so the executor
+    // attaches nothing — otherwise the web derive would materialize an agent row
+    // with a model and zero tokens (Decision 2).
+    const frame = dropUsage(addModel(assistantUsage([{ type: "text", text: "model only" }])));
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // The text message IS emitted — only the attach is withheld.
+    assert.ok(probe.emits.some((m) => m.kind === "text" && m.payload["text"] === "model only"));
+    assert.strictEqual(withModel(probe.emits).length, 0, "no model without usage to co-gate it");
+    assert.strictEqual(withUsage(probe.emits).length, 0);
+  });
+
+  it("subagent frame keeps its agent attribution alongside BOTH usage and model", async () => {
+    // The per-agent Model column exists precisely for this: a subagent pinned to a
+    // different model than the lead (PRD #37 / #69).
+    const subFrame = addModel(assistantUsage([{ type: "text", text: "reviewed unit A" }], USAGE, "reviewer"), "claude-sonnet-5");
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [subFrame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withModel(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.strictEqual(carriers[0]!.agent, "reviewer", "subagent_type attribution intact");
+    assert.strictEqual(carriers[0]!.payload["model"], "claude-sonnet-5");
+    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
   });
 });
 

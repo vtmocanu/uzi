@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { RunUsage } from "../lib/runUsage";
+import type { AgentUsage, RunUsage } from "../lib/runUsage";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { formatDuration } from "./RunEvent";
 import { cx } from "./ui";
@@ -35,17 +35,28 @@ function Th({ children, left }: { children: ReactNode; left?: boolean }) {
   );
 }
 
-function Td({ children, left, total }: { children: ReactNode; left?: boolean; total?: boolean }) {
+// `mono` is the PRD #93 Model column: left-aligned like `left`, but a model id is a
+// machine string, so it keeps the monospace face (per the approved mock).
+function Td({ children, left, total, mono }: { children: ReactNode; left?: boolean; total?: boolean; mono?: boolean }) {
   return (
     <td
       className={cx(
         "px-2.5 py-1.5",
-        left ? "text-left font-sans" : "text-right font-mono tabular-nums",
+        left ? cx("text-left", mono ? "font-mono" : "font-sans") : "text-right font-mono tabular-nums",
         total ? "font-semibold text-fg" : cx("text-muted", left && "text-fg"),
         !total && "border-b border-edge/50",
       )}
     >
-      {children}
+      {/* A model id is an unbounded machine string, so the Model column clips like
+          the strip's own model line does. `max-w` on a bare <td> is not honored by
+          table layout — the constraint has to sit on an inner block-level span. */}
+      {mono ? (
+        <span className="block max-w-[220px] truncate" title={typeof children === "string" ? children : undefined}>
+          {children}
+        </span>
+      ) : (
+        children
+      )}
     </td>
   );
 }
@@ -64,9 +75,27 @@ function AgentChip({ agent }: { agent: string }) {
 
 const money = (usd: number): string => (usd > 0 ? formatCost(usd) : "—");
 
+/** The mock's `td.model.dim`: a derived/absent value, not a model id the agent ran on. */
+const Dim = ({ children }: { children: ReactNode }) => <span className="text-faint">{children}</span>;
+
+// PRD #93 Decision 4: one model → the bare string; several → the primary plus the
+// count of the others ("claude-opus-4-8 +1"). Decision 6: no model → "—", never the
+// strip's init model.
+function agentModelCell(a: AgentUsage): ReactNode {
+  if (!a.model) return <Dim>—</Dim>;
+  return a.otherModels > 0 ? `${a.model} +${a.otherModels}` : a.model;
+}
+
+// The total row spans agents: the single model string when the whole run used one,
+// "N models" when it used several, "—" when none was recorded.
+function totalModelCell(models: string[]): ReactNode {
+  if (models.length === 0) return <Dim>—</Dim>;
+  return models.length === 1 ? models[0] : <Dim>{models.length} models</Dim>;
+}
+
 export function RunUsagePanel({ usage }: { usage: RunUsage }) {
   if (!usage.hasUsage) return null;
-  const { total, model, phases, agents, agentTotal } = usage;
+  const { total, model, phases, agents, agentTotal, agentModels } = usage;
   const cachePct = Math.round(usage.cacheHitRatio * 100);
   const tokensIn = total.fresh + total.cached;
 
@@ -152,10 +181,11 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
             Per-agent breakdown
           </summary>
           <div className="mt-2 overflow-x-auto">
-            <table className="w-full min-w-[480px] border-collapse text-xs">
+            <table className="w-full min-w-[600px] border-collapse text-xs">
               <thead>
                 <tr>
                   <Th left>Agent</Th>
+                  <Th left>Model</Th>
                   <Th>In (fresh)</Th>
                   <Th>In (cached)</Th>
                   <Th>Out</Th>
@@ -167,6 +197,7 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
                     <Td left>
                       <AgentChip agent={a.agent} />
                     </Td>
+                    <Td left mono>{agentModelCell(a)}</Td>
                     <Td>{formatTokens(a.fresh)}</Td>
                     <Td>{formatTokens(a.cached)}</Td>
                     <Td>{formatTokens(a.out)}</Td>
@@ -174,6 +205,7 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
                 ))}
                 <tr>
                   <Td left total>Attributed total</Td>
+                  <Td left total mono>{totalModelCell(agentModels)}</Td>
                   <Td total>{formatTokens(agentTotal.fresh)}</Td>
                   <Td total>{formatTokens(agentTotal.cached)}</Td>
                   <Td total>{formatTokens(agentTotal.out)}</Td>

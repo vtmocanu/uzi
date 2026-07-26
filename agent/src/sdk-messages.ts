@@ -325,3 +325,31 @@ export function assistantUsageOf(message: unknown): Record<string, unknown> | un
   if (!msg || msg["type"] !== "assistant") return undefined;
   return asRecord(asRecord(msg["message"])?.["usage"]);
 }
+
+/**
+ * The model an assistant frame's API call actually ran on
+ * (`SDKAssistantMessage.message.model`, e.g. "claude-opus-4-8"). Read here but
+ * attached by the executor for the SAME reason `assistantUsageOf` is (PRD #93
+ * Decision 2, which inherits PRD #40 Decision 11's argument verbatim): mapAssistant
+ * explodes one frame into N messages and cannot see the executor's later signal
+ * filter, and every phase terminates on a signal frame — so attaching in the mapper
+ * would systematically lose the lead's terminating-frame attribution.
+ *
+ * The value is CO-GATED with usage at that seam: it rides the SAME surviving
+ * message under the SAME `usageAttached` latch, so a model is recorded only where
+ * that agent's tokens are. That is what lets the web derive read `model` inside its
+ * existing `"usage" in payload` branch and never manufacture a zero-token agent row
+ * out of a model-only frame. A frame whose messages are ALL filtered loses both
+ * (accepted, same as usage).
+ *
+ * This is per-CALL model, which is the only source of the agent→model mapping the
+ * per-agent table needs: the result frame's `modelUsage` map is keyed by model, so
+ * it cannot say which agent used which when several agents share one (PRD #93
+ * Decision 1). Undefined for any non-assistant frame, or one whose `model` is
+ * absent or not a string.
+ */
+export function assistantModelOf(message: unknown): string | undefined {
+  const msg = asRecord(message);
+  if (!msg || msg["type"] !== "assistant") return undefined;
+  return asString(asRecord(msg["message"])?.["model"]);
+}

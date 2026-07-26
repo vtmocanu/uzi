@@ -1,9 +1,9 @@
 # PRD #93: Per-agent Model column in the run-view usage table
 
 **GitLab Issue**: [#93](https://gitlab.example.com/vtmocanu/uzi/-/issues/93)
-**Status**: Draft (created 2026-07-20)
+**Status**: ✅ Complete (created 2026-07-20, shipped 2026-07-26)
 **Priority**: Low
-**Mockup**: [`prds/mockups/93-per-agent-model-column-mock.html`](mockups/93-per-agent-model-column-mock.html) (approved 2026-07-20)
+**Mockup**: [`prds/mockups/93-per-agent-model-column-mock.html`](../mockups/93-per-agent-model-column-mock.html) (approved 2026-07-20)
 **Related**:
 - PRD #40 (run-view usage surfaces — this extends its per-agent table; the strip/per-phase/`run_usage` rollup are untouched).
 - PRD #37 / PRD #69 (per-agent and per-user model selection — the reason agents in one run can run on different models, which is what makes this column worth showing).
@@ -125,18 +125,29 @@ Dependency shape: **M1 freezes the wire field** (`payload.model` on assistant
 frames); **M2** consumes it. They touch disjoint packages (`agent/` vs `web/`)
 and, once the field name is frozen by M1's contract, can proceed in parallel.
 
-- [ ] **M1 — Worker attaches per-frame model.** `assistantModelOf` helper +
+- [x] **M1 — Worker attaches per-frame model.** `assistantModelOf` helper +
   executor attach; agent unit tests green (`cd agent && npm test`). Freezes the
   contract: assistant-frame `payload.model: string`.
-- [ ] **M2 — Web derives + renders the column.** `deriveRunUsage` records the
+- [x] **M2 — Web derives + renders the column.** `deriveRunUsage` records the
   per-agent model set; `RunUsagePanel` shows the Model column per the approved
   mock (single value, `+1` multi, `—` absent). `cd web && npm run typecheck`.
-- [ ] **M3 — Tests cover the new behavior.** agent: model attach + filtered-frame
+- [x] **M3 — Tests cover the new behavior.** agent: model attach + filtered-frame
   no-model. web: per-agent single/multi/absent derivation + column render. Full
   suites green (`agent` node --test, `web` vitest).
-- [ ] **M4 — Demo data + docs.** `mocks/data.ts` demo run populates the column;
+- [x] **M4 — Demo data + docs.** `mocks/data.ts` demo run populates the column;
   any PRD-#40 usage doc gains a one-line note. `npm run build` (check-docs)
   green.
+  - **The docs half was a genuine no-op**, not a skip: no page under `docs/`
+    documents PRD #40's usage panel at all — the `per-agent` hits in `docs/` are
+    `docs/cli.md` (steering being run-level) and `docs/repo-agents.md`, neither
+    about usage. There was nothing to add a line to, and this PRD's Touchpoints
+    already said "No new doc page".
+  - **Caveat on M3's "full suites green".** The web suite is green outright
+    (1064/1064). The agent suite is 866/869 with two failures that are
+    environmental and pre-existing — `agent-browser-shim` (no chromium resolves
+    in the sandbox, exit 127) and `git.test.ts`'s hooks-dir assertion (the image
+    bakes the root-owned path this sandbox has) — both reproduced unchanged at
+    the parent commit, in files this work does not touch.
 
 ## Out of Scope
 
@@ -157,3 +168,50 @@ and, once the field name is frozen by M1's contract, can proceed in parallel.
   matching `prds/mockups/93-per-agent-model-column-mock.html`.
 - **Regression**: a pre-feature run (no `model` on frames) still renders the
   per-agent table, with `—` in the Model column and no thrown error.
+
+## What shipped (2026-07-26)
+
+All three validation legs were actually run, not asserted:
+
+- **Unit** — agent: `assistantModelOf` + the co-gated executor attach +
+  filtered-frame drop. web: per-agent single/multi/absent derivation and the
+  rendered column. A mutation sweep confirmed the tests are load-bearing (moving
+  the model assignment out of the usage latch, dropping the `assistant` guard,
+  returning first-seen instead of most-frequent, flipping the tie-break, ignoring
+  `payload.model`, and dropping the `+K` suffix each reddened a named test).
+- **Visual** — verified in a real browser against `VITE_UZI_MOCK=1`, not by
+  reading the source: strip `claude-opus-4-8`; rows lead/reviewer
+  `claude-opus-4-8`, coder `claude-sonnet-5`; total row `2 models`. Column
+  position, left alignment, monospace face and the dim step all match the mock.
+  (The demo run's init frame was moved `claude-sonnet-4-6` → `claude-opus-4-8`
+  as part of this work: the strip IS the lead's model, and leaving it as sonnet
+  showed a strip model no agent row accounted for. Fixture data only.)
+- **Regression** — a pre-feature run renders `—` on both an agent row and the
+  total row, with the strip's init model still shown and never leaking into the
+  column (Decision 6), and throws nothing.
+
+Three deliberate divergences from the mock, all confirmed correct: the mock's
+brand background tint, its brand-coloured header, and its `NEW` header pill sit
+under the mock's own `/* ---- the NEW model column highlight ---- */` comment —
+they exist to point the approver at the diff, so they were **not** shipped. The
+three rules in that same block that ARE the design (left align, monospace,
+`td.model.dim`) were kept.
+
+One addition to Decision 4's implementation: `modelCounts` is a **null-prototype**
+map. The key is an untrusted model id off the wire, and with a plain `{}` a model
+named `constructor` read back the inherited function — `(counts[m] ?? 0) + 1`
+produced a string, `primaryModel`'s numeric sort went NaN, and frequency ordering
+silently died (measured: one such frame beat a model seen 100 times); `__proto__`
+made the write a no-op and lost the count. Display truthfulness only — no
+prototype pollution is reachable — but it is now correct by construction.
+
+Found while validating, **out of this PRD's scope and deliberately not fixed
+here**: `Td`'s `cx("text-muted", left && "text-fg")` emits both classes, and
+`text-muted` wins the cascade, so `text-fg` is dead. Every left-aligned cell in
+the panel — Agent and Phase included, both predating this PRD — renders muted
+where the mock has them at `fg`. Fixing it would change the per-phase table,
+which this PRD explicitly leaves untouched. Filed as
+[#152](https://gitlab.example.com/vtmocanu/uzi/-/issues/152), with the cascade
+order measured against the built stylesheet (`.text-fg` at offset 24294,
+`.text-muted` at 24536 in `dist/assets/index-CyMus4EH.css` on `b9d85633`) rather
+than inferred from the class list.
