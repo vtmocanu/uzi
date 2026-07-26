@@ -81,12 +81,15 @@ export interface AssembledAgents {
 
 /** Map one template's structured fields onto an SDK AgentDefinition. availableSkills
  *  (when given) restricts the template's ALLOCATED skills to the worker's
- *  materialized survivors; repoSkillNames are the repo-borne skills, which carry no
- *  allocation and so attach to EVERY subagent. */
+ *  materialized survivors; allTemplateSkillNames are the skills that carry NO
+ *  allocation to honor and so attach to EVERY subagent — repo-borne skills always
+ *  (assembleAgents), plus the run's whole surviving delivered set on the
+ *  repo-source path (subagentsFromTemplates, PRD #72 M1 / Decision 6). Callers
+ *  pass survivors only; this function does not re-filter that list. */
 function toDefinition(
   t: AgentTemplate,
   availableSkills?: ReadonlySet<string>,
-  repoSkillNames: readonly string[] = [],
+  allTemplateSkillNames: readonly string[] = [],
 ): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
@@ -108,13 +111,26 @@ function toDefinition(
   if (t.model) def.model = t.model;
   // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
   // skills (filtered to the materialized survivors, so it never lists a skill
-  // dropped by cap/collision) PLUS every repo-borne skill — repo skills carry no
-  // allocation and are enabled for ALL templates in the run (PRD §Worker point 3).
-  // Delivered skills stay per-template; only repo skills are all-templates. Always
-  // set explicitly (possibly []). The lead is the main thread, covered by the
+  // dropped by cap/collision) PLUS every all-templates skill — those carry no
+  // allocation to honor and are enabled for ALL templates in the run (repo-borne
+  // skills, PRD §Worker point 3; on a repo-source roster also the delivered
+  // survivors, PRD #72 M1). On the own-template path the all-templates list is the
+  // repo skills alone, so delivered skills stay per-template there. Always set
+  // explicitly (possibly []). The lead is the main thread, covered by the
   // top-level union, so it is not registered here.
+  //
+  // De-dup: since PRD #72 the two lists can OVERLAP on the repo path (the repo
+  // survivors are members of the run's surviving set), and a plain concat would
+  // put a duplicate `uzi:<name>` on the SDK. This Set and the one
+  // subagentsFromTemplates builds its list with are REDUNDANT WITH EACH OTHER —
+  // measured 2026-07-26 by mutation, removing either ALONE changes no output and
+  // only removing BOTH reddens the tests. Both are kept deliberately: this one
+  // predates #72 and also covers allocated ∩ all-templates, that one collapses the
+  // overlap at the point where #72 creates it. Do not "simplify" one away on the
+  // grounds that a test still passes — no single test can hold it.
   const allocated = (t.skills ?? []).filter((n) => !availableSkills || availableSkills.has(n));
-  const names = repoSkillNames.length > 0 ? [...new Set([...allocated, ...repoSkillNames])] : allocated;
+  const names =
+    allTemplateSkillNames.length > 0 ? [...new Set([...allocated, ...allTemplateSkillNames])] : allocated;
   def.skills = names.map(qualifiedSkillName);
   return def;
 }
@@ -154,7 +170,20 @@ export function assembleAgents(
  * comes from the claim payload. Feeding the repo roster through `assembleAgents`
  * instead would route a repo-authored `lead.prompt_body` into the lead system
  * prompt, the exact repo-borne injection `settingSources: []` exists to prevent.
- * Excluded names are dropped. Skill scoping is identical to assembleAgents.
+ * Excluded names are dropped.
+ *
+ * Skill scoping DIFFERS from assembleAgents (PRD #72 M1 / Decision 6): every
+ * subagent here gets the run's whole SURVIVING skill set, not a per-template
+ * slice. Allocations key on `template_id` and a repo roster has no template rows,
+ * so `t.skills` is always absent (repoagents.ts builds name/description/
+ * prompt_body only) and per-template scoping would deliver nothing at all — a run
+ * started with agents from git would silently lose every delivered skill its owner
+ * allocated. With no allocation signal to honor, honoring none is the honest
+ * reading, and it is exactly the all-templates rule repo-borne skills already
+ * follow. `availableSkills` IS that surviving set (built from the materialized run
+ * union), so a skill dropped by the per-run cap or a name collision is not in it
+ * and therefore reaches nobody. Passing no survivor set (a caller with no skills)
+ * degrades to the repo-borne names alone.
  */
 export function subagentsFromTemplates(
   templates: AgentTemplate[],
@@ -162,10 +191,16 @@ export function subagentsFromTemplates(
   availableSkills?: ReadonlySet<string>,
   repoSkillNames: readonly string[] = [],
 ): Record<string, AgentDefinition> {
+  // Union order follows the run union (delivered survivors, then repo survivors),
+  // since availableSkills is built from it; the repo names are already members in
+  // production and are unioned in only so a caller passing a delivered-only set
+  // still gets them. That membership is exactly why this de-dups — see the
+  // matching note in toDefinition for why BOTH Sets stay despite being redundant.
+  const allTemplateSkillNames = availableSkills ? [...new Set([...availableSkills, ...repoSkillNames])] : repoSkillNames;
   const subagents: Record<string, AgentDefinition> = {};
   for (const t of templates) {
     if (exclude.has(t.name)) continue;
-    subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
+    subagents[t.name] = toDefinition(t, availableSkills, allTemplateSkillNames);
   }
   return subagents;
 }
@@ -177,9 +212,12 @@ export function subagentsFromTemplates(
  * assembleAgents' leadSystemPrompt/leadModel.
  *
  *   - "own":  the owner's already-assembled subagents (lead already partitioned
- *             out by assembleAgents), minus the excluded names.
+ *             out by assembleAgents), minus the excluded names. Skills stay
+ *             per-template — the allocations ARE the admin's scoping surface here,
+ *             so this path is deliberately untouched by PRD #72 M1.
  *   - "repo": the detected repo roster mapped subagents-only (a repo `lead` stays
- *             a subagent), minus the excluded names.
+ *             a subagent), minus the excluded names. Every subagent gets the run's
+ *             whole surviving skill set (PRD #72 M1) — see subagentsFromTemplates.
  *
  * Exclusions are re-applied here worker-side; the API validated membership (M2)
  * but the worker owns what actually reaches the SDK. An exclusion naming an agent

@@ -483,6 +483,11 @@ export class SdkExecutor implements Executor {
       const resolved = resolveAgentSelection(verdict.selection, repoAvailable);
       if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
       const selection = resolved.selection;
+      // Skill scoping is source-dependent from here (PRD #72 M1): `own` keeps the
+      // per-template allocations assembled above; `repo` gives every subagent the
+      // full survivor set, since a repo roster has no template rows to allocate
+      // against. survivorNames is the filter in both cases, so a skill dropped by
+      // the cap or a collision is unreachable either way.
       const selectedSubagents = selectSubagents(
         selection.source,
         assembled.subagents,

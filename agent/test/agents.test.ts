@@ -172,6 +172,80 @@ describe("selectSubagents (PRD #37)", () => {
   });
 });
 
+describe("delivered skills reach repo-sourced subagents (PRD #72 M1)", () => {
+  // Own templates carry per-template ALLOCATIONS; repo templates never do —
+  // detectRepoAgents builds {name, description, prompt_body} and nothing else, so
+  // `.skills` is absent by construction. That is the gap M1 closes.
+  const ownCoder: AgentTemplate = { ...coder, skills: ["cicd"] };
+  const ownReviewer: AgentTemplate = { ...reviewer, skills: ["kb"] };
+  const repoCoder: AgentTemplate = { name: "coder", description: "repo coder", prompt_body: "REPO CODER" };
+  const repoAuditor: AgentTemplate = { name: "auditor", description: "repo auditor", prompt_body: "audit" };
+  // The materialized run union: two delivered survivors plus one repo-borne one.
+  const survivors = new Set(["cicd", "kb", "deploy-notes"]);
+  const repoSurvivors = ["deploy-notes"];
+
+  it("enables EVERY surviving delivered skill on EVERY repo subagent", () => {
+    const subagents = subagentsFromTemplates([repoCoder, repoAuditor], new Set(), survivors, repoSurvivors);
+    for (const name of ["coder", "auditor"]) {
+      assert.deepStrictEqual(
+        subagents[name]!.skills,
+        ["uzi:cicd", "uzi:kb", "uzi:deploy-notes"],
+        `${name} must receive the run's whole surviving set, not a per-template slice`,
+      );
+    }
+  });
+
+  it("lists each skill exactly once when a repo survivor is also in the run set", () => {
+    // The repo survivors are members of the run union, so the two lists OVERLAP
+    // and a plain concat would list deploy-notes twice. NOTE the de-dup lives in
+    // TWO places (subagentsFromTemplates' union and toDefinition's), redundant
+    // with each other: measured by mutation 2026-07-26, only removing BOTH reddens
+    // this. A single-line mutation here is NOT a control — mutate both.
+    const skills = subagentsFromTemplates([repoAuditor], new Set(), survivors, repoSurvivors).auditor!.skills!;
+    assert.deepStrictEqual([...new Set(skills)], skills, `duplicate skill entries: ${JSON.stringify(skills)}`);
+  });
+
+  it("never lists a skill dropped by the per-run cap or a name collision", () => {
+    // `kb` is allocated + repo-requested but is NOT in the survivor set (the worker
+    // dropped it), so it must be absent from the repo roster AND the own roster.
+    const dropped = new Set(["cicd"]);
+    const repo = subagentsFromTemplates([repoCoder, repoAuditor], new Set(), dropped, []);
+    for (const name of ["coder", "auditor"]) {
+      assert.deepStrictEqual(repo[name]!.skills, ["uzi:cicd"], `${name} must not list the dropped kb`);
+    }
+    const own = assembleAgents([lead, ownCoder, ownReviewer], dropped, []).subagents;
+    assert.deepStrictEqual(own.coder!.skills, ["uzi:cicd"]);
+    assert.deepStrictEqual(own.reviewer!.skills, [], "the dropped skill is gone from the own path too");
+  });
+
+  it("leaves the OWN path scoped per template — allocations stay the scoping surface", () => {
+    const own = assembleAgents([lead, ownCoder, ownReviewer], survivors, repoSurvivors).subagents;
+    // Each own subagent gets ITS allocation plus the repo-borne skill — never the
+    // other subagent's allocation (that would delete the admin's scoping control,
+    // PRD #72 Decision 6 "Own-template runs are unchanged").
+    assert.deepStrictEqual(own.coder!.skills, ["uzi:cicd", "uzi:deploy-notes"]);
+    assert.deepStrictEqual(own.reviewer!.skills, ["uzi:kb", "uzi:deploy-notes"]);
+    // And selectSubagents("own", …) hands those definitions through untouched.
+    const selected = selectSubagents("own", own, [repoCoder, repoAuditor], [], survivors, repoSurvivors);
+    assert.deepStrictEqual(selected.coder!.skills, ["uzi:cicd", "uzi:deploy-notes"]);
+    assert.deepStrictEqual(selected.reviewer!.skills, ["uzi:kb", "uzi:deploy-notes"]);
+  });
+
+  it("selectSubagents routes the repo source through the run-wide rule", () => {
+    const own = assembleAgents([lead, ownCoder, ownReviewer], survivors, repoSurvivors).subagents;
+    const repo = selectSubagents("repo", own, [repoCoder, repoAuditor], [], survivors, repoSurvivors);
+    assert.deepStrictEqual(repo.coder!.skills, ["uzi:cicd", "uzi:kb", "uzi:deploy-notes"]);
+    assert.deepStrictEqual(repo.auditor!.skills, ["uzi:cicd", "uzi:kb", "uzi:deploy-notes"]);
+  });
+
+  it("degrades to the repo-borne names when no survivor set is supplied", () => {
+    // A caller with no skills at all (sdk-resume-honors-agents.test.ts calls this
+    // shape) must not crash or invent names.
+    const subagents = subagentsFromTemplates([repoCoder], new Set());
+    assert.deepStrictEqual(subagents.coder!.skills, []);
+  });
+});
+
 describe("shipped lead builtin", () => {
   // Guard the cross-package contract: the lead template the api ships
   // (api/internal/agenttmpl/builtins/lead.md) must carry a name this worker
