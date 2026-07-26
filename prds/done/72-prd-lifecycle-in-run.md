@@ -1,11 +1,34 @@
 # PRD #72: PRD lifecycle inside the run — progress updates, move-to-done, and the issue link that follows
 
 **GitLab Issue**: [#72](https://gitlab.example.com/vtmocanu/uzi/-/issues/72)
-**Status**: Implemented — all six milestones landed, reviewed, audited and scenario-validated (2026-07-26). **One acceptance item remains open**: the "Manual, and required" run in the Validation section has not been performed, so the headline behaviour (an agent ticking checkboxes and moving the file) is shipped and specified but **not demonstrated**. It is a prompt clause plus a skill body — instructions to a model — and no automated test can reach it. The mechanical guarantees (run-kind gating, path validation, the target binding, seed-once) are test-proven; see `specs/ai.md` §384 for the boundary.
+**Status**: Complete (2026-07-26). All six milestones landed, reviewed, audited and scenario-validated, and the "Manual, and required" acceptance run in the Validation section has now been performed — see the Decision Log entry for 2026-07-26.
 
-*(Created 2026-07-25; revised same day after an adversarial review that opened every citation and traced each design decision against the code — it found three critical gaps, all folded in: the repo-source/autopilot completion path, the missing run-kind gate, and an under-specified description rewrite. See the Decision Log.)*
 **Priority**: Medium
 **Related**: [#96](https://gitlab.example.com/vtmocanu/uzi/-/issues/96) (mid-run restart discards un-pushed commits — the durability bug this PRD deliberately does NOT try to fix), [#110](https://gitlab.example.com/vtmocanu/uzi/-/issues/110) (checkpoint agent work — closed will-not-implement; the reason "update the PRD and push mid-run" is not on the table), [#122](https://gitlab.example.com/vtmocanu/uzi/-/issues/122) (milestone-structured runs — the DB-side progress record this PRD's file-side record must not contradict), [#16](https://gitlab.example.com/vtmocanu/uzi/-/issues/16) (skills), [#37](https://gitlab.example.com/vtmocanu/uzi/-/issues/37) (repo-sourced agents — whose skill gap M1 closes and whose trust model Decision 6 must argue against), [#46](https://gitlab.example.com/vtmocanu/uzi/-/issues/46) (self-improvement runs — excluded by Decision 13), [#24](https://gitlab.example.com/vtmocanu/uzi/-/issues/24) (MR-state watcher, whose candidate prefilter M5 must not reuse)
+
+**What the acceptance run established, and what it did not.** A real `issue` run
+(`c13cff61`, one iteration, on a throwaway PRD created for the purpose) ticked the
+two milestones it built, **left the third unchecked**, and **left its PRD in
+`prds/`** rather than moving it. It also updated that PRD's status header to record
+*why* the file stayed, wrote per-milestone evidence rather than bare ticks, and
+declined to write a statement the test PRD asked for on the grounds that it was
+false — documenting the divergence instead of complying quietly. The skill
+demonstrably reached the model: the submitted plan cited `SKILL.md` by path and
+paraphrased all five of its sections, which `docs/skills.md` says no automated test
+can prove.
+
+**Not established: that `signal_done` carried no `prd_done_path`.** The lead
+reported it and the behaviour is consistent with it, but the call is intercepted by
+`scanSignals` and never persisted, and the field is absent from the run DTO — so
+that criterion rests on the agent's own testimony rather than on a measurement
+(#150). **And one passing run is one draw from a stochastic process**: the Risks
+section's rollout spot-check still applies to the first several runs that move a
+file.
+
+*(Created 2026-07-25; revised same day after an adversarial review that opened every
+citation and traced each design decision against the code — it found three critical
+gaps, all folded in: the repo-source/autopilot completion path, the missing run-kind
+gate, and an under-specified description rewrite. See the Decision Log.)*
 
 ## Problem
 
@@ -498,8 +521,8 @@ untouched; its content gets one line.
       template logs a warning instead of failing silently; the migration is
       idempotent against an instance that already has the row.
 
-- [ ] **M3 — The `prd-lifecycle` skill + the prompt clauses** — **SHIPPED, NOT
-      VERIFIED. Deliberately left unticked; see the note under this milestone.**
+- [x] **M3 — The `prd-lifecycle` skill + the prompt clauses** — shipped, and the
+      acceptance run performed 2026-07-26; see the note under this milestone.
       New builtin skill
       (adapted per Decision 4; reviewer instruction per Decision 3; already-in-
       `done/` is a no-op per Decision 2), defaulted to `lead` + `reviewer` via
@@ -512,18 +535,39 @@ untouched; its content gets one line.
       PRDLESS run and a `ci_fix` run touch no PRD file; a submitted plan names the
       PRD-update step.
 
-      **Why this box is unticked while the code shipped.** Every clause in that
-      Verified list except the last is a claim about **what a live model does**,
-      and the Validation section below marks that run "Manual, and required". It
-      has not been performed. Ticking this box would assert a verification that did
-      not occur — which is precisely the over-claim the skill shipped in this
-      milestone exists to prevent, and it was caught by a fact-checker after the
-      lead had ticked all six. The mechanically testable parts **are** proven and
-      mutation-pinned: the clause is emitted iff `kind === "issue"`, its wording
-      carries the Decision 5 conditional, the plan prompt carries the Decision 15
-      line, the `mkdir -p` precedes the `git mv`, and the four stripped steps are
-      pinned as absent. `specs/ai.md` §384 states the same boundary. **Tick this
-      box when the manual run happens, not before.**
+      **This box was held unticked until the acceptance run happened, and that
+      history is worth keeping.** Every clause in the Verified list except the last
+      is a claim about **what a live model does**, so ticking it on the strength of
+      a green test suite would have asserted a verification that did not occur —
+      precisely the over-claim the skill shipped in this milestone exists to
+      prevent. It was caught by a fact-checker *after* the lead had ticked all six.
+
+      **Acceptance run, 2026-07-26** — run `c13cff61` on a throwaway PRD (#143),
+      one iteration, MR closed unmerged. Against the Verified list:
+
+      - **ticks what it built** — the two implemented milestones ticked, each with
+        an evidence note recording the actual gate output rather than a bare tick.
+      - **leaves unbuilt items unchecked** — the third milestone, deliberately made
+        impossible in-run, was left unchecked.
+      - **a partial completion does not move the file** — the PRD stayed in
+        `prds/`, and the run updated its status header to record *why*.
+      - **a submitted plan names the PRD-update step** (Decision 15) — the plan
+        carried a dedicated section pre-declaring exactly the above.
+      - **the skill reached the model** — the plan cited `SKILL.md` by path and
+        paraphrased all five of its sections. `docs/skills.md` is explicit that no
+        automated test can establish this.
+
+      **Two things the run did NOT establish.** That `signal_done` carried no
+      `prd_done_path`: the lead reported it and the behaviour is consistent, but
+      the call is intercepted by `scanSignals` and never persisted, and the field
+      is absent from the run DTO — so it rests on testimony (#150). And the
+      complete-PRD path (*"a run that completes the PRD moves the file to
+      `prds/done/`"*) was **not exercised**: this run completed only part of its
+      PRD by design, because leaving a box unchecked is the failure mode worth
+      testing. The move-on-complete path remains proven only by unit tests.
+
+      **One run is one draw from a stochastic process.** The Risks section's
+      rollout spot-check stands.
 
 - [x] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
       the tool, extracted by `scanSignals` (which discards `signal_done` input
@@ -738,3 +782,23 @@ via the Decision 5 prompt clause). M5 needs M4's stored path.
     which M1 falsifies or leaves stale.
   - Several citations tightened (`docs/skills.md:97`/`:113-114`,
     `prompt.ts:32-33`, `agents.ts:149-187`).
+- **2026-07-26, acceptance run** — the "Manual, and required" run was performed
+  against a throwaway PRD (#143) on the deployed instance at `0.11.8`. It passed
+  the criteria that could be measured, and the two it could not are recorded
+  under M3 rather than glossed. Three observations worth keeping:
+  - **The run over-delivered on the judgment criteria.** It recorded *why* the
+    file stayed put in the status header, wrote per-milestone evidence instead of
+    bare ticks, and **declined to write a statement the test PRD asked for** on
+    the grounds that it was false — the test PRD demanded a "no mid-run push"
+    bullet, which on a user page reads as "uzi never pushes", when in fact the
+    worker pushes the branch once after the executor returns and it is the
+    *agent* that never pushes. It documented the divergence in the PRD instead of
+    complying quietly. That is the conservative-completion discipline applied to
+    the spec, not just to the checkboxes.
+  - **The one criterion that could not be checked was the one about a forge
+    write.** `prd_done_path` is invisible from outside the process, so the field
+    whose misuse this PRD accepts as a named residual is also the field with no
+    audit trail (#150).
+  - **The complete-PRD move path was not exercised.** The run was designed to
+    complete only part of its PRD, because an agent ticking a box it did not earn
+    is the failure worth catching. Moving on completion stays unit-tested only.

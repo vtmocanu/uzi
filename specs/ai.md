@@ -11044,7 +11044,7 @@ skills", and the user decided two things directly — **patch the issue descript
 merge**, and **let autopilot move PRDs to `done/` unattended** — then ratified the
 exposure that combination creates (*"allow it, we review the MR by human anyway"*).
 Everything else below is an AI design decision inside those constraints. Design
-record: `prds/72-prd-lifecycle-in-run.md` (fifteen Decisions, with the adversarial
+record: `prds/done/72-prd-lifecycle-in-run.md` (fifteen Decisions, with the adversarial
 review that forced five of them).
 
 **Read §384 first if you are rebuilding this.** The headline behaviour — an agent

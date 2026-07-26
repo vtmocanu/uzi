@@ -442,7 +442,7 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
 
 ## Feature #72 — PRD lifecycle inside the run
 
-Tracked as GitLab issue vtmocanu/uzi#72; PRD at `prds/72-prd-lifecycle-in-run.md`.
+Tracked as GitLab issue vtmocanu/uzi#72; PRD at `prds/done/72-prd-lifecycle-in-run.md`.
 
 - Bundle the relevant PRD skills so a run can update its own PRD. [user, the originating ask on #72]
 - After the MR merges, uzi patches the issue's own PRD link to follow the moved file. [user 2026-07-25]
