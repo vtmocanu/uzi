@@ -95,25 +95,64 @@ export function diagnosticsCommand(workerId: string): string {
   return `kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=${workerId}`;
 }
 
-/** The failed-worker detail strip. */
+/**
+ * The detail strip for a worker in the ATTENTION SET — failed OR outdated.
+ *
+ * It covers both, and that is a correctness requirement rather than symmetry. The badge's
+ * `title` is a hover tooltip: no keyboard path, no touch path, and inconsistent
+ * screen-reader behaviour. So gating this strip on `upgrade_failed` alone left the OTHER
+ * alert state — `outdated`, which `needsAttention` counts and the nav badge will count —
+ * with its entire explanation reachable only by a mouse.
+ *
+ * Worth stating because a test cannot catch it: asserting the title's exact VALUE is a
+ * stronger check than asserting its presence, and it is still satisfiable while the
+ * information reaches nobody. jsdom can verify an attribute is correct; it cannot verify
+ * anyone can reach it.
+ *
+ * The failure-specific parts (the likely cause, the kubectl affordance) stay gated on
+ * `upgrade_failed` — there is no pod to inspect for a worker that is merely behind.
+ */
 export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
-  if (worker.upgrade_status !== "upgrade_failed") return null;
-  const cause = likelyCause(worker.upgrade_blocking_container ?? null, worker.upgrade_blocking_reason ?? null);
+  if (!needsAttention(worker)) return null;
+  const failed = worker.upgrade_status === "upgrade_failed";
+  const cause = failed ? likelyCause(worker.upgrade_blocking_container ?? null, worker.upgrade_blocking_reason ?? null) : null;
+  const tone = failed ? "border-danger/30 bg-danger/5" : "border-warn/30 bg-warn/5";
   return (
-    <div className="mt-2 rounded border border-danger/30 bg-danger/5 p-2 text-xs">
-      <div className="font-medium text-danger">Upgrade failed</div>
+    <div className={`mt-2 rounded border p-2 text-xs ${tone}`}>
+      <div className={`font-medium ${failed ? "text-danger" : "text-warn"}`}>
+        {failed ? "Upgrade failed" : "Outdated"}
+      </div>
+      {/* The api's own sentence, as TEXT — the same string the badge carries as a title,
+          rendered where a keyboard and a screen reader can both reach it. */}
       {worker.upgrade_detail && <div className="mt-1 text-fg">{worker.upgrade_detail}</div>}
       {cause && <div className="mt-1 text-faint">{cause}</div>}
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          className="rounded border border-hair px-1.5 py-0.5 text-faint hover:text-fg"
-          onClick={() => void navigator.clipboard?.writeText(diagnosticsCommand(worker.id))}
-        >
-          Copy kubectl command
-        </button>
-        <code className="truncate text-faint">{diagnosticsCommand(worker.id)}</code>
-      </div>
+      {failed && (
+        <div className="mt-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="rounded border border-hair px-1.5 py-0.5 text-faint hover:text-fg"
+              onClick={() => void navigator.clipboard?.writeText(diagnosticsCommand(worker.id))}
+            >
+              Copy kubectl command
+            </button>
+            {/* NOT truncated. `-n <worker-namespace>` is the PREFIX, so clipping would
+                hide exactly the part the reader has to replace — handing them a command
+                that looks complete and resolves the wrong namespace, or none. Wrapping is
+                the lesser evil for a string meant to be read and edited. */}
+            <code className="break-all text-faint">{diagnosticsCommand(worker.id)}</code>
+          </div>
+          {/* The substitution instruction. Without it the placeholder is a trap: a user
+              pastes the command verbatim and kubectl answers "No resources found", which
+              reads as "the worker is gone" rather than "fill in the namespace". MEASURED
+              on dev-cluster: the hosted worker from the motivating incident lives in the
+              DOCKER namespace, not the default one, so guessing is not an option either. */}
+          <p className="mt-1 text-faint">
+            Replace <code>&lt;worker-namespace&gt;</code> with the namespace this worker runs in — the docker-capable
+            tier uses a separate one.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import type { Worker } from "../lib/api";
 import {
   FleetUpgradePanel,
@@ -100,9 +100,15 @@ describe("FleetUpgradePanel — B-1, the target divergence", () => {
     // Assert the divergence SENTENCE, not just the word "target" — the panel heading
     // also says "target release", so a loose match here would pass with the divergence
     // line entirely absent.
-    expect(screen.getByText(/not the control plane/)).toBeTruthy();
-    expect(screen.getByText("v0.11.0")).toBeTruthy();
-    expect(screen.getAllByText("v0.11.7").length).toBeGreaterThan(0);
+    // Scope to the divergence PARAGRAPH rather than reaching for getAllByText. The panel
+    // heading also says "v0.11.7", so a page-wide query has to either tolerate multiple
+    // matches or count them — and tolerating multiples throws away the "Found multiple
+    // elements" error, which is precisely the signal that caught this test's first
+    // version matching the heading instead of the divergence line.
+    const line = screen.getByText(/not the control plane/).closest("p");
+    expect(line).toBeTruthy();
+    expect(within(line as HTMLElement).getByText("v0.11.0")).toBeTruthy();
+    expect(within(line as HTMLElement).getByText("v0.11.7")).toBeTruthy();
   });
 
   it("says nothing when the hosted target matches the control plane", () => {
@@ -158,10 +164,39 @@ describe("fleetSummary", () => {
   });
 });
 
-describe("the failed-worker strip", () => {
-  it("renders only for upgrade_failed", () => {
-    const { container } = render(<WorkerUpgradeDetail worker={aWorker({ upgrade_status: "outdated" })} />);
-    expect(container.innerHTML).toBe("");
+describe("the detail strip", () => {
+  it("renders for the WHOLE attention set, not just failures", () => {
+    // `outdated` is an alert state that `needsAttention` counts and the nav badge will
+    // count. Gating this strip on upgrade_failed left its entire explanation in a hover
+    // `title`: no keyboard path, no touch path, inconsistent for screen readers.
+    render(<WorkerUpgradeDetail worker={aWorker({ upgrade_status: "outdated" })} />);
+    expect(screen.getByText("Outdated")).toBeTruthy();
+    expect(screen.getByText("running 0.11.0, target 0.11.7")).toBeTruthy();
+    // No pod to inspect for a worker that is merely behind, so no kubectl affordance.
+    expect(screen.queryByRole("button", { name: /copy kubectl/i })).toBeNull();
+  });
+
+  it("renders nothing for states outside the attention set", () => {
+    for (const status of ["up_to_date", "upgrading", "unknown"] as const) {
+      const { container, unmount } = render(<WorkerUpgradeDetail worker={aWorker({ upgrade_status: status })} />);
+      expect(container.innerHTML).toBe("");
+      unmount();
+    }
+  });
+
+  it("tells the reader to substitute the namespace, and does not clip the placeholder", () => {
+    render(
+      <WorkerUpgradeDetail
+        worker={aWorker({ upgrade_status: "upgrade_failed", upgrade_blocking_reason: "CrashLoopBackOff" })}
+      />,
+    );
+    // Without this the placeholder is a trap: pasted verbatim, kubectl answers "No
+    // resources found", which reads as "the worker is gone".
+    expect(screen.getByText(/Replace/)).toBeTruthy();
+    const code = screen.getAllByText(/kubectl -n/)[0];
+    // `-n <worker-namespace>` is the PREFIX, so a truncating class hides exactly the part
+    // that must be edited.
+    expect(code.className).not.toContain("truncate");
   });
 
   it("shows the api's detail, a likely cause, and a copyable command", () => {
