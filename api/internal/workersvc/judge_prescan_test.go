@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -484,5 +485,91 @@ func TestSuppressResolvedTruncatesAfterSuppression(t *testing.T) {
 	if got[0].Command != cands[judgeMaxMissingTools].Command {
 		t.Errorf("first reported miss = %q, want the first UNsuppressed candidate %q",
 			got[0].Command, cands[judgeMaxMissingTools].Command)
+	}
+}
+
+// traceUseUsageAttached builds the SAME tool_use row as traceUse, plus the two keys
+// the worker's executor attaches to whichever mapped message survives its signal
+// filter: `model` and `usage`. Deliberately a separate helper rather than a parameter
+// on traceUse, so the two arms of the test below differ in exactly one thing and a
+// future edit to the base shape lands on both.
+func traceUseUsageAttached(seq int32, id, command string) store.ListToolTraceForRunRow {
+	p, err := json.Marshal(map[string]any{
+		"id": id, "name": "Bash", "input": map[string]any{"command": command},
+		// sdk-executor.ts: `em.payload["usage"] = frameUsage` and, co-gated under the
+		// same latch, `em.payload["model"] = frameModel`.
+		"model": "claude-opus-4-8",
+		"usage": map[string]any{"input_tokens": 123, "output_tokens": 45},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return store.ListToolTraceForRunRow{Seq: seq, Kind: "tool_use", Payload: p}
+}
+
+// TestPrescanIgnoresFrameKeysOnToolUse pins a CROSS-PRD contract that neither PRD
+// guards on its own: keys another feature attaches to a run_message payload are
+// ADDITIVE, and the pre-scan's verdict must not move when they appear.
+//
+// The collision is real, not hypothetical. PRD #93 (per-agent Model column) attaches
+// `model` alongside `usage` to the surviving mapped message, and for an assistant
+// frame that message can be a tool_use BLOCK — which is exactly the payload this
+// milestone's `toolUseCommand` decodes to recover the command the agent typed. The two
+// PRDs were developed on separate branches and never saw each other; reviewed alone,
+// neither shows the interaction. It is currently inert because `toolUseCommand`
+// decodes into a narrow struct and encoding/json ignores unknown fields by default —
+// an implicit property nothing else asserts, which is what makes it worth a test. The
+// next feature to attach a key at that seam will have no idea this constraint exists.
+//
+// 🔴 HOW THIS TEST WAS SHOWN TO DISCRIMINATE, because a green here is otherwise
+// indistinguishable from a test that compares two things it never varied. The control
+// is a fold on `toolUseCommand`, and the OBVIOUS fold is the wrong one:
+//
+//   - Plain `DisallowUnknownFields()` reddens BOTH arms — `name` is absent from the
+//     struct too, so the no-keys arm fails first on the precondition. That proves only
+//     "the pipeline is sensitive to decoding in general", which is not this test's
+//     claim, and a reader who stopped there would believe the control passed.
+//   - The DISCRIMINATING fold adds `Name string` to the struct AND
+//     `DisallowUnknownFields()`, leaving ONLY PRD #93's keys unknown. Measured: the
+//     precondition still holds at [helm], and the interaction assertion then fires with
+//     [helm] -> [helm tsc].
+//
+// Keep that distinction if this test is ever revised. The first fold is the one that
+// gets reached for, and it silently tests something else.
+func TestPrescanIgnoresFrameKeysOnToolUse(t *testing.T) {
+	// A run that fumbles a bare `tsc`, fumbles `helm` (never resolved), then runs tsc
+	// green through an npm script. Only helm should be reported. The npm output comes
+	// from npmScriptOutput because the script-echo channel is what suppresses tsc at
+	// all: a hand-written empty result answers [helm tsc] and would make this test
+	// agree with a broken implementation for the wrong reason.
+	build := func(use func(int32, string, string) store.ListToolTraceForRunRow) []store.ListToolTraceForRunRow {
+		return []store.ListToolTraceForRunRow{
+			use(1, "a", "tsc --noEmit"),
+			traceResult(2, "a", "sh: tsc: command not found", true),
+			use(3, "b", "helm lint ./deploy"),
+			traceResult(4, "b", "bash: helm: command not found", true),
+			use(5, "c", "npm run typecheck"),
+			traceResult(6, "c", npmScriptOutput("typecheck", "tsc --noEmit", ""), false),
+		}
+	}
+
+	bare := reportedCommands(prescan(build(traceUse)))
+	attached := reportedCommands(prescan(build(traceUseUsageAttached)))
+
+	// Precondition FIRST: if the bare trace does not already discriminate, the
+	// comparison below is two identical wrong answers agreeing with each other.
+	if len(bare) != 1 || bare[0] != "helm" {
+		t.Fatalf("precondition failed: the trace WITHOUT frame keys reported %v, want exactly "+
+			"[helm] (tsc suppressed by the npm script echo, helm never resolved). This test "+
+			"cannot detect an interaction until the trace itself discriminates", bare)
+	}
+
+	if !slices.Equal(bare, attached) {
+		t.Fatalf("PRD #93's model/usage keys CHANGED the M3 verdict: %v -> %v. Keys another "+
+			"feature attaches to a run_message payload must be inert here — toolUseCommand "+
+			"decodes tool_use into a narrow struct, so an unknown key must be IGNORED, never "+
+			"fail the decode. A tool the run demonstrably ran green is now being reported "+
+			"missing to the judge because an unrelated payload field appeared next to it",
+			bare, attached)
 	}
 }
