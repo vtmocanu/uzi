@@ -359,3 +359,101 @@ func TestMaxUpgradingWindowExceedsControllerStuckAge(t *testing.T) {
 			"measurement that replaces the placeholder must respect this floor", p.MaxUpgradingWindow, ControllerStuckAge)
 	}
 }
+
+// RolledTag decides what EVERY hosted worker is compared against (Decision 9), and it
+// is entirely controller-supplied. It had no coverage in the main classification table
+// and none at all in the adversarial direction, which is how B-1 below went unnoticed.
+
+func TestRolledTagIsHonouredOnlyForHostedWorkersAndOnlyWhenFresh(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	anchor := now.Add(-time.Minute)
+	settledAgesAgo := now.Add(-time.Hour)
+
+	// The signal claims the fleet rolls to 0.11.0, which is what this worker runs.
+	sig := func() *RollSignal {
+		return &RollSignal{
+			Phase: PhaseSettled, ObservedAt: now, UpgradingSince: &anchor,
+			RolledTag: "0.11.0", PhaseSince: &settledAgesAgo,
+		}
+	}
+
+	// EXTERNAL worker: the rolled tag must be ignored entirely. Nothing upgrades an
+	// external worker, so a controller has no standing to say what it should be running
+	// — if it could, it would be asserting about a worker outside its jurisdiction.
+	ext := fleetInput(now, sig())
+	ext.Kind = "external"
+	if status, _ := ClassifyUpgrade(ext, ceilingParams()); status != UpgradeStatusOutdated {
+		t.Errorf("an EXTERNAL worker classified %q; the controller's rolled tag must not be its target, "+
+			"so it stays outdated against the api's own release", status)
+	}
+
+	// STALE signal: the tag goes with it. A tag is only authoritative while the report
+	// carrying it is fresh, otherwise a dead controller pins the fleet's target forever.
+	stale := sig()
+	stale.ObservedAt = now.Add(-10 * time.Minute)
+	if status, _ := ClassifyUpgrade(fleetInput(now, stale), ceilingParams()); status != UpgradeStatusOutdated {
+		t.Errorf("a STALE signal's rolled tag was still used as the target (%q); freshness must gate the "+
+			"tag as well as the phase", status)
+	}
+
+	// HOSTED and fresh: honoured (the positive control for both assertions above).
+	if status, _ := ClassifyUpgrade(fleetInput(now, sig()), ceilingParams()); status != UpgradeStatusUpToDate {
+		t.Errorf("a hosted worker with a fresh signal must be compared against the rolled tag ⇒ "+
+			"up_to_date, got %q", status)
+	}
+}
+
+// B-1 — CHARACTERIZATION, NOT ENDORSEMENT.
+//
+// `ceilingOK` gates the two phase-asserted rows but NOT the target assignment. So a
+// controller that never lies about phase — reporting `settled`, which is true — and
+// instead reports a `worker_image_tag` equal to the fleet's already-stale version makes
+// every hosted worker read `up_to_date` INDEFINITELY. The ceiling never engages, because
+// no row it gates is being used.
+//
+// That is the same suppression INV-5 exists to prevent, reached by a route that requires
+// no false phase, and it is WORSE than the `upgrading` route in one respect: `upgrading`
+// renders a visible badge, while `up_to_date` renders nothing at all. The operator sees a
+// healthy fleet.
+//
+// This is pinned as the CURRENT behaviour, deliberately, not as desired behaviour.
+// Decision 9 says the hosted target is the controller's tag, and honouring that is what
+// makes an independently-pinned worker image work at all. The agreed resolution is to
+// SURFACE the divergence in the Fleet panel when the reported tag is below the control
+// plane's version — a display fix in M5, not a classification change here. If someone
+// later gates the target by ceilingOK, this test will fail; read it before "fixing" it,
+// because that change would break independent pinning.
+func TestB1ControllerCanSuppressViaTheTargetWithoutLyingAboutPhase(t *testing.T) {
+	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
+	// The anchor is long past the ceiling, so every controller-ASSERTED row is barred.
+	anchor := now.Add(-10 * testWindow)
+	settledAgesAgo := now.Add(-24 * time.Hour)
+
+	sig := &RollSignal{
+		Phase:      PhaseSettled, // TRUE: the pod really is Ready. No lie about phase.
+		ObservedAt: now,
+		// Past the ceiling — and irrelevant, which is the finding.
+		UpgradingSince: &anchor,
+		// The lie is HERE: the fleet's stale version presented as the roll target.
+		RolledTag:  "0.11.0",
+		PhaseSince: &settledAgesAgo,
+	}
+	status, detail := ClassifyUpgrade(fleetInput(now, sig), ceilingParams())
+
+	if status != UpgradeStatusUpToDate {
+		t.Fatalf("B-1 characterization is out of date: got %q (%q), expected %q. If the target assignment "+
+			"is now gated by the ceiling, that is a deliberate behaviour change — update this test and "+
+			"check that independently-pinned worker images still work (Decision 9).",
+			status, detail, UpgradeStatusUpToDate)
+	}
+	// State the consequence in the test so it is visible without reading the audit: the
+	// ceiling is fully expired and the worker still reports healthy, silently.
+	if elapsed := now.Sub(*sig.UpgradingSince); elapsed <= testWindow {
+		t.Fatalf("precondition: the anchor must be past the ceiling (elapsed %v, window %v) or this test "+
+			"proves nothing about the ceiling being bypassed", elapsed, testWindow)
+	}
+	if detail != "" {
+		t.Errorf("detail = %q; up_to_date renders nothing, which is why this route is worse than the "+
+			"`upgrading` one it bypasses — M5 must surface the tag divergence", detail)
+	}
+}

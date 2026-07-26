@@ -2551,11 +2551,31 @@ WITH prev AS (
       FROM prev
      WHERE r.worker_id = prev.id
        AND r.upgrading_since IS NOT NULL
+       -- COMPARE THE RELEASE, NOT THE STRING. Both sides are stripped of SemVer
+       -- build metadata (everything from the first '+') before being compared,
+       -- because the api's classifier and this clause must agree on what "the
+       -- version moved" means and on raw strings they do not:
+       --
+       --   0.11.7+g1a2b3c4  vs  0.11.7+gdeadbeef
+       --     raw text     -> DIFFERENT  (this clause would clear the ceiling)
+       --     x/mod/semver -> 0          (the classifier holds it is the same release)
+       --
+       -- Un-stripped, a worker satisfies "the roll completed" while nothing about its
+       -- release changed, so the ceiling re-arms and MaxUpgradingWindow silently
+       -- becomes "45 minutes from the most recent re-register". Compose that with a
+       -- crash-looping agent — which re-registers on every start — and each restart
+       -- buys a fresh window. It points the UNSAFE way: eager clearing LENGTHENS
+       -- suppression, in exactly the case INV-5 is the last line of defence for.
+       --
+       -- The trigger is the scenario the +g<short-sha> stamp exists to expose: a
+       -- re-cut tag producing two images at one release with different short shas.
+       --
        -- IS DISTINCT FROM, not <>: the old version is NULL for a worker that has
        -- never reported one, and <> would evaluate NULL there and clear nothing —
        -- silently skipping the first register of exactly the worker whose version
-       -- just became knowable.
-       AND $2 IS DISTINCT FROM prev.old_version
+       -- just became knowable. split_part(NULL, …) is still NULL, so stripping
+       -- preserves that.
+       AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
 SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM upd
 `

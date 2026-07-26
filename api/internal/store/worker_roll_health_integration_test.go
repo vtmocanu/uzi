@@ -187,6 +187,57 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 			"window", got)
 	}
 
+	// ---- Build metadata is NOT a version move. ----
+	//
+	// The anchor's "the version moved" test and the classifier's "same release" test
+	// must agree, and on raw strings they do not: 0.11.7+g1a2b3c4 and 0.11.7+gdeadbeef
+	// are different text and an identical release. Un-stripped, a re-registration
+	// carrying only a new short-sha would satisfy "the roll completed" while nothing
+	// about the release changed — re-arming the ceiling, so the window silently becomes
+	// "45 minutes from the latest re-register". That points the UNSAFE way: eager
+	// clearing LENGTHENS suppression.
+	//
+	// The trigger is the scenario the +g<sha> stamp was adopted to expose: a re-cut tag
+	// producing two images at one release. Composed with a crash-looping agent, which
+	// re-registers on every start, each restart would buy a fresh window.
+	if _, err := q.UpsertWorkerRollHealth(ctx, rollReport(hosted, "rolling", t0.Add(25*time.Minute))); err != nil {
+		t.Fatalf("re-arm before the metadata check: %v", err)
+	}
+	if anchorAfter("armed for the metadata check") == nil {
+		t.Fatalf("precondition: the anchor must be set before testing that metadata does not clear it")
+	}
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: hosted, Version: pgtype.Text{String: "0.11.7+g1a2b3c4", Valid: true},
+	}); err != nil {
+		t.Fatalf("register with build metadata: %v", err)
+	}
+	if anchorAfter("register 0.11.7 -> 0.11.7+g1a2b3c4") == nil {
+		t.Errorf("registering 0.11.7+g1a2b3c4 over 0.11.7 cleared the anchor. Build metadata is excluded " +
+			"from SemVer precedence, so the classifier reads these as the SAME release; the anchor must " +
+			"not disagree with it, or the ceiling re-arms on a roll that never happened.")
+	}
+	// And a DIFFERENT short-sha at the same release must likewise not clear.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: hosted, Version: pgtype.Text{String: "0.11.7+gdeadbeef", Valid: true},
+	}); err != nil {
+		t.Fatalf("register with a second build metadata: %v", err)
+	}
+	if anchorAfter("register +g1a2b3c4 -> +gdeadbeef") == nil {
+		t.Errorf("re-registering at the same release with a different short-sha cleared the anchor; a " +
+			"re-cut tag must not buy a fresh suppression window")
+	}
+	// CONTROL: a real release move, carrying metadata on BOTH sides, still clears.
+	// Without this the assertions above would pass against a clause that never clears.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: hosted, Version: pgtype.Text{String: "0.11.8+gdeadbeef", Valid: true},
+	}); err != nil {
+		t.Fatalf("register a real move: %v", err)
+	}
+	if got := anchorAfter("register +gdeadbeef -> 0.11.8+gdeadbeef"); got != nil {
+		t.Errorf("upgrading_since = %v after a genuine release move (0.11.7 -> 0.11.8, both carrying "+
+			"build metadata); stripping metadata must not have disabled the clear altogether", got)
+	}
+
 	// A fresh roll re-arms with a NEW anchor — the ceiling is not a one-shot latch.
 	if _, err := q.UpsertWorkerRollHealth(ctx, rollReport(hosted, "rolling", t0.Add(30*time.Minute))); err != nil {
 		t.Fatalf("re-arm upsert: %v", err)
