@@ -927,7 +927,22 @@ export const mockApi = {
     });
   },
   // The in-browser demo build has no server; report "demo" to match the header pill.
-  version: async () => delay({ version: "demo" }),
+  // A real SemVer, not "demo" (PRD #113 M5). Upgrade classification compares against
+  // this, and a non-SemVer control-plane version turns classification OFF entirely — so
+  // the literal "demo" made every badge and the whole Fleet panel unreachable in demo
+  // mode. The demo-mode signal does not live here: AppShell renders a separate "demo"
+  // pill, so nothing is lost by making this comparable.
+  // PRD #113 M6. Computed LIVE from the demo worker list rather than hardcoded, so the
+  // badge actually clears when a worker is deleted — web-ux needs to see it appear AND
+  // clear, and a constant would only ever show the first half.
+  workerUpgradeSummary: async () => {
+    const attention = workers.filter(
+      (w) => w.upgrade_status === "upgrade_failed" || w.upgrade_status === "outdated",
+    ).length;
+    return delay({ attention, target_release: "0.4.2" });
+  },
+
+  version: async () => delay({ version: "0.4.2" }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -1786,6 +1801,14 @@ export const mockApi = {
       template_declared: template ?? null,
       template_reported: null,
       version: null,
+      // No version reported until the worker registers, so nothing to compare
+      // against the control-plane release (PRD #113).
+      upgrade_status: "unknown" as const,
+      upgrade_detail: null,
+      upgrade_target: "" as const,
+      upgrade_blocking_container: null,
+      upgrade_blocking_reason: null,
+      upgrade_last_exit_code: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       // No resource sample until the worker heartbeats (PRD #49) → no gauges yet.
@@ -1831,7 +1854,15 @@ export const mockApi = {
   // is not a demo — and quota 2 against one seeded hosted worker puts the whole
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
-  hostedConfig: async () => delay({ enabled: true, quota: 2 }),
+  // Quota 3 against TWO seeded hosted workers (PRD #113 M5 raised both by one). The
+  // load-bearing property is unchanged and is why the numbers moved together: there is
+  // exactly ONE slot of headroom, so web-ux can still drive provision -> at quota ->
+  // button disables -> delete -> it enables again, which is the only way to prove the
+  // client-side gate RELEASES rather than merely starting disabled.
+  //
+  // The second seeded worker is the failed roller, which the demo previously could not
+  // show at all — so a browser pass could only ever validate the healthy path.
+  hostedConfig: async () => delay({ enabled: true, quota: 3 }),
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
@@ -1856,6 +1887,14 @@ export const mockApi = {
       template_declared: template,
       template_reported: null,
       version: null,
+      // No version reported until the worker registers, so nothing to compare
+      // against the control-plane release (PRD #113).
+      upgrade_status: "unknown" as const,
+      upgrade_detail: null,
+      upgrade_target: "" as const,
+      upgrade_blocking_container: null,
+      upgrade_blocking_reason: null,
+      upgrade_last_exit_code: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
       stats_cpu_pct: null,

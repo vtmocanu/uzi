@@ -11024,3 +11024,411 @@ See [prds/done/98-judge-menu.md](../prds/done/98-judge-menu.md) for the Decision
 [prds/done/98-judge-menu-m8-design.md](../prds/done/98-judge-menu-m8-design.md) for the M8 design note, and
 [prds/done/98-judge-menu-m8-w3-rulings.md](../prds/done/98-judge-menu-m8-w3-rulings.md) for the wave-3
 rulings these sections record.
+
+# PRD #113 — Worker upgrade & version health (fleet status, per-worker badges, Workers-menu alert badge)
+
+Serves human (Feature #113, owner-accepted from the mock 2026-07-22): a worker's reported version must
+be the release it is actually running; workers needing attention are those that **failed to upgrade**
+or are **behind**, while a worker mid-upgrade is informational and must not raise an alert; diagnostics
+are read-only in v1; dark-only.
+
+**Several of this PRD's own assertions were disproved before a line was written, and more during
+implementation** — after an adversarial review that had already claimed to verify every load-bearing
+claim against the code. Each correction is recorded in the section that owns the decision rather than
+collected as a list, because a decision whose premise was false is only useful with the false premise
+attached. Deliberately no tally: the PRD's Decision Log counts five and the MR description six, both
+defensible depending on whether the mock's RBAC contradiction is one of them, and a count in a third
+place would only drift further.
+
+## 387. Version is the RELEASE coordinate, not a new scheme — stamped at build, and the fake default retired
+
+- **Reuse the SemVer the image tag and chart `appVersion` already are** (Model B, PRD #52). We did NOT
+  invent an agent version scheme: a second coordinate would need its own mapping onto the thing that
+  actually rolls the fleet, and the whole point is answering "is this worker on the latest release?".
+- **`UZI_AGENT_VERSION` stops being a frozen literal** (`agent/src/config.ts`) and becomes the release,
+  stamped as a build arg by the tag-only publish job. The `0.1.0-m4` default is **retired**: unset ⇒
+  empty ⇒ `unknown`, never a synthesized `0.0.0-dev`. A fake SemVer is precisely the defect this
+  replaces, and an untagged validation build has no release to report — so "empty" is the correct
+  answer there, not a placeholder.
+- **The stamp carries `+g<short-sha>` build metadata.** Adopted deliberately and now rather than later:
+  SemVer build metadata is classification-neutral (it does not affect precedence), and adding it after
+  the fact would change every worker's displayed version string. It later caused a real defect anyway —
+  see §390, where a version *string* changing had to be distinguished from a version *moving*.
+- **The `X-Client-Version` header stays deliberately unread, and the stored version still moves only at
+  register.** Recorded because "the api ignores a header the worker sends" reads like a bug to the next
+  reader. Reading it on heartbeat is a store change (heartbeat's params carry no version binding at
+  all), and it is unnecessary: a rolled hosted pod is a **fresh process** that registers on boot, so
+  the stale window is pod-Ready→first-register — seconds, not "until the next release". The PRD's
+  Decision 7 was written as though that window were long. It is short, and the graces in §389 are
+  sized against the short one.
+- **The CI tag gate is part of this decision, not incidental.** Once the tag is the version the product
+  compares against, an invalid or leading-zero SemVer tag is no longer a cosmetic mistake — it silently
+  produces a fleet that cannot be classified. So the release job rejects it at the source.
+
+## 388. Normalization is what makes the comparison EXIST — and the three ways this rule failed OPEN
+
+**As the PRD originally wrote Decision 8, it was unimplementable and the feature was silently dead.**
+`golang.org/x/mod/semver` requires a leading `v`; every version this project ships is **bare** (the api
+image stamps `${UZI_VERSION#v}` deliberately, the chart's `appVersion` is bare). Measured on the
+literal shipped forms, two *different* releases compared **equal** and both were `IsValid=false`. So
+every worker would have read `up_to_date` forever: **failing open, never alerting**, which is the worst
+possible failure for an alerting feature because nothing looks wrong.
+
+- **Normalize before comparing** — re-prefix, guard, compare — mirroring the in-repo precedent in
+  `api/internal/forge/forgejo.go`, whose doc comment already names this exact wrinkle.
+- **The `IsValid` guards are load-bearing, not defensive.** Measured: an invalid operand sorts *below* a
+  valid one, so dropping a guard makes garbage classify `outdated` — the false alert this decision
+  exists to forbid.
+- **The retired `0.1.0-m4` literal is VALID SemVer** and sorts below every release, so the
+  "unparseable ⇒ `unknown`" rule does not catch it. Fixing the normalizer is what *activates* it: with
+  normalization absent the fleet reads `up_to_date`, with it present every pre-stamp image reads
+  `outdated` and the badge goes red fleet-wide on the very release that introduces the anti-cry-wolf
+  machinery. The classifier treats the exact literal as unreported ⇒ `unknown`, and that special case
+  had to ship **in the same commit as the normalizer**.
+- **Reported AHEAD of target ⇒ `up_to_date`, never an alert.** A per-cluster pinned worker tag and a
+  hand-built image are both legitimate; "ahead" is not a problem to report.
+- **A `dev` control plane disables version COMPARE, not roll-health.** This is a reading of Decision 8
+  the PRD does not state. Everything goes `unknown` with no alerts because there is no trustworthy
+  "latest" — but a stuck pod is a *direct observation*, not a comparison, so the roll-health rows still
+  fire. Suppressing them would discard the motivating incident's own signal on exactly the builds a
+  developer is most likely to be debugging.
+- **The lesson generalises past semver, and it is why this section exists at all.** The case that
+  certifies the comparison must be a worker that is **behind**. `Compare(x, x) = 0` is the *right
+  answer from a broken implementation*, so an all-current fixture set passes against the defect. The
+  same shape recurs twice more in this PRD (§392's one-tick drift, §392's never-called verb), and the
+  probe that originally missed it fed the code the `v`-prefixed inputs the *design* produces rather
+  than the bare ones production emits — a probe that feeds your design's own assumptions cannot
+  discover that the assumption is the bug.
+
+## 389. Two detectors by necessity, one first-match ladder — and four durations, each named for the failure it bounds
+
+- **Two detectors, not redundancy.** Version-compare (worker self-report) and controller roll-health
+  answer different questions. Because the stored version moves only at register, version-compare alone
+  cannot distinguish `upgrade_failed` from a plain `outdated`, carries no human reason, and — the
+  load-bearing part — **mislabels a healthy mid-roll worker as behind**. Roll-health is hosted-only, so
+  external workers only ever read `up_to_date` / `outdated`, with copy stating they do not auto-upgrade.
+- **A single first-match-wins ladder, never two independent booleans** (`api/internal/workersvc/
+  upgrade.go`). Roll-health rows sit above the version rules; the version rules then resolve
+  ahead / unparseable / equal / behind. One evaluation order means there is no pair of flags that can
+  disagree, and the precedence *is* the anti-cry-wolf rule: a fresh `upgrading` suppresses `outdated`.
+- **Hosted "latest" is the tag that actually rolls, not the api's own version.** `values.yaml` permits
+  pinning the worker image tag independently, so the api's release can be the wrong hosted target. The
+  controller reports the tag it rolls to and the api uses that for the hosted fleet; the api's own
+  stamped version remains the reference only for external workers. (This supported pin is also what
+  makes §391's residual attack unfixable without removing a feature.)
+- **Four durations, each a named parameter with the failure it bounds** — never a literal at the
+  comparison site, and the classifier takes its clock from the service's existing injectable `now`
+  seam, so none of them is testable only by sleeping:
+  - **Controller-signal TTL (60s) = 6× the controller's poll cadence, deliberately NOT the repo's
+    existing 3× staleness precedent.** The failure modes are asymmetric: too short and a live
+    `upgrading` decays mid-roll into `outdated`, turning the whole fleet's badge red — the exact
+    cry-wolf the owner forbids; too long and a badge lingers after the controller **dies**, which is
+    merely informational. 6× tolerates five consecutive failed reports. **This TTL bounds a controller
+    that STOPS reporting. It bounds a liar not at all** — see §390, and do not "correct" this constant
+    to 3× from the heartbeat precedent without reading that asymmetry.
+  - **Hosted roll grace (10m), consulted ONLY when there is no fresh signal** (controller down, never
+    deployed, or version-skewed). Anchored on api process start, which is free and needs no column
+    because Model B rolls the api in the same release. Sized above a healthy `Recreate` of the
+    browser-inflated worker image (cold pull plus `/nix` reseed) and below the ~14 minutes the
+    motivating incident ran before a human noticed.
+  - **Register-convergence grace (5m)** bounds the "controller says the new pod is Ready but the stored
+    version is still the old one" transient — seconds in the healthy case (§387), while still surfacing
+    a pod that is container-Ready with a crash-looping agent inside on the incident's timescale.
+  - **Max upgrading window (45m)** is §390's ceiling. Its value is a **backstop, not a detector**, so
+    generosity is safe and the asymmetry says err high; it is constrained at load time to exceed the
+    controller's own reasonless-stuck age, because the two constants live in different modules and
+    would otherwise drift into a hole. **The value is reasoned, not measured** — nobody has taken the
+    p99 healthy-roll measurement it should exceed (§395).
+- **The degenerate cases resolve by falling out of the ladder, not by special cases.** No controller
+  (compose) and an older controller that never posts are the *same* case, needing no code. A phase
+  string the api does not model drops **that entry**, never 400s the fleet's report. An unparseable
+  reported tag falls back to the control plane's version while still honouring the **phase** half of
+  the signal, because a garbage tag must not blind the fleet. Liveness (`offline`) is an orthogonal
+  badge and never enters this — a worker can legitimately read `up_to_date` and `offline` at once.
+
+## 390. INV-5, the absolute ceiling — and why the ANCHOR is the invariant
+
+- **A TTL bounds a controller that stops reporting; it does nothing about one that keeps reporting
+  something false.** A live liar satisfies *any* TTL forever, so `upgrade_failed` and `outdated` are
+  permanently suppressed fleet-wide. That is **alert suppression**, and the suppressed alert is the one
+  this whole PRD exists to raise. So the api records `upgrading_since` on the first report putting a
+  worker into a non-terminal roll state and, past the window, classifies by version-compare alone
+  whatever the controller says. **TTL and ceiling are different instruments for different failures and
+  neither substitutes for the other.**
+- **The ceiling gates BOTH controller-assertable states**, not just `upgrading`: a liar asserting
+  `upgrade_failed` across a healthy fleet is a denial-of-attention attack in the other direction.
+- **Three rejected anchors, recorded with their reasons**, because the first reads as *more* precise
+  than the one chosen and is what a re-implementation will reach for:
+  - *Key the clock on the reported target tag* — the controller supplies that tag, so a liar **rotates
+    it** and every rotation reads as a fresh roll that resets the clock. Precision handed to the
+    attacker.
+  - *Write the clock on every upsert* — deletes the ceiling outright by refreshing it each tick. This
+    is what a careless reading of "first observed" produces, which is why the set-if-NULL lives in the
+    SQL (a `COALESCE` inside `ON CONFLICT DO UPDATE`) rather than in Go, where a refactor of the
+    calling code could lose it silently.
+  - *Anchor on the worker's heartbeat* — tempting because it is server-stamped, worker-authenticated
+    and needs no migration, and it misses the attack completely: a worker heartbeats happily on the
+    **old** version indefinitely while the controller lies that it is `upgrading`. Fresh heartbeat,
+    stale version, suppressed alert. Kept as an additional disqualifier, never the anchor.
+- **Cleared only when the worker's own authenticated re-registration MOVES its stored version.** A
+  register is evidence the *pod* came back; version movement is evidence the *roll completed*, and
+  `upgrading_since` means "a roll is in progress", so the latter is what should end it. Clearing on any
+  register opens an unbounded re-arm path — liar suppresses, ceiling expires, alert finally fires,
+  worker restarts for any reason, clock clears, liar re-arms — and that path is **most available
+  exactly where a stuck worker lives**, since a crash-looping agent re-registers on every start. The
+  clear is its own statement in the register path, joined to the statement that already writes the
+  version so the two are atomic; it must not ride the existing token-delivery guard, which makes a
+  repeat registration a no-op by design.
+- **Paired set-guard: arm the clock only where version-compare would already say `outdated`.** You
+  cannot suppress an alert that would not fire, and this keeps the innocent-restart case vacuous rather
+  than merely harmless.
+- **Build metadata is not a version move.** §387's `+g<sha>` changes the string without changing the
+  release, so a "did the string change" clear would let a rebuild re-arm the ceiling. Comparison is on
+  the release. This is the one real defect the build-metadata decision caused, and it was found by
+  review rather than by the tests that existed.
+- **The residual is stated rather than engineered away.** This narrows the re-arm to nothing
+  constructible, but it is not *proven* closed, and the two attacks pull in opposite directions: a
+  clock the worker can reset invites re-arm, while a cumulative budget keyed on the target invites the
+  tag rotation rejected above. **There is no single clean anchor**, and no fourth mechanism was invented
+  to chase one. The discriminating probe is recorded instead: drive a worker that re-registers
+  repeatedly on an unchanged old version while the controller posts `upgrading` continuously, and
+  assert the alert still fires at the ceiling. Under unconditional clearing that probe fails.
+
+## 391. The controller→api report is DISPLAY-ONLY, and the SCHEMA is what makes that true
+
+Reconciles with PRD #58's doctrine that the controller asserts nothing: the poll stays a pure read, and
+this is a **separate** bearer-authed `POST /api/controller/status` carrying only observability. It
+mounts inside the existing controller route block, so it inherits the fleet-scoped credential, the
+hosting gate, and presence on both routers — a new route, not a new mechanism.
+
+- **Display-only is enforced by the schema, not by prose.** The report lands in its own table
+  (`worker_upgrade_reports`) whose only foreign key is the worker id, and nothing on the
+  claim / heartbeat / register path reads it. The forbidden set is recorded as a checklist rather than
+  an adjective: no register or token-destruction path, no credential or join-token state, no
+  claim/runs path, no online/offline status (owned by heartbeat, so roll-health must not be able to
+  mark a worker online), no generation counter (which drives what the controller is *told* to do, so a
+  writable one is a self-driving loop), **no INSERT into `workers` at all**, and no kube client in the
+  api — the last one already gated by a module-scoped build-graph test.
+- **Why a separate table rather than columns on `workers`.** The query pattern does not decide it (both
+  are primary-key joins); the **write** pattern does. Every other column on `workers` is written by
+  *that worker*, on *its own row*, on a path that already updates it — the resource-stats precedent
+  rides the heartbeat, and that is what someone will reach for. It does not transfer: this is one
+  *different principal* writing *every hosted row at once, every tick*, onto the **hot claim table**
+  (`FOR UPDATE SKIP LOCKED` plus a per-worker heartbeat update). A separate table makes "this can never
+  affect anything real" structurally true instead of documented, and secondarily: rollback is a
+  `DELETE`, the whole fleet lands in one statement, and the hosted-only guard sits in the statement
+  rather than in a loop a refactor can drop. Recorded honestly: columns would also have worked and the
+  classification does not depend on the choice.
+- **Three timestamps that must not be collapsed**, each with a different writer and a different
+  consumer. The wire's own `reported_at` is **display only**. The api's `observed_at` is stamped at
+  receipt and **drives freshness**. `upgrading_since` is **set-if-NULL only** and drives the §390
+  ceiling. Collapsing the first two sources freshness from the untrusted party, so a **future**
+  timestamp means the signal never goes stale — clock skew achieves that accidentally and malice
+  permanently, the cheapest possible bypass of the TTL. Collapsing the third into the upsert deletes
+  the ceiling.
+- **`204 No Content`, deliberately.** A sink that returns nothing makes display-only *structural*:
+  there is no response body for the controller to read desired state out of, so the endpoint cannot
+  quietly become a second control channel. Per-row garbage is dropped with a warning, never a 4xx for
+  the fleet.
+- **A route-local lenient decoder, commented at the site.** Both house decode helpers set
+  `DisallowUnknownFields`, so the forward-compatibility Decision 10 promises is **impossible** with the
+  house helper — a newer controller talking to an older api would get a 400, losing half the skew
+  tolerance the design budgets for. The **contract test** sets the opposite policy on purpose, so drift
+  is caught at the gate. Two decoders, opposite policies, one wire: exactly the distinction that gets
+  "tidied" into a bug, so the reason is written where the tidying would happen.
+- **Update-only, hosted-only, capped, sanitized.** A report naming an external worker updates zero
+  rows; one naming an unknown id inserts nothing (no row creation from the wire, so a liar cannot
+  assert failures against workers it has no jurisdiction over). The entry count is capped explicitly
+  because a body-size limit bounds *bytes*, not *upserts*. Every controller-supplied display string
+  goes through the existing self-report sanitizer, because `upgrade_detail` is rendered into a terminal
+  by `api/cmd/uzi/worker.go`; the phase is **validated** against a closed enum rather than sanitized.
+  Rows absent from a report are left to age out via the TTL, never deleted — deleting them would make
+  "no signal" and "signal says settled" indistinguishable across one dropped request.
+- **The golden wire contract lives on the PRODUCER's side**, inverting the existing poll pattern,
+  because this flow is controller→api: the controller marshals the golden and the api parses it. The
+  sample carries one fully-populated and one all-null entry so a dropped field or a pointer/value
+  collapse reddens both sides. This is the third cross-module test input in the repo and the first in
+  this direction, so it is invisible to Go's test cache — `-count=1` is the only thing standing between
+  a drifted contract and a green.
+- **Cross-tenant scoping is a schema decision, not a discipline.** The report is fleet-wide with no
+  user column; the per-worker read is strictly per-user. A naively written fleet aggregate would give
+  every user a nav badge counting **other users' failing workers**, on the most-rendered surface in the
+  app — a leak **by omission**, the kind that survives review. So the report table carries no user id
+  (denormalizing it would create a second source of truth that can disagree with `workers.user_id`),
+  which makes the tenancy join through `workers` unavoidable, and the aggregate query is named for its
+  scope so it cannot be read as fleet-wide.
+- **The honest safety claim, after three corrections.** "The worst a lying controller achieves is a
+  wrong badge" was false twice over. First, without §390's ceiling a controller re-posting `upgrading`
+  suppresses the fleet's alerts permanently — materially worse than the wrong-delete #58 refused,
+  because nobody sees an alert that never fires. Second, the ceiling gates the *phase* assertions but
+  not the *target* assignment, so a compromised controller need not lie about phase at all: it reports
+  a target equal to the fleet's stale versions with `phase = settled`, the compare comes out equal, and
+  every hosted worker reads `up_to_date` indefinitely — the same suppression by a different route and
+  **strictly worse**, since `upgrading` at least renders a badge and `up_to_date` renders nothing.
+  **Why it is not simply fixed**: pinning the worker tag below the api's release is a *supported*
+  operation (§389), so from the api's side a legitimate pin and this attack are indistinguishable; a
+  monotonic floor would turn a supported operation into a manual one. **Resolution for v1: keep the
+  behaviour and make the divergence OBSERVABLE** — the fleet panel states when the hosted target sits
+  below the control plane's own version, converting a silent suppression into a visible one, the same
+  move made for parked pods in §392. **So the honest form is: a lying controller cannot change api
+  state and cannot hide indefinitely, but it CAN suppress alerts for as long as nobody reads the fleet
+  panel.** Anything stronger requires taking away the pin.
+
+## 392. `pods: list` only, in both namespaces — two gates, readiness-not-drift, and a read that must never abort reconcile
+
+- **`list` only. No `get`, no `watch`.** A worker's pod name is Deployment-generated, so the controller
+  cannot know it without enumerating and `get`-by-name has no call site — the same argument
+  `worker-rbac.yaml` already makes for Deployments. This **narrows** the reserved-hook comment that had
+  promised `get, list`, and the comment was corrected in place rather than left to mislead.
+- **Both worker namespaces**, restricted and docker tier, with the reasoning mirrored — only one of the
+  two files carried the reserved-hook note, so a reader following "both namespaces" would have found a
+  placeholder in one place and nothing in the other.
+- **Two gates, because either alone certifies nothing.** A negative gate over the fake-client action log
+  (pod actions are `list` only, no `get`/`watch`/`delete`) mirrors the existing Secret-read gate — but
+  it passes **vacuously** on a build that never calls pods at all. So a positive gate asserts pods
+  **are** listed in a reconcile that observes roll health. The existing Secret gate is Secret-scoped, so
+  the pod grant could not have broken it; the worry the PRD recorded was satisfied by construction, and
+  the *positive* assertion is what actually covers the new call.
+- **`upgrading` derives from POD READINESS, never from the drift predicate.** After the controller
+  patches a drifted Deployment, the patch body carries the spec-hash annotation, so the live
+  Deployment's hash *immediately* equals the wanted one and the next tick takes the early return:
+  **drift is true for exactly one tick**, ten seconds at the default cadence. Reading drift as the state
+  of a roll yields `settled` asserted confidently while the new pod is still Pending, so the fleet
+  classifies `outdated` while rolling perfectly normally — the same cry-wolf, arriving by a different
+  road. The wrong version is shorter, reads more naturally, and is **correct on tick one**, so the test
+  that separates them must advance two ticks. The Deployment's own hash says what was *asked for*; only
+  the pod says what is *running*.
+- **Stuck-ness is derived from pod fields only, statelessly** (`controller/internal/kube/rollhealth.go`):
+  a closed set of blocking waiting reasons; a restart-count arm for a container that flickers through
+  `Running` so its waiting reason is intermittently absent; and an age arm as the **fallback only**, for
+  `Pending`/`FailedScheduling`/`FailedMount`, where no container exists to carry a reason at all. The
+  real incident fires on the reason arm within about two minutes, which is why the age arm can be
+  generous.
+- **A pod-list failure is logged and swallowed, never fatal.** The report is the last step of the tick
+  and its error does not abort the cycle, unlike poll and observe, whose errors deliberately do. An
+  observability read that can stop reconciliation would make this a **strictly worse controller than
+  the one we already have** — the feature would trade a missing badge for a fleet that stops being
+  managed.
+- **A free adjacent win, taken because the pods are being listed anyway**: warn on a pod parked in a
+  worker namespace carrying neither the worker name prefix nor the managed-by stamp. The existing orphan
+  check returns early for anything not named like ours, so a parked pod was enumerated, matched against
+  nothing, and never logged. It **detects rather than prevents** — and it is worth doing because the
+  three controls that limit *blast radius* limit nothing about *admission*, the NetworkPolicy file says
+  of itself that its enforcement is unproven, and the Pod Security levels invert against intuition: the
+  docker tier, where a parked pod matters most, has the weakest admission. Noisy if anything ever
+  legitimately lands there, which nothing should — the noise is the point.
+
+## 393. The confidentiality cut on an owner-accepted mock: `pods/log` REFUSED, events not granted
+
+- **`pods/log` is refused outright, and this is a confidentiality boundary rather than a scope trim.**
+  Worker pod logs carry agent output over a *user's cloned private repo*, so granting it would make the
+  controller a channel for customer source. The mock's raw `tar:` log pane is dropped; the container,
+  reason, restart count and exit code already name the fault, and the operator has `kubectl logs`.
+- **"View pod events" becomes a copy-the-`kubectl`-command affordance**, not an `events: list` grant.
+  The operator reaches events in one paste; the grant does not widen so the app can render them. A UI
+  action must not promise Events it cannot fetch.
+- **The reversal cost is asymmetric, and that — not the mock — decided it.** Restoring "View pod events"
+  later costs one RBAC line plus a handler. Un-shipping a `pods/log` grant costs a credential-scope
+  review and **cannot retract what was already exposed**.
+- **"Likely cause" is a closed lookup table in the web layer**, keyed on container and reason, so it
+  reads as editable product copy rather than a data field we claim to have measured. One entry was later
+  removed for naming a failure these pods cannot produce — which is the failure mode the closed-table
+  decision is meant to make cheap to fix.
+- **"N releases behind" is dropped as not derivable.** uzi knows two version *strings*, not the release
+  *sequence*, and has no release list to count against. Both versions are rendered instead.
+- **This overrules parts of an owner-accepted mock and was the team lead's call**, taken so the branch
+  was not stalled on a confirmation round-trip. Recorded here with its price rather than left as an
+  omission, and surfaced to the owner for ratification (`specs/human.md`, Feature #113).
+- **What the mock promised and v1 does NOT ship**, each with its reason, because a spec that implies
+  them would license a doc page promising them:
+  - **No "rolled N ago".** The controller's phase timestamp is the pod's *creation* time for a rolling
+    or stuck pod, not when the failure began, so the label would have stated something the controller
+    cannot know.
+  - **No live pod events** (above). **"Copy diagnostics" did ship** — it is satisfiable entirely from
+    the persisted report and needs no new RBAC.
+  - **Mute is storage only.** The table and its corrected release key exist and are covered by a live-DB
+    test; nothing can set a mute through the API, so the badge's mute subtraction is a live branch that
+    has never subtracted anything.
+
+## 394. The alert badge: what it counts, on what clock, and a tone whose premise was wrong
+
+- **`upgrading` is deliberately not an alert** (owner-accepted). A roll in progress is expected,
+  transient and self-resolving; counting it would cry wolf on every release. Everything in §389 and
+  §390 exists to keep that promise under a controller that is slow, absent, or lying — and the
+  milestone ordering existed for the same reason, since shipping the surface before the roll-health
+  fold would have delivered the cry-wolf by ordering rather than by any line of code, with no test able
+  to catch it because every milestone involved is individually correct.
+- **The badge polls on its own interval and is deliberately NOT visibility-gated**, diverging from the
+  neighbouring Judge backlog badge that shares the same `NavItem` prop. The reason is the whole point
+  of the feature: a hidden tab is precisely when nobody is watching, and this badge exists to count a
+  failure that appears while the operator is elsewhere. It rides a shell-owned fleet aggregate
+  (`GET /api/workers/upgrade-summary`) rather than the Workers page's poll, which is page-local.
+- **Decision 2's "red versus grey" describes a palette this product does not have, and the real
+  separation is about half what the decision assumed.** Measured in a browser: **nothing in the sidebar
+  is grey** — both neutral badges are brand orange, the alert is rose. ΔE2000 between them is **29.05**
+  (hue separation 35.7°, both warm), against **51.94** and **56.60** for this palette's deliberately
+  distinct pairs, with size, shape, radius, font and position all identical — so **hue is the only
+  channel carrying the distinction**. Above just-noticeable, so the badges *are* distinguishable and
+  this is not a blocking defect; they are not *categorically* distinct, which is what the decision
+  claimed. **And it is theme-asymmetric:** the same pair measures **77.64** in the other theme, so the
+  distinction that *is* the feature is weakest in the default theme and excellent in the other.
+  Choosing a more separated alert hue is the owner's design decision, recorded rather than taken. What
+  must not stand is the premise: a reader reasoning from "red vs grey" is reasoning about a UI that
+  does not exist.
+- **The collapsed rail conveyed neither count nor tone.** The labelled pill was gated out of the DOM
+  when collapsed and the remaining dot was `aria-hidden`, so an assistive-technology user got nothing
+  in the layout where the operator has the least context. Fixed by giving the collapsed state its own
+  accessible name. Recorded because a validator had reported the opposite as a structural property and
+  it was relayed as established, which set the severity ceiling wrong until it was measured.
+- **Mute scope is per-user-per-worker-per-release.** A release-wide mute would also hide a *different*
+  worker failing later in the same release — exactly the case the badge exists for. It degrades
+  trivially to release-wide semantics if a "mute all" is ever wanted; the reverse does not. Storing the
+  literal release string means the next release auto-unmutes with no expiry logic. Frozen in the
+  migration, so it is a schema decision rather than one revisited casually.
+- **Dark-only** (owner-accepted), matching the product's two dark themes. No light variant.
+
+## 395. What this PRD does NOT cover, and what a rebuild inherits open
+
+Recorded as a decision rather than left to read as an omission, following §364's precedent.
+
+- **Out of scope by decision.** No remediation or self-heal: no restart, retry or auto-rollback of a
+  failed upgrade, because uzi ships no worker-restart endpoint and delete-plus-reprovision remains the
+  only lifecycle control — diagnostics are read-only (owner-accepted). No PVC auto-resize on release,
+  though that is what the motivating incident actually needed. No general notification centre: this
+  ships one alerting surface for one signal, and reusing the pattern is a later PRD. No change to the
+  roll policy itself — the deliberate no-active-run gate is untouched, and this PRD only makes its
+  outcome visible.
+- **Open, deliberately or otherwise.** The mute has storage and no UI (§393), so its subtraction has
+  never run in production terms. The fleet-panel divergence line is the *only* thing between a
+  tag-suppressing controller and a silently green fleet (§391), and it works only when someone reads
+  the panel. The ceiling's window is a **reasoned default against an unmeasured quantity** — nobody has
+  taken the p99 healthy-roll measurement it must exceed. And the ordering constraint that the surface
+  must not precede the roll-health fold is a *reasoning* constraint that no test can enforce.
+- **The entire signal path is UNEXERCISED in production, and that is one gap seen from two ends.**
+  Measured on the live cluster before this branch: the controller **cannot `list pods`** in either
+  worker namespace, with `list deployments` answering yes as the positive control. So the controller has
+  never produced a roll-health signal and the api has never received one — the ladder's roll-health
+  rows, the report endpoint and the ceiling have run only against tests and fixtures. **Post-merge
+  cluster validation is the first real execution of this path, not a confirmation pass**, and it should
+  be read that way when it runs.
+- **Two documentation claims about this feature were refuted after it shipped, both the same shape:
+  prose about the feature outrunning the feature.** First, the copy-`kubectl` affordance (§393) renders
+  a `<worker-namespace>` placeholder, and the page said that pasting it unsubstituted "succeeds and
+  finds nothing, which looks like the worker having gone" — a silent wrong answer. **Measured: the
+  failure is the opposite kind.** `<` and `>` are shell redirection, so the shell fails on the missing
+  redirect target (`no such file or directory: worker-namespace`) and `kubectl` never runs at all. Loud,
+  not silent, and before any cluster call. **And the sentence is not merely wrong, it describes what the
+  OBVIOUS FIX would do** — which is why it is recorded rather than only deleted. Quoting the
+  placeholder is the natural correction, and measured, quoting makes it survive as one literal
+  argument, so `kubectl` *does* run, against a namespace literally named `<worker-namespace>`, and
+  answers `No resources found` with **exit 0**. So the silent wrong answer the page wrongly attributed
+  to the unquoted form is exactly what quoting manufactures. Neither form is safe to paste, and they
+  fail in opposite ways. Second, "the exit code separates permission-denied from
+  `/nix` running out of space" is false: GNU `tar` exits 2 for *every* fatal error, so both cases exit
+  2. What actually discriminates them is the stderr line — which this architecture deliberately refuses
+  to carry (§393). Recorded here rather than only fixed in the page, because both read as *diagnostics
+  guidance*, and guidance naming a discriminator the system cannot provide is worse than none.
+
+See [prds/113-worker-upgrade-status.md](../prds/113-worker-upgrade-status.md) for the Decision Log and
+the amendments each of these sections distils, and [docs/worker-upgrades.md](../docs/worker-upgrades.md)
+for the operator-facing meaning of each state.

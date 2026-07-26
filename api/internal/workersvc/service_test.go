@@ -141,11 +141,11 @@ type fakeStore struct {
 	backlogArg       *store.ListJudgeRecommendationRowsForUserParams
 
 	// Submit input.
-	runByID            store.Run
-	runByIDErr         error
-	workerByID         store.Worker
-	workerByIDErr      error
-	createdInput       *store.CreateRunInputParams
+	runByID       store.Run
+	runByIDErr    error
+	workerByID    store.Worker
+	workerByIDErr error
+	createdInput  *store.CreateRunInputParams
 	// reviseCount is the number of persisted revise_plan rows the fake pretends the run
 	// already has (PRD #41 plan-revision cap); reviseCountRunID captures the run id the
 	// read-only cap query was asked about. reviseCapArg captures the atomic capped-enqueue
@@ -353,10 +353,10 @@ func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorker
 	f.callOrder = append(f.callOrder, "requeue_worker")
 	return 0, nil
 }
-func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
+func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
 	f.registerParams = &arg
 	f.callOrder = append(f.callOrder, "register")
-	return f.registerResult, nil
+	return store.RegisterWorkerRow(f.registerResult), nil
 }
 func (f *fakeStore) HeartbeatWorker(context.Context, store.HeartbeatWorkerParams) (store.Worker, error) {
 	return f.heartbeat, nil

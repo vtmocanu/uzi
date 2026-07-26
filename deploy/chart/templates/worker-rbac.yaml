@@ -78,19 +78,40 @@ rules:
     # is otherwise invisible entirely (Pods get/list does not cover it: an orphan
     # Deployment scaled to zero has no pods).
     verbs: ["create", "list", "delete"]
-  # PODS ARE DELIBERATELY NOT GRANTED AT ALL, and Decision 1's original list said
-  # "Pods get/list (drift detection only)". That parenthetical was wrong: drift
-  # detection reads the DEPLOYMENT's pod-template annotations (uzi.dev/spec-hash and
-  # uzi.dev/hosted-generation), never a pod — and an enumeration of every kube call in
-  # controller/ finds no pod call at all. Granting a verb for a feature that does not
-  # exist is exactly what "Verbs pinned minimal" forbids.
-  #
-  # The real recorded use is Decision 9's V2 hook: a pod wedged in
-  # ContainerCreating/FailedMount is the only handle anyone has on "the token Secret is
-  # missing", which is undetectable by design (see the Secrets rule). Decision 9 places
-  # that with the v2 pod-phase status work, "not v1" — so it gets `pods: get, list`
-  # when it is built, and loses nothing by being granted then. Least privilege means
-  # granting at need.
+  - apiGroups: [""]
+    resources: ["pods"]
+    # Decision 9's reserved V2 hook, now built (PRD #113 M3). Roll health is only
+    # readable from pods: the DEPLOYMENT's annotations say what was ASKED FOR, and
+    # equal the desired hash the instant the patch returns, so they cannot distinguish
+    # "rolling" from "rolled and wedged". Only the pod says what is RUNNING.
+    #
+    # `list` ONLY — not `get`, not `watch`. The reserved-hook comment this replaces
+    # promised `get, list`; that was a stale promise rather than a spec, and `get` has
+    # no call site: a worker's pod name is Deployment-generated
+    # (<name>-<hash>-<suffix>), so the controller cannot construct one without
+    # enumerating, and enumerating is `list`. Same argument the Deployments rule above
+    # makes — "a verb granted for a call that does not exist is what that forbids".
+    #
+    # `pods/log` IS REFUSED and must stay refused. Worker logs carry agent output over
+    # a user's cloned private repo, so the subresource is a content-disclosure grant of
+    # a wholly different order than pod metadata. No `events` verb either: the mock's
+    # "View pod events" button was dropped rather than widen this file (design 5c).
+    # Everything the failed-worker strip renders — container, reason, restart count,
+    # exit code, pod phase — is in containerStatuses[].state.waiting.REASON and
+    # lastTerminationState, i.e. free at this grant.
+    #
+    # `.message` is deliberately NOT read, and this line used to name it as though it
+    # were. Reason is a short closed-ish k8s enum; message is FREE TEXT that routinely
+    # carries filesystem paths, image references and Secret names, and it reaches a
+    # browser badge and a terminal via the CLI. Adding it later needs a producer-side
+    # length bound (there is none today) on top of the api's sanitizer, so it is a
+    # decision rather than a field.
+    #
+    # Unlike the Secrets rule, this one HAS a mechanical gate on both sides:
+    # controller/internal/kube asserts over the whole fake-client action log that pod
+    # actions are `list` only (negative) AND that pods are actually listed (positive).
+    # The negative alone would pass on a build that never calls pods at all.
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -176,6 +197,19 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    # Same grant, same reasons as the restricted Role above (PRD #113 M3): `list` only,
+    # no `get`/`watch`, and `pods/log` refused. Both namespaces need it because roll
+    # health is per-worker and the docker tier's workers live only here — a scan of one
+    # namespace can never see the other's.
+    #
+    # Worth stating where the risk actually is: this tier runs `enforce: privileged`
+    # (worker-docker-namespace.yaml) while the restricted default runs
+    # `enforce: restricted`, so the namespace with the WEAKEST admission is the one
+    # where a parked non-worker pod matters most. That is an argument for the unmanaged
+    # pod warning M3 adds, not against this grant — pod metadata is what detects it.
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

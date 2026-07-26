@@ -1000,3 +1000,36 @@ func TestWorkerListShowsVersion(t *testing.T) {
 		t.Errorf("a worker that never registered a version should render \"-\", not an empty cell:\n%s", out)
 	}
 }
+
+// PRD #113 M5: the UPGRADE column. `uzi worker list` is a first-class second consumer of
+// the same DTO the web badge reads, so a worker that is failing an upgrade must be visible
+// here too — the CLI is where an operator already is when a run stalls.
+func TestWorkerListShowsUpgradeStatus(t *testing.T) {
+	v := "0.11.0"
+	cur := "0.11.7"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "behind", Status: "online", Version: &v, UpgradeStatus: "outdated", UpgradeTarget: "0.11.7"},
+		{ID: "w2", Name: "broken", Status: "offline", Version: &v, UpgradeStatus: "upgrade_failed", UpgradeTarget: "0.11.7"},
+		{ID: "w3", Name: "fine", Status: "online", Version: &cur, UpgradeStatus: "up_to_date", UpgradeTarget: "0.11.7"},
+		{ID: "w4", Name: "local", Status: "online", UpgradeStatus: "unknown"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "UPGRADE") {
+		t.Fatalf("no UPGRADE column:\n%s", out)
+	}
+	for _, want := range []string{"outdated", "FAILED", "up to date"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	// `unknown` renders as "-", not as the word. An unstamped local build, an
+	// unparseable report and a `dev` control plane all classify unknown, and none is a
+	// finding — a column of "unknown" in front of every local developer trains them to
+	// ignore this column entirely.
+	if strings.Contains(out, "unknown") {
+		t.Errorf("the unknown state rendered as the word rather than \"-\":\n%s", out)
+	}
+}

@@ -44,12 +44,21 @@ import {
 // localStorage key for the desktop sidebar's collapsed state (per browser).
 const SIDEBAR_COLLAPSED_KEY = "uzi.sidebar.collapsed";
 
+// 60s. Slower than the Workers page's 10s liveness poll on purpose: this one exists to
+// notice a state that persists for minutes (a stuck roll), not to animate a gauge, and it
+// runs on every page for every logged-in user.
+const WORKERS_ATTENTION_POLL_MS = 60_000;
+
 // The server build version, fetched once and shared. Memoised at module scope so
 // the two SidebarContent mounts (desktop rail + mobile drawer) and any remount
 // reuse a single unauthenticated GET /api/version. A failed fetch resolves to ""
 // (rendered as nothing), never a thrown error in the shell.
 let versionPromise: Promise<string> | null = null;
-function useAppVersion(): string | null {
+// Exported so the Workers page can state the fleet's target release from the SAME
+// coordinate the footer shows (PRD #113 M5). The promise is memoised at module scope, so
+// reusing this hook costs no extra request and — more importantly — makes it impossible
+// for the panel and the footer to disagree about what release the control plane is.
+export function useAppVersion(): string | null {
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     if (!versionPromise) {
@@ -91,6 +100,7 @@ function NavItem({
   onNavigate,
   collapsed = false,
   badge = 0,
+  badgeTone = "count",
 }: {
   to: string;
   icon?: ReactNode;
@@ -109,11 +119,21 @@ function NavItem({
   // collapsed, a dot overlaps the icon since a rail has no room for a number. 0
   // renders nothing.
   badge?: number;
+  // badgeTone distinguishes "go look" from "there is a queue" (PRD #113 Decision 2).
+  // The default `count` tone is the brand pill every existing badge uses — an unread
+  // count, a Judge backlog: things to get to. `alert` is red, and it means a worker
+  // needs attention now.
+  //
+  // A new TONE rather than a new mechanism, deliberately: two badge implementations
+  // would drift in position, size and collapsed-rail behaviour, and the rail's dot has
+  // no room to distinguish them by anything but colour.
+  badgeTone?: "count" | "alert";
 }) {
   const { pathname } = useLocation();
   let active = exactOnly ? pathname === to : isNavActive(pathname, to);
   if (active && excludeSubpath && isNavActive(pathname, excludeSubpath)) active = false;
   const hasBadge = badge > 0;
+  const alert = badgeTone === "alert";
   return (
     <Link
       to={to}
@@ -133,16 +153,39 @@ function NavItem({
           {collapsed && hasBadge && (
             <span
               aria-hidden="true"
-              className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-brand ring-2 ring-surface"
+              className={cx(
+                "absolute -right-1 -top-1 h-2 w-2 rounded-full ring-2 ring-surface",
+                alert ? "bg-danger" : "bg-brand",
+              )}
             />
           )}
         </span>
       )}
       {!collapsed && <span className="truncate">{label}</span>}
+      {/* The count SURVIVES COLLAPSE. The pill below is gated on !collapsed and the rail's
+          dot is aria-hidden, so without this an assistive-tech user got no count and no
+          tone at all in the collapsed rail — measured: no aria-label, empty innerText, only
+          title="Workers". That is the information not being there, not a visual
+          degradation, and it happens in the layout where the operator has least context.
+          "The sidebar was collapsed" is not a reason to withhold an incident count.
+          sr-only rather than an aria-label on the Link, so the destination name and the
+          count stay separate strings rather than one run-on label. */}
+      {collapsed && hasBadge && (
+        <span className="sr-only">{alert ? `${badge} needing attention` : `${badge} unread`}</span>
+      )}
       {!collapsed && hasBadge && (
         <span
-          aria-label={`${badge} unread`}
-          className="ml-auto min-w-[1.25rem] rounded-full bg-brand px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none text-on-brand"
+          // The label says what the number MEANS. "3 unread" for a worker count would be
+          // wrong in a way a screen-reader user could not recover from — nothing else on
+          // the page would explain it.
+          aria-label={alert ? `${badge} needing attention` : `${badge} unread`}
+          className={cx(
+            "ml-auto min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none",
+            // text-on-brand, NOT text-white: measured 2.69:1 for white on bg-danger at 10px/600
+            // against 8.27:1 for the Notifications and Judge badges. The badge whose entire
+            // purpose is to be noticed mid-incident was the only sidebar badge failing AA.
+            alert ? "bg-danger text-on-brand" : "bg-brand text-on-brand",
+          )}
         >
           {badge > 99 ? "99+" : badge}
         </span>
@@ -181,6 +224,7 @@ function SidebarContent({
   onToggleCollapse,
   unread = 0,
   judgeTodo = 0,
+  workersAttention = 0,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
@@ -191,6 +235,9 @@ function SidebarContent({
   // `unread`, sourced from /me/judge/stats.todo — the ONE canonical number, so the badge
   // agrees with the Judge page's To-triage tab and the judge notification to the digit.
   judgeTodo?: number;
+  // Count for the Workers nav badge (PRD #113 M6). 0 renders nothing at all — not a
+  // badge showing zero, which would be a permanent ornament that means nothing.
+  workersAttention?: number;
   // Notifications unread count for the bell badge (PRD #46 M2). Owned by the
   // parent AppShell so the single poll feeds both this badge and the status
   // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
@@ -311,7 +358,17 @@ function SidebarContent({
         <NavGroup label="Factory" collapsed={collapsed}>
           <NavItem to="/agents" icon={<BotIcon />} label="Agents" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/skills" icon={<SkillIcon />} label="Skills" onNavigate={onNavigate} collapsed={collapsed} />
-          <NavItem to="/settings/workers" icon={<ServerIcon />} label="Workers" onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem
+            to="/settings/workers"
+            icon={<ServerIcon />}
+            label="Workers"
+            badge={workersAttention}
+            // alert, not the default count tone: red reads "go look", while the grey
+            // Judge pill beside it reads "there is a queue" (Decision 2).
+            badgeTone="alert"
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
           {/* Judge (PRD #98): the cross-run recommendation workbench. Badge is the
               to-triage backlog count — the same number the page's To-triage tab shows. */}
           <NavItem to="/judge" icon={<ScaleIcon />} label="Judge" badge={judgeTodo} onNavigate={onNavigate} collapsed={collapsed} />
@@ -516,6 +573,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   // needs a propagation channel as well as a shared source: JudgeTodoContext publishes this
   // setter, and the Judge page pushes the fresh canonical `triage.todo` it already has.
   const [judgeTodo, setJudgeTodo] = useState(0);
+  // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
+  // counted server-side so this badge and the Workers page's badges cannot disagree.
+  const [workersAttention, setWorkersAttention] = useState(0);
   // Desktop sidebar collapse, persisted per browser. Initialised lazily from
   // localStorage so the first paint already matches the stored state — a
   // post-mount effect would flash the sidebar expanded then snap it collapsed.
@@ -568,6 +628,38 @@ export function AppShell({ children }: { children: ReactNode }) {
     };
   }, [user, location.pathname]);
 
+  // Workers-attention poll (PRD #113 M6). On navigation AND on a fixed interval, which
+  // is deliberately more than the Judge badge does: a worker's roll fails while the
+  // operator is doing something else entirely, and a badge that only refreshes on
+  // navigation would stay clean through the whole incident if they happen not to move.
+  //
+  // NOT visibility-gated, for the same reason. A hidden tab is precisely when nobody is
+  // watching the Workers page, and the badge is what is supposed to pull them back.
+  // One indexed user-scoped query per tick, no forge or model call.
+  //
+  // A failed fetch keeps the last known count rather than blanking the badge: dropping to
+  // zero on a transient error would read as "resolved", which is the one wrong answer.
+  useEffect(() => {
+    if (!user) {
+      setWorkersAttention(0);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      api
+        .workerUpgradeSummary()
+        .then((s) => {
+          if (alive) setWorkersAttention(s.attention);
+        })
+        .catch(() => {});
+    load();
+    const t = window.setInterval(load, WORKERS_ATTENTION_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [user, location.pathname]);
+
   // Status favicon (PRD #70 M4): mounted here so it lives on every route incl.
   // guest and survives logout (enabled flips false → reset to the static mark).
   // Reuses the unread count above — no second unread poll — and owns its own
@@ -602,6 +694,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           onToggleCollapse={() => setCollapsed((c) => !c)}
           unread={unread}
           judgeTodo={judgeTodo}
+          workersAttention={workersAttention}
         />
       </aside>
 
@@ -633,7 +726,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} workersAttention={workersAttention} />
           </div>
         </div>
       )}

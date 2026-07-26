@@ -167,6 +167,12 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/cli-tokens/", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
 	{"GET", "/api/me/judge/stats", noLimiter},
+	// noLimiter, same reasoning as /me/judge/stats beside it: an authenticated read that
+	// AppShell polls on a fixed interval for every logged-in user. A per-user budget here
+	// would throttle the app's own shell — the badge would silently stop updating for a
+	// user doing nothing wrong — and the endpoint spends nothing: one indexed
+	// user-scoped query, no forge call, no model call (PRD #113 M6).
+	{"GET", "/api/me/workers/upgrade-summary", noLimiter},
 	{"GET", "/api/me/memory/", noLimiter},
 	{"GET", "/api/me/rate-limits", noLimiter},
 	{"GET", "/api/me/secrets/", noLimiter},
@@ -216,6 +222,16 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/chats/{id}/continue", limChat},
 	{"POST", "/api/chats/{id}/end", noLimiter},
 	{"POST", "/api/chats/{id}/messages", limChat},
+	// noLimiter, and this is a reasoned choice rather than the default (PRD #113 M4).
+	// The per-user limiters key on the authenticated USER, and a controller request has
+	// no user in context — it carries the fleet-scoped bearer credential, so
+	// PerUserMiddleware cannot apply at all rather than being merely unhelpful. What is
+	// left would be a per-IP budget, which is meaningless here: there is exactly one
+	// controller principal, on a fixed ~10s cadence, dialing from a pod CIDR that is a
+	// trusted proxy by construction. The real bounds on this endpoint are the ones that
+	// fit it — a 1 MiB body cap and an explicit 512-entry cap — not a request rate.
+	// Same reasoning, same answer as GET /api/controller/poll above.
+	{"POST", "/api/controller/status", noLimiter},
 	{"POST", "/api/chats/{id}/proposals/{pid}/confirm", limForge},
 	{"POST", "/api/chats/{id}/proposals/{pid}/dismiss", noLimiter},
 	{"POST", "/api/forge/connections/", noLimiter},

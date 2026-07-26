@@ -625,6 +625,43 @@ export interface Worker {
   template_declared: string | null;
   template_reported: string | null;
   version: string | null;
+  // Derived upgrade health (PRD #113), computed by the api at read time from `version`
+  // against the control plane's release — never stored, so it cannot disagree with the
+  // row it describes. upgrade_detail is the sentence behind the badge ("running 0.11.0,
+  // target 0.11.7"), null in the steady up_to_date case where there is nothing to say.
+  //
+  // Five states, but the api derives only three from a version comparison:
+  // up_to_date / outdated / unknown. "upgrading" and "upgrade_failed" require the
+  // controller's roll report, because `version` is written ONLY at register — a worker
+  // stuck offline mid-roll keeps reporting its OLD version and cannot self-report that
+  // it is stuck. Both arrive with the roll-health fold.
+  //
+  // "unknown" is the honest answer, not an error: an unstamped image, an unparseable
+  // report, or a "dev" control plane all land here, and none of them should raise an
+  // alert.
+  upgrade_status: "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
+  upgrade_detail: string | null;
+  // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
+  // hosted worker with a fresh report, otherwise the control plane's own version. "" when
+  // the control plane has no version stamp (classification off).
+  //
+  // Rendered by the Fleet panel when it differs from the control-plane version. That
+  // divergence is a supported operation — values.yaml may pin the worker image — and it is
+  // also the shape a compromised controller would use to suppress every alert in the fleet
+  // by reporting the fleet's own stale version as the target. The api cannot tell them
+  // apart, so the UI states it rather than judging it.
+  upgrade_target: string;
+  // The blocking container and the k8s waiting REASON behind an upgrade_failed. Null for
+  // every other status, and null on responses that carry no roll-health join (register,
+  // heartbeat, create). The reason only — `message` is never sent, being free text that
+  // carries paths and Secret names.
+  upgrade_blocking_container: string | null;
+  upgrade_blocking_reason: string | null;
+  // The blocking container's last exit code, null when it never terminated (a different
+  // fact from "exited 0"). It DISCRIMINATES causes the reason alone conflates — a
+  // seed-nix CrashLoopBackOff comes both from a permissions error unpacking the nix store
+  // and from that volume filling up.
+  upgrade_last_exit_code: number | null;
   last_heartbeat_at: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
@@ -1520,6 +1557,12 @@ const realApi = {
   // Server build version (Model B: the release git tag; "dev" on a local build).
   // Unauthenticated, like /health — the shell footer reads it.
   version: () => request<{ version: string }>("GET", "/version"),
+  // The Workers nav badge's count (PRD #113 M6). Its own endpoint rather than a fold over
+  // listWorkers: the Workers page's poll is page-local and visibility-gated, so a badge
+  // fed from it would be stale or absent exactly when the operator is not on that page,
+  // which is the only situation a nav badge exists for.
+  workerUpgradeSummary: () =>
+    request<{ attention: number; target_release: string }>("GET", "/me/workers/upgrade-summary"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),

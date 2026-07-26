@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -52,8 +53,8 @@ func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerR
 func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
 	return 0, nil
 }
-func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
-	return store.Worker{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
+func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.RegisterWorkerRow, error) {
+	return store.RegisterWorkerRow{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
 }
 
 // HeartbeatWorker echoes the stats params back onto the returned worker, so a
@@ -360,11 +361,11 @@ func TestWorkerHeartbeatDropsInvalidStats(t *testing.T) {
 	// int64-overflow mem) and the validation rejects (junk source, negative mem, a
 	// missing required mem_bytes).
 	for _, body := range []string{
-		`{"version":"1","stats":{"cpu_pct":1e999,"mem_bytes":1,"source":"cgroup"}}`,         // float64 overflow
-		`{"version":"1","stats":{"mem_bytes":99999999999999999999,"source":"cgroup"}}`,      // int64 overflow
-		`{"version":"1","stats":{"cpu_pct":10,"mem_bytes":1,"source":"../etc/passwd"}}`,     // garbage source enum
-		`{"version":"1","stats":{"mem_bytes":-5,"source":"cgroup"}}`,                          // negative mem
-		`{"version":"1","stats":{"cpu_pct":10,"source":"cgroup"}}`,                            // missing required mem_bytes
+		`{"version":"1","stats":{"cpu_pct":1e999,"mem_bytes":1,"source":"cgroup"}}`,     // float64 overflow
+		`{"version":"1","stats":{"mem_bytes":99999999999999999999,"source":"cgroup"}}`,  // int64 overflow
+		`{"version":"1","stats":{"cpu_pct":10,"mem_bytes":1,"source":"../etc/passwd"}}`, // garbage source enum
+		`{"version":"1","stats":{"mem_bytes":-5,"source":"cgroup"}}`,                    // negative mem
+		`{"version":"1","stats":{"cpu_pct":10,"source":"cgroup"}}`,                      // missing required mem_bytes
 	} {
 		st := &protocolStore{}
 		h := newProtocolHandler(t, st)
@@ -392,7 +393,7 @@ func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 		StatsMemLimitBytes: pgtype.Int8{Int64: 2147483648, Valid: true},
 		StatsSource:        pgtype.Text{String: "cgroup", Valid: true},
 	}
-	dto := apitypes.AdminWorkerDTO{WorkerDTO: workerDTOFromWorker(w, 0, false, ""), OwnerEmail: "u@example.test"}
+	dto := apitypes.AdminWorkerDTO{WorkerDTO: workerDTOFromWorker(w, 0, false, "", "", time.Now(), time.Now()), OwnerEmail: "u@example.test"}
 	b, err := json.Marshal(dto)
 	if err != nil {
 		t.Fatalf("marshal admin dto: %v", err)

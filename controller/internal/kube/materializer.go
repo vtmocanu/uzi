@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,11 +47,16 @@ type Materializer struct {
 	cfg      RenderConfig
 	resolver preset.Resolver
 	log      *slog.Logger
+	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
+	// time.Now() at the comparison site would make stuckAge testable only by
+	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
+	// which live in this package.
+	now func() time.Time
 }
 
 // New builds a Materializer.
 func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, log *slog.Logger) *Materializer {
-	return &Materializer{client: client, cfg: cfg, resolver: resolver, log: log}
+	return &Materializer{client: client, cfg: cfg, resolver: resolver, log: log, now: time.Now}
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -100,6 +107,11 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		byID[id] = o
 		return o
 	}
+	// The image each worker's Deployment currently asks for, collected in the
+	// deployment pass and handed to the pod pass below. Kept in a local rather than
+	// written straight onto ObservedWorker.Roll because the pod pass REPLACES Roll
+	// wholesale, which would drop anything stashed there first.
+	targetImages := map[string]string{}
 
 	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -114,6 +126,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 		o := get(id)
 		o.HasDeployment = true
+		if img := workerImage(d); img != "" {
+			targetImages[id] = img
+		}
 		// Read the drift signals off the POD TEMPLATE's annotations — where we stamped
 		// them, and where they have to be for a change to roll the pod at all.
 		ann := d.Spec.Template.Annotations
@@ -151,7 +166,122 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			o.HasNixPVC = true
 		}
 	}
+
+	// Pods (PRD #113 M3): roll health, and the only place it is readable. LIST only —
+	// the grant is `list` and nothing here may become a get-by-name, which is
+	// impossible anyway (pod names are Deployment-generated).
+	//
+	// Unselected, for the same reason as the two lists above: a label selector would
+	// make the unmanaged-pod check below structurally blind to exactly what it looks
+	// for. Pods inherit the pod template's labels, so IsOurs works on them unchanged.
+	// A POD-LIST FAILURE IS LOGGED AND SWALLOWED. It must never abort the cycle, and
+	// this is the one asymmetry in this function that is worth reading carefully.
+	//
+	// The Deployment and PVC lists above return their errors, and that is CORRECT for
+	// them: they drive decisions, so reconciling against a view we just admitted we
+	// could not read is how a healthy worker gets clobbered. Nothing of the sort is
+	// true here. `.Roll` is written below and consumed in exactly ONE place — the
+	// display-only status report in reconcile.Tick. No create, patch, teardown or
+	// token-delivery decision reads it.
+	//
+	// So returning an error here would stop provisioning, teardown, patching and token
+	// delivery for the entire hosted fleet on account of a read whose only consumer is
+	// a badge. MEASURED, and this is not hypothetical: the controller ServiceAccount
+	// deployed on dev-cluster today answers `no` to `list pods` in both worker
+	// namespaces (with `list deployments` = yes as the positive control), and nothing
+	// in the chart orders worker-rbac.yaml ahead of controller-deployment.yaml — no
+	// sync-wave on either. So the first tick after this image becomes ready 403s. With
+	// the swallow, that is a few ticks of absent roll-health rows, which the api already
+	// reads as "no signal"; without it, the fleet wedges and the symptom points nowhere
+	// near roll health.
+	//
+	// The principle is the same one the report step in Tick states from the other side:
+	// an observability feature must never be able to take down the thing it observes.
+	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		m.log.Warn("listing pods for roll health failed; continuing without roll health for this namespace (reconciliation is unaffected)",
+			"namespace", ns, "error", err)
+		return nil
+	}
+	byWorker := map[string][]corev1.Pod{}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		id, ours := IsOurs(p.Labels)
+		if !ours {
+			m.flagUnmanagedPod(p.Name, ns)
+			continue
+		}
+		byWorker[id] = append(byWorker[id], *p)
+	}
+	// Derive for every worker we have a DEPLOYMENT for, not merely for every worker we
+	// found pods for. The difference is the Recreate gap: between the old pod being
+	// deleted and the new one appearing there are no pods, and iterating pods alone
+	// would emit NO ROW for that worker.
+	//
+	// A missing row is not neutral. The api reads absence as "no signal", so the only
+	// thing keeping a healthy mid-roll worker from flashing `outdated` during the gap
+	// would be the 60s freshness TTL still holding the PREVIOUS report alive — an
+	// invisible dependency on one constant in another module, where shortening the TTL
+	// would produce cry-wolf that nobody would trace back to it. Emitting an explicit
+	// `rolling` row for a pod-less worker removes that coupling: the gap now asserts
+	// what it actually is. It is also what design §B-4 specifies.
+	now := m.now()
+	for _, o := range byID {
+		if o.Namespace != ns || !o.HasDeployment {
+			continue
+		}
+		// wantHash is what this worker's DEPLOYMENT currently asks for, already read
+		// off its pod template above. Passing it is what makes the derivation about
+		// pod readiness rather than deployment drift — see rollhealth.go's header.
+		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, now)
+		o.Roll.TargetImage = targetImages[o.ID]
+	}
+	// A worker seen ONLY as pods (its Deployment already gone, its pods still
+	// terminating) gets roll health too — teardown is in flight and the row is honest
+	// about what is there.
+	for id, ps := range byWorker {
+		o := get(id)
+		if o.HasDeployment {
+			continue // already derived above
+		}
+		o.Roll = deriveRollHealth(ps, o.SpecHash, now)
+		o.Roll.TargetImage = targetImages[id]
+	}
 	return nil
+}
+
+// workerImage returns the agent container's image from a worker Deployment's pod
+// template — what the cluster was TOLD to run, which is the honest target to report.
+// Selected by container name rather than index: the docker tier adds a DinD sidecar,
+// so containers[0] is not reliably the agent.
+func workerImage(d *appsv1.Deployment) string {
+	for _, c := range d.Spec.Template.Spec.Containers {
+		if c.Name == workerContainerName {
+			return c.Image
+		}
+	}
+	return ""
+}
+
+// flagUnmanagedPod warns about a pod in a worker namespace that this controller did
+// not stamp (PRD #113 M3, design 5d).
+//
+// Deliberately WIDER than flagOrphan, which returns early for any name not prefixed
+// uzi-hw- ("not ours, not named like ours: none of our business"). That early return
+// means a pod simply parked in a worker namespace under any other name is
+// enumerated, matched against nothing, and never logged — and nothing PREVENTS one
+// being parked there. The three controls that bound blast radius (default-deny
+// NetworkPolicy, PodSecurity admission, ResourceQuota) all bound what such a pod can
+// DO; none of them bound admission.
+//
+// Free here because Observe now lists pods anyway, so this costs no RBAC. It detects
+// rather than prevents, and it is noisy if anything ever legitimately lands in a
+// worker namespace — which the namespace inventory says nothing should, so the noise
+// IS the signal.
+func (m *Materializer) flagUnmanagedPod(name, ns string) {
+	m.log.Warn("unmanaged pod in a worker namespace: not stamped by this controller; flagging only, never adopting or deleting",
+		"kind", "pod", "name", name, "namespace", ns,
+		"expected_stamp", LabelManagedBy+"="+ValueManagedBy)
 }
 
 // flagOrphan logs a uzi-hw-*-named object we did not create. Never adopted, never

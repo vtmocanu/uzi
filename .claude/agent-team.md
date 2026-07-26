@@ -106,6 +106,17 @@ decides where the next person spends their time. Re-derive those too.
   different claims. Two validators can both be right and disagree, because they
   asked different questions. When two reports conflict, find the two questions
   before picking a winner.
+- **Correctness ≠ reachability — a DIFFERENT axis from presence, and the reason "write a
+  better test" does not close this class.** Asserting an attribute's *exact value* is
+  strictly stronger than asserting its presence, and **still** satisfiable while the
+  information reaches nobody: strength of assertion is orthogonal to reachability. Measured
+  2026-07-26 (PRD #113 M5): `upgrade_detail` reached the user only through a `title`
+  attribute, the detail strip rendered only for `upgrade_failed`, and `outdated` was *also*
+  an alert state — so one of the two states the nav badge counts had its entire explanation
+  in a hover: no keyboard, no touch, inconsistent for screen readers. The test asserted the
+  `title`'s exact string and passed, as it should have. **jsdom can verify an attribute is
+  correct; it cannot verify anyone can reach it.** Named by the coder who wrote the passing
+  test, about its own test.
 - **The experiment that justifies a choice usually also bounds it.** Record both
   halves, not the flattering one.
 
@@ -119,6 +130,24 @@ decides where the next person spends their time. Re-derive those too.
 - **`web/` has two `role="status"` regions** — `RateLimitAnnouncer` (app-wide,
   always-present, empty) comes first in the DOM, so any `querySelector("[role=status]")`
   silently grabs the wrong one. Selector-by-role here is ambiguous by construction.
+- **PLAIN `$?` AFTER A PIPE READS THE LAST COMMAND, NOT YOURS — and this caught FOUR agents on
+  one branch, every one of them citing this file at each other while doing it.** Simpler than the
+  `PIPESTATUS` entry below and far more common, because `cmd | head` is how everyone bounds
+  output. Measured instances, PRD #113: the lead reported `BUILD EXIT: 0` from `head` and nearly
+  told a worker its build was fine without knowing; the lead again on a `go build`; a reviewer
+  read `head`'s exit while verifying a `docker tag` claim, in a report that cites this trap; and
+  the fact-checker published **busybox tar exit 0** for both failure paths — the real answer is
+  **1** — because it piped tar's stderr through `tail`. That last one briefly contradicted a
+  correct finding.
+  **The remedy is not vigilance, it is not piping when you need the status.** Redirect to a file,
+  read `$?` on the very next line, then grep the file — which also proves the stage you care
+  about actually ran rather than that the wrapper exited 0. Where you need both the message and
+  the code, run it **twice**: once piped for the message, once clean for `$?`. The coder that did
+  exactly that said it was for readability rather than because it had the trap in mind, which is
+  the honest version — the habit protected it, not the knowledge.
+  **Why this belongs above the `PIPESTATUS` entry:** that one fails LOUDLY-ish (an empty string
+  where a number belongs). This one always yields a plausible integer, so a broken check and a
+  passing one are typographically identical.
 - **`${PIPESTATUS[0]}` IS A BASH-ISM AND THIS SHELL IS zsh — IT EXPANDS TO NOTHING,
   SILENTLY.** zsh's array is `$pipestatus` and it is **1-indexed** (`$pipestatus[1]` is the
   first command; bash's `PIPESTATUS` is 0-indexed). In zsh, `${PIPESTATUS[0]}` is simply an
@@ -241,6 +270,19 @@ Two lead-side failures worth naming because neither is a stale-read:
   returned nothing and the lead concluded the code must live somewhere it had not
   looked, then briefed two agents on it. The symbol did not exist, and its absence
   WAS the blocking defect — the inverse of "a failed grep is not evidence."
+
+**0b. WHEN A LIVE-TREE MEASUREMENT DISAGREES WITH A PINNED ONE, THE FIRST HYPOTHESIS IS
+MID-EDIT — NOT DEFECT.** The disposition half of EARLY-vs-STALE, and it is where a correct
+attribution still produces a wrong action. Measured 2026-07-26 (PRD #113 M5), by a validator
+who had done the pinning correctly: it proved two web failures were *not* the pinned SHA's
+fault, and then treated "not this SHA's fault" as "therefore someone must act" — escalating
+URGENT. The third possibility, that the tree was mid-edit between two commits of one logical
+change, was both likelier and cheaper to test than either defect hypothesis. A rerun sixty
+seconds later showed 1033/1033. **Eliminating one cause does not leave only one; enumerate
+three (this SHA, elsewhere, mid-edit) and test the cheapest first.** For EARLY the disposition
+is *re-probe*, never escalate — and confirming it costs one rerun. Three round-trips on this
+branch went to this shape, two of them the lead's, once mis-attributed to a truncated grep,
+which is the familiar trap hiding the unfamiliar one.
 
 **1. An instruction to change a file is a CLAIM about that file's current
 contents, and it EXPIRES.** Read the file before acting on any dispatch that
@@ -609,6 +651,25 @@ for the instruction nobody has written yet.
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
 compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
 
+- **A DELIVERED TASK DESCRIPTION CARRIES NEITHER ITS CURRENCY NOR ITS COMPLETION — check the
+  task's STATUS before acting on its text.** A `TaskUpdate` wakes the named idle agent, which
+  reads the description as a live assignment; the delivery says nothing about whether the
+  instruction is still true or whether it has already been carried out. Those are **two
+  different questions with two different fixes**, and this run produced both forms:
+  - **Stale** — task #14's description was written before the work it described happened, kept
+    `:198`/"both counts"/"M8 owns it" after all three were corrected, and would have had an
+    agent re-correct an already-correct doc row, the specific failure the PRD names. *Fix: put
+    a SHA or milestone in the description so its currency is checkable.*
+  - **Already-executed** — task #23 was created to dodge the staleness problem, its text was
+    accurate, and it was then re-delivered as if pending **after** being completed. Same root
+    cause, opposite symptom. *Fix: only checking status before acting catches this; no wording
+    can.*
+  Named by the agent that received both: *"'Is this instruction current?' and 'has this
+  instruction already been executed?' are two different questions, and the delivery carries
+  neither answer."* Corollary for the lead: do task-list bookkeeping **before** the dispatch,
+  or accept skipping it — an update sent to an idle agent is a dispatch whether you meant it
+  as one or not.
+
 - **AN EXECUTION ORACLE IS NOT A COVERAGE ORACLE: the log tells you a query RAN, never that anyone
   was WATCHING.** Postgres `log_statement='all'` on a throwaway container is the strongest
   instrument this repo has for "is this query exercised" — it observes execution instead of
@@ -732,8 +793,17 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   |---|---|
   | mutation addressed by LINE NUMBER, landed on a comment | address **by content**; assert the changed-line count |
   | census truncated by `head` | count with `rg -c` / `wc -l` / `--stat` and **reconcile the total against the rows shown** |
-  | pipeline broke; nothing mutated or measured | prove application with `git diff --numstat` **plus** a re-grep showing zero remaining |
+  | pipeline broke; nothing mutated or measured | prove application with `git diff --numstat` **plus** a re-grep showing zero remaining — but see the NEW-FILE caveat below, where `--numstat` is itself a blind instrument |
   | check asked the wrong QUESTION (presence, not behaviour) | assert **identity/behaviour** (`String(impl)`, `toBe(el)`, `git grep <sha>`), never presence |
+  **NEW-FILE CAVEAT, and it makes the prescribed remedy itself a blind instrument.** `git diff
+  --numstat` compares against the INDEX, so for a file created in the working tree and not yet
+  staged it reports **nothing** — the same empty output it gives when a mutation failed to apply.
+  A mutation-applied check that cannot distinguish "landed" from "never ran" is the exact defect
+  this table exists to catch, sitting inside the table's own remedy column. Measured 2026-07-26
+  (PRD #113 M2): a mutation on a newly-added `upgrade.go` "proved" itself with empty `--numstat`
+  output. Use a content hash before/after (`md5`/`shasum`) plus the one-line diff, or stage the
+  file first so `--numstat` has a baseline. Found by the coder that hit it, on a rule the lead had
+  put in its own brief.
   Before believing any verification step, ask *what would this print if it were broken?* If the
   answer matches what it prints when it passes, it is not evidence. **Naming the class buys no
   immunity:** three of the four were committed by the agents most fluent in these rules, on the
@@ -823,6 +893,18 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   been executed, and when it was, it was false** — it told the user to re-run a WRITE to
   recover data a re-run cannot return. The only mechanism that catches this class: run the
   command, then execute exactly what its output told the user to do, and assert the outcome.
+- **A COMMENT THAT JUSTIFIES A CHOICE ON ONE AXIS CROWDS OUT THE QUESTION OF WHAT ELSE THAT
+  CHOICE DECIDES.** The author-facing sibling of the per-claim rule below, and it is nastier
+  because the comment is not wrong — it is **complete-looking**. Measured 2026-07-26 (PRD #113
+  M4): a SQL clause used `IS DISTINCT FROM` and its comment carefully explained why, on the
+  NULL-handling axis, which was true. Nobody then asked what *else* raw-string comparison
+  treats as different — and the answer was SemVer build metadata, so the anchor read
+  `0.11.7+g1a2b3c4` and `0.11.7+gdeadbeef` as a version change while the classifier read them
+  as one release, re-arming a suppression window on every re-cut tag. Diagnosed by the author
+  of the comment: *"the stamp made it reachable; the unasked question is what let it ship."*
+  The screen: when a comment defends an operator or a type choice, ask **what other property
+  does this operator decide**, not merely whether the stated reason is sound. A justification
+  is an invitation to stop reading.
 - **Apply the screen PER CLAIM, not per comment block.** A verified-true sentence adjacent to
   an unverified one reads as *one continuous argument*, and the reader's guard drops after the
   part that checks out. Live example: a rigorous, correctly-cited sentence sitting four lines

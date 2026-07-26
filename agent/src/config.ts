@@ -236,7 +236,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir: env.UZI_DATA_DIR?.trim() || "/data",
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
     workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
-    version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
+    // Build-stamped by CI (`publish:agent` passes the release tag as the
+    // UZI_AGENT_VERSION build arg; the templates turn it into image ENV), so a
+    // worker's reported version IS the release it runs (PRD #113 M1).
+    //
+    // UNSET STAYS EMPTY, and that is the load-bearing half. The retired
+    // "0.1.0-m4" default made every worker report a release it had not been
+    // running since M4, and a plausible-looking SemVer is worse than no answer:
+    // the api's version compare cannot tell a frozen literal from a real report,
+    // so it would confidently classify a current worker as years behind. Empty
+    // reaches the api as NULL (pgText("") -> NULL) and classifies as `unknown`.
+    version: env.UZI_AGENT_VERSION?.trim() ?? "",
     executor: parseExecutor(env.UZI_EXECUTOR),
     stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
     // Default ON, so unset means enabled — hence the explicit check rather than

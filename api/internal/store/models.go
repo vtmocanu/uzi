@@ -445,3 +445,29 @@ type Worker struct {
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
 }
+
+type WorkerUpgradeMute struct {
+	UserID    uuid.UUID          `json:"user_id"`
+	WorkerID  uuid.UUID          `json:"worker_id"`
+	Release   string             `json:"release"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type WorkerUpgradeReport struct {
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	Phase                string             `json:"phase"`
+	PhaseSince           pgtype.Timestamptz `json:"phase_since"`
+	TargetImage          pgtype.Text        `json:"target_image"`
+	PodPhase             pgtype.Text        `json:"pod_phase"`
+	BlockingContainer    pgtype.Text        `json:"blocking_container"`
+	BlockingReason       pgtype.Text        `json:"blocking_reason"`
+	RestartCount         int32              `json:"restart_count"`
+	LastExitCode         pgtype.Int4        `json:"last_exit_code"`
+	ControllerReportedAt pgtype.Timestamptz `json:"controller_reported_at"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	UpgradingSince       pgtype.Timestamptz `json:"upgrading_since"`
+	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
+	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}

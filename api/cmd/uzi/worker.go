@@ -1,8 +1,11 @@
 package main
 
 import (
+	"strings"
+
 	"github.com/spf13/cobra"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -34,7 +37,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
-				rows = append(rows, []string{w.ID, w.Name, w.Status, strOr(w.Version, "-")})
+				rows = append(rows, []string{w.ID, w.Name, w.Status, strOr(w.Version, "-"), upgradeCell(w)})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
 			// auto-stopped run is "check the worker's version" — v0.10.1+ isolates a
@@ -43,7 +46,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// (WorkersSettings.tsx); the CLI is a first-class second consumer and did
 			// not, so the doc shipped a remedy one of its two audiences could not
 			// follow. "-" when a worker has never registered a version.
-			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION"}, rows)
+			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE"}, rows)
 		},
 	}
 
@@ -126,4 +129,32 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(list, rm, setToken)
 	return cmd
+}
+
+// upgradeCell renders a worker's upgrade status for the table (PRD #113 M5).
+//
+// Words, not symbols: this column is read by operators and by agents parsing --json's
+// sibling, and the CLI's other columns are plain words too. The api's five-state enum is
+// passed through as-is rather than re-mapped, so the CLI and the web badge can never
+// describe the same worker differently — a second vocabulary is a second thing to keep in
+// sync.
+//
+// "unknown" renders as "-" and not as the word: an unstamped local build, an unparseable
+// report and a `dev` control plane all classify unknown, and none of them is a finding.
+// Rendering it as text would put a column of "unknown" in front of every developer running
+// a local stack and train them to ignore this column.
+func upgradeCell(w apitypes.WorkerDTO) string {
+	switch w.UpgradeStatus {
+	case "", "unknown":
+		return "-"
+	case "up_to_date":
+		return "up to date"
+	case "upgrade_failed":
+		return "FAILED"
+	default:
+		// outdated | upgrading, and any state a newer api adds. Passing an unrecognized
+		// value through is deliberate: a newer server's new state should read as itself,
+		// not as "-" hiding a state this build has no opinion about.
+		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
+	}
 }
