@@ -12,6 +12,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Worker upgrade health.** Settings → Workers shows a per-worker upgrade badge, a Fleet
+  upgrade summary, and a detail strip on a worker whose upgrade failed; the Workers nav item
+  carries an alert-toned count of workers needing attention. `uzi worker list` gains an
+  `UPGRADE` column. See [docs/worker-upgrades.md](docs/worker-upgrades.md) (PRD #113).
+- **Worker images report the release they are running.** CI stamps the release tag into the
+  agent image, so a worker's reported version is the release it actually runs instead of a
+  frozen literal. An unstamped (locally built) image reports no version rather than a
+  misleading one (PRD #113).
+
 - `uzi tui`: a full-screen terminal UI — a live board of your runs, a run detail view with a per-agent lane rail and live transcript, and in-place steering (follow-up, approve/reject, cancel) and judge-review triage, all without leaving the keyboard (PRD #112).
 
 ### Changed
