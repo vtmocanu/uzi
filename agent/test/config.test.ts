@@ -26,6 +26,23 @@ describe("loadConfig workerTemplate (PRD #18)", () => {
   });
 });
 
+describe("loadConfig version (PRD #113 M1)", () => {
+  it("reports the build-stamped UZI_AGENT_VERSION", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_AGENT_VERSION: "0.11.7" })).version, "0.11.7");
+  });
+
+  it("is EMPTY when unstamped — never a fake SemVer", () => {
+    // The retired "0.1.0-m4" default is the whole point of this milestone: an
+    // unstamped image must report nothing (the api classifies it `unknown`)
+    // rather than a plausible version it is not running. An unstamped image sets
+    // the ENV to the empty ARG default, so set-but-empty is the SHIPPING case,
+    // not a corner one — both it and unset must land on "".
+    assert.strictEqual(loadConfig(baseEnv()).version, "");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_AGENT_VERSION: "" })).version, "");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_AGENT_VERSION: "   " })).version, "");
+  });
+});
+
 describe("loadConfig chat lifecycle knobs (PRD #39)", () => {
   it("applies the documented defaults when unset", () => {
     const c = loadConfig(baseEnv());

@@ -293,6 +293,19 @@ RUN printf 'uzi source baked into the worker image (PRD #39 chat)\ncommit: %s\nb
 # on the separate /nix volume.
 ENV UZI_DATA_DIR=/data
 
+# Bake the RELEASE this image was built from, so the worker's self-reported
+# `version` means something (PRD #113 M1). CI's publish:agent passes the git tag
+# (`--build-arg UZI_AGENT_VERSION=$CI_COMMIT_TAG`) and the ${...#v} strip drops a
+# leading v, so the stamped value is the bare Model-B coordinate == image tag ==
+# chart appVersion — the same normalization api/Dockerfile applies to
+# main.version. UNSET IS EMPTY, deliberately: a local or MR validation build
+# stamps nothing, the worker reports no version, and the api classifies it
+# `unknown`. That is the honest answer, and the reason the frozen "0.1.0-m4"
+# default was retired — a fake SemVer is indistinguishable from a real report.
+# MIRRORED in templates/jvm (jvm is NOT `FROM base`); keep in lockstep.
+ARG UZI_AGENT_VERSION=
+ENV UZI_AGENT_VERSION=${UZI_AGENT_VERSION#v}
+
 # Bake the template identity into the image so the worker self-reports the image
 # it was actually built from (PRD #18 register `template`). This is a HARDCODED
 # literal per template — deliberately NOT the WORKER_TEMPLATE build arg echoed

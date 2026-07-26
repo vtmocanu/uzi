@@ -61,6 +61,18 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       );
     });
 
+    it(`${name}: stamps the release into UZI_AGENT_VERSION, v-stripped, empty when unstamped (PRD #113 M1)`, () => {
+      // The worker's self-reported version is only meaningful if EVERY template
+      // carries the stamp — a template that forgets it silently reports `unknown`
+      // for a released image. jvm is NOT `FROM base`, so this is per-Dockerfile.
+      assert.match(text, /^\s*ARG\s+UZI_AGENT_VERSION=\s*$/m, `${name}/Dockerfile must declare ARG UZI_AGENT_VERSION with an EMPTY default (unstamped -> unknown, never a fake SemVer)`);
+      assert.match(
+        text,
+        /^\s*ENV\s+UZI_AGENT_VERSION=\$\{UZI_AGENT_VERSION#v\}\s*$/m,
+        `${name}/Dockerfile must bake ENV UZI_AGENT_VERSION=\${UZI_AGENT_VERSION#v} (bare Model-B coordinate, matching api/Dockerfile's main.version strip)`,
+      );
+    });
+
     it(`${name}: installs the pinned devbox binary + nix at build (PRD #18)`, () => {
       // Every template gains the provisioning stack so it works regardless of which
       // image a worker runs. Pinned build-time installs only — no floating
