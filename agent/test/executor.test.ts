@@ -15,6 +15,7 @@ import {
   type RunContext,
 } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
+import { disableAutoMaintenance } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 
 // A throwaway git worktree the stub can write its marker into and commit. No
@@ -23,6 +24,14 @@ function makeWorktree(): { path: string; cleanup: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-stub-wt-"));
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
   execFileSync("git", ["init", "-b", "main", dir], { env, stdio: "pipe" });
+  // The stub COMMITS in here, and a commit ends by spawning a detached
+  // `git maintenance run --auto` that outlives it and keeps writing inside .git —
+  // same teardown race as the repo fixture (issue #127).
+  disableAutoMaintenance(dir, env);
+  // No rmSync retry here, deliberately: disableAutoMaintenance above suppresses the only
+  // git writer in this dir (the stub's commit, executor.ts:470), and the skills-plugin dir
+  // is a sibling OUTSIDE it. A retry would guard nothing identifiable while adding up to
+  // 2750 ms of blocking sleep per stuck directory on a real failure (issue #127 review).
   return { path: dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
