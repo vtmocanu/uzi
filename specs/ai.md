@@ -11894,6 +11894,15 @@ four managers and turned an *inferred* second pnpm vector into a fact.
   for yarn *and* npm); a real Berry as the `yarn` on PATH (`YARN_IGNORE_PATH` is a yarn-1 mechanism);
   and lockfile-embedded specifiers (`git:`/`file:`/`link:`, arbitrary `resolved` URLs) plus `.npmrc`
   registry redirection.
+- **NO SINGLE ENVIRONMENT EXECUTED ALL FOUR ARMS, and yarn is the residual that matters most.**
+  This is the sharpest limit here and the easiest to miss, because the reports read as complete
+  coverage when taken together. The shipped worker image is `FROM node:22-alpine`, which carries
+  **npm and yarn 1** and no pnpm or bun (verified: the Dockerfile's `apk add` adds none of them);
+  the machine that ran the independent installer validation had **npm, pnpm and bun** and no yarn.
+  So the manager the shipped image actually uses is the one arm never executed end-to-end by a
+  validator — two partial coverages, not one complete one. What does hold for yarn: the argv **and**
+  `YARN_IGNORE_PATH` are pinned by a mutation-folded test, and the `yarnPath` probes were run inside
+  the pinned `node:22-alpine` by other agents.
 - **`--ignore-scripts` bounds what runs at install time, not what the install PLACES on disk.**
   Attacker-chosen code landing in `node_modules` executes when the agent later runs a gate. Not a
   *new* exposure — the repo's own test files already execute under the same uid — but a different
@@ -12016,6 +12025,17 @@ Serves human: "the deterministic *command not found* scan feeds the judge as an 
   shell transcript does this, and uzi's own repo has a CLI with docs. The channel also unlocks only
   for a runner in executable position with `run` as its next token, so `grep "npm run" Makefile`
   does not open it for grep's output.
+- **🔴 THE WRAPPED ARM HAS NO INFERENCE FALLBACK, AND THAT BOUNDS HOW MUCH OF THE MOTIVATING BUG
+  M3 FIXES.** A green `npm run typecheck` marks **`npm`** green, never `tsc`: the only thing that
+  attributes the wrapped tool is the package manager's echo (`> tsc --noEmit`) *surviving into the
+  captured `tool_result`*, and nothing anywhere infers the inner tool from "the wrapper ran green".
+  Verified by reading `observedTools`: it returns `executablesIn(command)` plus, only for a
+  script-runner invocation, `scriptEchoTools(toolResultText(payload))`. Measured both ways — the same
+  trace with real npm output suppresses `tsc`, and with an empty `tool_result` does not. So a run
+  whose npm output was truncated, suppressed or captured empty keeps its false missing-tool flag.
+  Deliberate (the alternative is inferring an execution nobody observed), and the PRD's original
+  wording — "an `npm run <script>` … that wraps it" — read as though the wrapping alone sufficed,
+  which is the belief this bullet exists to stop.
 - **A same-result veto**, checked against **that** payload: an exit-0 `npm run lint` whose output
   says `eslint: not found` is not evidence eslint ran.
 - **LATEST green seq wins, not earliest.** `suppressResolved` asks an existential ("is there a green
