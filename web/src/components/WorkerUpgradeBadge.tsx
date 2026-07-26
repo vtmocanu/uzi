@@ -91,8 +91,19 @@ export function likelyCause(container: string | null, reason: string | null, las
     // asserted a permissions error as the cause, which is false as a rule: under
     // `set -eu -o pipefail` the tar pipeline is the only failing step, so ENOSPC on the
     // /nix PVC produces the IDENTICAL (seed-nix, CrashLoopBackOff) pair — and the store is
-    // ~1.7 GB, so that is not a remote possibility. The exit code is what separates them,
-    // which is why it is named rather than guessed at.
+    // ~1.7 GB, so that is not a remote possibility.
+    //
+    // AND THE EXIT CODE DOES NOT SEPARATE THEM, which is what this comment claimed next.
+    // Measured in the worker base image (node:22-alpine@sha256:16e22a55…, `apk add tar` →
+    // GNU tar 1.35, extracting as uid 10001): permission denied gives "Cannot open:
+    // Permission denied", ENOSPC gives "Wrote only 8704 of 10240 bytes", and BOTH exit 2 —
+    // GNU tar uses 2 for every fatal error. (Busybox tar, if GNU tar were ever absent,
+    // exits 1 for both; the conclusion does not depend on which one runs.) What separates
+    // them is tar's stderr LINE, which is exactly what this architecture refuses to carry:
+    // pods/log is not offered and k8s `message` is never forwarded.
+    //
+    // So the string below names both causes and reports the code as a fact to quote into a
+    // bug report — it must not be reworded into a claim that the code chooses between them.
     const code = typeof lastExitCode === "number" ? ` Its last exit code was ${lastExitCode}.` : "";
     return `The nix store reseed is failing. Two causes produce this exact signature: a permissions error unpacking the store (the shape of the v0.11.0 incident), or the /nix volume running out of space.${code}`;
   }
@@ -201,11 +212,23 @@ export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
                 complete. Wrapping keeps both halves. */}
             <code className="break-all text-faint">{diagnosticsCommand(worker.id)}</code>
           </div>
-          {/* The substitution instruction. Without it the placeholder is a trap: a user
-              pastes the command verbatim and kubectl answers "No resources found", which
-              reads as "the worker is gone" rather than "fill in the namespace". MEASURED
-              on dev-cluster: the hosted worker from the motivating incident lives in the
-              DOCKER namespace, not the default one, so guessing is not an option either. */}
+          {/* The substitution instruction. Without it the placeholder is a trap — though not
+              the trap this comment first described. Pasted into a shell the command never
+              reaches kubectl at all: `<` and `>` are REDIRECTION OPERATORS, so bash and zsh
+              both abort with "worker-namespace: No such file or directory" (exit 1, measured
+              in both; no stray output file is created either, since the failed input
+              redirection aborts before the output one). Loud and confusing, but it does say
+              "you left something unsubstituted".
+
+              The dangerous case is the substituted-but-WRONG namespace: kubectl accepts it,
+              exits 0, and answers "No resources found", which reads as "the worker is gone".
+              MEASURED on dev-cluster: the hosted worker from the motivating incident lives
+              in the DOCKER namespace, not the default one, so guessing is not an option.
+
+              DO NOT "fix" this by quoting the placeholder in diagnosticsCommand. kubectl
+              does NOT reject `<worker-namespace>` for violating RFC 1123 — it exits 0 with
+              "No resources found", so quoting converts the loud failure into the silent one
+              this very paragraph warns about. */}
           <p className="mt-1 text-faint">
             Replace <code>&lt;worker-namespace&gt;</code> with the namespace this worker runs in — the docker-capable
             tier uses a separate one.

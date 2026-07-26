@@ -399,7 +399,7 @@ uzi worker set-token <worker-id> --default     # clear the binding
 
 | value | meaning |
 |---|---|
-| `up to date` | the worker runs the release it is targeted at |
+| `up to date` | the worker runs the release it is targeted at, or a newer one |
 | `outdated` | it runs an older release, and nothing is currently rolling it |
 | `upgrading` | a roll is in progress; expected and transient |
 | `FAILED` | it tried to take a new release and could not — this is the one to act on |

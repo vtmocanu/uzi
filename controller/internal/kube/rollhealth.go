@@ -152,8 +152,10 @@ func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconci
 	default:
 		health.Phase = protocol.PhaseRolling
 	}
-	// Both non-settled phases date from the same place, and it is NOT the moment the
-	// phase began — see the PhaseSince note on reconcile.RollHealth. A stateless
+	// Both non-settled phases REACHED HERE date from the same place, and it is NOT the
+	// moment the phase began — see the PhaseSince note on reconcile.RollHealth. The two
+	// early returns above are the exception and stay that way: `rolling` with no current
+	// pod carries NO timestamp, because there is nothing to date it from. A stateless
 	// controller has no memory of the transition, so the pod's creation is the only
 	// timestamp available. It is EARLIER than the event the field name implies, so any
 	// consumer computing `now - PhaseSince` overestimates the duration and any threshold
