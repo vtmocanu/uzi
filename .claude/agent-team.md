@@ -242,6 +242,19 @@ Two lead-side failures worth naming because neither is a stale-read:
   looked, then briefed two agents on it. The symbol did not exist, and its absence
   WAS the blocking defect — the inverse of "a failed grep is not evidence."
 
+**0b. WHEN A LIVE-TREE MEASUREMENT DISAGREES WITH A PINNED ONE, THE FIRST HYPOTHESIS IS
+MID-EDIT — NOT DEFECT.** The disposition half of EARLY-vs-STALE, and it is where a correct
+attribution still produces a wrong action. Measured 2026-07-26 (PRD #113 M5), by a validator
+who had done the pinning correctly: it proved two web failures were *not* the pinned SHA's
+fault, and then treated "not this SHA's fault" as "therefore someone must act" — escalating
+URGENT. The third possibility, that the tree was mid-edit between two commits of one logical
+change, was both likelier and cheaper to test than either defect hypothesis. A rerun sixty
+seconds later showed 1033/1033. **Eliminating one cause does not leave only one; enumerate
+three (this SHA, elsewhere, mid-edit) and test the cheapest first.** For EARLY the disposition
+is *re-probe*, never escalate — and confirming it costs one rerun. Three round-trips on this
+branch went to this shape, two of them the lead's, once mis-attributed to a truncated grep,
+which is the familiar trap hiding the unfamiliar one.
+
 **1. An instruction to change a file is a CLAIM about that file's current
 contents, and it EXPIRES.** Read the file before acting on any dispatch that
 quotes it, names a line number, or says a fix "did not land". Evidence:
