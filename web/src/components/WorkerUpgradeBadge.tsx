@@ -147,6 +147,20 @@ export function likelyCause(container: string | null, reason: string | null, las
  * The namespace is NOT guessed. A docker-tier worker lives in a different namespace, and a
  * command naming the wrong one fails in a way that looks like the worker is gone — so the
  * placeholder is explicit and the copy says to fill it in.
+ *
+ * NO PLACEHOLDER CAN ANNOUNCE ITSELF, so do not go looking for a better one. kubectl does
+ * not validate a namespace argument against RFC 1123 before querying: measured against a
+ * real cluster, `-n '<worker-namespace>'` exits 0 with "No resources found", so every
+ * candidate spelling — `<worker-namespace>`, `NAMESPACE`, `__FILL_ME_IN__` — reaches the
+ * api server and comes back empty and cheerful. The only reason the current form fails
+ * loudly is an accident of shell syntax (`<`/`>` are redirections, so a paste never
+ * execs), which means the SUBSTITUTION REMINDER lives in the copy below and nowhere else.
+ * Changing the placeholder without changing that copy silently removes the only warning.
+ *
+ * The way out is to stop needing a placeholder: the controller knows each worker's
+ * namespace (it groups pods by it in observeNamespace) and could carry it on the wire.
+ * Deliberately not done here — it reopens the M3/M4 protocol contract, both goldens and
+ * the audit surface for a display string. See the MR description.
  */
 export function diagnosticsCommand(workerId: string): string {
   return `kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=${workerId}`;
