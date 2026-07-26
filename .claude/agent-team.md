@@ -130,6 +130,29 @@ decides where the next person spends their time. Re-derive those too.
 - **`web/` has two `role="status"` regions** — `RateLimitAnnouncer` (app-wide,
   always-present, empty) comes first in the DOM, so any `querySelector("[role=status]")`
   silently grabs the wrong one. Selector-by-role here is ambiguous by construction.
+- **A CHECK PASSES BECAUSE THE CASE YOU CHOSE IS ONE WHERE BROKEN AND CORRECT AGREE — the umbrella
+  class, and it is distinct from everything else here because every instrument already mandated
+  reports green for the right reasons.** The positive control passes, the mutation applied, the
+  tree changed, the assertion executed — and the result is still worthless, because the *input*
+  was one both implementations handle identically. Measured five times on PRD #113, none of them
+  PRD-specific:
+  - `Compare("0.11.7","0.11.7") = 0` is the right answer from a broken version comparison, so an
+    all-current fixture set certifies a classifier that never normalizes. The discriminating
+    fixture is one that is genuinely *behind*.
+  - a single-tick roll-health test passes against a drift-driven implementation, because the
+    broken version is **correct on tick one**. Two ticks discriminate.
+  - a negative RBAC assertion ("no verb beyond `list` was issued") passes trivially on a build
+    that never calls pods at all. The positive half is what has content.
+  - a semver probe fed `v`-prefixed inputs — the case the *design* assumed — cannot discover that
+    the assumption is the bug. Diagnosed by its author: *"a probe that feeds the code the inputs
+    your design assumes cannot discover that the assumption is the bug."*
+  - a shell test written with double quotes expanded at assignment time, measuring nothing about
+    the literal-string case it was written to settle.
+  **The screen is one question, asked of the INPUT rather than the instrument:** *is there a
+  version of this code that is wrong and would still pass on the case I picked?* If yes, pick a
+  different case. Note this is not "add a control" — a control aimed at the wrong failure is
+  itself decoration; the control has to be aimed at the specific way *this* check could pass
+  vacuously, which is usually different per test.
 - **PLAIN `$?` AFTER A PIPE READS THE LAST COMMAND, NOT YOURS — and this caught FOUR agents on
   one branch, every one of them citing this file at each other while doing it.** Simpler than the
   `PIPESTATUS` entry below and far more common, because `cmd | head` is how everyone bounds

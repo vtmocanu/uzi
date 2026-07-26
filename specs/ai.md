@@ -11044,7 +11044,7 @@ skills", and the user decided two things directly — **patch the issue descript
 merge**, and **let autopilot move PRDs to `done/` unattended** — then ratified the
 exposure that combination creates (*"allow it, we review the MR by human anyway"*).
 Everything else below is an AI design decision inside those constraints. Design
-record: `prds/72-prd-lifecycle-in-run.md` (fifteen Decisions, with the adversarial
+record: `prds/done/72-prd-lifecycle-in-run.md` (fifteen Decisions, with the adversarial
 review that forced five of them).
 
 **Read §384 first if you are rebuilding this.** The headline behaviour — an agent
@@ -11718,3 +11718,50 @@ Recorded as a decision rather than left to read as an omission, following §364'
 See [prds/113-worker-upgrade-status.md](../prds/113-worker-upgrade-status.md) for the Decision Log and
 the amendments each of these sections distils, and [docs/worker-upgrades.md](../docs/worker-upgrades.md)
 for the operator-facing meaning of each state.
+
+## 396. Three claims in §389 and §392 were disproved by live validation, and one of them had three copies
+
+Recorded as a correction rather than by rewriting those sections, because §387-§395 were written
+before the feature had ever run on a cluster and the record of *what was believed then* is worth
+keeping beside what was measured. All three were stated as fact; all three now have a measurement.
+
+- **§392 said the real incident "fires on the reason arm within about two minutes."** MEASURED
+  2026-07-26 at 2s resolution on 0.11.8: first `stuck` at **37 seconds** from pod creation. Wrong
+  by ~3x, in the safe direction — the conclusion it supports ("which is why the age arm can be
+  generous") holds, and is now measured rather than assumed. The same overstatement was in
+  `rollhealth.go`'s `stuckAge` comment and is corrected there.
+
+- **§392 described the restart-count arm as being for "a container that flickers through
+  `Running`."** That case is real and was reproduced — but the arm **also carries the motivating
+  incident**, which the description does not say. A fast-failing `seed-nix` alternates between
+  `waiting:CrashLoopBackOff` and `terminated:Error`; `Error` is **not** in `blockingReasons`;
+  measured steady-state split **71% / 29%**. On every `Error` tick the reason arm is silent and
+  only `restartCount >= 3` holds the verdict. **So raising or dropping that threshold makes PRD
+  #113's own motivating incident flicker indefinitely** — a consequence nobody derived while the
+  constant was labelled "reasoned, not measured". Corrected in the `stuckRestartThreshold` comment.
+
+- **§389 said the register-convergence grace surfaces "a pod that is container-Ready with a
+  crash-looping agent inside."** It does not. R3 additionally requires `isBehind()`, and a
+  crash-looping agent re-registers at the **current** release on every start, so it is never behind
+  and R3 never fires — the row falls through to `up_to_date`. **This claim existed in three places**:
+  here, in `RegisterConvergenceGrace`'s doc comment, and implicitly in the belief that the case was
+  covered at all. The underlying gap is real and tracked as issue #145: the controller reports
+  `settled` on `Ready` alone, and the shipped worker container has **no readiness probe**, so
+  `Ready` means "the process started" rather than "the agent works". That report also blanks
+  `blocking_container` / `restart_count` / `last_exit_code`, and the upsert overwrites them, so a
+  worker with 5 restarts and exit 1 persists as pristine.
+
+**§389's "the value is reasoned, not measured" about `MaxUpgradingWindow` stands and must stay.**
+Live validation produced n=1 (87s, of which **70.7s was a cold image pull** — the window sizes pull
+latency, not the `/nix` reseed the incident makes you expect). The cold-reseed tail is still
+unmeasured because a fresh 4 Gi `storage-class` PVC never bound (`ExternalProvisioning` x26 over 10m on
+hypervisor CSI). Replacing an honest placeholder with a number derived from one sample would be a
+regression, not progress. The enforced floor is `ControllerStuckAge + 1m` = 11m and is real.
+
+**What live validation CONFIRMED in those sections:** `pods: list` only with no `get`/`watch`
+(`auth can-i` matrix against the deployed ServiceAccount); the age arm as the fallback for
+`Pending`/`FailedScheduling` with no container to carry a reason; the server-stamped `observed_at`
+being genuinely distinct from the wire's `controller_reported_at` (measured 0.5ms apart on one row);
+and a pod-read failure being logged and swallowed rather than fatal — the first reconcile after
+rollout failed its poll and the controller retried on the next tick instead of dying, which is A-1's
+fix working in production.
