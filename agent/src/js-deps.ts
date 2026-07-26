@@ -28,10 +28,10 @@
 // (migration 00047) holds devbox `init_hook`s to. Dropping it breaks that reasoning and
 // makes auto-install opt-in. Do not "improve" it.
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { runnerCommand } from "./runner-uid.js";
+import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 
 /** The package managers whose lockfile we recognize. */
 export type JsPackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -136,7 +136,16 @@ export interface InstallCommand {
   cwd: string;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
+  /** Aborts this install (PRD #121 M2). Provisioning is kicked off concurrently with
+   *  the plan turn, so a run that ends without ever reaching the implement phase — a
+   *  rejected plan, a cancel — must be able to reclaim the subprocess instead of
+   *  blocking teardown on it for the full timeout. */
+  signal?: AbortSignal;
 }
+
+/** The `detail` an install reports when it was aborted rather than run to a verdict.
+ *  Distinguished from a genuine failure so a log never reads a cancel as npm erroring. */
+const DETAIL_CANCELLED = "cancelled";
 
 /** The exec boundary. Injectable so tests drive the composition without spawning a real
  *  package manager or touching a registry. Resolves — never rejects — in the default
@@ -221,11 +230,14 @@ export async function discoverJsProjects(rootPath: string): Promise<JsProject[]>
  * @param env      the SCRUBBED replacement env for the subprocess (buildCheckEnv) — never
  *                 a `process.env` spread; the worker's join token must be absent by
  *                 construction.
+ * @param opts.signal aborts the sweep: the in-flight install is killed and every dir not
+ *                 yet reached is reported cancelled. Cancelling is still a normal return,
+ *                 never a throw — the caller gets the partial results.
  */
 export async function installJsDeps(
   rootPath: string,
   env: NodeJS.ProcessEnv,
-  opts: { timeoutMs?: number; exec?: InstallExec } = {},
+  opts: { timeoutMs?: number; exec?: InstallExec; signal?: AbortSignal } = {},
 ): Promise<JsDepsResult[]> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
   const exec = opts.exec ?? execInstall;
@@ -260,10 +272,16 @@ export async function installJsDeps(
     const cwd = project.dir === "." ? rootPath : join(rootPath, project.dir);
 
     let outcome: { ok: boolean; detail: string };
-    try {
-      outcome = await exec({ command: wrapped.command, args: wrapped.args, cwd, env, timeoutMs });
-    } catch (err) {
-      outcome = { ok: false, detail: `could not run: ${errText(err)}` };
+    if (opts.signal?.aborted) {
+      // Already cancelled: report the remaining dirs honestly instead of spawning
+      // installs whose result nobody will wait for.
+      outcome = { ok: false, detail: DETAIL_CANCELLED };
+    } else {
+      try {
+        outcome = await exec({ command: wrapped.command, args: wrapped.args, cwd, env, timeoutMs, signal: opts.signal });
+      } catch (err) {
+        outcome = { ok: false, detail: `could not run: ${errText(err)}` };
+      }
     }
 
     results.push({
@@ -272,7 +290,9 @@ export async function installJsDeps(
       ok: outcome.ok,
       detail: outcome.ok
         ? `${label} ok`
-        : `${label} failed (${outcome.detail}) — node_modules absent, gates skip honestly`,
+        : outcome.detail === DETAIL_CANCELLED
+          ? `${label} cancelled — node_modules absent`
+          : `${label} failed (${outcome.detail}) — node_modules absent, gates skip honestly`,
     });
   }
   return results;
@@ -287,36 +307,73 @@ export function depsReadyFor(results: readonly JsDepsResult[], dir: string): boo
 }
 
 /**
- * The default exec boundary: `execFile` under the caller's env and wall-clock cap.
- * Captures ONLY the exit status, never the (potentially secret-bearing) output — the
- * run-message redactor does not cover a third-party install's stdout, so none of it is
- * allowed anywhere near a log or an MR. Same discipline as `defaultCheckRunner`.
+ * The default exec boundary: `spawn` under the caller's env, with a wall-clock cap and
+ * cancellation. Reports ONLY how the process ended — never its output, which is not
+ * captured at all (`stdio: "ignore"`). That is deliberate and structural rather than
+ * disciplinary: the run-message redactor does not cover a third-party install's stdout,
+ * so the safest place for it is nowhere.
+ *
+ * `spawn` rather than `execFile`, for two reasons that both come back to the uid split:
+ *
+ *  - `detached: true` makes the child a process-GROUP leader. That is the shape
+ *    `killRunnerGroup` documents, and it is what lets a kill reach any grandchild the
+ *    package manager spawned. `execFile` does NOT forward `detached` to spawn (it copies
+ *    a fixed subset of options), so the flag would have been silently dropped there.
+ *  - Cancellation must NOT go through a plain `child.kill()` — from the WORKER that is
+ *    EPERM against a process running as `runner`, the same wall `killRunnerGroup` exists
+ *    to cross (runner-uid.ts). It would fail silently and leave the install running. Both
+ *    the abort path and the timeout path therefore route through `killRunnerGroup`, which
+ *    reuids via setpriv under the split and signals directly on a #58 single-uid start.
  */
 export const execInstall: InstallExec = (cmd) =>
   new Promise((resolve) => {
-    execFile(
-      cmd.command,
-      cmd.args,
-      { cwd: cmd.cwd, env: cmd.env, timeout: cmd.timeoutMs, maxBuffer: 1 << 20 },
-      (error) => {
-        if (!error) {
-          resolve({ ok: true, detail: "exit 0" });
-          return;
-        }
-        // execFile's error carries `code` as the ENOENT-style string on a spawn failure,
-        // or the numeric exit status when the command ran and exited non-zero.
-        const e = error as Error & { code?: string | number; killed?: boolean };
-        if (e.code === "ENOENT") {
-          resolve({ ok: false, detail: "package manager not available in the worker" });
-          return;
-        }
-        if (e.killed) {
-          resolve({ ok: false, detail: "timed out" });
-          return;
-        }
-        resolve({ ok: false, detail: typeof e.code === "number" ? `exit ${e.code}` : "failed" });
-      },
-    );
+    let cancelled = false;
+    let timedOut = false;
+    let settled = false;
+    const child = spawn(cmd.command, cmd.args, {
+      cwd: cmd.cwd,
+      env: cmd.env,
+      detached: true,
+      stdio: "ignore",
+    });
+    const onAbort = (): void => {
+      cancelled = true;
+      killRunnerGroup(child.pid);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killRunnerGroup(child.pid);
+    }, cmd.timeoutMs);
+    // The live child keeps the loop alive on its own; an un-unref'd timer would keep it
+    // alive for the FULL cap even after the install finished early.
+    timer.unref();
+    const done = (r: { ok: boolean; detail: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cmd.signal?.removeEventListener("abort", onAbort);
+      resolve(r);
+    };
+
+    child.on("error", (err) => {
+      // A spawn failure: the package manager is not on the runner's PATH.
+      const code = (err as NodeJS.ErrnoException).code;
+      done({ ok: false, detail: code === "ENOENT" ? "package manager not available in the worker" : "failed" });
+    });
+    child.on("close", (code, signalName) => {
+      // A cancelled or timed-out install has no verdict — say so, never invent an exit
+      // code from the signal that killed it.
+      if (cancelled) return done({ ok: false, detail: DETAIL_CANCELLED });
+      if (timedOut) return done({ ok: false, detail: "timed out" });
+      if (code === 0) return done({ ok: true, detail: "exit 0" });
+      if (code === null) return done({ ok: false, detail: `killed (${signalName})` });
+      done({ ok: false, detail: `exit ${code}` });
+    });
+
+    if (cmd.signal) {
+      if (cmd.signal.aborted) onAbort();
+      else cmd.signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 
 /** True when the dir declares a workspace layout: a `workspaces` field in package.json

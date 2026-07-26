@@ -2,7 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   depsReadyFor,
@@ -256,6 +257,24 @@ describe("execInstall (the real exec boundary): status only, output never", () =
     assert.deepEqual(r, { ok: false, detail: "timed out" });
   });
 
+  it("reports an aborted install as `cancelled`, not as an invented exit code", async () => {
+    const ac = new AbortController();
+    const p = execInstall({ ...base, command: "sh", args: ["-c", "sleep 30"], signal: ac.signal });
+    setTimeout(() => ac.abort(), 50);
+    const started = Date.now();
+    const r = await p;
+    assert.deepEqual(r, { ok: false, detail: "cancelled" });
+    // The point of aborting is NOT waiting out the wall-clock cap.
+    assert.ok(Date.now() - started < 4000, "an aborted install must return promptly, not run to its timeout");
+  });
+
+  it("returns immediately when the signal is ALREADY aborted at spawn time", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const r = await execInstall({ ...base, command: "sh", args: ["-c", "sleep 30"], signal: ac.signal });
+    assert.deepEqual(r, { ok: false, detail: "cancelled" });
+  });
+
   it("captures ONLY the exit status — install output never reaches the result", async () => {
     const secret = "sk-ant-api03-NEVER-IN-A-LOG";
     const r = await execInstall({
@@ -336,6 +355,29 @@ describe("discoverJsProjects: the search is BOUNDED (a huge repo must not melt t
   });
 });
 
+// PRD #121 M2 collapsed self-improve's hardcoded `["web", "agent"]` dir list into this
+// discovery. A self_improve run clones THIS repo, and SELF_IMPROVE_CHECKS pre-flight on
+// `web/node_modules` and `agent/node_modules` — so if discovery ever stops resolving
+// those two dirs, every npm check in a self-improvement MR silently reports "skipped"
+// instead of running. Asserted as a SUPERSET (never an exact roster), so adding a new JS
+// dir to the repo is free; what must not change silently is these two disappearing.
+describe("discoverJsProjects over uzi's own repo (the self-improve path depends on this)", () => {
+  it("resolves web/ and agent/ as npm projects", async () => {
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const projects = await discoverJsProjects(repoRoot);
+    const byDir = new Map(projects.map((p) => [p.dir, p]));
+    for (const dir of ["web", "agent"]) {
+      const p = byDir.get(dir);
+      assert.ok(p, `${dir}/ must still be discovered — self-improve's npm checks pre-flight on its node_modules`);
+      assert.equal(p.manager, "npm", `${dir}/ must resolve to npm (its lockfile is package-lock.json)`);
+    }
+    // A root install would NOT create web/node_modules + agent/node_modules the way the
+    // per-dir installs do, so a root package.json appearing here is a real regression
+    // for the self-improve checks, not a cosmetic change.
+    assert.ok(!byDir.has("."), "the repo root has no package.json; a root install would not satisfy the per-dir checks");
+  });
+});
+
 describe("installJsDeps: the sandbox is UNCHANGED (runner uid + the caller's scrubbed env)", () => {
   it("wraps the install in the setpriv → runner argv when the uid split is active", async () => {
     const root = mkClone({ "package.json": PKG, "package-lock.json": "" });
@@ -383,6 +425,36 @@ describe("installJsDeps: the sandbox is UNCHANGED (runner uid + the caller's scr
     } finally {
       if (prevToken === undefined) delete process.env.UZI_WORKER_TOKEN;
       else process.env.UZI_WORKER_TOKEN = prevToken;
+    }
+  });
+
+  it("threads the abort signal to the exec boundary and skips the dirs it never reached", async () => {
+    const root = mkClone({
+      "a/package.json": PKG,
+      "a/package-lock.json": "",
+      "b/package.json": PKG,
+      "b/package-lock.json": "",
+    });
+    const ac = new AbortController();
+    const seen: (AbortSignal | undefined)[] = [];
+    // The first dir observes the signal and aborts mid-sweep; the second must then be
+    // reported cancelled without ever being spawned.
+    let spawns = 0;
+    const exec: InstallExec = async (cmd) => {
+      spawns++;
+      seen.push(cmd.signal);
+      ac.abort();
+      return { ok: false, detail: "cancelled" };
+    };
+    const results = await installJsDeps(root, {}, { exec, signal: ac.signal });
+
+    assert.equal(spawns, 1, "the dir after the abort must not be spawned");
+    assert.equal(seen[0], ac.signal, "the exec boundary must receive the caller's signal");
+    assert.equal(results.length, 2, "every discovered dir is still reported");
+    for (const r of results) {
+      assert.equal(r.ok, false);
+      assert.match(r.detail, /cancelled — node_modules absent/);
+      assert.ok(!/failed \(/.test(r.detail), "a cancel must not be reported as an install failure");
     }
   });
 
