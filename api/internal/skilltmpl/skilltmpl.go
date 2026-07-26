@@ -68,6 +68,8 @@ func init() {
 		builtins = append(builtins, def)
 	}
 	sort.Slice(builtins, func(i, j int) bool { return builtins[i].Name < builtins[j].Name })
+	// Must run AFTER the parse loop above — it reads `builtins` (allocations.go).
+	validateDefaultAllocations()
 }
 
 // Builtins returns the embedded builtin skills, sorted by name. The returned

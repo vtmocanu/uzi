@@ -1,5 +1,7 @@
 package skilltmpl
 
+import "fmt"
+
 // Default allocations for builtin skills (PRD #72 M2).
 //
 // An allocation is what makes a skill reachable AT ALL. `ListRunSkillAllocations`
@@ -28,6 +30,47 @@ var defaultAllocations = map[string][]string{
 	// reconciler seeds only on FIRST insert and this row already exists
 	// everywhere — keep the two in sync by hand; SQL cannot read this map.
 	"ci-cd-norms": {"coder", "reviewer"},
+}
+
+// The KEYS must name shipped builtin skills, and this is enforced at package
+// init — a panic, matching what this package already does for a builtin whose
+// SKILL.md fails to parse or whose directory disagrees with its frontmatter name.
+// The map is compile-time data, so this can only fire on a build where a
+// developer made the mistake; it cannot depend on runtime state, and it fails
+// identically in CI, in tests, and at boot.
+//
+// It matters exactly one milestone out. PRD #72 M3 must add
+// `builtins/prd-lifecycle/SKILL.md` and its map entry IN THE SAME COMMIT. With
+// only a test guarding this, splitting them across commits would leave an entry
+// that silently never fires — the failure mode this whole milestone exists to
+// remove. With the panic, the split does not boot, which is the loud version.
+//
+// The VALUES cannot be checked here: agent-template names live in `agenttmpl`,
+// and importing it would add a production dependency to this package purely to
+// catch a developer error. They are pinned by a package-external test instead
+// (allocations_test.go), where the import costs nothing, backed at runtime by
+// the reconciler's zero-row warning — which is also the only layer that can see
+// a template an ADMIN deleted.
+// Called from skilltmpl.go's init AFTER the builtins are parsed. NOT its own
+// init(): Go runs a package's init functions in FILENAME order, and
+// allocations.go sorts before skilltmpl.go — so an init() here would read an
+// empty `builtins` and panic on a perfectly healthy tree. (Measured, not
+// reasoned: that is exactly what the first version of this check did.)
+func validateDefaultAllocations() {
+	shipped := make(map[string]bool, len(builtins))
+	for _, d := range builtins {
+		shipped[d.Name] = true
+	}
+	for name, targets := range defaultAllocations {
+		if !shipped[name] {
+			panic(fmt.Sprintf(
+				"skilltmpl: defaultAllocations names %q, which is not a shipped builtin skill "+
+					"(add builtins/%s/SKILL.md in the same commit as the map entry, or drop the entry)", name, name))
+		}
+		if len(targets) == 0 {
+			panic(fmt.Sprintf("skilltmpl: defaultAllocations[%q] has no target templates; drop the entry instead", name))
+		}
+	}
 }
 
 // DefaultAllocationsFor returns the agent-template names a builtin skill is
