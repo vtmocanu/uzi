@@ -28,7 +28,11 @@ function makeWorktree(): { path: string; cleanup: () => void } {
   // `git maintenance run --auto` that outlives it and keeps writing inside .git —
   // same teardown race as the repo fixture (issue #127).
   disableAutoMaintenance(dir, env);
-  return { path: dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }) };
+  // No rmSync retry here, deliberately: disableAutoMaintenance above suppresses the only
+  // git writer in this dir (the stub's commit, executor.ts:470), and the skills-plugin dir
+  // is a sibling OUTSIDE it. A retry would guard nothing identifiable while adding up to
+  // 2750 ms of blocking sleep per stuck directory on a real failure (issue #127 review).
+  return { path: dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emitted: EmittedMessage[] } {

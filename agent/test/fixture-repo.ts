@@ -85,14 +85,37 @@ export function makeFixture(files: Record<string, string> = {}): Fixture {
     dataDir,
     cleanup() {
       // BELT-AND-BRACES, not the fix (issue #127). The fix is disableAutoMaintenance
-      // above, which stops any detached git process existing in `origin` at all. The
-      // retry covers what the fixture CANNOT pre-configure: the repos the code under
-      // test creates under `dataDir` (the worker bare + the runner clone), which also
-      // live inside `base` and whose own commit/fetch/push each spawn a detached
-      // `git maintenance` — three of them back to back just before a run returns.
-      // Retries alone would have been the wrong sole fix: they hide the leak instead
-      // of removing it, and a process outliving its test can also race the NEXT
-      // fixture. maxRetries*retryDelay is the ceiling (Node backs off linearly).
+      // above, which stops any detached git process existing in `origin` at all —
+      // measured over a full suite run: 68 detached maintenance children inside the
+      // fixture origin before, 0 after, including all 32 spawned by the `receive-pack`
+      // of a push (the exposure the CI failure named: `rmdir '.../origin/.git'`).
+      //
+      // The retry covers the repos PRODUCT CODE creates under `dataDir` (worker bare +
+      // runner clone), which live inside `base` and still spawn ~115 of their own per
+      // run. Note precisely why it is a retry and not more config: those repos ARE
+      // reachable — `gitEnv()` passes `process.env.GIT_CONFIG_GLOBAL` straight through
+      // (`agent/src/git.ts:576`), and exporting one pointing at these settings takes
+      // 115 -> 8, measured. It is not taken because doing so stops the integration
+      // tests exercising gitEnv's PRODUCTION `/dev/null` default, and
+      // `test/git-hardening.test.ts:49-65` deliberately mutates that var. That fidelity
+      // cost, not impossibility, is the reason. (The GIT_CONFIG_COUNT/KEY_n route does
+      // NOT work at all: gitEnv builds a replacement env and resets the count from 0,
+      // `git.ts:602-609`.)
+      //
+      // WHAT THE RETRY ACTUALLY BUYS, measured rather than assumed — Node's rimraf
+      // sweeps a directory's children ONCE, then loops `rmdirSync(path)` alone; it never
+      // re-scans. So it rescues only entries that REMOVE THEMSELVES: `maintenance.lock`
+      // (git unlinks it) is recovered at ~515 ms where 0 retries fails instantly. For a
+      // PERSISTENT entry — `gc.log`/`gc.pid`, which git leaves on purpose and which is
+      // this issue's own hypothesis for the error naming `.git` itself — retrying cannot
+      // help and merely converts a 216 ms failure into a 3020 ms one. Per directory, on
+      // a blocking sleep.
+      //
+      // Retries alone would have been the wrong sole fix regardless: they hide the leak
+      // instead of removing it, and a process outliving its test can race the NEXT
+      // fixture. CEILING: Node sleeps i*retryDelay for i=1..maxRetries, so 50 x 55 =
+      // 2750 ms per stuck directory — NOT maxRetries*retryDelay, and a linear back-off
+      // cannot have a product ceiling. A tree stuck at several levels multiplies it.
       fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     },
   };
