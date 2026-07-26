@@ -11,6 +11,11 @@ vi.mock("../lib/api", async (importActual) => {
     ...actual,
     api: {
       listWorkers: vi.fn(),
+      // The page states the fleet's target release from the same GET /api/version the
+      // footer uses (PRD #113 M5), so mounting it now touches this. Resolving "" is the
+      // honest default here: these tests assert on gauges and rows, and an unstamped
+      // control plane is exactly what a local build looks like.
+      version: vi.fn().mockResolvedValue({ version: "" }),
       // The page reads the user's tokens alongside the workers (PRD #104 M6) to
       // populate the per-row token picker.
       listSecrets: vi.fn(),
@@ -72,6 +77,9 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     version: "0.4.2",
     upgrade_status: "up_to_date",
     upgrade_detail: null,
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
     last_heartbeat_at: "2026-07-14T00:00:00Z",
     created_at: "2026-07-01T00:00:00Z",
     stats_cpu_pct: null,

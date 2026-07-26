@@ -49,7 +49,11 @@ const SIDEBAR_COLLAPSED_KEY = "uzi.sidebar.collapsed";
 // reuse a single unauthenticated GET /api/version. A failed fetch resolves to ""
 // (rendered as nothing), never a thrown error in the shell.
 let versionPromise: Promise<string> | null = null;
-function useAppVersion(): string | null {
+// Exported so the Workers page can state the fleet's target release from the SAME
+// coordinate the footer shows (PRD #113 M5). The promise is memoised at module scope, so
+// reusing this hook costs no extra request and — more importantly — makes it impossible
+// for the panel and the footer to disagree about what release the control plane is.
+export function useAppVersion(): string | null {
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     if (!versionPromise) {

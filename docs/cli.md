@@ -393,6 +393,28 @@ uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 ```
 
+### Upgrade status
+
+`uzi worker list` carries an `UPGRADE` column beside `VERSION`:
+
+| value | meaning |
+|---|---|
+| `up to date` | the worker runs the release it is targeted at |
+| `outdated` | it runs an older release, and nothing is currently rolling it |
+| `upgrading` | a roll is in progress; expected and transient |
+| `FAILED` | it tried to take a new release and could not — this is the one to act on |
+| `-` | no usable version to compare (an unstamped local image, or a `dev` control plane) |
+
+Two things worth knowing before acting on it. A worker's version is recorded **at
+register only**, so a worker that is offline mid-roll still reports the release it was
+running before — which is why `FAILED` comes from the controller watching the pod rather
+than from the worker itself. And a **hosted** worker is compared against the tag the
+controller is rolling to, which `values.yaml` may pin below the api's own release; the
+Workers page states that divergence when it exists.
+
+`-` is not a problem to fix. It is what a locally built image and an unstamped control
+plane both look like, which is most of a development setup.
+
 `set-token` takes a **label** (the name from `token list`), not an id, and
 takes effect on that worker's next claim — no restart and no re-minted join
 token. Passing both a label and `--default`, or neither, is a usage error

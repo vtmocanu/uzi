@@ -130,7 +130,7 @@ var runInputKinds = map[string]bool{
 // degraded: passing a nil signal says "this row carries no controller report", which
 // is exactly what it carries. The per-user LIST path has the join and folds it.
 func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
-	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(workersvc.UpgradeInput{
+	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
 		Reported:     w.Version.String,
 		Kind:         w.Kind,
 		CPVersion:    cpVersion,
@@ -141,6 +141,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	return apitypes.WorkerDTO{
 		UpgradeStatus:        upgradeStatus,
 		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget:        upgradeTarget,
 		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel: textPtrValue(secretLabel != "", secretLabel),
 		ID:                   w.ID.String(),
@@ -165,7 +166,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
-	upgradeStatus, upgradeDetail := workersvc.ClassifyUpgrade(workersvc.UpgradeInput{
+	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
 		Reported:     w.Version.String,
 		Kind:         w.Kind,
 		CPVersion:    cpVersion,
@@ -174,28 +175,33 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		APIStartedAt: apiStartedAt,
 	}, workersvc.UpgradeParams{})
 	return apitypes.WorkerDTO{
-		UpgradeStatus:        upgradeStatus,
-		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
-		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
-		AnthropicSecretLabel: textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
-		ID:                   w.ID.String(),
-		Name:                 w.Name,
-		Status:               w.Status,
-		Kind:                 w.Kind,
-		HostedSize:           textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
-		Docker:               boolPtrValue(w.DockerEnabled),
-		Busy:                 w.Busy,
-		ActiveRuns:           int(w.ActiveRuns),
-		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:     textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:     textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:              textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:      timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:            w.CreatedAt.Time,
-		StatsCPUPct:          float4PtrValue(w.StatsCpuPct),
-		StatsMemBytes:        int8PtrValue(w.StatsMemBytes),
-		StatsMemLimitBytes:   int8PtrValue(w.StatsMemLimitBytes),
-		StatsSource:          textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
+		UpgradeStatus: upgradeStatus,
+		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget: upgradeTarget,
+		// Only meaningful for a failed upgrade, and only the list path has the join that
+		// carries them at all.
+		UpgradeBlockingContainer: textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
+		UpgradeBlockingReason:    textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
+		AnthropicSecretID:        uuidPtrValue(w.AnthropicSecretID),
+		AnthropicSecretLabel:     textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
+		ID:                       w.ID.String(),
+		Name:                     w.Name,
+		Status:                   w.Status,
+		Kind:                     w.Kind,
+		HostedSize:               textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:                   boolPtrValue(w.DockerEnabled),
+		Busy:                     w.Busy,
+		ActiveRuns:               int(w.ActiveRuns),
+		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:         textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:         textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:                  textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:          timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:                w.CreatedAt.Time,
+		StatsCPUPct:              float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:            int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes:       int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:              textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
 }
 

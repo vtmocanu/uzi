@@ -51,6 +51,27 @@ type WorkerDTO struct {
 	// from this field and arrive from the controller's roll report instead.
 	UpgradeStatus string  `json:"upgrade_status"`
 	UpgradeDetail *string `json:"upgrade_detail"`
+	// UpgradeTarget is the coordinate this worker was compared AGAINST — the
+	// controller's rolled tag for a hosted worker with a fresh report (Decision 9,
+	// because values.yaml may pin the worker image independently of the api's release),
+	// otherwise the control plane's own version.
+	//
+	// On the wire so the UI can state the divergence when a hosted target sits below
+	// the control-plane version. That divergence is a supported operation (a deliberate
+	// pin) AND the shape of a fleet-wide alert-suppression attack, and the api cannot
+	// tell them apart — so it is surfaced rather than judged. Empty when the control
+	// plane has no version stamp, i.e. when classification is off entirely.
+	UpgradeTarget string `json:"upgrade_target"`
+	// The blocking container and the k8s waiting REASON behind an upgrade_failed, split
+	// out from UpgradeDetail so the UI can key a lookup on them rather than parsing a
+	// sentence. Null for every other status.
+	//
+	// The reason ONLY — `state.waiting.message` is deliberately never sent. Reason is a
+	// short k8s enum; message is free text that routinely carries filesystem paths,
+	// image references and Secret names, and this field reaches a browser badge and a
+	// terminal via the CLI.
+	UpgradeBlockingContainer *string `json:"upgrade_blocking_container"`
+	UpgradeBlockingReason    *string `json:"upgrade_blocking_reason"`
 	// Latest container resource sample (PRD #49), all null until the worker reports
 	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
 	// is unlimited or the sample came from the process fallback; StatsCPUPct is null

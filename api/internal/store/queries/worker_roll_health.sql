@@ -104,11 +104,32 @@ SELECT
     r.observed_at,
     r.upgrading_since,
     r.worker_image_tag,
-    (m.user_id IS NOT NULL) AS muted
+    -- ::boolean, not a bare expression: sqlc types an uncast boolean expression as
+    -- interface{}, so the Go field cannot be used as a bool without a type assertion.
+    -- Same family as the LEFT-JOIN nullability trap CLAUDE.md records — sqlc's inference
+    -- on expressions is weaker than on columns, and the cast is what makes it a bool.
+    (m.user_id IS NOT NULL)::boolean AS muted
 FROM workers w
 LEFT JOIN worker_upgrade_reports r ON r.worker_id = w.id
+-- The mute's release key is the controller's rolled tag for a HOSTED worker and the
+-- worker's OWN reported version for anything else. That is not a fallback, it is what
+-- "release" means for each population (PRD #113 M5, B-2):
+--
+--   * hosted: the tag being rolled TO. A stuck roll on 0.11.7 is muted; 0.11.8 alerts
+--     again, because the next roll is a different event.
+--   * external: the version the worker IS on. Nothing upgrades an external worker, so
+--     it sits `outdated` indefinitely and the mute means "I know this one runs 0.11.0".
+--     It expires when the WORKER moves, which is the only event that changes the fact
+--     being muted — a new control-plane release does not.
+--
+-- COALESCE(r.worker_image_tag, '') alone was dead for external workers and they are
+-- exactly who the mute is for: the roll-health upsert is confined to kind='hosted', so
+-- an external worker has no report, its key was always '' and a mute stored against
+-- any real release never matched. Keying on '' instead would have made an external
+-- mute PERMANENT, which contradicts the whole point of scoping a mute to a release.
 LEFT JOIN worker_upgrade_mutes m
-       ON m.worker_id = w.id AND m.user_id = w.user_id AND m.release = COALESCE(r.worker_image_tag, '')
+       ON m.worker_id = w.id AND m.user_id = w.user_id
+      AND m.release = COALESCE(r.worker_image_tag, w.version, '')
 WHERE w.user_id = @user_id
 ORDER BY w.created_at;
 

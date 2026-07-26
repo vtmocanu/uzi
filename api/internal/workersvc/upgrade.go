@@ -326,6 +326,24 @@ func (p UpgradeParams) withDefaults() UpgradeParams {
 //   - R8 (no-signal grace) sits BELOW the compare rows, so it can only ever soften
 //     `outdated` — never override `up_to_date` or `unknown`.
 func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail string) {
+	status, detail, _ = classifyWithTarget(in, p)
+	return status, detail
+}
+
+// ClassifyUpgradeWithTarget also returns the coordinate the worker was actually compared
+// against (PRD #113 M5, B-1).
+//
+// The target is returned rather than recomputed by the caller because the two must never
+// disagree: the Fleet panel states "hosted workers target X" beside a badge derived from
+// X, and a second derivation is a second chance to be wrong. It is also the only way the
+// panel can surface a divergence the classifier is REQUIRED to honour — Decision 9 makes
+// a controller-pinned tag authoritative, so a legitimate pin and a suppression attack are
+// indistinguishable here and the resolution is to say what the target is, visibly.
+func ClassifyUpgradeWithTarget(in UpgradeInput, p UpgradeParams) (status, detail, target string) {
+	return classifyWithTarget(in, p)
+}
+
+func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail string, resolvedTarget string) {
 	p = p.withDefaults()
 	hosted := in.Kind == "hosted"
 	s := in.Signal
@@ -349,10 +367,10 @@ func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail st
 	}
 
 	if hosted && signalFresh && ceilingOK && s.Phase == PhaseStuck {
-		return UpgradeStatusUpgradeFailed, stuckDetail(s) // R1
+		return UpgradeStatusUpgradeFailed, stuckDetail(s), target // R1
 	}
 	if hosted && signalFresh && ceilingOK && s.Phase == PhaseRolling {
-		return UpgradeStatusUpgrading, rollingDetail(s) // R2
+		return UpgradeStatusUpgrading, rollingDetail(s), target // R2
 	}
 
 	// R3 — the controller says the new pod is Ready but workers.version has not caught
@@ -363,7 +381,7 @@ func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail st
 	if hosted && signalFresh && s.Phase == PhaseSettled && s.PhaseSince != nil &&
 		in.Now.Sub(*s.PhaseSince) <= p.RegisterConvergenceGrace &&
 		isBehind(in.Reported, target) {
-		return UpgradeStatusUpgrading, fmt.Sprintf("rolled to %s; awaiting re-registration", target)
+		return UpgradeStatusUpgrading, fmt.Sprintf("rolled to %s; awaiting re-registration", target), target
 	}
 
 	// R4-R7, R9: the version-compare core.
@@ -376,9 +394,9 @@ func ClassifyUpgrade(in UpgradeInput, p UpgradeParams) (status string, detail st
 	// already said `outdated`.
 	if status == UpgradeStatusOutdated && hosted && !signalFresh &&
 		in.Now.Sub(in.APIStartedAt) < p.HostedRollGrace {
-		return UpgradeStatusUpgrading, "roll in progress (unconfirmed — no controller signal)"
+		return UpgradeStatusUpgrading, "roll in progress (unconfirmed — no controller signal)", target
 	}
-	return status, detail
+	return status, detail, target
 }
 
 // isBehind reports whether reported is a usable version strictly below target. Used by

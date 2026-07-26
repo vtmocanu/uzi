@@ -6,6 +6,8 @@ import { Link } from "react-router-dom";
 import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
+import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
+import { useAppVersion } from "../components/AppShell";
 import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
@@ -20,6 +22,9 @@ const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
+  // The control plane's own release, from the same memoised GET /api/version the footer
+  // uses — one coordinate, so the panel and the footer cannot disagree.
+  const cpVersion = useAppVersion();
   // The user's named tokens, for the per-worker picker (PRD #104 M3/M6). Read
   // alongside the workers so a rebind can offer labels without a second round trip.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
@@ -322,7 +327,9 @@ export function WorkersSettings() {
             description="Generate a join token above, then start the uzi-agent container with it — the worker shows up here when it heartbeats."
           />
         ) : (
-          <ul className="space-y-2">
+          <>
+            <FleetUpgradePanel workers={workers} cpVersion={cpVersion ?? ""} />
+            <ul className="space-y-2">
             {workers.map((w) => (
               <li
                 key={w.id}
@@ -331,6 +338,9 @@ export function WorkersSettings() {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <span className="font-medium text-fg">{w.name}</span>
+                    <span className="ml-2 align-middle">
+                      <WorkerUpgradeBadge worker={w} />
+                    </span>
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
                       {w.template_reported ? (
                         <span>template {w.template_reported}</span>
@@ -506,9 +516,11 @@ export function WorkersSettings() {
                 {/* Live resource gauges (PRD #49): renders only once the worker has
                     reported a sample, so a worker without stats keeps its old row. */}
                 <WorkerStatGauges worker={w} />
+                <WorkerUpgradeDetail worker={w} />
               </li>
             ))}
-          </ul>
+            </ul>
+          </>
         )}
       </Card>
     </SettingsShell>

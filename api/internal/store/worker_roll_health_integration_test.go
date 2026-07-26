@@ -339,3 +339,81 @@ func TestWorkerUpgradeSummaryIsPerUserLiveDB(t *testing.T) {
 			"authorization and it did not hold", mutes)
 	}
 }
+
+// B-2: the mute must work for EXTERNAL workers, who are the population it exists for.
+//
+// They never auto-upgrade, so they sit `outdated` indefinitely — the PRD's own
+// alert-fatigue risk. The original join key was COALESCE(r.worker_image_tag, ”), and the
+// roll-health upsert is confined to kind='hosted', so an external worker had no report,
+// its key was always ” and a mute stored against any real release silently never
+// matched. A HOSTED fixture passes while the feature is dead for its actual population,
+// which is why this test uses an external worker and moves its version.
+func TestExternalWorkerMuteIsKeyedOnItsOwnVersionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("mute-%s@e2e", userID))
+	workerID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, kind, version)
+		 VALUES ($1, $2, $3, $4, 'online', 'external', '0.11.0')`,
+		workerID, userID, "ext-"+workerID.String()[:8], []byte(workerID.String()))
+
+	muted := func(what string) bool {
+		rows, err := q.GetWorkerUpgradeSummaryForUser(ctx, userID)
+		if err != nil {
+			t.Fatalf("summary (%s): %v", what, err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("summary (%s) returned %d rows, want 1", what, len(rows))
+		}
+		return rows[0].Muted
+	}
+
+	if muted("before any mute") {
+		t.Fatalf("precondition: the worker must start unmuted")
+	}
+
+	// The user mutes it at the version it is actually running. For a worker with no
+	// controller-reported tag, THAT is what "release" means: the fact being muted is
+	// "this worker runs 0.11.0 and I accept that".
+	if err := q.MuteWorkerUpgrade(ctx, store.MuteWorkerUpgradeParams{
+		UserID: userID, WorkerID: workerID, Release: "0.11.0",
+	}); err != nil {
+		t.Fatalf("mute: %v", err)
+	}
+	if !muted("after muting 0.11.0") {
+		t.Errorf("an EXTERNAL worker's mute did not take effect. The join key must fall back to the " +
+			"worker's own version: an external worker has no roll-health row, so a key derived only from " +
+			"worker_image_tag is always '' and no real release value can ever match it — the mute is dead " +
+			"for exactly the population that needs it.")
+	}
+
+	// ACROSS A VERSION CHANGE: the worker is upgraded by its owner. The muted fact no
+	// longer holds, so the mute must stop matching rather than silencing the row forever.
+	// Keying on '' would have made it permanent, contradicting the whole point of
+	// scoping a mute to a release.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: workerID, Version: pgtype.Text{String: "0.11.7", Valid: true},
+	}); err != nil {
+		t.Fatalf("register the upgraded version: %v", err)
+	}
+	if muted("after the worker moved to 0.11.7") {
+		t.Errorf("the mute survived the worker moving from 0.11.0 to 0.11.7. A mute that outlives the " +
+			"thing it muted silences a row permanently, which is how an alert stops being trusted.")
+	}
+}

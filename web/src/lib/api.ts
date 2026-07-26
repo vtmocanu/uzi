@@ -641,6 +641,22 @@ export interface Worker {
   // alert.
   upgrade_status: "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
   upgrade_detail: string | null;
+  // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
+  // hosted worker with a fresh report, otherwise the control plane's own version. "" when
+  // the control plane has no version stamp (classification off).
+  //
+  // Rendered by the Fleet panel when it differs from the control-plane version. That
+  // divergence is a supported operation — values.yaml may pin the worker image — and it is
+  // also the shape a compromised controller would use to suppress every alert in the fleet
+  // by reporting the fleet's own stale version as the target. The api cannot tell them
+  // apart, so the UI states it rather than judging it.
+  upgrade_target: string;
+  // The blocking container and the k8s waiting REASON behind an upgrade_failed. Null for
+  // every other status, and null on responses that carry no roll-health join (register,
+  // heartbeat, create). The reason only — `message` is never sent, being free text that
+  // carries paths and Secret names.
+  upgrade_blocking_container: string | null;
+  upgrade_blocking_reason: string | null;
   last_heartbeat_at: string | null;
   created_at: string;
   // Latest container resource sample (PRD #49), all null until the worker reports
