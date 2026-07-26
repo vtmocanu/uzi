@@ -66,7 +66,8 @@ shipped playbook silently absent:
   `agent/src/protocol.ts:161-162`, filled by
   `agentsFromTemplates(templates, skills.perTemplate)` at
   `workersvc/service.go:942`) — it builds `{name, description, prompt_body}` and
-  nothing else (`agent/src/repoagents.ts:289`). So `toDefinition` computes
+  conditionally adds `tools` and `model`, but never a skills field
+  (`agent/src/repoagents.ts:289`). So `toDefinition` computes
   `allocated = (t.skills ?? []).filter(…)` = empty (`agent/src/agents.ts:116`)
   and a repo-sourced subagent receives **only** repo-borne skills. A run started
   with agents from git silently loses every delivered skill its owner allocated.
@@ -263,8 +264,18 @@ scopes a skill to `coder`, `docs/skills.md:42-52`). It would also degrade
 routing — the one-line description is what the model routes on, so more
 candidates in every agent's context means more wrong pulls. **That routing cost
 is paid on repo-source runs**, where a subagent may now list up to
-`SKILLS_MAX_PER_RUN` (32, `agent/src/skills-run.ts:15`) skills. Accepted there
-because no alternative exists; refused on own runs because one does.
+the run's **configured** cap (`skills_max_per_run` from the claim; the constant at
+`agent/src/skills-run.ts` is `DEFAULT_SKILLS_MAX_PER_RUN` = 32, a fallback used
+only when the claim omits config) skills. Accepted there because no alternative
+exists; refused on own runs because one does.
+
+*(Corrected 2026-07-26: this read "`SKILLS_MAX_PER_RUN` (32)". That identifier
+does not exist; the enforced value is server-supplied, so 32 is wrong for any
+instance whose admin raised it — and raising it raises the very exposure this
+sentence bounds. Note also that a cap is not a containment: `enforceSkillCaps`
+evicts a precedence-ordered tail, bounding how many a repo subagent sees, never
+which. The honest bound is the content one — a repo subagent receives exactly the
+run's materialized union, the same set the lead already receives.)*
 
 ### Decision 7 — Default allocation targets `lead`, and what that actually does
 
@@ -451,7 +462,7 @@ untouched; its content gets one line.
 
 ## Milestones
 
-- [ ] **M1 — Repo-sourced agents receive delivered skills** (worker only): on
+- [x] **M1 — Repo-sourced agents receive delivered skills** (worker only): on
       `source === "repo"`, `subagentsFromTemplates` enables the run's surviving
       delivered skills on every repo subagent, matching the repo-skill rule.
       Own-template assembly is untouched. **Verified**: a repo-source run with an
@@ -464,7 +475,7 @@ untouched; its content gets one line.
       (`sdk-executor.ts:265-268`), and `agent/test/agents.test.ts` has no skill
       assertions at all.
 
-- [ ] **M2 — Builtin skills carry a default allocation**: a Go-side map from
+- [x] **M2 — Builtin skills carry a default allocation**: a Go-side map from
       builtin skill name to default template names; `ReconcileBuiltinSkills`
       seeds a shared allocation when — and only when — it inserted the row, and
       **warns on a zero-row seed** (Decision 9); the boot ordering against
@@ -475,7 +486,7 @@ untouched; its content gets one line.
       template logs a warning instead of failing silently; the migration is
       idempotent against an instance that already has the row.
 
-- [ ] **M3 — The `prd-lifecycle` skill + the prompt clauses**: new builtin skill
+- [x] **M3 — The `prd-lifecycle` skill + the prompt clauses**: new builtin skill
       (adapted per Decision 4; reviewer instruction per Decision 3; already-in-
       `done/` is a no-op per Decision 2), defaulted to `lead` + `reviewer` via
       M2's map; `prompt.ts` gains the done-condition clause, conditional on a
@@ -487,7 +498,7 @@ untouched; its content gets one line.
       PRDLESS run and a `ci_fix` run touch no PRD file; a submitted plan names the
       PRD-update step.
 
-- [ ] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
+- [x] **M4 — `signal_done` declares the moved path**: optional `prd_done_path` on
       the tool, extracted by `scanSignals` (which discards `signal_done` input
       today), threaded through `TurnResult` → `ExecutorResult` → the finish
       report, persisted on the run with a pending-patch marker, `issue` kind only.
@@ -501,7 +512,7 @@ untouched; its content gets one line.
       neither; a traversal, absolute, or non-`prds/` path is rejected without
       failing the run; a `self_improve` or `ci_fix` run never sets the field.
 
-- [ ] **M5 — Patch the issue link on merge**: `UpdateIssueDescription` on the
+- [x] **M5 — Patch the issue link on merge**: `UpdateIssueDescription` on the
       `Forge` interface and both drivers (each wrapping its own errors through the
       PAT-scrubbing redactor, as `gitlab.go:57`/`:74` do — redaction is per-method,
       not automatic), plus the five test fakes; a dedicated watcher over `issue`
@@ -530,7 +541,7 @@ untouched; its content gets one line.
       untouched; an unmerged or closed MR never rewrites and does not poll
       forever; a forge error retries.
 
-- [ ] **M6 — Docs + specs + CLI**: `docs/skills.md` (default allocations, the
+- [x] **M6 — Docs + specs + CLI**: `docs/skills.md` (default allocations, the
       repo-agent rule), `docs/repo-agents.md` (which mentions skills nowhere
       today and is the user-facing page for what M1 changes), `docs/prdless.md`,
       `docs/autopilot.md` (unattended move-to-done, Decision 14), plus the two
