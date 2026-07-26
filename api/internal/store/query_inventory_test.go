@@ -51,7 +51,7 @@ import (
 // Concretely, in this file's own terms: nothing below executes a query, folds a predicate,
 // or measures isolation, so a row naming a test that merely *touches* the query is as green
 // as a row naming a test that reddens when the query is mutated. The mutation folds recorded
-// in prds/98-judge-menu.md are what tell those apart; this is the index of where to look,
+// in prds/done/98-judge-menu.md are what tell those apart; this is the index of where to look,
 // not the evidence.
 //
 // WHAT IT DOES CATCH — the one thing an index can catch, and the reason it is worth having:

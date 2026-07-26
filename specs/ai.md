@@ -9690,7 +9690,7 @@ existing contract with existing consumers, and D14 is about not breaking them.
 Serves human: extends the Run retrospective (LLM judge) feature
 (`specs/human.md:280`). PRD #94 gave a recommendation a triage state but no
 cross-run home, so the same recurring idea was re-triaged once per run it
-appeared in. Design record: `prds/98-judge-menu.md`.
+appeared in. Design record: `prds/done/98-judge-menu.md`.
 
 ## 358. A new, WIDER read on #94's join shape — grouped by `(category, target)`, migration-free (D1)
 
@@ -10676,7 +10676,7 @@ instruction can be false while parsing perfectly — two of them were.
   says so at the site (`parser.ParseDir` over one directory). Widening the extractor past that
   package — with the entry bound to its emitting site, which is what would close the residual
   without the exact-match churn — is **deliberately unfunded this wave**; the design is in
-  `prds/98-judge-menu-m8-w3-rulings.md` §1.6.
+  `prds/done/98-judge-menu-m8-w3-rulings.md` §1.6.
 
 ## 374. PRD #98 Part C — the harness `eval`s lifted instructions behind an ANCHORED ALLOWLIST floor, never a metacharacter blacklist
 
@@ -10732,7 +10732,7 @@ here is not a fake — it is a live-DB store test running the real SQL against a
 the tree now carries a lot of them.
 
 - **Coverage is RECORDED rather than REPEATED.** Where each dropped block is actually pinned is
-  written into `prds/98-judge-menu.md` **by test function name**. A property asserted twice is not
+  written into `prds/done/98-judge-menu.md` **by test function name**. A property asserted twice is not
   covered twice; it is covered once and paid for twice, and the second copy is the one that rots
   when the first is edited.
 - **What survived, and why only these two.** B4 (the row cap) was **unpinned anywhere live** — the
@@ -11020,7 +11020,7 @@ readable as the honest statement it was.
   forge-fake ignores `updated_after` (§377), and B4′ pins the row cap's FLAG and cut ordering but
   not the `LIMIT`/`ORDER BY` interaction at scale.
 
-See [prds/98-judge-menu.md](../prds/98-judge-menu.md) for the Decision Log,
-[prds/98-judge-menu-m8-design.md](../prds/98-judge-menu-m8-design.md) for the M8 design note, and
-[prds/98-judge-menu-m8-w3-rulings.md](../prds/98-judge-menu-m8-w3-rulings.md) for the wave-3
+See [prds/done/98-judge-menu.md](../prds/done/98-judge-menu.md) for the Decision Log,
+[prds/done/98-judge-menu-m8-design.md](../prds/done/98-judge-menu-m8-design.md) for the M8 design note, and
+[prds/done/98-judge-menu-m8-w3-rulings.md](../prds/done/98-judge-menu-m8-w3-rulings.md) for the wave-3
 rulings these sections record.
