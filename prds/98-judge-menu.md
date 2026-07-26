@@ -1424,7 +1424,13 @@ Five items. All found by execution, all with evidence recorded here or in the M3
       the only reason it is
       visible at all.
 
-- [ ] **Widen the query inventory beyond the judge family.**
+- [x] **MOVED OUT OF THIS PRD — now [issue #135](https://gitlab.example.com/vtmocanu/uzi/-/issues/135) (2026-07-25).**
+      The mechanism is built and the first 12 files are covered; what remains is an open-ended
+      hygiene programme, one file at a time, and **a PRD that cannot close until it finishes is a
+      PRD that never closes.** #135 carries the full procedure, the remaining-file list, the three
+      declaration states and the constraints — everything below, plus the state re-derivation
+      commands. Ticked here as *relocated*, not as done: the work is real and unfinished, it simply
+      no longer belongs to #98. *(Everything below is preserved as the design record.)*
 
       **STATE AT `407d6b72` (2026-07-25) — re-derive before trusting, the commands are below.**
       **12 of 28 files covered, 53 queries declared. 16 files and 239 queries remain**, and the
@@ -1674,7 +1680,15 @@ container name" that does not exist, and load contention measured at 3-6× headr
 concurrent suite). Recorded in the checkpoint as unknown. Sequencing is the mitigation and it
 costs nothing; do not attribute it.
 
-- [ ] **PARTIAL, wave 3 — the e2e half is GREEN; the docs/specs half is what remains.** The leg
+- [x] **DONE, wave 3 — both halves. The docs/specs half landed 2026-07-25** and this entry read
+      PARTIAL until then: `docs/cli.md` gained the admin CLI-token inventory, the `--run` remedy and
+      the mock/demo toggle (plus a **stale claim the documenter found on its own** — `updated: 0`
+      was described as indistinguishable across three causes, and the CLI now tells "already
+      settled" apart); `CHANGELOG.md` gained its `[Unreleased]` line; `specs/ai.md` gained §373-§381;
+      and `docs/judge.md` needed nothing, having already landed via the wave-2 merges — checked
+      before writing rather than written twice. **`407d6b72`: 197 PASS / 1 FAIL, both judge phases
+      green, the single red attributable to an unguarded claim race in main's harness.**
+      *(Original PARTIAL text follows.)* The leg
       landed as B4′ + B6′ (Part B narrowed by user ruling on 2026-07-25: duplicate removal, not a
       time trim — `tier2`'s live-DB tests came to cover B1/B2/B3/B5 and B6's matrix, and where each
       is pinned is now recorded **by test function name** rather than rebuilt). **`e535edb6`: 197
