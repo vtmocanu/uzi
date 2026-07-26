@@ -43,7 +43,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
+import { assistantModelOf, assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { errMessage } from "./util.js";
 
@@ -672,11 +672,18 @@ export class SdkExecutor implements Executor {
           });
         }
         const frameUsage = assistantUsageOf(msg);
+        const frameModel = assistantModelOf(msg);
         let usageAttached = false;
         for (const em of mapSdkMessage(msg)) {
           if (em.kind === "tool_use" && isSignalToolName(em.payload["name"])) continue;
           if (frameUsage && !usageAttached) {
             em.payload["usage"] = frameUsage;
+            // PRD #93 Decision 2: `model` is CO-GATED with usage — same surviving
+            // message, same latch. A model is recorded only where that agent's
+            // tokens are, so the web derive (which reads it inside its existing
+            // `"usage" in payload` branch) can never produce a zero-token agent row
+            // from a model-only frame. No usage ⇒ no model, deliberately.
+            if (frameModel !== undefined) em.payload["model"] = frameModel;
             usageAttached = true;
           }
           ctx.emit(em);

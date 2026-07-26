@@ -12,6 +12,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **A Model column in the run view's per-agent usage table.** The usage panel named the run's
+  model only once, in the top strip — the main thread's. A run is multi-model (a subagent can
+  pin its own model, PRD #37; the owner's default governs the lead, PRD #69), so the per-agent
+  breakdown now shows which model each agent actually ran on: the model string normally,
+  `<primary> +K` for an agent that spanned several, `—` for a run whose frames predate the
+  feature. Tokens only — per-agent cost remains unavailable, and no cost surface changed
+  (PRD #93).
+
 - **Worker upgrade health.** Settings → Workers shows a per-worker upgrade badge, a Fleet
   upgrade summary, and a detail strip on a worker whose upgrade failed; the Workers nav item
   carries an alert-toned count of workers needing attention. `uzi worker list` gains an

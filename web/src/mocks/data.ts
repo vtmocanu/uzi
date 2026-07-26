@@ -1774,8 +1774,13 @@ const dm = (kind: string, agent: string | null, payload: unknown, minAgo: number
 });
 
 export const mockDoneMessages: RunMessage[] = [
-  dm("status", null, { event: "init", model: "claude-sonnet-4-6" }, 219),
-  dm("text", "lead", { text: "Reading the PRD and the current run-view rendering to scope the fold-results work.", usage: { input_tokens: 38_200, cache_read_input_tokens: 401_500, cache_creation_input_tokens: 2_000, output_tokens: 14_800 } }, 218),
+  // The init frame is the strip's model — the run's MAIN-THREAD model, i.e. the
+  // lead's — so it must match the lead's assistant frames below (opus), or the demo
+  // would show a strip model that no agent row accounts for.
+  dm("status", null, { event: "init", model: "claude-opus-4-8" }, 219),
+  // PRD #93: `model` rides the same assistant frame as `usage` — the coder pinned
+  // sonnet while lead/reviewer ran on opus, so the demo run shows a mixed column.
+  dm("text", "lead", { text: "Reading the PRD and the current run-view rendering to scope the fold-results work.", model: "claude-opus-4-8", usage: { input_tokens: 38_200, cache_read_input_tokens: 401_500, cache_creation_input_tokens: 2_000, output_tokens: 14_800 } }, 218),
   dm("tool_use", "lead", { id: "tu-1", name: "Read", input: { file_path: "prds/11-run-view-ux.md" } }, 218),
   dm("tool_result", "lead", { tool_use_id: "tu-1", content: "# PRD 11 — Run view UX\n\nFold tool results under their calls…" }, 218),
   dm("tool_use", "lead", { id: "tu-2", name: "Grep", input: { pattern: "tool_result", path: "web/src" } }, 217),
@@ -1793,12 +1798,12 @@ export const mockDoneMessages: RunMessage[] = [
   }, 216),
   dm("status", null, { text: "plan submitted — awaiting approval" }, 216),
   dm("status", null, { text: "plan approved by vlad@uzi.local" }, 205),
-  dm("text", "coder", { text: "Implementing the id-based pairing index and the fold-under-call rendering.", usage: { input_tokens: 51_600, cache_read_input_tokens: 583_900, cache_creation_input_tokens: 0, output_tokens: 24_100 } }, 204),
+  dm("text", "coder", { text: "Implementing the id-based pairing index and the fold-under-call rendering.", model: "claude-sonnet-5", usage: { input_tokens: 51_600, cache_read_input_tokens: 583_900, cache_creation_input_tokens: 0, output_tokens: 24_100 } }, 204),
   dm("tool_use", "coder", { id: "tu-3", name: "Edit", input: { file_path: "web/src/components/RunEvent.tsx" } }, 203),
   dm("tool_result", "coder", { tool_use_id: "tu-3", content: "ok" }, 203),
   dm("tool_use", "coder", { id: "tu-4", name: "Bash", input: { command: "cd web && npx vitest run src/components/RunEvent.test.tsx" } }, 200),
   dm("tool_result", "coder", { tool_use_id: "tu-4", content: "✓ 14 tests passed" }, 199),
-  dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
+  dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", model: "claude-opus-4-8", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
   dm("tool_use", "coder", { id: "tu-5", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
   dm("tool_result", "coder", { tool_use_id: "tu-5", content: "ok" }, 192),
   dm("tool_use", "coder", { id: "tu-6", name: "Bash", input: { command: "cd web && npm run typecheck && npm test" } }, 190),
@@ -1851,8 +1856,8 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
 });
 
 export const mockFailedMessages: RunMessage[] = [
-  fm("status", null, { event: "init", model: "claude-sonnet-4-6" }),
-  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings.", usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 } }),
+  fm("status", null, { event: "init", model: "claude-opus-4-8" }), // matches the lead's frames below
+  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings.", model: "claude-opus-4-8", usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 } }),
   fm("tool_use", "lead", { id: "f-1", name: "Bash", input: { command: "go test -bench=Pool ./internal/store/..." } }),
   fm("tool_result", "lead", { tool_use_id: "f-1", content: "benchmark hung — no output after 40m", is_error: true }),
   fm("error", null, { text: "run timed out after 2h0m0s (RUN_TIMEOUT)" }),
