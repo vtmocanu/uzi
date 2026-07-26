@@ -832,6 +832,18 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   been executed, and when it was, it was false** — it told the user to re-run a WRITE to
   recover data a re-run cannot return. The only mechanism that catches this class: run the
   command, then execute exactly what its output told the user to do, and assert the outcome.
+- **A COMMENT THAT JUSTIFIES A CHOICE ON ONE AXIS CROWDS OUT THE QUESTION OF WHAT ELSE THAT
+  CHOICE DECIDES.** The author-facing sibling of the per-claim rule below, and it is nastier
+  because the comment is not wrong — it is **complete-looking**. Measured 2026-07-26 (PRD #113
+  M4): a SQL clause used `IS DISTINCT FROM` and its comment carefully explained why, on the
+  NULL-handling axis, which was true. Nobody then asked what *else* raw-string comparison
+  treats as different — and the answer was SemVer build metadata, so the anchor read
+  `0.11.7+g1a2b3c4` and `0.11.7+gdeadbeef` as a version change while the classifier read them
+  as one release, re-arming a suppression window on every re-cut tag. Diagnosed by the author
+  of the comment: *"the stamp made it reachable; the unasked question is what let it ship."*
+  The screen: when a comment defends an operator or a type choice, ask **what other property
+  does this operator decide**, not merely whether the stated reason is sound. A justification
+  is an invitation to stop reading.
 - **Apply the screen PER CLAIM, not per comment block.** A verified-true sentence adjacent to
   an unverified one reads as *one continuous argument*, and the reader's guard drops after the
   part that checks out. Live example: a rigorous, correctly-cited sentence sitting four lines
