@@ -1,7 +1,7 @@
 # PRD #113: Worker upgrade & version health — fleet status, per-worker badges, and a Workers-menu alert badge
 
 **GitLab Issue**: [#113](https://gitlab.example.com/vtmocanu/uzi/-/issues/113)
-**Status**: Draft (created 2026-07-22; revised same day after a fable adversarial review that verified every load-bearing claim against the code — M3 reworked around a new display-only controller→api report, classification precedence added, M1 shrunk; see the Decision Log)
+**Status**: In Progress (created 2026-07-22; revised same day after a fable adversarial review that verified every load-bearing claim against the code — M3 reworked around a new display-only controller→api report, classification precedence added, M1 shrunk; see the Decision Log. Implementation started 2026-07-26 on `feature/prd-113-worker-upgrade-status`.)
 **Priority**: Medium
 **Mock**: `prds/mockups/113-worker-upgrade-status-mock.html` (accepted by owner 2026-07-22)
 
