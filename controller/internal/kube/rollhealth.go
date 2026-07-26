@@ -148,6 +148,22 @@ func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconci
 	case !current.CreationTimestamp.IsZero() && now.Sub(current.CreationTimestamp.Time) > stuckAge:
 		// The reasonless arm: Pending with FailedScheduling or FailedMount, where no
 		// container status exists to carry a reason.
+		//
+		// CreationTimestamp, not Status.StartTime, and the difference is load-bearing here
+		// rather than cosmetic. StartTime is when the KUBELET acknowledged the pod, so it is
+		// nil for a pod that never bound to a node — which is precisely the FailedScheduling
+		// case this arm exists to catch. CreationTimestamp is set by the api server at
+		// admission and is always present.
+		//
+		// MEASURED, not reasoned: swapping this arm to `current.Status.StartTime != nil &&
+		// now.Sub(current.Status.StartTime.Time) > stuckAge` turns the reasonless case into
+		// `Phase = "rolling"` where "stuck" is wanted, so an unschedulable worker would
+		// report rolling forever. The mutation is caught — rollhealth_test.go's "a
+		// reasonless pod past stuckAge is stuck" fails at once, because its pod fixture
+		// sets CreationTimestamp and no StartTime, exactly like the pods this arm sees.
+		// (`kubectl describe` prints its "Start Time" line from Status.StartTime, so that
+		// line is absent for these pods too — noted because docs/worker-upgrades.md sends
+		// an operator to read it.)
 		health.Phase = protocol.PhaseStuck
 	default:
 		health.Phase = protocol.PhaseRolling

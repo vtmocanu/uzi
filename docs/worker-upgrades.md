@@ -50,9 +50,9 @@ unsubstituted it never reaches kubectl: `<` and `>` are redirections, so the she
 file named `worker-namespace`. Confusing, but a reliable reminder. The quiet failure is the
 *wrong* namespace, which prints `No resources found` and reads as the worker having gone.
 
-**`Start Time` in that output** is when the pod was created, not when it went wrong. Nothing
-records when a worker started failing — each check re-reads the pods from scratch — so a pod
-created twelve minutes ago has been *failing* for some unknown part of those twelve minutes.
+**`Start Time` in that output** is when the pod started, not when it went wrong, and a pod that
+never scheduled has no `Start Time` line at all. Nothing records when a worker started failing,
+so a pod that started twelve minutes ago has been *failing* for some unknown part of that time.
 
 ## Pinned worker images, and the CLI
 

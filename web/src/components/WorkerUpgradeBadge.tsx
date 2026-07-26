@@ -96,7 +96,8 @@ export function likelyCause(container: string | null, reason: string | null, las
     // AND THE EXIT CODE DOES NOT SEPARATE THEM, which is what this comment claimed next.
     // Measured in the worker base image (node:22-alpine@sha256:16e22a55…, `apk add tar` →
     // GNU tar 1.35, extracting as uid 10001): permission denied gives "Cannot open:
-    // Permission denied", ENOSPC gives "Wrote only 8704 of 10240 bytes", and BOTH exit 2 —
+    // Permission denied", ENOSPC gives "Wrote only 8704 of 10240 bytes" (e.g. — the byte
+    // counts vary per run, only the shape is stable), and BOTH exit 2 —
     // GNU tar uses 2 for every fatal error. (Busybox tar, if GNU tar were ever absent,
     // exits 1 for both; the conclusion does not depend on which one runs.) What separates
     // them is tar's stderr LINE, which is exactly what this architecture refuses to carry:
