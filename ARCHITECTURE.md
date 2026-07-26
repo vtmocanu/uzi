@@ -417,37 +417,6 @@ binding, and the chat lane always resolves the owner's default. Because the
 token rides the claim rather than the worker, re-pointing a worker is
 complete server-side — no restart, no re-minted join token.
 
-### Worker version and upgrade health
-
-A worker's `version` is written **only at register** (`workersvc.Register`), so a worker
-that is offline mid-roll still reports the release it was running before — heartbeats
-carry a version the api discards, and the `X-Client-Version` header is read nowhere. That
-one fact is why upgrade health needs two independent detectors rather than one: version
-comparison answers "is this behind?", and it structurally cannot answer "did this try to
-upgrade and fail?", because the worker that failed is the worker that cannot report.
-
-The second detector is the controller, which observes worker **pods** (`pods: list`, both
-worker namespaces) and POSTs a **display-only** report to `POST /api/controller/status`.
-Display-only is structural rather than promised: the report lands in its own table whose
-only foreign key is `worker_id`, the upsert is confined to existing `kind='hosted'` rows so
-it can neither create workers nor touch an external one, liveness stays heartbeat-owned,
-and the endpoint answers 204 with no body — so there is nothing for the controller to read
-state back out of. PRD #58's "the controller asserts nothing" holds for everything else;
-the poll is still a pure read.
-
-The api folds both into one derived `upgrade_status` on the worker DTO, computed at read
-time and never stored, so it cannot go stale against the row it describes. Three separate
-timestamps make that safe, and collapsing any pair reopens a specific hole: the
-controller's own clock is display-only, the api stamps its own receipt time to drive
-signal freshness, and a third column anchors a ceiling on how long a controller may be
-believed about one roll — cleared only by the worker's own authenticated re-registration
-moving its version. Roll-health rows are reachable only by joining through `workers`,
-which is what makes the per-user scoping unavoidable.
-
-Rationale, the decision log, and the alternatives that were rejected are in
-`prds/113-worker-upgrade-status.md`. The user-facing behaviour is
-[docs/worker-upgrades.md](docs/worker-upgrades.md).
-
 ### Run lifecycle
 
 One `runs` row is the unit of work; an issue can accumulate several over its
@@ -970,6 +939,37 @@ presets — is `prds/done/58-hosted-k8s-workers.md` (its Decision Log especially
 docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
 `prds/done/83-docker-capable-worker.md`.
+
+### Worker version and upgrade health
+
+A worker's `version` is written **only at register** (`workersvc.Register`), so a worker
+that is offline mid-roll still reports the release it was running before — heartbeats
+carry a version the api discards, and the `X-Client-Version` header is read nowhere. That
+one fact is why upgrade health needs two independent detectors rather than one: version
+comparison answers "is this behind?", and it structurally cannot answer "did this try to
+upgrade and fail?", because the worker that failed is the worker that cannot report.
+
+The second detector is the controller, which observes worker **pods** (`pods: list`, both
+worker namespaces) and POSTs a **display-only** report to `POST /api/controller/status`.
+Display-only is structural rather than promised: the report lands in its own table whose
+only foreign key is `worker_id`, the upsert is confined to existing `kind='hosted'` rows so
+it can neither create workers nor touch an external one, liveness stays heartbeat-owned,
+and the endpoint answers 204 with no body — so there is nothing for the controller to read
+state back out of. PRD #58's "the controller asserts nothing" holds for everything else;
+the poll is still a pure read.
+
+The api folds both into one derived `upgrade_status` on the worker DTO, computed at read
+time and never stored, so it cannot go stale against the row it describes. Three separate
+timestamps make that safe, and collapsing any pair reopens a specific hole: the
+controller's own clock is display-only, the api stamps its own receipt time to drive
+signal freshness, and a third column anchors a ceiling on how long a controller may be
+believed about one roll — cleared only by the worker's own authenticated re-registration
+moving its version. Roll-health rows are reachable only by joining through `workers`,
+which is what makes the per-user scoping unavoidable.
+
+Rationale, the decision log, and the alternatives that were rejected are in
+`prds/113-worker-upgrade-status.md`. The user-facing behaviour is
+[docs/worker-upgrades.md](docs/worker-upgrades.md).
 
 ## Not yet in scope
 

@@ -162,6 +162,17 @@ function NavItem({
         </span>
       )}
       {!collapsed && <span className="truncate">{label}</span>}
+      {/* The count SURVIVES COLLAPSE. The pill below is gated on !collapsed and the rail's
+          dot is aria-hidden, so without this an assistive-tech user got no count and no
+          tone at all in the collapsed rail — measured: no aria-label, empty innerText, only
+          title="Workers". That is the information not being there, not a visual
+          degradation, and it happens in the layout where the operator has least context.
+          "The sidebar was collapsed" is not a reason to withhold an incident count.
+          sr-only rather than an aria-label on the Link, so the destination name and the
+          count stay separate strings rather than one run-on label. */}
+      {collapsed && hasBadge && (
+        <span className="sr-only">{alert ? `${badge} needing attention` : `${badge} unread`}</span>
+      )}
       {!collapsed && hasBadge && (
         <span
           // The label says what the number MEANS. "3 unread" for a worker count would be

@@ -401,3 +401,29 @@ describe("the workers-attention poll's cleanup (PRD #113 M7)", () => {
     }
   });
 });
+
+// BLK-4 — the count must survive collapse.
+//
+// The expanded pill is gated on `!collapsed` and the rail's dot is `aria-hidden`, so before
+// this an assistive-tech user in the collapsed rail got no count and no tone at all — only
+// `title="Workers"`. That is the information not being there rather than a visual
+// degradation, and it happens in the layout where the operator has least context.
+//
+// Note what this test does NOT claim: it asserts an accessible NAME exists and carries the
+// count and the tone. Whether a screen reader announces it usefully in this nav structure is
+// the thing jsdom cannot see — correctness is not reachability.
+describe("the collapsed rail keeps the badge's meaning (BLK-4)", () => {
+  it("exposes the count and tone when collapsed, not just a decorative dot", async () => {
+    mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 2, target_release: "0.6.0" });
+    renderShell("/dashboard");
+    await screen.findByText("Workers");
+
+    // Collapse the rail. getByRole, NOT queryByRole with an early return — an early return
+    // here is exactly the vacuous escape hatch this suite keeps finding elsewhere: the test
+    // would pass by never reaching its assertion if the toggle were ever renamed.
+    fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
+
+    // The tone-bearing string must still be reachable by name.
+    expect(await screen.findByText("2 needing attention")).toBeTruthy();
+  });
+});
