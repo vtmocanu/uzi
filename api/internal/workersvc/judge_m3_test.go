@@ -27,14 +27,14 @@ func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.mod
 // -------------------------------------------------------------------------
 
 func TestScanCommandNotFound(t *testing.T) {
-	payloads := [][]byte{
-		[]byte(`{"text":"bash: kubectl: command not found"}`),
-		[]byte(`{"text":"zsh: command not found: helm"}`),
-		[]byte(`{"text":"exec: \"terraform\": executable file not found in $PATH"}`),
-		[]byte(`{"text":"/bin/sh: 1: jq: not found"}`),
-		[]byte(`{"text":"kubectl: command not found"}`), // duplicate → deduped
-		[]byte(`{"text":"all good here, tests passed"}`),
-	}
+	payloads := rawResultRows(
+		`{"text":"bash: kubectl: command not found"}`,
+		`{"text":"zsh: command not found: helm"}`,
+		`{"text":"exec: \"terraform\": executable file not found in $PATH"}`,
+		`{"text":"/bin/sh: 1: jq: not found"}`,
+		`{"text":"kubectl: command not found"}`, // duplicate → deduped
+		`{"text":"all good here, tests passed"}`,
+	)
 	got := scanCommandNotFound(payloads)
 	cmds := map[string]bool{}
 	for _, m := range got {
@@ -54,20 +54,37 @@ func TestScanCommandNotFound(t *testing.T) {
 }
 
 func TestScanCommandNotFoundEmptyWhenClean(t *testing.T) {
-	if got := scanCommandNotFound([][]byte{[]byte(`{"text":"go test ./... ok"}`)}); len(got) != 0 {
+	if got := scanCommandNotFound(rawResultRows(`{"text":"go test ./... ok"}`)); len(got) != 0 {
 		t.Fatalf("clean output must yield no hits, got %v", got)
+	}
+}
+
+// TestScanCommandNotFoundIgnoresToolUseRows pins the HARD RULE of the PRD #121 M3
+// widening: the not-found regexes see tool_result rows ONLY. The trace now carries
+// tool_use payloads too, and those hold the command the agent TYPED — which by
+// definition never ran. An agent echoing the phrase must not report a missing tool.
+//
+// This is a regression the widening itself would introduce, not one it inherits, so
+// it is pinned here rather than left to the suppression fixture.
+func TestScanCommandNotFoundIgnoresToolUseRows(t *testing.T) {
+	rows := []store.ListToolTraceForRunRow{
+		traceUse(1, "tu-1", `echo "foo: command not found"`),
+		traceUse(2, "tu-2", `grep -r "zsh: command not found: bar" .`),
+	}
+	if got := scanCommandNotFound(rows); len(got) != 0 {
+		t.Fatalf("tool_use payloads must never be scanned for missing-tool evidence; got %v", got)
 	}
 }
 
 // TestScanCommandNotFoundFiltersNoise: the low-confidence "X: not found" form drops
 // HTTP/line numbers and shared-object/header files but keeps a real missing tool.
 func TestScanCommandNotFoundFiltersNoise(t *testing.T) {
-	payloads := [][]byte{
-		[]byte(`{"text":"/bin/sh: 1: 404: not found"}`),        // numeric → dropped
-		[]byte(`{"text":"ld: libssl.so.1: not found"}`),        // shared lib → dropped
-		[]byte(`{"text":"link error: foo.o: not found"}`),      // object file → dropped
-		[]byte(`{"text":"/bin/sh: 1: shellcheck: not found"}`), // real tool → kept
-	}
+	payloads := rawResultRows(
+		`{"text":"/bin/sh: 1: 404: not found"}`,        // numeric → dropped
+		`{"text":"ld: libssl.so.1: not found"}`,        // shared lib → dropped
+		`{"text":"link error: foo.o: not found"}`,      // object file → dropped
+		`{"text":"/bin/sh: 1: shellcheck: not found"}`, // real tool → kept
+	)
 	got := scanCommandNotFound(payloads)
 	cmds := map[string]bool{}
 	for _, m := range got {
@@ -194,9 +211,9 @@ func TestJudgeClaimCarriesModelAndSignal(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
 	uid, target := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		claimRun:           judgeRun(uid, target),
-		anthropic:          sealedTok,
-		toolResultPayloads: [][]byte{[]byte(`{"text":"bash: shellcheck: command not found"}`)},
+		claimRun:      judgeRun(uid, target),
+		anthropic:     sealedTok,
+		toolTraceRows: rawResultRows(`{"text":"bash: shellcheck: command not found"}`),
 	}
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
@@ -295,7 +312,7 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
 	user, runID := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},         // GetRun + no worker ⇒ no live poller
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},          // GetRun + no worker ⇒ no live poller
 		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
 		userByID:     store.User{JudgeEnabled: true},
 		anthropic:    []byte("sealed"),

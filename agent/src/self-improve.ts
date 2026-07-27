@@ -4,15 +4,20 @@
 // description carries its OWN test-suite evidence (the worker's own proof,
 // alongside uzi's CI which independently verifies it since PRD #52); and it flags
 // changes to guard-critical paths for extra-careful human review. The check
-// evidence + `npm ci` run under the cap-less `runner` uid (PRD #51 M4, buildCheckEnv
-// / prepareCheckDeps below), so a hostile self-improvement change's test code cannot
-// read the worker's 0400 token file — the same-OS-user residual this used to carry
-// is closed for the local (A1) path. The primary directive is untouched — the bot
-// still never merges to main.
+// evidence + the dependency install run under the cap-less `runner` uid (PRD #51 M4,
+// buildCheckEnv below; the install itself is js-deps.ts since PRD #121 M1/M2), so a
+// hostile self-improvement change's test code cannot read the worker's 0400 token
+// file — the same-OS-user residual this used to carry is closed for the local (A1)
+// path. The primary directive is untouched — the bot still never merges to main.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { runnerCommand } from "./runner-uid.js";
+import { buildCheckEnv } from "./sdk-env.js";
+
+// Re-exported so the existing importers (runner.ts, the tests) keep one obvious home for
+// the self-improve check vocabulary; sdk-env.ts is the definition.
+export { buildCheckEnv };
 
 // SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
 // Reusing one branch is what lets an open self-improvement MR be extended (the
@@ -84,9 +89,11 @@ export interface SelfImproveCheck {
 // its toolchain is present in the worker. `go` (and `nodejs`) reach the worker only
 // if the connected uzi repo's tool profile provisions them (PRD #18 devbox tooling,
 // threaded to the checks via buildCheckEnv's toolEnv). With an empty tool profile the
-// Go check honest-skips (ENOENT) and the npm checks depend on prepareCheckDeps having
-// installed node_modules. M9 makes real evidence POSSIBLE; the honest skip (M8) is the
-// fallback whenever a toolchain/dep is genuinely absent — never a false pass/fail.
+// Go check honest-skips (ENOENT) and the npm checks depend on the js-deps installer
+// (PRD #121) having installed node_modules — which now happens BEFORE the agent's
+// first turn as well as before these checks. M9 makes real evidence POSSIBLE; the
+// honest skip (M8) is the fallback whenever a toolchain/dep is genuinely absent —
+// never a false pass/fail.
 //
 // The npm checks declare `requires: "node_modules"`. A fresh clone has none, and
 // running `npm test` there does NOT fail with ENOENT (npm itself exists) — it exits
@@ -132,95 +139,12 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
   return results;
 }
 
-// ─── Check subprocess environment (M9 + audit, security load-bearing) ─────────
-// The checks below (and prepareCheckDeps' `npm ci`) execute AGENT-AUTHORED code as
-// the WORKER uid — worktree test files, package.json scripts, vite/tsc/go test —
-// ENTIRELY OUTSIDE the SDK hook system (guardrails.ts constrains only the AGENT's
-// Bash, not a worker-spawned execFile child). The worker process holds the decrypted
-// forge PAT + Anthropic token, and its env carries the join token
-// (UZI_WORKER_TOKEN[_FILE]) + UZI_API_URL. So a check subprocess gets a SCRUBBED
-// REPLACEMENT env — the same discipline provision.ts uses for nix build hooks — never
-// a process.env spread: the join-token/API vars are ABSENT BY CONSTRUCTION, so
-// agent-authored code cannot read them to impersonate the worker
-// (join token → /api/worker/runs/claim → bot forge PAT + the user's Anthropic token).
-//
-// CLOSED for the local path (PRD #51 M4): the check + `npm ci` subprocesses now run
-// under the cap-less `runner` uid (runnerCommand, below), and the join-token FILE at
-// /run/secrets/worker_token is 0400 worker-owned, so agent-authored test code — even
-// though it executes model-written code the SDK hook system never sees — CANNOT read
-// the worker's token at all. `npm ci` still runs with --ignore-scripts (prepareCheckDeps)
-// as a defense-in-depth REDUCTION of the lifecycle-script code-exec path. What the
-// same-uid residual used to expose (join token → claim → bot forge PAT + the user's
-// Anthropic token) is no longer reachable by these checks on the A1 (root-started) path.
-// On a #58 single-uid (non-root) start there is no split and the checks run as the sole
-// uid (that PRD's accepted posture); the cross-container k8s form is mapped in
-// docs/proc-hardening.md. (This was the same residual class provision.ts documented for
-// build hooks; both are closed together by the M4 spawn-as-runner.)
-
-// buildCheckEnv is the scrubbed replacement env for a check subprocess. PATH comes
-// from the provisioned toolEnv when present (so go/vitest/tsc resolve), else the
-// worker's base PATH; HOME is a writable per-run dir (npm cache/config). Only what the
-// toolchains + npm-over-HTTPS demonstrably need is added — never a worker secret.
-export function buildCheckEnv(
-  source: NodeJS.ProcessEnv,
-  homeDir: string,
-  toolEnv?: Record<string, string>,
-): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
-    // the /nix-bearing runner image PATH under the split (checks run as `runner`), NOT
-    // the worker's stripped PATH. Single-uid (#58): ALSO the image PATH since PRD #120 —
-    // the entrypoint now pins UZI_RUNNER_PATH on both branches, so this no longer inherits
-    // npm's run-script injections (/app/node_modules/.bin et al).
-    PATH: toolEnv?.PATH ?? runnerPath(source),
-    HOME: homeDir,
-    // No interactive prompt if a check shells out to git; not a secret.
-    GIT_TERMINAL_PROMPT: "0",
-  };
-  // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir(source);
-  if (tmp) env.TMPDIR = tmp;
-  // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer
-  // the provisioned value, fall back to the image's; never invent, never carry else.
-  for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"] as const) {
-    const v = toolEnv?.[k] ?? source[k];
-    if (v) env[k] = v;
-  }
-  return env;
-}
-
-// prepareCheckDeps installs node deps so the npm checks can actually run (M9),
-// best-effort. `npm ci --ignore-scripts` in each dir under the SCRUBBED env:
-// --ignore-scripts deletes the lifecycle-script code-exec entry path (a reduction,
-// not a close). On any failure (no registry egress, lockfile drift) it leaves
-// node_modules absent, so the check pre-flight reports an honest "skipped" — never a
-// false pass, never a fabricated failure. Returns per-dir notes for logging only.
-export async function prepareCheckDeps(
-  worktreePath: string,
-  env: NodeJS.ProcessEnv,
-  dirs: string[] = ["web", "agent"],
-  timeoutMs = 10 * 60 * 1000,
-): Promise<{ dir: string; ok: boolean; detail: string }[]> {
-  const out: { dir: string; ok: boolean; detail: string }[] = [];
-  for (const dir of dirs) {
-    const cwd = `${worktreePath}/${dir}`;
-    if (!existsSync(`${cwd}/package.json`)) {
-      out.push({ dir, ok: false, detail: "no package.json" });
-      continue;
-    }
-    // PRD #51 M4: `npm ci` runs agent-authored package.json (even with --ignore-scripts,
-    // the lockfile resolution + any allowed binary) — an untrusted surface, so under the
-    // `runner` uid (setpriv wrapper). Single-uid (#58) runs it directly.
-    const nci = runnerCommand("npm", ["ci", "--ignore-scripts"]);
-    const ok = await new Promise<boolean>((resolve) => {
-      execFile(nci.command, nci.args, { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
-        resolve(!error),
-      );
-    });
-    out.push({ dir, ok, detail: ok ? "npm ci --ignore-scripts ok" : "npm ci failed → checks skip honestly" });
-  }
-  return out;
-}
+// The scrubbed replacement env these checks (and the js-deps install) run under is
+// `buildCheckEnv`, which now lives in sdk-env.ts beside `buildSdkEnv` (PRD #121). It moved
+// there because it is a GENERIC subprocess-env builder with three consumers — these checks,
+// the runner's self-improve block, and the executor's dependency install — and a generic
+// executor should not import a run-kind-specific module to get one. Its security rationale
+// moved with it; read that comment before touching anything that feeds a check subprocess.
 
 // defaultCheckRunner runs a check via execFile under the SCRUBBED env (buildCheckEnv)
 // with a wall-clock cap. It captures only the exit status, never the (potentially

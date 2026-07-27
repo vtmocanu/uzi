@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -58,6 +59,12 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool,
 		`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 2, 'text', $2)`,
 		targetID, []byte(`{"text":"not a tool_result"}`))
+	// A tool_use sibling (PRD #121 M3): the invocation side the widened trace query
+	// exists to reach. Inserted at a HIGHER seq than the tool_result so the ORDER BY
+	// is assertable — under DESC the two swap places.
+	mustExec(ctx, t, pool,
+		`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 3, 'tool_use', $2)`,
+		targetID, []byte(`{"id":"tu-1","name":"Bash","input":{"command":"npm run typecheck"}}`))
 	mustExec(ctx, t, pool, `INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'w', $3)`,
 		workerID, userID, []byte{0x2})
 
@@ -80,10 +87,26 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 		t.Fatalf("a second active judge for the same target must 23505, got %v", err)
 	}
 
-	// ── ListToolResultPayloadsForRun: only the tool_result message ──
-	payloads, err := q.ListToolResultPayloadsForRun(ctx, store.ListToolResultPayloadsForRunParams{RunID: targetID, Lim: 100})
-	if err != nil || len(payloads) != 1 {
-		t.Fatalf("ListToolResultPayloadsForRun = %d rows, %v; want exactly the 1 tool_result", len(payloads), err)
+	// ── ListToolTraceForRun (PRD #121 M3): BOTH tool kinds, the 'text' row excluded,
+	// oldest first. Executing this is the only thing that verifies the query — sqlc
+	// generating cleanly is not a measurement (CLAUDE.md), and the three properties
+	// asserted here are the three a fold can break: the kind filter, the projection
+	// (seq/kind, not just payload), and the ASC ordering suppression depends on.
+	trace, err := q.ListToolTraceForRun(ctx, store.ListToolTraceForRunParams{RunID: targetID, Lim: 100})
+	if err != nil || len(trace) != 2 {
+		t.Fatalf("ListToolTraceForRun = %d rows, %v; want the tool_result + the tool_use, "+
+			"with the 'text' row excluded", len(trace), err)
+	}
+	if trace[0].Seq != 1 || trace[0].Kind != "tool_result" {
+		t.Fatalf("trace[0] = seq %d kind %q; want the OLDEST row first (seq 1, tool_result) — "+
+			"ORDER BY seq ASC is what makes \"X later ran green\" mean anything", trace[0].Seq, trace[0].Kind)
+	}
+	if trace[1].Seq != 3 || trace[1].Kind != "tool_use" {
+		t.Fatalf("trace[1] = seq %d kind %q; want seq 3, tool_use", trace[1].Seq, trace[1].Kind)
+	}
+	if !strings.Contains(string(trace[1].Payload), "npm run typecheck") {
+		t.Fatalf("the tool_use payload must carry the command text (%q) — it is the ONLY place "+
+			"the command exists; tool_result has no command at all", string(trace[1].Payload))
 	}
 
 	// ── trace/review authz: claim the judge run, then the scoped query finds it ──
