@@ -68,6 +68,92 @@
   // output carries the `openssl` CLI; verified `devbox install` at the pinned rev puts
   // /opt/uzi-toolchain/bin/openssl on PATH. (gcc/go/python3 don't hit this — their CLI
   // is in `out`, which IS installed.)
+  //
+  // `file`, `perl` and `coreutils` (2026-07-27) close the three open `install_worker_tool`
+  // judge recommendations that are genuinely missing toolchain. Sweep: all 21 runs via
+  // `uzi review backlog --bucket all` (not truncated), 14 tool groups, 8 still open. Same
+  // "every worker should have it" class as openssl, so they live here, not as tier-2:
+  //   * `file` — artifact validation, asked for by two runs (b64b98f3, 1dfc65b4). The
+  //     fact-checker hex-dumped a PNG header to read magic bytes + IHDR because it had no
+  //     `file`; the lead had to infer shim-vs-real-binary from `head` output. Browser/UX
+  //     verification runs keep needing it.
+  //   * `perl` — one-shot in-place edits (run bedfc75d). A reviewer's mutation sweep hit
+  //     exit 127 on `perl -0pi -e` and recovered via a python3 heredoc. Near-universal
+  //     assumption; cheap to stop being a surprise.
+  //   * `coreutils` — for `fmt` (run c13cff61: two hand-rewrap round-trips on hard-wrapped
+  //     docs under a line-count build gate). nixpkgs ships no standalone `fmt`; GNU
+  //     coreutils is the only source of it.
+  //
+  // COST OF `coreutils`, measured and accepted (owner decision, 2026-07-27). This dir's
+  // profile is FIRST on the agent PATH (/opt/uzi-toolchain/bin), so GNU coreutils SHADOWS
+  // 82 busybox applets — ls, cp, mv, date, sort, stat, head, tail, wc, printf, du, df, … —
+  // for every run in every repo, not just `fmt`. Measured by diffing the built agent
+  // image's /bin + /usr/bin against the coreutils `bin` dir at the pinned rev. GNU is
+  // broadly a superset of busybox but NOT identical (`sort`, `date`, `stat` formats
+  // differ), so a script that silently relied on busybox behaviour can change. If odd
+  // shell breakage appears after this rolls, `coreutils` is the first suspect and the
+  // cheapest of the three to drop — `fmt` is the least valuable of them.
+  //
+  // Verified at the pinned rev before adding (x86_64-linux eval + a live arm64-linux
+  // `devbox install` inside the built agent image, 2026-07-27):
+  //   * meta.outputsToInstall is ["out","man"] / ["out","man"] / ["out"] — all three carry
+  //     `out`, so they do NOT hit the openssl split-output trap above and stay bare attrs.
+  //   * each ships its binary: bin/file, bin/perl, bin/fmt. Exercised from the resulting
+  //     profile: `file --version` → file-5.48, `perl -e` runs, `fmt -w 20` rewraps.
+  //   * all three narinfos are HTTP 200 on cache.nixos.org, so CI's amd64-only kaniko
+  //     build substitutes them rather than compiling.
+  //
+  // NOTE (as load-bearing as the openssl one): write them BARE, never `file@latest`. A
+  // plain `devbox add file perl coreutils` resolves through devbox-search, which pins each
+  // package to ITS OWN nixpkgs revision (measured: file/perl → 7525d999…, coreutils →
+  // 6d120041…) and writes a fat `systems:` block — dragging two EXTRA nixpkgs revisions
+  // into an image whose whole point is one pinned rev. Bare attrs resolve against the
+  // manifest's own nixpkgs input and lock as `source: "nixpkg"` at 20535e48…, matching
+  // every entry above. Add packages by editing this file + `devbox install`, not `devbox add`.
+  //
+  // `kubernetes-helm` + `kubeconform` (2026-07-27, owner decision) give an agent editing
+  // deploy/chart/ a LOCAL gate. uzi ships a 2809-line chart whose only gate today is CI's
+  // `helm_chart` job (.gitlab-ci.yml:374-410 — `helm lint` plus four `helm template` runs
+  // with invariant guards), so a chart edit is committed blind and fails minutes later in
+  // CI. `helm template … | kubeconform -strict` reproduces most of that locally:
+  //   * `kubernetes-helm` — `helm lint` / `helm template` / `helm dependency`. The attr is
+  //     `kubernetes-helm`; the binary it puts on PATH is `helm` (mainProgram).
+  //   * `kubeconform` — offline SCHEMA validation of rendered manifests, the half kubectl
+  //     cannot do without a cluster (`--dry-run=client` is parse-level only;
+  //     `--dry-run=server` needs a live API server).
+  //
+  // KNOWN AND ACCEPTED (owner decision, 2026-07-27): this pinned rev carries helm **4.2.3**
+  // and has no helm-3 attr, while CI pins **3.16.4** (alpine/helm:3.16.4, .gitlab-ci.yml:376).
+  // A local helm run is therefore a SMOKE CHECK, NOT a mirror of the CI gate: a chart edit
+  // that is green locally can still fail `helm_chart`, and the 3→4 breaking-change set has
+  // NOT been enumerated here. CI's helm 3 stays the authority — an agent must not reshape
+  // the chart to satisfy local helm 4 against a red CI job. Second gap: the CI job runs
+  // `helm repo add cnpg` + `helm dependency build`, so any local render needing the CNPG
+  // subchart also needs worker egress to the CNPG chart repo.
+  //
+  // Verified at the pinned rev (2026-07-27): both are single-output (meta.outputsToInstall
+  // == ["out"]), so neither hits the openssl split-output trap above; mainPrograms `helm`
+  // and `kubeconform`; both narinfos are HTTP 200 on cache.nixos.org for x86_64-linux
+  // (79 MiB and 9.1 MiB), so the amd64 kaniko build substitutes rather than compiles.
+  //
+  // NOT added, deliberately:
+  //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
+  //     any cluster by construction: `automountServiceAccountToken: false` at BOTH the
+  //     ServiceAccount (deploy/chart/templates/worker-rbac.yaml) and the pod spec
+  //     (controller/internal/kube/render.go, `automount := false`), and no kubeconfig is
+  //     injected. So only client-side verbs would ever work, and they buy little here —
+  //     `--dry-run=client` is parse-level, this repo has no kustomize overlays, and
+  //     `helm template` + `kubeconform` already cover the ground for 57 MiB less.
+  //
+  // Also NOT added (both are open judge recs; neither is a package problem):
+  //   * `glab` (runs b64b98f3, 1dfc65b4). The forge PAT is never in the agent env by
+  //     construction — see the "PAT handling" directive in agent/src/git.ts and the
+  //     scrubbed replacement env in agent/src/sdk-env.ts (buildCheckEnv) — so an installed
+  //     glab would be an unauthenticated binary against a private GitLab. Giving agents
+  //     forge reads is a credential-exposure design decision, not a toolchain line.
+  //   * `typescript`/`vitest` (runs a6322954, bdc4c634, 95afd872) are repo-pinned dev
+  //     dependencies, not toolchain; baking them would drift from whatever the clone pins.
+  //     PRD #121's agent/src/js-deps.ts installs them from the repo's own lockfile.
   "packages": [
     "go",
     "gcc",
@@ -76,6 +162,11 @@
     "chromium",
     "fontconfig",
     "dejavu_fonts",
-    "openssl.bin"
+    "openssl.bin",
+    "file",
+    "perl",
+    "coreutils",
+    "kubernetes-helm",
+    "kubeconform"
   ]
 }

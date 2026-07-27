@@ -6,6 +6,38 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Five more tools every run can reach: `file`, `perl`, `fmt`, `helm` and `kubeconform`.**
+  The first three close judge recommendations raised by runs that lost work to a missing
+  executable — a fact-checker hex-dumped a PNG header to read its magic bytes because it had
+  no `file`, a reviewer's mutation sweep exited 127 on `perl -0pi -e` and had to be rewritten
+  as a Python heredoc, and a docs run hand-rewrapped the same paragraph twice for want of
+  `fmt`. `helm` and `kubeconform` are new capability rather than repair: an agent editing
+  `deploy/chart/` can now lint, render and schema-validate it in-worker instead of committing
+  blind and learning from CI's `helm_chart` job minutes later. All five ride the same pinned
+  nix/devbox path as the rest of the toolchain and are baked into the image at build time, so
+  they cost no per-run provisioning. Two caveats are worth knowing rather than discovering:
+  `coreutils`, which is where `fmt` comes from, places GNU versions of 82 busybox applets
+  (`ls`, `cp`, `date`, `sort`, `stat`, …) ahead of the image's own on `PATH`; and the pinned
+  nixpkgs revision carries helm 4 while CI gates on helm 3, so a local render is a smoke
+  check and never the authority over a red `helm_chart` job.
+
+### Changed
+
+- **Hosted workers may now reach the CloudNativePG chart repository, at the cost of two
+  general-purpose GitHub hosts.** Rendering uzi's own chart needs `helm dependency build` to
+  fetch the `cluster` subchart, and that fetch redirects twice before it lands: from
+  `cloudnative-pg.github.io` to `cloudnative-pg.io` for the index, then from `github.com` to
+  `release-assets.githubusercontent.com` for the 63 KB tarball. All four names are now in
+  `workers.fqdnEgress.allowFQDNs`, in both the chart default and the dev-cluster values —
+  Helm replaces list values rather than merging them, so an entry added to only one of the
+  two reaches no cluster. The last two names are by a distance the widest entries in that
+  list (any repository, any release asset) on a fence whose stated purpose is the
+  repository-exfiltration residual, so this is a deliberate trade and not an oversight. The
+  same chart is also published as an OCI artifact on `ghcr.io`, which would narrow this to a
+  registry carrying no repository or code access if the `Chart.yaml` change proves worth it.
+
 ## [0.11.10] - 2026-07-27
 
 ### Fixed
