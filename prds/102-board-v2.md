@@ -655,7 +655,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 
 **Phase 3 — non-PRD issues**
 
-- [ ] **M6 — Non-PRD issues visible, off by default**: `State` added to
+- [x] **M6 — Non-PRD issues visible, off by default**: `State` added to
       `ListIssuesOptions` and both drivers, defaulting to today's `all`
       (Decision 10); an additive `state=opened`, no-label fetch in
       `FullSync`/`IncrementalSync` (Decision 9); eviction keep-set unioned
@@ -675,7 +675,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       under each fetch failing independently. The stale-doc sweep
       (below) lands here.
 
-- [ ] **M6-docs — Stale-doc sweep** (review S10): M6 invalidates prose
+- [x] **M6-docs — Stale-doc sweep** (review S10): M6 invalidates prose
       and code comments beyond `Board.tsx:368`. Correct, in the same MR:
       `docs/board.md` intro + the whole "Why only some issues show up"
       section (`:128-135`) + the "Staying in sync" prose (`:120-122`,
@@ -686,7 +686,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       "state=all is mandatory" driver comments (`gitlab.go:249-250`,
       `forgejo.go:303-304`) that Decision 10 invalidates.
 
-- [ ] **M7 — Verified end to end**: a fresh repo connection seeds the new
+- [~] **M7 — Verified end to end**: a fresh repo connection seeds the new
       columns and labels; `vtmocanu/uzi`'s own board is migrated by hand per
       M3 with cards keeping their placement; ordering, the non-PRD toggle,
       and Promote behave on a real board **on k8s** (per CLAUDE.md, k8s is
@@ -696,8 +696,35 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       `state` list param and the harness must tolerate two list calls per
       sync cycle (its eviction/race assumptions at `run-e2e.sh:239-256`
       are sensitive to sync shape).
+    - **PARTIAL at MR time (2026-07-28). The e2e half is DONE; the k8s half
+      is structurally out of reach before merge and is the only milestone
+      not closed.**
+    - **Done**: the fake forge now honours `state` **and `labels`** — it
+      ignored *both*, and its comment claiming "the caller filters by label"
+      was false, which mattered because against it the Decision 11 union
+      keep-set was trivially correct (both fetches returned the same set).
+      `./e2e/run-e2e.sh` green at `fb9d89da`: exit 0, the terminal
+      `tearing down (down -v)` line, 204 PASS / 0 FAIL, **8m02s**.
+      `scripts/smoke.sh` green in an isolated project.
+    - **Not done**: validation on dev-cluster. Deployment there is GitOps
+      via ArgoCD from a `v*` tag, so it cannot happen until this branch
+      merges and is released. It is a post-merge step, not a skipped one.
+    - **Also not covered**, stated so the green is not read as wider than it
+      is: e2e never calls `PUT /repos/{id}/board/order` and holds no
+      `board_position` reference, and every board assertion selects by
+      `.iid==$iid` — order-independent. **A wrong `ORDER BY` would not have
+      failed that run.** e2e proves M5 broke nothing; the freeze itself is
+      covered by the live-DB sweep and vitest, both mutation-verified. The
+      harness also seeds no non-PRD issue (`makeIssue` defaults `labels` to
+      `["PRD"]`), so the union's *discriminating* case rests on the Go
+      tests. A board-order phase and a non-PRD fixture are the two things
+      that would close it.
+    - **Citation drift**: the `run-e2e.sh:239-256` anchor above is stale —
+      that range is the cleanup/`KEEP_STACK` block. The real sites are
+      ~2205 (reconcile cadence) and ~2462-2472 (the FullSync-eviction
+      dedup assertion).
 
-- [ ] **M-specs — specs/ai.md updated** (review S1): the repo's specs
+- [x] **M-specs — specs/ai.md updated** (review S1): the repo's specs
       contract requires an AI-decisions record. M2 falsifies
       `specs/ai.md:1528` ("Board order everywhere: In Progress, Human
       Review, Upcoming, Later" — cited as `:1514` until 2026-07-27, which
