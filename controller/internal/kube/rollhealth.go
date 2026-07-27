@@ -46,10 +46,17 @@ import (
 // ============================================================================
 //
 // The worker container has NO readiness probe — MEASURED on the live Deployment,
-// `readinessProbe: null`, only the dind sidecar carries a StartupProbe. So `Ready`
-// means the kubelet started the process, not that the agent works. A container that
-// starts, dies 40 seconds later and repeats is Ready for most of every cycle, and the
-// unguarded early return therefore reported `settled` on those ticks. Two symptoms
+// `readinessProbe: null`; the only probes anywhere under controller/ are two dind
+// StartupProbes (one on the `dind` sidecar, one on the `dind-init` init container). So
+// `Ready` means the kubelet started the process, not that the agent works.
+//
+// A container that starts, dies ~40s later and repeats is Ready on a SUBSTANTIAL
+// MINORITY of ticks — MEASURED at 41 of 133 samples (31%), and it DECAYS as kubelet's
+// backoff grows: 100% Ready at 0 restarts, 78% at 1, 58% at 2, 44% at 3, 30% at 4, 19%
+// at 5, 10% at 6. (An earlier version of this banner said "Ready for most of every
+// cycle", which is true only for the first two cycles and false in aggregate.) 31% is
+// still ample: the unguarded early return reported `settled` on every one of those
+// ticks, and a badge only has to be wrong sometimes to be untrustworthy. Two symptoms
 // from that one line: the badge alternated settled/stuck every ~40s, and — since a
 // `settled` report returns before the blocking-container lookup below — the report
 // carried zeroed diagnostics that overwrote the real ones, so a worker with 5 restarts
@@ -62,13 +69,22 @@ import (
 // THE OBVIOUS ALTERNATIVE WAS MEASURED AND DOES NOT WORK. The rule first proposed for
 // this was "pod Ready + the worker's own heartbeat says offline, after the register
 // convergence grace". Measured over 123 samples of a real crash-looping pod it fired
-// ZERO times, because the two signals are anti-correlated BY CONSTRUCTION: Ready means
-// the container is Running, the container dies with the agent, so the agent is alive
-// and beat within its 15s interval — it cannot be offline while Ready. (Second,
-// independent reason: PhaseSince is the Ready condition's LastTransitionTime, which
-// RESETS on every restart, so "after the grace elapsed" is never true for a flapping
-// pod.) Do not reach for the heartbeat here; it also does not belong in this module,
-// which reads pods and must not read api state.
+// ZERO times, because the two signals are anti-correlated: Ready means the container is
+// Running, the container dies with the agent, so the agent is alive and beat within its
+// 15s interval — it cannot be offline while Ready. (Second, independent reason:
+// PhaseSince is the Ready condition's LastTransitionTime, which RESETS on every restart,
+// so "after the grace elapsed" is never true for a flapping pod. That one holds
+// unconditionally.)
+//
+// ⚠ THE ANTI-CORRELATION IS NOT UNCONDITIONAL, and an earlier version of this banner
+// said "by construction" without saying so. The measurement's heartbeat half is a MODEL
+// — the sampled pod was a busybox flapper, not the agent — and it depends on the worker
+// registering fast enough to beat the 45s stale threshold. Measured at 1.9s, bounded at
+// ~32s by `UZI_DOCKER_READY_TIMEOUT` (default 30s), which is ENV-TUNABLE AND PINNED BY
+// NOTHING. Raise it above 45s and the anti-correlation weakens and this advice expires.
+// So: do not reach for the heartbeat here — but if you are here because that timeout
+// moved, the reasoning above is what to re-derive. It also does not belong in this
+// module regardless, which reads pods and must not read api state.
 
 const (
 	// stuckRestartThreshold is when repeated restarts alone mean stuck, with no
@@ -415,8 +431,15 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // from a real crash-looping pod, EIGHT carried no lastState at all — four were before
 // the first restart (correct), but the other four were one entire container instance
 // with restartCount 6 and `"lastState": {}`. A rule needing finishedAt would have been
-// BLIND for that instance's whole Ready window, and the other six instances populated
-// it, so no amount of reading kubelet's documented behaviour would have shown this.
+// BLIND for that instance's whole Ready window.
+//
+// Counted by INSTANCE rather than by sample: seven running instances, of which FIVE
+// populated lastState, one (restartCount 0) was correctly empty because nothing had
+// died yet, and one (restartCount 6) was the anomaly. So six of seven BEHAVED AS
+// EXPECTED — which is not the same as "six populated it", the claim an earlier version
+// of this comment made; that phrasing double-counts the restartCount-0 instance, whose
+// emptiness this very paragraph depends on being correct. Either way, no amount of
+// reading kubelet's documented behaviour would have shown this.
 // state.running.startedAt is present on every running container by construction and
 // says the same thing one step removed. Do not "simplify" it back.
 //
@@ -464,6 +487,13 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // does not carry through either, for the same reason. Do not read this function's choice
 // as the one an operator sees: the verdict and the subject are computed from two
 // different containers by construction.
+//
+// The divergence runs BOTH ways, so neither container is the guaranteed subject. This
+// function answers WHETHER (first container flapping now); the fall-through answers WHO
+// (highest LIFETIME count). A flapping dind beside a quiet-but-worn worker names the
+// worker, as measured; a flapping worker beside a dind with more lifetime restarts that
+// has been up past flapWindow names the dind. Both are the same #159 defect from
+// opposite ends.
 //
 // TRACKED AS ISSUE #159, deliberately not fixed here — it changes rendered output on a
 // path no measurement covers, so it wants its own fixture and its own measurement. Note

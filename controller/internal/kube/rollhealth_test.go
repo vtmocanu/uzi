@@ -638,10 +638,12 @@ func runningFor(p *corev1.Pod, container string, restarts int32, up time.Duratio
 // Issue #145 — A READY POD IS NOT SETTLED WHILE A CONTAINER IS FLAPPING.
 //
 // The worker container has no readiness probe, so `Ready` means the kubelet started the
-// process, not that the agent works. A container that starts, dies 40s later and repeats
-// is Ready for most of every cycle, so the unguarded early return reported `settled` on
-// those ticks — the badge alternated, and because `settled` returns BEFORE the
-// blocking-container lookup the report carried zeroed diagnostics over the real ones.
+// process, not that the agent works. A container that starts, dies ~40s later and
+// repeats is Ready on 31% of ticks — MEASURED, 41 of 133 samples, and decaying from 100%
+// at 0 restarts to 10% at 6 as kubelet's backoff grows. The unguarded early return
+// reported `settled` on every one of those, so the badge alternated; and because
+// `settled` returns BEFORE the blocking-container lookup, the report carried zeroed
+// diagnostics over the real ones.
 //
 // Each case below is here because a WRONG implementation passes the others:
 //
@@ -657,9 +659,12 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 
 	// --- 1. THE DEFECT. Ready, 5 restarts, this instance up 30s. ---
 	//
-	// 30s because that is the shape measured live: `sleep 40; exit 1` is Ready for most
-	// of each cycle. Any value well inside flapWindow does; the point is that the
-	// container came up recently and has died repeatedly.
+	// 30s because that is the live shape: the sampled flapper ran `sleep 40; exit 1`, so
+	// a fresh instance sits ~30s into its life on the Ready ticks. Any value well inside
+	// flapWindow does; the point is that the container came up recently and has died
+	// repeatedly. (Not "Ready for most of each cycle" — measured, it is Ready on 31% of
+	// ticks overall and less as the backoff grows. The fixture is unaffected; only the
+	// justification was overstated.)
 	pod := ready(runningFor(workerPod("w1", want, 20*time.Minute), "worker", 5, 30*time.Second, exit1, false),
 		testNow.Add(-30*time.Second))
 	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
