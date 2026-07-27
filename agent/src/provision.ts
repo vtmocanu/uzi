@@ -22,8 +22,8 @@
 // run in this scrubbed env). CORRECTION (2026-07-25, PRD #123 §6): this line used to claim
 // the allowlist bounds them full stop. It does not. Under `repo_devbox_opt_in` the tier-2
 // list comes from the CLONED REPO's devbox.json and is filtered by SHAPE ONLY — no
-// allowlist, and no `toolprofile.Denied()`, so the 18 credential-bearing CLIs that check
-// exists to bar (toolprofile.go:66-72) install unimpeded. The worker cannot do better today:
+// allowlist, and no `toolprofile.Denied()`, so the 20 credential-bearing CLIs that check
+// exists to bar (toolprofile.go:66-80) install unimpeded. The worker cannot do better today:
 // ClaimConfig ships it no rule set (workersvc/claim.go:160-183). PRD #123 M1b closes it.
 // Stated plainly because this sentence is the recorded mitigation for the residual above.
 // On a #58 single-uid (non-root) start there is no split and the hook runs

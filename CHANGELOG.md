@@ -50,6 +50,14 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   reports is `aws`, so a name comparison would have covered `glab` and quietly missed the
   whole cloud-CLI half of the list.
 
+- **Two password-manager CLIs an admin could allowlist are now barred, as was always
+  intended.** The list of credential-bearing tools that may never be installed carried
+  entries for `op` and `bw`, which are not real package names and therefore matched
+  nothing — the 1Password and Bitwarden CLIs have been installable the whole time. The
+  real names are now on the list. Nothing in the live allowlist or any repo's tool
+  profile named either, so no existing configuration is affected; a repo that adds one
+  from today will have its request rejected rather than silently ignored.
+
 ## [0.11.12] - 2026-07-27
 
 ### Fixed

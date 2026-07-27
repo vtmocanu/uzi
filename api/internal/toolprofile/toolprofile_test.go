@@ -1,7 +1,10 @@
 package toolprofile
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -173,13 +176,17 @@ func TestDeniedExecutablesCoverDenylist(t *testing.T) {
 	}
 }
 
-// TestDeniedExecutablesAreNotInstallablePackages is the assertion that catches the
-// `fly` defect: flyctl symlinks its binary to `fly`, but nixpkgs `fly` is the
-// Concourse CI client — a different, NOT-denylisted, installable tool. Listing the
-// alias made an installable package's CLI permanently unreportable.
+// TestDeniedExecutablesAreNotInstallablePackages is a REGRESSION PIN for the `fly`
+// defect, not a guard — the distinction matters and the first version of this comment
+// blurred it. flyctl symlinks its binary to `fly`, but nixpkgs `fly` is the Concourse CI
+// client: a different, NOT-denylisted, installable tool whose CLI the alias made
+// permanently unreportable.
 //
-// The rule: a suppressed executable may share a name with a package only if that
-// package is itself denied. Anything else suppresses something someone can install.
+// It cannot DISCOVER a collision, only re-catch the one already found: with `fly`
+// removed, zero entries below are reachable from deniedExecutableSet, so the loop's
+// true branch never fires today. Verified live — re-adding `fly` to flyctl's list
+// reddens it. Keep it for that, and read the next test for the check that is actually
+// data-driven.
 func TestDeniedExecutablesAreNotInstallablePackages(t *testing.T) {
 	for exec := range deniedExecutableSet {
 		if knownInstallablePackages[exec] && !denylist[exec] {
@@ -190,11 +197,51 @@ func TestDeniedExecutablesAreNotInstallablePackages(t *testing.T) {
 }
 
 // knownInstallablePackages are nixpkgs attribute names that collide with an executable
-// some denylisted package installs. Hand-maintained and deliberately short: it exists
-// to pin collisions we have actually found, not to mirror nixpkgs. Verified at the rev
+// some denylisted package installs. Hand-maintained and deliberately short: it pins
+// collisions already found, and makes no claim to mirror nixpkgs. Verified at the rev
 // agent/devbox-global/devbox.lock pins.
 var knownInstallablePackages = map[string]bool{
 	"fly": true, // "Command line interface to Concourse CI" - NOT flyctl
+}
+
+// TestDeniedExecutablesDoNotShadowTheBakedToolchain is the data-driven half. Rather
+// than a list someone must think to update, it reads the packages actually baked into
+// every worker image and asserts none of them is suppressed.
+//
+// Why this one bites when the pin above cannot: the baked manifest changes for its own
+// reasons — five packages were added to it the same day this test was written — so a
+// future collision arrives WITHOUT anyone editing this file, which is exactly the case
+// a hand-maintained list misses. If the toolchain ever bakes a tool whose name collides
+// with a denied CLI, a genuine missing-tool finding for it would be unreportable.
+func TestDeniedExecutablesDoNotShadowTheBakedToolchain(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "agent", "devbox-global", "devbox.json"))
+	if err != nil {
+		t.Fatalf("read baked toolchain manifest: %v", err)
+	}
+	// devbox.json is HuJSON (it carries // comments), so pull the packages array by
+	// shape rather than unmarshalling.
+	m := regexp.MustCompile(`(?s)"packages"\s*:\s*\[(.*?)\]`).FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("could not find the packages array in devbox.json — did its shape change?")
+	}
+	body := regexp.MustCompile(`//[^\n]*`).ReplaceAll(m[1], nil)
+	pkgs := regexp.MustCompile(`"([^"]+)"`).FindAllSubmatch(body, -1)
+	if len(pkgs) < 5 {
+		t.Fatalf("parsed only %d baked packages — the scan is probably broken, not the manifest", len(pkgs))
+	}
+	for _, p := range pkgs {
+		name := string(p[1])
+		// A baked package name may carry an output suffix (`openssl.bin`, `file.out`);
+		// the executable is what collides, so compare on the base attr too.
+		base := name
+		if i := strings.IndexByte(base, '.'); i > 0 {
+			base = base[:i]
+		}
+		if deniedExecutableSet[name] || deniedExecutableSet[base] {
+			t.Errorf("baked toolchain package %q collides with a suppressed executable: "+
+				"a genuine missing-tool finding for it could never be reported", name)
+		}
+	}
 }
 
 // TestDeniedExecutableCoversDivergentNames is the case a name-equality check fails.

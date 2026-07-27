@@ -152,15 +152,28 @@ var deniedExecutableSet = func() map[string]bool {
 // ALLOWLIST path, so observing it missing there is the policy working rather than a
 // gap to report.
 //
-// SCOPE, stated precisely because the obvious stronger claim is false. Denied() has
-// exactly one call site — the admin allowlist-write handler — so it bounds tier-1
-// only. The tier-2 path (a cloned repo's own devbox.json under repo_devbox_opt_in) is
-// filtered by SHAPE ONLY and consults neither the allowlist nor Denied(), so a repo
-// that opts in CAN install these. See the dated correction at agent/src/provision.ts
-// (PRD #123 §6), which retracted exactly this over-claim. The residual: if a tier-2
-// install of such a tool fails, the run really is missing something it was meant to
-// have and this suppression hides it. Narrow, accepted, and recorded rather than
-// discovered later.
+// SCOPE, stated precisely because the obvious stronger claim is false. The denylist is
+// enforced on the TIER-1 path at three points — the admin allowlist write (via Denied),
+// and profile save + claim assembly (via Resolve → Allowed, which reads the denylist map
+// directly at :213). It is NOT consulted on the tier-2 path: a cloned repo's own
+// devbox.json under repo_devbox_opt_in is filtered by SHAPE ONLY, so a repo that opts in
+// CAN install these. See the dated correction at agent/src/provision.ts (PRD #123 §6),
+// which retracted exactly this over-claim.
+//
+// (An earlier draft of this note said Denied() has "exactly one call site" and inferred
+// tier-1 was bounded only at the allowlist write. The call-site count was right and the
+// inference wrong — Allowed() reads the map without going through Denied, so a
+// grandfathered allowlist row still cannot pass a denied package at claim time.)
+//
+// The residual: if a tier-2 install of such a tool fails, the run really is missing
+// something it was meant to have and this suppression hides it. Not theoretical —
+// vtmocanu/uzi itself has repo_devbox_opt_in true. Narrow, accepted, recorded.
+//
+// SECOND RESIDUAL, from the basenaming below: a repo-local script sharing a name with a
+// denied CLI (`./scripts/vault`, `tools/op`) is suppressed too. Path forms were the
+// bypass basenaming exists to close, so this is deliberate — a denied CLI leaking past
+// the filter is worse than a repo script going unreported — but it is a real widening
+// and not a corner case.
 //
 // Distinct from Denied, which takes a PACKAGE name. Callers that observe shell output
 // (the judge's command-not-found scan) want this one.

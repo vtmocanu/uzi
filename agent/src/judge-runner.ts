@@ -76,12 +76,14 @@ CRITICAL SAFETY RULES:
 Produce a verdict and recommendations. A recommendation's "category" is one of exactly:
 - enable_tool          — an existing tool/skill that should have been enabled
 - install_worker_tool  — a missing worker tool/executable to install (name it in "target").
-                         NEVER use this for a credential-bearing CLI: glab, gh, hub, tea, aws, az,
-                         gcloud, gsutil, bq, sam, oci, doctl, flyctl, heroku, vault, op, bw. Those are
-                         barred by policy — a logged-in one reachable from the agent's shell would
-                         defeat the rule that the worker holds the forge credential and the agent does
-                         not — so recommending their installation is never actionable. If the run lost
-                         effort reaching for one, that is a PROMPT or ROSTER defect: report it as
+                         NEVER use this category for these credential-bearing CLIs:
+                         aws, aws_completer, az, bq, bw, docker-credential-gcloud, doctl, flyctl,
+                         gcloud, gh, git-credential-gcloud.sh, glab, gsutil, heroku, hub, kubelogin,
+                         oci, op, sam, tea, vault.
+                         They are barred by policy — a logged-in one reachable from the agent's shell
+                         would defeat the rule that the worker holds the forge credential and the agent
+                         does not — so recommending their installation is never actionable. If the run
+                         lost effort reaching for one, that is a PROMPT or ROSTER defect: report it as
                          adjust_template or improve_agent, naming what should have told the agent the
                          tool is unavailable.
 - adjust_template      — an agent template or prompt to adjust (name the template in "target")

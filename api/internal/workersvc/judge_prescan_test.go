@@ -635,8 +635,12 @@ func TestScanSuppressesDenylistedCLIsInPathForm(t *testing.T) {
 			t.Errorf("path-form denied CLI leaked through as %q (got %v)", c, cmds)
 		}
 	}
-	// The ordinary tool must still be reported, path form and all.
-	if len(cmds) == 0 {
-		t.Errorf("the non-denied path-form miss should still be reported, got %v", cmds)
+	// The ordinary tool must still be reported — and reported as `jq`, NOT `/usr/bin/jq`.
+	// Asserting the VALUE rather than the count is deliberate: a count-only assertion
+	// passed while the candidate carried the full path, which put a path in the
+	// recommendation target (the coordinate the cross-run backlog dedupes on) and let one
+	// tool occupy two candidate slots when a run hit both the bare and path forms.
+	if !slices.Contains(cmds, "jq") {
+		t.Errorf("the non-denied path-form miss must be reported basenamed as \"jq\", got %v", cmds)
 	}
 }

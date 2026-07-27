@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path"
 	"regexp"
 	"strings"
 
@@ -145,9 +146,22 @@ func payloadText(p []byte) string {
 }
 
 // normalizeCommandToken trims whitespace and surrounding quotes off a flagged
-// executable name, the way the scan has always keyed its dedupe map.
+// executable name, then reduces it to its BASENAME.
+//
+// The basename is not cosmetic. reExecNotFound captures `/` and `.`, so Go's
+// exec.LookPath error arrives as a full path, and without this the scan carried it
+// through in two damaging ways: the recommendation's target became `/usr/bin/jq`
+// rather than `jq` — and `(category, target)` is the coordinate the cross-run backlog
+// dedupes on, so the same tool split into separate rows per invocation path — and the
+// `seen` map keyed on the raw token, so one run hitting both `jq: command not found`
+// and `exec: "/usr/bin/jq"` produced TWO candidates for one tool, consuming two of the
+// judgeMissCandidateCap slots.
 func normalizeCommandToken(cmd string) string {
-	return strings.Trim(strings.TrimSpace(cmd), `"'`)
+	trimmed := strings.Trim(strings.TrimSpace(cmd), `"'`)
+	if trimmed == "" {
+		return ""
+	}
+	return path.Base(trimmed)
 }
 
 // scanCommandNotFound flags missing-executable evidence in a run's tool_result
