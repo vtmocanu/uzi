@@ -1752,6 +1752,72 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     );
   });
 
+  it("carries the install's per-dir facts into the FIRST implement prompt (#157)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [assistantText("implementing"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [
+        { dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" },
+        { dir: "agent", manager: "npm", ok: false, detail: "npm ci --ignore-scripts failed (exit 1)" },
+      ],
+      truncated: false,
+    });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+
+    // Turn 1 is the plan turn: mechanism only, and it cannot know the outcome.
+    assert.match(turns[0]!.promptText!, /do NOT put a manual/);
+    assert.ok(!/deps_dirs_/.test(turns[0]!.promptText!), "the plan turn is built before the join, so it has no facts to give");
+    // Turn 2 is the first implement turn: the real per-dir outcome, failure included.
+    assert.match(turns[1]!.promptText!, /installed:\n1\. web/);
+    assert.match(turns[1]!.promptText!, /failed:\n2\. agent/);
+    // Turn 3 is a later implement turn on a resumed session — it must not repeat.
+    assert.ok(!/deps_dirs_/.test(turns[2]!.promptText!));
+  });
+
+  it("tells the agent when discovery was TRUNCATED, so the list cannot read as exhaustive (#157 audit)", async () => {
+    // joinDepsInstall used to return only `results`, dropping `truncated` on the floor —
+    // so a repo past MAX_PROJECT_DIRS got a note that read as full coverage, recreating
+    // the unexplainable `command not found` this change exists to remove.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [{ dir: "web", manager: "npm", ok: true, detail: "ok" }],
+      truncated: true,
+    });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.match(turns[1]!.promptText!, /NOT the complete set of JS projects/);
+  });
+
+  it("the facts are still correct after a plan REVISION (#157)", async () => {
+    // gatePlan can be re-entered, and each round runs another planning turn. The join
+    // happens after the LAST round, so the implement prompt must carry the final
+    // outcomes — not something captured at the first gate.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [{ dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" }],
+      truncated: false,
+    });
+    const probe = makeCtx({}, [{ kind: "revise", feedback: "add a rollback step" }, { kind: "approve", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+
+    assert.strictEqual(turns.length, 3, "expected plan, revision, then one implement turn");
+    // The REVISION turn is still a planning turn, riding a resumed session that already
+    // carries the mechanism note — so it must not be handed facts it cannot have yet.
+    assert.ok(!/deps_dirs_/.test(turns[1]!.promptText!), "the revision turn runs before the join");
+    assert.match(turns[2]!.promptText!, /1\. web/, "the implement turn after a revision must still get the facts");
+  });
+
   it("is best-effort: a failed install does NOT fail the run, and the skip is reported honestly", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
