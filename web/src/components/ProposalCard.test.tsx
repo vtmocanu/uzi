@@ -35,6 +35,28 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124, item 9. Every field here is model-generated. The existing suite pins that
+// they are INERT (no anchors); this pins that they are also not REORDERABLE, which escaping
+// does not give you. Confirm/dismiss post `proposal.id`, so the raw values still round-trip.
+describe("ProposalCard — model text carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters from title, description and repo path", () => {
+    const { container } = render(
+      <ProposalCard
+        chatId="chat-1"
+        proposal={aProposal({
+          title: "Add a \u202Emetrics dashboard",
+          description: "The judge \u202Eapproved this\u200B sketch.",
+          repo_path: "grp/\u200Bproj",
+        })}
+      />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Add a metrics dashboard")).toBeTruthy();
+    expect(container.textContent).toContain("The judge approved this sketch.");
+    expect(screen.getByText("grp/proj")).toBeTruthy();
+  });
+});
+
 describe("ProposalCard — model text is inert (Decision 8)", () => {
   it("renders a link-bearing description as plain text, never as an anchor", () => {
     const { container } = render(

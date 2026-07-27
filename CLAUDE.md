@@ -103,6 +103,10 @@ npx vitest run src/pages/Foo.test.tsx      # single file
 npm run build                              # runs check-docs + tsc --noEmit + vite build
 ```
 
+**A NON-MOCK `vite dev` OR `vite preview` OF THIS REPO TALKS TO YOUR LIVE STACK.** `web/vite.config.ts` sets `server.proxy` for `/api` → `http://127.0.0.1:8080`, and there is no `preview` override, so **`vite preview` inherits it** — the same proxy the dev loop wants is a live wire to `uzi-web-1` and the real database behind it. Measured 2026-07-27 while browser-verifying #124: the first page load of a preview build fired `GET /api/auth/me` at the real stack and got a 401 carrying nginx headers and the production CSP. That run was harmless because this app only GETs on mount, but that is a property of today's app, not of the technique — **a page that POSTs on mount would have written to real uzi.** Same class as the "never run a bare `docker compose up` for smoke purposes" rule above, arriving through a config file nobody reads instead of through an env var.
+
+Mitigations, in order of preference: run with `VITE_UZI_MOCK=1`, which replaces `api` wholesale so the app makes **no** network calls at all; or, when you specifically need the shipped `realApi` path (browser-level response interception is the only honest way to test a client-side transform — a mock fixture exercises `mockApi`, which is the code you are not shipping), **register every interception route BEFORE the first `open`**. Two things that bite there: route precedence is not last-registered-wins, so `unroute` a broad pattern rather than layering a narrow one over it; and stub `/api/repos`, `/api/forge/connections` and `/api/runs` as well as the endpoint under test, or their 401s trip the global logout redirect and bounce you to `/login` before the surface renders.
+
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
