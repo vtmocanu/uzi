@@ -879,9 +879,19 @@ the only one the fake can express.
 1. **Which component owns this value?** If it is not the one you are reading it from, you have a
    derived path. Ask it about the *write*, not the read: the owner is whoever last set it, and if
    that write happens after your read, the value cannot exist yet.
-2. **If the authoritative field were wrong, would any test notice?** If nothing reads it, nothing
-   pins the fake either — so the absence of a failing test is not evidence here, it is the
-   precondition.
+2. **If the authoritative field were wrong, would any test notice?** 🔴 **Read the whole
+   mechanism before deleting this one — it is not a paradox and it is not rhetoric.** A test can
+   only fail on a field something reads. Nothing read `/state`'s response body, so nothing
+   constrained the fake's answer, so the fake was free to answer `{}` — and the suite was green
+   *because* the field was unread, not despite it. **The green was CAUSED by the gap it was
+   being read as ruling out.** So on a field nobody consumes yet, "no test fails" is the
+   precondition for the bug rather than evidence against it, and the only way to learn anything
+   is to make something read the field.
+
+Sits with its neighbours on purpose: **TYPECHECK the mutated tree**, **Mutate at the CALL
+SITE**, and **An assertion defines its CHANNEL** are all the same family — a green or a red that
+measures the instrument instead of the code. This one is the case where the instrument was never
+pointed at the value at all.
 
 **Corollary, and it has a specific trigger: the moment a previously-ignored field becomes
 load-bearing, audit every fake of that endpoint IN THE SAME COMMIT.** Leniency that was free
@@ -1038,9 +1048,23 @@ person best placed to notice their own instance of it.
   own instance only because a mechanical re-screen was already running for another reason.
 - The lead prescribed an **uncompilable mutation twice — the second time inside the correction
   of the first**, by which point the failure mode was known.
+- *(PRD #35, 2026-07-27 — a later branch, same shape, added because leaving it out would be
+  selecting evidence in the section about not doing that.)* The lead ruled an `attempt` key out
+  of a feed payload and justified it with *"the rows are already distinguished by `resets_at`,
+  which differs per park **by construction**"* — about a field that is **conditionally absent**
+  (omitted when the reset is unknown, which is exactly the case the exponential fallback exists
+  for), **having been told in the same report that unknown keys are omitted rather than
+  nulled**. The property was read off the case where the field is present rather than off the
+  thing that owns it. Caught by the architect. **The ruling was right and only its justification
+  was false, which is the more dangerous half**: the lead was simultaneously asking for that
+  justification to be recorded *as reasoning others should rely on*, and had spent the same
+  session correcting this exact move in three other agents.
 
-**Four for four, and the tally includes whoever is reading this.** The fix is never "be more
-careful": it is a mechanism that does not depend on the author noticing.
+**Four for four ROLES — and the lead accounts for three of the six entries.** That is the
+opposite of what seniority predicts, and it is the finding: **holding a rule and applying it to
+yourself are separate skills**, so position in the loop is not protection. The tally includes
+whoever is reading this. The fix is never "be more careful": it is a mechanism that does not
+depend on the author noticing.
 
 **A second, distinct shape — the true local fact that ends the search.** Three times one
 validator stated something correct about the thing in front of it and stopped, because a true
