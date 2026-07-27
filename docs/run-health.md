@@ -24,6 +24,10 @@ from when the flag was raised, not from when the run started.
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 
+**A run paused on an Anthropic usage limit never gets one of these flags,
+even after hours.** It isn't stuck — see
+[Paused on a usage limit](run-limit-wait.md) for that state.
+
 ## This is an early-warning aid, not a guardrail
 
 A flag never stops, kills, or requeues a run — `RUN_TIMEOUT` and the
@@ -46,3 +50,5 @@ setting it to `0`, from **Admin → Instance settings → Run health** — see
 [Admin settings](./admin-settings.md#run-health). The loop-detection window
 itself (how many repeats, over how large a window) isn't tunable; only the
 time-based signals are.
+
+Related: [Paused on a usage limit](run-limit-wait.md) · [Why was my run stopped automatically?](run-auto-stopped.md) · [Configuration](configuration.md)
