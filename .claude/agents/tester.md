@@ -157,7 +157,14 @@ Gate slots, per component. Everything not listed as a command genuinely does not
 exist here yet — see PRD #103, which builds them.
 
 ```
-format         none (gap)          # gofmt -l ./api reports 26 drifted files today
+format         none (gap)          # gofmt -l ./api reports PRE-EXISTING drift; run it for
+                                   # the current list. Do NOT record a count here: it read
+                                   # 26, then 25, then 19, and a stale present-tense tally
+                                   # is read as a fact about today. The check that matters
+                                   # is `comm -12` between gofmt -l and YOUR commit's file
+                                   # list being EMPTY. (Corrected 2026-07-27: this line
+                                   # said "reports 26 drifted files today"; a tester
+                                   # measured 19 and correctly flagged the "today".)
 lint           none (gap)          # no golangci-lint, no eslint; `go vet` runs in CI only
 typecheck      cd web && npm run typecheck
                cd agent && npm run typecheck

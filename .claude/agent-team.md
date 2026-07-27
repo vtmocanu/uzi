@@ -711,6 +711,159 @@ implementation, and beat it where we can. Reviewer and fact-checker
 cross-check our work against these; verify "we do it better than X" claims
 against the actual submodule code, not from memory.
 
+## Two negative results from instruments that share an assumption are ONE negative result
+
+**A search that comes back empty is evidence only if it could have come back full.** Running a
+second search and getting empty again feels like corroboration and usually is not: if both
+searches are shaped by the same guess about naming, they fail together, and their agreement
+measures the guess rather than the code.
+
+Measured 2026-07-27, and it nearly shipped a false security invariant. An auditor ruled a field
+safe on the premise that one query was the only one listing a table, having run:
+
+- `grep -rn "ListWorkers" queries/*.sql` — but the counterexample is `ListAllWorkers`, which
+  **does not contain the substring `ListWorkers`**. The search was structurally incapable of
+  returning it, and its two-line output was read as an enumeration.
+- `grep -rln "WorkerDTO\|Worker\b" pages/Admin*.tsx` — wrong twice over: the type is
+  `AdminWorkerDTO`, and the admin list is not on an `Admin*.tsx` page at all.
+
+Two empty results, each shaped by a different guess about naming, treated as agreement. The
+premise was false: an admin route renders every user's row, so the "safe" field was the only
+cross-principal sink in the batch. It was caught because the agent asked to *write the claim
+into a comment* checked it first — the last cheap moment before a false invariant becomes
+code, carrying two names.
+
+**The fix is to enumerate from the schema object, not from a name you already know** — every
+query touching `workers`, via `grep "^-- name:"`, not every query whose name matches a string
+you have already seen. The same reduction covers the sibling failures: a grep over
+already-inventoried field names, a fixture built to demonstrate one state and read as a search
+for its opposite, and a `textContent` assertion read as whole-component coverage. **All four
+are searching a space defined by what you already found.**
+
+**Corollary for the lead:** relaying a teammate's verified-sounding premise is not verification.
+When a claim is about to be *written down* as an invariant — in a comment, a spec, or a doc —
+re-derive it yourself, however well-sourced it is. That is the moment it stops being a finding
+and starts being something the next reader will trust without checking.
+
+## TYPECHECK the mutated tree before reading the test result
+
+**A mutation that does not compile produces a run that says nothing, and "nothing" is one
+glance from the finding you were hoping for.** Measured 2026-07-27, on the last round of a
+long batch: a replacement string carried literal backslashes into a Python `str.replace`, the
+mutant was a TypeScript syntax error, vitest failed to **collect** the file, and the run
+printed `Tests  no tests`.
+
+The dangerous reading was right there — *"the mutation applied and no test went red"* reads as
+*"this site is unguarded"*, which would have been a false **Blocking** finding against a
+correct fix. The reviewer who hit it caught it and said so.
+
+**It is the inverse of the silent no-op mutation** (a fold that matches nothing, runs green,
+and understates). Both look like "the tests did not say what I expected", and the only
+instrument that separates them is the compiler:
+
+- run `npx tsc --noEmit` (or the language's equivalent) **between mutate and run**;
+- keep the pre-assert that the pattern was present and the post-assert that it is gone;
+- add a post-assert that no stray escape reached the source, since the escaping bug is what
+  produced the syntax error in the first place.
+
+**Read the collection line, not just the tally.** `Tests no tests` and `1 failed` are both
+"not the green I expected", and only one of them is a result.
+
+## Mutate at the CALL SITE, not in the shared helper
+
+**Folding a mutation into a shared function proves the function is live. It does not prove
+every caller routes through it** — and those are the two different claims a control is
+usually being asked to settle.
+
+Measured 2026-07-27. A strip helper had two call sites; the control replaced the helper's
+body with the identity and two cases reddened, which read as proof the strip was load-bearing.
+Both reddened cases exercised **the same call site**. The other arm had no assertion at all,
+so a fix applied to only one of the two would have passed that control unchanged — which is
+what happened, and it was caught by an audit reading the comment rather than by the test.
+
+**The discriminating instrument is per-call-site**: fold each site separately (pass the raw
+value at site A, restore, pass it raw at site B) and require **each** to red on its own. That
+is the same shape as the sweep-per-site discipline usually applied to render sites, and the
+reason it gets skipped in a helper is that mutating one function feels more central — it is
+the composition-point mistake one level down.
+
+The tester that found this named why it was invisible: *"mutating the shared helper is the
+composition-point mistake one level down — the same shape as the finding itself, which is
+presumably why neither of us saw it from inside."* A control written from inside the
+abstraction inherits the abstraction's blind spot.
+
+## An assertion defines its CHANNEL, and "assert over the whole subtree" covers exactly one
+
+**"Nothing in this component carries X" and "nothing in this component's TEXT carries X" are
+different claims, and the test that means the second reads like the first.** A React
+`container.textContent` assertion cannot see `title=`, `aria-label=`, `alt=`, `placeholder=`,
+a form control's `value`, or `document.title`. The component is in scope; the channel is not,
+and the assertion's own wording papers over the gap.
+
+Measured 2026-07-27: nine tests asserting `container.textContent` all passed while **four**
+untrusted values reached `title`/`aria-label` attributes unstripped, across three rounds of
+review. Every one was found by a sweep or a mutation control; **none by a test.** The
+demonstration is one line: revert the attribute fix and only the new case reds — the existing
+text-channel case, for the *same field*, stays green.
+
+Three habits follow, all earned in that batch:
+
+- **Fix at the composition point, not the render sites.** One descriptor feeding five
+  renderers gets one strip where it is composed; five strips drift out of step, and the sixth
+  renderer added later gets none.
+- **A test that renders the wrong component passes forever.** A `run.branch` test rendered a
+  heading component that does not render the branch. It was green and worthless, and the
+  control caught it. **Three files in that batch needed a component extracted to make the
+  claim assertable at all** — if the value is not reachable by a test, that is a finding
+  about the code's shape, not a reason to assert something adjacent.
+- **The suite is not the only gate: `vitest` does not typecheck.** A green run hid a type
+  error introduced while restoring a mutation. Run the typecheck alongside, and narrow a type
+  rather than casting — a cast hides the regression the type would have caught.
+
+Pairs with the per-fact sweep below: **sweep per fact, and check that your assertion can
+observe the channel the value actually travels.**
+
+## Sweep per FACT after the last behavioural commit
+
+**A batch's own findings falsify claims in code it never touched. Nothing in a per-commit
+or per-file review catches that, because the stale claim is not in the diff.** After the
+last behavioural commit — before the final review wave, not after it — grep for every
+*fact* the batch established and find every place that asserts otherwise.
+
+Earned on the 2026-07-27 quick-wins batch, where **four separate defects were false claims
+about work that had already been done correctly**: four sibling comments left asserting a
+mechanism the fix had disproved (one of them directly contradicting another comment three
+files away), a placeholder assertion that could not fail, a doc headline falsified by the
+function one line beneath it, and a freshness claim that was true of three of a fallback
+chain's six rungs. The code was right every time; the prose went stale as neighbouring
+facts settled. They cost four review rounds and were found by four different agents.
+
+Three things make it work, all learned the hard way in that batch:
+
+- **Sweep for the CLAIM, not the wording.** A grep for the phrase misses a sentence that
+  asserts the same thing in different words — `git.ts` carried the superseded measurement
+  table without ever using the phrase the sweep was looking for.
+- **The correction has to state the mechanism, not just delete the false clause.**
+  "Dropped the wrong claim" and "states the right one" are different edits and only the
+  second prevents the next round: a comment that is no longer false but no longer explains
+  anything leaves the next reader to re-derive it and get it wrong, which is what happened
+  three times to one paragraph in that batch.
+- **A comment has no executable control**, so the only check is reading each replacement
+  against the code it sits beside, verifying every citation resolves at HEAD, and
+  re-measuring any number it quotes. Say which comments were read and which were not —
+  silence reads as coverage.
+- **A CITATION is an assertion too, and `git log -S` is its control.** "Commit X fixed this"
+  is checkable and almost never checked. In one batch the same two commits were transposed
+  **twice** — they were one apart, touched the same field, and differed only in *channel*,
+  which was the very distinction the sentence existed to teach. A reader following the
+  citation landed on a commit whose subject line contradicted the claim in its first six
+  words, which discredits the true half along with the false one. Before writing "commit X
+  did Y", run `git log -S '<the exact string>' -- <path>` and let it name X.
+
+Corollary for the lead: when you dispatch a fix that names N sites, **verify all N landed**.
+The one that got missed in that batch was missed because the lead checked the site it had
+argued about and not the four it had listed in the same message.
+
 ## Quality gates
 
 Paste this block into every tester, reviewer and auditor dispatch — teammates
