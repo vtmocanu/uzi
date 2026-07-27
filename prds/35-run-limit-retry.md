@@ -516,18 +516,39 @@ this PRD supersedes that stance for sustained limits.
      the Go service layer and pass it explicitly on each; do not push the defaulting
      into SQL, where a fifth path added later would silently miss it.
 
-     **↳M0 — the per-run surface is an OPEN QUESTION FOR THE USER, not a coder
-     decision.** This bullet said "the start-run modal shows a pre-checked box".
-     **There is no start-run modal**: `startRun` is a one-click button calling
-     `api.createRun(repoId, iid)` from `web/src/pages/Board.tsx:211-215` and
-     `web/src/pages/IssueView.tsx:70-75`. Introducing a modal changes existing
-     behaviour on every run a user starts. Recommendation put to the user: keep the
-     one-click start (inheriting the user default), ship the optional `wait_on_limit`
-     on `POST /api/runs` for the CLI and API, and satisfy "per run" with a **toggle on
-     the run view while the run is non-terminal** — which is strictly better, because
-     it also covers autopilot, `ci_fix` and `self_improve` runs that have no start
-     affordance and therefore cannot be served by a modal at all. Everything else in
-     the design is independent of the answer.
+     **↳2026-07-27 — RULED BY THE USER. The per-run surface is a run-view toggle, not
+     a start-run modal.** This bullet said "the start-run modal shows a
+     pre-checked/unchecked box". **That modal does not exist and never did**:
+     `startRun` is a one-click button calling `api.createRun(repoId, iid)` directly,
+     from `web/src/pages/Board.tsx:211-215` and `web/src/pages/IssueView.tsx:70-75`.
+     Building one would change existing behaviour on every run a user starts, so the
+     question was escalated rather than decided by the team — it reinterprets a
+     requirement the user stated in issue #35 ("each user can opt in per run or set a
+     default in settings"). The user accepted the recommendation:
+
+     - **Start stays one click** and inherits `users.wait_on_limit`. No modal, no
+       confirmation step, no change to either existing surface.
+     - **`wait_on_limit` ships as an optional field on `POST /api/runs`**, so CLI and
+       API callers have per-run control at creation.
+     - **Per-run control in the web is a toggle on the RUN VIEW**, live while the run
+       is non-terminal.
+
+     **The coverage argument is what justifies the reinterpretation, and it is not a
+     consolation prize — the toggle is a strictly larger surface than the modal would
+     have been.** A start-run modal can only reach runs a human starts by hand.
+     Autopilot, `ci_fix` and `self_improve` runs are created by the poller and the
+     self-improve engine with **no start affordance at all**, so a modal could never
+     have given them a per-run opt-in — and `ci_fix` and `self_improve` both park
+     (Decision 14). The toggle covers every kind that can park, including the three
+     the modal structurally could not. It also arrives at the better moment: a user
+     learns they want to wait when they are looking at a run, not before it exists.
+
+     **Semantics of the toggle, so it is not mistaken for a control it is not.** It
+     changes the flag for **future** limit failures only and never changes the run's
+     current status: flipping it off on an already-parked run does **not** un-park or
+     cancel it (Decision 11's cancel is the control for that), and flipping it on
+     while parked is a no-op. On a terminal run the endpoint is a no-op and the UI
+     renders the toggle inert.
    - The flag rides the claim payload like `auto_approve` (top-level, re-read from
      the row on every claim) so a resumed run keeps its opt-in.
    - `app_settings` is not used — it is admin/instance-wide only ("there is no
@@ -745,9 +766,26 @@ this PRD supersedes that stance for sustained limits.
   `Sweep`** — a parked run is never RUN_TIMEOUT-failed, stale-requeued, or
   auto-stopped (PRD #108); cancel-while-parked applies immediately.
 - [ ] **M3 — Opt-in surfaces**: `users.wait_on_limit` + `PUT /me/wait-on-limit` +
-  Settings toggle; `CreateRun` wire + start-modal checkbox defaulting from the user
-  setting; autopilot runs inherit the default; tests (default inheritance, explicit
+  Settings toggle; `CreateRun` wire defaulting from the user setting; **all four**
+  creation paths stamp the flag (Decision 7); tests (default inheritance, explicit
   override, flag survives resume).
+
+  **↳2026-07-27 scope change, per the user's ruling in Decision 7.** The start-run
+  modal checkbox is **dropped — there is no modal, and none is being built**; the
+  one-click start is untouched. In its place:
+  - `PUT /api/runs/:id/wait-on-limit` (owner-scoped, RequireAuth → ValidateCSRF like
+    the `/me` sibling), guarded by the same **negative** predicate
+    `CancelRunServerSide` uses — `status NOT IN ('completed','failed','cancelled')` —
+    so it is a no-op on a terminal run and covers `limit_wait` for free.
+  - The run-view toggle, **inert on terminal runs**, wired to that endpoint.
+  - Tests: the toggle flips the column on a running run; is a no-op on a terminal one;
+    **does not change `status` on an already-parked run** (the one assertion that
+    stops a future reader mistaking it for a cancel); a `ci_fix` and a `self_improve`
+    run each inherit the user default at creation, since those are two of the three
+    kinds the dropped modal could never have reached.
+
+  The web half of this belongs to the **web lane**, not the api lane, so `RunView.tsx`
+  keeps one owner alongside M4's countdown strip.
 - [ ] **M4 — Web UX**: `RunStatus`/tones/`limit_wait` pill, run-view countdown strip
   (resets-at + attempt N/cap), runs list + board card badge **including
   `web/src/lib/runBadge.ts`** (Decision 10), `limit_wait`/`limit_hit` render cases in
@@ -928,3 +966,41 @@ this PRD supersedes that stance for sustained limits.
   **The milestone graph is unchanged** — none of the four rulings moves a file
   between lanes; (b) lands in the agent lane and the seam, (a)/(c)/(d) in the api
   lane, and the M4 constraints remove a collision rather than creating one.
+- 2026-07-27 — **Both M0 open questions ruled BY THE USER**; both went the way the
+  architect recommended.
+
+  **Q1 — the per-run opt-in surface: run-view toggle, no start-run modal.**
+  Escalated to the user rather than decided by the team, because it **reinterprets a
+  requirement the user stated in issue #35** — *"each user can opt in per run or set a
+  default in settings"* — and because the PRD's own prescription named a surface that
+  does not exist (`startRun` is a direct `api.createRun` call from
+  `Board.tsx:211-215` and `IssueView.tsx:70-75`; there is no modal to add a checkbox
+  to, and adding one changes existing behaviour on every hand-started run). The user
+  was shown the coverage argument and took it: a modal can only ever reach
+  human-started runs, while autopilot, `ci_fix` and `self_improve` runs have **no
+  start affordance at all** — and `ci_fix` and `self_improve` both park (Decision 14).
+  The toggle is therefore a **strictly larger** surface than the modal it replaces,
+  not a reduced one. Start stays one click and inherits the user default;
+  `wait_on_limit` ships on `POST /api/runs` for CLI/API callers; the web's per-run
+  control is a run-view toggle on a non-terminal run, which changes future limit
+  behaviour only and never the current status. Full semantics in Decision 7; M3's
+  scope updated (modal dropped, `PUT /api/runs/:id/wait-on-limit` added).
+
+  **Q2 — `RUN_LIMIT_MAX_WAITS` stays at 5.** It is a *retry* budget, not a
+  credential-count budget; an operator with a large pool raises it via env. The
+  documented ≈40-day worst case (5 × 8d, Decision 5) is unchanged.
+
+  **Provenance, for the spec-keeper.** Q1 is a **user-confirmed reinterpretation of a
+  user-stated requirement** — the strongest category, and the one that must not be
+  filed as an AI design decision. The requirement text belongs to `specs/human.md`
+  (never edited without user approval); the *mechanism* chosen to satisfy it (run-view
+  toggle, endpoint shape, terminal-run inertness) is ours and belongs in `specs/ai.md`.
+  Q2 is a user ruling on a knob's default, not a requirement change.
+
+  **ADR filed**: [`adr/0035-run-limit-retry.md`](../adr/0035-run-limit-retry.md)
+  records Decision 6e — the ruling, the two rejected options, and specifically the
+  "unbuildable as written" reasoning (promotion is strictly upstream of the claim
+  where re-selection happens), which is the part not recoverable from the outcome. It
+  is deliberately **not yet linked from `ARCHITECTURE.md`**: that file describes what
+  uzi *is*, and nothing here is built. The link lands with the archival to
+  `prds/done/`.
