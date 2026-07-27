@@ -171,7 +171,7 @@ type Store interface {
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
 	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
-	ListToolResultPayloadsForRun(ctx context.Context, arg store.ListToolResultPayloadsForRunParams) ([][]byte, error)
+	ListToolTraceForRun(ctx context.Context, arg store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error)
 	ListRunInputsForRun(ctx context.Context, arg store.ListRunInputsForRunParams) ([]store.RunUserInput, error)
 	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.

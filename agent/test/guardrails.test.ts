@@ -591,3 +591,123 @@ describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () =>
     assert.deepStrictEqual(await hook(pathInput("Edit", { file_path: "/work/wt/src/notes.ts" })), {});
   });
 });
+
+// PRD #116 — the deny-phrase CONTRACT.
+//
+// `web/src/components/RunEvent.tsx` classifies a `tool_result` as a calm "⊘ blocked"
+// chip (instead of a red "✗ error") when "denied by guardrail" STARTS one of its
+// lines. `web/` and `agent/` are separate npm packages, so the web side hardcodes
+// that phrase — nothing at build time couples the two. This block is the belt that
+// makes that coupling safe: if a reason ever stops carrying the phrase, the failure
+// mode is a RED TEST HERE, not a silent revert of every blocked chip back to red in
+// the UI (which nobody would notice, because the run still works).
+//
+// Two tests, deliberately overlapping, because neither alone is sufficient:
+//   (a) behavioural — drives all 15 deny paths that exist TODAY through the public
+//       API, which is the only way to reach the reasons (they are module-private).
+//       It cannot cover a reason that does not exist yet.
+//   (b) source scan — greps the reason literals straight out of guardrails.ts, so a
+//       FUTURE 16th reason added without the phrase fails here even though (a) has no
+//       case for it. It counts DECLARATIONS and readable LITERALS separately and
+//       requires them to be EQUAL, so a reason written in a form the literal regex
+//       cannot read — a template literal, a single-quoted string, a value built by a
+//       call — fails loudly instead of slipping past invisibly. That was a real hole:
+//       such a 16th reason satisfies the ">= 15" floor via the other fifteen, and (a)
+//       cannot reach it either, so BOTH halves would have gone green on exactly the
+//       case (b) exists to catch. Accepted false positive: splitting the phrase across
+//       a concatenation (`"denied by " + "guardrail: …"`) reddens the scan although
+//       the runtime value is fine. Write it as one literal; the scan is deliberately
+//       dumber than the compiler.
+describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
+  const PHRASE = "denied by guardrail";
+  const PROC_PATH = "/proc/1/environ";
+  const SECRET_PATH = "/run/secrets/worker_token";
+  const agentGuard = buildAgentGuardHook(["coder", "reviewer", "tester"], nullLogger());
+
+  const hookReason = async (subagentType: unknown): Promise<string | undefined> => {
+    const out = (await agentGuard({
+      ...baseInput(),
+      hook_event_name: "PreToolUse",
+      tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: subagentType },
+      tool_use_id: "tu-116",
+    } as HookInput)) as { hookSpecificOutput?: { permissionDecisionReason?: string } };
+    return out.hookSpecificOutput?.permissionDecisionReason;
+  };
+
+  // One entry per REASON_* constant, reached through the PUBLIC API (the constants
+  // themselves are not exported). Triggers are lifted from the suites above wherever
+  // they already exist — if a case ever stops denying, the TRIGGER is wrong (fix it),
+  // never the assertion.
+  const REASON_CASES: Array<{ name: string; trigger: () => Promise<string | undefined> }> = [
+    // 12 reachable via screenBashCommand(command, extraSecretPaths?, dockerWired?).
+    { name: "git push", trigger: async () => screenBashCommand("git push origin main").reason },
+    { name: "git remote mutation", trigger: async () => screenBashCommand("git remote set-url origin https://evil.example/x.git").reason },
+    { name: "forced git operation", trigger: async () => screenBashCommand("git checkout --force other").reason },
+    { name: "git config read", trigger: async () => screenBashCommand("git config --get http.extraHeader").reason },
+    { name: "git config write", trigger: async () => screenBashCommand("git config remote.origin.url https://evil.example/x.git").reason },
+    { name: "environment dump", trigger: async () => screenBashCommand("env").reason },
+    { name: "process table", trigger: async () => screenBashCommand("ps aux").reason },
+    { name: "/proc read", trigger: async () => screenBashCommand(`cat ${PROC_PATH}`).reason },
+    // The built-in /run/secrets/ prefix; extraSecretPaths reaches the same reason.
+    { name: "secret file read", trigger: async () => screenBashCommand(`cat ${SECRET_PATH}`).reason },
+    // dockerWired defaults to false → the no-daemon reason...
+    { name: "docker with no daemon wired", trigger: async () => screenBashCommand("docker ps").reason },
+    // ...so reaching the redirect reason REQUIRES dockerWired=true.
+    { name: "docker daemon redirect", trigger: async () => screenBashCommand("docker -H tcp://evil:2375 ps", [], true).reason },
+    // MAX_DEPTH is 6; seven stacked `eval` wrappers exceed it.
+    { name: "command nesting depth", trigger: async () => screenBashCommand("eval eval eval eval eval eval eval ls").reason },
+    // 2 reachable via screenToolPath(candidate, worktreeRoot, cwd, secretPaths?).
+    { name: "file outside the worktree", trigger: async () => screenToolPath("/etc/passwd", WT, WT).reason },
+    { name: ".git access", trigger: async () => screenToolPath(".git/config", WT, WT).reason },
+    // 1 reachable via the Agent-tool guard hook.
+    { name: "unknown/unassembled subagent", trigger: async () => hookReason("evil") },
+  ];
+
+  for (const { name, trigger } of REASON_CASES) {
+    it(`the "${name}" deny reason starts with "${PHRASE}"`, async () => {
+      const reason = await trigger();
+      assert.ok(typeof reason === "string" && reason.length > 0, `${name}: expected a non-empty deny reason (the trigger no longer denies?)`);
+      assert.ok(
+        reason.startsWith(PHRASE),
+        `${name}: reason must start with "${PHRASE}" — web/src/components/RunEvent.tsx keys its blocked chip off it. Got: ${JSON.stringify(reason)}`,
+      );
+    });
+  }
+
+  // 15 cases producing 15 DISTINCT strings is what proves the table actually exercises
+  // 15 different deny paths, rather than the same path fifteen times.
+  it("covers all 15 deny reasons, and each case reaches a DISTINCT one", async () => {
+    assert.strictEqual(REASON_CASES.length, 15, "expected one case per REASON_* constant in src/guardrails.ts");
+    const reasons = await Promise.all(REASON_CASES.map((c) => c.trigger()));
+    assert.strictEqual(new Set(reasons).size, 15, `expected 15 distinct reasons, got: ${JSON.stringify(reasons, null, 2)}`);
+  });
+
+  // (b) The future-proofing half: read the reason literals out of the source itself.
+  it("every REASON_* literal declared in src/guardrails.ts carries the phrase", () => {
+    const src = fs.readFileSync(new URL("../src/guardrails.ts", import.meta.url), "utf8");
+    // Two passes over the same source, sharing one left-hand side so they cannot
+    // drift: `decls` counts every REASON_* constant HOWEVER its value is written,
+    // `literals` reads back only those values this scan can actually parse (a
+    // double-quoted string — `\s` spans newlines, so wrapping one is still readable).
+    const DECL_LHS = String.raw`\bconst\s+REASON_[A-Z0-9_]+\s*(?::[^=;\n]*)?=`;
+    const decls = [...src.matchAll(new RegExp(DECL_LHS, "g"))];
+    const literals = [...src.matchAll(new RegExp(DECL_LHS + String.raw`\s*"((?:[^"\\]|\\.)*)"`, "g"))].map((m) => m[1]!);
+    // The floor stops the whole scan passing vacuously on an empty list (constants
+    // renamed away, file moved)…
+    assert.ok(decls.length >= 15, `expected >= 15 REASON_* declarations, found ${decls.length} — did the declaration style change?`);
+    // …and the EQUALITY is what closes the hole the floor alone leaves: a 16th reason
+    // written as a template literal, a single-quoted string, or a call result is
+    // counted HERE and unreadable THERE. Without this it passes both halves in
+    // silence — the floor is still satisfied by the other 15, and the behavioural
+    // table cannot reach a constant that did not exist when it was written.
+    assert.strictEqual(
+      literals.length,
+      decls.length,
+      `every REASON_* must be a double-quoted string literal so this scan can read it; ${decls.length} declared, ${literals.length} readable`,
+    );
+    for (const literal of literals) {
+      assert.ok(literal.startsWith(PHRASE), `REASON literal must start with "${PHRASE}": ${JSON.stringify(literal)}`);
+    }
+  });
+});

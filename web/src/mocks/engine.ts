@@ -104,6 +104,17 @@ function planningScript(runId: string): Timed[] {
     }),
     ...tool(runId, "lead", "Read", { file_path: "prds/13-worker-metrics.md" }, "# PRD 13 — Worker heartbeat metrics\n\nExpose heartbeat freshness per worker…"),
     ...tool(runId, "lead", "Grep", { pattern: "heartbeat", path: "api/internal" }, "api/internal/handler/worker.go:88\napi/internal/store/queries/workers.sql:14\napi/internal/poller/sweeper.go:31"),
+    // PRD #116: a handled guardrail denial (the live #115 case — spawning the SDK
+    // built-in `Explore` subagent). `error: true` sets is_error, so the feed can
+    // demo the neutral "⊘ blocked" chip in a STREAMING run, not just the fixtures.
+    ...tool(
+      runId,
+      "lead",
+      "Agent",
+      { subagent_type: "Explore", description: "map the heartbeat plumbing" },
+      "denied by guardrail: only the run's assembled subagents may be invoked",
+      { error: true },
+    ),
     {
       delay: 1200,
       step: () =>

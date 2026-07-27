@@ -488,6 +488,19 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   of starting fresh. The run continues without its earlier context; if the
   branch already carries pushed work, the planning prompt says so, so an
   amnesiac lead reads that work instead of redoing it.
+- **claimed → running, before the plan turn** — once `provisionRunTools` has set up
+  the run's tool env, the executor kicks off a lockfile-driven JS dependency
+  install for the cloned repo, picked per discovered lockfile (monorepo
+  workspaces resolving to one root install): a frozen, `--ignore-scripts`
+  install per manager, **plus** per-manager hardening flags beyond that alone —
+  `--ignore-scripts` does not close every repo-controlled install-time vector
+  (see the PRD's Trust posture section). Exact commands live at
+  `INSTALL_COMMANDS` in `agent/src/js-deps.ts`, kept there rather than
+  duplicated here so this bullet can't drift from what ships. Runs under the
+  same runner-uid + scrubbed-env sandbox as the checks below, concurrently
+  with the plan turn — and, on human-gated runs, the `awaiting_approval` wait
+  — and is joined before the first implement turn, so the agent's own
+  dependency install never races it (PRD #121).
 - **running → awaiting_approval → running** — the lead agent produces a plan;
   the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
   at the gate until the user approves or rejects it in the run view, or

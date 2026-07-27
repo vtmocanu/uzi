@@ -1,7 +1,7 @@
-# PRD #102: Board v2 — column rename, label chips, manual ordering, non-PRD issues
+# PRD #102: Board v2 — column rename, label chips, sorting + manual ordering, non-PRD issues
 
 **GitLab Issue**: [#102](https://gitlab.example.com/vtmocanu/uzi/-/issues/102)
-**Status**: Draft (created 2026-07-20)
+**Status**: Draft (created 2026-07-20; M5 widened to sort modes 2026-07-27)
 **Priority**: Medium
 
 Four board changes, bundled because they all land in `Board.tsx` and the
@@ -42,7 +42,7 @@ invisible. The data already ships: `cardDTO.Labels []string`
 **3. Cards cannot be ordered.** Within a column, cards render in the order
 the API returned, which is `ORDER BY forge_issue_iid ASC`
 (`api/internal/store/queries/forge.sql:186`) — issue number, oldest
-first. `Board.tsx:313` buckets by column preserving that order. There is
+first. `Board.tsx:314` buckets by column preserving that order. There is
 no way to say "this one first".
 
 **4. Non-PRD issues are invisible, and not by a render filter.** The
@@ -66,8 +66,12 @@ not already tracking.
   `Backlog | Planned | In Progress | Human Review | Later | Closed`.
 - **Label chips on cards**: render each card's labels minus workflow
   markers and minus the configured column labels.
-- **Manual ordering**: uzi-owned drag-to-reorder within a column, shared
-  across users.
+- **Manual ordering + sort modes**: uzi-owned drag-to-reorder within a
+  column, durable and cross-device for the board's owner (**not** shared
+  across users — see Decision 8's correction), offered alongside a
+  board-wide sort-mode switcher (issue number, run activity, last updated,
+  title) whose default reproduces today's order exactly. Dragging
+  auto-switches the board into manual mode.
 - **Show non-PRD issues**: an *additive* second fetch for open issues
   without the `PRD` label, gated by a per-user toggle, with a `Promote`
   action to turn one into a real PRD card.
@@ -172,18 +176,209 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
    order behaves identically on both drivers. It is board *presentation*
    state, not forge data — document it so nobody reports it as a sync bug.
 
-8. **Ordering is shared; visibility is per-browser.** Board state today
-   is split: `board_columns` is per-repo and shared, `hideEmpty` is
-   per-browser in `localStorage` (`Board.tsx:78`, `prefs.ts`). A manual
-   priority order is a team statement about what to work on next, so it
-   goes in the DB, shared. The non-PRD toggle is one person choosing what
-   to look at, so it uses `prefs`, keyed per repo, like Hide-empty — which
-   is per-browser, not truly per-user (the same user on two browsers sees
-   two states); acceptable for a view preference.
+7a. **Manual order is one of several sort modes, and the default mode
+    reproduces today's board exactly** (user, 2026-07-27). The modes:
+    `Manual` (default), `Issue number`, `Recent run activity`,
+    `Last updated`, `Title`.
+
+    `Manual` is not "the manual order or nothing": its tiebreak for cards
+    nobody has dragged is `forge_issue_iid ASC`, so on an untouched board
+    it renders byte-for-byte what ships today. That is what makes it safe
+    as the default — today's behavior is what you get without choosing
+    anything, rather than something you have to go and pick. `Issue
+    number` is therefore *not* redundant with it: it is the escape hatch
+    that ignores the manual order entirely, which is the only way back to
+    plain issue-number order once someone has dragged.
+
+    **Note what "the current sort" is not.** Today's order is
+    `ORDER BY forge_issue_iid ASC` (`store/queries/forge.sql:186`) — issue
+    number, which is monotonic per project on **both** drivers and
+    therefore exactly creation order on both (GitLab's iid; Forgejo's
+    `Index`, mapped at `forge/forgejo.go:679`, which is monotonic but
+    shared with pull requests, so an issue-only board sees creation order
+    with gaps in the numbering). It is **not** GitLab's board order: uzi
+    never reads `relative_position`, and per Decision 7 it never will, so
+    "sort the way GitLab's board does" is not an offerable mode on both
+    drivers.
+
+    Sorting is a pure client-side function. The board payload already
+    ships every card for the repo in one response and `Board.tsx:314`
+    buckets them in memory, so no query change and no new read endpoint.
+    Verified 2026-07-27: there is no cap and no pagination anywhere on
+    that payload — `buildBoard` (`handler/board.go:329-376`) calls
+    `ListIssuesByRepo` with no `LIMIT`, the web client is a single
+    `GET /repos/${repoId}/board` (`api.ts:1728`) with no page param, and
+    `maxBoardColumns = 10` caps columns only. Both drivers paginate
+    upstream to exhaustion (`gitlab.go:246-274`, `forgejo.go:293-335`).
+    Cost by mode: `Issue number`, `Title` and `Recent run activity` are
+    free (`iid`, `title`, and `latest_run.updated_at` — pinned below —
+    already ride `cardDTO`); `Last updated` is the one API change —
+    `issues.forge_updated_at` exists on the row
+    (`migrations/00002_forge.sql:57`) but is not on `cardDTO`
+    (`handler/board.go:42-71`), so the field is added.
+
+    **`Recent run activity` needs two things pinned that "free" hides**
+    (review, 2026-07-27). `cardDTO.LatestRun` is a **pointer**, null on
+    every card that has never run (`handler/board.go:66`, web mirror
+    `api.ts:358`) — and on a real board most cards have never run. Sort
+    key: **`latest_run.updated_at`**, matching the mode's name, descending.
+    Null placement: never-run cards last, `forge_issue_iid ASC` among
+    themselves, mirroring the NULLS-LAST rule in 7b. Note also that
+    `ListLatestRunsForRepo` picks the latest run by `created_at DESC`
+    (`forge.sql:216`), so the chosen row's `updated_at` is the newest
+    run's, not the max across the issue's runs — intended, and stated here
+    so nobody "fixes" it later.
+
+7b. **Dragging auto-switches the board to `Manual`, and EVERY drop freezes
+    the visible order before it moves anything** (user, 2026-07-27).
+    Reposition-drag stays live in *every* mode; there is no "switch to
+    Manual first" dead state and no disabled-drag affordance to explain.
+
+    The trap that makes this more than a one-line pref write: sorted by
+    `Last updated`, drag card #7 to the top. If the drop writes only #7's
+    position and then flips the mode, every *other* card falls back to the
+    iid tiebreak and the whole board re-sorts under the user's hand — the
+    drag reads as having scrambled the board rather than moved one card.
+    So a drop **materializes the currently displayed order of every
+    non-closed card into the ordering column, then applies the move**:
+    freeze, then move. One bulk write, and boards are small (see Open
+    Questions, M6 scale).
+
+    **The freeze fires on every drop, including one already in `Manual`
+    mode — gating it on "mode != Manual" reintroduces the exact bug this
+    decision exists to prevent** (review, 2026-07-27). On an untouched
+    board every ordering value is NULL and the default mode is already
+    `Manual`, so a mode-gated freeze would not fire; the drop writes one
+    position, and that single non-NULL card sorts ahead of every NULL
+    under `NULLS LAST`. Drag a card to the *bottom* of a column and it
+    renders at the *top*. Once every card is non-NULL the freeze changes
+    no ordering — though it still rewrites every non-closed row — so
+    making it unconditional removes the only state in which the gate is
+    wrong, at no cost to the result.
+
+    The freeze is board-wide, not per-column, because the mode is
+    board-wide (7a): flipping to `Manual` re-sorts the untouched columns
+    too, and those must not move either.
+
+    **Freeze the PAYLOAD set, not the rendered set** (review, 2026-07-27).
+    "Currently displayed" is the wrong scope once M6's non-PRD toggle
+    exists: a viewer with the toggle off would freeze only the PRD cards,
+    leaving every non-PRD card NULL and therefore relocated to the bottom
+    of its column on the viewer's *other* browser, where the toggle is on.
+    Same hazard, smaller blast radius, for Decision 13a's excluded
+    self-improve issue. So positions are computed for every non-closed
+    card in the board payload using the same pure sort function, not from
+    visual position — hidden cards included.
+
+    **Closed cards are excluded from the freeze** and keep a NULL order.
+    Closed is not a drop target (`Board.tsx:310` `droppable: false`,
+    `:468-472`, `:597`, and `move()` returns early at `:253`), so a
+    position there is unreachable by drag — but a frozen one would ride an
+    issue that later reopens on the forge and drop it at an arbitrary
+    point in its new column, contradicting the newly-synced-goes-to-the-
+    bottom rule below.
+
+    **Concurrency: the reorder write is board-wide and last-writer-wins
+    across the owner's own tabs and devices. Accepted** (review,
+    2026-07-27). Today's `move()` is per-card and forge-first
+    (`Board.tsx:252`); a whole-board write is a new conflict class, and
+    the board polls every 10s (`Board.tsx:208`), so two tabs can each
+    submit an order computed from a different snapshot and the second
+    discards all of the first. A draft of this paragraph specified a
+    board-version check that 409s a stale write — **dropped**, on two
+    grounds: `boardDTO` carries no version, etag or generation field
+    (`handler/board.go:165-179`, web mirror `api.ts:365-378`), so the
+    client has nothing to send and adding one is exactly the "no other API
+    read change" M5 forbids; and per Decision 8's correction the conflict
+    is now one person's two tabs rather than two people, which the
+    existing refetch-on-poll already resolves within 10s. Revisit if
+    cross-user boards ever ship.
+
+    Unknown iids — evicted by `DeleteIssuesNotIn`
+    (`forgesvc/service.go:287`, keep-set built at `:283-286`) between
+    render and submit — are a per-iid no-op, never a 404. One stale card
+    must not fail the whole freeze. This rule is independent of the
+    dropped version check and stands.
+
+    **Positions are one board-global gapped-integer sequence**, not a
+    per-column sequence restarting at each lane (review, 2026-07-27).
+    Global is what makes a cross-column drag well-defined — a card moved
+    between columns carries a number that still means something in its
+    destination, where a per-column sequence would hand it a colliding
+    one. Gaps leave room to insert without rewriting neighbours. This also
+    settles what freeze test 3 compares, and it is the missing piece the
+    M5-drop-semantics Open Question needs in order to close.
+
+    Cards synced *after* a freeze have a NULL order. `ORDER BY <order>
+    NULLS LAST, forge_issue_iid ASC` lands them at the bottom of their
+    column, ordered by iid among themselves — the concrete reading of M5's
+    "newly synced issues take the fallback rather than jumping to the top".
+
+8. **Ordering is durable and cross-device; visibility is per-browser.**
+
+   > **Corrected 2026-07-27 (review).** This decision read *"Ordering is
+   > shared … A manual priority order is a team statement about what to
+   > work on next, so it goes in the DB, shared"*, and the word `shared`
+   > was false in the sense it was being used. **There is no second viewer
+   > of a uzi board today.** `issues.repo_id → repos.connection_id →
+   > forge_connections.user_id` (`migrations/00002_forge.sql:49`, `:25`,
+   > `:8` respectively), so
+   > two people who each connect `vtmocanu/uzi` get two `forge_connections`
+   > rows, two `repos` rows, and two independent `issues` caches under
+   > different `repo_id`s. Every board route resolves through
+   > `GetRepoForUser` — `WHERE r.id = $1 AND c.user_id = $2`
+   > (`store/queries/forge.sql:80-88`), called from `repoForRequest`
+   > (`handler/board.go:800-817`) by all five board handlers (`:189`,
+   > `:467`, `:549`, `:662`, `:775`); run creation is scoped the same way
+   > (`workersvc/service.go:2244`). An ordering column on `issues` is
+   > therefore **per-owner state**, and putting it in the DB buys
+   > durability and cross-device consistency for its one owner, not team
+   > sharing.
+   >
+   > The `IsMine` / "a shared board must not leak another user's email"
+   > language on `cardDTO` (`handler/board.go:65,75,93,126,146`) is PRD
+   > #33 designing *defensively* for a shared board, not evidence of one:
+   > `assembleCards` passes `repo.UserID` as the viewer (`:362-365`), and
+   > that is the connection owner by construction.
+   >
+   > One genuine cross-user `repos` path exists and does **not** weaken
+   > this: admin `PatchRepo` (`handler/forge.go:589`) branches to
+   > `SetRepoSkillsEnabled` / `SetRepoDevboxOptIn` (`forge.sql:111-115`,
+   > `:124-128`, both commented "not scoped to the owning user") for an
+   > admin caller. It writes two opt-in booleans and reads no board, card,
+   > issue or ordering state. Noted so the next reader who greps for
+   > unscoped `repos` access does not think this correction missed it.
+
+   Board state today is split: `board_columns` is per-repo (and, per the
+   correction above, therefore also per-owner) in the DB, while
+   `hideEmpty` is per-browser in `localStorage` (`Board.tsx:79-80`,
+   `prefs.ts`). A manual priority order is a durable statement about what
+   to work on next rather than a glance-level view choice, so it goes in
+   the DB. The non-PRD toggle is one person choosing what to look at right
+   now, so it uses `prefs`, keyed per repo, like Hide-empty — which is
+   per-browser, not truly per-user (the same user on two browsers sees two
+   states); acceptable for a view preference.
    - Accepted cost: with a per-browser toggle, `In Progress` can show a
      different card count in different browsers. "How many are in flight"
      stops being a shared number. Revisit only if it causes real
      confusion.
+   - **The sort MODE (Decision 7a) is per-browser too, and its default is
+     `Manual`.** The order is durable, the choice of whether to honor it
+     is a view preference, so the mode goes in `prefs` keyed per repo like
+     Hide-empty. The default matters for a plainer reason than the one
+     first written here: `Manual` on an untouched board *is*
+     `forge_issue_iid ASC`, so defaulting to it is what makes the feature
+     invisible until someone wants it (7a). An earlier draft justified the
+     default by "otherwise a second user cannot see the shared order" —
+     struck, because per the correction above there is no second user.
+     Same default, sound reason.
+   - **Accepted cost of the board-wide freeze (7b), now that it is
+     per-owner:** dragging one card while sorted by `Title` rewrites your
+     own stored order for the whole board, on every device you use. Within
+     one person's own board that is a defensible read of "I want it to
+     look like this"; it would not have been if boards were shared. If
+     cross-user boards ever ship, revisit 7b before they do — see the open
+     question below.
 
 9. **The non-PRD fetch is ADDITIVE; today's PRD sync is untouched**
    (user, 2026-07-20). Not a widening of the existing filter — a second,
@@ -206,8 +401,10 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 
 11. **Eviction becomes a union, and must fail closed.** `FullSync`
     deletes everything absent from its keep-set (the
-    `DeleteIssuesNotIn` call at `service.go:279`; the keep-set is built at
-    `:274-278`):
+    `DeleteIssuesNotIn` call at `service.go:287`; the keep-set is built at
+    `:283-286` — both anchors read `:279` / `:274-278` until 2026-07-27
+    and had drifted about eight lines; `:279` is `upsertIssues`' error
+    return):
 
     ```go
     s.q.DeleteIssuesNotIn(ctx, ...{RepoID: repoID, KeepIids: keep})
@@ -395,24 +592,66 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       must not compete with the run/pipeline badges, and a card with many
       labels must not blow out the column width.
 
-**Phase 2 — manual ordering**
+**Phase 2 — sort modes + manual ordering**
 
-- [ ] **M5 — Manual ordering within a column**: a nullable ordering column
-      on `issues` (migration number assigned at merge time, above the live
-      head — currently `00074`), a reorder endpoint, and drag-to-reorder in
-      the board. Cards with no explicit order fall back to
-      `forge_issue_iid ASC`, so an existing board is unchanged until
-      someone drags, and newly synced issues take the fallback rather than
-      jumping to the top. The drag gesture must distinguish "move to
-      another column" (existing, writes a label forge-first) from
-      "reposition within this column" (new, uzi-only); settle the drop
-      semantics before implementing. **Sync-clobber trap** (review S6):
-      `UpsertIssue`'s `ON CONFLICT DO UPDATE SET` (`forge.sql:169-183`)
-      wholesale-sets every listed column on every poll. The new ordering
-      column must be **excluded** from that SET list (it is uzi-owned,
-      never in the forge payload), or each 1-minute poll resets manual
-      order. Guard it with a test that reorders, syncs, and asserts the
-      order survives.
+- [ ] **M5 — Sort modes and manual ordering within a column**: a nullable
+      ordering column on `issues` (migration number assigned at merge time,
+      above the live head — currently `00085`), a reorder endpoint,
+      drag-to-reorder in the board, and a board-wide sort-mode switcher.
+      The five modes of Decision 7a, default `Manual`, whose tiebreak is
+      `forge_issue_iid ASC` — so an existing board renders exactly as it
+      does today until someone drags, and newly synced issues sort
+      `NULLS LAST` to the bottom rather than jumping to the top. Every
+      drop, `Manual` included, freezes the board-wide order before it
+      moves anything and leaves the board in `Manual` (Decision 7b).
+      `cardDTO` gains `forge_updated_at` for the `Last updated` mode; no
+      other API read change. The sort is a pure, unit-tested helper in
+      `web/src/lib/` (the `runBadge.ts` / `boardColumns.ts` discipline)
+      taking cards + mode and returning the ordered list, so every mode is
+      testable without a DOM. `npm run typecheck` + `npm test` +
+      `go test -count=1 ./...` green.
+    - **There is no card-level drop target today.** `onDrop` is on the lane
+      (`Board.tsx:474`); cards get `draggable` at `:617`, gated by
+      `const draggable = !card.closed` (`:597`), but are not drop targets,
+      so reposition needs a new insertion affordance built from scratch.
+      The gesture must distinguish "move to another column" (existing,
+      writes a label forge-first via `move()` at `:252`) from "reposition
+      within this column" (new, uzi-only, no forge write); settle the drop
+      semantics before implementing.
+    - **Docs** (`docs/board.md`, `audience: user`, renders in-app): the
+      page says nothing about ordering or sorting today (`rg 'order|sort'`
+      hits only the `order: 30` frontmatter), and M3 is rename-only while
+      M6-docs is M6-only, so without a bullet here a visible feature ships
+      undocumented — `web/scripts/check-docs.mjs` validates frontmatter and
+      links, never coverage. Document the five modes, the `Manual` default,
+      that dragging rewrites the stored order for the whole board, and that
+      newly synced issues land at the bottom.
+    - **CLI**: no change needed, recorded per CLAUDE.md's check-the-CLI
+      rule and the precedent Decision 14 sets. `api/cmd/uzi`'s `board` is
+      the runs TUI (`tui_*.go`) and `uzicli` has no board client method, so
+      the reorder endpoint and the new `cardDTO` field have no CLI
+      consumer.
+    - **Sync-clobber trap** (review S6): `UpsertIssue`'s `ON CONFLICT DO
+      UPDATE SET` (`forge.sql:169-183`) wholesale-sets every listed column
+      on every poll. The new ordering column must be **excluded** from that
+      SET list (it is uzi-owned, never in the forge payload), or each
+      1-minute poll resets manual order. Guard it with a test that
+      reorders, syncs, and asserts the order survives.
+    - **Freeze tests** (Decision 7b), three, because each catches a
+      different way the freeze goes wrong:
+      1. A drop taken while sorted by something other than `Manual` leaves
+         every card *except* the dragged one in the position it visually
+         occupied. The fixture has to be one where the mode order and the
+         iid order genuinely differ — with a fixture where they coincide,
+         the broken implementation (write one position, let the rest fall
+         back to iid) passes.
+      2. **On an untouched board in the default `Manual` mode, dragging a
+         card to the bottom of its column leaves it at the bottom.** This
+         is the one a mode-gated freeze fails: all-NULL ordering plus one
+         written position puts the dragged card first under `NULLS LAST`.
+      3. A freeze performed with cards hidden from the viewer (M6's
+         non-PRD toggle off) leaves those cards' relative order unchanged
+         for a viewer with the toggle on — the payload-set rule.
 
 **Phase 3 — non-PRD issues**
 
@@ -460,14 +699,23 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 
 - [ ] **M-specs — specs/ai.md updated** (review S1): the repo's specs
       contract requires an AI-decisions record. M2 falsifies
-      `specs/ai.md:1514` ("Board order everywhere: In Progress, Human
-      Review, Upcoming, Later"); `:342-343` lists the seeded set and is
+      `specs/ai.md:1528` ("Board order everywhere: In Progress, Human
+      Review, Upcoming, Later" — cited as `:1514` until 2026-07-27, which
+      is MR-watcher prose); `:342-343` lists the seeded set and is
       **already stale** (three labels, missing Human Review — the same
       PRD-#12 bug caught in `configuration.md:104`); `:326` names the
-      implicit `Open`; `:2011` records manual ordering as "not built",
-      which M5 changes. Add ai.md items for M2 (rename + reorder + the
+      implicit `Open`. **M5 falsifies `specs/ai.md:328-329` hardest** —
+      *"`issues` — a cache, never authoritative. uzi's only owned board
+      state is column config; every issue field is overwritten from the
+      forge each sync"* — because M5 puts a uzi-owned ordering column on
+      `issues` and mandates excluding it from that overwrite. (An earlier
+      draft cited `:2011` as recording manual ordering "not built"; struck
+      2026-07-27 — the sole "not built" in the file is `:2025` and it is
+      about `mr_state`. Nothing in ai.md records ordering as not built.)
+      Add ai.md items for M2 (rename + reorder + the
       dashed-border/State/eviction/hwm design), M5 (ordering is uzi-owned
-      board state), and M6, and fix the two stale lines. Can land per
+      board state; sort modes are per-browser with a `Manual` default),
+      and M6, and fix the stale lines. Can land per
       milestone rather than all at once.
 
 ## Parallelization
@@ -475,7 +723,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 | Phase | Milestones | Depends on | Files touched |
 |---|---|---|---|
 | 1 | M1, M2, M3, M4 | — | `web/src/pages/Board.tsx`, `IssueView.tsx`, `web/src/lib/`, `forgesvc/service.go`, `docs/` |
-| 2 | M5 | — (conflicts with Phase 1 in `Board.tsx`) | `Board.tsx`, `handler/board.go`, `store/` + migration |
+| 2 | M5 | — (conflicts with Phase 1 in `Board.tsx`) | `Board.tsx`, `web/src/lib/`, `handler/board.go`, `store/` + migration |
 | 3 | M6 | M4 (chip helper) | `forge/`, `forgesvc/service.go`, `handler/workers.go`, `handler/board.go`, `Board.tsx`, `docs/` |
 
 M1–M4 are one agent's work and should land first as a single MR. M5 and
@@ -496,7 +744,21 @@ concurrently against Phase 1 will conflict; sequence them.
   `PRDLESS`, `autopilot`, or its own column's label shows no chip for
   those.
 - Reordering a card within a column survives a reload and a poll cycle,
-  and is visible to a second user.
+  and is still there in a different browser on a different device (the
+  order is per-owner and durable, not shared across users — Decision 8's
+  correction; the criterion here previously said "visible to a second
+  user", which no board route can produce).
+- On a board nobody has dragged, the default mode renders exactly today's
+  `forge_issue_iid ASC` order.
+- **On that same untouched board, dragging a card to the bottom of its
+  column leaves it at the bottom.** This is the criterion that
+  discriminates; the two either side of it pass against a mode-gated
+  freeze, which is the defect (Decision 7b).
+- Dragging a card while the board is sorted by `Last updated` leaves every
+  *other* card in the position it visually occupied, and leaves the board
+  in `Manual` mode (Decision 7b).
+- An issue synced after a manual reorder appears at the bottom of its
+  column, not the top.
 - With the toggle off, the board shows exactly the PRD-labeled issues it
   shows today, and closed PRD cards still reach the Closed column.
 - With the toggle on, open non-PRD issues appear, render dashed, offer
@@ -524,13 +786,27 @@ concurrently against Phase 1 will conflict; sequence them.
 ## Open Questions
 
 - **M5 drop semantics.** The exact gesture separating reposition from
-  move, and where a card lands when dragged into a manually ordered column
-  from another one.
+  move. (The other half of this question — where a card lands when dragged
+  into a manually ordered column from another one — was closed 2026-07-27
+  by 7b's board-global gapped-integer sequence: the card keeps a number
+  that is meaningful in its destination.)
 - **M6 scale.** Not a concern at the expected size (user, 2026-07-20:
   thousands of issues are not expected, and the additive fetch is
   open-only). The tripwire if that changes: the non-PRD fetch is unbounded
   and runs every `FullSync`, so a repo with a large *open* issue count
   would want a cap or a per-repo opt-in.
+- **Is a per-owner manual order the feature we want?** (raised by the
+  2026-07-27 review.) This PRD was written believing the order would be a
+  team-visible priority statement; the schema does not support that (see
+  Decision 8's correction), so what M5 actually ships is "arrange *your*
+  board how you like it, durably, on every device you use". That is still
+  worth having and the milestone stands, but the pitch changes and two
+  design choices were argued from the wrong premise — the board-wide
+  freeze (7b) and the `Manual` default (7a/8), both of which survive on
+  other grounds. If a genuinely shared board is wanted, it is a separate
+  and much larger PRD: one `repos`/`issues` row per project rather than
+  per connection, which touches run ownership, PAT selection, and every
+  `*ForUser` query. **Do not bolt a cross-user order onto M5.**
 
 ## Out of Scope
 
@@ -551,5 +827,11 @@ concurrently against Phase 1 will conflict; sequence them.
 - Renaming the fixture columns in the Go test suite (Decision 4).
 - Any change to `ColumnInProgress` / `ColumnHumanReview`, the two names
   the run automation is coupled to.
-- Sort-by options (updated-at, run state) — a plausible follow-up once
-  manual ordering exists, but a separate feature.
+- ~~Sort-by options (updated-at, run state) — a plausible follow-up once
+  manual ordering exists, but a separate feature.~~ **Pulled INTO scope
+  2026-07-27** (Decisions 7a/7b, M5). Deferring them would have meant
+  re-touching the same `cardsByColumn` memo and the same drag gate a
+  second time, and M5 has to settle the ordering seam either way. What
+  stays out: **per-column** sort modes (the mode is board-wide, Decision
+  7a), and a mode stored per-user in the DB rather than per-browser
+  (Decision 8).

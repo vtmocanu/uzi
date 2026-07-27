@@ -86,7 +86,30 @@ export function likelyCause(container: string | null, reason: string | null, las
     // tag or a missing pull secret.
     return "The image could not be pulled: the tag may not exist, the pull secret may be missing, or the registry may be unreachable or rate-limiting.";
   }
-  if (reason === "CrashLoopBackOff" && container === "seed-nix") {
+  // TWO REASONS, ONE FAILURE (issue #146). A fast-failing seed-nix ALTERNATES between
+  // `waiting: CrashLoopBackOff` and `terminated: Error` as kubelet cycles it — MEASURED
+  // steady-state split 71% / 29% on 0.11.8. Gating on CrashLoopBackOff alone made this
+  // guidance appear and vanish on roughly three ticks in ten while the badge correctly
+  // stayed `upgrade_failed`, so an operator watched the explanation for an unchanged
+  // failure flicker out. `Error` is the SAME incident observed a moment later, not a
+  // different one.
+  //
+  // The exit-code requirement applies to the `Error` arm ONLY, and the asymmetry is
+  // deliberate rather than an oversight. `CrashLoopBackOff` on an INIT container is
+  // already self-evidently a failure (a successful init container exits 0 and is never
+  // restarted), and requiring a code there would REMOVE guidance that ships today for a
+  // row whose exit code was never recorded — the test below pins that case. `Error` is the
+  // weaker signal, so it is required not to contradict itself: an explicit exit 0 with
+  // reason `Error` is incoherent and gets silence. An ABSENT code is not a contradiction
+  // and still qualifies, which is what `!== 0` says about null and undefined.
+  //
+  // NOT added to the controller's blockingReasons. `Error` is not a state k8s refuses to
+  // leave — that set's entry criterion — and it does not need to be: on every `Error` tick
+  // the restart arm already holds the `stuck` verdict. See stuckRestartThreshold's comment,
+  // which measures exactly this.
+  const seedNixFailing =
+    container === "seed-nix" && (reason === "CrashLoopBackOff" || (reason === "Error" && lastExitCode !== 0));
+  if (seedNixFailing) {
     // Faithful to the v0.11.0 incident WITHOUT generalising from it. The earlier version
     // asserted a permissions error as the cause, which is false as a rule: under
     // `set -eu -o pipefail` the tar pipeline is the only failing step, so ENOSPC on the

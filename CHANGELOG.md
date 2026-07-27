@@ -6,10 +6,6 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
-### Fixed
-
-- **Browser launches on hosted k8s workers get `--no-sandbox` again.** The worker's `CMD` is `npm run start`, and npm's run-script prepends `/app/node_modules/.bin` to `PATH` — so on the non-root (single-uid) start the real `agent-browser` CLI shadowed the PRD #87 shim, and every launch silently lost the flags the shim injects. Chromium then aborted on the setuid sandbox that the worker hardening makes impossible. The entrypoint now pins the runner PATH on both start modes, so the shim resolves first on k8s as it always did on compose. Runner children also stop resolving the worker's own `node_modules/.bin` (`tsx`, `tsc`, `esbuild`, …), which is the intended boundary (PRD #120, issue #120).
-
 ### Added
 
 - **Workers can be set to pick their Anthropic token automatically.** Settings → Workers gains
@@ -83,25 +79,6 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   column, so the three-way choice the CLI could already *set* is finally one it can *show*
   (PRD #111 M1 + M5).
 
-- **A Model column in the run view's per-agent usage table.** The usage panel named the run's
-  model only once, in the top strip — the main thread's. A run is multi-model (a subagent can
-  pin its own model, PRD #37; the owner's default governs the lead, PRD #69), so the per-agent
-  breakdown now shows which model each agent actually ran on: the model string normally,
-  `<primary> +K` for an agent that spanned several, `—` for a run whose frames predate the
-  feature. Tokens only — per-agent cost remains unavailable, and no cost surface changed
-  (PRD #93).
-
-- **Worker upgrade health.** Settings → Workers shows a per-worker upgrade badge, a Fleet
-  upgrade summary, and a detail strip on a worker whose upgrade failed; the Workers nav item
-  carries an alert-toned count of workers needing attention. `uzi worker list` gains an
-  `UPGRADE` column. See [docs/worker-upgrades.md](docs/worker-upgrades.md) (PRD #113).
-
-- `uzi tui`: a full-screen terminal UI — a live board of your runs, a run detail view with a per-agent lane rail and live transcript, and in-place steering (follow-up, approve/reject, cancel) and judge-review triage, all without leaving the keyboard (PRD #112).
-- **Builtin skills now ship allocated.** Each builtin carries a default shared allocation, seeded the first time uzi inserts the skill, so a fresh instance no longer needs an admin to click allocate before a builtin can reach a run. That gap was total rather than partial: allocations are what build the run's skill union, so an unallocated builtin reached nobody, not the subagents it was meant for and not the lead either. Seeding happens only on that first insert, so an allocation an admin removes afterwards stays removed; `ci-cd-norms` (whose row predates the mechanism everywhere, so its insert can never fire again) is backfilled onto existing instances by a migration, allocated to `coder` and `reviewer` (PRD #72 M2). See [docs/skills.md](docs/skills.md).
-- **A `prd-lifecycle` builtin skill**, allocated to `lead` and `reviewer` by default: the playbook for updating the issue's linked `prds/*.md` file at the end of an issue run, ticking items only on direct evidence, and moving the file to `prds/done/` when (and only when) every item is complete. The lead's own instructions carry a short version of the same step so it does not depend on the skill being allocated, conditional in its wording on the issue actually linking a PRD, and the plan prompt now asks the submitted plan to name that step, so a human approving a plan sees that the repo's spec file changes too. Both layers are instructions to a model rather than enforcement: the merge request stays the check on whether a PRD update is honest (PRD #72 M3). See [docs/skills.md](docs/skills.md).
-- **A run started with repo agents now carries the run's delivered skills.** Allocations key on your agent templates and a repo's `.claude/agents/` roster has none, so repo subagents previously received no delivered skill at all: a run started with agents from git silently lost every skill its owner had allocated. Each repo subagent now receives exactly the run's materialized skill union, which is the same set the lead already receives and no superset of it. Per-template scoping is unchanged on template runs. The trade, recorded rather than discovered later: a repo-authored subagent can now read every delivered skill body and could write it into the branch, accepted because skill bodies are user data and never secrets by product policy (PRD #72 M1). See [docs/repo-agents.md](docs/repo-agents.md).
-- **The issue's own PRD link is corrected after the merge.** When an issue run reports that it moved its PRD to `prds/done/`, uzi rewrites that link in the issue description once the run's merge request has merged, so the link a human clicks still resolves against the default branch. It is edge-triggered (once, then never again, so it does not fight a later human edit) and only ever repoints a `prds/*.md` link the description already carried, matched on the moved file's name, so a link to a different PRD is untouched. The bound is that a run cannot introduce a link, not that it cannot pick among the ones already there: an issue linking several PRDs can have the wrong one repointed if the run declares a matching filename, which costs description integrity on that one issue and nothing wider. `ci_fix` and `self_improve` runs are excluded at both the write and the read side. Adds `UpdateIssueDescription` to the forge interface and both drivers (PRD #72 M5). See [docs/autopilot.md](docs/autopilot.md).
-
 ### Changed
 
 - **Anthropic token labels can no longer contain invisible formatting characters.** Zero-width
@@ -117,14 +94,263 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   controls would have left the look-alike problem in place while appearing to fix it. Labels
   saved before this landed are untouched (PRD #111 M2).
 
+- **A guardrail denial no longer reads as a failure in the run activity feed.** When a
+  PreToolUse guardrail denies a call — a `git push`, an env or `/proc` read, an unassembled
+  subagent — the agent recovers and the run carries on, but the feed painted the result with
+  the same red "✗ error" badge as a genuine tool crash, so a healthy run looked broken to
+  anyone watching. Such results now render a third, calm state: a neutral "⊘ blocked" chip
+  (only the glyph is warn-tinted, because a full warn chip would collide with the
+  "plan awaiting approval" and slow-duration tints) that stays collapsed rather than
+  auto-expanding, since a handled and recovered-from denial does not want attention. A real
+  failure is untouched — still red, still auto-expanded. The chat surface inherits it, as it
+  renders through the same row. Detection is render-time, keyed off the `"denied by guardrail"`
+  phrase all 15 deny reasons carry, so historical runs get the calm chip too with no persisted
+  marker and no migration; `is_error` is deliberately left true on the stored frame, which keeps
+  the record honest to what the SDK emitted and is what leaves every downstream reader — the
+  judge's missing-tool prescan among them — seeing exactly what it saw before. The phrase must
+  START a line of the result, not merely appear in it: matching anywhere would have meant a
+  genuinely failing command whose output quotes the phrase rendering calm and collapsed, and this
+  change created that case itself, since a red `npm test` in the agent prints test titles carrying
+  the phrase. The coupling to the phrase is real and is pinned from the agent side, since the two
+  are separate npm packages: `agent/test/guardrails.test.ts` now drives all 15 deny paths through
+  the public API and also scans the reason declarations in source, so a future 16th reason added
+  without the phrase — or written in a form the scan cannot read — fails there rather than
+  silently turning its chip red again (issue #116).
+
+### Fixed
+
+- **A crash-looping hosted worker's diagnostics no longer vanish the moment its pod
+  reports Ready.** A `settled` roll report overwrote `blocking_container`,
+  `blocking_reason`, `restart_count` and `last_exit_code` with empties whether or not it
+  had looked at them, so a worker with five restarts and exit 1 could read as pristine
+  in the database at exactly the moment someone was reading the row to debug it. The
+  four columns now move together and are only replaced by a report whose phase
+  (`rolling`/`stuck`) means the controller actually measured them; the worker's own
+  authenticated version move still clears them (issue #145).
+
+- **The Workers page badge no longer flickers `upgrade failed` → nothing →
+  `upgrade failed` while a container crash-loops.** The worker container has no
+  readiness probe, so `Ready == True` means only that the process started, not that the
+  agent works — a Ready-but-flapping container was being reported `settled`. A Ready pod
+  is now withheld from `settled` while any container has 3+ restarts and its current
+  instance has been up less than 10 minutes, and self-clears once the container stays
+  up. A negative container uptime (clock skew between kubelet and controller) no longer
+  reads as flapping either (issue #145).
+  See [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+## [0.11.12] - 2026-07-27
+
+### Fixed
+
+- **`file` did not work in 0.11.11, despite that release announcing it.** The package was
+  declared as bare `file`, and devbox resolved that to the package's `dev` output -- headers
+  and libmagic, containing no `file` program at all. `devbox global install` reported success,
+  so the image shipped with `file` simply absent from the toolchain, exactly the silent
+  `command not found` the release was meant to remove. It is now declared `file.out`, the
+  output that carries the program, and verified from the realized profile rather than from a
+  shell that had the raw store path on its search path -- which is what made the original
+  check look green. This is the same trap `openssl.bin` documents; the earlier note reasoned
+  from a nixpkgs attribute that turns out not to govern what devbox installs, and that
+  reasoning is now corrected in place. Found by the new guard below, on its first real run.
+
+- **The worker image's toolchain guard had stopped covering the toolchain, and now cannot
+  drift again.** The guard exists so a broken toolchain fails the image BUILD instead of
+  shipping a silent `command not found` to every subagent at run time. It was a hardcoded
+  line naming five binaries, and it never grew as the manifest did: `chromium`,
+  `fontconfig` and `dejavu_fonts` arrived, then `file`, `perl`, `coreutils`,
+  `kubernetes-helm` and `kubeconform` in 0.11.11, none of them guarded. By that release it
+  was verifying 5 of 13 packages while reporting success, so a green `publish:agent` said
+  nothing about whether `helm` resolved. Worse than an uncovered package is a green light
+  nobody re-derives. The guard now checks its own coverage: it reads what `devbox global
+  install` actually installed and fails the build if any package lacks a row in
+  `agent/devbox-global/toolchain-guard.tsv`, so adding a package without guarding it is no
+  longer possible. Each row also runs its tool rather than only resolving it, because a nix
+  package can land its libraries and manual pages while its CLI never appears -- the
+  `openssl.bin` bug this guard missed the first time. Packages that legitimately ship no
+  binary are declared as such rather than guessed: `fontconfig` sounds like it provides
+  `fc-cache` and does not.
+
+## [0.11.11] - 2026-07-27
+
+### Added
+
+- **Five more tools every run can reach: `file`, `perl`, `fmt`, `helm` and `kubeconform`.**
+  The first three close judge recommendations raised by runs that lost work to a missing
+  executable — a fact-checker hex-dumped a PNG header to read its magic bytes because it had
+  no `file`, a reviewer's mutation sweep exited 127 on `perl -0pi -e` and had to be rewritten
+  as a Python heredoc, and a docs run hand-rewrapped the same paragraph twice for want of
+  `fmt`. `helm` and `kubeconform` are new capability rather than repair: an agent editing
+  `deploy/chart/` can now lint, render and schema-validate it in-worker instead of committing
+  blind and learning from CI's `helm_chart` job minutes later. All five ride the same pinned
+  nix/devbox path as the rest of the toolchain and are baked into the image at build time, so
+  they cost no per-run provisioning. Two caveats are worth knowing rather than discovering:
+  `coreutils`, which is where `fmt` comes from, places GNU versions of 82 busybox applets
+  (`ls`, `cp`, `date`, `sort`, `stat`, …) ahead of the image's own on `PATH`; and the pinned
+  nixpkgs revision carries helm 4 while CI gates on helm 3, so a local render is a smoke
+  check and never the authority over a red `helm_chart` job.
+
+### Changed
+
+- **Hosted workers may now reach the CloudNativePG chart repository, at the cost of two
+  general-purpose GitHub hosts.** Rendering uzi's own chart needs `helm dependency build` to
+  fetch the `cluster` subchart, and that fetch redirects twice before it lands: from
+  `cloudnative-pg.github.io` to `cloudnative-pg.io` for the index, then from `github.com` to
+  `release-assets.githubusercontent.com` for the 63 KB tarball. All four names are now in
+  `workers.fqdnEgress.allowFQDNs`, in both the chart default and the dev-cluster values —
+  Helm replaces list values rather than merging them, so an entry added to only one of the
+  two reaches no cluster. The last two names are by a distance the widest entries in that
+  list (any repository, any release asset) on a fence whose stated purpose is the
+  repository-exfiltration residual, so this is a deliberate trade and not an oversight. The
+  same chart is also published as an OCI artifact on `ghcr.io`, which would narrow this to a
+  registry carrying no repository or code access if the `Chart.yaml` change proves worth it.
+
+### Fixed
+
+- **The agent no longer reinstalls dependencies the worker has already provisioned.**
+  0.11.9 added JS dependency provisioning before the agent's first turn, and it works: the
+  first real run after it shipped installed both workspaces before the agent's first tool
+  call, and hit zero `command not found` for a gate tool where earlier runs hit them
+  routinely. But nothing told the agent any of that, so it planned an `npm ci` at plan time
+  (when the background install genuinely has not finished yet) and then ran it. Since
+  `npm ci` deletes `node_modules` before installing, that destroyed the provisioned tree and
+  rebuilt it, costing exactly the time the feature exists to save. The agent is now told:
+  the plan prompts state the mechanism without promising it will succeed, since the install
+  can fail; the implement prompt carries the actual per directory results, reporting a
+  failed directory as failed so the agent can react rather than trusting a claim that is
+  false for that run. It also now says when discovery hit its directory bound, so a bounded
+  scan cannot read as full coverage (issue #157).
+
+- **Repo supplied directory names reaching the agent's prompt are contained.** Those names
+  come from reading an untrusted cloned repo, and they land outside the fences that mark
+  quoted content as data, which is the one position where instruction shaped text is what
+  those fences exist to stop. A repo could commit a directory whose name reads as an
+  instruction. Names are now filtered to a conservative character set, length bounded, and
+  placed inside a nonce fence whose tag a repo cannot forge, since the tag is drawn at
+  random during the run while the name was committed to git before the run existed. A name
+  the filter had to alter is flagged as not being a usable path, with a pointer to locate
+  the real directory, so honest names like `my project` or `café` do not silently become
+  paths that cannot be found. This reduces the surface rather than closing it: the fence
+  relabels the text as data, it does not remove it from the model's context (issue #157).
+
+## [0.11.10] - 2026-07-27
+
+### Fixed
+
+- **The crossed-off steps in the dashboard's "Get the factory running" checklist are
+  legible again.** The strikethrough was drawn in a border token (`--edge-strong`) sitting
+  at roughly 1.9:1 against the card, while the struck text beside it is at roughly 6.9:1 —
+  so the line marking a step done was all but invisible, in both the ember and mission
+  themes. The decoration now inherits the muted text colour, which keeps it legible in
+  every theme without adding a token (issue #60).
+
+- **Two objects the chart declares were being deleted from the rendered manifest, so
+  restricted-tier hosted workers could not be provisioned.** A Helm template comment
+  ending `*/ -}}` immediately before a `---` trims the newline as well, gluing the
+  document separator onto the previous value. The two objects on either side then merge
+  into a single YAML document with duplicate keys, and a parser keeps only the last — so
+  the `uzi-workers` ServiceAccount and the `InfisicalSecret` that materializes its Harbor
+  pull secret silently vanished, taking the pull secret with them. The docker tier was
+  unaffected only because its object happened to come last in each merged pair. Nothing
+  cheap caught it: `helm lint` passed, `helm template` exited 0, the text still contained
+  `kind: ServiceAccount`, and ArgoCD reported `Synced/Healthy` truthfully, being in sync
+  with what the manifest declared once parsed. `scripts/assert-chart-render.sh` now
+  asserts one `kind:` per document in CI (issue #149).
+
+## [0.11.9] - 2026-07-27
+
+### Added
+
+- **JS dependency provisioning before the agent's first turn.** A run touching a JS repo (npm, pnpm, yarn, or bun, including monorepo workspaces) now gets its cloned repo's dependencies installed automatically: the worker detects the lockfile and kicks off a frozen, `--ignore-scripts` install as the run starts, overlapping it with the plan turn (and the approval wait, on human-gated runs) so it's ready before the agent's first implement turn, instead of the agent discovering a missing `node_modules` mid-task. Runs under the same runner-uid + scrubbed-env sandbox that already runs the repo's tests; an unrecognized layout or a failed install is skipped honestly, same as before (PRD #121).
+
+- **A Model column in the run view's per-agent usage table.** The usage panel named the run's
+  model only once, in the top strip — the main thread's. A run is multi-model (a subagent can
+  pin its own model, PRD #37; the owner's default governs the lead, PRD #69), so the per-agent
+  breakdown now shows which model each agent actually ran on: the model string normally,
+  `<primary> +K` for an agent that spanned several, `—` for a run whose frames predate the
+  feature. Tokens only — per-agent cost remains unavailable, and no cost surface changed
+  (PRD #93).
+
+### Fixed
+
+- **A hosted worker that can never get a pod is now alerted on, and the alert no longer
+  expires.** Two defects found by live cluster validation of 0.11.8, neither catchable
+  before deploying. First, `deriveRollHealth` returned `rolling` unconditionally when a
+  worker had zero pods, and every stuck-detection arm needs a pod, so a worker whose
+  Deployment could not create one (a missing ServiceAccount, in the measured case) was
+  reported as a healthy in-progress roll forever. It now reports `stuck` plus the
+  Kubernetes reason when the Deployment carries `ReplicaFailure=True` (issue #148).
+  Second, that alert then expired: the anti-suppression ceiling gated the `upgrade_failed`
+  row as well as the `upgrading` one, and its clock starts when the api first believes a
+  roll is in progress, which for a hosted worker is while it is still being provisioned.
+  On the measured worker that left a 70-second window out of 45 minutes before the badge
+  went quiet again, permanently. The ceiling now gates only the suppressing direction, so
+  a worker the cluster keeps reporting as stuck keeps its badge until the pod recovers
+  (issue #151). See [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+- **A self-improve check could outlive its 15-minute cap and orphan a process.** The
+  wall-clock cap was enforced by `execFile`'s own `timeout`, which kills from the worker
+  uid, and under the runner-uid split that is `EPERM` against a process running as
+  `runner`. Measured: a 2-second cap called back at 2008ms carrying `EPERM` while the
+  runner's `sleep 120` was still alive six seconds later. Checks now run as a detached
+  process group that is killed as a group (issue #153).
+
+- **A check no longer runs against dependencies its own install failed to build.** The
+  `node_modules` pre-flight treated a surviving directory as "deps ready", but a failed
+  `npm ci` leaves the previous tree intact with the new dependency absent, so the install
+  failed, the directory remained, the pre-flight passed, and the check reported a
+  real-looking failure that was really a stale tree. The signal is now the gap between
+  what the manifest declares and what the tree contains (issue #154).
+
+- **The `/nix` guidance stopped flickering out of the upgrade detail strip.** A fast-failing
+  `seed-nix` init container alternates between `CrashLoopBackOff` and `Error` as kubelet
+  cycles it (a measured 71/29 split), and the explanation was gated on the first reason
+  alone, so on roughly three polls in ten it vanished while the badge correctly stayed
+  failed. The operator watched the explanation for an unchanged failure appear and
+  disappear (issue #146).
+
+- **The judge's missing-tool scan no longer flags a tool the run actually ran.** `scanCommandNotFound` used to text-match any `command not found` hit and report that tool as missing even when the same run later ran it successfully through an npm script (`node_modules/.bin/tsc`, `vitest`, `eslint`); it now checks up to a bounded window of the run's tool-invocation trace and drops a hit once that tool is seen running clean later in the run (PRD #121).
+
+## [0.11.8] - 2026-07-26
+
+### Added
+
+- **Worker upgrade health.** Settings → Workers shows a per-worker upgrade badge, a Fleet
+  upgrade summary, and a detail strip on a worker whose upgrade failed; the Workers nav item
+  carries an alert-toned count of workers needing attention. `uzi worker list` gains an
+  `UPGRADE` column. See [docs/worker-upgrades.md](docs/worker-upgrades.md) (PRD #113).
+
+- **Builtin skills now ship allocated.** Each builtin carries a default shared allocation, seeded the first time uzi inserts the skill, so a fresh instance no longer needs an admin to click allocate before a builtin can reach a run. That gap was total rather than partial: allocations are what build the run's skill union, so an unallocated builtin reached nobody, not the subagents it was meant for and not the lead either. Seeding happens only on that first insert, so an allocation an admin removes afterwards stays removed; `ci-cd-norms` (whose row predates the mechanism everywhere, so its insert can never fire again) is backfilled onto existing instances by a migration, allocated to `coder` and `reviewer` (PRD #72 M2). See [docs/skills.md](docs/skills.md).
+
+- **A `prd-lifecycle` builtin skill**, allocated to `lead` and `reviewer` by default: the playbook for updating the issue's linked `prds/*.md` file at the end of an issue run, ticking items only on direct evidence, and moving the file to `prds/done/` when (and only when) every item is complete. The lead's own instructions carry a short version of the same step so it does not depend on the skill being allocated, conditional in its wording on the issue actually linking a PRD, and the plan prompt now asks the submitted plan to name that step, so a human approving a plan sees that the repo's spec file changes too. Both layers are instructions to a model rather than enforcement: the merge request stays the check on whether a PRD update is honest (PRD #72 M3). See [docs/skills.md](docs/skills.md).
+
+- **A run started with repo agents now carries the run's delivered skills.** Allocations key on your agent templates and a repo's `.claude/agents/` roster has none, so repo subagents previously received no delivered skill at all: a run started with agents from git silently lost every skill its owner had allocated. Each repo subagent now receives exactly the run's materialized skill union, which is the same set the lead already receives and no superset of it. Per-template scoping is unchanged on template runs. The trade, recorded rather than discovered later: a repo-authored subagent can now read every delivered skill body and could write it into the branch, accepted because skill bodies are user data and never secrets by product policy (PRD #72 M1). See [docs/repo-agents.md](docs/repo-agents.md).
+
+- **The issue's own PRD link is corrected after the merge.** When an issue run reports that it moved its PRD to `prds/done/`, uzi rewrites that link in the issue description once the run's merge request has merged, so the link a human clicks still resolves against the default branch. It is edge-triggered (once, then never again, so it does not fight a later human edit) and only ever repoints a `prds/*.md` link the description already carried, matched on the moved file's name, so a link to a different PRD is untouched. The bound is that a run cannot introduce a link, not that it cannot pick among the ones already there: an issue linking several PRDs can have the wrong one repointed if the run declares a matching filename, which costs description integrity on that one issue and nothing wider. `ci_fix` and `self_improve` runs are excluded at both the write and the read side. Adds `UpdateIssueDescription` to the forge interface and both drivers (PRD #72 M5). See [docs/autopilot.md](docs/autopilot.md).
+
+### Changed
+
 - **`UZI_AGENT_VERSION` now carries a real build stamp instead of a frozen placeholder.** CI
   stamps the release into the agent image, and an unstamped image reports no version rather
   than the retired `0.1.0-m4` literal — so a hand-set value is no longer the only thing that
   variable could mean (PRD #113).
 
+## [0.11.7] - 2026-07-26
+
+### Added
+
+- `uzi tui`: a full-screen terminal UI — a live board of your runs, a run detail view with a per-agent lane rail and live transcript, and in-place steering (follow-up, approve/reject, cancel) and judge-review triage, all without leaving the keyboard (PRD #112).
+
+### Changed
+
 - `/api/ws` now accepts a Bearer CLI token (`uzc_`/`uza_`) as well as a browser session cookie, so a headless client can subscribe to a run's live event stream; per-run authorization and the socket's origin check are unchanged (PRD #112 M1).
+
 - **The `uzi` CLI strips more from untrusted text before printing it, which changes the output of existing commands** — not only the new `uzi tui`. `uzi run logs`, `uzi run get`, `uzi review show`, `uzi review backlog` and the disposition tables now also remove DEL (`0x7f`) and every Unicode format character (category `Cf`: the bidi overrides `U+202A`–`U+202E`, the isolates `U+2066`–`U+2069`, `U+200F`, zero-width spaces and joiners, the BOM, and the soft hyphen). Previously only C0 (except tab and newline) and C1 were removed, so a bidi override could visually reorder a judge's `target` or an agent's label into something it is not, and zero-width runes could silently consume a table column's width budget while drawing nothing. Printable text is unaffected, and `--json` output is byte-exact as before. If you script against the human tables, this removes characters that were previously passed through (PRD #112 M3).
+
 - **Consequence of the above, stated because it is visible:** `U+200D` (zero-width joiner) is itself a format character, so **emoji ZWJ sequences decompose** in CLI output — a family emoji renders as its component people, a profession emoji as its parts. This affects all of the commands listed above, not only `uzi tui`. It is the accepted cost of rejecting the whole `Cf` category rather than an allowlist: an allowlist of "safe" format characters is a list somebody has to keep correct, and getting it wrong reopens the bidi-override spoof (PRD #112 M3).
+
+### Fixed
+
+- **Browser launches on hosted k8s workers get `--no-sandbox` again.** The worker's `CMD` is `npm run start`, and npm's run-script prepends `/app/node_modules/.bin` to `PATH` — so on the non-root (single-uid) start the real `agent-browser` CLI shadowed the PRD #87 shim, and every launch silently lost the flags the shim injects. Chromium then aborted on the setuid sandbox that the worker hardening makes impossible. The entrypoint now pins the runner PATH on both start modes, so the shim resolves first on k8s as it always did on compose. Runner children also stop resolving the worker's own `node_modules/.bin` (`tsx`, `tsc`, `esbuild`, …), which is the intended boundary (PRD #120, issue #120).
 
 ## [0.11.6] - 2026-07-25
 

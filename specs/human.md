@@ -521,6 +521,23 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 - The **"1 release behind"** ordinal is dropped as not derivable (uzi knows two version strings, not the release sequence). Both versions are rendered instead.
 - **Mute** shipped as storage only — there is no way to set a mute from the UI in v1.
 
+## Feature #121 — Pre-provision a cloned repo's JS dependencies
+
+Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/121-clone-js-deps-provision.md`.
+
+**Ratified [user 2026-07-27].** Derived by the team during implementation and put to the
+owner, rather than stated up front: the original trust-posture premise was found false
+during the work, and the constraint below is what replaced it.
+
+- A run's dependency install must never execute code the cloned repo authored: it
+  runs pre-approval, so it has to clear the same bar as `repo_devbox_opt_in` (per-repo
+  opt-in, default OFF, a repo's devbox scripts never executed).
+- `--ignore-scripts` is NOT sufficient on its own to hold that line (measured for yarn
+  and pnpm), so the per-manager mitigations that do hold it are part of the contract,
+  not an implementation detail.
+- If uzi ever adopts a full-scripts install, auto-provisioning must become opt-in.
+  Crossing that tradeoff is the owner's decision, never a milestone's.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

@@ -148,8 +148,8 @@ type fakeStore struct {
 	createJudgeRunErr       error
 	activeJudgeRun          store.Run
 	activeJudgeRunErr       error
-	toolResultPayloads      [][]byte
-	toolResultPayloadsErr   error
+	toolTraceRows           []store.ListToolTraceForRunRow
+	toolTraceRowsErr        error
 	runInputs               []store.RunUserInput
 	workerPageMessages      []store.RunMessage
 	workerPageErr           error
@@ -535,8 +535,8 @@ func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunPa
 func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeJudgeRun, f.activeJudgeRunErr
 }
-func (f *fakeStore) ListToolResultPayloadsForRun(context.Context, store.ListToolResultPayloadsForRunParams) ([][]byte, error) {
-	return f.toolResultPayloads, f.toolResultPayloadsErr
+func (f *fakeStore) ListToolTraceForRun(context.Context, store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error) {
+	return f.toolTraceRows, f.toolTraceRowsErr
 }
 func (f *fakeStore) ListRunInputsForRun(context.Context, store.ListRunInputsForRunParams) ([]store.RunUserInput, error) {
 	return f.runInputs, nil

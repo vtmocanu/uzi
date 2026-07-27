@@ -28,10 +28,11 @@ import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
-import { buildSdkEnv } from "./sdk-env.js";
+import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
+import { installJsDeps, type JsDepsInstall, type JsDepsResult } from "./js-deps.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
 import { resolveAgentSelection, type ClaimConfig } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
@@ -45,7 +46,7 @@ import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { assistantModelOf, assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
-import { errMessage } from "./util.js";
+import { clampToDirCharset, errMessage } from "./util.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
 // (PRD §Configuration); converted to ms at the timer.
@@ -117,6 +118,10 @@ export interface SdkExecutorOptions {
    *  can POST a cross-run learning. Absent ⇒ no memory server is registered (tests/
    *  stubs that never call it), so the tool wiring is additive and back-compatible. */
   client?: WorkerClient;
+  /** Install the cloned repo's JS dependencies (PRD #121 M2); default = installJsDeps.
+   *  Injected in tests so no package manager is ever spawned and the kick-off/join
+   *  ordering is drivable. */
+  installDeps?: typeof installJsDeps;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -147,6 +152,7 @@ export class SdkExecutor implements Executor {
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
   private readonly provision: typeof provisionTools;
+  private readonly installDeps: typeof installJsDeps;
   /** Resolved once from the worker's docker wiring (PRD #83 M1). `dockerWired` gates
    *  the Bash guardrail; `dockerHost` is injected into the SDK env when present. */
   private readonly dockerWired: boolean;
@@ -183,6 +189,7 @@ export class SdkExecutor implements Executor {
     this.provisionHomeDir = opts.provisionHomeDir ?? this.homeDir;
     this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
+    this.installDeps = opts.installDeps ?? installJsDeps;
     // Docker wiring (PRD #83 M1): derive the two consumer facts ONCE. `dockerHost` set
     // ⇒ a sidecar daemon is reachable, so the guardrail allows docker and DOCKER_HOST is
     // injected into the SDK env; absent ⇒ docker is denied and never injected.
@@ -249,6 +256,28 @@ export class SdkExecutor implements Executor {
       log: this.log,
       provision: this.provision,
     });
+
+    // JS dependency provisioning (PRD #121 M2). Kicked off HERE — after
+    // provisionRunTools, so the install resolves the RUN's provisioned node/npm off
+    // toolEnv's PATH rather than the image's, and before the plan turn, so it overlaps
+    // the plan turn and (on a human-gated run) the whole `awaiting_approval` wait.
+    // JOINED before the first implement turn, below. NOT awaited here: awaiting would
+    // throw the overlap away, which is the entire wall-clock argument for doing this.
+    const depsAbort = new AbortController();
+    const depsInstall = this.startDepsInstall(ctx, toolEnv, depsAbort.signal);
+    // The install's per-dir verdicts, kept alive to the END of the run rather than
+    // consumed and dropped at the join. The install fires BEFORE the plan turn, so by
+    // the time anything downstream asks "were the deps actually there?" the answer is
+    // long out of scope — and that question is precisely what gate honesty (PRD #121 M4,
+    // split out) has to answer to write a reason line a reviewer can act on. Deliberately
+    // INTERNAL: `ExecutorResult` gains no field for it while nothing in this PRD consumes
+    // one. The precedent for opening that door cheaply is `toolEnv`, which rides
+    // ExecutorResult for exactly this kind of executor-computed state (runner.ts).
+    let depsResults: JsDepsResult[] = [];
+    // Audit 1: carried alongside the results, because a bounded scan that reads as full
+    // coverage is exactly the unexplainable `command not found` this PRD removes — and
+    // the prompt's consumer is the agent that will actually run the gates.
+    let depsTruncated = false;
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
@@ -360,8 +389,13 @@ export class SdkExecutor implements Executor {
     const idleMs = seconds(ctx.config?.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS);
 
     // Cancel/shutdown spans the whole run (all turns + the gate). It trips the
-    // current turn's abort; the gate also unblocks via the steering verdict.
-    const onSignal = (): void => this.trip(state, REASON_CANCELLED);
+    // current turn's abort; the gate also unblocks via the steering verdict. It also
+    // reclaims the dependency install (PRD #121 M2) — a cancelled run must not sit at
+    // the join waiting out an install whose results nobody will read.
+    const onSignal = (): void => {
+      this.trip(state, REASON_CANCELLED);
+      depsAbort.abort();
+    };
     if (ctx.signal) {
       if (ctx.signal.aborted) onSignal();
       else ctx.signal.addEventListener("abort", onSignal, { once: true });
@@ -483,6 +517,30 @@ export class SdkExecutor implements Executor {
         return { branch: ctx.branch, fixVerdict: "not_code" };
       }
 
+      // --- Join the JS dependency install (PRD #121 M2) ---------------------
+      // The IMPLEMENT phase must never race the install. Past this point the agent
+      // runs `npm test` / `vitest` / `tsc`, and will run its own `npm ci` if it thinks
+      // deps are missing; npm has NO cross-process `node_modules` lock, so a concurrent
+      // worker-side install in the same dir would corrupt the tree. Joining here is what
+      // makes that impossible FOR THE IMPLEMENT TURNS — placed after the not_code return
+      // above, so a ci_fix that never implements does not wait for deps it will not use.
+      //
+      // RESIDUAL, AND IT IS NOT CLOSED BY THIS JOIN: the PLAN turn can do the same thing.
+      // It runs under `permissionMode: "bypassPermissions"` with full Bash, and
+      // guardrails.ts has no package-manager rule of any kind (verified: it screens git
+      // push/history/config, credential reads, /proc, secret paths, `env` and docker —
+      // nothing about npm/pnpm/yarn/bun). So a planning agent exploring the repo can run
+      // `npm ci` in a dir this install is mid-flight in. That window is DELIBERATE — the
+      // overlap is the entire wall-clock argument for starting before the plan turn — so
+      // it is named here rather than fixed; closing it would mean giving the overlap up.
+      //
+      // Worth knowing what it costs, because it is worse than "the deps are missing": a
+      // half-written `node_modules` still EXISTS, so `defaultCheckRunner`'s
+      // `requires: "node_modules"` pre-flight passes, the check runs against a corrupt
+      // tree, and it FAILS — accusing good code of failing, which is the one thing
+      // self-improve.ts's status mapping exists to prevent.
+      ({ results: depsResults, truncated: depsTruncated } = await this.joinDepsInstall(ctx, depsInstall));
+
       // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
       // The plan turn ran with the OWN subagents; the approved selection now decides
       // the roster for the implement phase. The lead ALWAYS stays uzi's builtin from
@@ -542,6 +600,12 @@ export class SdkExecutor implements Executor {
           first: iteration === 1,
           iteration,
           followUp,
+          // #157: the join above populated these, so the first implement turn can be told
+          // which dirs are ready and which genuinely are not — the facts the plan turn
+          // could not have. Correct on the revise path too: the join runs after the LAST
+          // gate round, so however many revisions happened, these are the final outcomes.
+          deps: depsResults,
+          depsTruncated,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
@@ -551,7 +615,15 @@ export class SdkExecutor implements Executor {
         followUp = ctx.pullFollowUp?.();
       }
 
-      this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch, agent_source: selection.source });
+      // js_deps rides the completion log so a finished run's record says whether its
+      // gates were runnable — the same question M4 will have to answer from a durable
+      // source. It is also what keeps depsResults READ rather than merely assigned.
+      this.log.info("SDK run completed", {
+        run_id: ctx.runId,
+        branch: ctx.branch,
+        agent_source: selection.source,
+        js_deps: depsResults.map((r) => ({ dir: r.dir, ok: r.ok })),
+      });
       // toolEnv (PRD #46 M9): the allowlisted provisioned tool env, so the self_improve
       // check runner can put the run's provisioned toolchains on its subprocess PATH.
       const result: ExecutorResult = { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
@@ -571,6 +643,15 @@ export class SdkExecutor implements Executor {
     } finally {
       this.disarmWall(state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);
+      // PRD #121 M2: no install may outlive the run. On every path that never reached
+      // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
+      // install may still be in flight, and the runner tears the clone down and pushes
+      // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
+      // kill rather than by the install's own 10-minute cap (that is what stops a
+      // rejected plan blocking on deps nobody needs); the promise already carries its
+      // own catch, so awaiting it can never throw here and mask the real failure.
+      depsAbort.abort();
+      await depsInstall;
       // Reap every agent subprocess before returning, so none survives into the
       // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
       // too, not just the runner's explicit pre-push call.
@@ -580,6 +661,71 @@ export class SdkExecutor implements Executor {
       // never evicts the warm-start cache. Best-effort.
       if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  /**
+   * Start provisioning the clone's JS dependencies (PRD #121 M2), returning a promise
+   * that NEVER rejects.
+   *
+   * The `.catch` is attached HERE, at creation, not at the join — between the two the
+   * promise is floating, and a rejection reaching an empty microtask queue is an
+   * unhandled rejection that kills the worker process. `installJsDeps` is contracted
+   * never to throw, but that contract belongs to the module; this call site must not
+   * depend on it holding.
+   *
+   * ENV: the same scrubbed REPLACEMENT env the self-improve checks use (`buildCheckEnv`)
+   * — never a `process.env` spread. The install executes repo-authored package.json /
+   * lockfile resolution, so the worker's join token, API URL, forge PAT and OAuth token
+   * are absent by construction; PATH comes from the run's provisioned toolEnv so the
+   * install uses the RUN's node/npm. HOME is the PER-RUN SDK home, matching what
+   * runner.ts already passes for the self-improve checks. Per-run and not the shared
+   * provisioning HOME on purpose: a shared HOME would warm the npm cache across runs,
+   * but every run's install writes it under the same `runner` uid, so one run could seed
+   * content a later run installs. A cold cache per run is the cheaper side of that
+   * trade, and the run's HOME is torn down with the run.
+   */
+  private startDepsInstall(
+    ctx: RunContext,
+    toolEnv: Record<string, string> | undefined,
+    signal: AbortSignal,
+  ): Promise<JsDepsInstall> {
+    ctx.emit({ kind: "status", agent: "worker", payload: { text: "installing the repo's JS dependencies (in the background)" } });
+    return this.installDeps(ctx.worktreePath, buildCheckEnv(process.env, this.homeDir, toolEnv), { signal }).catch(
+      (err: unknown) => {
+        // Best-effort, always: provisioning can never fail the run. Unlike
+        // provisionRunTools (whose failure DOES fail the run — the agent would be
+        // missing its declared toolchain), a missing node_modules degrades to the
+        // agent installing them itself, exactly as it does today.
+        this.log.warn("JS dependency provisioning failed", { run_id: ctx.runId, error: errMessage(err) });
+        return { results: [], truncated: false };
+      },
+    );
+  }
+
+  /**
+   * Wait for the dependency install and report what it did on the run's feed. Never
+   * throws: the promise carries its own catch, and a provisioning result — however bad —
+   * is information for the user, not a run failure.
+   */
+  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsInstall>): Promise<JsDepsInstall> {
+    const { results, truncated } = await depsInstall;
+    if (results.length === 0) {
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: "no JS dependencies to install (no lockfile found)" } });
+      return { results, truncated };
+    }
+    // One line, naming every dir and — for anything that did not install — why. A
+    // silent skip here resurfaces later as an inexplicable `vitest: not found`.
+    const installed = results.filter((r) => r.ok).map((r) => safeDirLabel(r.dir));
+    const skipped = results.filter((r) => !r.ok);
+    const parts: string[] = [];
+    if (installed.length > 0) parts.push(`installed JS dependencies in ${installed.join(", ")}`);
+    for (const s of skipped) parts.push(`${safeDirLabel(s.dir)}: ${s.detail}`);
+    // Truncation goes on the FEED, not just in a log: without it the line above reads as
+    // full coverage, and a `vitest: not found` in dir 13 becomes unexplainable.
+    if (truncated) parts.push("discovery hit its directory bound — some project dirs were not installed");
+    ctx.emit({ kind: "status", agent: "worker", payload: { text: parts.join(" — ") } });
+    this.log.info("JS dependency provisioning", { run_id: ctx.runId, results, truncated });
+    return { results, truncated };
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
@@ -821,4 +967,20 @@ function describeSkillDrop(name: string, reason: string): string {
  */
 export function resolveLeadModel(configModel?: string, templateModel?: string): string | undefined {
   return configModel || templateModel || undefined;
+}
+
+/**
+ * Render a discovered directory name for the run's activity feed. `dir` comes from
+ * `readdir`, i.e. it is REPO-CONTROLLED text: a repo can commit a directory whose name
+ * contains newlines, backticks, or instruction-shaped prose, and this string is
+ * persisted to `run_messages` and rendered to a human. Not a path escape and React
+ * escapes the HTML, but untrusted text should not be able to shape a status line, so the
+ * charset is clamped to what a real project dir needs and the length is bounded.
+ */
+function safeDirLabel(dir: string): string {
+  // 120 chars: this is a rendered feed line, where a long-but-real directory name is
+  // more useful than a short one, and React escapes the output — the clamp here is
+  // cosmetic plus defence in depth. The PROMPT clamp is load-bearing and uses a
+  // tighter bound; both share the charset deliberately (clampToDirCharset).
+  return clampToDirCharset(dir, 120);
 }

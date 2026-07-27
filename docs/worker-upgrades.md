@@ -21,7 +21,7 @@ by watching the pod rather than by asking the worker.
 | **up to date** | Reported version matches its target, or is newer | none |
 | **upgrading** | A roll is in progress — expected and transient | none |
 | **outdated** | Behind its target, nothing currently rolling it | see below |
-| **upgrade failed** | The new container is not ready *and* stuck: a blocking reason, three restarts, or ten minutes | yes |
+| **upgrade failed** | The new container is not ready *and* stuck: a blocking reason, three restarts, or ten minutes — or no pod could be created at all | yes |
 | *(no badge)* | Nothing usable to compare | none |
 
 **outdated** — hosted workers are rolled for you when a release changes the image tag, so this
@@ -29,7 +29,16 @@ usually means a roll has not happened yet or did not finish. **External workers 
 upgraded automatically**, since nothing in uzi can restart a container on your machine: there
 it is a reminder to pull and restart, not a fault. **no badge** — nothing to compare and
 nothing claimed: a locally built worker reports no version, and an api built outside a release
-turns comparison off fleet-wide, the normal state of a development setup.
+turns comparison off fleet-wide, the normal state of a development setup. One case here is
+*not* benign: a hosted worker that has **never** run has no version to compare either. A hosted
+worker with no badge and no `VERSION` never started — check its deployment rather than reading
+absence as "nothing to report".
+
+A failing hosted worker no longer decays into that state. Until 0.11.9 an **upgrade failed**
+badge expired after a fixed window and the row fell back to version comparison, which for a
+worker that never registered meant no badge at all: the alert went quiet while the worker was
+still broken. As long as the cluster keeps reporting the worker as stuck, the badge now stays.
+It clears when the pod recovers, not on a timer.
 
 ## When an upgrade fails
 
@@ -43,6 +52,13 @@ restart count, last exit code. Two reasons are common enough to name:
 
 Otherwise the reason and exit code are the useful facts — uzi reports what the cluster said
 rather than guessing at a cause it cannot observe. There is no restart button.
+
+**`pod: FailedCreate` — read the *deployment*, not the pod.** It names `pod` and carries no
+restart count or exit code because nothing was ever started: Kubernetes refused to create the
+pod (a missing ServiceAccount, an exceeded quota, an admission policy). **The copyable command
+below cannot help here** — `describe pod` matches nothing and prints `No resources found`, which
+reads as the worker having gone. Use `describe deploy -l uzi.dev/hosted-worker-id=<id>` instead;
+its `Conditions` and `Events` carry the refusal in full.
 
 The copyable **kubectl command** is read-only (`describe pod`). Replace `<worker-namespace>`
 with the namespace that worker runs in — docker-capable workers live in a separate one. Pasted

@@ -8,6 +8,7 @@ import { SdkExecutor, resolveLeadModel, type SdkQueryFn, type SdkExecutorOptions
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
+import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger } from "./helpers.js";
 
@@ -1583,5 +1584,353 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
       /invalid run id/,
     );
     assert.strictEqual(called, false, "provisioning must not run for a malformed run id");
+  });
+});
+
+// PRD #121 M2 — the clone's JS dependencies are provisioned BEFORE the agent works.
+// The install is kicked off after provisionRunTools (so it uses the RUN's node, not the
+// image's) and concurrently with the plan turn, then JOINED before the first implement
+// turn (npm has no cross-process node_modules lock, so the agent must never race it).
+describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
+  /** A deferred install: resolves only when `release()` is called. */
+  function deferredInstall(results: JsDepsResult[] = []) {
+    const calls: { root: string; env: NodeJS.ProcessEnv; signal?: AbortSignal }[] = [];
+    let done = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const installDeps: SdkExecutorOptions["installDeps"] = async (root, env, opts) => {
+      calls.push({ root, env, signal: opts?.signal });
+      await gate;
+      done = true;
+      return { results, truncated: false };
+    };
+    return { calls, installDeps, release: () => release(), isDone: () => done };
+  }
+
+  it("overlaps the plan turn, then JOINS before the first implement turn", async () => {
+    const deferred = deferredInstall([{ dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" }]);
+    const provisionOrder: string[] = [];
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      provisionOrder.push("provision");
+      return { toolEnv: {} };
+    };
+
+    // Observed INSIDE each turn, so the assertions read the real interleaving rather
+    // than a post-hoc reconstruction.
+    let installDoneAtPlanTurn: boolean | undefined;
+    let installDoneAtImplementTurn: boolean | undefined;
+    let turn = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      turn++;
+      const isPlan = turn === 1;
+      if (isPlan) installDoneAtPlanTurn = deferred.isDone();
+      else installDoneAtImplementTurn = deferred.isDone();
+      return (async function* () {
+        for await (const _ of params.prompt) void _;
+        if (isPlan) yield submitPlan("# plan");
+        else yield signalDone();
+        yield resultSuccess();
+      })();
+    };
+
+    // A real runId + tool_packages, so provisionRunTools actually provisions and the
+    // kick-off ordering below is measuring something.
+    const probe = makeCtx({
+      runId: "51210000-0000-4000-8000-000000000001",
+      config: { tool_packages: ["kubectl"] },
+    }, undefined);
+    // Release the install from the GATE, but on a later macrotask: without the join the
+    // implement turn would start on this same tick chain and observe it unfinished.
+    const gated = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (planMd) => {
+      provisionOrder.push("gate");
+      setTimeout(() => deferred.release(), 50);
+      return gated(planMd);
+    };
+
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision, installDeps: deferred.installDeps }).run(probe.ctx);
+
+    assert.strictEqual(deferred.calls.length, 1, "the install must be started exactly once");
+    assert.deepStrictEqual(provisionOrder, ["provision", "gate"], "tool provisioning must precede the plan gate");
+    assert.strictEqual(
+      installDoneAtPlanTurn,
+      false,
+      "the plan turn ran only after the install had already finished — the install was awaited at kick-off instead of overlapping the plan turn",
+    );
+    assert.strictEqual(
+      installDoneAtImplementTurn,
+      true,
+      "the first implement turn started while the dependency install was still running — it was never joined",
+    );
+    // The install targets the run's clone, and the outcome is on the feed.
+    assert.strictEqual(deferred.calls[0]!.root, probe.ctx.worktreePath);
+    assert.ok(
+      probe.emits.some((m) => m.kind === "status" && String(m.payload["text"]).includes("installed JS dependencies in web")),
+      "the run feed must report what was installed",
+    );
+  });
+
+  // Local: `revise`/`approve` live in the PRD #41 describe block, not at file scope.
+  const revise = (feedback: string): PlanVerdict => ({ kind: "revise", feedback });
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+
+  it("JOINS before implement on the REVISE path too, not just the single-gate path", async () => {
+    // The gate can be re-entered N times (PRD #41), and each re-entry runs another
+    // PLANNING turn. The sibling test above covers one gate call; this covers two, so
+    // a join that moved inside the revision loop — or a second entry into implement
+    // that skipped it — cannot pass unnoticed.
+    const RELEASE_MS = 400;
+    const deferred = deferredInstall([{ dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" }]);
+
+    // Observed INSIDE each turn, so the assertions read the real interleaving rather
+    // than a post-hoc reconstruction (same discipline as the sibling test).
+    const doneAtTurn: Record<number, boolean> = {};
+    const startedAtTurn: Record<number, number> = {};
+    let turn = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      turn++;
+      const t = turn;
+      doneAtTurn[t] = deferred.isDone();
+      startedAtTurn[t] = Date.now();
+      return (async function* () {
+        for await (const _ of params.prompt) void _;
+        // turns 1 and 2 are PLANNING turns — a revision turn must submit a plan too.
+        if (t <= 2) yield submitPlan(`# Plan v${t}`);
+        else yield signalDone();
+        yield resultSuccess();
+      })();
+    };
+
+    const probe = makeCtx({}, [revise("add a rollback step"), approve]);
+    // Release from the APPROVING (second) gate, on a later macrotask: without a join
+    // the implement turn would start on this same tick chain and observe it unfinished.
+    const gated = probe.ctx.gatePlan!;
+    let gateCalls = 0;
+    let releasedAt = 0;
+    probe.ctx.gatePlan = async (planMd) => {
+      gateCalls++;
+      if (gateCalls === 2) {
+        releasedAt = Date.now();
+        setTimeout(() => deferred.release(), RELEASE_MS);
+      }
+      return gated(planMd);
+    };
+
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps: deferred.installDeps }).run(probe.ctx);
+
+    assert.strictEqual(gateCalls, 2, "the gate must have been re-entered once (revise → approve)");
+    assert.strictEqual(turn, 3, "expected plan turn, revision turn, then one implement turn");
+    assert.strictEqual(deferred.calls.length, 1, "the install must be started ONCE, not restarted per gate round");
+
+    assert.strictEqual(
+      doneAtTurn[1],
+      false,
+      "the plan turn ran only after the install finished — the install was awaited at kick-off instead of overlapping",
+    );
+    assert.strictEqual(
+      doneAtTurn[2],
+      false,
+      "the REVISION turn ran only after the install finished — the revise path is not overlapping the install",
+    );
+    assert.strictEqual(
+      doneAtTurn[3],
+      true,
+      "the first implement turn started while the dependency install was still running: on the revise path the agent " +
+        "can run its own `npm ci` in the same dir as the worker-side install, and npm has no cross-process node_modules lock",
+    );
+
+    // The control. `doneAtTurn[3] === true` is satisfiable by coincidence (a fast
+    // install, a scheduling accident); a gap at least as long as the release delay is
+    // not — it proves the implement turn actually BLOCKED at the join.
+    const gap = startedAtTurn[3]! - releasedAt;
+    assert.ok(
+      gap >= RELEASE_MS - 25,
+      `the implement turn started ${gap}ms after the approving gate but the install was not released until ` +
+        `${RELEASE_MS}ms — it did not wait at the join, it merely observed an install that had already finished`,
+    );
+  });
+
+  it("carries the install's per-dir facts into the FIRST implement prompt (#157)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [assistantText("implementing"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [
+        { dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" },
+        { dir: "agent", manager: "npm", ok: false, detail: "npm ci --ignore-scripts failed (exit 1)" },
+      ],
+      truncated: false,
+    });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+
+    // Turn 1 is the plan turn: mechanism only, and it cannot know the outcome.
+    assert.match(turns[0]!.promptText!, /do NOT put a manual/);
+    assert.ok(!/deps_dirs_/.test(turns[0]!.promptText!), "the plan turn is built before the join, so it has no facts to give");
+    // Turn 2 is the first implement turn: the real per-dir outcome, failure included.
+    assert.match(turns[1]!.promptText!, /installed:\n1\. web/);
+    assert.match(turns[1]!.promptText!, /failed:\n2\. agent/);
+    // Turn 3 is a later implement turn on a resumed session — it must not repeat.
+    assert.ok(!/deps_dirs_/.test(turns[2]!.promptText!));
+  });
+
+  it("tells the agent when discovery was TRUNCATED, so the list cannot read as exhaustive (#157 audit)", async () => {
+    // joinDepsInstall used to return only `results`, dropping `truncated` on the floor —
+    // so a repo past MAX_PROJECT_DIRS got a note that read as full coverage, recreating
+    // the unexplainable `command not found` this change exists to remove.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [{ dir: "web", manager: "npm", ok: true, detail: "ok" }],
+      truncated: true,
+    });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.match(turns[1]!.promptText!, /NOT the complete set of JS projects/);
+  });
+
+  it("the facts are still correct after a plan REVISION (#157)", async () => {
+    // gatePlan can be re-entered, and each round runs another planning turn. The join
+    // happens after the LAST round, so the implement prompt must carry the final
+    // outcomes — not something captured at the first gate.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()],
+      [submitPlan("# Plan v2"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [{ dir: "web", manager: "npm", ok: true, detail: "npm ci --ignore-scripts ok" }],
+      truncated: false,
+    });
+    const probe = makeCtx({}, [{ kind: "revise", feedback: "add a rollback step" }, { kind: "approve", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+
+    assert.strictEqual(turns.length, 3, "expected plan, revision, then one implement turn");
+    // The REVISION turn is still a planning turn, riding a resumed session that already
+    // carries the mechanism note — so it must not be handed facts it cannot have yet.
+    assert.ok(!/deps_dirs_/.test(turns[1]!.promptText!), "the revision turn runs before the join");
+    assert.match(turns[2]!.promptText!, /1\. web/, "the implement turn after a revision must still get the facts");
+  });
+
+  it("is best-effort: a failed install does NOT fail the run, and the skip is reported honestly", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [
+        { dir: "web", manager: "npm", ok: false, detail: "npm ci --ignore-scripts failed (exit 1) — node_modules absent, gates skip honestly" },
+      ],
+      truncated: false,
+    });
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5", "an install failure must never fail the run");
+    assert.ok(
+      probe.emits.some((m) => m.kind === "status" && String(m.payload["text"]).includes("node_modules absent")),
+      "a skipped install must say so on the feed, with its reason",
+    );
+  });
+
+  it("survives an installer that THROWS (the call site never relies on the module's contract)", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => {
+      throw new Error("installer blew up");
+    };
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5", "a throwing installer must not fail the run");
+  });
+
+  it("a REJECTED plan aborts the install instead of blocking teardown on it", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    let sawSignal: AbortSignal | undefined;
+    // Resolves ONLY on abort. If the executor did not abort, run() would hang here and
+    // the test would fail on the suite timeout.
+    const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
+      new Promise((resolve) => {
+        sawSignal = opts?.signal;
+        opts?.signal?.addEventListener("abort", () => resolve({ results: [], truncated: false }), { once: true });
+      });
+    const probe = makeCtx({}, { kind: "reject", reason: "no" });
+
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx),
+      (err: unknown) => err instanceof PlanRejectedError,
+    );
+    assert.ok(sawSignal?.aborted, "a run that never implements must abort the install it will not use");
+  });
+
+  it("a CANCELLED run aborts the install", async () => {
+    const controller = new AbortController();
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    let sawSignal: AbortSignal | undefined;
+    const installDeps: SdkExecutorOptions["installDeps"] = (_root, _env, opts) =>
+      new Promise((resolve) => {
+        sawSignal = opts?.signal;
+        opts?.signal?.addEventListener("abort", () => resolve({ results: [], truncated: false }), { once: true });
+      });
+    const probe = makeCtx({ signal: controller.signal }, { kind: "cancel" });
+    // Cancel lands while the gate is deciding, exactly as a user cancel does.
+    probe.ctx.gatePlan = async () => {
+      controller.abort();
+      return { kind: "cancel" };
+    };
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx), /run cancelled/);
+    assert.ok(sawSignal?.aborted, "a cancelled run must reclaim its install");
+  });
+
+  it("installs under the SCRUBBED check env: the run's provisioned PATH, no worker credentials", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const provision: SdkExecutorOptions["provision"] = async () => ({ toolEnv: { PATH: "/run/tools/bin:/usr/bin" } });
+    const seen: NodeJS.ProcessEnv[] = [];
+    const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+      seen.push(env);
+      return { results: [], truncated: false };
+    };
+    const probe = makeCtx({
+      runId: "51210000-0000-4000-8000-000000000002",
+      config: { tool_packages: ["kubectl"] },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision, installDeps }).run(probe.ctx);
+
+    const env = seen[0]!;
+    assert.strictEqual(env.PATH, "/run/tools/bin:/usr/bin", "the install must resolve the RUN's node/npm, not the image's");
+    assert.strictEqual(env.HOME, homeDir);
+    for (const k of ["UZI_WORKER_TOKEN", "UZI_WORKER_TOKEN_FILE", "UZI_API_URL", "UZI_FORGE_PAT", "ANTHROPIC_API_KEY"]) {
+      assert.strictEqual(env[k], undefined, `${k} must be absent from the install env by construction`);
+    }
+    // beforeEach puts real-looking secrets in process.env; none may be reachable.
+    const blob = JSON.stringify(env);
+    for (const secret of [FAKE_JOIN_TOKEN, FAKE_PAT, OAUTH]) {
+      assert.ok(!blob.includes(secret), "a worker credential leaked into the install env");
+    }
+  });
+
+  it("says so plainly when the repo has no JS dependencies to install", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({ results: [], truncated: false });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.ok(
+      probe.emits.some((m) => m.kind === "status" && String(m.payload["text"]).includes("no JS dependencies to install")),
+      "an empty result must be reported, not silently swallowed",
+    );
   });
 });

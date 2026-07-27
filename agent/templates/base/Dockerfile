@@ -126,8 +126,9 @@ RUN set -o pipefail \
 # The owner's "the default worker should have docker/python/go available" set, delivered
 # through the ONE nix/devbox path (PRD #18 — no second apk package path, no version drift)
 # and PRE-WARMED into the baked /nix so first use is instant instead of paying the cold
-# closure fetch. The committed pinned manifest (agent/devbox-global/devbox.json)
-# lists go + python3 + pip; `devbox global install` realizes their closures into the
+# closure fetch. The committed pinned manifest (agent/devbox-global/devbox.json) is the
+# single source of truth for WHICH packages (13 as of 0.11.11 -- read the file, do not
+# trust a count quoted here); `devbox global install` realizes their closures into the
 # DEFAULT /nix (baked into this image layer) and builds the global profile. Runs AFTER the
 # nix chown (line ~88) and the devbox binary install above, per the M1 spec.
 #
@@ -135,12 +136,12 @@ RUN set -o pipefail \
 # re-runs the live worker-user build and confirms the EXACT `devbox global` invocation
 # (`devbox global install` from the copied manifest, or the equivalent
 # `devbox global add go python3 python3Packages.pip`), the resulting `devbox.lock`, and
-# that go/python3/pip land on the AGENT PATH. HOME=/home/worker (set above), so devbox's
+# that the manifest's packages land on the AGENT PATH. HOME=/home/worker (set above), so devbox's
 # global config resolves under $HOME/.local/share/devbox/global/default; ENV PATH below
 # adds that profile's bin dir. jvm mirrors this stanza (it is NOT `FROM base`).
 RUN mkdir -p /home/worker/.local/share/devbox/global/default
 COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/default/devbox.json
-# The committed lock PINS the nixpkgs revision (go/python/pip). Without this COPY the
+# The committed lock PINS the nixpkgs revision for EVERY package. Without this COPY the
 # image never sees it and the pin FLOATS per rebuild — it must sit BEFORE the install.
 COPY agent/devbox-global/devbox.lock /home/worker/.local/share/devbox/global/default/devbox.lock
 RUN devbox global install \
@@ -159,7 +160,7 @@ RUN PROFILE="$(readlink -f /home/worker/.local/share/devbox/global/default/.devb
     && readlink -f /opt/uzi-toolchain > /etc/uzi-toolchain-profile \
     && chown -R worker:runner /nix/var/nix/gcroots \
     && chown -h worker:runner /nix/var/nix/gcroots/uzi-toolchain
-# Put the STABLE toolchain bin on the image PATH so go/python3/gcc/pip resolve for BOTH the
+# Put the STABLE toolchain bin on the image PATH so the baked toolchain resolves for BOTH the
 # worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the image
 # PATH). Points at /opt/uzi-toolchain/bin — the immutable handle above — NOT the mutable
 # `.devbox/.../default/bin` symlink. A per-run `devbox shellenv` still PREPENDS run tools,
@@ -168,8 +169,18 @@ ENV PATH="/opt/uzi-toolchain/bin:${PATH}"
 # PRD #92 M1 fail-closed guard (the "UNVERIFIED" stanza never had one): a broken toolchain
 # fails the BUILD here (resolving against /opt/uzi-toolchain/bin) instead of shipping a
 # silent 127 to every subagent at run time.
-RUN command -v python3 && command -v go && command -v gcc && command -v pip && command -v openssl \
-    && go version && python3 --version && gcc --version && pip --version && openssl version
+#
+# DRIFT-PROOF SINCE 0.11.11. This was a hardcoded `command -v python3 && ... && openssl`
+# line, and it never grew as devbox.json did: chromium/fontconfig/dejavu_fonts (PRD #87)
+# and then file/perl/coreutils/kubernetes-helm/kubeconform were all baked WITHOUT guard
+# coverage, so the guard passed on 5 of 13 packages while `publish:agent` reported green.
+# The guard now cross-checks its own coverage against what devbox actually installed, so
+# adding a package to devbox.json without a row in toolchain-guard.tsv FAILS THE BUILD.
+# MIRRORED in jvm (it is NOT `FROM base`) -- keep the two in lockstep.
+COPY agent/devbox-global/toolchain-guard.tsv /tmp/toolchain-guard.tsv
+COPY agent/devbox-global/assert-toolchain.sh /tmp/assert-toolchain.sh
+RUN bash /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv \
+    && rm -f /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

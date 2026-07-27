@@ -9,7 +9,7 @@ import {
   buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
-  prepareCheckDeps,
+  missingDeclaredDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -195,6 +195,50 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
     assert.equal(r.detail, "command not available in the worker");
   });
 
+  it("maps the wall-clock cap to skipped, not failed (#153)", async () => {
+    // A check killed by the cap produced no verdict, so it is never evidence of a
+    // failure. This regressed silently under execFile: the cap surfaced as `e.killed`,
+    // which is NOT set on the spawn path, so a timed-out check reported "failed".
+    const started = Date.now();
+    const r = await defaultCheckRunner(checkEnv, 150)(check({ command: "sh", args: ["-c", "sleep 30"] }), worktree);
+    assert.equal(r.status, "skipped", "a check that ran out of wall clock must never be reported as a failure");
+    assert.equal(r.detail, "timed out");
+    // The cap must actually fire; if the kill did not land this would run the full 30s.
+    assert.ok(Date.now() - started < 5000, "the wall-clock cap did not kill the check");
+  });
+
+  it("the wall-clock kill reaps the check's GRANDCHILDREN, not just its direct child (#153)", async () => {
+    // A test suite backgrounds helpers (a dev server, a docker container, a watcher). A
+    // plain `child.kill()` signals only the direct child and orphans those; the fix
+    // spawns the check `detached` — making it a process-GROUP leader — and reaps the
+    // GROUP. This is the half of #153 that IS observable without a uid split, and it is
+    // what stops a timed-out check leaving work behind on the worker.
+    const marker = join(worktree, `grandchild-${Date.now()}`);
+    const r = await defaultCheckRunner(checkEnv, 200)(
+      // Backgrounds a grandchild that will write a marker shortly AFTER the cap fires,
+      // then blocks. `nohup` does not setsid, so the grandchild stays in the group — a
+      // group kill reaches it, a direct-child kill does not.
+      check({ command: "sh", args: ["-c", `nohup sh -c 'sleep 1; echo alive > ${marker}' >/dev/null 2>&1 & sleep 30`] }),
+      worktree,
+    );
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "timed out");
+    await new Promise((res) => setTimeout(res, 1800));
+    assert.ok(
+      !existsSync(marker),
+      "a backgrounded grandchild outlived the wall-clock kill: the check was not reaped as a process group, so a timed-out suite leaves processes running on the worker",
+    );
+  });
+
+  it("maps a kill by any other signal to skipped (an OOM kill is not a test failure)", async () => {
+    const r = await defaultCheckRunner(checkEnv, 5000)(
+      check({ command: "sh", args: ["-c", "kill -TERM $$; sleep 5"] }),
+      worktree,
+    );
+    assert.equal(r.status, "skipped");
+    assert.match(r.detail, /^killed \(SIG/);
+  });
+
   it("captures ONLY the exit status — command output never reaches the result", async () => {
     const secret = "sk-ant-api03-NEVER-IN-THE-MR";
     const r = await defaultCheckRunner(checkEnv, 5000)(
@@ -204,6 +248,91 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
     assert.equal(r.status, "failed");
     assert.equal(r.detail, "exit 3");
     assert.ok(!JSON.stringify(r).includes(secret), "command output must never reach the CheckResult");
+  });
+});
+
+// #154: the `requires: "node_modules"` pre-flight treated a SURVIVING directory as
+// "deps ready". Measured: with package.json declaring a dependency the lockfile does not
+// carry, `npm ci` refuses (EUSAGE), exits 1, and leaves the previous node_modules intact
+// with the new dependency absent from it. The directory is therefore not the signal — the
+// gap between what the manifest declares and what the tree contains is.
+describe("stale-dependency pre-flight (#154)", () => {
+  const mkProject = (manifest: string, installed: string[] | null): string => {
+    const wt = mkdtempSync(join(tmpdir(), "si-stale-"));
+    mkdirSync(join(wt, "web"), { recursive: true });
+    writeFileSync(join(wt, "web", "package.json"), manifest);
+    if (installed !== null) {
+      mkdirSync(join(wt, "web", "node_modules"), { recursive: true });
+      for (const name of installed) mkdirSync(join(wt, "web", "node_modules", name), { recursive: true });
+    }
+    return wt;
+  };
+  const npmCheck: SelfImproveCheck = {
+    name: "web: npm test",
+    cwd: "web",
+    // Would EXIT 0 if it ever ran — so any "skipped" below came from the pre-flight,
+    // and any "passed" proves the pre-flight let it through.
+    command: "sh",
+    args: ["-c", "exit 0"],
+    requires: "node_modules",
+  };
+  const env = { PATH: process.env.PATH, HOME: tmpdir() };
+
+  it("skips when a declared dependency is missing from a SURVIVING node_modules", async () => {
+    // Exactly the measured EUSAGE aftermath: the install refused, the old tree remains,
+    // the newly-declared dep never landed.
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0","dep-b":"1.0.0"}}', ["dep-a"]);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "skipped", "a check must never run against a tree the installer failed to build");
+    assert.match(r.detail, /dependencies out of date/);
+    assert.match(r.detail, /dep-b/, "the reason must name what is missing, so a reader can act on it");
+  });
+
+  it("runs the check when every declared dependency is present", async () => {
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0"},"devDependencies":{"dep-c":"1.0.0"}}', ["dep-a", "dep-c"]);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "passed", "a healthy tree must still produce real evidence");
+  });
+
+  it("handles scoped packages, which live one directory deeper", async () => {
+    const missing = mkProject('{"name":"w","dependencies":{"@scope/pkg":"1.0.0"}}', []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, missing)).status, "skipped");
+    const present = mkProject('{"name":"w","dependencies":{"@scope/pkg":"1.0.0"}}', ["@scope/pkg"]);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, present)).status, "passed");
+  });
+
+  it("does NOT require optional or peer deps, which may legitimately be absent", async () => {
+    // An optional dep skipped for a platform mismatch is not a broken tree, and a peer
+    // dep may be intentionally unmet. Requiring either would fabricate a skip.
+    const wt = mkProject(
+      '{"name":"w","optionalDependencies":{"fsevents":"2.0.0"},"peerDependencies":{"react":"18.0.0"}}',
+      [],
+    );
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("does NOT fabricate a skip when the manifest is unreadable — unknown is not a failure", async () => {
+    const wt = mkProject("{not json", []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("leaves the zero-dependency project alone (the trap this must not fall into)", async () => {
+    // `npm ci` on a project declaring NO dependencies exits 0 and creates no
+    // node_modules at all — measured. The requirement is derived from what is declared,
+    // so a project declaring nothing has nothing to be missing. The pre-existing
+    // directory-existence pre-flight still governs that case and is untouched.
+    const wt = mkProject('{"name":"w","version":"1.0.0"}', []);
+    assert.deepEqual(missingDeclaredDeps(join(wt, "web")), []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("still reports a bare clone as 'not installed', not as 'out of date'", async () => {
+    // No node_modules at all is the ORIGINAL pre-flight's case and keeps its wording —
+    // the two reasons point a reader at different problems.
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0"}}', null);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "dependencies not installed in the worker");
   });
 });
 
@@ -262,23 +391,10 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
   });
 });
 
-describe("prepareCheckDeps (M9: best-effort npm ci → honest skip on failure)", () => {
-  it("reports per-dir outcomes and never throws when npm ci fails", async () => {
-    const wt = mkdtempSync(join(tmpdir(), "si-deps-"));
-    mkdirSync(join(wt, "web"), { recursive: true });
-    // web/ has a package.json but a broken lockfile-less state → npm ci fails; agent/
-    // has no package.json → reported as such. Neither throws; both leave node_modules
-    // absent so the checks skip honestly.
-    writeFileSync(join(wt, "web", "package.json"), '{"name":"x","version":"1.0.0"}');
-    const notes = await prepareCheckDeps(wt, { PATH: process.env.PATH, HOME: wt }, ["web", "agent"], 30_000);
-    const web = notes.find((n) => n.dir === "web");
-    const agent = notes.find((n) => n.dir === "agent");
-    assert.ok(web && !web.ok, "npm ci without a lockfile must fail, reported honestly");
-    assert.ok(agent && !agent.ok && agent.detail.includes("no package.json"));
-    // The failure left no node_modules → a real check there would pre-flight to skipped.
-    assert.ok(!existsSync(join(wt, "web", "node_modules")));
-  });
-});
+// The `prepareCheckDeps` block that stood here went with the function (PRD #121 M2):
+// the dependency install is now js-deps.ts's `installJsDeps`, and its best-effort /
+// honest-skip contract is covered there — including the no-lockfile and failed-install
+// cases this block asserted.
 
 describe("selfImproveMrSection skip disclosure (M8)", () => {
   it("states plainly that skipped is not passed when any check was skipped", () => {

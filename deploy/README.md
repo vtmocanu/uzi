@@ -57,6 +57,17 @@ Cutting a release is three steps; only the tag push publishes anything.
    Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z`
    (they must be equal). Open an MR, let CI go green, merge to `main`.
 
+   **Write the CHANGELOG section in this same MR, and re-check it just before
+   tagging.** `publish:assert-changelog` fails the publish stage if any merge since
+   the previous tag changed shipping code without being cited in the new version's
+   section. Run it yourself first — `bash scripts/assert-changelog-covers-release.sh
+   main` — because the failure mode it guards is invisible in the release MR's own
+   diff: **anything that merges while your release MR is open rides into the release
+   without ever passing through it.** That has happened three times (0.11.7 and
+   0.11.8 shipped with entries still under `[Unreleased]`; issue #60 landed inside
+   0.11.10's window with no entry at all). A merge with genuinely nothing to announce
+   is exempted with a `Changelog: none` line in its commit message.
+
 2. **Tag that merged commit and push the tag.**
 
    ```sh
