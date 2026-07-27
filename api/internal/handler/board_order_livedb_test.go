@@ -310,6 +310,75 @@ func TestSetBoardOrderDedupesLiveDB(t *testing.T) {
 	}
 }
 
+// THE TWO FREEZE STATEMENTS RUN IN ONE TRANSACTION, and until this test nothing
+// observed it. Measured by the tester: replacing tx/qtx with h.q — so both statements
+// still execute and commit, and only atomicity is lost — left the whole live sweep at
+// RUN=204 PASS=204 FAIL=0 SKIP=0.
+//
+// WHY NO EXISTING TEST COULD SEE IT, which is the more useful half: with the second
+// statement failing, both configurations return 500, and every test's status check is a
+// t.Fatalf that fires first and identically. Execution never reaches an assertion about
+// the rows, and the rows are where the difference lives — 0 keeping a position with the
+// transaction, 3 without.
+//
+// What that difference costs in production: a failed second statement leaves the board
+// RENUMBERED BUT UNCLEARED, and the 10s poll renders it. The user sees their order
+// scrambled by a request that returned an error, which reads as a sync bug rather than a
+// write bug and sends the next person to the wrong half of the system.
+//
+// The second statement is failed with a trigger rather than by mutating generated code,
+// so the test is deterministic, needs no race, and leaves the tree alone. It is scoped
+// to this fixture's repo and dropped on cleanup: the LiveDB runner shares one database.
+func TestSetBoardOrderRollsBackWhenTheSecondStatementFailsLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardOrderFixture(ctx, t, 10, 20, 30)
+
+	// Seed a clean order first, so ClearBoardOrderExcept has something to clear on the
+	// second call and therefore actually fires.
+	if w := f.call(t, f.owner, f.repoID, `{"iids":[10,20,30]}`); w.Code != http.StatusOK {
+		t.Fatalf("seed call = %d, want 200", w.Code)
+	}
+
+	// Fail ONLY the clear: raise when a row's position is being set to NULL. That is
+	// exactly what ClearBoardOrderExcept does and never what SetBoardOrderPositions does.
+	mustExecT(ctx, t, f.pool, `
+		CREATE OR REPLACE FUNCTION uzi_test_fail_board_clear() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.board_position IS NULL AND OLD.board_position IS NOT NULL THEN
+				RAISE EXCEPTION 'uzi test: forced failure of the clear statement';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`)
+	mustExecT(ctx, t, f.pool, `
+		CREATE TRIGGER uzi_test_fail_board_clear_trg
+		BEFORE UPDATE ON issues FOR EACH ROW
+		WHEN (NEW.repo_id = '`+f.repoID.String()+`')
+		EXECUTE FUNCTION uzi_test_fail_board_clear()`)
+	t.Cleanup(func() {
+		mustExecT(context.Background(), t, f.pool, `DROP TRIGGER IF EXISTS uzi_test_fail_board_clear_trg ON issues`)
+		mustExecT(context.Background(), t, f.pool, `DROP FUNCTION IF EXISTS uzi_test_fail_board_clear()`)
+	})
+
+	// Submit an order that OMITS 30, so the clear has a row to null and fires the trigger.
+	w := f.call(t, f.owner, f.repoID, `{"iids":[20,10]}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 — the forced failure did not reach the handler", w.Code)
+	}
+
+	// THE ASSERTION THE 500 HIDES. Without the transaction, 10 and 20 keep the positions
+	// the first statement wrote (2000 and 1000) and 30 keeps its old one: three rows
+	// renumbered by a request that failed. With it, every row still holds the order from
+	// the successful seed above, untouched.
+	pos := f.positions(ctx, t)
+	for iid, want := range map[int64]int64{10: 1000, 20: 2000, 30: 3000} {
+		if !pos[iid].Valid || pos[iid].Int64 != want {
+			t.Errorf("issue %d board_position = %v, want %d — the failed freeze was not rolled back, "+
+				"so the board is renumbered but uncleared and the next poll will render it", iid, pos[iid], want)
+		}
+	}
+}
+
 // The cap. 5000 is far above any real board; the test exists because an array-accepting
 // endpoint must not be handable an unbounded one.
 func TestSetBoardOrderRejectsOversizedListLiveDB(t *testing.T) {
