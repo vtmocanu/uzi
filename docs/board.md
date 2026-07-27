@@ -14,16 +14,31 @@ manual reload.
 
 ## Columns
 
-- **Open** (implicit): issues carrying none of the configured column labels.
-- One column per configured label (seeded on first open: `In Progress`,
-  `Human Review`, `Upcoming`, `Later`); reconfigure any time from the
-  board's column settings.
+- **Backlog** (implicit): issues carrying none of the configured column
+  labels. There is no `Backlog` label behind it, so nothing is written to
+  GitLab when a card sits here; GitLab's own board lists these issues in its
+  built-in **Open** list instead, and the two names cannot be reconciled
+  (GitLab's built-in list can't be renamed).
+- One column per configured label, seeded on first open in this order:
+  `Planned`, `In Progress`, `Human Review`, `Later`. Reconfigure any time
+  from the board's column settings.
 - **Closed** (implicit): the issue's GitLab state, not a label; cards here
   aren't draggable.
 
+A fresh board therefore reads **Backlog · Planned · In Progress · Human
+Review · Later · Closed**, left to right in the order work moves: nobody has
+decided yet, someone picked it, an agent has it, its merge request is waiting
+on you, or it was looked at and deliberately deferred.
+
 `In Progress` and `Human Review` are also the two columns the run automation
-below moves cards through; `Upcoming`/`Later` are plain backlog buckets it
+below moves cards through; `Planned`/`Later` are plain backlog buckets it
 never touches except to restore a card to one.
+
+**Existing boards keep the columns they already have.** A board seeded before
+`Planned` existed still shows `Upcoming`, in its old position: uzi will not
+rename a real GitLab label out from under you, and there's no undo for that
+from inside uzi. To adopt the new name by hand, see
+[Configuration](./configuration.md).
 
 **Hide empty columns.** The board toolbar has a **Hide empty** tick box: turn
 it on and any column with no cards drops out, with a **`N hidden`** count next
@@ -54,8 +69,8 @@ and board views.
 Starting a run moves its issue for you: **Start run** puts the card in **In
 Progress**; when the run completes, it moves to **Human Review** (with or
 without a merge request); a failed or cancelled run moves it back to
-wherever it started (Open,
-Upcoming, Later) rather than a hardcoded column, so a backlog placement is
+wherever it started (Backlog,
+Planned, Later) rather than a hardcoded column, so a backlog placement is
 never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is

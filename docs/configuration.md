@@ -101,7 +101,18 @@ These extend the core table above; `UZI_SECRET_KEY` (which also encrypts forge b
 
 ### Default column labels are created on the forge
 
-The first time a repo's board is opened, uzi ensures three labels exist on that GitLab project — `In Progress`, `Upcoming`, `Later` (`forgesvc.DefaultColumns`) — creating any that are missing via the forge's label-create API. This is a deliberate, visible side effect: those labels then show up in GitLab's own label list and board for that project, not just inside uzi. Board columns are reconfigurable afterward to any of the project's labels; the default set is only what's seeded on first open.
+The first time a repo's board is opened, uzi ensures four labels exist on that GitLab project: `Planned`, `In Progress`, `Human Review`, `Later` (`forgesvc.DefaultColumns`), creating any that are missing via the forge's label-create API. They are seeded in that order, which is the order the board renders them in, after the implicit `Backlog` lane. This is a deliberate, visible side effect: those labels then show up in GitLab's own label list and board for that project, not just inside uzi. Board columns are reconfigurable afterward to any of the project's labels; the default set is only what's seeded on first open.
+
+### Renaming a board column on an existing board
+
+Boards seeded before `Planned` existed keep their `Upcoming` column, in its old position. uzi does not migrate them: renaming a column means rewriting a real GitLab label that saved filters, other boards and other tooling may depend on, and there is no undo for it from inside uzi. To adopt the new name by hand, do it **in this order**:
+
+1. **Rename the label in GitLab first.** Project → Manage → Labels, edit `Upcoming`, set its title to `Planned`, save. GitLab carries every issue over with the label, so no issue loses its labelling.
+2. **Then repoint the uzi column.** On the board, open **Columns**, remove `Upcoming`, add `Planned`, move it to the top with the arrows, and save.
+
+The order matters. Between the two steps the affected cards sit in `Backlog` (they now carry `Planned`, which is not yet a configured column), and step 2 settles them into `Planned` on the next sync. Doing it the other way round is what you want to avoid: repointing the uzi column first leaves the `Upcoming` label on GitLab with nothing in uzi referring to it, while every issue still wearing that label carries no configured column label and drops into `Backlog` with no column on the board pointing at where it went.
+
+Nothing about this is required. A board that keeps `Upcoming` keeps working exactly as it does today.
 
 ### Freshness contract
 
