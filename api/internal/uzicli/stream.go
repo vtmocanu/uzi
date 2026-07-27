@@ -55,14 +55,26 @@ var knownRunEventTypes = map[string]struct{}{
 // intended, since the comment below turns an unrecognised status into "do not trust
 // this to be active".
 //
-// The count in the first sentence is part of the contract, and it is now ENFORCED:
-// TestKnownRunStatusesMatchTheDocumentedCount fails if the map and the number above
-// disagree. That is a narrower guarantee than it looks, and the boundary is worth
-// stating so nobody over-trusts it — the assertion pins the map against this COMMENT,
-// not against the migration. Widening the DB CHECK to a ninth status without touching
-// this file still leaves both green, because no test in this leaf package can see
-// `api/internal/store/migrations/`. What it does catch is the likelier half of the
-// same mistake: editing one of the two here and forgetting the other.
+// Two tests enforce this, and they cover different halves:
+//
+//   - TestKnownRunStatusesMatchTheDocumentedCount pins the map against the COUNT in the
+//     first sentence, so editing one without the other fails.
+//   - TestKnownRunStatusesMatchTheMigrationCheck pins it against runs_status_check
+//     ITSELF, parsed out of the migration that last declares it. That is the one that
+//     matters: it is what makes "widen the CHECK, forget this map" a red test instead of
+//     a silent downgrade of every run in the new status.
+//
+// An earlier version of this comment claimed the second test was impossible here,
+// because uzicli is a leaf package that cannot import the store. That was wrong twice
+// over: the package already imports apitypes and coder/websocket, and reading a file
+// needs no import at all — internal/uzicli sits at the same depth as internal/workersvc,
+// whose auto_select_test.go established the `../store/migrations/` path literal.
+//
+// What is still NOT covered is one narrow case, measured rather than assumed: a future
+// migration that widens the domain WITHOUT ever naming runs_status_check passes
+// silently, because the scan selects its file by that name. A plain rename does not
+// slip through — it fails loudly instead — and a DROP-then-ADD-under-a-new-name is
+// caught, because the DROP still names it. See the test for the full table.
 var knownRunStatuses = map[string]struct{}{
 	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
 	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.

@@ -189,7 +189,15 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 				} else if parked {
 					parked = false
-					fmt.Fprintf(env.Stderr, "run %s resumed (%s)\n", args[0], sanitizeTTY(run.Status))
+					// cellText, NOT sanitizeTTY, and the difference is the whole point:
+					// sanitizeTTY spares "\n", so a status carrying one would inject a
+					// line onto stderr. Unreachable today because runs_status_check
+					// constrains status to eight values — which is precisely the argument
+					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
+					// controlled today" is exactly the assumption that rots). Holding one
+					// line of this file to a weaker standard than the line beside it, on a
+					// premise that line disowns, is not a defensible split.
+					fmt.Fprintf(env.Stderr, "run %s resumed (%s)\n", args[0], cellText(run.Status))
 				}
 				select {
 				case <-cmd.Context().Done():

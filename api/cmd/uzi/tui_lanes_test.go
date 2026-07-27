@@ -121,6 +121,18 @@ func TestLaneLabelClampIsRuneSafe(t *testing.T) {
 }
 
 // The D5 ladder, all six rungs plus the three traps.
+//
+// 🔴 NOT EXHAUSTIVE OVER STATUSES, and it is not trying to be. `limit_wait` (PRD #35)
+// rides the same gate rung as `awaiting_approval` and is covered by
+// TestCrewStateForParkedRun below, deliberately kept separate.
+//
+// The reason is structural rather than tidiness: each row here isolates ONE rung's
+// precedence, so a single `limit_wait` row would pin the VERDICT without pinning WHICH
+// RUNG produced it — and the whole point of the park's placement is that it fires above
+// two rungs that answer differently (recency says `idle`, a frozen health flag says
+// `stalled`). Proving that needs the stale-vs-fresh and flagged-vs-ok PAIRS, which one
+// table row structurally cannot hold. Folding it in would produce a row that passes for
+// a reason nobody could later separate from the one intended.
 func TestCrewStateForLadder(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	const me, other = "toolu_me", "toolu_other"

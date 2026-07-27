@@ -269,6 +269,38 @@ func TestLimitWaitLineSanitizesTheRateLimitType(t *testing.T) {
 	if !strings.Contains(got, "five") || !strings.Contains(got, "next-line") {
 		t.Errorf("sanitizing dropped the printable text too, got:\n%q", got)
 	}
+
+	// TAB — the second discriminator. sanitizeTTY spares "\t" DELIBERATELY (a tab is
+	// ordinary content in the free-text columns it also serves); only cellText folds it
+	// to a space. A tab survives into a tabwriter cell and walks the whole column right,
+	// with the rune offset pinned throughout — which is why the table's own alignment
+	// assertions cannot see it.
+	tabbed := parkedRun(now)
+	withTab := "five\thour"
+	tabbed.RateLimitType = &withTab
+	if line := limitWaitLine(tabbed, now); strings.Contains(line, "\t") {
+		t.Errorf("a tab in rate_limit_type reached a table cell: %q — sanitizeTTY spares tab, so this is the probe that proves cellText is wired", line)
+	}
+
+	// THE LENGTH CAP — the third, and the one with the most reach. sanitizeTTY has no
+	// length bound at all; cellText inherits compactText's 200-char cap. This is what
+	// stops an oversized value blowing the table rail.
+	//
+	// By this test's own stated standard, the DB CHECK is not the answer here: a
+	// constraint forbidding an oversized value is a guarantee made in ANOTHER package,
+	// and rate_limit_type carries no CHECK at all by design (the vocabulary is the SDK's,
+	// so 00090 deliberately left it open and put the guard in Go). The renderer must
+	// bound what it is handed.
+	oversized := parkedRun(now)
+	long := strings.Repeat("x", 250)
+	oversized.RateLimitType = &long
+	line := limitWaitLine(oversized, now)
+	if strings.Contains(line, long) {
+		t.Errorf("a 250-char rate_limit_type reached the terminal uncapped (line is %d bytes) — sanitizeTTY has no length bound, so this probe is what proves the cap is applied", len(line))
+	}
+	if !strings.Contains(line, "…") {
+		t.Errorf("an oversized rate_limit_type was neither truncated nor ellipsised: %q", line)
+	}
 }
 
 // TestFmtUntil pins the TWO-unit rendering, which is where this parts company with
