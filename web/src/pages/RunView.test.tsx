@@ -236,6 +236,13 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
     );
     // The rendered TEXT is the assertion — a `title` check here would be measuring what
     // 96ed275a already fixed, on a surface that carries no title at all.
+    //
+    // The POSITIVE assertion below is load-bearing, not belt-and-braces. Both renders sit
+    // behind a truthiness guard, so a fixture that regressed to `null` would mount nothing
+    // and leave `not.toMatch` matching an empty string — green, and proving nothing. Same
+    // shape as this batch's first finding: `!fs.existsSync(...)` passing because the thing
+    // it tested for was absent. Measured: nulling this fixture reds with
+    // `expected '' to be 'the repo approved this'`.
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(container.textContent).toBe("the repo approved this");
   });
@@ -252,6 +259,9 @@ describe("HealthFlag — the health reason (#124, text channel)", () => {
       <HealthFlag run={run({ status: "running", health: "stalled", health_reason: "no output for \u202E20m\u200B" })} />,
     );
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    // Sharper here than in the sibling case: the pill DOES mount without a reason (it
+    // renders `⚠ stalled`), so `not.toMatch` passes on a null fixture and only this line
+    // catches it. Measured: `expected '⚠ stalled' to contain 'no output for 20m'`.
     expect(container.textContent).toContain("no output for 20m");
   });
 });
