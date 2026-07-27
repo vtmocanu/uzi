@@ -542,10 +542,33 @@ func renderRoot(rc store.GetSlackRunContextRow, base string) string {
 	return head
 }
 
-// renderThread returns the threaded outcome event for a terminal transition, or
-// "" for a non-terminal one. Completed carries the MR link; failed the reason. The
-// worker-originated failure reason is length-bounded and mrkdwn-escaped before it
-// goes out (it is untrusted free text with no source-side length bound).
+// renderThread returns the threaded event for a transition, or "" when the
+// transition is not worth interrupting the owner for. Completed carries the MR link;
+// failed the reason. The worker-originated failure reason is length-bounded and
+// mrkdwn-escaped before it goes out (it is untrusted free text with no source-side
+// length bound).
+//
+// 🔴 THIS USED TO READ "for a terminal transition, or "" for a NON-TERMINAL one",
+// and PRD #35 made that false: `limit_wait` is non-terminal and posts. Stated as a
+// RULING rather than left to be rediscovered, because the old sentence is exactly
+// what would make the next reader file the park case as a violation and delete it.
+//
+// The rule is "worth interrupting for", and terminality was only ever a proxy for
+// it. What broke the proxy is a status that lasts HOURS BY DESIGN — the contract was
+// written before one existed. The mechanism that forces the widening: the root line
+// is EDITED, and a Slack edit raises no notification, so a park with no threaded post
+// is never communicated at all. The user learns their run is idle by happening to
+// look, having lost the window in which they might have cancelled it.
+//
+// TWO PROPERTIES BOUND THE WIDENING, and they are what make it safe rather than
+// merely better — check any future non-terminal case against both:
+//
+//  1. It is bounded by construction. RUN_LIMIT_MAX_WAITS caps parks per run
+//     (default 5), so a run can post this at most that many times over its life.
+//  2. The RESUME posts nothing. `queued` falls to the default arm, which is right —
+//     resuming is a return to normal and the edited root already shows it. Without
+//     this half, a run that parks five times would produce ten posts and the feature
+//     would read as a notification stream.
 func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	switch rc.Status {
 	case "completed":
@@ -565,18 +588,9 @@ func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	case "cancelled":
 		return "🚫 cancelled"
 	case "limit_wait":
-		// 🔴 THE ONLY NON-TERMINAL CASE IN THIS SWITCH, AND IT IS DELIBERATE.
-		// renderThread otherwise fires on terminal transitions only, so adding one here
-		// widens a documented contract — the justification is that the root line is
-		// EDITED rather than posted, and a Slack edit raises no notification. Without a
-		// threaded post a user is never told their run paused; they would discover it by
-		// happening to look. A park is exactly the event worth interrupting for, because
-		// the run may sit idle for hours and the user may want to cancel instead.
-		//
-		// Bounded by construction: RUN_LIMIT_MAX_WAITS caps parks per run (default 5),
-		// so this can post at most that many times over a run's life. The promotion back
-		// to `queued` posts nothing — `queued` falls to the default arm — which is right:
-		// resuming is a return to normal, and the edited root already shows it.
+		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
+		// two properties that bound it live on this function's doc comment above, in one
+		// place, so they cannot drift from the contract they amend.
 		return limitWaitLabel(rc)
 	default:
 		return ""
