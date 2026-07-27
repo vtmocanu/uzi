@@ -44,9 +44,25 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // resume-skips-the-gate path (Decision 6b) consumes plan_md and plan_approved
   // together, so the parse of both is now load-bearing.
   //
-  // These are strict-equality assertions against the NON-DEFAULT values the golden
-  // carries, so a producer that dropped a field (undefined) fails here rather than
-  // coincidentally matching a `false` default.
+  // The golden carries these as `true` rather than at their zero values for two
+  // reasons, NEITHER of which is "otherwise a dropped field would pass":
+  //
+  //   1. it matches the precedent auto_approve already set in this fixture, and
+  //   2. a non-default value is what distinguishes "actually wired" from "present
+  //      and always zero" for a future producer built from the real claim path
+  //      rather than from the hand-built struct.
+  //
+  // An earlier version of this comment claimed a `false` golden would let a producer
+  // that DROPPED the field pass here. That is false and was corrected rather than
+  // left: this file imports `node:assert/strict`, so `assert.equal` IS
+  // `strictEqual`, and `undefined === false` is false — the assertion throws at
+  // either golden value.
+  //
+  // What actually gates a dropped field is stated in this file's header and is worth
+  // re-stating because it is not this assertion: removing a member from
+  // `ClaimResponse` fails `npm run typecheck`, not this test, because
+  // agent/tsconfig.json includes `test` in the program. The Go half is gated
+  // separately, by a byte-compare against MarshalIndent output.
   assert.equal(claim.wait_on_limit, true);
   assert.equal(claim.plan_approved, true);
   assert.equal(claim.plan_md, "# Plan\n");
