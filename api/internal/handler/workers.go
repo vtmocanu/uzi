@@ -326,6 +326,15 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		FinishedAt:       timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
 		CreatedAt:        r.CreatedAt.Time,
 		UpdatedAt:        r.UpdatedAt.Time,
+		// PRD #35 usage-limit park. Mapped INDEPENDENTLY of each other, like the
+		// PRD #111 credential fields below: WaitOnLimit is set on every run from
+		// creation while the other four stay null/zero until a first park, so a run
+		// legitimately carries the opt-in with no park data. Never branch on the group.
+		WaitOnLimit:    r.WaitOnLimit,
+		LimitResetsAt:  timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
+		RetryNotBefore: timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
+		LimitWaitCount: r.LimitWaitCount,
+		RateLimitType:  textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
 	}
 	if r.RepoID.Valid {
 		s := uuid.UUID(r.RepoID.Bytes).String()

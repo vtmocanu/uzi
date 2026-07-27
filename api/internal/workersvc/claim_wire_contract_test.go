@@ -17,9 +17,15 @@ const wireContractFixture = "testdata/claim_skills_wire.json"
 
 // sampleClaimPayloadWithSkills is a representative, fully-populated claim showing
 // every PRD #16 wire addition: repo.skills_enabled, the skills union, the
-// skills_dropped log, per-template ClaimAgent.skills, and the config caps. Values
-// are fixed (no random uuids) so the golden file is stable. Secrets are obvious
-// non-credentials so scanners never flag the fixture.
+// skills_dropped log, per-template ClaimAgent.skills, and the config caps — plus,
+// since PRD #35, the usage-limit park fields. Values are fixed (no random uuids) so
+// the golden file is stable. Secrets are obvious non-credentials so scanners never
+// flag the fixture.
+//
+// The booleans are deliberately set NON-DEFAULT (true), exactly as AutoApprove
+// already was: a golden carrying every flag at its zero value would still pass
+// against a producer that dropped the field entirely, which is the one drift this
+// cross-language pin exists to catch.
 func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
@@ -37,6 +43,8 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		RequeueCount:     0,
 		PlanMd:           strptr("# Plan\n"),
 		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
+		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
+		PlanApproved:     true, // PRD #35 Decision 6b: lets a resume skip the plan gate
 		Repo: ClaimRepo{
 			ID:            "22222222-2222-2222-2222-222222222222",
 			URL:           "https://gitlab.example.com/g/p",

@@ -587,6 +587,17 @@ UPDATE runs SET
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
+  -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
+  -- this clause a `running` heartbeat delivered AFTER the park report — the batcher
+  -- retries, and two pre-gate fire-and-forget reports already exist, so reordering
+  -- is not hypothetical — would flip limit_wait back to running under a worker whose
+  -- execution has already ended. The run would then sit `running` until RUN_TIMEOUT
+  -- failed it, with the park silently lost. The inversion is worth naming: the same
+  -- negative-guard shape that makes CancelRunServerSide cover a new status for free
+  -- is what makes THIS statement dangerous.
+  -- Resume is unaffected: a promoted run is 'claimed' when the worker reports running.
+  AND status <> 'limit_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -604,7 +615,12 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- Symmetric with SetRunRunning's guard (PRD #35): the negative predicate above
+  -- admits limit_wait, and a re-delivered gate report must not un-park a run. Kept
+  -- even though the current worker cannot reach this ordering, because "the caller
+  -- never does that today" is what SetRunRunning's own history disproves.
+  AND status <> 'limit_wait';
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is

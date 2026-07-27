@@ -729,6 +729,9 @@ export type RunStatus =
   | "claimed"
   | "running"
   | "awaiting_approval"
+  /** Parked until the owner's Anthropic usage window reopens (PRD #35).
+   *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
+  | "limit_wait"
   | "completed"
   | "failed"
   | "cancelled";
@@ -890,6 +893,38 @@ export interface Run {
    *  Since PRD #111 M1 it can be read together with the credential above: what the
    *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
+  /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
+   *  the run parks at status "limit_wait" and resumes when the window reopens,
+   *  instead of failing. Present on every run from creation, so it is what a "will
+   *  retry on limit" affordance renders BEFORE any park has happened. */
+  wait_on_limit: boolean;
+  /** PRD #35: when the exhausted window reopens, as REPORTED by the worker off the
+   *  SDK frame, and when the server will actually promote the run back to queued.
+   *
+   *  🔴 THESE ARE NOT THE SAME INSTANT AND THE COUNTDOWN READS `retry_not_before`.
+   *  That is when work resumes. It carries jitter, is clamped to RUN_LIMIT_MAX_PARK,
+   *  is cross-checked against the owner's own rate-limit gauge, and is POOL-AWARE —
+   *  a user whose second credential still has headroom is promoted early, so
+   *  retry_not_before is routinely EARLIER than limit_resets_at, not merely offset
+   *  from it. Render limit_resets_at as context ("the five-hour window reopens at
+   *  …") and never compute the countdown from it.
+   *
+   *  Both null for a run that has never parked. ISO-8601 strings, like every other
+   *  timestamp on this type. */
+  limit_resets_at: string | null;
+  retry_not_before: string | null;
+  /** PRD #35: how many times this run has parked (0 if never), capped server-side
+   *  by RUN_LIMIT_MAX_WAITS. The CAP is deliberately not on this type — it is one
+   *  server constant and does not belong on every row of a list response — so render
+   *  "attempt N", not "attempt N/M", unless the denominator is fetched from /api/me. */
+  limit_wait_count: number;
+  /** PRD #35: which window rejected the run ("five_hour", "seven_day", …). Already
+   *  allowlisted against the SDK union server-side, with anything unrecognised
+   *  coerced to "unknown", so it is a safe enum here and never worker free text —
+   *  but render an unrecognised value honestly rather than dropping it, since the
+   *  vocabulary is the SDK's and a newer server can ship a member this build has not
+   *  heard of. Null for a run that has never parked. */
+  rate_limit_type: string | null;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW

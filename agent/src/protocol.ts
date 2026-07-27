@@ -15,9 +15,18 @@ export const WORKER_API_PREFIX = "/api/worker";
 export type RunState =
   | "running"
   | "awaiting_approval"
+  | "limit_wait"
   | "completed"
   | "failed";
 
+/**
+ * The states a run never leaves.
+ *
+ * `limit_wait` is NOT one of them and must never be added (PRD #35): a parked run
+ * resumes when the usage-limit window reopens. The warning is here because nothing
+ * would catch the mistake — adding it is type-legal (it is a `RunState`), and this
+ * Set currently has no consumer outside this file, so no test or typecheck fails.
+ */
 export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
   "completed",
   "failed",
@@ -251,8 +260,11 @@ export interface ClaimConfig {
 /**
  * Response body of a successful (200) claim.
  *
- * The server also sends top-level run fields the worker does not consume in M2
- * (status, iteration_count, requeue_count, plan_md); they are ignored here.
+ * The server also sends top-level run fields the worker does not consume
+ * (status, iteration_count, requeue_count); they are ignored here.
+ *
+ * `plan_md` used to be in that ignored list and no longer is — PRD #35's resume
+ * path consumes it, so it is declared below.
  */
 export interface ClaimResponse {
   run_id: string;
@@ -305,6 +317,27 @@ export interface ClaimResponse {
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */
   judge_signal?: JudgeSignal | null;
+  /** The plan already captured for this run (PRD #35 Decision 6b). The server has
+   *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
+   *  nothing read it. A resumed run whose plan was already approved replays THIS
+   *  text instead of re-planning, so the field is now load-bearing.
+   *  Null on a fresh run and on any run that never reached the gate. */
+  plan_md?: string | null;
+  /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
+   *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is
+   *  autopilot". On a resume with a resumable session this lets the worker skip the
+   *  Phase-1 planning turn and the gate entirely: without it a park-and-resume
+   *  re-generates a plan, re-parks the run at awaiting_approval for a human who
+   *  already approved one, and can fail outright with REASON_NO_PLAN when the resumed
+   *  session declines to re-emit signal_plan.
+   *  Absent on an older server ⇒ treat as false, i.e. plan as today. */
+  plan_approved?: boolean;
+  /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
+   *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
+   *  `auto_approve` above, and for the same reason: an unattended resume must not
+   *  silently lose the behaviour the user chose. Absent on an older server ⇒ false,
+   *  i.e. a limit death fails the run as it does today. */
+  wait_on_limit?: boolean;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -705,6 +738,19 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
+   *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
+   *  `number` in the typings with no unit declared, so the WORKER normalizes it
+   *  (< 10^12 ⇒ seconds ⇒ ×1000) before sending and the server re-validates rather
+   *  than trusting the normalization. Absent when the frames carried no usable
+   *  reset — the server then falls back to its exponential park schedule. */
+  limit_resets_at?: number;
+  /** limit_wait (PRD #35): the SDK's `rateLimitType` verbatim, e.g. "five_hour".
+   *  Sent unvalidated ON PURPOSE — the server allowlists it against the SDK union
+   *  and coerces anything else to "unknown" before it reaches the DB, the DTO, the
+   *  feed or Slack. Doing the allowlisting here as well would put the authoritative
+   *  copy of the vocabulary on the untrusted side. */
+  rate_limit_type?: string;
 }
 
 export interface UserInput {

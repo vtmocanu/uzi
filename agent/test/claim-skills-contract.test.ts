@@ -37,6 +37,20 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // worker must still parse the skills fields alongside it.
   assert.equal(claim.auto_approve, true);
 
+  // PRD #35: the usage-limit park fields ride the same claim, top-level alongside
+  // auto_approve and re-read from the runs row on every claim so a resumed run keeps
+  // them. plan_md is asserted here for the first time — the server always sent it,
+  // but it was undeclared in protocol.ts and unread while nothing needed it; the
+  // resume-skips-the-gate path (Decision 6b) consumes plan_md and plan_approved
+  // together, so the parse of both is now load-bearing.
+  //
+  // These are strict-equality assertions against the NON-DEFAULT values the golden
+  // carries, so a producer that dropped a field (undefined) fails here rather than
+  // coincidentally matching a `false` default.
+  assert.equal(claim.wait_on_limit, true);
+  assert.equal(claim.plan_approved, true);
+  assert.equal(claim.plan_md, "# Plan\n");
+
   // Config caps ride the claim (no worker-side hardcoded drift).
   assert.equal(claim.config?.skill_max_bytes, 65536);
   assert.equal(claim.config?.skills_max_per_run, 32);

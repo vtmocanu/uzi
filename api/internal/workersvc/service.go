@@ -2092,6 +2092,21 @@ type StateRequest struct {
 	// report is its only channel for recording which roster it used. A human-gated run
 	// omits this and persists its selection through the approve_plan input instead.
 	AgentSelection *AgentSelection `json:"agent_selection"`
+	// LimitResetsAt is the epoch at which the exhausted Anthropic usage window
+	// reopens, as the worker read it off the SDK frame (PRD #35). The worker
+	// normalizes the SDK's unit-less number to MILLISECONDS before sending; the
+	// server re-validates rather than trusting that. UNTRUSTED input: it is stored
+	// for display and cross-checked against this user's own anthropic_rate_limits
+	// gauge, but it is never the promotion gate — retry_not_before is computed
+	// server-side and clamped, so a worker cannot park a run for years.
+	LimitResetsAt *int64 `json:"limit_resets_at"`
+	// RateLimitType is the SDK's rateLimitType for the window that rejected the run.
+	// UNTRUSTED free text on arrival: the server allowlists it against the SDK union
+	// and coerces anything unrecognised to "unknown" before it reaches the DB, any
+	// DTO, the feed or Slack. That enum allowlist is what closes the injection,
+	// length and control-char concerns in one move — unlike the register path, the
+	// state path has no sanitizeSelfReported.
+	RateLimitType *string `json:"rate_limit_type"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting

@@ -80,6 +80,14 @@ var runDTOKeys = []string{
 	// pick — so all four are always PRESENT on the wire and a client branches per
 	// field rather than on the group.
 	"anthropic_select_reason", "anthropic_headroom_pct",
+	// PRD #35 usage-limit park. Five keys, always present. wait_on_limit is set from
+	// creation on every run; the other four stay null/0 until a first park, so — as
+	// with the credential group above — a client branches per field, never on the
+	// group. limit_resets_at and retry_not_before are separate keys because they are
+	// separate instants: the countdown reads retry_not_before, which is jittered,
+	// clamped and pool-aware and is routinely EARLIER than the reported reset.
+	"wait_on_limit", "limit_resets_at", "retry_not_before", "limit_wait_count",
+	"rate_limit_type",
 }
 
 func TestRunDTOTags(t *testing.T) {

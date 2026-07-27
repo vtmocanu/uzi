@@ -42,13 +42,28 @@ var knownRunEventTypes = map[string]struct{}{
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a
-// CHECK constraint over exactly these seven values (migration 00020_workers_runs.sql).
-// A value outside the set cannot be stored, so one arriving on the wire means the
-// server is newer than this binary — which is precisely when it must not be trusted
-// to mean "active".
+// CHECK constraint over exactly these eight values (runs_status_check, declared
+// inline in 00020_workers_runs.sql and widened with 'limit_wait' by PRD #35's
+// migration). A value outside the set cannot be stored, so one arriving on the wire
+// means the server is newer than this binary — which is precisely when it must not be
+// trusted to mean "active".
+//
+// THIS MAP MUST BE WIDENED IN THE SAME COMMIT AS THE CHECK. It is not a display
+// concern: NormalizeRunEvent rewrites any status outside it to RunStatusUnknown at the
+// DECODE boundary, so a status the DB accepts and this map omits reaches every CLI and
+// TUI consumer as "unknown" — silently, and with the opposite meaning to the one
+// intended, since the comment below turns an unrecognised status into "do not trust
+// this to be active". No test catches the omission; the sentinel behaviour is pinned
+// but the roster is not.
+//
+// The count in the first sentence is part of the contract — if it disagrees with the
+// map, one of the two was edited alone.
 var knownRunStatuses = map[string]struct{}{
 	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
-	"completed": {}, "failed": {}, "cancelled": {},
+	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.
+	// NON-terminal — it is deliberately absent from terminalRunStatuses below.
+	"limit_wait": {},
+	"completed":  {}, "failed": {}, "cancelled": {},
 }
 
 // terminalRunStatuses are the three a run never leaves. Verified against the requeue
