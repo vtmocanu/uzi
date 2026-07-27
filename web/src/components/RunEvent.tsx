@@ -322,21 +322,45 @@ export function resultToText(content: unknown): { text: string; hadNonText: bool
 // guardrail deny reasons carries (agent/src/guardrails.ts:92-111), plus the two
 // colon-less `?? "denied by guardrail"` fallbacks (:539/:786). `web/` and `agent/`
 // are separate npm packages, so the phrase cannot be imported — the contract is
-// pinned from the agent side by agent/test/guardrails.test.ts. Matched with
-// `.includes`, NOT `.startsWith`, so it survives the colon-less fallback and a
-// possible future `<tool_use_error>…</tool_use_error>` SDK wrapper (PRD #116).
+// pinned from the agent side by agent/test/guardrails.test.ts.
 const GUARDRAIL_DENY_MARK = "denied by guardrail";
+
+// The SDK may wrap a tool error in `<tool_use_error>…</tool_use_error>`; the open
+// tag is stripped before the anchor test so a wrapped denial still reads as one.
+const TOOL_USE_ERROR_OPEN = "<tool_use_error>";
 
 export type ResultState = "ok" | "error" | "blocked";
 
 // classifyResultState maps a tool_result to its presentation state (PRD #116).
-// "blocked" is gated on is_error deliberately: over-matching would need a
-// genuinely FAILING result whose text also contains the exact phrase — negligible.
-// The state is purely presentational — `is_error` stays true on the persisted
-// frame, and no executor/health/judge path is touched (PRD #116 Decision 2).
+//
+// The deny phrase must START one of the text's LINES (after leading whitespace and
+// an optional `<tool_use_error>` open tag). Anchoring per line, rather than
+// `.includes` over the whole text, is what keeps both halves honest:
+//   - a real denial still matches in every shape it ships in — the plain reason, the
+//     colon-less `?? "denied by guardrail"` fallback (no colon to anchor on, which is
+//     why this is not an exact-string or "phrase + colon" test), the `<tool_use_error>`
+//     wrapper, and a denial that is one of several content blocks joined with "\n" by
+//     resultToText, wherever in that join it lands;
+//   - a MID-LINE mention no longer disarms the red chip. A genuinely failing command
+//     that greps guardrails.ts, or a failing `npm test` whose node --test output echoes
+//     a test title quoting the phrase, is a real problem and must stay "✗ error"
+//     (under-alarming it is the risk PRD #116 called out).
+//
+// "blocked" is gated on is_error: a successful result quoting the phrase is untouched.
+// The state is purely presentational — `is_error` stays true on the persisted frame,
+// so nothing downstream shifts. That guarantee comes from the frame being UNCHANGED,
+// not from nobody reading it: the judge's missing-tool prescan does read this exact
+// field (api/internal/workersvc/judge.go, toolResultOutcome → observedGreenTools), and
+// flipping a denial to non-error at the source would make a denied command count as
+// green evidence that it ran (PRD #116 Decision 2).
 export function classifyResultState(isError: boolean, text: string): ResultState {
   if (!isError) return "ok";
-  return text.includes(GUARDRAIL_DENY_MARK) ? "blocked" : "error";
+  for (const line of text.split("\n")) {
+    let s = line.trimStart();
+    if (s.startsWith(TOOL_USE_ERROR_OPEN)) s = s.slice(TOOL_USE_ERROR_OPEN.length).trimStart();
+    if (s.startsWith(GUARDRAIL_DENY_MARK)) return "blocked";
+  }
+  return "error";
 }
 
 // ── durations ───────────────────────────────────────────────────────────────
@@ -567,30 +591,40 @@ function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMess
 
 // ── per-kind rows ───────────────────────────────────────────────────────────
 
+// The neutral chip/body frame, shared by "ok" and "blocked" so a future tweak to
+// one cannot silently drift from the other.
+const NEUTRAL_CHIP = "border-edge bg-raised/50 text-muted hover:border-edge-strong";
+const NEUTRAL_BODY = "border-edge bg-ink";
+
 // Per-state chip/body presentation (PRD #116 Decision 4). "blocked" reuses the
-// NEUTRAL success frame verbatim — only its ⊘ glyph is warn-tinted, because
-// --warn already means "plan awaiting approval" (:765) and slow duration (:531),
-// so a fully warn chip would collide semantically.
+// NEUTRAL success frame — only its ⊘ glyph is warn-tinted, because --warn is
+// already spoken for by the plan-submitted chip and the slow-duration tint, so a
+// fully warn chip would collide semantically.
+//
+// The weight lives in glyphClass, per state, rather than on the shared span: at
+// 11px, `font-bold` closes the counter of ⊘ and it rasterises as a small amber
+// blob, confusable with the feed's agent-status dots. ✓/✗ read fine bold at that
+// size and keep it; ⊘ goes non-bold and a touch larger instead.
 const RESULT_TONE: Record<ResultState, { glyph: string; glyphClass: string; chip: string; body: string; aria: string }> = {
   ok: {
     glyph: "✓",
-    glyphClass: "text-ok",
-    chip: "border-edge bg-raised/50 text-muted hover:border-edge-strong",
-    body: "border-edge bg-ink",
+    glyphClass: "font-bold text-ok",
+    chip: NEUTRAL_CHIP,
+    body: NEUTRAL_BODY,
     aria: "Tool output",
   },
   error: {
     glyph: "✗",
-    glyphClass: "text-danger",
+    glyphClass: "font-bold text-danger",
     chip: "border-danger/40 bg-danger/10 text-danger",
     body: "border-danger/40 bg-danger/[0.08]",
     aria: "Tool error output",
   },
   blocked: {
     glyph: "⊘",
-    glyphClass: "text-warn",
-    chip: "border-edge bg-raised/50 text-muted hover:border-edge-strong",
-    body: "border-edge bg-ink",
+    glyphClass: "text-warn text-[13px] leading-none",
+    chip: NEUTRAL_CHIP,
+    body: NEUTRAL_BODY,
     aria: "Tool blocked output",
   },
 };
@@ -666,7 +700,7 @@ function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: s
           tone.chip,
         )}
       >
-        <span aria-hidden="true" className={cx("font-bold", tone.glyphClass)}>
+        <span aria-hidden="true" className={tone.glyphClass}>
           {tone.glyph}
         </span>
         {label}

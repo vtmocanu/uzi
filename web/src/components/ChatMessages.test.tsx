@@ -19,9 +19,9 @@ function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunM
 
 // The chat surface renders tool rows through the SAME RunEventRow/ToolResultBody
 // as the run feed, so the PRD #116 "blocked" state must reach it for free —
-// guardrail denies genuinely happen in chat (the Bash + path guards are wired at
-// agent/src/chat-executor.ts:259). This pins that inheritance; the state machine
-// itself is covered in RunEvent.test.tsx.
+// guardrail denies genuinely happen in chat (the Bash + path guards are both wired
+// into the chat session's PreToolUse hooks, agent/src/chat-executor.ts:256-266).
+// This pins that inheritance; the state machine itself is covered in RunEvent.test.tsx.
 describe("ChatMessages tool rows (PRD #116)", () => {
   const DENY = "denied by guardrail: reading /proc is not permitted";
 

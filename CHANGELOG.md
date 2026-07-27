@@ -19,13 +19,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   failure is untouched — still red, still auto-expanded. The chat surface inherits it, as it
   renders through the same row. Detection is render-time, keyed off the `"denied by guardrail"`
   phrase all 15 deny reasons carry, so historical runs get the calm chip too with no persisted
-  marker and no migration; `is_error` is deliberately left true on the stored frame, which
-  keeps it honest to what the SDK emitted and leaves every executor, run-health and judge path
-  untouched. The coupling to that phrase is real and is pinned from the agent side, since the
-  two are separate npm packages: `agent/test/guardrails.test.ts` now drives all 15 deny paths
-  through the public API and also scans the reason literals in source, so a future 16th reason
-  added without the phrase fails there rather than silently turning its chip red again
-  (issue #116).
+  marker and no migration; `is_error` is deliberately left true on the stored frame, which keeps
+  the record honest to what the SDK emitted and is what leaves every downstream reader — the
+  judge's missing-tool prescan among them — seeing exactly what it saw before. The phrase must
+  START a line of the result, not merely appear in it: matching anywhere would have meant a
+  genuinely failing command whose output quotes the phrase rendering calm and collapsed, and this
+  change created that case itself, since a red `npm test` in the agent prints test titles carrying
+  the phrase. The coupling to the phrase is real and is pinned from the agent side, since the two
+  are separate npm packages: `agent/test/guardrails.test.ts` now drives all 15 deny paths through
+  the public API and also scans the reason declarations in source, so a future 16th reason added
+  without the phrase — or written in a form the scan cannot read — fails there rather than
+  silently turning its chip red again (issue #116).
 
 ## [0.11.11] - 2026-07-27
 

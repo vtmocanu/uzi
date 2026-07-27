@@ -595,12 +595,12 @@ describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () =>
 // PRD #116 — the deny-phrase CONTRACT.
 //
 // `web/src/components/RunEvent.tsx` classifies a `tool_result` as a calm "⊘ blocked"
-// chip (instead of a red "✗ error") when its text CONTAINS "denied by guardrail".
-// `web/` and `agent/` are separate npm packages, so the web side hardcodes that
-// phrase — nothing at build time couples the two. This block is the belt that makes
-// that coupling safe: if a reason ever stops carrying the phrase, the failure mode is
-// a RED TEST HERE, not a silent revert of every blocked chip back to red in the UI
-// (which nobody would notice, because the run still works).
+// chip (instead of a red "✗ error") when "denied by guardrail" STARTS one of its
+// lines. `web/` and `agent/` are separate npm packages, so the web side hardcodes
+// that phrase — nothing at build time couples the two. This block is the belt that
+// makes that coupling safe: if a reason ever stops carrying the phrase, the failure
+// mode is a RED TEST HERE, not a silent revert of every blocked chip back to red in
+// the UI (which nobody would notice, because the run still works).
 //
 // Two tests, deliberately overlapping, because neither alone is sufficient:
 //   (a) behavioural — drives all 15 deny paths that exist TODAY through the public
@@ -608,9 +608,16 @@ describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () =>
 //       It cannot cover a reason that does not exist yet.
 //   (b) source scan — greps the reason literals straight out of guardrails.ts, so a
 //       FUTURE 16th reason added without the phrase fails here even though (a) has no
-//       case for it. Known limitation: the regex only sees a literal that stays on one
-//       line, so reformatting one across lines makes it invisible — the ">= 15" floor
-//       turns that into a red test rather than a vacuous pass.
+//       case for it. It counts DECLARATIONS and readable LITERALS separately and
+//       requires them to be EQUAL, so a reason written in a form the literal regex
+//       cannot read — a template literal, a single-quoted string, a value built by a
+//       call — fails loudly instead of slipping past invisibly. That was a real hole:
+//       such a 16th reason satisfies the ">= 15" floor via the other fifteen, and (a)
+//       cannot reach it either, so BOTH halves would have gone green on exactly the
+//       case (b) exists to catch. Accepted false positive: splitting the phrase across
+//       a concatenation (`"denied by " + "guardrail: …"`) reddens the scan although
+//       the runtime value is fine. Write it as one literal; the scan is deliberately
+//       dumber than the compiler.
 describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
   const PHRASE = "denied by guardrail";
   const PROC_PATH = "/proc/1/environ";
@@ -679,12 +686,26 @@ describe("deny reasons carry the user-facing phrase (PRD #116)", () => {
   // (b) The future-proofing half: read the reason literals out of the source itself.
   it("every REASON_* literal declared in src/guardrails.ts carries the phrase", () => {
     const src = fs.readFileSync(new URL("../src/guardrails.ts", import.meta.url), "utf8");
-    const decl = /\bconst\s+REASON_[A-Z0-9_]+\s*=\s*"((?:[^"\\]|\\.)*)"/g;
-    const literals = [...src.matchAll(decl)].map((m) => m[1]!);
-    // A floor, not an equality: a 16th reason is welcome, a scan that matched NOTHING
-    // (someone reformatted a literal across lines, or renamed the constants) must fail
-    // loudly instead of passing vacuously on an empty list.
-    assert.ok(literals.length >= 15, `expected >= 15 REASON_* declarations, found ${literals.length} — did the declaration style change?`);
+    // Two passes over the same source, sharing one left-hand side so they cannot
+    // drift: `decls` counts every REASON_* constant HOWEVER its value is written,
+    // `literals` reads back only those values this scan can actually parse (a
+    // double-quoted string — `\s` spans newlines, so wrapping one is still readable).
+    const DECL_LHS = String.raw`\bconst\s+REASON_[A-Z0-9_]+\s*(?::[^=;\n]*)?=`;
+    const decls = [...src.matchAll(new RegExp(DECL_LHS, "g"))];
+    const literals = [...src.matchAll(new RegExp(DECL_LHS + String.raw`\s*"((?:[^"\\]|\\.)*)"`, "g"))].map((m) => m[1]!);
+    // The floor stops the whole scan passing vacuously on an empty list (constants
+    // renamed away, file moved)…
+    assert.ok(decls.length >= 15, `expected >= 15 REASON_* declarations, found ${decls.length} — did the declaration style change?`);
+    // …and the EQUALITY is what closes the hole the floor alone leaves: a 16th reason
+    // written as a template literal, a single-quoted string, or a call result is
+    // counted HERE and unreadable THERE. Without this it passes both halves in
+    // silence — the floor is still satisfied by the other 15, and the behavioural
+    // table cannot reach a constant that did not exist when it was written.
+    assert.strictEqual(
+      literals.length,
+      decls.length,
+      `every REASON_* must be a double-quoted string literal so this scan can read it; ${decls.length} declared, ${literals.length} readable`,
+    );
     for (const literal of literals) {
       assert.ok(literal.startsWith(PHRASE), `REASON literal must start with "${PHRASE}": ${JSON.stringify(literal)}`);
     }

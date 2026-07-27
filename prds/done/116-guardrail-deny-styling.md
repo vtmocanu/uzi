@@ -119,10 +119,10 @@ Current states → new:
 
 ## Milestones
 
-- [ ] **M1 — Blocked render state.** `RunEvent.tsx` classifies `"denied by
+- [x] **M1 — Blocked render state.** `RunEvent.tsx` classifies `"denied by
   guardrail: "` results as "blocked": calm tone/label/glyph, collapsed by default,
   non-danger border. A genuine `is_error` result is visually unchanged.
-- [ ] **M2 — Tests.**
+- [x] **M2 — Tests.**
   - `web/src/components/RunEvent.test.tsx`: a guardrail-deny `tool_result` renders
     "blocked" (not "error"), is collapsed initially (`aria-expanded=false`, body
     `hidden`), uses a non-danger tone, and preserves the raw reason in the body; a
@@ -140,9 +140,60 @@ Current states → new:
     `is_error` sample ≈`:1776`; live mock runs set it through `engine.ts:80`'s
     `opts.error → is_error`) so the blocked state is demonstrable without a live run.
   - `npm test` + `npm run typecheck` green.
-- [ ] **M3 — Spec note.** Append a short decision to `specs/ai.md` (append-only at
+- [x] **M3 — Spec note.** Append a short decision to `specs/ai.md` (append-only at
   the tail) recording the "blocked" presentation state, the prefix contract it
   keys off, and that `is_error` is deliberately left true (presentation-only).
+  (Landed as `specs/ai.md` §418.)
+
+## As built — where the implementation departs from the plan above
+
+Recorded because five things in this PRD did not survive contact with the code.
+Each was verified before changing course.
+
+1. **The match is anchored to the START of a LINE, not `.includes` anywhere in the
+   text** (Decision 1 and the Risks section both specify `.includes`). The anchor
+   test strips leading whitespace and an optional `<tool_use_error>` open tag first,
+   so every real shape still matches: the plain reason, the colon-less fallback, a
+   wrapped reason, and a denial that is one of several content blocks joined with
+   `\n` by `resultToText`. What it no longer matches is a MID-line mention — and the
+   over-match this PRD dismissed as "negligible" turned out to be reachable from
+   this very change: a failing `cd agent && npm test` prints `node --test` titles
+   like ``ok 14 - the ".git access" deny reason starts with "denied by guardrail"``,
+   so a red gate run would have rendered calm and collapsed. That is the "Under-
+   alarming a real problem" risk in this document, arriving for real. Pinned by two
+   must-stay-red tests (the TAP log, and a failing grep of `guardrails.ts`).
+2. **Decision 2's "read ONLY by `RunEvent.tsx:557` and nothing else" is false, and the
+   conclusion survives for a different reason.** `api/internal/workersvc/judge.go`'s
+   `toolResultOutcome` parses a `tool_result` block's `is_error`, feeding
+   `observedGreenTools` — the PRD #121 missing-tool prescan. (The `isErrorResult`
+   half of the survey holds.) Nothing here changes, because the frame is untouched —
+   but the guarantee comes from the frame being UNCHANGED, not from nobody reading
+   it. The distinction is load-bearing: flipping a denial to non-error at the source,
+   which that sentence would license, would make a denied command count as green
+   evidence that it ran.
+3. **The contract test lives at `agent/test/guardrails.test.ts`** (this PRD says
+   `agent/src/`), and the 15 `REASON_*` constants are module-PRIVATE, so "assert all
+   15 constants start with the phrase" is not directly expressible. It is pinned two
+   ways instead, with `agent/src/guardrails.ts` left untouched: behaviourally (all 15
+   deny paths driven through the public API, asserting 15 *distinct* reasons) and
+   structurally (a source scan asserting every `REASON_*` DECLARATION is one the scan
+   can read and carries the phrase — so a future 16th reason fails even if written in
+   a form the literal regex cannot parse, which a mutation test confirmed was
+   otherwise a silent hole).
+4. **`web/src/components/ChatMessages.test.tsx` did not exist** — it was created
+   rather than extended. (The mock line references in M2 are also transposed:
+   `mockDoneMessages` is at `data.ts:1776`, the `fm()` helper at `:1848`.)
+5. **The `⊘` glyph is not `font-bold`** (Decision 4 pins the tone, not the weight). A
+   browser pass measured that at 11px with weight 700 the glyph's counter closes and
+   it rasterises as an amber blob — confusable with the feed's existing status dots.
+   It renders non-bold at 13px; `✓`/`✗` keep their weight.
+
+**Deliberately not done**, and worth a follow-up rather than a silent omission: the
+chip label is the terse `"blocked"` this PRD pins, but a browser pass argued for
+`"blocked by guardrail"` — collapsed is the state it ships in, and "blocked" alone
+does not say who blocked it (a first read of "did someone cancel this?" is plausible).
+Declined here because Decision 4 pins the treatment and every other chip label in this
+row is terse ("ok", "error", "3 lines"); it is a copy call for a human, not a defect.
 
 ## Risks & mitigations
 
