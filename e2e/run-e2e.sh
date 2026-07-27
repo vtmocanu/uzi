@@ -1471,14 +1471,42 @@ FINAL_LW="$(apiget "/api/runs/$RUN_LW")"
 # 🔴 THE GATE-SKIP EVIDENCE. "It completed" is not evidence — a run that re-planned
 # and re-gated would also complete, since the harness has no second approver but the
 # stub self-approves nothing. What proves the skip is the worker's own feed line, and
-# that exactly ONE awaiting_approval was ever recorded for this run.
+# that the plan entered the gate exactly ONCE for this run.
 apiget "/api/runs/$RUN_LW/messages" \
   | jq -e '[.messages[] | select(.payload.text // "" | test("skipping the planning turn"))] | length == 1' >/dev/null \
   || fail "the resume did not report skipping the planning turn and the gate"
-GATES="$(db_psql "SELECT count(*) FROM run_messages WHERE run_id = '$RUN_LW' AND payload::text LIKE '%awaiting_approval%'")"
+# COUNTS GATE ENTRIES VIA kind='plan'. `runner.ts` emits exactly one such message as the
+# FIRST line of gatePlan(), unconditionally and before any branch, so this count IS the
+# number of gatePlan invocations: 1 for the original attempt, 2 if the resume re-gated.
+#
+# 🔴 It used to read `payload::text LIKE '%awaiting_approval%'`, which is not a weaker
+# version of this — it is unmeasurable. `awaiting_approval` is a run STATUS, reported to
+# the runs table via /state; it never appears in a run_messages payload. That query
+# returned 0 on every run ever recorded here (7 of 7 checked), whether the run gated
+# once, twice or never, so it could not discriminate the thing the comment above claims.
+# It was also captured and never asserted, which is what hid it: the value only reached a
+# `pass` string, so a phase printing "gate markers: 0" read as evidence for two sessions.
+# Asserting the OLD query `= 1` would have reddened every green run; asserting it `= 0`
+# would have pinned a constant. Both halves had to be fixed together — wiring up an
+# assertion on the wrong column is how a vacuous check becomes a confidently wrong one.
+# WHAT THIS CATCHES, stated narrowly because the obvious claim is wrong: it is NOT what
+# catches a StubExecutor missing the Decision 6b branch. That defect strands the resume at
+# awaiting_approval with nobody to approve it, so `wait_status … completed` above times out
+# and this line is never reached (measured 2026-07-28). This closes the OTHER hole, the one
+# the comment at the top of this block describes: a re-gate that DOES complete — autopilot,
+# a future auto-approve, a verdict already queued — satisfies every other assertion here,
+# including the completion and `limit_wait_count == 1`. Only the count sees it.
+#
+# Non-vacuous, and measured rather than assumed: across one full run of this suite the
+# per-run `kind='plan'` counts were 0, 1 and 2 (the PRD #41 revise loop produces 2), so `= 1`
+# discriminates. The query it replaced returned 0 for EVERY run_messages row in the whole
+# database, not merely for this run.
+GATES="$(db_psql "SELECT count(*) FROM run_messages WHERE run_id = '$RUN_LW' AND kind = 'plan'")"
+[ "$GATES" = 1 ] \
+  || fail "the plan entered the gate $GATES time(s), want exactly 1 — the resume re-planned and re-gated instead of skipping past an approval that already happened"
 echo "$FINAL_LW" | jq -e '.run.limit_wait_count == 1' >/dev/null \
   || fail "the resumed run parked again (limit_wait_count moved), so the sentinel is not first-attempt-only"
-pass "resume skipped the planning turn AND the gate, then completed with zero human intervention (gate markers: $GATES)"
+pass "resume skipped the planning turn AND the gate, then completed with zero human intervention (gate entries: $GATES, asserted)"
 
 # --- the exponential fallback, which a poller-disabled deployment uses by default --
 say "PRD #35: a park with no reported reset uses the exponential fallback schedule"
@@ -2135,14 +2163,28 @@ say "secret-hygiene assertions"
 #
 # Under this file's `set -euo pipefail`, `printf '%s' "$BIG" | grep -q PAT` reports FAILURE
 # when PAT *matches*: `grep -q` exits the instant it finds the match, `printf` still has
-# most of the corpus to write, and it dies of SIGPIPE (141) — which `pipefail` promotes to
-# the pipeline's status. The match was real; the exit code lies about it. It only bites once
-# the corpus exceeds the ~64 KB pipe buffer, so it is invisible on small inputs and arrives
-# the day some phase above makes the logs bigger. Measured 2026-07-28: a 200 KB string with
-# the marker at offset 0 returns NOMATCH through `grep -q`, `1` through `grep -c`, and true
-# through `[[ == * ]]`. The three failing runs printed `db boot banner: 1, agent uid-split
-# banner: 1` from `grep -c` in the very failure message saying the banners were absent —
-# `-c` reads to EOF, so it never triggers the bug that produced the failure.
+# data to write, and it dies of SIGPIPE (141) — which `pipefail` promotes to the pipeline's
+# status. The match was real; the exit code lies about it.
+#
+# 🔴 THE TRIGGER IS THE MATCH'S POSITION, NOT THE CORPUS SIZE. The condition is that MORE
+# THAN A PIPE BUFFER'S WORTH OF DATA FOLLOWS THE MATCH, so the writer still has to block
+# after the reader is gone. A LATE match is safe at ANY size, because `grep -q` reaches EOF
+# before `printf` ever blocks. Size is necessary, not sufficient. Measured 2026-07-28 on
+# this host (64 KiB pipe buffer), and the boundary is exactly that:
+#
+#   secret EARLY, 15 MB -> rc=141 DISARMED    secret EARLY, 64 KB -> rc=141 DISARMED
+#   secret LATE,  15 MB -> rc=0   fires       secret EARLY, 63 KB -> rc=0   fires
+#   secret EARLY, 15 KB -> rc=0   fires
+#
+# That is worse than "big corpora are unsafe", which is why the distinction is kept: a
+# secret logged EARLY — at worker boot, exactly when a join token or PAT surfaces — sat in
+# the blind spot, while one logged in the last few KB was caught. The scan was least
+# reliable precisely where a leak is most likely.
+#
+# It is invisible on small inputs and arrives the day some phase above makes the logs
+# bigger. The three failing runs printed `db boot banner: 1, agent uid-split banner: 1`
+# from `grep -c` in the very failure message saying the banners were absent — `-c` reads to
+# EOF, so it never triggers the bug that produced the failure.
 #
 # NOT the `set -e`/AND-list exemption documented ~1700 lines below (`echo hi | grep -qF
 # nope && fail`). That one is about a NON-match in an AND-list; this is a MATCH being
@@ -5072,8 +5114,14 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   # 🔴 CAPTURE THEN MATCH IN BASH, never `compose logs agent | grep -q`. Same SIGPIPE defect
   # documented at the secret-hygiene corpus gate: under `set -euo pipefail`, `grep -q` exits
   # on the match, the writer upstream dies of SIGPIPE, and pipefail promotes that to the
-  # pipeline's status — so a MATCH is reported as a failure once the stream passes the ~64 KB
-  # pipe buffer. The agent is the chattiest service here, so it crosses that quickly.
+  # pipeline's status — so a MATCH is reported as a failure whenever more than a pipe
+  # buffer's worth of output FOLLOWS it (position, not total size; see that note).
+  #
+  # These sites sit squarely in the bad case, which is why they are not merely theoretical:
+  # `docker_wired:true` and the register line are BOOT lines, so everything the agent logs
+  # afterwards is data following the match — and the agent is the chattiest service here.
+  # The false-red probability therefore RISES the longer the worker has been up, which is
+  # the intermittency signature to expect if these ever regress.
   #
   # The CONSEQUENCE differs from the leak scan's, which is why it is worth spelling out
   # rather than cross-referencing. These are positive assertions (`… || fail`), so the bug
