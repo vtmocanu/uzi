@@ -13414,3 +13414,17 @@ embedded newline additionally forges a row on a tabwriter rail. **The validator 
 alone**: tightening it is a behaviour change to an existing endpoint with its own blast radius, and
 the render site is the boundary that must hold without it. A sanitized cell beside an unsanitized one
 in the same row is worse than either, because it reads as though the question was considered.
+
+**Convergent, not sole — recorded at merge time so the provenance is not overstated.** Issue #124
+reached two of those three sites independently and from the other direction (untrusted *display
+text*, §420), landing on `main` while this branch was open. Where the two met — the web workers
+list's name cell — the merge kept **issue #124's** helper: `stripUnsafeChars` is `Cc`+`Cf` sparing
+`\n`/`\t`, where the token-label helper this PRD reached for is `Cf`-only **by design**, mirroring
+the Go `validateSecretLabel` predicate so the two implementations stay comparable. A name has no
+validator to mirror and can carry a bare ESC, which is `Cc`, so the superset is the right one on
+exactly the argument this section makes. The CLI's two cells keep `cellText` (`compactText` plus a
+tab fold), which is the same predicate via `sanitizeTTY`. 🔴 The lesson for a rebuild is the one
+this pair only shows in hindsight: **"which characters are unsafe in untrusted display text" must
+have ONE answer per language, and a second helper is justified only by a predicate it is
+deliberately mirroring** — otherwise the site that picked the narrower one is a hole nobody sees,
+because both spellings look sanitized.
