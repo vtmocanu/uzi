@@ -976,3 +976,38 @@ func TestPollerCreatedRunsInheritTheOwnerWaitOnLimitDefault(t *testing.T) {
 		}
 	})
 }
+
+// TestWaitOnLimitSurvivesAResume is the PRD-named test for the opt-in's durability.
+//
+// The mechanism is that the flag is RE-READ from the runs row on every claim rather
+// than remembered by the worker, so a resume after a park delivers whatever the row
+// says NOW — which is also what makes the per-run toggle take effect mid-flight. A
+// worker-side cache would pass every other test in this file and fail exactly here.
+func TestWaitOnLimitSurvivesAResume(t *testing.T) {
+	f := newAutoFixture(t)
+	f.fs.claimRun.WaitOnLimit = true
+
+	// First claim: the run is queued for the first time.
+	if got := f.claim(t).WaitOnLimit; !got {
+		t.Fatal("the first claim did not carry the opt-in")
+	}
+
+	// A park and a promotion later, the SAME run is claimed again. The row is what
+	// changed (limit_wait_count rose, the park history is stamped) — the flag did not.
+	f.fs.claimRun.LimitWaitCount = 1
+	f.fs.claimRun.RateLimitType = pgtype.Text{String: "five_hour", Valid: true}
+	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: parkNow, Valid: true}
+	if got := f.claim(t).WaitOnLimit; !got {
+		t.Fatal("a RESUMED run lost its opt-in. It would then fail on its next usage " +
+			"limit instead of parking again, silently spending the user's remaining " +
+			"retry budget on nothing")
+	}
+
+	// And the converse, which is what makes the per-run toggle meaningful: flipping the
+	// row off between claims must reach the next claim.
+	f.fs.claimRun.WaitOnLimit = false
+	if got := f.claim(t).WaitOnLimit; got {
+		t.Fatal("a run toggled OFF between claims still claimed as opted-in; the flag is " +
+			"re-read from the row precisely so a mid-flight change takes effect")
+	}
+}

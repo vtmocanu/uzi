@@ -118,6 +118,7 @@ const getSlackRunContext = `-- name: GetSlackRunContext :one
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
        r.health, r.plan_md,
+       r.rate_limit_type, r.retry_not_before, r.limit_wait_count,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -132,22 +133,25 @@ WHERE r.id = $1
 `
 
 type GetSlackRunContextRow struct {
-	ID                uuid.UUID   `json:"id"`
-	UserID            uuid.UUID   `json:"user_id"`
-	Status            string      `json:"status"`
-	IssueIid          pgtype.Int8 `json:"issue_iid"`
-	IssueTitle        string      `json:"issue_title"`
-	MrIid             pgtype.Int8 `json:"mr_iid"`
-	MrWebUrl          pgtype.Text `json:"mr_web_url"`
-	Branch            pgtype.Text `json:"branch"`
-	FailureReason     pgtype.Text `json:"failure_reason"`
-	Kind              string      `json:"kind"`
-	Health            string      `json:"health"`
-	PlanMd            pgtype.Text `json:"plan_md"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	ForgeType         string      `json:"forge_type"`
-	RepoAgentNames    []string    `json:"repo_agent_names"`
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	Status            string             `json:"status"`
+	IssueIid          pgtype.Int8        `json:"issue_iid"`
+	IssueTitle        string             `json:"issue_title"`
+	MrIid             pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl          pgtype.Text        `json:"mr_web_url"`
+	Branch            pgtype.Text        `json:"branch"`
+	FailureReason     pgtype.Text        `json:"failure_reason"`
+	Kind              string             `json:"kind"`
+	Health            string             `json:"health"`
+	PlanMd            pgtype.Text        `json:"plan_md"`
+	RateLimitType     pgtype.Text        `json:"rate_limit_type"`
+	RetryNotBefore    pgtype.Timestamptz `json:"retry_not_before"`
+	LimitWaitCount    int32              `json:"limit_wait_count"`
+	PathWithNamespace string             `json:"path_with_namespace"`
+	WebUrl            string             `json:"web_url"`
+	ForgeType         string             `json:"forge_type"`
+	RepoAgentNames    []string           `json:"repo_agent_names"`
 }
 
 // Everything the notifier renders into a run DM (content-minimized): owner,
@@ -162,6 +166,19 @@ type GetSlackRunContextRow struct {
 // Slack. COALESCE collapses BOTH NULL (no worker report) and [] (scanned, found
 // none) to an empty array — Slack renders them identically (single-approve shape).
 // Names ride in roster order (WITH ORDINALITY).
+//
+// rate_limit_type / retry_not_before / limit_wait_count (PRD #35 M5) are selected
+// FROM THE RUNS ROW because this query is an explicit column list and there is no
+// other way to reach them: the "paused: usage limit (five_hour); resumes ~<t>" line
+// cannot be built from a run_messages payload, which this query never joins. That
+// is the whole reason rate_limit_type is a column on `runs` rather than living only
+// in the feed message (see 00090's comment).
+//
+// rate_limit_type arrives here ALREADY ALLOWLISTED — workersvc coerces anything
+// outside the seven-member vocabulary to 'unknown' before it is stored, and 00090's
+// CHECK is the backstop. The renderer escapes it anyway; that is defence in depth
+// against a writer that bypassed both, which is precisely the population the CHECK
+// exists for.
 func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
 	row := q.db.QueryRow(ctx, getSlackRunContext, id)
 	var i GetSlackRunContextRow
@@ -178,6 +195,9 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.Kind,
 		&i.Health,
 		&i.PlanMd,
+		&i.RateLimitType,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
 		&i.PathWithNamespace,
 		&i.WebUrl,
 		&i.ForgeType,

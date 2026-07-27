@@ -548,9 +548,16 @@ type CreateRunParams struct {
 //
 // wait_on_limit is the PRD #35 opt-in, resolved in the SERVICE layer as
 // COALESCE(explicit request, the owner's users.wait_on_limit default) and passed in
-// explicitly. The defaulting is deliberately NOT pushed into SQL: a fifth creation
-// path added later would silently miss a DEFAULT clause here and opt its users out
-// with nothing going red, whereas a missing Go argument does not compile.
+// explicitly, rather than defaulted in SQL. Naming the column here is what makes an
+// unstamped creation path visible in a diff of THIS file.
+//
+// 🔴 IT IS NOT VISIBLE TO THE COMPILER, THOUGH, AND ASSUMING OTHERWISE IS THE TRAP.
+// sqlc generates a PARAMS STRUCT, and a Go struct literal that omits a field
+// compiles happily and yields the zero value — which for a bool is false, i.e. every
+// run from that path silently opted OUT. Measured while writing this: adding the
+// column and regenerating left `go build ./...` fully green with all three call
+// sites unstamped. So the guard here is a TEST that creates a run for an opted-in
+// owner and asserts the flag arrives, per creation path — not the type system.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.UserID,
