@@ -6,6 +6,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.11.10] - 2026-07-27
+
+### Fixed
+
+- **Two objects the chart declares were being deleted from the rendered manifest, so
+  restricted-tier hosted workers could not be provisioned.** A Helm template comment
+  ending `*/ -}}` immediately before a `---` trims the newline as well, gluing the
+  document separator onto the previous value. The two objects on either side then merge
+  into a single YAML document with duplicate keys, and a parser keeps only the last — so
+  the `uzi-workers` ServiceAccount and the `InfisicalSecret` that materializes its Harbor
+  pull secret silently vanished, taking the pull secret with them. The docker tier was
+  unaffected only because its object happened to come last in each merged pair. Nothing
+  cheap caught it: `helm lint` passed, `helm template` exited 0, the text still contained
+  `kind: ServiceAccount`, and ArgoCD reported `Synced/Healthy` truthfully, being in sync
+  with what the manifest declared once parsed. `scripts/assert-chart-render.sh` now
+  asserts one `kind:` per document in CI (issue #149).
+
 ## [0.11.9] - 2026-07-27
 
 ### Added
