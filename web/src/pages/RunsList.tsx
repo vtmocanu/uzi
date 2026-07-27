@@ -272,7 +272,14 @@ export function RunsList() {
                     className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2 text-sm"
                   >
                     <div>
-                      <span className="font-medium text-fg">{w.name}</span>
+                      {/* Issue #124, and this one is CROSS-PRINCIPAL: this list comes from
+                          `api.adminListWorkers()` -> ListAllWorkers, which embeds every
+                          user's worker row, so an admin reads names ANOTHER user chose.
+                          `handler/workers.go:388` only TrimSpaces and length-caps a name at
+                          creation -- no Cc/Cf strip -- so a bidi override in one user's
+                          worker name renders in the admin's fleet list beside a different
+                          user's `owner_email`. */}
+                      <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                       <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
                       {(w.template_reported || w.template_declared) && (
                         <span className="ml-2 text-xs text-faint">

@@ -338,7 +338,11 @@ export function WorkersSettings() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <span className="font-medium text-fg">{w.name}</span>
+                    {/* Own workers here, but stripped for the same reason and with the
+                        same helper as the admin fleet list (RunsList.tsx): the field is
+                        unstripped at ingest, and one page treating it as safe while the
+                        other does not is how the next reader picks the wrong precedent. */}
+                    <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
                     </span>
@@ -435,7 +439,7 @@ export function WorkersSettings() {
                         restart, no re-minted join token. */}
                     {tokens.length > 1 && confirmingDelete !== w.id && (
                       <Select
-                        aria-label={`Anthropic token for ${w.name}`}
+                        aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
                         className="h-8 max-w-[11rem] text-xs"
                         value={w.anthropic_secret_label ?? ""}
                         disabled={tokenBusy === w.id}
@@ -486,7 +490,7 @@ export function WorkersSettings() {
                     ref={confirmRef}
                     tabIndex={-1}
                     role="group"
-                    aria-label={`Confirm deleting ${w.name}`}
+                    aria-label={`Confirm deleting ${stripUnsafeChars(w.name)}`}
                     // The label alone would DEFEAT this control for a screen reader.
                     // Focusing a named container announces its accessible NAME —
                     // "Confirm deleting base (M), group" — which sounds like a routine

@@ -92,6 +92,40 @@ afterEach(() => {
 // The await anchors on the STATUS pill, not on the title — awaiting the cleaned title would
 // make a mutation red at a findByText timeout instead of at the assertion, which is the
 // blind-instrument trap this batch already hit twice.
+// Issue #124, and the only CROSS-PRINCIPAL case in the batch: the admin fleet list renders
+// worker names their OWNER chose, beside that owner's email. A bidi override there is one
+// user spoofing a row in an admin's view, not spoofing their own.
+describe("RunsList — the admin fleet list carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of another user's worker name", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [
+        {
+          id: "w1", name: "prod\u202Ebox\u200B", status: "online", owner_email: "someone@else.test",
+          kind: "external", hosted_size: null, busy: false, active_runs: 0, max_concurrent_runs: null,
+          template_declared: null, template_reported: null, version: null, last_heartbeat_at: null,
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    } as never);
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+    // Anchored on the owner email, which the mutation cannot move.
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("prodbox")).toBeTruthy();
+  });
+});
+
 describe("RunsList — the run title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters out of the forge-supplied title", async () => {
     vi.mocked(useAuth).mockReturnValue({

@@ -48,6 +48,15 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				// format characters compacts to "" and must still read as "-", not as a blank
 				// cell. (A judge could not do this, but a hostile worker holding a valid join
 				// token could, and that is whose string this is.)
+				//
+				// `w.Name` in the same row is deliberately NOT compacted, and the difference is
+				// worth a word because nothing in the code shows it: this command lists only
+				// the CALLER's own workers, and a name is set by its owner (handler/workers.go),
+				// so the author and the only reader are the same person. `Version` is different
+				// in both respects — the WORKER self-reports it, and the web's admin fleet list
+				// renders names cross-user, which is why that surface strips the name and this
+				// one does not. If `uzi worker list` ever grows an admin/all-users mode, the
+				// name becomes cross-principal here too and needs compactText.
 				version := compactText(strOr(w.Version, ""))
 				if version == "" {
 					version = "-"
