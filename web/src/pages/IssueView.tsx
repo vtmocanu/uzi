@@ -171,7 +171,20 @@ export function IssueView() {
                 <span className="text-sm text-faint">#{issue.iid}</span>
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
-                <Badge tone="neutral">{columnLabel(issue)}</Badge>
+                {/* S3: `wrap` plus a bounded width, because a column name is
+                    user-supplied and effectively unbounded. The Columns editor accepts
+                    any length (no maxlength, no validation) and GitLab allows 255
+                    characters; measured at 375x812, a 105-char name rendered a 594px
+                    badge inside a 375px viewport and pushed document.scrollWidth to
+                    610, scrolling the whole page sideways. The threshold is around 60
+                    characters, which a real column name can reach by accident.
+
+                    The board's own column header already handles the same string by
+                    wrapping — this makes the detail page agree with it. min-w-0 is
+                    required for the wrap to take effect inside the flex row. */}
+                <Badge tone="neutral" wrap>
+                  <span className="min-w-0 break-words">{columnLabel(issue)}</span>
+                </Badge>
                 {/* Same predicate the board cards use (PRD #102 M4, Decision 6). The
                     issue view knows only its own column, so that is the column
                     exclusion set — which means the two surfaces do NOT agree on a

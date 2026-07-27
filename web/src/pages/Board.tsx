@@ -230,9 +230,24 @@ export function Board() {
   // Pending toast-removal timers, cleared on unmount so a dismissal never fires
   // setState on an unmounted component.
   const toastTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // S5: the announcement text lives in its OWN state, read by a live region that is
+  // always mounted (rendered near the top of the tree below). The toast container
+  // cannot be that region — it is conditionally rendered, so the region is created in
+  // the same tick as its first content, and most assistive tech announces only
+  // CHANGES to a region that already existed. A region born holding text is usually
+  // silent, which is the worst kind of accessibility bug: the markup looks right.
+  //
+  // In-repo precedent for the always-mounted shape: RateLimitMeters.tsx renders a
+  // permanently empty sr-only role=status whose CONTENT changes. (The M6 brief said
+  // that region sits beside the stuck-runs banner — it does not; it is on Settings.
+  // The pattern is what transfers, not the location.)
+  const [announcement, setAnnouncement] = useState("");
   const pushToast = useCallback((text: string) => {
     const id = (toastSeq.current += 1);
     setToasts((t) => [...t, { id, text }]);
+    // Same text to the live region. Kept in step here, in the one function every
+    // toast goes through, so a caller cannot announce visually and not audibly.
+    setAnnouncement(text);
     const timer = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
     toastTimers.current.push(timer);
   }, []);
@@ -748,6 +763,15 @@ export function Board() {
         }
       />
 
+      {/* S5: ALWAYS MOUNTED, and that is the entire fix. A live region must exist
+          before its content changes for assistive tech to announce the change; a
+          region rendered into existence together with its first message is typically
+          silent. Empty until something is announced, and sr-only because the visible
+          toast stack already carries the message for everyone else. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </div>
+
       {error && <Alert message={error} />}
 
       {(awaitingRuns.length > 0 || stuckRuns.length > 0) && (
@@ -943,6 +967,33 @@ export function Board() {
                     dimmed={dragIid === card.iid}
                   />
                 ))}
+                {/* N2: the drop-at-END affordance. Hovering a lane's whitespace
+                    highlighted the lane and showed NOTHING about where the card would
+                    land — while hovering any card showed a precise insertion edge. So
+                    the one drop with no feedback was the one whose result the user is
+                    least able to predict, and the lane's own whitespace below the last
+                    card is only its p-2.5 (measured: cards ended at y=703, lane bottom
+                    714, an ~11px strip).
+
+                    This renders exactly when the pointer is over THIS lane and over no
+                    card — which is the state the lane's onDrop already treats as
+                    "append to the end", so the indicator and the behaviour are the
+                    same condition rather than two that can drift.
+
+                    It also enlarges the target as a side effect: the bar is a real
+                    element in the flow, so the ~11px strip becomes a full row. That
+                    was the cosmetic half of the finding; the feedback is the real one.
+
+                    Not rendered for an empty lane — the "Drop a card here" placeholder
+                    below already says it, and two indicators would contradict. */}
+                {dragIid != null && isTarget && insertAt == null && cards.length > 0 && (
+                  <div
+                    aria-hidden="true"
+                    className="rounded-lg border-2 border-dashed border-brand/70 py-3 text-center text-[11px] text-brand"
+                  >
+                    Drop at the end
+                  </div>
+                )}
                 {cards.length === 0 && (
                   <p className="rounded-lg border border-dashed border-edge py-6 text-center text-xs text-faint">
                     {col.droppable ? "Drop a card here" : "Nothing closed yet"}
@@ -954,12 +1005,12 @@ export function Board() {
         })}
       </div>
 
+      {/* No role/aria-live here any more (S5): the always-mounted sr-only region above
+          owns announcing, and leaving them on this one would announce every toast
+          twice for anyone whose AT did pick this region up. This stack is now purely
+          visual. */}
       {toasts.length > 0 && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2"
-        >
+        <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2">
           {toasts.map((t) => (
             <div
               key={t.id}
@@ -1110,35 +1161,45 @@ export function IssueCard({
         // and ring treatment would put the least urgent card on the board at the top
         // of the hierarchy.
         //
-        // NEITHER CUE CLEARS WCAG 1.4.11's 3:1, and that is MEASURED. Sampled from
-        // getComputedStyle on the rendered cards of a mock build, in both themes,
-        // compositing each card's effective background up the tree (the numbers agree
-        // with the same figures derived from the index.css tokens, to 0.01):
+        // THE BORDER TOKEN IS border-faint, NOT border-edge, AND THAT IS THE WHOLE
+        // POINT OF THIS BLOCK. Measured with getComputedStyle on rendered cards of a
+        // mock build, in both themes, compositing each card's effective background up
+        // the tree (agreeing to 0.01 with the same figures derived from the index.css
+        // tokens), against WCAG 1.4.11's 3:1 for a non-text indicator:
         //
-        //                                        ember    mission
-        //   dashed border vs the non-PRD card    1.39:1   1.35:1
-        //   PRD card bg vs non-PRD card bg       1.09:1   1.09:1
+        //                                          ember    mission
+        //   border-edge  vs the non-PRD card       1.39:1   1.35:1   <- fails
+        //   border-faint vs the non-PRD card       5.16:1   5.09:1   <- ships
+        //   PRD card bg  vs non-PRD card bg        1.09:1   1.09:1
         //
-        // So the dashed border is near-invisible, and bg-transparent does not rescue
-        // it. The rationale that picked bg-transparent — that it is how the Closed
-        // LANE earns its separation — does not survive measurement either: that lane's
-        // own background separation is 1.03:1 (ember) / 1.04:1 (mission), weaker than
-        // the border it was supposed to be supplementing. What actually distinguishes
-        // the Closed lane is its header text, and what actually distinguishes a
-        // non-PRD card is the BUTTON TEXT below: "Promote to PRD" where a PRD card
-        // says "Start run". Decision 17 says as much itself.
+        // border-edge was the original choice and it is near-invisible: an ordinary
+        // card's border is ALREADY border-edge, so dashed-versus-solid at 1.39:1 was
+        // the entire distinction. bg-transparent was picked as a second cue on the
+        // reasoning that it is how the Closed LANE earns its separation — but that
+        // does not survive measurement either: the Closed lane's own background
+        // separation is 1.03:1 (ember) / 1.04:1 (mission), WEAKER than the border it
+        // was supposed to be supplementing. What distinguishes that lane is its header
+        // text. bg-transparent is kept because it is a real if minor cue and it
+        // composes, but it is not what carries this.
         //
-        // Kept as approved rather than changed here, because the treatment is the
-        // lead's and web-ux re-measures when M6 lands. The measured fix is one token:
-        // border-faint clears the threshold in both themes (5.16:1 / 5.08:1) and stays
-        // quiet, so it collides with neither `loud` (the warn ring, reserved for
-        // awaiting_approval) nor opacity-40 (mid-drag).
+        // border-faint is reused rather than invented: it is the app-wide
+        // de-emphasised token, so a card wearing it reads as quiet, which is what a
+        // non-PRD card is. It collides with neither treatment Decision 17 ruled out —
+        // `loud` (the warn ring, reserved for awaiting_approval) nor opacity-40
+        // (being dragged right now).
         //
-        // The one card with NO textual cue is a non-PRD card that has closed on the
-        // forge and not yet been evicted: promotable is false, isPRD is false, so it
-        // renders no button at all. That window is the one docs/board.md documents.
+        // Second cue, and the one that does the work when a card has both: the BUTTON
+        // below reads "Promote to PRD" where a PRD card reads "Start run". The
+        // exception is a non-PRD card that has CLOSED on the forge and not yet been
+        // evicted — promotable false, isPRD false, so no button at all. At 1.39:1 that
+        // card carried no cue whatsoever; at 5.16:1 the border carries it alone. The
+        // eviction window itself is documented in docs/board.md.
         isPRD ? "bg-raised/80" : "border-dashed bg-transparent",
-        loud ? "border-warn/60 ring-2 ring-warn/40" : "border-edge",
+        // One border-color class per branch, never two: Tailwind utilities of equal
+        // specificity resolve by the order they appear in the generated STYLESHEET,
+        // not by their order in this string, so listing border-edge and border-faint
+        // together would pick a winner nobody chose.
+        loud ? "border-warn/60 ring-2 ring-warn/40" : isPRD ? "border-edge" : "border-faint",
         draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
         dimmed && "opacity-40",
         // An INSET shadow, so the card's box size never changes and the lane does not
@@ -1174,7 +1235,24 @@ export function IssueCard({
               either one is focused. They drive the same applyDrop, hence the same
               unconditional whole-board freeze, as a drop. */}
           {(canMoveUp || canMoveDown) && (
-            <span className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+            <span
+              // S6: the [@media(hover:none)]:opacity-100 is the touch fallback, and
+              // without it these buttons are UNREACHABLE on a touch device. Reveal was
+              // hover- and focus-within-only; the card root is not focusable
+              // (confirmed in the a11y tree), so the only way to reveal them without a
+              // mouse was to focus the title link — which navigates on tap. So a touch
+              // user had no way to reorder at all, and no way to learn that ordering
+              // exists.
+              //
+              // A coarse pointer has no hover state to reveal anything, so the
+              // buttons are simply always visible there. That is the same reasoning
+              // that made them opacity-based rather than `hidden` in the first place:
+              // an affordance you cannot reach is the same as one that is not there.
+              //
+              // Tailwind 3.4 has no built-in hover-none variant; the arbitrary variant
+              // is the supported spelling.
+              className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100"
+            >
               <button
                 type="button"
                 draggable={false}

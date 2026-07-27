@@ -460,3 +460,35 @@ describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
     expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
   });
 });
+
+// web-ux S3. A column name is user-supplied and effectively unbounded: the Columns
+// editor applies no maxlength and GitLab allows 255 characters. Measured at 375x812,
+// a 105-char name rendered a 594px badge in a 375px viewport and pushed
+// document.scrollWidth to 610 — the whole page scrolled sideways.
+//
+// jsdom has no layout, so this CANNOT assert the width. It asserts the mechanism
+// instead: the badge must not be whitespace-nowrap, which is what forced the
+// overflow. Stated plainly because a passing test here is weaker evidence than the
+// browser measurement that found it.
+describe("IssueView — a long column name does not overflow the page (web-ux S3)", () => {
+  it("renders the column badge wrapping rather than nowrap", async () => {
+    setAuth(false);
+    const long = "Waiting on the upstream vendor to confirm the migration window and sign off";
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: long }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    const badge = screen.getByText(long).closest("span[class*='rounded-md']") as HTMLElement;
+    expect(badge).toBeTruthy();
+    expect(badge.classList.contains("whitespace-nowrap")).toBe(false);
+    expect(badge.classList.contains("whitespace-normal")).toBe(true);
+  });
+
+  it("still renders an ordinary column name", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: "In Progress" }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("In Progress")).toBeTruthy();
+  });
+});

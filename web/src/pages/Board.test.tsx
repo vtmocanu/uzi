@@ -628,7 +628,107 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     renderBoard();
     await screen.findByText("Backlog");
     fireEvent.click(moveBtn(1, "down"));
-    await screen.findByText(/#1 moved down in Backlog/);
+
+    // TWO surfaces since web-ux S5, and this asserts both by name rather than
+    // findByText, which now throws on the multiple match. The split is the fix: the
+    // visible toast is for people who can see it, and the always-mounted sr-only
+    // live region is what a screen reader actually announces. Asserting only one
+    // would let the other be deleted silently — and the sr-only one is the half no
+    // developer would notice missing.
+    const announced = await screen.findAllByText(/#1 moved down in Backlog/);
+    expect(announced).toHaveLength(2);
+
+    const live = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.textContent).toMatch(/#1 moved down in Backlog/);
+  });
+
+  // web-ux S5. A live region must EXIST before its content changes, or assistive tech
+  // has no change to announce. The old markup created the region and its first message
+  // in the same render, which is typically silent — and looks correct in the DOM.
+  it("mounts the live region before there is anything to announce (S5)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    const live = document.querySelector('div.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.getAttribute("aria-live")).toBe("polite");
+    // Present and EMPTY: the region exists before any announcement has happened.
+    expect(live.textContent).toBe("");
+  });
+
+  it("does not double-announce: the visible toast stack is not itself a live region (S5)", async () => {
+    // Two regions carrying the same string announces it twice. The visible stack is
+    // purely visual now.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await screen.findAllByText(/#1 moved down in Backlog/);
+
+    const regions = document.querySelectorAll('[role="status"][aria-live="polite"]');
+    const carrying = [...regions].filter((r) => /#1 moved down/.test(r.textContent ?? ""));
+    expect(carrying).toHaveLength(1);
+    expect((carrying[0] as HTMLElement).classList.contains("sr-only")).toBe(true);
+  });
+
+  // web-ux S6. Reveal was hover/focus-within only, and the card root is not focusable,
+  // so on a touch device the only way to reveal these buttons was to focus the title
+  // link — which navigates on tap. A touch user therefore could not reorder at all.
+  //
+  // NEITHER instrument in this repo can observe the defect: jsdom applies no media
+  // queries, and agent-browser's device presets set the viewport while
+  // matchMedia("(hover: hover)") still returns true, so hover:none cannot be
+  // emulated. The class token is the only thing assertable here.
+  //
+  // That the ARBITRARY VARIANT COMPILES is the other half, and it is not assertable in
+  // jsdom either — a mistyped Tailwind variant is silently dropped, leaving this test
+  // green over a class with no CSS behind it. Verified at build time instead:
+  //   npm run build && grep -c 'hover:none' dist/assets/*.css   -> 1
+  it("keeps the reorder buttons reachable on a touch device (S6)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const reveal = moveBtn(1, "down").parentElement as HTMLElement;
+
+    expect(reveal.classList.contains("opacity-0")).toBe(true);
+    expect(reveal.classList.contains("group-hover:opacity-100")).toBe(true);
+    // The touch fallback: a coarse pointer has no hover state to reveal anything.
+    expect(reveal.classList.contains("[@media(hover:none)]:opacity-100")).toBe(true);
+  });
+
+  // web-ux N2. Hovering a card showed a precise insertion edge; hovering the lane's
+  // whitespace highlighted the lane and showed nothing at all — so the drop whose
+  // outcome is hardest to predict was the one with no feedback.
+  it("shows a drop-at-the-end affordance over lane whitespace (N2)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const lane = laneFor("Backlog");
+
+    // Nothing while no drag is in progress.
+    expect(screen.queryByText("Drop at the end")).toBeNull();
+
+    fireEvent.dragStart(screen.getByRole("link", { name: "issue one" }), {
+      dataTransfer: { setData: vi.fn(), getData: () => "1" },
+    });
+    fireEvent.dragOver(lane);
+    expect(screen.getByText("Drop at the end")).toBeTruthy();
+  });
+
+  it("does not show it while the pointer is over a card, where the edge already answers", async () => {
+    // Two indicators at once would contradict each other about where the card lands.
+    renderBoard();
+    await screen.findByText("Backlog");
+    const lane = laneFor("Backlog");
+
+    fireEvent.dragStart(screen.getByRole("link", { name: "issue one" }), {
+      dataTransfer: { setData: vi.fn(), getData: () => "1" },
+    });
+    fireEvent.dragOver(lane);
+    expect(screen.getByText("Drop at the end")).toBeTruthy();
+
+    // Over a card: the card-level handler sets insertAt, and the end bar retracts.
+    const card = screen.getByRole("link", { name: "issue two" }).closest("div[class*='rounded-lg']") as HTMLElement;
+    fireEvent.dragOver(card, { clientY: 5 });
+    expect(screen.queryByText("Drop at the end")).toBeNull();
   });
 
   it("does not announce a move when there was nothing to move", async () => {
@@ -952,6 +1052,40 @@ describe("Board — non-PRD issues (PRD #102 M6)", () => {
     expect(iids.filter((i) => i === 2 || i === 4)).toEqual([2, 4]);
     // The move really happened, so this is not passing by doing nothing.
     expect(iids.indexOf(5)).toBeLessThan(iids.indexOf(3));
+  });
+
+  // D17. Asserted on the CLASS, which is unusual and deliberate: the finding this
+  // encodes is a contrast measurement (border-edge 1.39:1 / 1.35:1 against WCAG
+  // 1.4.11's 3:1; border-faint 5.16:1 / 5.09:1), and no test in this repo can see a
+  // contrast ratio. Pinning the token is the only instrument available, so a silent
+  // revert to border-edge reddens here instead of shipping an invisible marker.
+  //
+  // It also pins the ONE-token rule. Tailwind utilities of equal specificity resolve
+  // by stylesheet order, not class-attribute order, so a card carrying both
+  // border-edge and border-faint would pick a winner nobody chose — and would look
+  // correct in the class list.
+  it("draws a non-PRD card with the contrast-clearing border token (Decision 17)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+
+    const cardOf = (title: string) =>
+      screen.getByRole("link", { name: title }).closest("div[class*='rounded-lg']") as HTMLElement;
+
+    // classList, not className: these are TOKEN assertions, and a substring check
+    // reports "border-edge" present on any card carrying hover:border-edge-strong,
+    // which every draggable card does. That is not hypothetical — the first version
+    // of this test failed for exactly that reason against correct markup.
+    const nonPRD = cardOf("issue two");
+    expect(nonPRD.classList.contains("border-dashed")).toBe(true);
+    expect(nonPRD.classList.contains("border-faint")).toBe(true);
+    expect(nonPRD.classList.contains("border-edge")).toBe(false);
+
+    // An ordinary card is untouched: still solid, still border-edge.
+    const prd = cardOf("issue one");
+    expect(prd.classList.contains("border-edge")).toBe(true);
+    expect(prd.classList.contains("border-faint")).toBe(false);
+    expect(prd.classList.contains("border-dashed")).toBe(false);
   });
 
   it("offers Promote instead of Start run on a non-PRD card (Decision 15)", async () => {
