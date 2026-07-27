@@ -232,6 +232,47 @@ already-applied head makes every upgraded instance refuse to boot.
   polls looks active while never being chosen. M2 therefore renders each token's
   live eligibility (fresh / stale / refused / below-threshold), and M6 checks
   whether OAuth setup-tokens can ever produce a fresh gauge at all (see R7).
+- **D23 — `GET /api/me/rate-limits` moves to `RequireUser`, on non-additivity —
+  NOT on a sensitivity ranking.** Added 2026-07-27 after M2 shipped, on an
+  auditor ruling the lead deliberately did not make alone. **The problem**: M2
+  gives the CLI a pool toggle, but the endpoint that reports live eligibility is
+  cookie-only, so a scripted `uzi token pool x --on` gets no signal that `x` can
+  never be picked — reintroducing exactly the silent no-op R7 and D11 exist to
+  kill.
+  **The lead's first argument for widening was rejected and must not be
+  reinstated**: "rate-limit percentages are less sensitive than the labels and
+  ids already exposed beside them" ranks *identifiers* against *behavioral
+  telemetry* and concludes from the ranking. That is the "it's only metadata"
+  move, and it would equally justify putting per-run cost on a shared board. The
+  percentages are more sensitive **in kind** and less sensitive only in
+  resolution. Two legs hold instead:
+  1. **Non-additivity.** Every inference this endpoint enables is already
+     available at *finer* granularity through routes that are already
+     `RequireUser`. `GET /api/runs` carries per-run `UsageDTO` — input, cache,
+     output tokens, `cost_usd`, plus three timestamps — which is a timestamped
+     consumption series, strictly finer than a 0-100 aggregate refreshed at the
+     poll interval. And `POST /repos/{id}/runs` is `RequireUser`, so a stolen
+     `uzc_` can already **spend** the victim's quota; knowing when it resets is a
+     rounding error against being able to burn it.
+  2. **It is a GET of the caller's own row.** `SelfRateLimits` is a single
+     owner-scoped read with no outbound call and no `usagePoker.Poke` (so it
+     opens no amplification vector against Anthropic), it mints nothing, and it
+     never reads `IsAdmin` — no admin branch, so no escalation path.
+  **The caveat is part of the decision, not a footnote: non-additivity is a
+  property of the CURRENT route table, not of this endpoint.** If `/api/runs`'s
+  usage fields or `CreateRun` were ever moved back to cookie-only,
+  `/me/rate-limits` under `RequireUser` would become the widest remaining
+  activity channel and this decision must be revisited. A future reader inherits
+  the condition, not only the conclusion.
+  Rejected: putting `auto_status` on `SecretDTO` instead — it adds a third query
+  feeding `Classify`, widening D21's differential surface in M6, for a worse
+  result (the status without the meters beside it is less useful than the
+  meters). Also rejected: leaving it, which keeps R7 live for scripted use.
+  **Implementation constraint**: split the route group, do **not** change the
+  group's middleware — `PUT /me/autopilot` and `PUT /me/judge` share it and must
+  stay cookie-only. `route_limiter_mounts_test.go` pins the **limiter**, not the
+  auth middleware, so it cannot catch a mistake here; the guard must assert both
+  that a Bearer request reaches the GET **and** that the two PUTs still 401.
 - **D19 — M5's two columns land in M1's migration.** `anthropic_select_reason`
   and `anthropic_headroom_pct` on `runs`. M5 as drafted had nowhere to persist
   "why it fell back", and M1 is already altering `runs`; folding them in costs
