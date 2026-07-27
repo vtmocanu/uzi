@@ -1,15 +1,18 @@
-// Package usagepoller is the per-user Claude rate-limit poller (PRD #53), a
-// self-improve/privcheck-shaped engine: a Boot pass at start plus an interval
-// ticker, 0 disables it, wired in main.go under the background WaitGroup. Each
-// tick it lists every user holding an anthropic_token, opens the token via the
-// shared vault path (secretopen), asks Anthropic (usage endpoint first, ~1-token
-// header probe as fallback — D2), and upserts one gauge row per user (D4). The
-// token never leaves this process; only percentages + reset epochs are stored.
+// Package usagepoller is the per-TOKEN Claude rate-limit poller (PRD #53, repointed
+// from per-user by #104 M5), a self-improve/privcheck-shaped engine: a Boot pass at
+// start plus an interval ticker, 0 disables it, wired in main.go under the background
+// WaitGroup. Each tick it lists every anthropic_token in the factory (one row per
+// TOKEN, not per user), opens each via the shared vault path (secretopen), asks
+// Anthropic (usage endpoint first, ~1-token header probe as fallback — D2), and
+// upserts one gauge row per TOKEN (D4). The token never leaves this process; only
+// percentages + reset epochs are stored.
 //
 // Failure semantics are copied from cc-statusline (D5): a malformed response never
 // overwrites the last good row; a definitive HTTP refusal with no usable fallback
-// arms a fixed 15-minute per-user backoff (in-process, no knob) so a refusing
-// credential is not hammered every interval; a transport error just waits for the
+// arms a fixed 15-minute PER-TOKEN backoff (in-process, no knob, keyed by
+// user_secret_id since PRD #104 M5 — this said "per-user" until PRD #111 and had
+// been wrong since the gauge was repointed at tokens) so a refusing credential is
+// not hammered every interval; a transport error just waits for the
 // next tick. A vault-locked (dek-sealed) owner is skipped and their last reading
 // kept (D3); a master-sealed token opens regardless of lock state — both handled
 // by secretopen's dispatch, so this engine needs no separate vault gate.
@@ -34,9 +37,13 @@ import (
 // defaultMaxConcurrency bounds how many users are polled in parallel per tick.
 const defaultMaxConcurrency = 4
 
-// backoffDuration is the fixed per-user backoff after a definitive HTTP refusal
+// backoffDuration is the fixed per-TOKEN backoff after a definitive HTTP refusal
 // with no usable fallback (D5). In-process and no knob by design: a restart just
 // retries once.
+//
+// Per-token, not per-user, and the distinction is the whole point of the map: one
+// refusing credential must not silence its owner's other meters (see inBackoff,
+// where the map is keyed by secret id). This said "per-user" until PRD #111 M4.
 const backoffDuration = 15 * time.Minute
 
 // pokeBuffer bounds the poke channel; a full buffer drops the signal (the next
@@ -155,9 +162,13 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// tickAll polls every token-holding user once, with bounded concurrency and a
-// per-tick deadline of one interval so a pile-up of slow calls can't run past the
-// next tick. A per-user failure is logged and skipped inside pollUser.
+// tickAll polls every anthropic_token in the factory once, with bounded concurrency
+// and a per-tick deadline of one interval so a pile-up of slow calls can't run past
+// the next tick. A per-TOKEN failure is logged and skipped inside pollToken.
+//
+// The fan-out is one goroutine per TOKEN, not per user, so a user holding three
+// credentials occupies three slots of maxConc. That is deliberate (poll cost scales
+// with token count, not user count — R3) and it is what the semaphore bounds.
 func (e *Engine) tickAll(ctx context.Context) {
 	tickCtx, cancel := context.WithTimeout(ctx, e.interval)
 	defer cancel()

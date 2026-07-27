@@ -49,19 +49,28 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				// cell. (A judge could not do this, but a hostile worker holding a valid join
 				// token could, and that is whose string this is.)
 				//
-				// `w.Name` in the same row is deliberately NOT compacted, and the difference is
-				// worth a word because nothing in the code shows it: this command lists only
-				// the CALLER's own workers, and a name is set by its owner (handler/workers.go),
-				// so the author and the only reader are the same person. `Version` is different
-				// in both respects — the WORKER self-reports it, and the web's admin fleet list
-				// renders names cross-user, which is why that surface strips the name and this
-				// one does not. If `uzi worker list` ever grows an admin/all-users mode, the
-				// name becomes cross-principal here too and needs compactText.
+				// `w.Name` IS sanitized too, through cellText (= compactText plus the tab fold
+				// a column rail needs). This paragraph used to say the opposite — that a name
+				// is deliberately left raw because `worker list` shows only the CALLER's own
+				// workers, so its author and its only reader are the same person. That argument
+				// holds for the SPOOFING half and does not cover the rest: worker names are
+				// validated for LENGTH ONLY (handler/workers.go: TrimSpace + a 200-byte cap)
+				// and workers.name is a bare `text` with no CHECK, so unlike a token label an
+				// ESC is storable in one, and an embedded newline breaks the tabwriter rail for
+				// every FOLLOWING row — a name can forge a table row in its owner's own output.
+				// The admin/all-users mode this paragraph anticipated is not hypothetical either,
+				// it is just not a FLAG on this command: `uzi admin workers` (admin.go) has
+				// printed names cross-tenant since PRD #64 M7, and rendered them raw until
+				// PRD #111 M5 put cellText on that cell. A sanitized cell beside an unsanitized
+				// one in the same row is worse than either, because it reads as though the
+				// question was considered.
 				version := compactText(strOr(w.Version, ""))
 				if version == "" {
 					version = "-"
 				}
-				rows = append(rows, []string{w.ID, w.Name, w.Status, version, upgradeCell(w)})
+				rows = append(rows, []string{
+					w.ID, cellText(w.Name), w.Status, version, upgradeCell(w), bindModeCell(w),
+				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
 			// auto-stopped run is "check the worker's version" — v0.10.1+ isolates a
@@ -70,7 +79,11 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// (WorkersSettings.tsx); the CLI is a first-class second consumer and did
 			// not, so the doc shipped a remedy one of its two audiences could not
 			// follow. "-" when a worker has never registered a version.
-			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE"}, rows)
+			// TOKEN is PRD #111 M5, and it closes a CLI-parity hole M3 opened: the CLI
+			// gained a WRITE (`worker set-token --auto`) with no human-readable READ, so
+			// the only way to confirm what a worker was set to was `--json`. A three-way
+			// user choice you can set and cannot see is worse than one you cannot set.
+			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE", "TOKEN"}, rows)
 		},
 	}
 
@@ -97,41 +110,62 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	// set-token points a worker at one of the caller's named Anthropic tokens
-	// (PRD #104 M3). Unlike `create`, this mints nothing and hands back no
-	// credential — it re-points a worker between tokens the caller already owns —
-	// so it is reachable from a CLI token (D8).
+	// set-token sets HOW a worker chooses its Anthropic credential (PRD #104 M3,
+	// widened by PRD #111 M3). Unlike `create`, this mints nothing and hands back no
+	// credential — it re-points a worker between tokens the caller already owns — so
+	// it is reachable from a CLI token (D8).
 	//
-	// `--default` and a label are mutually exclusive, and one of them is required:
-	// `uzi worker set-token <id>` with neither would be ambiguous between "clear the
+	// Exactly ONE of a label, --default or --auto, and one of them is required:
+	// `uzi worker set-token <id>` with none would be ambiguous between "clear the
 	// binding" and "show me the binding", and silently picking either is worse than
-	// asking.
-	var toDefault bool
+	// asking. The command keeps its name rather than becoming `set-bind-mode`,
+	// because a rename would break every script that already calls it and the verb
+	// still describes what a user is doing — choosing which token pays.
+	var toDefault, toAuto bool
 	setToken := &cobra.Command{
 		Use:   "set-token <worker-id> [label]",
-		Short: "Point a worker at one of your Anthropic tokens (or --default)",
-		Long: "Bind a worker to a named Anthropic token, so its runs spend that\n" +
-			"credential instead of your default one. Pass --default to clear the\n" +
-			"binding and fall back to your default token.\n\n" +
+		Short: "Choose how a worker picks its Anthropic token: a label, --default, or --auto",
+		Long: "Choose which Anthropic credential a worker's runs spend.\n\n" +
+			"  <label>     pin the worker to that named token\n" +
+			"  --default   use your default token\n" +
+			"  --auto      let uzi pick per claim, from the tokens you opted into the\n" +
+			"              pool with `uzi token pool` — preferring the account with the\n" +
+			"              most rate-limit headroom\n\n" +
+			"With --auto and an empty or unreadable pool the worker simply uses your\n" +
+			"default token; auto never fails a run for want of a candidate.\n\n" +
 			"Takes effect on the worker's next claim: no restart, no new join token.\n" +
-			"Chat runs on a bound worker still spend your default token.",
+			"Chat runs still spend your default token whatever the mode.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			label := ""
 			if len(args) == 2 {
 				label = args[1]
 			}
+			// Counted rather than checked pairwise: with three choices, pairwise
+			// conditions grow quadratically and the one that gets forgotten is always
+			// the pair added last.
+			chosen := 0
+			for _, on := range []bool{label != "", toDefault, toAuto} {
+				if on {
+					chosen++
+				}
+			}
+			if chosen != 1 {
+				return uzicli.Exitf(uzicli.ExitUsage,
+					"pass exactly one of: a token label, --default, or --auto")
+			}
+			mode := "pinned"
 			switch {
-			case toDefault && label != "":
-				return uzicli.Exitf(uzicli.ExitUsage, "pass either a token label or --default, not both")
-			case !toDefault && label == "":
-				return uzicli.Exitf(uzicli.ExitUsage, "pass a token label, or --default to clear the binding")
+			case toDefault:
+				mode = "default"
+			case toAuto:
+				mode = "auto"
 			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			wkr, err := c.SetWorkerToken(cmd.Context(), args[0], label)
+			wkr, err := c.SetWorkerBindMode(cmd.Context(), args[0], mode, label)
 			if err != nil {
 				return err
 			}
@@ -140,15 +174,21 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(wkr)
 			}
 			if !gf.quiet {
-				if label == "" {
+				switch mode {
+				case "auto":
+					p.Printf("worker %s now auto-selects from your Anthropic token pool\n", args[0])
+				case "default":
 					p.Printf("worker %s now uses your default Anthropic token\n", args[0])
-				} else {
-					p.Printf("worker %s now uses Anthropic token %q\n", args[0], label)
+				default:
+					// The label is user-authored; cellText is what every other
+					// user-authored cell in this binary goes through.
+					p.Printf("worker %s now uses Anthropic token %q\n", args[0], cellText(label))
 				}
 			}
 			return nil
 		},
 	}
+	setToken.Flags().BoolVar(&toAuto, "auto", false, "auto-select per claim from your opted-in token pool")
 	setToken.Flags().BoolVar(&toDefault, "default", false, "clear the binding; use the account default token")
 
 	cmd.AddCommand(list, rm, setToken)
@@ -181,4 +221,45 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 		// not as "-" hiding a state this build has no opinion about.
 		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
 	}
+}
+
+// bindModeCell renders HOW a worker chooses its Anthropic credential, for
+// `uzi worker list`'s TOKEN column (PRD #111 M5).
+//
+// The three modes need three different renderings because they answer different
+// questions, and only one of them has a name to show:
+//
+//	default  →  "default"        the owner's default token; no binding
+//	pinned   →  "<label>"        the credential itself, which is the useful fact
+//	auto     →  "auto"           chosen per claim from the pool; no fixed answer
+//
+// A pinned worker prints its LABEL rather than the word "pinned" because the label
+// is what the user set and what `uzi worker set-token` takes back. The other two have
+// no label to print: `default` resolves at claim time and `auto` resolves differently
+// on every claim, so naming a token there would be a snapshot presented as a setting.
+//
+// The server reports the EFFECTIVE mode (handler's effectiveBindMode), so `pinned`
+// always arrives with an id and a label beside it — D9's pinned-with-a-deleted-token
+// case has already been mapped to `default` upstream. The nil guard below is
+// therefore belt-and-braces against a DTO that contradicts itself, not a case the
+// current server can produce; it renders "default" because that is what such a
+// worker would actually spend.
+//
+// An UNRECOGNISED mode prints as itself, for the reason every other renderer in this
+// PRD does: the CLI is versioned separately from the API.
+func bindModeCell(w apitypes.WorkerDTO) string {
+	switch w.AnthropicBindMode {
+	case "default":
+		return "default"
+	case "auto":
+		return "auto"
+	case "pinned":
+		if w.AnthropicSecretLabel == nil || *w.AnthropicSecretLabel == "" {
+			return "default"
+		}
+		// User-authored text into a table cell: cellText folds newlines and tabs,
+		// which would otherwise break the column rail, and caps the length.
+		return cellText(*w.AnthropicSecretLabel)
+	}
+	return w.AnthropicBindMode
 }

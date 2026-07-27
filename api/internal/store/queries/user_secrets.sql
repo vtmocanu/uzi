@@ -43,7 +43,7 @@ VALUES (@user_id, @kind, @label,
         @want_default::boolean
             OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind),
         @ciphertext, @sealed_with)
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: RotateUserSecret :one
 -- Replace one stored secret's value in place, keyed on its id (PRD #104 D10) and
@@ -53,7 +53,7 @@ RETURNING id, kind, label, is_default, created_at, updated_at;
 UPDATE user_secrets
 SET ciphertext = $3, sealed_with = $4, updated_at = now()
 WHERE id = $1 AND user_id = $2
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: UpsertDefaultUserSecret :one
 -- The kind-path compatibility alias (PRD #104 D14): PUT /api/me/secrets/{kind}
@@ -96,7 +96,7 @@ ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetUserSecretCiphertext :one
 -- Fetch the sealed ciphertext + how it was sealed, for decryption at agent-run
@@ -134,6 +134,54 @@ WHERE id = $1 AND user_id = $2;
 SELECT id FROM user_secrets
 WHERE user_id = $1 AND kind = $2 AND is_default;
 
+-- name: GetDefaultUserSecretMeta :one
+-- Resolve the user's default secret of a kind to its id AND its label, in one
+-- owner-scoped read (PRD #111 M1, D8). This is GetDefaultUserSecretID plus the
+-- label, and the two exist side by side rather than one replacing the other
+-- because their callers want different things: the poller and the secrets handler
+-- want only the id, the claim path wants the label too so the run can SNAPSHOT
+-- which account it spent.
+--
+-- The predicate is character-identical to GetUserSecretCiphertext's
+-- (WHERE user_id AND kind AND is_default, :112) on purpose. D8 replaces
+-- "open the default" with "resolve the default, then open THAT id", and the
+-- equivalence of the two resolutions is what makes that a no-op for behavior: same
+-- row, same sealed_with, same kind-derived DEK AAD. The partial unique index from
+-- 00077 makes at most one row match, which is what keeps this :one.
+--
+-- Both columns come from ONE owner-scoped row on purpose. Resolving the id here
+-- and then looking the label up separately by id would be a cross-tenant read with
+-- no owner predicate; there is deliberately no such second query to reach for.
+--
+-- pgx.ErrNoRows means the user has no secret of the kind at all, and the claim
+-- path MUST keep mapping that to its existing "no Anthropic token configured for
+-- this user" credential failure — a token-less user's run has always failed that
+-- way, and leaking a different error from here would silently rewrite
+-- runs.failure_reason for a case that has not changed.
+SELECT id, label FROM user_secrets
+WHERE user_id = $1 AND kind = $2 AND is_default;
+
+-- name: GetUserSecretMetaByID :one
+-- The by-id counterpart of GetDefaultUserSecretMeta (PRD #111 M1): the label of
+-- ONE named credential, for the same snapshot, on the bound paths (a worker's
+-- binding, the judge lane's).
+--
+-- Owner-scoped in the predicate exactly as GetUserSecretCiphertextByID is
+-- (WHERE id AND user_id, :127), so a caller supplying another user's secret id
+-- gets no rows rather than that user's label. That matters more here than it looks:
+-- the id is opened by secretopen.OpenByID, which re-scopes and would refuse a
+-- foreign row anyway — but this query runs FIRST, and without the predicate the
+-- claim would fail with another user's label already in hand at the exact point
+-- M1 records it and M5 renders it.
+--
+-- Deliberately NOT filtered on kind, matching GetUserSecretCiphertextByID: the
+-- open reads the row's own kind for the DEK AAD, and adding a kind predicate here
+-- would change what an (already impossible) mis-kinded binding fails WITH, for no
+-- gain. pgx.ErrNoRows means "not this user's secret, or gone", which the claim path
+-- maps to the same credential failure OpenByID's ErrNoSecret produces today.
+SELECT id, label FROM user_secrets
+WHERE id = $1 AND user_id = $2;
+
 -- name: GetUserSecretIDByLabel :one
 -- Resolve a user-facing label to the credential it names, case-insensitively to
 -- match the unique index 00077 put on (user_id, kind, lower(label)) — `Console` and
@@ -158,7 +206,13 @@ ORDER BY kind;
 -- indistinguishable rows), the label + is_default the UI renders, and the
 -- timestamps — never the ciphertext. Default first, then by label, so the credential
 -- a user's unbound workers spend against leads the list.
-SELECT id, kind, label, is_default, created_at, updated_at
+--
+-- auto_eligible (PRD #111 M2) rides along: it is the D2 opt-in, a flag the owner
+-- set, and belongs with the rest of a token's metadata. It is NOT the token's live
+-- eligibility — whether the selector could actually pick it right now additionally
+-- depends on its gauge reading, which this query deliberately does not join (see
+-- ListRateLimitsForUser, which does).
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at
 FROM user_secrets
 WHERE user_id = @user_id AND kind = @kind
 ORDER BY is_default DESC, lower(label) ASC;
@@ -169,7 +223,7 @@ ORDER BY is_default DESC, lower(label) ASC;
 -- per-(user,kind) advisory lock the mutation takes first, it is what lets
 -- set-default's clear-then-set and delete-default's guard read a stable picture.
 -- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
-SELECT id, kind, label, is_default FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible FROM user_secrets
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
@@ -196,7 +250,7 @@ WHERE user_id = @user_id AND kind = @kind AND is_default;
 -- lock, so this cannot promote a foreign row.
 UPDATE user_secrets SET is_default = true, updated_at = now()
 WHERE id = @id AND user_id = @user_id
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: RenameUserSecret :one
 -- Rename ONE of the user's secrets (PRD #104 M2). Owner-scoped. A label colliding
@@ -206,7 +260,33 @@ RETURNING id, kind, label, is_default, created_at, updated_at;
 -- invariant (only the label index, which enforces itself).
 UPDATE user_secrets SET label = @label, updated_at = now()
 WHERE id = @id AND user_id = @user_id
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
+
+-- name: SetUserSecretAutoEligible :one
+-- Opt ONE of the user's tokens into or out of the auto-selection pool (PRD #111 M2,
+-- D2). Owner-scoped in its own predicate, exactly as RenameUserSecret is, so a
+-- caller holding a foreign id writes nothing and reads nothing back — the handler's
+-- ownership check and this predicate are two independent layers, and the migration's
+-- kind CHECK is a third.
+--
+-- Returns the same metadata shape as RenameUserSecret / SetUserSecretDefault so all
+-- three feed one secretMeta builder; the shared shape is why the Go structs are
+-- convertible to each other at the call site, and why a column added to one must be
+-- added to all of them.
+--
+-- Idempotent: setting the value it already has affects one row and changes nothing
+-- but updated_at, which is the right answer for a toggle a UI may re-send.
+--
+-- The kind predicate is vacuous today (anthropic_token is user_secrets' only kind)
+-- and is here for the day it is not: the ROUTE already asserts the kind in its path
+-- (/anthropic_token/{id}), so a request naming a secret of some other kind is a
+-- mismatch the handler should answer 404 to. Without this it would instead reach
+-- 00087's CHECK and surface as a 500. That makes the CHECK argument stronger rather
+-- than weaker — the constraint stays the backstop, and the handler stops depending
+-- on it to produce a user-facing error.
+UPDATE user_secrets SET auto_eligible = @auto_eligible, updated_at = now()
+WHERE id = @id AND user_id = @user_id AND kind = @kind
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: DeleteUserSecret :execrows
 -- Delete ONE secret, keyed on its id (PRD #104 D10) and scoped to its owner. The

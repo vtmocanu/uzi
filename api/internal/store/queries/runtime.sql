@@ -6,8 +6,23 @@
 -- (PRD #18), NULL when the caller made no choice. anthropic_secret_id is the
 -- optional mint-time token binding (PRD #104 M3); NULL means "my owner's default",
 -- which is what every worker minted before this was and stays.
-INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
-VALUES (@user_id, @name, @token_hash, @template_declared, @anthropic_secret_id)
+--
+-- 🔴 anthropic_bind_mode MUST BE NAMED HERE, and its absence was a silent
+-- regression. PRD #111 M3 made the MODE decide whether the id is read at all
+-- (workerSecretID gates on it first), and this INSERT set five columns without it —
+-- so the row took 00088's column default 'default' while carrying a real binding,
+-- and every worker minted through `POST /api/workers {"anthropic_token":"..."}`
+-- quietly spent the OWNER'S DEFAULT instead. PRD #104 M3's mint-time binding was
+-- dead, silently, in every channel — and M1 made it worse: the run records the
+-- credential actually opened, so the attribution feature CORROBORATED the wrong
+-- answer.
+--
+-- Written in the SAME statement as the id, for the reason SetWorkerAnthropicSecret
+-- gives: mode and id describe one decision, and a row where they disagree is one no
+-- resolution rule can rescue. The caller derives the pair (pinned when a label
+-- resolved, else default), exactly as PatchWorker does.
+INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
+VALUES (@user_id, @name, @token_hash, @template_declared, @anthropic_secret_id, @anthropic_bind_mode)
 RETURNING *;
 
 -- name: SetWorkerAnthropicSecret :one
@@ -25,8 +40,18 @@ RETURNING *;
 --
 -- Takes effect on the worker's NEXT claim — no restart, no re-minted join token,
 -- because the token never rides the worker, only each claim response.
+--
+-- Since PRD #111 M3 it writes the BIND MODE in the same statement, and that is the
+-- point rather than a convenience: mode and id describe one decision, so writing
+-- them separately would open a window where a worker reads 'pinned' with the old
+-- id, or 'default' while still carrying one. One UPDATE makes the pair atomic. The
+-- caller is responsible for sending a coherent pair (a NULL id with 'pinned' is
+-- legal here and resolves as 'default' per D9 — see 00088 for why no CHECK can
+-- enforce the coupling).
 UPDATE workers
-SET anthropic_secret_id = @anthropic_secret_id, updated_at = now()
+SET anthropic_secret_id = @anthropic_secret_id,
+    anthropic_bind_mode = @anthropic_bind_mode,
+    updated_at = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING *;
 
@@ -471,6 +496,46 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
 WHERE r.id = @run_id;
+
+-- name: SetRunAnthropicSecret :execrows
+-- Record WHICH Anthropic credential this claim spends (PRD #111 M1). Written by
+-- every claim lane — run, judge and chat — after a SUCCESSFUL open, so the
+-- recorded id is provably the id whose ciphertext was decrypted (D8) rather than
+-- whatever the user's default happened to be a moment later.
+--
+-- The label is a SNAPSHOT, not a denormalisation to keep in sync: 00086's FK nulls
+-- the id when the token is deleted, and a rename rewrites the label in place, so
+-- the snapshot is the only thing that keeps a finished run's history readable
+-- after either. It is written from the SAME owner-scoped row that produced the id
+-- (GetDefaultUserSecretMeta / GetUserSecretMetaByID), never looked up separately.
+--
+-- Owner-scoped even though the caller only ever passes the run it just claimed.
+-- That is the same self-standing-scope argument ListRunsForUser's rv.user_id join
+-- predicate makes: without it this write is safe only because of a fact maintained
+-- in another file (ClaimRun/ClaimChatRun are user-scoped), and it costs nothing to
+-- make it true here instead. A mismatched pair returns 0 rows rather than writing.
+-- The FK is the other half — recording a credential the run's owner does not own
+-- is rejected by the database, not by this predicate.
+--
+-- reason is the mode that named the credential; headroom is NULL until M4 has one
+-- to record (see 00086). updated_at follows house style and is safe here
+-- specifically because the run is 'claimed' at this instant, which holds for BOTH
+-- lanes that call this write, not just the run lane:
+--   * ClaimRun's affinity predicate reads r.updated_at only for status = 'queued'
+--     rows (:406);
+--   * ClaimChatRun has its OWN affinity predicate over r.updated_at (chat.sql:72),
+--     likewise narrowed to status = 'queued';
+--   * ListActiveRunsForHealth deliberately excludes 'claimed' entirely.
+-- So no reader of runs.updated_at applies to a claimed run on either lane. Naming
+-- one of the two readers, as this comment first did, would have left a reader of
+-- the same column unaccounted for while reading as though the set were complete.
+UPDATE runs
+SET anthropic_secret_id     = @anthropic_secret_id,
+    anthropic_secret_label  = @anthropic_secret_label,
+    anthropic_select_reason = @anthropic_select_reason,
+    anthropic_headroom_pct  = sqlc.narg('anthropic_headroom_pct'),
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id;
 
 -- name: SetRunRunning :execrows
 -- claimed/awaiting_approval → running, AND running → running: the worker reports

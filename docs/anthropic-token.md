@@ -94,6 +94,87 @@ uzi worker set-token <worker-id> --default     # clear the binding
 > will still move the meter on your default token. If you are reconciling a
 > meter against what you thought you spent, this is usually the reason.
 
+## Letting uzi pick the token (auto-selection)
+
+A worker can choose its token per claim instead of being pinned to one. Set
+its picker to **Auto-select from the pool** (or `uzi worker set-token
+<worker-id> --auto`) and each claim spends whichever of your **pooled**
+tokens has the most rate-limit headroom.
+
+It is opt-in **per token**, and the pool starts empty. On **Settings →
+Anthropic tokens**, tick **Auto-select from this token** on each one you are
+happy for uzi to spend; `uzi token pool <name> --on|--off` does the same. The
+pool is empty by default on purpose — one that helped itself to every
+credential would spend the one you reserved for something else.
+
+**Opting a token in does not guarantee it gets picked.** Beside the toggle,
+each pooled token shows whether auto-selection could pick it *right now*:
+
+| chip | what it means |
+|---|---|
+| **in pool** | it can be picked |
+| **never polled** | uzi has never read a usage figure for it, so it cannot be ranked — it will never be picked |
+| **no usage data** | it was polled, but the reading carried no percentage |
+| **stale reading** | the last reading is too old to steer a choice |
+| **low headroom** | it is nearly exhausted, so it is picked only if every pooled token is |
+
+Those chips are the point rather than decoration: a token uzi cannot read a
+usage figure for can never be chosen, and without the chip it would sit there
+looking active. Check them after opting a token in.
+
+### How it chooses
+
+Headroom is whichever window is fuller: `min(100 − 5-hour %, 100 − 7-day %)`.
+The emptiest token wins. When two are within a few points of each other, the
+one that **replenishes soonest** wins — and it is the reset of the window
+that is actually holding it back, because a 5-hour reset does not relieve a
+7-day cap. Ties beyond that are broken deterministically, so the same inputs
+always give the same answer.
+
+A small bias spreads work: each run already in flight on a token counts
+slightly against it, so several claims arriving inside one polling interval
+do not all pile onto the same credential. It is a nudge, not a cap — an empty
+token still wins with a couple of runs on it.
+
+### 🔴 "Auto" does not mean "only my pool"
+
+**Auto-selection never fails a run.** If it cannot pick — nothing is pooled,
+no pooled token has a reading it can rank, or the token it picked will not
+open — the run falls back to your **default token**, and your default is
+spent *whether or not it is in the pool*. The fallback does not consult the
+opt-in.
+
+So a token you deliberately kept **out** of the pool can still pay for a run,
+if it happens to be your default. That is not a bug and there is no third
+option: refusing to run would be worse. If you want a credential never spent
+by ordinary runs, it must not be your default either.
+
+The run view says which of these happened — see below.
+
+### Reading it back
+
+Every run names the credential it spent **and why**, as a chip in the run
+view and an `ANTHROPIC_TOKEN` row in `uzi run get`:
+
+| what you see | what happened |
+|---|---|
+| `console-key — auto, 62% headroom` | auto-selection picked it; it had 62 points of headroom |
+| `console-key — auto (best of pool), 8% headroom` | every pooled token was nearly exhausted, so it spent the least-consumed one |
+| `console-key — pinned` | the worker is bound to this token |
+| `console-key — default` | nothing named a token, so your default paid |
+| `review-key — judge binding` | your judge setting chose it, not a worker's |
+| `default — default (auto: no tokens in the pool)` | the worker is on auto and you have pooled nothing |
+| `default — default (auto: no fresh usage readings)` | the worker is on auto and no pooled token had a reading it could rank — never polled, polled without percentages, or aged out |
+| `default — default (auto: the chosen token would not open)` | auto picked one, its stored value would not decrypt, so your default paid |
+
+The last three are the fallbacks, shown in amber and linked to this page,
+because in each case the worker is set to auto and auto did not happen. They
+are different problems: pool one in, look at why the readings are
+missing or unusable, or re-paste the token that would not open.
+
+A run whose token you later delete still names it, with **(deleted)** — the
+name is a snapshot taken when the run was claimed, so history stays readable.
+
 ## Pointing the judge at a token
 
 **Settings → Run judge** has a **Token the judge spends** picker (shown once
@@ -138,9 +219,10 @@ Click **Delete** on the token's row. Two rules:
   actually runs against it. Replace its value if that happens.
 - **Meters are per token.** Each stored token gets its own 5-hour and 7-day
   reading — see [Claude rate limits](./rate-limits.md).
-- **The CLI can list tokens but not change them.** `uzi token list` prints
-  names, default flags and timestamps; adding, renaming, re-defaulting and
-  deleting are web-only. That is a deliberate boundary, not a gap: a CLI
+- **The CLI can list tokens, and can move them in and out of the pool.**
+  `uzi token list` prints names, default flags, pool opt-in and live
+  eligibility; `uzi token pool <name> --on|--off` is the one write it has.
+  Adding, renaming, re-defaulting and deleting are web-only. That is a deliberate boundary, not a gap: a CLI
   token is a bearer credential, and if it could mint or replace Anthropic
   credentials, a stolen one could swap out your account's credentials rather
   than merely read their names. See [the CLI guide](./cli.md#anthropic-tokens).

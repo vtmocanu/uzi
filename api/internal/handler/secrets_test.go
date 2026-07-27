@@ -93,7 +93,7 @@ func TestAnthropicTokenNeverLeaks(t *testing.T) {
 
 	// 3. The metadata DTO carries no secret value.
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	b, _ := json.Marshal(secretMeta(uuid.New(), store.KindAnthropicToken, "default", true, now, now))
+	b, _ := json.Marshal(secretMeta(uuid.New(), store.KindAnthropicToken, "default", true, true, now, now))
 	if strings.Contains(string(b), fixture) {
 		t.Fatal("secret metadata response leaked the token")
 	}
@@ -202,5 +202,90 @@ func TestPutAnthropicTokenNeverLeaksEndToEnd(t *testing.T) {
 
 	if strings.Contains(logs.String(), fixture) {
 		t.Fatal("a handler log line leaked the token")
+	}
+}
+
+// TestValidateSecretLabelRejectsInvisibles pins the PRD #111 M2 addition to
+// validateSecretLabel: Unicode FORMAT characters (category Cf) are refused
+// alongside the control characters PRD #104 already refused.
+//
+// Why a label is different from other free text, and why this is not merely
+// terminal hygiene: since PRD #111 the label IS the string a user reads to answer
+// "which account did this run bill?". Two properties follow, and both are asserted
+// rather than described:
+//
+//   - A bidi override makes a label READ as a different account than it names.
+//   - A zero-width makes two DISTINCT tokens render identically, while 00077's
+//     unique index on lower(label) does not fold them — so the collision the index
+//     exists to prevent stays reachable while looking prevented.
+func TestValidateSecretLabelRejectsInvisibles(t *testing.T) {
+	// The six the auditor measured storing intact against the previous validator.
+	// Named individually so a failure says WHICH class regressed.
+	for _, tc := range []struct {
+		name  string
+		label string
+	}{
+		{"U+202E right-to-left override", "safe\u202edrowssap"},
+		{"U+2066 left-to-right isolate", "safe\u2066key"},
+		{"U+200B zero-width space", "work\u200b"},
+		{"U+200D zero-width joiner", "work\u200dkey"},
+		{"U+FEFF byte-order mark", "\ufeffwork"},
+		{"U+00AD soft hyphen", "con\u00adsole"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validateSecretLabel(tc.label); err == nil {
+				t.Fatalf("label %q was accepted; an invisible codepoint lets a label lie about which account it names", tc.label)
+			}
+		})
+	}
+
+	// The confusability property, stated as the pair rather than as one string: the
+	// two are DIFFERENT rows that a browser draws identically. Only the second can
+	// still be created, which is what closes the collision.
+	if _, err := validateSecretLabel("work"); err != nil {
+		t.Fatalf("the plain label was rejected: %v", err)
+	}
+	if _, err := validateSecretLabel("work\u200b"); err == nil {
+		t.Fatal("`work` and `work`+U+200B are distinct rows that render identically; the second must be refused")
+	}
+
+	// Controls stay refused (PRD #104's half, unchanged).
+	for _, label := range []string{"bel\a", "esc\x1b[31m", "del\x7f", "bad�"} {
+		if _, err := validateSecretLabel(label); err == nil {
+			t.Errorf("control-bearing label %q was accepted", label)
+		}
+	}
+
+	// 🔴 THE ACCEPTED COST, PINNED SO IT IS A DECISION AND NOT A SURPRISE.
+	// U+200D is itself a format character, so multi-part emoji built from ZWJ
+	// sequences are NOT storable. That is deliberate: the identical-rendering hazard
+	// applies to a zero-width joiner exactly as it does to a bidi override, and a
+	// reject-list of only the bidi controls would leave the collision live while
+	// looking like it had solved something. A future reader who wants ZWJ emoji back
+	// is changing this decision, not fixing an oversight.
+	if _, err := validateSecretLabel("family \U0001F468\u200d\U0001F469\u200d\U0001F467 key"); err == nil {
+		t.Fatal("a ZWJ emoji sequence was accepted; the reject-all-Cf decision means it must not be")
+	}
+	// The cost is bounded to JOINED sequences: a single-codepoint emoji is fine, so
+	// "no emoji in labels" would be the wrong summary of this rule.
+	if _, err := validateSecretLabel("🔑 console"); err != nil {
+		t.Fatalf("a single-codepoint emoji label was rejected: %v — the rule is about JOINERS, not emoji", err)
+	}
+
+	// Ordinary labels are untouched: interior spaces, accents, and non-Latin scripts
+	// all pass, and trimming still happens.
+	for _, tc := range []struct{ in, want string }{
+		{"  console key  ", "console key"},
+		{"cheia mea", "cheia mea"},
+		{"日本語のキー", "日本語のキー"},
+	} {
+		got, err := validateSecretLabel(tc.in)
+		if err != nil {
+			t.Errorf("ordinary label %q was rejected: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("validateSecretLabel(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

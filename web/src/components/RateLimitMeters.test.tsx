@@ -55,8 +55,21 @@ const staleReading: MyRateLimits = {
 // Since PRD #104 M5 the endpoint returns ONE READING PER TOKEN. These tests are
 // about how a single reading renders, so tokens() wraps one as the user's default
 // — the multi-token rendering has its own tests below.
+// auto_eligible/auto_status (PRD #111 M2) ride every token row. Defaulted here to
+// the un-pooled state, which is what every pre-#111 fixture described.
 function tokens(limits: MyRateLimits) {
-  return { tokens: [{ secret_id: "sec-1", label: "default", is_default: true, limits }] };
+  return {
+    tokens: [
+      {
+        secret_id: "sec-1",
+        label: "default",
+        is_default: true,
+        auto_eligible: false,
+        auto_status: "not_pooled" as const,
+        limits,
+      },
+    ],
+  };
 }
 // A token-less user is an EMPTY list, not a no_token status.
 const noTokens = { tokens: [] };

@@ -49,14 +49,21 @@ const maxLabelBytes = 64
 
 // secretMeta builds the metadata-only DTO (apitypes.SecretDTO) for one stored
 // secret. The value appears in no field — there is no reveal endpoint.
-func secretMeta(id uuid.UUID, kind, label string, isDefault bool, created, updated pgtype.Timestamptz) apitypes.SecretDTO {
+//
+// autoEligible is passed rather than defaulted (PRD #111 M2): every query feeding
+// this now RETURNs the column, so a caller that does not have it has taken a row
+// from somewhere that cannot answer, and should say so rather than guess `false` —
+// a wrong `false` reads as "you never opted this token in", which is a setting the
+// user did set.
+func secretMeta(id uuid.UUID, kind, label string, isDefault, autoEligible bool, created, updated pgtype.Timestamptz) apitypes.SecretDTO {
 	return apitypes.SecretDTO{
-		ID:        id.String(),
-		Kind:      kind,
-		Label:     label,
-		IsDefault: isDefault,
-		CreatedAt: created.Time,
-		UpdatedAt: updated.Time,
+		ID:           id.String(),
+		Kind:         kind,
+		Label:        label,
+		IsDefault:    isDefault,
+		AutoEligible: autoEligible,
+		CreatedAt:    created.Time,
+		UpdatedAt:    updated.Time,
 	}
 }
 
@@ -80,7 +87,7 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.SecretDTO, 0, len(rows))
 	for _, s := range rows {
-		out = append(out, secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.CreatedAt, s.UpdatedAt))
+		out = append(out, secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.AutoEligible, s.CreatedAt, s.UpdatedAt))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"secrets": out})
 }
@@ -196,7 +203,7 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	if h.usagePoker != nil {
 		h.usagePoker.Poke(user.ID)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.CreatedAt, row.UpdatedAt)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt)})
 }
 
 // DeleteAnthropicToken removes the current user's DEFAULT Anthropic token (PRD #104
@@ -344,7 +351,7 @@ func (h *Handler) CreateAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		h.usagePoker.Poke(user.ID)
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.CreatedAt, row.UpdatedAt),
+		"secret": secretMeta(row.ID, row.Kind, row.Label, row.IsDefault, row.AutoEligible, row.CreatedAt, row.UpdatedAt),
 	})
 }
 
@@ -421,7 +428,15 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			return gerr
 		}
 		found = true
-		out = store.RenameUserSecretRow{ID: cur.ID, Kind: cur.Kind, Label: cur.Label, IsDefault: cur.IsDefault}
+		// AutoEligible is carried from the CURRENT row, not left zero: this handler
+		// never changes the pool flag (that is its own route, D13), so the response
+		// must report what the token's flag actually is. A zero here would answer
+		// "not pooled" to a rotate of a pooled token — a wrong answer about a
+		// setting the user did set, on the one response they are looking at.
+		out = store.RenameUserSecretRow{
+			ID: cur.ID, Kind: cur.Kind, Label: cur.Label,
+			IsDefault: cur.IsDefault, AutoEligible: cur.AutoEligible,
+		}
 
 		if req.Token != nil {
 			if _, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
@@ -473,7 +488,99 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		h.usagePoker.Poke(user.ID)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.CreatedAt, out.UpdatedAt),
+		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt),
+	})
+}
+
+// PatchAnthropicTokenAutoEligible opts ONE of the user's tokens into or out of the
+// auto-selection pool (PRD #111 M2, D2). An id that is not the caller's is a 404.
+//
+// 🔴 WHY THIS IS ITS OWN ROUTE INSTEAD OF A FIELD ON PatchAnthropicToken (D13).
+// The obvious implementation — one more optional field on the PATCH above — cannot
+// be reached by the CLI, because every secrets WRITE is deliberately cookie-only
+// (RequireAuth): "a Bearer-reachable mint would let a stolen uzc_ replace a user's
+// tokens" (PRD #104 D8). Moving that PATCH under RequireUser to reach the toggle
+// would make RENAME, ROTATE and SET-DEFAULT Bearer-reachable as collateral damage,
+// which is precisely the exposure D8 closes.
+//
+// So the toggle gets a narrow route of its own, mounted under RequireUser, and the
+// existing writes stay exactly where they are. The precedent is exact: PATCH
+// /workers/{id} is RequireUser because "it mints nothing and yields no credential
+// the caller lacks — it only re-points a worker at a token they already hold". This
+// is the same class of action: it re-points SPEND among tokens the caller already
+// holds. It creates nothing, reveals nothing, and its worst outcome from a stolen
+// CLI token is that the thief changes which of the victim's own credentials the
+// victim's own runs bill — bad, but strictly less than replacing them.
+//
+// The ownership check is COPIED, not reinvented, from the mutating handlers above:
+// the advisory lock, then the owner-scoped GetUserSecretForUpdate, then 404 (never
+// 403) for a foreign id — a 403 would confirm the id names a real credential
+// belonging to someone else (handler/judge.go says the same). The lock is arguably
+// unnecessary for a lone boolean, since it guards the exactly-one-default
+// invariant this write does not touch; it is taken anyway because it costs nothing
+// and keeps the toggle from racing a concurrent delete of the same row.
+func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	secretID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid secret id")
+		return
+	}
+	// A POINTER, so "field omitted" is distinguishable from "set to false". A plain
+	// bool would silently opt a token OUT for any client that sent `{}`, which is
+	// the wrong direction to be lenient in for a spend control.
+	var req struct {
+		AutoEligible *bool `json:"auto_eligible"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.AutoEligible == nil {
+		httpx.Error(w, http.StatusBadRequest, "auto_eligible is required")
+		return
+	}
+
+	var out store.SetUserSecretAutoEligibleRow
+	var found bool
+	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+		if _, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
+			ID: secretID, UserID: user.ID,
+		}); gerr != nil {
+			if errors.Is(gerr, pgx.ErrNoRows) {
+				return nil // found stays false → 404
+			}
+			return gerr
+		}
+		found = true
+		row, serr := q.SetUserSecretAutoEligible(r.Context(), store.SetUserSecretAutoEligibleParams{
+			ID: secretID, UserID: user.ID, Kind: store.KindAnthropicToken,
+			AutoEligible: *req.AutoEligible,
+		})
+		if serr != nil {
+			return serr
+		}
+		out = row
+		return nil
+	})
+	if err != nil {
+		slog.Error("patch anthropic token auto-eligible", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	// No usagePoker.Poke here, unlike rotate and set-default: pooling a token
+	// changes which credential future claims PREFER, not which one the poller reads
+	// or what it would read. Poking would spend a header probe to learn nothing.
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"secret": secretMeta(out.ID, out.Kind, out.Label, out.IsDefault, out.AutoEligible, out.CreatedAt, out.UpdatedAt),
 	})
 }
 
@@ -547,9 +654,54 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 }
 
 // validateSecretLabel trims and checks a token label (PRD #104 D7): non-empty, at
-// most maxLabelBytes, no control characters. Leading/trailing whitespace is trimmed
-// (so the stored value satisfies the migration's `label = btrim(label)` CHECK);
-// interior spaces are allowed (a label is a human name, not a token).
+// most maxLabelBytes, no control characters and no Unicode FORMAT characters.
+// Leading/trailing whitespace is trimmed (so the stored value satisfies the
+// migration's `label = btrim(label)` CHECK); interior spaces are allowed (a label
+// is a human name, not a token).
+//
+// 🔴 THE Cf HALF IS ABOUT WHAT A LABEL IS FOR, NOT ABOUT TERMINAL SAFETY.
+// Since PRD #111 a label is the string a user reads to answer "which account did
+// this run bill?" — so a label that can render as something it is not defeats the
+// feature it exists to serve. Two measured consequences, both closed here:
+//
+//   - U+202E (RIGHT-TO-LEFT OVERRIDE) and its neighbours visually REVERSE the text
+//     after them, so a label can be made to read as a different account entirely.
+//   - Zero-widths make two DISTINCT tokens render identically: `work` and
+//     `work`+U+200B are different rows that look the same in a browser, and 00077's
+//     unique index is on `lower(label)`, which does not fold them.
+//
+// 🔴 THE SECOND HAZARD IS NARROWED, NOT CLOSED, AND THE DIFFERENCE MATTERS. The bidi
+// half is fully closed — every reordering codepoint is `Cf`. The identical-rendering
+// half is not: measured, these are all still accepted because NONE of them is `Cf` —
+// U+3164 HANGUL FILLER and U+FFA0 (both `Lo`), U+2800 BRAILLE PATTERN BLANK (`So`),
+// U+00A0 NBSP and U+3000 IDEOGRAPHIC SPACE (both `Zs`). So `work` and `work`+U+3164
+// remain two rows a browser draws identically.
+//
+// That residual is ACCEPTED, deliberately, and the list must not grow here: the set
+// of blank-rendering codepoints is unbounded, homoglyphs (`work` with a Cyrillic о)
+// are the same class with no character rule reaching them at all, and this repo has
+// now settled on the `control + Cf` pair in three places — a longer list here would
+// make the three disagree about what a label is. A comment claiming a closed hazard
+// is how the next person skips checking, which is why this one says what it does not
+// cover.
+//
+// The predicate is the pair this repo has already settled on twice — sanitizeTTY
+// (cmd/uzi/run.go) and workersvc.hasUnsafeChar — rather than a third spelling of
+// almost the same rule.
+//
+// THE COST, DECIDED RATHER THAN DISCOVERED: U+200D (zero-width joiner) is itself a
+// format character, so EMOJI ZWJ SEQUENCES ARE NOT STORABLE — `family 👨‍👩‍👧 key` is
+// refused, and a single-codepoint emoji like `🔑 key` is fine. That is accepted on
+// purpose. A token label is an operational identifier used to answer a billing
+// question; the identical-rendering hazard applies to a zero-width JOINER exactly
+// as it does to a bidi override, and a partial reject-list (bidi controls only)
+// would leave the collision live while looking like it had solved something. The
+// error message says so, because a user hitting this deserves the reason and not a
+// mystery.
+//
+// Only NEW writes are validated. Labels stored before this landed are unaffected,
+// which is why the CLI still routes every label through cellText — see the tests
+// there for why that is defense in depth rather than redundancy.
 func validateSecretLabel(raw string) (string, error) {
 	label := strings.TrimSpace(raw)
 	if label == "" {
@@ -561,6 +713,13 @@ func validateSecretLabel(raw string) (string, error) {
 	for _, r := range label {
 		if r == unicode.ReplacementChar || unicode.IsControl(r) {
 			return "", errors.New("label must not contain control characters")
+		}
+		if unicode.In(r, unicode.Cf) {
+			return "", errors.New("Label must not contain invisible formatting characters " +
+				"(zero-width spaces and joiners, bidirectional overrides, the byte-order mark): " +
+				"they let two different tokens look identical, or make a label read as a different " +
+				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one " +
+				"of these characters. Use a plain name.")
 		}
 	}
 	return label, nil

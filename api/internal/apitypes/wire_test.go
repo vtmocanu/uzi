@@ -71,6 +71,15 @@ var runDTOKeys = []string{
 	"pipeline_ref", "pipeline_web_url", "fix_verdict", "claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",
+	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
+	// snapshot and outlives the id, so both keys are always on the wire.
+	"anthropic_secret_id", "anthropic_secret_label",
+	// PRD #111 M5: the MODE that named it, and the measured headroom of an auto pick
+	// (D20). Four keys, three independent nullabilities — the label outlives the id,
+	// the reason is present on every claimed run, and the headroom only on an auto
+	// pick — so all four are always PRESENT on the wire and a client branches per
+	// field rather than on the group.
+	"anthropic_select_reason", "anthropic_headroom_pct",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -281,7 +290,11 @@ func TestSecretDTOTags(t *testing.T) {
 	// field — the pin is here so a future field addition that leaks the secret trips
 	// this test.
 	assertTags(t, "SecretDTO", SecretDTO{},
-		"id", "kind", "label", "is_default", "created_at", "updated_at")
+		"id", "kind", "label", "is_default",
+		// PRD #111 M2: the auto-selection pool opt-in. A flag the owner set, not a
+		// value — it names no credential and reveals nothing about one.
+		"auto_eligible",
+		"created_at", "updated_at")
 }
 
 func TestRepoDTOTags(t *testing.T) {
@@ -311,6 +324,9 @@ var workerDTOKeys = []string{
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.
 	"anthropic_secret_id", "anthropic_secret_label",
+	// PRD #111 M3: HOW this worker chooses — default | pinned | auto. The server
+	// reports the EFFECTIVE mode, so "pinned" always has an id beside it.
+	"anthropic_bind_mode",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -373,7 +389,12 @@ func TestRateLimitDTOTags(t *testing.T) {
 
 func TestTokenRateLimitDTOTags(t *testing.T) {
 	assertTags(t, "TokenRateLimitDTO", TokenRateLimitDTO{},
-		"secret_id", "label", "is_default", "limits")
+		"secret_id", "label", "is_default",
+		// PRD #111 M2: the pool opt-in and the SERVER-COMPUTED live eligibility.
+		// auto_status is on the wire as a string precisely so no client re-derives
+		// it from the windows below (D21).
+		"auto_eligible", "auto_status",
+		"limits")
 }
 
 func TestAdminRateLimitRowDTOTags(t *testing.T) {

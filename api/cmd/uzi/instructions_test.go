@@ -238,6 +238,23 @@ var knownInstructions = []knownInstruction{
 			"resolution check is the complete bar for a help reference.",
 	},
 	{
+		command:  "uzi token pool",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #111 M3. `uzi worker set-token --auto` names the command
+		// that fills the pool it selects from, because "auto" is inert until a user
+		// has opted at least one token in — a help text that omitted it would send
+		// someone to a mode that silently does nothing.
+		//
+		// HELP, derived: the span sits in a cobra Long field (worker.go), which
+		// classifyKind reads as documentation rather than an emitter. Nothing runs it
+		// and nothing should; the complete bar for a help reference is that the path
+		// RESOLVES, and it does — `uzi token pool` is a real subcommand, pinned by
+		// TestTokenSubcommands and exercised by four tests in token_test.go.
+		note: "HELP: `uzi worker set-token`'s Long help cross-links the command that " +
+			"populates the auto-selection pool (worker.go). Never emitted at runtime; the " +
+			"path-resolution check is the complete bar.",
+	},
+	{
 		command:  "uzi review backlog",
 		evidence: evidenceHelpOnly,
 		// CORRECTED. The old note said "Printed by both truncation warnings". It is not:
@@ -262,6 +279,33 @@ var knownInstructions = []knownInstruction{
 	},
 
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi token list",
+		evidence: evidenceGoTest,
+		where:    "TestTokenPoolUnknownLabelIsUsageError",
+		// ARRIVED WITH PRD #111 M2, and the backstop caught it the moment it entered the
+		// tree — `uzi token pool` resolves a LABEL client-side, so an unresolvable one is a
+		// usage error that has to tell the caller where the valid labels are.
+		//
+		// RUNTIME, not HELP, and derived rather than chosen: the span sits inside an
+		// Exitf argument (token.go), which classifyKind reads as an emitter. The entry is
+		// therefore a claim that the command was EXECUTED and its outcome asserted, which
+		// is what TestTokenPoolUnknownLabelIsUsageError does: it drives the real cobra parse
+		// with a label the fake client's list does not contain and asserts the OUTCOME pair
+		// — exit 3 (ExitUsage, not a 404, because the label never reached the server) and
+		// NO write attempted (LastPoolSecretID stays empty). The second half is the one
+		// worth having: an implementation that sent the label to the server and let it 404
+		// would produce the same exit code from the user's side.
+		//
+		// Its honest limit, stated because the e2e rows set a higher bar: the remedy is
+		// executed against a FAKE client, so this proves the argv shape and the refusal, not
+		// that `uzi token list` succeeds against a booted API. TestTokenList covers the
+		// command itself, also against a fake.
+		note: "RUNTIME: `uzi token pool`'s unknown-label refusal (token.go) names the read " +
+			"that prints the caller's valid labels. EXECUTED through the real parse in " +
+			"TestTokenPoolUnknownLabelIsUsageError, which asserts exit 3 AND that no write " +
+			"was sent. Not executed against a booted API.",
+	},
 	{
 		command:  "uzi skill install",
 		evidence: evidenceGoTest,

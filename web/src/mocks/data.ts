@@ -158,8 +158,24 @@ function okReading(
 // the two meter pairs are visibly different rather than duplicates.
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
 
+// 🔴 auto_eligible HERE MUST AGREE WITH mockSecrets, TOKEN FOR TOKEN. The settings
+// row draws its toggle from mockSecrets and its chip from this list, so a
+// disagreement renders a checked box beside "not in pool" — which is what the demo
+// build shipped until this was fixed, and exactly the contradiction the feature
+// exists to prevent. The component now suppresses a chip that disagrees with the
+// toggle rather than drawing it, so a mistake here degrades to a missing chip; that
+// is a backstop, not a licence to let these drift.
 export const mockMyTokenRateLimits: TokenRateLimits[] = [
-  { secret_id: "sec-default", label: "default", is_default: true, limits: mockMyRateLimits },
+  {
+    secret_id: "sec-default",
+    label: "default",
+    is_default: true,
+    // NOT pooled — the reserved-credential case D2 exists for. Its contrast with
+    // console-key below is the thing worth seeing on a cold load.
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
+    limits: mockMyRateLimits,
+  },
   {
     // 34% / 22% — busier than the default but still both green under the #115
     // bands, so vlad reads "Live" on both tokens (mockup frame A) and is the
@@ -167,7 +183,34 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     secret_id: "sec-console",
     label: "console-key",
     is_default: false,
+    // Pooled AND pickable: the healthy chip, which had been rendering on no row at all.
+    auto_eligible: true,
+    auto_status: "eligible" as const,
     limits: okReading(34, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
+  },
+  {
+    // F2: `never polled` — pooled, but uzi has NEVER read a usage figure for it, so
+    // the selector can never pick it. This is R7's silent no-op, and without a
+    // fixture carrying it the state the chip mechanism exists to surface was
+    // unreachable in the demo build. `unavailable` is what a token with no gauge row
+    // actually returns.
+    secret_id: "sec-never-polled",
+    label: "refused-key",
+    is_default: false,
+    auto_eligible: true,
+    auto_status: "no_reading" as const,
+    limits: { status: "unavailable" as const },
+  },
+  {
+    // F2: `low headroom` — pooled, current, and nearly spent. Distinct from the three
+    // above in the way F4 is about: per D10 this token IS still picked when every
+    // pooled token is this low, so it must not wear the same "skipped" tone.
+    secret_id: "sec-low",
+    label: "nearly-spent",
+    is_default: false,
+    auto_eligible: true,
+    auto_status: "below_threshold" as const,
+    limits: okReading(93, 40 * MIN, 88, 1 * D, 3),
   },
 ];
 
@@ -176,7 +219,16 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
 function tokenised(limits: MyRateLimits, label = "default"): TokenRateLimits[] {
   return limits.status === "no_token"
     ? [] // token-less is an EMPTY list since M5, not a status
-    : [{ secret_id: `sec-${label}`, label, is_default: true, limits }];
+    : [
+        {
+          secret_id: `sec-${label}`,
+          label,
+          is_default: true,
+          auto_eligible: false,
+          auto_status: "not_pooled" as const,
+          limits,
+        },
+      ];
 }
 
 // Per-persona readings so a demo login as a seeded non-admin reaches every own-
@@ -582,6 +634,7 @@ export const mockSecrets: SecretMeta[] = [
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    auto_eligible: false,
     created_at: daysAgo(30),
     updated_at: daysAgo(4),
   },
@@ -590,8 +643,33 @@ export const mockSecrets: SecretMeta[] = [
     kind: "anthropic_token",
     label: "console-key",
     is_default: false,
+    // Pooled, so the mock shows the PRD #111 toggle in its ON state and the
+    // eligibility chip beside it.
+    auto_eligible: true,
     created_at: daysAgo(9),
     updated_at: daysAgo(9),
+  },
+  // Two more pooled tokens so the states that MATTER are browsable (F2): a token
+  // the poller has never reached, and one that is nearly spent. Both are pooled —
+  // an un-pooled token shows no chip at all, so only a pooled one can demonstrate
+  // that opting in is not the same as being pickable.
+  {
+    id: "sec-never-polled",
+    kind: "anthropic_token",
+    label: "refused-key",
+    is_default: false,
+    auto_eligible: true,
+    created_at: daysAgo(3),
+    updated_at: daysAgo(3),
+  },
+  {
+    id: "sec-low",
+    kind: "anthropic_token",
+    label: "nearly-spent",
+    is_default: false,
+    auto_eligible: true,
+    created_at: daysAgo(12),
+    updated_at: daysAgo(1),
   },
 ];
 
@@ -1074,6 +1152,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -1103,6 +1182,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
@@ -1148,6 +1228,7 @@ export const mockWorkers: Worker[] = [
     stats_source: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -1177,6 +1258,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "process",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -1210,6 +1292,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
 ];
 
@@ -1246,6 +1329,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
     owner_email: "mira@uzi.local",
   },
 ];
@@ -1433,6 +1517,11 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // Not claimed yet, so no credential was spent — both null (PRD #111 M1).
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,
@@ -1471,6 +1560,11 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    // M5: the headline case, and D20's own example — `console-key — auto, 62% headroom`.
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: 62,
     claimed_at: minsAgo(1),
     started_at: minsAgo(1),
     finished_at: null,
@@ -1522,6 +1616,11 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    // M5: an ordinary default, for contrast with the fallback above.
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(9),
     started_at: minsAgo(9),
     finished_at: null,
@@ -1560,6 +1659,12 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    // M5: D10's best-of-pool. Every pooled token was under the floor and the emptiest was
+    // spent anyway — the run worked, and the pool is nearly exhausted.
+    anthropic_select_reason: "best_of_pool",
+    anthropic_headroom_pct: 8,
     claimed_at: minsAgo(220),
     started_at: minsAgo(219),
     finished_at: minsAgo(184),
@@ -1601,6 +1706,15 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    // The DELETED-token shape (PRD #111 M1): the FK nulled the id, the label
+    // snapshot survived. This is the case the mock exists to make browsable —
+    // the run still names the account it billed after the token is gone.
+    anthropic_secret_id: null,
+    anthropic_secret_label: "retired-key",
+    // M5: a mode on a DELETED credential. The two are independent fields, so the chip
+    // has to say both things at once.
+    anthropic_select_reason: "pinned",
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(305),
     started_at: minsAgo(304),
     finished_at: minsAgo(120),
@@ -1639,6 +1753,12 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    // M5: the judge lane's own mode. Rendered `judge binding` and NOT `pinned`, which
+    // would send a user to Settings → Workers for a binding that does not exist.
+    anthropic_select_reason: "judge",
+    anthropic_headroom_pct: null,
     claimed_at: daysAgo(1.2),
     started_at: daysAgo(1.2),
     finished_at: daysAgo(1.1),
@@ -1677,6 +1797,14 @@ export const mockRuns: Run[] = [
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    // M5: the FALLBACK state, and the mock's most important credential row. The worker
+    // is set to auto and the run spent the default anyway because no pooled token had a
+    // fresh reading — the one case where the user's configuration and what actually
+    // happened differ, and the only one a browser pass can judge the amber chip against.
+    anthropic_select_reason: "pool_stale",
+    anthropic_headroom_pct: null,
     claimed_at: null,
     started_at: null,
     finished_at: daysAgo(3),
@@ -1969,6 +2097,10 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(12),
     started_at: minsAgo(12),
     finished_at: null,
@@ -2104,6 +2236,15 @@ export const mockLaneRuns: Run[] = [
   demoIssueRun({
     id: "run-stalled",
     issue_iid: 99,
+    // web-ux F23. `open_failed` had no mock run, so the LONGEST string in the
+    // vocabulary could only ever be seen as a rendering preview — and F20's overflow
+    // was findable exactly because a long string was on screen. This also fixes a
+    // second thing: a *running* run carrying NO credential is a shape no real instance
+    // produces, since a running run has by definition claimed one.
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "open_failed",
+    anthropic_headroom_pct: null,
     issue_title: "Busy crew, degraded: the stalled role sorts to the front",
     issue_description: "Demo run: same stream as run-busy with a looping health flag, so the active tester lane reads stalled and its role chip leads the rollup.",
     branch: "agent/issue-99",
@@ -2125,6 +2266,11 @@ export const mockCrewRuns: Run[] = [
   }),
   demoIssueRun({
     id: "run-degraded",
+    // The other half of F23: `pool_empty`, the second string with no mock run.
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "pool_empty",
+    anthropic_headroom_pct: null,
     issue_title: "Crew roster: worker went quiet (waiting on a worker)",
     status: "running",
     health: "waiting_worker",
@@ -2206,6 +2352,10 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(6),
     started_at: minsAgo(6),
     finished_at: null,

@@ -55,6 +55,33 @@ type Client interface {
 	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
 	// entry's value appears nowhere — there is no reveal endpoint.
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
+	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
+	// the auto-selection pool (PRD #111 M2, D2): PATCH
+	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.
+	//
+	// It takes an ID. The label→id resolution happens in the COMMAND, client-side —
+	// deliberately NOT the shape SetWorkerBindMode uses, which sends the label for the
+	// server to resolve. An earlier version of this comment claimed they were the
+	// same; see cmd/uzi/token.go for the two ways they differ (Go vs Postgres case
+	// folding, and a missing kind filter) and why this side is accepted for now.
+	//
+	// This is the ONE secrets write a CLI token can reach, and its own narrow route
+	// is why (D13). Every other secrets write is cookie-only, because minting or
+	// replacing a credential from a stolen uzc_ is the exposure PRD #104 D8 closes;
+	// this one mints nothing and reveals nothing, it only re-points which of the
+	// caller's OWN tokens the pool may spend. An unknown label is a usage error
+	// resolved client-side (exit 3); an unknown id is a 404 (exit 4).
+	SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
+	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
+	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
+	//
+	// RequireUser since PRD #111 D23. Before that this was cookie-only, which left
+	// `uzi token pool <label> --on` a silent no-op from a script's point of view: it
+	// could opt a token in and had no way to learn the token could never be picked
+	// (no gauge reading, or one that aged out) — R7's hazard, reintroduced on the CLI
+	// half. The status string is computed server-side by autoselect.Classify and is
+	// RENDERED here, never re-derived (D21).
+	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
@@ -85,15 +112,19 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
 	// there is no create counterpart here.
 	DeleteWorker(ctx context.Context, id string) error
-	// SetWorkerToken points a worker at one of the caller's named Anthropic tokens,
-	// or clears the binding when label is "" so the worker falls back to the
-	// caller's default: PATCH /api/workers/{id} {anthropic_token}. It takes a LABEL,
-	// the name a human knows, not a secret id. Unlike minting a worker this yields
-	// no credential the caller lacks, so it is RequireUser and reachable from a CLI
-	// token (PRD #104 D8). An unknown label is a 400 (exit 3); an unknown/foreign
-	// worker is a 404 (exit 4). The change lands on the worker's next claim — no
-	// restart, no re-minted join token.
-	SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error)
+	// SetWorkerBindMode sets HOW a worker chooses its Anthropic credential:
+	// PATCH /api/workers/{id} {anthropic_bind_mode, anthropic_token}.
+	//
+	//   - "pinned" + a LABEL (the name a human knows, not a secret id) → that token;
+	//   - "default" → the caller's default token;
+	//   - "auto"    → the selector picks from the caller's opted-in pool per claim.
+	//
+	// Unlike minting a worker this yields no credential the caller lacks, so it is
+	// RequireUser and reachable from a CLI token (PRD #104 D8). An unknown label or
+	// an illegal mode is a 400 (exit 3); an unknown/foreign worker is a 404 (exit 4).
+	// The change lands on the worker's next claim — no restart, no re-minted join
+	// token.
+	SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error)
 	// ListMemory returns the caller's agent memory across all repos (PRD #90):
 	// GET /api/me/memory. Each entry carries its repo + provenance so the owner can
 	// see what a future run would read back.
@@ -525,17 +556,42 @@ func (c *HTTPClient) ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, err
 	return env.Secrets, nil
 }
 
+func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	body := struct {
+		AutoEligible bool `json:"auto_eligible"`
+	}{AutoEligible: eligible}
+	var env struct {
+		Secret apitypes.SecretDTO `json:"secret"`
+	}
+	if err := c.patch(ctx, "/api/me/secrets/anthropic_token/"+url.PathEscape(id)+"/auto-eligible", body, &env); err != nil {
+		return apitypes.SecretDTO{}, err
+	}
+	return env.Secret, nil
+}
+
+func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error) {
+	var env struct {
+		Tokens []apitypes.TokenRateLimitDTO `json:"tokens"`
+	}
+	if err := c.get(ctx, "/api/me/rate-limits", &env); err != nil {
+		return nil, err
+	}
+	return env.Tokens, nil
+}
+
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
 }
 
-func (c *HTTPClient) SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error) {
-	// An empty label sends JSON null, which is what clears the binding — distinct
-	// from omitting the field, which would mean "leave it alone". *string is what
-	// makes the two expressible on the wire.
+func (c *HTTPClient) SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
+	// An empty label sends JSON null, which is what a non-pinned mode requires —
+	// distinct from omitting the field, which would mean "leave it alone". *string is
+	// what makes the two expressible on the wire, and the server REFUSES a label
+	// alongside default/auto rather than quietly dropping one of them.
 	body := struct {
-		AnthropicToken *string `json:"anthropic_token"`
-	}{}
+		AnthropicBindMode string  `json:"anthropic_bind_mode"`
+		AnthropicToken    *string `json:"anthropic_token"`
+	}{AnthropicBindMode: mode}
 	if label != "" {
 		body.AnthropicToken = &label
 	}

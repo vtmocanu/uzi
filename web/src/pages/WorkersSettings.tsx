@@ -3,7 +3,9 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
+
+import { sanitizeLabel } from "../lib/sanitizeLabel";
+import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
@@ -19,6 +21,17 @@ import { stripUnsafeChars } from "../lib/safeText";
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
 const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
+// The picker's <option> values encode the MODE, not just a label, because since
+// PRD #111 M3 there are three kinds of choice and only one of them names a token.
+// AUTO_OPTION is a sentinel rather than a label, and deliberately a string no label
+// can collide with: labels are user-authored, so a bare "auto" would be ambiguous
+// the moment someone names a token `auto`.
+//
+// Module scope, not inside the component: declared in the render path it was
+// re-created on every render, and a value used as an <option> identity has no
+// business being a new string each time.
+const AUTO_OPTION = "\u0000auto";
+
 const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
 
 export function WorkersSettings() {
@@ -29,6 +42,11 @@ export function WorkersSettings() {
   // The user's named tokens, for the per-worker picker (PRD #104 M3/M6). Read
   // alongside the workers so a rebind can offer labels without a second round trip.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  // How many of them are opted into the auto-selection pool (web-ux F18). An `auto`
+  // worker with ZERO pooled tokens resolves pool_empty on every claim and spends the
+  // owner's default, so the page must not say it auto-selects. Derived rather than
+  // fetched: auto_eligible already rides SecretMeta.
+  const pooledCount = tokens.filter((t) => t.auto_eligible).length;
   // Which worker's rebind is in flight, so only that row's picker disables.
   const [tokenBusy, setTokenBusy] = useState("");
   const [loading, setLoading] = useState(true);
@@ -63,10 +81,16 @@ export function WorkersSettings() {
   // quota of 2 produces), so deleting two identically-named workers would set the same
   // string, React would bail out, the effect would not re-fire, and the second
   // announcement would silently never take focus.
-  const [notice, setNotice] = useState<{ text: string } | null>(null);
+  //
+  // It also carries a TONE, because F18 made the two channels agree in WORDS and left
+  // them disagreeing in COLOUR: a green success banner reading "your token pool is
+  // empty, so its runs spend your default token" is the same category error one level
+  // down from the one F18 fixed, and this file's own comment argues that the visible
+  // and the announced must not disagree.
+  const [notice, setNotice] = useState<{ text: string; tone: "success" | "warning" } | null>(null);
   const noticeRef = useRef<HTMLDivElement>(null);
-  const announce = useCallback((text: string) => {
-    setNotice({ text });
+  const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
+    setNotice({ text, tone });
   }, []);
 
   const load = useCallback(async () => {
@@ -86,16 +110,33 @@ export function WorkersSettings() {
   // claim — no restart — which the announcement says, because a user who expects
   // to restart something will otherwise go looking for the control to do it.
   const rebind = useCallback(
-    async (workerId: string, label: string) => {
+    async (workerId: string, choice: string) => {
       setError("");
       setTokenBusy(workerId);
+      const mode: BindMode = choice === AUTO_OPTION ? "auto" : choice === "" ? "default" : "pinned";
       try {
-        const { worker } = await api.setWorkerToken(workerId, label === "" ? null : label);
+        const { worker } = await api.setWorkerBindMode(
+          workerId,
+          mode,
+          mode === "pinned" ? choice : null,
+        );
         setWorkers((prev) => prev.map((w) => (w.id === worker.id ? worker : w)));
         announce(
-          label === ""
-            ? `${worker.name} now spends your default token, from its next claim.`
-            : `${worker.name} now spends ${label}, from its next claim.`,
+          // F18's other half. A correct row summary beside a cheerful "now
+          // auto-selects from your token pool" would leave the misleading half in the
+          // one place a screen-reader user actually HEARS it — and the visual and the
+          // announced would then disagree, which is worse than not fixing either.
+          mode === "auto" && pooledCount === 0
+            ? `${worker.name} is set to auto-select, but your token pool is empty, so its runs spend your default token.`
+            : mode === "auto"
+              ? `${worker.name} now auto-selects from your token pool, from its next claim.`
+              : mode === "default"
+              ? `${worker.name} now spends your default token, from its next claim.`
+              : `${worker.name} now spends ${choice}, from its next claim.`,
+          // Amber for the empty-pool case only: nothing failed, but the worker is
+          // configured for something that will not happen, which is the one branch
+          // here that is not a plain success.
+          mode === "auto" && pooledCount === 0 ? "warning" : "success",
         );
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to change the worker's token");
@@ -103,9 +144,25 @@ export function WorkersSettings() {
         setTokenBusy("");
       }
     },
-    // announce is stable (a setState wrapper); listing it keeps the lint rule happy
-    // without re-creating rebind on every render.
-    [],
+    // announce is stable (a setState wrapper). pooledCount is NOT — it is derived from
+    // `tokens` on every render — and it MUST be in the deps.
+    //
+    // 🔴 THIS GUARDS A LIVE BUG ON THE ORDINARY PATH, not a future landmine, and the
+    // mechanism is subtler than "the token set changed mid-session". `tokens` starts
+    // as [] and is filled ASYNCHRONOUSLY by load(). So with `[]` deps, rebind is
+    // created on the FIRST render — when pooledCount is 0 — and never re-created. It
+    // holds 0 for the life of the mount, whatever the fetch returns.
+    //
+    // The reachable journey needs no refetch and no route change: open the page with a
+    // full pool, switch a worker to auto, hear "your token pool is empty". Measured —
+    // the test below reddens under `[]` with a token pooled at mount and no mid-mount
+    // change at all.
+    //
+    // Worth spelling out because a review concluded the opposite: it looked for a
+    // mid-mount token REFETCH, correctly found none (the tabs are separate routes, and
+    // the 10s poll re-reads workers only), and inferred the fix was merely defensive.
+    // The initial [] → fetched transition is the change, and it happens every time.
+    [pooledCount],
   );
 
   useEffect(() => {
@@ -228,7 +285,23 @@ export function WorkersSettings() {
 
       {newToken && (
         <Card className="space-y-3 border-ok/40">
-          <SectionTitle className="text-ok">Join token for “{newToken.worker}”</SectionTitle>
+          {/* sanitizeLabel here too, and the reason it is LOW rather than the same
+              severity as the list: this name is the one the user typed into the create
+              form seconds ago, in the same session — a user can only spoof their own
+              immediate echo, with no cross-tenant path and nothing stored-then-
+              surprising. The worker LIST renders names created at any time, and the
+              admin view renders other people's. Fixed anyway because it is the same
+              class and the same one-word fix.
+
+              This paragraph used to add that the aria-labels were CONSIDERED and left
+              raw. Issue #124 has since stripped both of them (stripUnsafeChars, below),
+              and the delete confirm's own comment gives the reason this one under-rated:
+              a live region is the ONLY thing a screen-reader user gets before a
+              destructive choice, so reordering it is not cosmetic. What is still raw is
+              the announce() strings; the argument holds there — escaped, no injection,
+              and every visible counterpart is sanitized — but it is a smaller claim than
+              the one this comment used to make. Recorded so nobody re-derives it. */}
+          <SectionTitle className="text-ok">Join token for “{sanitizeLabel(newToken.worker)}”</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
@@ -310,7 +383,7 @@ export function WorkersSettings() {
       {notice && (
         // tabIndex -1: focusable programmatically, never a tab stop of its own.
         <div ref={noticeRef} tabIndex={-1} className="outline-none">
-          <Alert tone="success" message={notice.text} />
+          <Alert tone={notice.tone} message={notice.text} />
         </div>
       )}
 
@@ -341,7 +414,20 @@ export function WorkersSettings() {
                     {/* Own workers here, but stripped for the same reason and with the
                         same helper as the admin fleet list (RunsList.tsx): the field is
                         unstripped at ingest, and one page treating it as safe while the
-                        other does not is how the next reader picks the wrong precedent. */}
+                        other does not is how the next reader picks the wrong precedent.
+
+                        F12's argument reaches the same cell from the other side and is
+                        why the helper is stripUnsafeChars rather than sanitizeLabel: a
+                        worker name is validated for LENGTH ONLY, so it has LESS
+                        protection than a token label, not more. React escapes HTML, so
+                        there is no XSS — but escaping does nothing to an RLO, which
+                        reorders the text around it and can make a worker render as one
+                        it is not, and nothing rejects a bare ESC either. sanitizeLabel
+                        is Cf-only by design (it mirrors the Go validateSecretLabel
+                        predicate for token labels); stripUnsafeChars is Cc+Cf, so it is
+                        the superset, and it is what the same field's two aria-labels
+                        below already use. The CLI's two name cells got the equivalent
+                        treatment via cellText. */}
                     <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
@@ -369,7 +455,42 @@ export function WorkersSettings() {
                         carries the label alongside the id — never from a source that
                         could supply an id with a null label. */}
                     <div className="mt-1 text-xs text-muted">
-                      {w.anthropic_secret_id ? (
+                      {/* auto is checked FIRST and independently of the id, because an
+                          auto worker holds no pin at all — reading the id first would
+                          fall through to "spends your default token", which is what an
+                          auto worker does only when its pool is empty, not what it IS.
+                          The server already resolves a pinned-but-idless worker to
+                          `default` (D9), so no rule is re-derived here. */}
+                      {w.anthropic_bind_mode === "auto" && pooledCount === 0 ? (
+                        // web-ux F18. An auto worker whose owner has pooled NOTHING
+                        // resolves pool_empty on every claim and spends the default —
+                        // and the page said "auto-selects from your token pool" with a
+                        // straight face. That is R7's silent no-op moved up one level:
+                        // M2 closed it on the TOKEN surface (a pooled token that can
+                        // never be picked shows why), and it stayed open on the WORKER
+                        // surface, which is where the choice is actually made.
+                        //
+                        // 🔴 THE CONDITION IS `pooled`, NOT `tokens.length`, and the
+                        // neighbouring precedent below is the trap: copying its
+                        // `tokens.length === 0` shape produces a guard that is silent
+                        // in exactly the case that matters — a user holding four tokens
+                        // with none opted in. auto_eligible rides SecretMeta already,
+                        // so this costs no fetch.
+                        <span className="text-warn">
+                          auto-selects, but your{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            token pool
+                          </Link>{" "}
+                          is empty — its runs spend your default token
+                        </span>
+                      ) : w.anthropic_bind_mode === "auto" ? (
+                        <span>
+                          auto-selects from your{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            token pool
+                          </Link>
+                        </span>
+                      ) : w.anthropic_secret_id ? (
                         <>
                           spends{" "}
                           <strong className="font-medium text-fg">
@@ -441,17 +562,35 @@ export function WorkersSettings() {
                       <Select
                         aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
                         className="h-8 max-w-[11rem] text-xs"
-                        value={w.anthropic_secret_label ?? ""}
+                        // Driven by the MODE first (PRD #111 M3): an auto worker
+                        // selects the sentinel, everything else falls back to the
+                        // label, and a worker whose pinned token was deleted arrives
+                        // here as mode "default" with a null label — so it shows
+                        // "default token", which is what it now spends.
+                        value={
+                          w.anthropic_bind_mode === "auto"
+                            ? AUTO_OPTION
+                            : (w.anthropic_secret_label ?? "")
+                        }
                         disabled={tokenBusy === w.id}
                         onChange={(e) => void rebind(w.id, e.target.value)}
                       >
-                        <option value="">default token</option>
-                        {tokens.map((t) => (
-                          <option key={t.id} value={t.label}>
-                            {t.label}
-                            {t.is_default ? " (default)" : ""}
-                          </option>
-                        ))}
+                        {/* web-ux F15: three of four options used to contain the
+                            word "default" — `default token` (the user's default),
+                            `default (default)` (a token NAMED default), and M3's new
+                            auto. The two account-level choices now read as sentences
+                            and the named tokens sit under a group label, so the
+                            question each option answers is different from the others. */}
+                        <option value="">Use my default token</option>
+                        <option value={AUTO_OPTION}>Auto-select from the pool</option>
+                        <optgroup label="Pin to a token">
+                          {tokens.map((t) => (
+                            <option key={t.id} value={t.label}>
+                              {t.label}
+                              {t.is_default ? " (your default)" : ""}
+                            </option>
+                          ))}
+                        </optgroup>
                       </Select>
                     )}
                     {confirmingDelete !== w.id && (

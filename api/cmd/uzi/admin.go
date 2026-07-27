@@ -89,7 +89,27 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(ws))
 			for _, w := range ws {
-				rows = append(rows, []string{w.ID, w.OwnerEmail, w.Name, w.Status})
+				// 🔴 THE CROSS-TENANT ONE. This prints another user's worker name into an
+				// ADMIN's terminal, and worker names are validated for length only — no
+				// control-character check, no Cf check, and workers.name carries no CHECK.
+				// So a crafted name is terminal control injection into someone else's
+				// session, and an embedded newline forges a row in a table an admin reads
+				// to make decisions. Strictly worse than the token-label case, where the
+				// validator had already put ANSI out of reach.
+				//
+				// The render site is the trust boundary and does not depend on the
+				// validator holding; hardening the validator is a separate change.
+				//
+				// 🔴 "THE CROSS-TENANT ONE" ABOVE MEANS "of the two worker-name cells",
+				// NOT "of this file". `uzi admin cli-tokens` below renders `t.Name` raw
+				// into the same kind of cross-tenant admin table, and CLI-token names get
+				// only strings.TrimSpace — no control-character check either. It is left
+				// deliberately: it is PRD #64's surface, this change does not make it
+				// worse, and render-site fixes here are scoped to the surfaces this PRD
+				// touches. It goes up as a follow-up with the worker-name validator.
+				// Named here so the next reader sees a signpost rather than two
+				// sanitized cells and a file that looks finished.
+				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status})
 			}
 			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS"}, rows)
 		},
@@ -237,11 +257,23 @@ func vaultCell(locked bool) string {
 // tokenCell renders a token's label for the admin table, marking the default so an
 // operator can see at a glance which credential a user's unbound workers spend
 // against (#104 M5). The label is a name, never the credential.
+//
+// 🔴 THE ONLY PATH WHERE A CRAFTED LABEL REACHES SOMEONE OTHER THAN ITS AUTHOR, which
+// is why it goes through cellText even though every other admin cell is
+// server-controlled. Everywhere else a hostile label can only spoof its own owner's
+// terminal; here it renders in an ADMIN's, listing every user's credentials.
+//
+// PRD #111 M2's validateSecretLabel now rejects Cf on write, which narrows this
+// without closing it: rows written before that landed were never re-validated, and
+// nothing re-validates on read. The auditor enumerated every write path that sets
+// user_secrets.label — the two body-driven ones validate, and UpsertDefaultUserSecret
+// and the seed pass compiled-in constants — so HISTORY is precisely the remaining
+// route, and a render-site defense is what covers history and future drift alike.
 func tokenCell(label string, isDefault bool) string {
 	if isDefault {
-		return label + " (default)"
+		return cellText(label) + " (default)"
 	}
-	return label
+	return cellText(label)
 }
 
 // windowPct renders a rate-limit window's percentage, or "-" when the window is

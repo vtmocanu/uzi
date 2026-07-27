@@ -209,7 +209,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct
 `
 
 type ClaimRunParams struct {
@@ -314,6 +314,10 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.MrWebUrl,
 		&i.PrdDonePath,
 		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
 	)
 	return i, err
 }
@@ -510,7 +514,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct
 `
 
 type CreateRunParams struct {
@@ -594,6 +598,10 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.MrWebUrl,
 		&i.PrdDonePath,
 		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
 	)
 	return i, err
 }
@@ -737,9 +745,9 @@ func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerd
 
 const createWorker = `-- name: CreateWorker :one
 
-INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type CreateWorkerParams struct {
@@ -748,6 +756,7 @@ type CreateWorkerParams struct {
 	TokenHash         []byte      `json:"token_hash"`
 	TemplateDeclared  pgtype.Text `json:"template_declared"`
 	AnthropicSecretID pgtype.UUID `json:"anthropic_secret_id"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 }
 
 // Workers -----------------------------------------------------------------
@@ -756,6 +765,21 @@ type CreateWorkerParams struct {
 // (PRD #18), NULL when the caller made no choice. anthropic_secret_id is the
 // optional mint-time token binding (PRD #104 M3); NULL means "my owner's default",
 // which is what every worker minted before this was and stays.
+//
+// 🔴 anthropic_bind_mode MUST BE NAMED HERE, and its absence was a silent
+// regression. PRD #111 M3 made the MODE decide whether the id is read at all
+// (workerSecretID gates on it first), and this INSERT set five columns without it —
+// so the row took 00088's column default 'default' while carrying a real binding,
+// and every worker minted through `POST /api/workers {"anthropic_token":"..."}`
+// quietly spent the OWNER'S DEFAULT instead. PRD #104 M3's mint-time binding was
+// dead, silently, in every channel — and M1 made it worse: the run records the
+// credential actually opened, so the attribution feature CORROBORATED the wrong
+// answer.
+//
+// Written in the SAME statement as the id, for the reason SetWorkerAnthropicSecret
+// gives: mode and id describe one decision, and a row where they disagree is one no
+// resolution rule can rescue. The caller derives the pair (pinned when a label
+// resolved, else default), exactly as PatchWorker does.
 func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createWorker,
 		arg.UserID,
@@ -763,6 +787,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		arg.TokenHash,
 		arg.TemplateDeclared,
 		arg.AnthropicSecretID,
+		arg.AnthropicBindMode,
 	)
 	var i Worker
 	err := row.Scan(
@@ -787,6 +812,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -975,7 +1001,7 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -1032,12 +1058,16 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.MrWebUrl,
 		&i.PrdDonePath,
 		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -1096,6 +1126,10 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.MrWebUrl,
 		&i.PrdDonePath,
 		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
 	)
 	return i, err
 }
@@ -1275,7 +1309,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -1335,6 +1369,10 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.MrWebUrl,
 		&i.PrdDonePath,
 		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
 	)
 	return i, err
 }
@@ -1372,7 +1410,7 @@ func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRun
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -1400,12 +1438,13 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -1438,12 +1477,13 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -1472,6 +1512,7 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -1486,7 +1527,7 @@ UPDATE workers SET
     stats_source          = $4,
     updated_at            = now()
 WHERE id = $5
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type HeartbeatWorkerParams struct {
@@ -1535,6 +1576,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -1576,7 +1618,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
@@ -1658,6 +1700,10 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.MrWebUrl,
 			&i.Run.PrdDonePath,
 			&i.Run.PrdPatchSettledAt,
+			&i.Run.AnthropicSecretID,
+			&i.Run.AnthropicSecretLabel,
+			&i.Run.AnthropicSelectReason,
+			&i.Run.AnthropicHeadroomPct,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1740,7 +1786,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -1802,6 +1848,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.HostedGeneration,
 			&i.Worker.DockerEnabled,
 			&i.Worker.AnthropicSecretID,
+			&i.Worker.AnthropicBindMode,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -2097,7 +2144,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        rv.verdict                AS judge_verdict,
        ru.input_tokens          AS usage_input_tokens,
@@ -2235,6 +2282,10 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.MrWebUrl,
 			&i.Run.PrdDonePath,
 			&i.Run.PrdPatchSettledAt,
+			&i.Run.AnthropicSecretID,
+			&i.Run.AnthropicSecretLabel,
+			&i.Run.AnthropicSelectReason,
+			&i.Run.AnthropicHeadroomPct,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,
@@ -2334,7 +2385,7 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -2394,6 +2445,7 @@ type ListWorkersByUserRow struct {
 	HostedGeneration      int64              `json:"hosted_generation"`
 	DockerEnabled         pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode     string             `json:"anthropic_bind_mode"`
 	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                  bool               `json:"busy"`
 	ActiveRuns            int64              `json:"active_runs"`
@@ -2458,6 +2510,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.HostedGeneration,
 			&i.DockerEnabled,
 			&i.AnthropicSecretID,
+			&i.AnthropicBindMode,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -2558,7 +2611,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -2610,7 +2663,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -2642,6 +2695,7 @@ type RegisterWorkerRow struct {
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -2721,6 +2775,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -2912,6 +2967,72 @@ func (q *Queries) SelfUsage(ctx context.Context, userID uuid.UUID) (SelfUsageRow
 		&i.RunCount,
 	)
 	return i, err
+}
+
+const setRunAnthropicSecret = `-- name: SetRunAnthropicSecret :execrows
+UPDATE runs
+SET anthropic_secret_id     = $1,
+    anthropic_secret_label  = $2,
+    anthropic_select_reason = $3,
+    anthropic_headroom_pct  = $4,
+    updated_at = now()
+WHERE id = $5 AND user_id = $6
+`
+
+type SetRunAnthropicSecretParams struct {
+	AnthropicSecretID     pgtype.UUID `json:"anthropic_secret_id"`
+	AnthropicSecretLabel  pgtype.Text `json:"anthropic_secret_label"`
+	AnthropicSelectReason pgtype.Text `json:"anthropic_select_reason"`
+	AnthropicHeadroomPct  pgtype.Int2 `json:"anthropic_headroom_pct"`
+	ID                    uuid.UUID   `json:"id"`
+	UserID                uuid.UUID   `json:"user_id"`
+}
+
+// Record WHICH Anthropic credential this claim spends (PRD #111 M1). Written by
+// every claim lane — run, judge and chat — after a SUCCESSFUL open, so the
+// recorded id is provably the id whose ciphertext was decrypted (D8) rather than
+// whatever the user's default happened to be a moment later.
+//
+// The label is a SNAPSHOT, not a denormalisation to keep in sync: 00086's FK nulls
+// the id when the token is deleted, and a rename rewrites the label in place, so
+// the snapshot is the only thing that keeps a finished run's history readable
+// after either. It is written from the SAME owner-scoped row that produced the id
+// (GetDefaultUserSecretMeta / GetUserSecretMetaByID), never looked up separately.
+//
+// Owner-scoped even though the caller only ever passes the run it just claimed.
+// That is the same self-standing-scope argument ListRunsForUser's rv.user_id join
+// predicate makes: without it this write is safe only because of a fact maintained
+// in another file (ClaimRun/ClaimChatRun are user-scoped), and it costs nothing to
+// make it true here instead. A mismatched pair returns 0 rows rather than writing.
+// The FK is the other half — recording a credential the run's owner does not own
+// is rejected by the database, not by this predicate.
+//
+// reason is the mode that named the credential; headroom is NULL until M4 has one
+// to record (see 00086). updated_at follows house style and is safe here
+// specifically because the run is 'claimed' at this instant, which holds for BOTH
+// lanes that call this write, not just the run lane:
+//   - ClaimRun's affinity predicate reads r.updated_at only for status = 'queued'
+//     rows (:406);
+//   - ClaimChatRun has its OWN affinity predicate over r.updated_at (chat.sql:72),
+//     likewise narrowed to status = 'queued';
+//   - ListActiveRunsForHealth deliberately excludes 'claimed' entirely.
+//
+// So no reader of runs.updated_at applies to a claimed run on either lane. Naming
+// one of the two readers, as this comment first did, would have left a reader of
+// the same column unaccounted for while reading as though the set were complete.
+func (q *Queries) SetRunAnthropicSecret(ctx context.Context, arg SetRunAnthropicSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunAnthropicSecret,
+		arg.AnthropicSecretID,
+		arg.AnthropicSecretLabel,
+		arg.AnthropicSelectReason,
+		arg.AnthropicHeadroomPct,
+		arg.ID,
+		arg.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setRunAwaitingApproval = `-- name: SetRunAwaitingApproval :execrows
@@ -3209,13 +3330,16 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 
 const setWorkerAnthropicSecret = `-- name: SetWorkerAnthropicSecret :one
 UPDATE workers
-SET anthropic_secret_id = $1, updated_at = now()
-WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+SET anthropic_secret_id = $1,
+    anthropic_bind_mode = $2,
+    updated_at = now()
+WHERE id = $3 AND user_id = $4
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type SetWorkerAnthropicSecretParams struct {
 	AnthropicSecretID pgtype.UUID `json:"anthropic_secret_id"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 	ID                uuid.UUID   `json:"id"`
 	UserID            uuid.UUID   `json:"user_id"`
 }
@@ -3234,8 +3358,21 @@ type SetWorkerAnthropicSecretParams struct {
 //
 // Takes effect on the worker's NEXT claim — no restart, no re-minted join token,
 // because the token never rides the worker, only each claim response.
+//
+// Since PRD #111 M3 it writes the BIND MODE in the same statement, and that is the
+// point rather than a convenience: mode and id describe one decision, so writing
+// them separately would open a window where a worker reads 'pinned' with the old
+// id, or 'default' while still carrying one. One UPDATE makes the pair atomic. The
+// caller is responsible for sending a coherent pair (a NULL id with 'pinned' is
+// legal here and resolves as 'default' per D9 — see 00088 for why no CHECK can
+// enforce the coupling).
 func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnthropicSecretParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, setWorkerAnthropicSecret, arg.AnthropicSecretID, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, setWorkerAnthropicSecret,
+		arg.AnthropicSecretID,
+		arg.AnthropicBindMode,
+		arg.ID,
+		arg.UserID,
+	)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -3259,6 +3396,7 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }

@@ -9677,7 +9677,11 @@ the save-time poke still refreshes only the **default** (its only caller is the
 kind-path alias, which has no token id to offer), so a newly added non-default token
 waits one interval for its first reading. Auto-failover on exhaustion is explicitly
 out of scope (D3) — it needs its own policy design for which token, chosen when, and
-how `run_usage` attributes a mid-run switch.
+how `run_usage` attributes a mid-run switch. **PRD #111 supplied exactly that design
+and it is no longer out of scope: §423-§431.** It answers *which* by headroom over an
+opt-in pool, *when* at claim time (never mid-run), and the attribution question by
+recording the credential on the run itself — the gap this paragraph names is the one
+§429 closes. The endpoint's auth also moved since (D23, §430).
 
 ## 355. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
 
@@ -9697,6 +9701,14 @@ how `run_usage` attributes a mid-run switch.
 - `PATCH /api/workers/{id}` **is** `RequireUser` (so `uzi worker set-token` works):
   it mints nothing and returns no credential, it re-points a worker between tokens
   the caller already owns.
+
+**This heading stopped being literally true on 2026-07-27 (PRD #111 D13).** There is
+now exactly one Bearer-reachable write in this route tree that is not the rebind:
+`PATCH /me/secrets/anthropic_token/{id}/auto-eligible`, mounted as its own narrow
+route under `RequireUser` **precisely so that D8's group is not moved** — see §430.
+Every bullet above still holds as written; what changed is that the exception is no
+longer a single one. Recorded rather than rewritten, because a decision that gained a
+sibling is not the same artifact as one that was wrong.
 
 ## 356. Absent vs explicit-null in the binding PATCH — `json.RawMessage`, not `*string`
 
@@ -12800,7 +12812,6 @@ observe it.
 and the phase half is controller-side and k8s-only, so it cannot reach `deriveRollHealth`; and the
 live-DB sweep on the phase commit, because nothing in it edits a query. In both cases a green would
 have been evidence for a change the run never executed.
-
 # PRD-less — Issue #124: untrusted display text, sanitized at both ends
 
 Serves no PRD; filed and fixed as a standalone security issue. Recorded because it sets
@@ -13007,3 +13018,413 @@ anything failing that shape is dropped rather than rendered.
 **Both phases carry it, first turn only.** The plan turn needs it to write correct
 instructions; the implement turn needs it because DELEGATING a diff command is where the
 defect was observed. Later turns ride a resumed session that already read it.
+
+# PRD #111 — Auto-select the Anthropic token per run by rate-limit headroom (the per-worker `auto` bind mode)
+
+## 423. PRD #111 — three forks settled before drafting, and a ranking that is ANCHORED rather than pairwise
+
+Since PRD #104 a user can hold several named Anthropic credentials. Two gaps remained: the binding
+was static and manual while the per-token rate-limit gauge (#53/#104 M5) went unconsumed, and a run
+recorded what it *cost* but never which credential *paid*.
+
+⚠️ **PROVENANCE: D1, D2 and D3 below are USER-STATED, settled with the user before drafting, and so
+is the originating ask they serve.** The contract now carries them — `specs/human.md`, Feature #111,
+approved 2026-07-27 — so this section is an ELABORATION of those items, not their record, and the
+elaboration is replaceable while they are not. A reader must not take them for AI choices.
+Everything from the ranking paragraph down, and all of §424-§431, is AI design.
+
+- **D1 — a per-worker THIRD bind mode**, not a per-user global toggle. A worker is `default`,
+  `pinned:<token>` or `auto`, so a user can auto-balance most workers while keeping the
+  retrospective one pinned. It composes with `workers.anthropic_secret_id` (00078) rather than
+  replacing it, and a pinned worker always wins over any heuristic.
+- **D2 — the candidate set is an OPT-IN pool, per token** (`user_secrets.auto_eligible`, default
+  false). Not paranoia: the product already documents holding a subscription token "for the work"
+  and a console key "for the retrospectives", so auto-selecting over *all* tokens would spend the
+  reserved one.
+- **D3 — least-consumed first, a within-threshold tie broken by soonest reset.** The naive form of
+  this is a real bug, so the algorithm is specified rather than left to the implementer.
+
+**The ranking, and the one thing that must not be re-derived as a comparator.** Headroom is
+`min(100 − five_hour_pct, 100 − seven_day_pct)` — the two windows are a conjunction, so whichever
+is fuller is what actually stops the next run. The rule reads like a pairwise `less` ("within T
+points, prefer the sooner reset; otherwise prefer headroom") and **written that way it is
+INTRANSITIVE**: at T=5 with A=80, B=75, C=70, A ties B and B ties C but A does not tie C. That is
+not a strict weak ordering, so `sort.Slice` over it yields order-dependent, undefined results and
+will not say so.
+
+The fix is structural, not a stricter comparator:
+
+```
+H*   = max penalised-rank over the eligible set
+tie  = { t : H* − rank(t) <= HEADROOM_TIE_PCT }        # ONE fixed anchor, so no chain exists
+pick = min over `tie` of (binding-window reset, then lowest secret id)
+```
+
+Three asymmetries in there are decisions, and each is the kind a re-derivation lands elsewhere on:
+
+- **The MIN_HEADROOM gate reads RAW headroom; H\* and the tie window read the PENALISED rank.**
+  Gating on the penalised value would let a busy-but-empty token fall under the floor and spuriously
+  trigger best-of-pool — spending a fallback account because a token was popular rather than full.
+- **H\* is computed over the FILTERED set**, after the eligible/best-of-pool choice. Anchoring on
+  the measured set lets a token the gate REJECTED set the reference.
+- **The in-flight bias is a bias, not a cap.** It counts every lane and every reason and includes
+  `awaiting_approval` (D18) — the count models concurrent spend against a credential, and nothing
+  about how a run acquired that credential changes the quota it consumes. That supersedes **R3's**
+  original "run-lane runs only" limit, which was a consequence of having no per-run token record;
+  M1 removed exactly that.
+
+The package is PURE — `time` and `uuid`, nothing else — which is what lets the whole ranking be
+tested from hand-written fixtures with no database. A test parses the package's own imports so the
+first `import "context"` fails rather than being noticed later.
+
+## 424. PRD #111 D22 — the tie-break reads the BINDING window's reset, and it is the only place a five/seven swap is observable
+
+"Soonest reset" is under-specified until you say *of what*. The reset compared is the **binding
+window's**: `five_hour_resets_at` when `five_hour_pct >= seven_day_pct`, else `seven_day_resets_at`;
+a pct tie picks the 5-hour window because it replenishes sooner; NULL is **+∞** (a token that names
+no reset is never "about to replenish"). Ties beyond that fall to the lowest secret id — a total
+order, so the pick is deterministic and a test can assert anything at all about it.
+
+Only the binding window's replenishment raises headroom. A token at 90% five-hour and 40% seven-day
+has headroom 10, and its seven-day reset three days out says nothing about when it becomes usable;
+using the other window's reset would prefer a token whose headroom does not move.
+
+**+∞ is a separate boolean, never a zero `time.Time`.** A zero time is a real, orderable instant
+that sorts BEFORE every genuine reset, so it would make a NULL-reset token win every tie — the exact
+inversion of the rule.
+
+🔴 **This is the ONLY place a five/seven pct SWAP is observable, by construction.** `headroom` is a
+`min`, which is symmetric, and the NULL gate is symmetric too, so swapping the two windows changes
+nothing that `Classify` can see. A fixture where both windows share a reset, or where only one is
+populated, therefore passes against a correct and a broken ranker alike. The discriminating fixture
+has the two windows DISAGREEING about which one binds, and asserts that the swap leaves `Classify`
+identical while flipping the pick.
+
+## 425. PRD #111 D14 — the retry gate is "a credential the SELECTOR named", NOT "auto mode"; the literal wording prescribes a useless retry
+
+D7 says auto-selection never fails a run. **Without D14 that is simply untrue**: `recoverClaimAssembly`
+maps `errCredentialUnavailable` to a TERMINAL run failure, so a token that clears the gauge gate and
+then will not decrypt — a rotated `UZI_SECRET_KEY`, a corrupt row, a token deleted between the
+ranking query and the open — kills a run the owner default would have completed. The optimizer would
+newly fail runs that static binding finished, which is the one outcome D7 exists to forbid.
+
+**D14 was drafted as "on `auto` mode and `errCredentialUnavailable`, retry once". That wording is
+wrong and the implementation is deliberately narrower.** An auto worker whose pool was empty or
+entirely stale carries `pool_empty`/`pool_stale` with a **nil** id — it is already running on the
+owner default. Under the literal text it would retry, and that retry would re-open **the identical
+credential that just failed**. The correct gate is *only a credential the selector itself named*
+(reason `auto` or `best_of_pool`, with a non-nil id).
+
+Three axes, each with its own reason:
+
+- **Only a selector-named credential.** A `pinned` or `judge` binding that will not open still fails
+  terminally: the user named that credential, and silently billing a different one is precisely the
+  wrong-account spend R4 is about.
+- **Only `errCredentialUnavailable`, never `errVaultLocked`.** That path already requeues, which is
+  transient and correct; retrying it would convert a WAIT into a SPEND on the wrong account.
+- **Exactly once, structurally.** The retry sets `reason=open_failed`, so the gate fails on its
+  REASON conjunct whatever the id turns out to be. An earlier argument reasoned from the id instead
+  (`workerSecretID` is nil for an auto worker) — true, but resting on the `auto ⇒ id IS NULL`
+  invariant, which a future third writer of `workers.anthropic_secret_id` could break without
+  touching that line.
+
+The recorded headroom is **NULL** on the retry. The measurement described the credential that would
+not open; attaching it to the one that did would attribute a reading to a token nothing measured.
+
+## 426. PRD #111 D20 — the run view names the MODE, and the vocabulary is eight values with three homes and three guards
+
+The label alone cannot answer the user's question, because **an auto pick and a default fallback can
+name the same token** — and PRD #104's compatibility path creates a row labelled literally `default`,
+so the label is not even a reliable hint. D20 was drafted with three renderings; the vocabulary
+closed at **eight**, and an implementer following the draft literally ships three and silently drops
+five. The three most important omissions are the ones D20's own rationale is about.
+
+| reason | rendering | produced by |
+|---|---|---|
+| `default` | `<label> — default` | no binding named a credential |
+| `pinned` | `<label> — pinned` | the claiming worker's binding |
+| `judge` | `<label> — judge binding` | the owner's judge setting, for judge + self_improve runs |
+| `auto` | `<label> — auto, N% headroom` | the selector, from the eligible set |
+| `best_of_pool` | `<label> — auto (best of pool), N% headroom` | every pooled token under the floor (D10) |
+| `pool_empty` | `<label> — default (auto: no tokens in the pool)` | nothing opted in |
+| `pool_stale` | `<label> — default (auto: no fresh usage readings)` | nothing measurable, incl. a disabled poller (R2) |
+| `open_failed` | `<label> — default (auto: the chosen token would not open)` | D14's retry |
+
+`judge` exists **because of** D20 and the draft had no slot for it: the judge lane borrowed `pinned`
+while the vocabulary held two values, and `pinned` sends a user to Settings → Workers looking for a
+binding that does not exist. It is also not a fallback, so "and, on fallback, why" does not cover it.
+
+**The em dash in every rendering above stays — the user's decision [user 2026-07-27], and it is NOT a
+general licence.** The house style avoids em dashes in user-facing content, and the question was
+raised rather than assumed. It was settled on one fact about *this* file: the CLI already ships four
+pre-existing em dashes in user-facing output, so changing this one line would make it inconsistent
+with its neighbours, which is worse for a reader than the style rule is good. That reasoning is local
+and it does not travel. **A brand-new user-facing string has no neighbours to be consistent with, so
+it takes the house style — a comma, a colon or a second sentence.** Recorded here rather than in
+`specs/human.md` deliberately: the ruling holds on a property of the current copy, not of the
+product, and a rebuild that renders no em dashes anywhere would satisfy the contract and make it
+moot. Freezing it into the contract file would turn a copy-consistency judgement into a requirement.
+
+**Three homes, three guards, and they are three MECHANISMS rather than restatements.** The set lives
+in `autoselect.Reason` (Go), migration `00089`'s CHECK (SQL) and a `SelectReason` union (TS).
+Go↔SQL is a test that parses the CHECK; SQL↔TS is a web test that parses the same migration;
+TS↔renderer is a `Record<SelectReason, …>` that fails **at typecheck, before any test runs**. A
+member added to the union alone is invisible to both parsing tests and caught only by the Record.
+
+Two shapes worth keeping:
+
+- **The runtime list is DERIVED from the exhaustive Record, not hand-written beside it.** A
+  hand-written mirror carrying `satisfies readonly SelectReason[]` constrains the array to contain
+  only VALID members and says nothing about containing ALL of them, so a union member missing from
+  the array left the guard green. Deriving from `Object.keys` removes the second place to forget
+  rather than adding a check for it.
+- **A Go `switch` is not exhaustive over a string type**, and for three of the eight a deleted arm
+  is *semantically null*: `default`, `pinned` and `auto` render as their own wire word, so the
+  fallthrough is byte-identical. The honest test asserts non-empty and DISTINCT over the enumerated
+  set, plus a raw-value check for the five that carry real prose.
+
+**The colour rule** (from the settings page, applied here): amber where the selector SKIPPED the
+token, `info` where it still picked one but the news is worth reading, neutral otherwise. So the
+three fallbacks are amber, `best_of_pool` is info — its own hint says the pool is nearly exhausted —
+and everything else is neutral. Tone and link are ONE predicate (link iff the tone is not neutral)
+so they cannot drift.
+
+## 427. PRD #111 — what "auto" does NOT mean, the six live-eligibility states, and what this PRD leaves unmet
+
+🔴 **The fallback spends the owner default, and the owner default NEVER consults `auto_eligible`.**
+So a token deliberately kept *out* of the pool can still pay for a run, if it happens to be the
+user's default. Not a regression, and there is no third option — D7 forbids failing the run — but
+"auto" does not mean "only my pool", and the docs say so.
+
+**D16 — `refused` is not a live state, and the set is SIX.** D11 promised a `refused` state and
+nothing can serve it: the poller's 15-minute refusal backoff is an unexported in-process map with no
+accessor, and `anthropic_rate_limits` has no failed-poll column. Rather than widen the poller for
+state that dies on restart, the LEFT JOIN's own distinction is used instead: `no_reading` ("never
+polled") for a token that has never produced a row, `stale` for one whose reading aged out. What is
+lost is the *diagnosis* of a token currently backing off; it reads `stale`. The six are `eligible`,
+`not_pooled`, `no_reading`, `unmeasured`, `stale`, `below_threshold` — not D11's original four,
+which named a state that does not exist and omitted two that do.
+
+**`Eligibility.Measured` is TRUE for `below_threshold`**, and reading it as "eligible" is the mistake
+the type invites. It means "can be RANKED at all"; D10's best-of-pool ranks exactly the
+below-threshold candidates, so if `Measured` excluded them the fallback would have nothing to pick.
+
+**D17 — `MAX_STALENESS` defaults to 3× the poll interval so the selector and the shipped meter
+agree**, and the meter is not touched. They agree by MATCHING DEFAULTS, not by sharing one
+definition, so an operator who overrides the knob re-opens the divergence. Unifying them would change
+what the shipped meter says, which is out of scope.
+
+**Unmet, and stated rather than narrowed: the k8s validation on dev-cluster.** It is a PRD success
+criterion and it did not happen. The prerequisites are a published branch image, a cross-repo ArgoCD
+values change, and authorization to spend real Anthropic quota — none of which is inside this run's
+boundary. **The two environments cover different halves**, which is the argument for doing it at all:
+the compose harness must pin `UZI_AUTOSELECT_MAX_STALENESS` because a disabled poller makes the
+default 0, so it structurally cannot exercise a live gauge; dev-cluster runs every shipped default
+against real tokens, so it structurally cannot exercise the poller-disabled fallback. Neither
+substitutes for the other. The one assertion nothing else reaches is the **hosted** worker path,
+which shares the `workers` table and `claimSecretID`.
+
+**Deploying this branch would COMMIT the draft migration numbers.** `00086`–`00089` are drafts
+renumbered at landing; migrations run at boot, so a branch image on a live cluster records those
+versions, and a landing renumber then leaves that cluster's `goose_db_version` pointing at versions
+the tree no longer has — which strict goose refuses to boot on.
+
+## 428. PRD #111 — four ways a mutation result is meaningless, all four measured on this branch
+
+Mutation testing is the discipline this repo leans on hardest, and this PRD produced a catalogue of
+how it lies. Each of these was hit, not theorised, and each produced a result that read as a
+measurement:
+
+1. **The edit did not apply.** A replacement string assumed one value per line where the source puts
+   five on one; the mutation was a no-op and the green run described an unmutated tree.
+2. **The system did not observe it.** `goose` is a cache keyed on a VERSION, not on content, so a
+   harness reusing one Postgres container across mutations never re-applied a mutated migration —
+   the file changed and the system under test did not. *"The file differs" is not "the mutation is
+   live"* for anything behind a migration runner, a package installer, or any version-keyed cache.
+3. **The suite did not run.** A harness that span up a fresh database per mutation never exported
+   `UZI_TEST_DATABASE_URL`, so every `*LiveDB` test SKIPPED and `go test` exited 0 — scored as
+   SURVIVED. Two false survivors, one of which was a perfectly good assertion that was nearly
+   "fixed". **The verification instrument needs its own positive control**, and it is the instrument
+   nobody thinks to verify.
+4. **The BUILD failed.** Mutations that change sqlc's inferred nullability stop the package
+   compiling, and a build failure also exits non-zero — so they scored RED while proving nothing.
+   The inverse of the trap the repo already records in one direction.
+
+The shape is unmistakable once listed: **a mutation harness that reads only an exit code is measuring
+the wrong thing four different ways.** The fix in every case is a positive control bound to the
+artifact — require the named test to appear as `--- PASS`/`--- FAIL`, and assert the edit landed.
+
+A related shape, from the same branch: **an e2e phase owes a teardown even when the harness tears
+down the stack.** A phase left one extra credential behind and broke a different phase 350 lines
+later, which asserts "exactly two anthropic tokens" and found three. The teardown carries a positive
+check of its own, because a bare restore is not an assertion.
+
+## 429. PRD #111 — the per-run attribution record, and the seam that makes the RECORDED id the id that was OPENED
+
+Serves the originating ask's third clause, "show me which token each run actually used". §423-§428
+cover how a token is *chosen*; nothing there says how the choice is *recorded*, and the recording is
+half the feature — a run that names the wrong account is worse than one that names none.
+
+**Four columns on `runs`, and the label is a SNAPSHOT rather than a join.** The credential id, a
+label snapshot, the select reason (§426's eight values) and the headroom the selector measured. The
+id carries a composite FK to `user_secrets (user_id, id)`, so the **database** rejects a run
+recording another user's credential rather than a Go check one refactor away from being bypassed.
+The label is copied because the id does not survive: the FK nulls it on delete and a rename rewrites
+`user_secrets.label` in place, so a join would make a run's history read "unknown" the moment a user
+tidies up their tokens and would silently re-label historical runs on a rename. Both are kept on
+purpose — the snapshot answers "which account was this?" forever, the id keeps it JOINable to
+`run_usage` (per-token cost) while the token exists.
+
+🔴 **`ON DELETE SET NULL` needs a COLUMN LIST on a composite FK.** A bare `SET NULL` nulls every
+referencing column, which here includes `runs.user_id` — `NOT NULL` since the runs table was born.
+Deleting a token that any run had recorded would then fail the constraint and the DELETE would error
+out, silently until the first user with run history tidied up. `SET NULL (anthropic_secret_id)`
+(Postgres 15+) nulls only the record. Two earlier migrations hit the same trap.
+
+**D8 — the recorded id is provably the OPENED id, and that cost a deliberate race.** Resolution used
+to hand the nil (default) case to a single ciphertext query that resolved "this user's default"
+*inside* the SQL and returned only plaintext, so no id ever escaped and a run could not name what it
+spent. The default is now resolved to `(id, label)` first and **every** open goes by id. The
+resolution is equivalent, not merely similar: the two predicates are character-identical and match at
+most one row under the one-default partial unique index. What changes is a window — between resolving
+and opening, the user could set a different default, and the run now opens what it resolved. That is
+the entire point, and the safer ordering; **do not "fix" it.** The narrow accepted cost is that a
+token DELETED inside that window now fails the claim where the single-statement form would have
+opened the new default. Both metadata lookups are owner-scoped **in their own predicate**, because
+they run *before* the open: an unscoped by-id lookup would put another user's label in hand at
+exactly the point it gets recorded, on a claim that then fails on the open.
+
+**D4/D5 — auto is a RUN-LANE placement decision, and the other two lanes keep their explicit
+bindings.** A `self_improve` run resolves the owner's judge binding; the judge lane forks to its own
+assemble path earlier; chat is always the owner default and is not bindable at all. Auto-spreading
+the judge lane would defeat the whole purpose of binding review spend separately. Extending auto
+there later is clean and deliberately not done here.
+
+**D9 — `pinned` with a NULL id resolves as `default`, and no CHECK can say so.** The obvious
+constraint ("pinned implies a non-NULL id") would make a *legal* token delete fail, because the
+binding FK is `ON DELETE SET NULL` and deliberately leaves the mode alone. So the rule lives in
+resolution, where it already lived for an unset binding before the mode column existed. The id is
+read in exactly one of the three modes, so a stale id left by a mode change cannot leak into a claim,
+and **the API reports the EFFECTIVE mode** so no client re-derives the rule and no UI shows a pin to
+a token that no longer exists.
+
+**A candidate-query ERROR fails the claim; it does not degrade to the owner default.** "The database
+was unreachable for a moment" and "you have no pooled tokens" are different facts, and quietly
+treating the first as the second spends an account the user did not choose while raising nothing. A
+failed claim is retried; a silent mis-spend is not, because nobody learns it happened. This is the
+one place auto may refuse, and it is not a counterexample to D7: nothing was selected.
+
+**D15 — do NOT build a per-token openability probe.** The drafted eligibility gate asked whether a
+candidate can be opened. It is vacuous where it was specified: vault unlock is a per-**user** check
+already made upstream by the claim, so by the time the selector runs the owner's vault is unlocked by
+construction. There is no per-token signal short of attempting the decrypt, and attempting it for
+every candidate would decrypt secrets we are not going to spend. The residual — one individually
+undecryptable token — is caught at open time by D14 (§425), which is the right place for it.
+
+## 430. PRD #111 — one classifier for two callers, one policy from four knobs, and the two auth-surface decisions the pool forced
+
+**D21 — the eligibility gate has exactly one implementation, and the status is computed
+SERVER-SIDE.** The settings page renders each token's live eligibility and the ranker gates
+candidates on the same predicate. Written twice they drift, and the drift is invisible in the worst
+way: the page confidently tells a user a token is eligible while the selector silently skips it, with
+nothing going red. So `Classify` is the whole gate, the status ships as a string, and web and CLI
+render it verbatim — **a `100 - pct` or a `synced_at` comparison in the client is a bug by
+construction, not a style preference.** The residual is that two different SQL queries feed it (the
+per-user settings list, the ranking query), pinned by a live-DB **differential** asserting the two
+produce identical candidates *except* the in-flight count, which only the ranking query populates.
+That exception is itself a contract: `Classify` must ignore in-flight, or the differential would be
+comparing two things that are allowed to differ.
+
+**D6 — four operator knobs, assembled by a METHOD so there can only be one policy.** `MIN_HEADROOM`
+(15 points), `HEADROOM_TIE_PCT` (5), `INFLIGHT_PENALTY` (3 points per in-flight run) and
+`MAX_STALENESS` (3× the poll interval, D17 — so the selector and the shipped meter agree). Server env
+rather than per-user settings: one policy keeps the ranking testable and the UI simple, and per-user
+tuning is a future refinement, not a gap. Three details that a re-derivation lands elsewhere on:
+**0 is meaningful for all three integers** (no floor / exact-tie-only / no bias), so they must parse
+as non-negative rather than treating 0 as "unset" and substituting the default; a floor **above 100**
+is unsatisfiable and is clamped loudly, because otherwise every token classifies below-threshold and
+auto looks broken rather than mis-set; and a tie window above 100 is degenerate but coherent, so it
+is deliberately *not* clamped. Two literals mapping four fields each is D21's failure in a new
+costume — internally consistent on both sides, silently disagreeing.
+
+**D13 — the pool toggle is its own narrow route, not a field on the existing token PATCH.**
+`PATCH /me/secrets/anthropic_token/{id}/auto-eligible` under `RequireUser`: the one Bearer-reachable
+write in the secrets tree (§355). The obvious delivery — add the flag to the existing PATCH so the
+CLI can reach it — would have required moving that route out of the cookie-only group, making
+**rename, rotate and set-default Bearer-reachable as collateral damage**. The narrow route is the
+same class as the worker rebind: it mints nothing, reveals nothing, and only re-points spend among
+tokens the caller already holds.
+
+**D23 — `GET /me/rate-limits` moved cookie-only → `RequireUser`, on NON-ADDITIVITY, not on a
+sensitivity ranking.** It had to move because D13 gives the CLI a pool toggle while the endpoint
+reporting live eligibility stayed unreachable from it — so a scripted opt-in got no signal that the
+token can never be picked, reintroducing exactly the silent no-op the status vocabulary exists to
+kill. 🔴 **The argument that was REJECTED and must not be reinstated**: "rate-limit percentages are
+less sensitive than the labels and ids already exposed beside them" ranks *identifiers* against
+*behavioral telemetry* and concludes from the ranking. That is the "it's only metadata" move, and it
+would equally justify putting per-run cost on a shared board; the percentages are more sensitive **in
+kind** and less sensitive only in resolution. Two legs hold instead: (1) every inference this enables
+is already available at *finer* granularity through routes that are already `RequireUser` — per-run
+usage rides a run DTO carrying its own timestamps, which is a timestamped consumption series strictly
+finer than a 0-100 aggregate refreshed once a poll interval, and run creation is already
+`RequireUser`, so a stolen CLI token can already **spend** the victim's quota; (2) it is a GET of the
+caller's own row — no outbound call, no poke (so no amplification vector against Anthropic), it mints
+nothing, and it never reads admin-ness, so there is no escalation branch.
+
+**Carry the caveat, not just the conclusion: non-additivity is a property of the CURRENT route table,
+not of this endpoint.** If per-run usage or run creation ever return to cookie-only, this endpoint
+becomes the widest remaining activity channel and the decision must be revisited.
+
+**Implementation constraint: split the route group, never change the group's middleware.** The
+autopilot and judge PUTs share it and must stay cookie-only. The route-mount test pins the
+**limiter**, not the auth middleware, so it cannot catch a mistake here — the guard has to assert
+both that a Bearer request reaches the GET *and* that those two PUTs still 401.
+
+## 431. PRD #111 pre-PR — `pool_stale` is an umbrella, the empty-pool guard counts the POOL, and a worker name is storable ANSI
+
+Three findings that changed shipped behaviour *after* §423-§430 were written. Each is a rule a
+rebuild re-derives wrongly by default, which is why they are recorded rather than left to the diff.
+
+**`pool_stale` is an UMBRELLA and its own name under-describes it.** The reason covers three
+classifier states — `no_reading`, `unmeasured` and `stale` — so "nothing has a fresh reading" is
+loose for the `unmeasured` case, where a **current** reading exists and simply carries no
+percentages. The precise statement is *no pooled token has a reading it can RANK*. 🔴 **The chip
+text is deliberately NOT hedged to match**: `default (auto: no fresh usage readings)` is reviewed
+shipped copy, and the doc and the chip saying the same thing **as each other** is what matters to a
+user, so only the prose around it carries the precision. A rebuild that reads the reason NAME as
+"aged out" ships a wrong explanation for two of its three causes.
+
+**The empty-pool guard counts POOLED tokens, not tokens.** A worker set to `auto` over an empty pool
+resolves `pool_empty` on every claim and spends the owner's default — so a worker surface that
+announces it auto-selects from the pool is R7's silent no-op moved up one level: the TOKEN surface
+closed it, and the WORKER surface, where the choice is actually made, kept it open. The trap is the
+neighbouring precedent: the analogous guard beside it tests "the user has no tokens", and copying
+that shape yields a guard silent in exactly the case that matters — a user holding four tokens with
+none opted in. The live region takes the **same** condition, because a correct row beside a cheerful
+announcement leaves the misleading half in the one place a screen-reader user actually hears it.
+
+**A worker name is STORABLE ANSI, unlike a token label, so the render site is the boundary.** §370
+already mandates one sanitizer on every human-render path; this PRD found three sites bypassing it
+for `workers.name`, and M5 is what made that visible rather than what caused it. Why it matters more
+here than the general rule implies: a worker name is validated for **length only** (trim plus a
+200-byte cap) and its column is a bare `text` with no CHECK, so unlike a token label an ESC **is
+storable in one** — and the admin worker listing prints another user's worker name beside their
+email into an **admin's** terminal, i.e. terminal control injection into someone else's session. An
+embedded newline additionally forges a row on a tabwriter rail. **The validator is deliberately left
+alone**: tightening it is a behaviour change to an existing endpoint with its own blast radius, and
+the render site is the boundary that must hold without it. A sanitized cell beside an unsanitized one
+in the same row is worse than either, because it reads as though the question was considered.
+
+**Convergent, not sole — recorded at merge time so the provenance is not overstated.** Issue #124
+reached two of those three sites independently and from the other direction (untrusted *display
+text*, §420), landing on `main` while this branch was open. Where the two met — the web workers
+list's name cell — the merge kept **issue #124's** helper: `stripUnsafeChars` is `Cc`+`Cf` sparing
+`\n`/`\t`, where the token-label helper this PRD reached for is `Cf`-only **by design**, mirroring
+the Go `validateSecretLabel` predicate so the two implementations stay comparable. A name has no
+validator to mirror and can carry a bare ESC, which is `Cc`, so the superset is the right one on
+exactly the argument this section makes. The CLI's two cells keep `cellText` (`compactText` plus a
+tab fold), which is the same predicate via `sanitizeTTY`. 🔴 The lesson for a rebuild is the one
+this pair only shows in hindsight: **"which characters are unsafe in untrusted display text" must
+have ONE answer per language, and a second helper is justified only by a predicate it is
+deliberately mirroring** — otherwise the site that picked the narrower one is a hole nobody sees,
+because both spellings look sanitized.

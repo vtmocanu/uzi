@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 )
@@ -67,13 +69,26 @@ func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		tokens = append(tokens, apitypes.TokenRateLimitDTO{
-			SecretID:  row.UserSecretID.String(),
-			Label:     row.Label,
-			IsDefault: row.IsDefault,
-			Limits:    limits,
+			SecretID:     row.UserSecretID.String(),
+			Label:        row.Label,
+			IsDefault:    row.IsDefault,
+			AutoEligible: row.AutoEligible,
+			AutoStatus:   string(h.autoStatus(autoselectrow.FromRateLimitRow(row))),
+			Limits:       limits,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": tokens})
+}
+
+// autoStatus classifies ONE candidate's live auto-selection eligibility (PRD #111 M2).
+//
+// It exists so the ANSWER is computed server-side and shipped as a string (D21). The
+// alternative — sending the raw pcts and letting the web decide — is what guarantees
+// drift: the ranker's gate would be in Go and the UI's in TypeScript, they would
+// diverge on some edge, and the divergence would surface as a settings page promising
+// a token is eligible while the selector quietly skips it, with no test failing.
+func (h *Handler) autoStatus(c autoselect.Candidate) autoselect.Status {
+	return autoselect.Classify(c, h.cfg.AutoselectPolicy(), time.Now()).Status
 }
 
 // AdminRateLimits returns every user's meters + staleness (PRD #53), grouped BY USER
@@ -122,11 +137,26 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		grp := &users[len(users)-1]
+		// The pool flag + live status ride the admin view too (PRD #111 M2). NOTHING
+		// RENDERS THEM TODAY — the admin page reads neither field — so this is an API
+		// contract choice, not a rendering requirement, and an earlier version of this
+		// comment overstated it. The reason it is still right: this is the SAME DTO the
+		// self view uses, so leaving them zero would put `auto_eligible: false` and an
+		// empty status on the wire for every token in the factory. A field that is
+		// absent is honest; a field that is present and uniformly wrong is what a
+		// future admin surface would build on. Widening that surface is PRD #104 M5's
+		// job, not this PRD's.
+		//
+		// AutoEligible is pgtype.Bool here because the admin query LEFT JOINs
+		// user_secrets; the token-less row is skipped above, so .Bool is the real value
+		// by the time it is read.
 		grp.Tokens = append(grp.Tokens, apitypes.TokenRateLimitDTO{
-			SecretID:  uuid.UUID(u.UserSecretID.Bytes).String(),
-			Label:     u.Label.String,
-			IsDefault: u.IsDefault.Bool,
-			Limits:    limits,
+			SecretID:     uuid.UUID(u.UserSecretID.Bytes).String(),
+			Label:        u.Label.String,
+			IsDefault:    u.IsDefault.Bool,
+			AutoEligible: u.AutoEligible.Bool,
+			AutoStatus:   string(h.autoStatus(autoselectrow.FromAdminRateLimitRow(u))),
+			Limits:       limits,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"users": users})

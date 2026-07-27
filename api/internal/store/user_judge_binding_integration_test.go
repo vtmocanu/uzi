@@ -139,6 +139,7 @@ func TestUserJudgeBindingLiveDB(t *testing.T) {
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "alpha", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
+		AnthropicBindMode: "pinned",
 	})
 	if err != nil {
 		t.Fatalf("create bound worker: %v", err)

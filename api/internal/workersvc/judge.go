@@ -713,10 +713,24 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	if err != nil {
 		return nil, err
 	}
-	anthropic, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
+	cred, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
 	if err != nil {
 		return nil, err
 	}
+	// The judge lane records what it spent exactly as the run lane does (PRD #111
+	// M1). It is the lane where this matters MOST: the judge binding exists so
+	// retrospectives can be billed to a different account, and until now nothing in
+	// the data said whether they actually were.
+	//
+	// Its reason is `judge`, not `pinned` (M4 closed the vocabulary). D20 makes the
+	// run view name the MODE, and "pinned" would send a user looking for a worker
+	// binding that does not exist — the choice was made by their judge setting, on a
+	// different page. An UNBOUND judge lane records `default`, honestly: the owner's
+	// default really did pay.
+	if err := s.recordRunCredential(ctx, run, cred, staticChoice(judgeSecret, selectReasonJudge)); err != nil {
+		return nil, err
+	}
+	anthropic := cred.Token
 
 	var targetRunID *string
 	var signal *JudgeSignal

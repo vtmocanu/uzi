@@ -42,6 +42,44 @@ type fakeStore struct {
 	// what proves the lookup is owner-scoped.
 	byIDSecrets map[uuid.UUID]store.GetUserSecretCiphertextByIDRow
 	byIDLookups []store.GetUserSecretCiphertextByIDParams
+	// byIDLabels is the label each by-id credential carries (PRD #111 M1), for the
+	// snapshot a claim records. Optional: an id with no entry gets a synthetic label,
+	// so a fixture that does not care about labels stages nothing.
+	byIDLabels map[uuid.UUID]string
+	// The DEFAULT credential as PRD #111 D8 now sees it. The default used to be
+	// resolved INSIDE secretopen's ciphertext query — nothing above ever learned its
+	// id — and is now resolved to (id, label) first and opened BY ID, so the fake
+	// models both halves:
+	//   - the id resolution yields is the fakeDefaultSecretID constant below, which
+	//     is what keeps every pre-#111 fixture (staging only `anthropic`) working
+	//     with no edit. There is deliberately no per-fixture override: one was added
+	//     with M1, nothing ever assigned it, and an unassigned knob reads as a
+	//     supported option while its branch is unreachable. M4 can add it back the
+	//     moment a test needs two different default ids.
+	//   - anthropicErr is raised from the RESOLVE, which is where production raises
+	//     it: GetDefaultUserSecretMeta returns pgx.ErrNoRows for a token-less user.
+	//   - defaultCiphertextErr is the OTHER half — resolution succeeded and the open
+	//     did not, which is the D8 race (the token deleted between the two).
+	defaultSecretLabel   string
+	defaultCiphertextErr error
+	defaultMetaLookups   []store.GetDefaultUserSecretMetaParams
+	// metaByIDLookups records every owner-scoped label lookup, which is what proves
+	// the label snapshot comes from a row scoped to the run's owner rather than from
+	// an unscoped SELECT label WHERE id = $1.
+	metaByIDLookups []store.GetUserSecretMetaByIDParams
+	// recordedCreds is every SetRunAnthropicSecret write (PRD #111 M1) in order.
+	// recordCredErr fails the write; recordCredRows overrides the rows-affected the
+	// fake reports (0 = the run vanished under the claim).
+	recordedCreds  []store.SetRunAnthropicSecretParams
+	recordCredErr  error
+	recordCredRows *int64
+	// autoCandidates is what M4's ranking query returns (PRD #111 M4) and
+	// autoCandidatesErr fails it. autoCandidateLookups records the user ids asked
+	// for — which is what proves the selector never ranks another tenant's tokens,
+	// and that a NON-auto worker never runs the query at all.
+	autoCandidates       []store.ListAutoSelectCandidatesRow
+	autoCandidatesErr    error
+	autoCandidateLookups []uuid.UUID
 	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
 	// "unbound", which is every user's state until they choose otherwise, so existing
 	// judge fixtures keep resolving the default with no change.
@@ -279,11 +317,98 @@ func (f *fakeStore) GetUserJudgeAnthropicSecret(context.Context, uuid.UUID) (pgt
 }
 func (f *fakeStore) GetUserSecretCiphertextByID(_ context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
 	f.byIDLookups = append(f.byIDLookups, arg)
+	if row, ok := f.byIDSecrets[arg.ID]; ok {
+		return row, nil
+	}
+	// Since PRD #111 D8 the DEFAULT credential is opened by id too, so this lookup
+	// serves it as well as the bound ones. Pre-#111 fixtures stage the default as
+	// `anthropic` (+ `anthropicSealedWith`) and never name an id, so the default id
+	// resolves here rather than through byIDSecrets. Every OTHER unknown id stays
+	// pgx.ErrNoRows — that is the "bound to a vanished credential" fixture and it
+	// must keep failing closed.
+	if arg.ID == f.defaultCredID() {
+		sealedWith := f.anthropicSealedWith
+		if sealedWith == "" {
+			sealedWith = store.SealedWithMaster
+		}
+		return store.GetUserSecretCiphertextByIDRow{
+			UserID: arg.UserID, Kind: store.KindAnthropicToken,
+			Ciphertext: f.anthropic, SealedWith: sealedWith,
+		}, f.defaultCiphertextErr
+	}
+	return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
+}
+
+// fakeDefaultSecretID is the id the fake's owner-default anthropic credential has.
+// A constant so a test can assert "the claim opened the DEFAULT" by id — which,
+// since PRD #111 D8 made every open go by id, is the only way left to say that.
+// Counting by-id lookups no longer distinguishes the default path from a bound one,
+// because both take it.
+var fakeDefaultSecretID = uuid.MustParse("d0000000-0000-4000-8000-00000000de17")
+
+// defaultCredID is the id the fake's default resolution yields.
+func (f *fakeStore) defaultCredID() uuid.UUID {
+	return fakeDefaultSecretID
+}
+
+// defaultCredLabel is the label that rides with it. user_secrets.label is NOT NULL
+// with a 1..64 CHECK since 00077 and PRD #104's compatibility path creates the row
+// labelled literally 'default', so an empty label is not a state the store can be in.
+func (f *fakeStore) defaultCredLabel() string {
+	if f.defaultSecretLabel != "" {
+		return f.defaultSecretLabel
+	}
+	return "default"
+}
+
+func (f *fakeStore) GetDefaultUserSecretMeta(_ context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error) {
+	f.defaultMetaLookups = append(f.defaultMetaLookups, arg)
+	// anthropicErr is the pre-#111 "this user has no token" knob, and it belongs
+	// HERE now: production raises pgx.ErrNoRows from this resolve, one query earlier
+	// than the ciphertext read it used to come from. The claim must still map it to
+	// the same errCredentialUnavailable text either way.
+	if f.anthropicErr != nil {
+		return store.GetDefaultUserSecretMetaRow{}, f.anthropicErr
+	}
+	return store.GetDefaultUserSecretMetaRow{ID: f.defaultCredID(), Label: f.defaultCredLabel()}, nil
+}
+
+func (f *fakeStore) GetUserSecretMetaByID(_ context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error) {
+	f.metaByIDLookups = append(f.metaByIDLookups, arg)
 	row, ok := f.byIDSecrets[arg.ID]
 	if !ok {
-		return store.GetUserSecretCiphertextByIDRow{}, pgx.ErrNoRows
+		return store.GetUserSecretMetaByIDRow{}, pgx.ErrNoRows
 	}
-	return row, nil
+	// The real query is owner-scoped in its predicate, so a foreign id yields no
+	// rows rather than that user's label. Mirrored here so a fixture staging a
+	// cross-user id cannot pass by accident.
+	if row.UserID != uuid.Nil && row.UserID != arg.UserID {
+		return store.GetUserSecretMetaByIDRow{}, pgx.ErrNoRows
+	}
+	label, ok := f.byIDLabels[arg.ID]
+	if !ok {
+		label = "token-" + arg.ID.String()[:8]
+	}
+	return store.GetUserSecretMetaByIDRow{ID: arg.ID, Label: label}, nil
+}
+
+func (f *fakeStore) ListAutoSelectCandidates(_ context.Context, userID uuid.UUID) ([]store.ListAutoSelectCandidatesRow, error) {
+	f.autoCandidateLookups = append(f.autoCandidateLookups, userID)
+	if f.autoCandidatesErr != nil {
+		return nil, f.autoCandidatesErr
+	}
+	return f.autoCandidates, nil
+}
+
+func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnthropicSecretParams) (int64, error) {
+	f.recordedCreds = append(f.recordedCreds, arg)
+	if f.recordCredErr != nil {
+		return 0, f.recordCredErr
+	}
+	if f.recordCredRows != nil {
+		return *f.recordCredRows, nil
+	}
+	return 1, nil
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
@@ -2303,23 +2428,52 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 		t.Fatalf("unbound worker claimed %q, want the owner's default token", got)
 	}
 
-	// 2. Bound to console-key → that credential, same worker row.
+	// 2. Bound to console-key → that credential, same worker row. Since PRD #111 M3
+	// the MODE is what makes the id readable at all, so a rebind sets both — which is
+	// exactly what SetWorkerAnthropicToken writes in one statement.
+	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: consoleID, Valid: true}
 	if got := claimToken(t, wkr); got != consoleToken {
 		t.Fatalf("bound worker claimed %q, want the console-key token — a rebind did not reach the claim payload", got)
 	}
-	if len(fs.byIDLookups) != 1 {
-		t.Fatalf("by-id lookups = %d, want exactly 1 (the bound claim)", len(fs.byIDLookups))
+	// WHICH id the second claim opened, not HOW MANY opens happened. The count was
+	// the right assertion while the default was resolved inside secretopen's by-KIND
+	// query — a by-id lookup could then only mean "a binding was followed". Since
+	// PRD #111 D8 every open goes by id (the default included, so its id can be
+	// recorded on the run), so this claim is lookup #2 and a count says nothing. The
+	// id does.
+	if len(fs.byIDLookups) != 2 {
+		t.Fatalf("by-id lookups = %d, want 2 (the default claim, then the bound one)", len(fs.byIDLookups))
 	}
 	// The lookup must be scoped to the claiming worker's OWNER, not to some
 	// caller-supplied user: this is what stops a worker row carrying a foreign
 	// secret id from resolving that credential (D11).
-	if fs.byIDLookups[0].UserID != owner || fs.byIDLookups[0].ID != consoleID {
+	if fs.byIDLookups[1].UserID != owner || fs.byIDLookups[1].ID != consoleID {
 		t.Fatalf("by-id lookup was (%v,%v), want (%v,%v)",
-			fs.byIDLookups[0].ID, fs.byIDLookups[0].UserID, consoleID, owner)
+			fs.byIDLookups[1].ID, fs.byIDLookups[1].UserID, consoleID, owner)
+	}
+	// The first lookup's ID is ENTAILED by step 1's token assertion, not independent
+	// of it: the fake serves the default plaintext only when arg.ID ==
+	// f.defaultCredID(), so a passing step 1 already implies this. Kept as a
+	// positional statement of the expected order, and labelled as such rather than
+	// presented as a second guard.
+	if fs.byIDLookups[0].ID != fs.defaultCredID() {
+		t.Fatalf("the unbound claim opened %v, want the owner's default %v", fs.byIDLookups[0].ID, fs.defaultCredID())
+	}
+	// Its USER is not entailed, and this is the assertion that earns its place. The
+	// fake's default-credential fallback echoes back whatever arg.UserID it was
+	// given, and secretopen.OpenByID's owner re-check then compares that echo against
+	// itself — so an openAnthropic that passed the WRONG user would still hand back
+	// the right plaintext and step 1 would pass. Only this catches it.
+	if fs.byIDLookups[0].UserID != owner {
+		t.Fatalf("the unbound claim's open was scoped to %v, want the run owner %v", fs.byIDLookups[0].UserID, owner)
 	}
 
-	// 3. Unbound again → back to the default, no restart in between.
+	// 3. Unbound again → back to the default, no restart in between. Both fields,
+	// because that is what a real unbind writes: leaving mode=pinned with a NULL id
+	// would exercise D9's FALLBACK (a deleted token) rather than a deliberate
+	// unbind, and those are different facts that happen to resolve the same way.
+	wkr.AnthropicBindMode = BindModeDefault
 	wkr.AnthropicSecretID = pgtype.UUID{}
 	if got := claimToken(t, wkr); got != defaultToken {
 		t.Fatalf("after clearing the binding the worker claimed %q, want the default again", got)
@@ -2356,6 +2510,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 	svc := New(fs, box, testParams())
 
 	wkr := worker()
+	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 
 	payload, err := svc.Claim(context.Background(), wkr)
@@ -2395,7 +2550,11 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2407,8 +2566,29 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 		t.Fatalf("judge claim spent %q, want the owner's DEFAULT — the judge lane binds per user (D1), not per worker",
 			payload.Secrets.AnthropicOAuthToken)
 	}
-	if len(fs.byIDLookups) != 0 {
-		t.Fatalf("judge claim did a by-id secret lookup (%d); it must resolve the default", len(fs.byIDLookups))
+	// It resolved the DEFAULT, not the worker's binding. Stated as an id rather than
+	// as "zero by-id lookups", which is what this asserted before PRD #111 D8 made
+	// the default path open by id as well — that phrasing now reads as "the claim
+	// opened nothing at all", which is not what the judge lane does.
+	//
+	// Split into its two halves because they are not equally strong, and the
+	// composite `||` hid that. The COUNT is the independent half: a second lookup
+	// means the claim also opened the worker's binding, and nothing above would
+	// notice. The ID half is entailed by the token assertion above — the fake serves
+	// the default plaintext only for f.defaultCredID() — so it is a positional
+	// restatement, not a second guard.
+	if len(fs.byIDLookups) != 1 {
+		t.Fatalf("judge claim made %d by-id opens, want exactly 1 — a second means it also opened the worker's binding (%v): %+v",
+			len(fs.byIDLookups), consoleID, fs.byIDLookups)
+	}
+	if fs.byIDLookups[0].ID != fs.defaultCredID() {
+		t.Fatalf("judge claim opened %v, want the owner's default (%v)", fs.byIDLookups[0].ID, fs.defaultCredID())
+	}
+	// Independent, for the reason spelled out in TestClaimRebindChangesCredential…:
+	// the fake's default fallback echoes arg.UserID back, so a wrong-user open still
+	// yields the right plaintext and passes every assertion above.
+	if fs.byIDLookups[0].UserID != owner {
+		t.Fatalf("judge claim's open was scoped to %v, want the run owner %v", fs.byIDLookups[0].UserID, owner)
 	}
 	if fs.claimCtxCalled {
 		t.Fatal("judge claim must not touch the repo/forge claim context")
@@ -2448,7 +2628,11 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 
 	// The claiming worker is bound to something ELSE entirely, to prove the judge
 	// lane ignores it (D1).
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2469,7 +2653,12 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 }
 
 // TestJudgeClaimUnboundUsesDefault: the unbound case is every user's state until
-// they choose otherwise, and must keep resolving the default with no by-id lookup.
+// they choose otherwise, and must keep resolving the OWNER'S DEFAULT.
+//
+// The last clause used to read "with no by-id lookup", which D8 made false in the
+// same commit that added an inline comment 22 lines below saying so. Since D8 the
+// default is resolved to an id and opened BY id like everything else, so "no by-id
+// lookup" now describes a claim that opened nothing at all.
 func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 	const defaultToken = "anthropic-DEFAULT-unbound-abcdef1234"
 	box := newBox(t)
@@ -2493,8 +2682,20 @@ func TestJudgeClaimUnboundUsesDefault(t *testing.T) {
 	if payload == nil || payload.Secrets.AnthropicOAuthToken != defaultToken {
 		t.Fatalf("unbound judge claim did not resolve the default: %+v", payload)
 	}
-	if len(fs.byIDLookups) != 0 {
-		t.Fatalf("unbound judge claim did %d by-id lookups, want 0", len(fs.byIDLookups))
+	// Same restatement as above: since PRD #111 D8 the default is opened BY ID, so
+	// "no by-id lookup" no longer means "resolved the default" — naming the id does.
+	// Split for the same reason as its twin in TestJudgeClaimIgnoresWorkerBinding: the
+	// count is independent, the id is entailed by the payload assertion above, and the
+	// user is independent (the fake's default fallback echoes back whatever user it
+	// was asked for).
+	if len(fs.byIDLookups) != 1 {
+		t.Fatalf("unbound judge claim made %d by-id opens, want exactly 1: %+v", len(fs.byIDLookups), fs.byIDLookups)
+	}
+	if fs.byIDLookups[0].ID != fs.defaultCredID() {
+		t.Fatalf("unbound judge claim opened %v, want the owner's default (%v)", fs.byIDLookups[0].ID, fs.defaultCredID())
+	}
+	if fs.byIDLookups[0].UserID != owner {
+		t.Fatalf("unbound judge claim's open was scoped to %v, want the run owner %v", fs.byIDLookups[0].UserID, owner)
 	}
 }
 
@@ -2587,7 +2788,11 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 	svc := New(fs, box, testParams())
 
 	// Claimed by a worker bound to a DIFFERENT credential: the judge binding wins.
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)

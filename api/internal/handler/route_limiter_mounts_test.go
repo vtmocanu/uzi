@@ -207,6 +207,15 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
+	// The auto-selection pool toggle (PRD #111 M2, D13). noLimiter, and the choice
+	// is deliberate rather than inherited: the credential-surface limiter (limAuth)
+	// exists for routes that MINT, REVEAL or ENUMERATE standing credentials, and
+	// this does none of those — it flips a boolean on a row the caller already owns.
+	// Abusing it costs the attacker a write and gains them nothing they could not
+	// already do with the cookie-only PATCH beside it. It sits under RequireUser
+	// like PATCH /api/workers/{id} below, which is the same class and is likewise
+	// unlimited.
+	{"PATCH", "/api/me/secrets/anthropic_token/{id}/auto-eligible", noLimiter},
 	{"PATCH", "/api/repos/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
 	{"POST", "/api/agent-templates/", noLimiter},

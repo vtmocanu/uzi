@@ -6,7 +6,93 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Added
+
+- **Workers can be set to pick their Anthropic token automatically.** Settings → Workers gains
+  an **auto (from pool)** option beside the existing per-token choices, and `uzi worker
+  set-token <id> --auto` does the same from the CLI. An auto worker chooses per claim from the
+  tokens you opted into the pool, so it needs no restart and no new join token to change what
+  it spends. Existing workers are untouched: one with a pinned token stays pinned, one without
+  stays on your default. A worker whose pinned token you later delete now says plainly that it
+  uses your default, rather than showing a pin to a token that no longer exists. If you set a
+  worker to auto while your pool is **empty**, the row says so rather than claiming it
+  auto-selects: every claim would spend your default token, and finding that out from a
+  finished run is too late (PRD #111 M3).
+
+- **An opt-in pool for auto-selecting Anthropic tokens.** Settings → Anthropic tokens gains a
+  per-token "Auto-select from this token" toggle, and `uzi token pool <label> --on|--off` does
+  the same from the CLI. The pool is empty by default and opting a token in is deliberate: a
+  pool that helped itself to every credential would spend the one you reserved for something
+  else. Beside the toggle, each pooled token shows whether auto-selection could actually pick
+  it right now — `in pool`, or `never polled` / `stale reading` / `no usage data` / `low
+  headroom` when it could not. That is the point of the chip rather than decoration: a token
+  uzi has never managed to read a usage figure for can never be picked, and without the chip it
+  would sit there looking active. The status is computed server-side from the same rule the
+  selector uses, so the page cannot promise something the selector will not do (PRD #111 M2).
+  New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
+  `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_MAX_STALENESS` and
+  `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
+  [docs/configuration.md](docs/configuration.md).
+
+- **uzi now picks the Anthropic token, per claim, by rate-limit headroom.** A worker set to
+  auto spends whichever of your pooled tokens has the most room left — headroom being whichever
+  of the 5-hour and 7-day windows is fuller, since both have to allow the run. Two tokens within
+  a few points of each other are separated by which one **replenishes soonest**, and it is the
+  reset of the window actually holding it back that counts: a 5-hour reset does not relieve a
+  7-day cap. A small bias against tokens with runs already in flight keeps several claims
+  arriving together from piling onto the same credential. Operators can tune all of it
+  (`UZI_AUTOSELECT_*`); nobody has to.
+
+  **It never fails a run**, and the ways it can decline to pick are worth knowing apart: nothing
+  opted in, nothing with a current reading — which is also what a switched-off usage poller
+  looks like — or a chosen token whose stored value would not decrypt. Each falls back to your
+  default token and says which happened, in the run view and in `uzi run get`.
+
+  🔴 **"Auto" does not mean "only my pool".** The fallback spends your **default** token, and
+  that path does not consult the opt-in — so a token you deliberately kept *out* of the pool can
+  still pay for a run if it happens to be your default. There is no third option, because
+  failing the run would be worse; if you want a credential never spent by ordinary runs, it must
+  not be your default either (PRD #111 M4).
+
+- **Every run now names the Anthropic credential it spent, and why that one.** The credential
+  is **recorded on all three lanes** (issue/ci_fix, judge and chat) and **shown in the run
+  view** as a `token <label> — <mode>` chip and by `uzi run get` as an `ANTHROPIC_TOKEN` row.
+  A chat conversation has its own view and does not show the chip yet, though its spend is
+  recorded like any other run's. Until now a run recorded what it cost but not which account
+  paid, which was a distinction without a difference while a user could hold one token and
+  stopped being one the moment PRD #104 let them hold several. The label is a snapshot taken
+  when the run was claimed, so it survives that token being renamed or deleted: a finished run
+  keeps naming the account it billed even after the credential is gone, and says `(deleted)`
+  so it is not mistaken for one you can still go and look at. Runs claimed before this landed
+  show nothing rather than a guess.
+
+  **The mode is there because the label alone cannot answer the question.** An automatic pick
+  and a fallback to your default can name the *same* token, so the chip says which of them
+  happened: `console-key — auto, 62% headroom`, `console-key — pinned`, `default — judge
+  binding`. When an `auto` worker did *not* get an automatic pick, it says so and says why —
+  `default (auto: no fresh usage readings)` — and links to Settings → Anthropic tokens, which
+  is where that particular problem gets fixed. Those runs are the only ones that carry a
+  warning colour: nothing failed, but your pool did no work, which is usually a setting you
+  can change. A run that spent the least-consumed token of a pool where **every** token was
+  nearly exhausted is called out separately, in blue rather than amber — it worked, but your
+  pool is nearly out — and links to the same page. `uzi worker list` also gains a **TOKEN**
+  column, so the three-way choice the CLI could already *set* is finally one it can *show*
+  (PRD #111 M1 + M5).
+
 ### Changed
+
+- **Anthropic token labels can no longer contain invisible formatting characters.** Zero-width
+  spaces and joiners, bidirectional overrides, the byte-order mark and the soft hyphen are now
+  rejected when a token is created or renamed, alongside the control characters that were
+  already rejected. The reason is what a label is for: it is the string you read to answer
+  "which account did this run bill?", and an invisible codepoint breaks exactly that — a
+  right-to-left override makes a label *read* as a different account, and a zero-width space
+  makes two genuinely different tokens draw identically in a browser while remaining distinct
+  rows. **The accepted cost, stated because it is a real one:** the zero-width joiner is itself
+  one of these characters, so multi-part emoji built from it (`👨‍👩‍👧`) can no longer be used in a
+  label; a single-codepoint emoji (`🔑`) is unaffected. Rejecting only the bidirectional
+  controls would have left the look-alike problem in place while appearing to fix it. Labels
+  saved before this landed are untouched (PRD #111 M2).
 
 - **A guardrail denial no longer reads as a failure in the run activity feed.** When a
   PreToolUse guardrail denies a call — a `git push`, an env or `/proc` read, an unassembled

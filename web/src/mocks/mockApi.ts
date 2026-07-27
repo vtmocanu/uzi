@@ -5,6 +5,8 @@
 
 import {
   ApiError,
+  type AutoStatus,
+  type BindMode,
   type AgentSelectionInput,
   type AgentTemplate,
   type AgentTemplateInput,
@@ -897,6 +899,33 @@ function sessionBody() {
   };
 }
 
+// rejectInvisibleLabel mirrors the server's validateSecretLabel Cf rule (PRD #111).
+//
+// The mock is this repo's BROWSABLE SPEC, and until this existed it accepted labels
+// production rejects — which is how a browser pass managed to store a bidi-override
+// label and demonstrate F12 against a build that was supposed to make it impossible.
+// A mock that disagrees with the API about what is valid teaches the wrong lesson and
+// leaves the new error copy with nowhere to be seen.
+//
+// Control characters are not re-checked here: the real validator rejects them too,
+// but they cannot be typed into the field, so the Cf half is the one a demo exercises.
+function rejectInvisibleLabel(label: string): void {
+  if (/\p{Cf}/u.test(label)) {
+    throw new ApiError(
+      400,
+      "Label must not contain invisible formatting characters (zero-width spaces and joiners, bidirectional overrides, the byte-order mark): they let two different tokens look identical, or make a label read as a different account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one of these characters. Use a plain name.",
+    );
+  }
+}
+
+// pooledFixtureStatus is each demo token's eligibility WHEN POOLED, so toggling one
+// off and on again returns it to the state its fixture describes instead of
+// flattening every token to `eligible`.
+const pooledFixtureStatus: Record<string, AutoStatus> = {
+  "sec-never-polled": "no_reading",
+  "sec-low": "below_threshold",
+};
+
 export const mockApi = {
   // ── Auth: instant and fake. Any credentials sign in as the admin. ──────────
   // The session bootstrap carries the instance labels alongside the user, mirroring
@@ -1149,6 +1178,9 @@ export const mockApi = {
       kind: "anthropic_token",
       label: "default",
       is_default: true,
+      // A new token is never pooled (PRD #111 D2) — mirror the server default or
+      // the mock teaches the wrong lesson.
+      auto_eligible: false,
       created_at: now,
       updated_at: now,
     };
@@ -1161,6 +1193,7 @@ export const mockApi = {
     requireUnlockedVault();
     const trimmed = label.trim();
     if (trimmed === "") throw new ApiError(400, "label must not be empty");
+    rejectInvisibleLabel(trimmed);
     const anthropic = () => secrets.filter((s) => s.kind === "anthropic_token");
     if (anthropic().some((s) => s.label.toLowerCase() === trimmed.toLowerCase())) {
       throw new ApiError(409, "a token with that label already exists");
@@ -1177,6 +1210,7 @@ export const mockApi = {
       kind: "anthropic_token",
       label: trimmed,
       is_default: wantDefault,
+      auto_eligible: false,
       created_at: now,
       updated_at: now,
     };
@@ -1196,6 +1230,7 @@ export const mockApi = {
     if (body.label !== undefined) {
       const trimmed = body.label.trim();
       if (trimmed === "") throw new ApiError(400, "label must not be empty");
+      rejectInvisibleLabel(trimmed);
       if (
         secrets.some(
           (s) => s.id !== id && s.kind === row.kind && s.label.toLowerCase() === trimmed.toLowerCase(),
@@ -1210,6 +1245,32 @@ export const mockApi = {
       row.is_default = true;
     }
     row.updated_at = new Date().toISOString();
+    return delay({ secret: { ...row } });
+  },
+  // The auto-selection pool toggle (PRD #111 M2). It also re-derives the token's
+  // live eligibility, because in the mock that is the only way the chip beside the
+  // toggle can move — and a toggle whose visible consequence never changes is the
+  // silent no-op the real feature exists to make visible.
+  setTokenAutoEligible: async (id: string, autoEligible: boolean) => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row) throw new ApiError(404, "token not found");
+    row.auto_eligible = autoEligible;
+    row.updated_at = new Date().toISOString();
+    const meter = mockMyTokenRateLimits.find((t) => t.secret_id === id);
+    if (meter) {
+      meter.auto_eligible = autoEligible;
+      // Opting OUT is always `not_pooled` — that gate comes first server-side too.
+      // Opting IN restores the token's OWN fixture state rather than hard-coding
+      // `eligible` (web-ux F2): the four states the feature exists for — never
+      // polled, stale, no usage data, low headroom — were unreachable in the demo
+      // because this line asserted every pooled token is pickable, which is the very
+      // thing the chip exists to disprove.
+      //
+      // This does NOT re-implement the gate. The real status is autoselect.Classify's
+      // answer, computed server-side; this restores a fixture value, which is why it
+      // lives here and not in lib/rateLimits.ts.
+      meter.auto_status = autoEligible ? (pooledFixtureStatus[id] ?? "eligible") : "not_pooled";
+    }
     return delay({ secret: { ...row } });
   },
   deleteAnthropicTokenById: async (id: string) => {
@@ -1818,6 +1879,7 @@ export const mockApi = {
       stats_source: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
+      anthropic_bind_mode: "default" as const,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -1830,18 +1892,28 @@ export const mockApi = {
   // PRD #104 M3: rebind a worker to a named token, or clear it with null. Mirrors
   // the real route's label→id resolution and its 400 for an unknown label, so the
   // picker's error path is browsable.
-  setWorkerToken: async (id: string, label: string | null) => {
+  setWorkerBindMode: async (id: string, mode: BindMode, label: string | null) => {
     const w = workers.find((x) => x.id === id);
     if (!w) throw new ApiError(404, "worker not found");
-    if (label === null || label.trim() === "") {
+    // Mirrors the server's refusal of a contradictory pair, so the picker's error
+    // path is browsable in the mock rather than only in production.
+    if (mode !== "pinned" && label !== null && label.trim() !== "") {
+      throw new ApiError(400, "anthropic_token must be null when anthropic_bind_mode is default or auto");
+    }
+    if (mode !== "pinned") {
+      w.anthropic_bind_mode = mode;
       w.anthropic_secret_id = null;
       w.anthropic_secret_label = null;
       return delay({ worker: { ...w } });
+    }
+    if (label === null || label.trim() === "") {
+      throw new ApiError(400, "anthropic_bind_mode=pinned requires a token label in anthropic_token");
     }
     const secret = secrets.find(
       (x) => x.kind === "anthropic_token" && x.label.toLowerCase() === label.trim().toLowerCase(),
     );
     if (!secret) throw new ApiError(400, "no Anthropic token with that label");
+    w.anthropic_bind_mode = "pinned";
     w.anthropic_secret_id = secret.id;
     w.anthropic_secret_label = secret.label;
     return delay({ worker: { ...w } });
@@ -1903,6 +1975,7 @@ export const mockApi = {
       stats_source: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
+      anthropic_bind_mode: "default" as const,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does
@@ -1955,6 +2028,10 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      anthropic_secret_id: null,
+      anthropic_secret_label: null,
+      anthropic_select_reason: null,
+      anthropic_headroom_pct: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -2004,6 +2081,10 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      anthropic_secret_id: null,
+      anthropic_secret_label: null,
+      anthropic_select_reason: null,
+      anthropic_headroom_pct: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -2356,6 +2437,10 @@ export const mockApi = {
       agent_source: null,
       agent_exclusions: null,
       own_agents: null,
+      anthropic_secret_id: null,
+      anthropic_secret_label: null,
+      anthropic_select_reason: null,
+      anthropic_headroom_pct: null,
       claimed_at: now,
       started_at: now,
       finished_at: null,

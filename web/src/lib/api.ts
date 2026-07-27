@@ -44,6 +44,13 @@ export interface SecretMeta {
   kind: string;
   label: string;
   is_default: boolean;
+  /** PRD #111 M2: the owner's opt-in to the auto-selection pool — an `auto` worker
+   *  spends only tokens flagged here. Default false; opting in is deliberate.
+   *
+   *  This is the SETTING, not the live answer. Whether the selector could actually
+   *  pick the token right now also depends on its rate-limit reading, which arrives
+   *  as `auto_status` on TokenRateLimits and is computed server-side. */
+  auto_eligible: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -686,7 +693,20 @@ export interface Worker {
   // the DEFAULT (D1) — the binding covers the run lane only.
   anthropic_secret_id: string | null;
   anthropic_secret_label: string | null;
+  /** How this worker's run-lane claims choose a credential (PRD #111 M3):
+   *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
+   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *
+   *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
+   *  nulls the worker's id server-side and leaves the stored mode alone, so the
+   *  database legitimately holds "pinned" with no id — a worker that resolves as
+   *  default. The API applies that rule before answering, so "pinned" here always
+   *  has an id beside it and no client needs to re-derive it. */
+  anthropic_bind_mode: BindMode;
 }
+
+/** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
+export type BindMode = "default" | "pinned" | "auto";
 
 export interface AdminWorker extends Worker {
   owner_email: string;
@@ -831,10 +851,44 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** PRD #111 M1: which Anthropic credential this run's claim actually spent —
+   *  what run_usage alone could never say. Both null for a run claimed before the
+   *  feature landed, and for a run not yet claimed.
+   *
+   *  They go null INDEPENDENTLY and that is the design, not a bug to defend
+   *  against: the label is a snapshot taken at claim time and survives the token
+   *  being renamed or deleted, while the id goes null when the token is deleted
+   *  (ON DELETE SET NULL). So `anthropic_secret_id === null` with a non-null label
+   *  is the normal shape of a historical run — render the label, and treat the id
+   *  as a link target only when it is there.
+   *
+   *  The label is USER-AUTHORED text. It is safe as JSX (React escapes it) but must
+   *  never be interpolated into HTML or a URL unescaped. */
+  anthropic_secret_id: string | null;
+  anthropic_secret_label: string | null;
+  /** PRD #111 M5: the MODE that named that credential, and the measured headroom of
+   *  an auto pick (D20). The label alone could never answer the user's question,
+   *  because an auto pick and a default fallback can name the SAME token — and PRD
+   *  #104's compatibility path creates a row labelled literally `default`, so the
+   *  label is not even a reliable hint at the mode.
+   *
+   *  Three INDEPENDENT nullabilities across the four fields, so branch per field and
+   *  never on the group: the label outlives the id, the reason is present on every
+   *  run claimed since M1, and the headroom only on an auto pick (and not on D14's
+   *  retry, where the reading described the credential that would not open).
+   *
+   *  🔴 RENDER THE REASON; NEVER RE-DERIVE IT. Same rule as AutoStatus and for the
+   *  same reason: it is the server's own record of what its selector did, and a UI
+   *  that reconstructed it from the other fields would eventually disagree with the
+   *  thing that actually spent the money. */
+  anthropic_select_reason: SelectReason | string | null;
+  anthropic_headroom_pct: number | null;
   /** PRD #40: the run's rolled-up token/cost totals (greatest-wins per model,
    *  summed across models — the server's run_usage_totals view). Present only when
    *  the run has usage rows; absent/null for a pre-feature run, so the UI shows
-   *  nothing rather than a fabricated 0. On both the list rows and the detail read. */
+   *  nothing rather than a fabricated 0. On both the list rows and the detail read.
+   *  Since PRD #111 M1 it can be read together with the credential above: what the
+   *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
 }
 
@@ -945,10 +999,53 @@ export type MyRateLimits =
 // TokenRateLimits is ONE token's meter (PRD #104 M5): the credential's label and
 // default flag — a name, never a value — plus the same status union PRD #53 froze.
 // secret_id keys the row for a rebind or a delete.
+/** AutoStatus is the server's answer to "could auto-selection pick this token right
+ *  now, and if not why" (PRD #111 M2). A CLOSED set, mirroring autoselect.Status.
+ *
+ *  🔴 RENDER IT; NEVER RE-DERIVE IT. It comes from autoselect.Classify, the same
+ *  single function the server's ranker gates candidates on, precisely so this page
+ *  cannot promise a token is eligible that the selector silently skips (D21).
+ *  Reconstructing it here from `limits` — a `100 - pct`, a synced_at comparison —
+ *  reintroduces exactly the drift the field exists to remove, and nothing would fail
+ *  when the two disagreed. */
+/** SelectReason is WHY a run spent the credential it spent (PRD #111 M5, D20) — the
+ *  MODE that named it. A CLOSED set of eight, mirroring autoselect.Reason in Go and
+ *  migration 00089's CHECK in SQL; selectReasonMatchesMigration in
+ *  runCredential.test.ts parses that migration and pins the three in step.
+ *
+ *  Typed as `SelectReason | string` on the wire rather than as the union alone: the
+ *  API is deployed separately from this bundle, so a newer server can ship a ninth
+ *  reason, and a union that lied about being total would make a renderer's exhaustive
+ *  switch look safe while dropping it. The renderer handles the unknown case
+ *  explicitly instead. */
+export type SelectReason =
+  | "default"
+  | "pinned"
+  | "judge"
+  | "auto"
+  | "best_of_pool"
+  | "pool_empty"
+  | "pool_stale"
+  | "open_failed";
+
+export type AutoStatus =
+  | "eligible"
+  | "not_pooled"
+  | "no_reading"
+  | "unmeasured"
+  | "stale"
+  | "below_threshold";
+
 export interface TokenRateLimits {
   secret_id: string;
   label: string;
   is_default: boolean;
+  /** The owner's pool opt-in, and the live eligibility it produces (PRD #111 M2).
+   *  Not redundant: a token can be opted IN and still unpickable — its gauge never
+   *  polled, or its reading aged out — which is the silent no-op the status exists
+   *  to surface. */
+  auto_eligible: boolean;
+  auto_status: AutoStatus;
   limits: MyRateLimits;
 }
 
@@ -1619,6 +1716,15 @@ const realApi = {
     id: string,
     body: { label?: string; default?: boolean; token?: string },
   ) => request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}`, body),
+  // The auto-selection pool toggle (PRD #111 M2, D13). Its OWN narrow route, not a
+  // field on the PATCH above: every other secrets write is cookie-only because a
+  // Bearer-reachable mint would let a stolen CLI token replace a user's credentials,
+  // and moving that PATCH to reach this toggle would have taken rename, rotate and
+  // set-default along with it.
+  setTokenAutoEligible: (id: string, autoEligible: boolean) =>
+    request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}/auto-eligible`, {
+      auto_eligible: autoEligible,
+    }),
   deleteAnthropicTokenById: (id: string) =>
     request<null>("DELETE", `/me/secrets/anthropic_token/${id}`),
   putAnthropicToken: (token: string) =>
@@ -1754,8 +1860,16 @@ const realApi = {
   // null so it falls back to the default (PRD #104 M3). Takes a LABEL, not an id —
   // the name is what a human picks. Lands on the worker's NEXT claim: no restart,
   // no re-minted join token.
-  setWorkerToken: (id: string, label: string | null) =>
-    request<{ worker: Worker }>("PATCH", `/workers/${id}`, { anthropic_token: label }),
+  /** Set HOW a worker chooses its Anthropic credential (PRD #111 M3). The mode and
+   *  the label travel together because the server refuses a contradictory pair
+   *  (a label with "default"/"auto", or "pinned" with none) rather than silently
+   *  reconciling it — either winner would spend a credential the caller did not
+   *  ask for. */
+  setWorkerBindMode: (id: string, mode: BindMode, label: string | null) =>
+    request<{ worker: Worker }>("PATCH", `/workers/${id}`, {
+      anthropic_bind_mode: mode,
+      anthropic_token: mode === "pinned" ? label : null,
+    }),
 
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.

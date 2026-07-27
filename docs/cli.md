@@ -388,10 +388,48 @@ point individual workers at them. The CLI can **read** that set and **move a
 worker between its members** — it cannot change the set itself:
 
 ```sh
-uzi token list                                 # labels, default flag, timestamps
+uzi token list                                 # labels, default flag, pool opt-in, live eligibility
+uzi token pool console-key --on                # add it to the auto-selection pool
+uzi token pool console-key --off               # take it back out
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
+uzi worker set-token <worker-id> --auto        # pick per claim, from the pool
 ```
+
+`uzi token pool` is the one token **write** the CLI has, and it is here for
+the same reason the others are not: it mints nothing and reveals nothing, it
+only re-points spend among tokens you already hold. Adding, renaming,
+re-defaulting and deleting stay web-only.
+
+`uzi token list` prints two columns about the pool, and they answer different
+questions:
+
+| column | question |
+|---|---|
+| `POOL` | did you opt this token in? |
+| `ELIGIBLE` | could auto-selection pick it *right now*? |
+
+`ELIGIBLE` is `eligible` when it can, or `no_reading` / `unmeasured` /
+`stale` / `below_threshold` when it cannot; `-` when the token is not pooled
+(the `POOL` column beside it already says so), and `?` when the eligibility
+read failed. **Check it after opting a token in**: a token uzi has never
+managed to poll stays unpickable while looking active.
+
+Under `--json` the same answer is the `auto_status` field. It is always
+present and is **`null` when it is not known** — which is not the same as
+"not eligible", so branch on null before you branch on the value. An
+un-pooled token reports `not_pooled` there rather than the table's `-`.
+
+`uzi worker list` carries a `TOKEN` column showing how each worker chooses:
+the token's **name** when it is pinned, or `default` / `auto`. An `auto`
+worker has no fixed answer, which is why it says `auto` rather than naming
+whatever it happened to pick last.
+
+`uzi run get` names the credential a run spent **and the mode that chose
+it** — `console-key — auto, 62% headroom`, `console-key — pinned`,
+`default — default (auto: no fresh usage readings)`. See
+[Anthropic tokens](./anthropic-token.md) for the full set and what each
+fallback means.
 
 ### Upgrade status
 

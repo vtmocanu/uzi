@@ -7,8 +7,10 @@
 // and not an edit-in-place field.
 
 import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
+import { api, ApiError, type AutoStatus, type SecretMeta, type Worker } from "../lib/api";
 import { isVaultLocked } from "../lib/api";
+import { autoChipFor } from "../lib/rateLimits";
+import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 
 const DOC_URL =
@@ -51,6 +53,12 @@ export function deleteWarning(
   isDefault: boolean,
   boundWorkers: string[],
   judgeBound: boolean,
+  // PRD #111, web-ux F5. An `auto` worker is bound to the POOL AS A SET, not to any
+  // one token, so deleting a pooled credential shrinks the candidate set and shifts
+  // spend without being bound to anything this function could enumerate. D5's whole
+  // argument is that a silent fallback is acceptable BEHAVIOUR and unacceptable
+  // SURPRISE — and "nothing is bound to it" was becoming the surprise.
+  autoEligible = false,
 ): string {
   if (isDefault) {
     // Reachable only as the LAST token (D6 blocks deleting a default while others
@@ -64,12 +72,19 @@ export function deleteWarning(
     );
   }
   if (judgeBound) affected.push("your run judge");
+  // The pool clause rides on BOTH branches: a token can be pooled and bound, pooled
+  // and unbound, or neither, and each combination is a different sentence.
+  const poolClause = autoEligible
+    ? " It also leaves your auto-selection pool, so workers set to auto will no longer spend it."
+    : "";
   if (affected.length === 0) {
-    return `Delete “${label}”? Nothing is bound to it, so no worker or judge setting changes.`;
+    return autoEligible
+      ? `Delete “${label}”? No worker or judge names it directly, but it is in your auto-selection pool — workers set to auto will no longer spend it.`
+      : `Delete “${label}”? Nothing is bound to it, so no worker or judge setting changes.`;
   }
   const subject = affected.join(" and ");
   const verb = boundWorkers.length + (judgeBound ? 1 : 0) === 1 ? "falls" : "fall";
-  return `Delete “${label}”? ${subject} ${verb} back to your default token.`;
+  return `Delete “${label}”? ${subject} ${verb} back to your default token.${poolClause}`;
 }
 
 // TokenRow is one stored credential: its label, the default badge, when it was
@@ -81,6 +96,8 @@ function TokenRow({
   soleToken,
   boundWorkers,
   judgeBound,
+  autoStatus,
+  autoFetchState,
   onChanged,
   onError,
   onNotice,
@@ -90,6 +107,15 @@ function TokenRow({
   soleToken: boolean;
   boundWorkers: string[];
   judgeBound: boolean;
+  // The SERVER's live eligibility answer for this token (PRD #111 M2), or
+  // undefined while the meters have not loaded (or failed to). Never re-derived
+  // here — see lib/rateLimits.ts for why that is a design rule and not a habit.
+  autoStatus: AutoStatus | undefined;
+  // Whether the meters fetch has resolved (web-ux F9). Without it a pooled token
+  // renders NO chip while loading and again on failure — visually identical to a
+  // healthy one, which is the silent no-op D11 exists to prevent, arriving through a
+  // spinner and an error path rather than through the poller.
+  autoFetchState: "pending" | "ready" | "failed";
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -100,6 +126,7 @@ function TokenRow({
   const disabled = busy || rowBusy;
   const blockedByD6 = secret.is_default && !soleToken;
   const d6HintId = `d6-${secret.id}`;
+  const autoHintId = `auto-${secret.id}`;
 
   const run = async (fn: () => Promise<unknown>, ok: string, fallback: string) => {
     onError("");
@@ -160,7 +187,11 @@ function TokenRow({
           </form>
         ) : (
           <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate font-medium text-fg">{secret.label}</span>
+            {/* web-ux F12: the label is user-authored and reaches this renderer
+                without necessarily having passed the server validator (rows written
+                before it landed are never re-validated). React escaping does not
+                touch a bidi override — see lib/sanitizeLabel. */}
+            <span className="truncate font-medium text-fg">{sanitizeLabel(secret.label)}</span>
             {secret.is_default && <Badge tone="ok">default</Badge>}
           </div>
         )}
@@ -208,7 +239,17 @@ function TokenRow({
                 // Deleting a bound token silently returns its workers to the
                 // default (D5), so the confirmation must NAME them rather than let a
                 // user discover the move from a meter.
-                if (!window.confirm(deleteWarning(secret.label, secret.is_default, boundWorkers, judgeBound)))
+                if (
+                  !window.confirm(
+                    deleteWarning(
+                      sanitizeLabel(secret.label),
+                      secret.is_default,
+                      boundWorkers,
+                      judgeBound,
+                      secret.auto_eligible,
+                    ),
+                  )
+                )
                   return;
                 void run(
                   () => api.deleteAnthropicTokenById(secret.id),
@@ -226,6 +267,84 @@ function TokenRow({
             )}
           </div>
         )}
+      </div>
+      {/* Auto-selection pool (PRD #111 M2, D2). The toggle and the live status sit
+          together on purpose: opting a token in whose gauge has never polled is a
+          silent no-op — it looks active and can never be picked (R7) — so the
+          consequence has to be visible at the moment of the choice, not one card
+          down. The chip renders the SERVER's answer verbatim. */}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {/* h-4 w-4 / text-sm to match autopilot, judge and Slack on this same page
+            (web-ux F7). The control deciding which account gets billed was the most
+            de-emphasised thing in the card, and 14px in a 16px row is under WCAG
+            2.5.8's 24×24 target minimum vertically. */}
+        <label className="flex items-center gap-2 text-sm text-muted">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={secret.auto_eligible}
+            disabled={disabled}
+            // Named per TOKEN (web-ux F6). Every checkbox previously carried the
+            // identical accessible name, so a screen-reader user heard N identical
+            // controls and could not tell which credential each one spends — on the
+            // control that decides which account gets billed. Mirrors the rename
+            // input's `aria-label` two blocks up.
+            aria-label={`Auto-select from ${sanitizeLabel(secret.label)}`}
+            aria-describedby={secret.auto_eligible ? autoHintId : undefined}
+            onChange={(e) => {
+              const next = e.target.checked;
+              void run(
+                () => api.setTokenAutoEligible(secret.id, next),
+                next
+                  ? `“${sanitizeLabel(secret.label)}” is now in the auto-selection pool.`
+                  : `“${sanitizeLabel(secret.label)}” is no longer in the auto-selection pool.`,
+                next
+                  ? "Failed to add the token to the pool"
+                  : "Failed to remove the token from the pool",
+              );
+            }}
+          />
+          <span aria-hidden="true">Auto-select from this token</span>
+        </label>
+        {/* The chip, decided by autoChipFor rather than here: a pooled token whose
+            status says `not_pooled` is two sources DISAGREEING, and showing a checked
+            box beside "not in pool" asserts a contradiction (web-ux F1). Pending and
+            failed fetches get their own honest chips rather than degrading to the
+            pre-feature appearance (F9). */}
+        {(() => {
+          const decision = autoChipFor(secret.auto_eligible, autoStatus, autoFetchState);
+          if (decision.kind === "hidden") return null;
+          const skipped = decision.chip.tone === "warning";
+          return (
+            <>
+              <Badge tone={decision.chip.tone} title={decision.chip.hint}>
+                {decision.chip.label}
+              </Badge>
+              {/* web-ux F3: the chip states a DIAGNOSIS; none of the labels says
+                  whether the token can actually be picked. That consequence used to
+                  live only in a `title`, which reaches no keyboard user, no touch
+                  user and no screen reader reliably — D11's failure mode one level
+                  up, the state rendered and the meaning withheld. It is visible copy
+                  now, and the sr-only description mirrors D6_HINT's pattern from the
+                  Delete button above. */}
+              {/* 🔴 `text-warn`, not `text-warning` — web-ux F22. `warning` is not a
+                  class in this project; the tailwind token is `warn`. The computed
+                  colour was rgb(228,232,240), the inherited body --fg, beside a chip at
+                  rgb(251,191,36): the amber pairing the F3 fix intended silently did not
+                  happen. A tailwind class that does not resolve fails COMPLETELY
+                  silently — nothing errors, the element just inherits — which is why it
+                  survived review, and why six other instances of the same typo exist
+                  elsewhere in this codebase. Those predate this PRD and are being
+                  raised separately rather than ridden in on a token-selection change. */}
+              {skipped && (
+                <span className="text-xs text-warn">— auto-selection skips it</span>
+              )}
+              <span id={autoHintId} className="sr-only">
+                {decision.chip.hint}
+              </span>
+            </>
+          );
+        })()}
       </div>
       <div className="mt-1 text-xs text-faint">
         updated {new Date(secret.updated_at).toLocaleString()}
@@ -277,6 +396,39 @@ export function AnthropicTokens({
       })
       .catch(() => {
         if (!cancelled) setWorkers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [secrets]);
+
+  // Per-token live auto-selection eligibility (PRD #111 M2), fetched here for the
+  // same reason the workers are: the consequence of the toggle belongs beside the
+  // toggle, and no caller has this data. Re-fetched whenever `secrets` changes, so
+  // opting a token in updates its chip without a page reload. Failure is silent by
+  // design, exactly as above — the toggle still works and still says what it did;
+  // an error banner over a secondary fetch would be worse than a missing chip.
+  const [autoStatuses, setAutoStatuses] = useState<Record<string, AutoStatus>>({});
+  // The fetch's own state, tracked rather than inferred from an empty map (web-ux
+  // F9). "no statuses yet" and "the fetch failed" and "this token has no meter row"
+  // are three different facts that an empty map collapses into one, and the
+  // collapsed answer renders as the pre-feature appearance — a pooled-but-unpickable
+  // token looking exactly like a healthy one.
+  const [autoFetchState, setAutoFetchState] = useState<"pending" | "ready" | "failed">("pending");
+  useEffect(() => {
+    let cancelled = false;
+    setAutoFetchState("pending");
+    void api
+      .getMyRateLimits()
+      .then(({ tokens }) => {
+        if (cancelled) return;
+        setAutoStatuses(Object.fromEntries(tokens.map((t) => [t.secret_id, t.auto_status])));
+        setAutoFetchState("ready");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setAutoStatuses({});
+        setAutoFetchState("failed");
       });
     return () => {
       cancelled = true;
@@ -372,6 +524,8 @@ export function AnthropicTokens({
                 .filter((w) => w.anthropic_secret_id === s.id)
                 .map((w) => w.name)}
               judgeBound={judgeSecretId === s.id}
+              autoStatus={autoStatuses[s.id]}
+              autoFetchState={autoFetchState}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}

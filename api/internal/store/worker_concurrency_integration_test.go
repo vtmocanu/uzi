@@ -55,6 +55,7 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	// unique bytes from two uuid.New()s, which is what every other LiveDB test here does.
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: userID, Name: "laptop", TokenHash: tokenHash(),
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
@@ -128,6 +129,7 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	// case the naive "busy = active_runs > 0" derivation would get wrong).
 	wkr2, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: userID, Name: "chat-only", TokenHash: tokenHash(),
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker(wkr2): %v", err)

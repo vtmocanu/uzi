@@ -350,6 +350,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListMySecrets)
+				// The auto-selection pool toggle (PRD #111 M2, D13). RequireUser, and
+				// it is the ONE write in this route tree that is — deliberately, and
+				// on the SAME reasoning as PATCH /workers/{id} below: it mints
+				// nothing, reveals nothing, and only re-points SPEND among tokens the
+				// caller already holds. It is a separate, narrow path precisely so
+				// that reasoning applies to it alone; folding the flag into the PATCH
+				// in the group below would have required moving that route here,
+				// making rename, rotate and set-default Bearer-reachable as
+				// collateral damage.
+				r.Patch("/anthropic_token/{id}/auto-eligible", h.PatchAnthropicTokenAutoEligible)
 			})
 			// Every WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
 			// rotating and deleting credentials is the CLI's exclusion zone — a
@@ -445,6 +455,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 		// Current-user autopilot opt-in (PRD #19): per-user consent to unattended
 		// runs, scoped to the authenticated user (no admin-toggles-for-you path).
+		//
+		// These two stay COOKIE-ONLY. They are consent switches that cause uzi to
+		// spend the caller's credentials unattended, which is not something a stolen
+		// CLI token should be able to turn on.
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Put("/me/autopilot", h.SetAutopilotEnabled)
@@ -452,8 +466,37 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens judging their finished runs. Session-scoped identity
 			// (never the body), like autopilot.
 			r.Put("/me/judge", h.SetJudgeEnabled)
-			// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
-			// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
+		})
+
+		// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
+		// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
+		//
+		// RequireUser since PRD #111 D23 — SPLIT OUT of the RequireAuth group above
+		// rather than widening it, because the two PUTs there must stay cookie-only.
+		//
+		// 🔴 THE ARGUMENT IS NON-ADDITIVITY, NOT A SENSITIVITY RANKING. "Percentages
+		// are less sensitive than the labels already exposed beside them" is the
+		// "it's only metadata" move, and it would equally license putting per-run cost
+		// on a shared board. The two legs that actually hold:
+		//
+		//   1. Every inference this enables is already available at FINER granularity
+		//      through routes that are already RequireUser. GET /api/runs carries
+		//      per-run UsageDTO — input/cache/output tokens, cost_usd and three
+		//      timestamps — a timestamped consumption series strictly finer than a
+		//      0..100 aggregate refreshed once a poll interval. And POST
+		//      /repos/{id}/runs is RequireUser, so a stolen uzc_ can already SPEND the
+		//      victim's quota; learning when it resets is a rounding error against
+		//      that.
+		//   2. It is a GET of the caller's own row: one owner-scoped read, no outbound
+		//      call, no usagePoker.Poke (so no amplification vector against Anthropic),
+		//      it mints nothing, and it never reads IsAdmin — no admin branch, no
+		//      escalation path.
+		//
+		// 🔴 CARRY THE CAVEAT, NOT JUST THE CONCLUSION: non-additivity is a property of
+		// the CURRENT route table, not of this endpoint. If /api/runs's usage fields or
+		// CreateRun ever return to cookie-only, this decision needs revisiting.
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/me/rate-limits", h.SelfRateLimits)
 		})
 

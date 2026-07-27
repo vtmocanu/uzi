@@ -538,6 +538,17 @@ during the work, and the constraint below is what replaced it.
 - If uzi ever adopts a full-scripts install, auto-provisioning must become opt-in.
   Crossing that tradeoff is the owner's decision, never a milestone's.
 
+## Feature #111 — Auto-select the Anthropic token per run
+
+Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/111-auto-select-anthropic-token.md`.
+
+- A worker can choose its Anthropic token automatically from a pool the user opts in, preferring the account with the most headroom. [user, the originating ask on #111]
+- Every run shows which token it actually used. [user, same ask]
+- Scope is a per-worker third bind mode (default / pinned / auto), not a per-user global toggle: some workers stay pinned while the rest auto-balance. [user 2026-07-22]
+- The candidate set is an opt-in pool, per token, default OFF — auto must never spend a token the user reserved for other work. [user 2026-07-22]
+- Ranking is least-consumed first; a within-threshold tie goes to the account that resets soonest. [user 2026-07-22]
+- The dev-cluster k8s validation (a PRD success criterion) is deferred to a follow-up issue, not dropped. [user 2026-07-27]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

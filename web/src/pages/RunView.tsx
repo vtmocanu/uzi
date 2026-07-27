@@ -41,6 +41,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
+import { RunCredential } from "../components/RunCredential";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
@@ -285,6 +286,11 @@ export function RunView() {
                   iteration {run.iteration_count}
                 </Badge>
               )}
+              {/* Which Anthropic credential this run spent (PRD #111 M1). Here in
+                  the header rather than beside the usage panel because it must show
+                  for every claimed run, and the usage panel only appears once a run
+                  has reported usage. */}
+              <RunCredential run={run} />
             </div>
           </div>
         }

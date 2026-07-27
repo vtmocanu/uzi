@@ -101,10 +101,75 @@ type RunDTO struct {
 	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
 	// nil slice) on the list/create/worker DTOs, which never drive the picker.
 	OwnAgents []RepoAgent `json:"own_agents"`
+	// Which Anthropic credential this run's claim actually spent (PRD #111 M1) —
+	// the answer to "which account paid for this run?", which run_usage alone could
+	// never give. Both null for a run claimed before the feature landed, and for a
+	// run that has not been claimed yet.
+	//
+	// The two are NOT redundant and they go null independently. The label is a
+	// SNAPSHOT taken at claim time, so it survives the token being renamed or
+	// deleted; the id is live and goes null (ON DELETE SET NULL, migration 00086)
+	// when the token is deleted. So `id == null, label != null` is the normal state
+	// of a historical run whose credential is gone — render the label, and treat the
+	// id as a link target only when present.
+	//
+	// The label is USER-SUPPLIED text, so any consumer writing it to a terminal must
+	// sanitize; the CLI routes it through cellText and the web through
+	// lib/sanitizeLabel for exactly this.
+	//
+	// This used to say "validateSecretLabel permits Unicode Cf, including bidi
+	// overrides". PRD #111 M2 made that false: the validator now rejects Cf on write.
+	// The obligation is unchanged, because the validator governs writes and not
+	// history — labels stored before it landed are never re-validated, and nothing
+	// re-validates on read.
+	//
+	// This DTO is owner-or-admin scoped throughout (ListRuns owner-only,
+	// AdminListRuns admin-only, GetRun owner-or-admin), which is why the label rides
+	// unconditionally here as failure_reason does. The SHARED board is a different
+	// struct with a different rule — a token label names another user's billing
+	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
+	AnthropicSecretID    *string `json:"anthropic_secret_id"`
+	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// AnthropicSelectReason is the MODE that named that credential, and it is why
+	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
+	// fallback can name the SAME token, so "which account paid" and "why that account"
+	// are different questions — and PRD #104's compatibility path creates a row
+	// labelled literally `default`, so the label is not even a reliable hint.
+	//
+	// One of eight server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK): default, pinned, judge, auto, best_of_pool, pool_empty,
+	// pool_stale, open_failed. Null for a run claimed before M1.
+	//
+	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
+	// and can carry no cross-tenant content, which is why it rides this DTO under the
+	// owner-or-admin scoping already in force rather than needing a gate of its own.
+	//
+	// Clients must render an UNRECOGNISED value honestly rather than dropping or
+	// guessing at it — the API is deployed separately, so a newer server can ship a
+	// ninth reason this client has never heard of.
+	AnthropicSelectReason *string `json:"anthropic_select_reason"`
+	// AnthropicHeadroomPct is the measured headroom of an AUTO pick, in percentage
+	// points, and null on every other lane because nothing measured them.
+	//
+	// The RAW min(100-five, 100-seven) — deliberately not the in-flight-penalised
+	// rank the selector actually ordered on. The raw number is the one a user can see
+	// in their own meters; the rank is an internal ordering key that appears nowhere
+	// else in the product and moves when somebody else's run starts.
+	//
+	// It is also null on D14's retry, where the pick would not open and the fallback
+	// was spent: the reading described the credential that FAILED, and attaching it to
+	// the one that succeeded would attribute a measurement to a token nothing measured.
+	//
+	// Derived from the owner's own gauge rows, so it carries no cross-tenant content
+	// either; an admin reading it is consistent with the admin rate-limits view.
+	AnthropicHeadroomPct *int `json:"anthropic_headroom_pct"`
 	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
 	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
 	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;
 	// nil on the create/worker DTO paths, which never render usage.
+	//
+	// Since PRD #111 M1 it can finally be read TOGETHER with the two fields above:
+	// what a run cost, and which credential it cost it against.
 	Usage *UsageDTO `json:"usage,omitempty"`
 }
 

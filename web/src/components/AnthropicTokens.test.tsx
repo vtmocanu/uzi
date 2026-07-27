@@ -19,6 +19,10 @@ vi.mock("../lib/api", async (importActual) => {
       // The card fetches workers itself so a delete can NAME the affected ones
       // (D5). Defaulted per-test in beforeEach.
       listWorkers: vi.fn(),
+      // PRD #111 M2: the pool toggle, and the per-token live eligibility the card
+      // fetches so the chip sits beside the toggle rather than a card away.
+      setTokenAutoEligible: vi.fn(),
+      getMyRateLimits: vi.fn(),
     },
   };
 });
@@ -31,6 +35,8 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    // PRD #111 M2: the auto-selection pool opt-in, false unless a test says otherwise.
+    auto_eligible: false,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T00:00:00Z",
     ...over,
@@ -72,6 +78,8 @@ function renderList(secrets: SecretMeta[], reload = noop, judgeSecretId: string 
 beforeEach(() => {
   vi.spyOn(window, "confirm").mockReturnValue(true);
   mockApi.listWorkers.mockResolvedValue({ workers: [] });
+  mockApi.getMyRateLimits.mockResolvedValue({ tokens: [] });
+  mockApi.setTokenAutoEligible.mockResolvedValue({ secret: secret() });
 });
 
 afterEach(() => {
@@ -327,5 +335,134 @@ describe("AnthropicTokens", () => {
   it("keeps no second copy of an error for screen readers", () => {
     const { container } = renderList([secret()]);
     expect(container.querySelectorAll(".sr-only").length).toBe(0);
+  });
+
+  // ── PRD #111 M2: the auto-selection pool toggle ───────────────────────────
+
+  it("reflects the pool opt-in and toggles it both ways", async () => {
+    renderList([secret({ auto_eligible: false })]);
+    const box = screen.getByLabelText(/Auto-select from/) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+
+    fireEvent.click(box);
+    await waitFor(() => expect(mockApi.setTokenAutoEligible).toHaveBeenCalledWith("sec-1", true));
+
+    cleanup();
+    renderList([secret({ auto_eligible: true })]);
+    const on = screen.getByLabelText(/Auto-select from/) as HTMLInputElement;
+    expect(on.checked).toBe(true);
+    fireEvent.click(on);
+    await waitFor(() => expect(mockApi.setTokenAutoEligible).toHaveBeenCalledWith("sec-1", false));
+  });
+
+  // The consequence has to be visible at the moment of the choice. Opting in a
+  // token whose gauge has never polled is a silent no-op — it looks active and can
+  // never be picked — so the chip lives beside the toggle rather than a card away.
+  it("shows the SERVER's eligibility beside the toggle for a pooled token", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        {
+          secret_id: "sec-1",
+          label: "default",
+          is_default: true,
+          auto_eligible: true,
+          auto_status: "no_reading",
+          limits: { status: "unavailable" },
+        },
+      ],
+    });
+    const { container } = renderList([secret({ auto_eligible: true })]);
+    // "never polled" is autoStatusChip's rendering of no_reading — rendered, not
+    // re-derived: nothing in this component looks at `limits`.
+    expect(await screen.findByText("never polled")).toBeTruthy();
+
+    // 🔴 AND THE SKIP NOTE IS ACTUALLY AMBER — web-ux F22. It read `text-warning`,
+    // which is NOT a class in this project (the tailwind token is `warn`), so it
+    // silently inherited the body --fg and rendered grey beside an amber chip. A
+    // tailwind class that does not resolve fails COMPLETELY silently: nothing errors,
+    // the element just inherits, which is exactly why it survived review.
+    //
+    // Asserted on the class rather than the computed colour because jsdom does not
+    // run tailwind — so this pins the one thing that WAS wrong (the stem) and is
+    // honest about not proving the pixel.
+    const note = screen.getByText(/auto-selection skips it/);
+    expect(note.className, "text-warning is not a class here; the token is warn").toMatch(/\btext-warn\b/);
+    expect(note.className).not.toMatch(/text-warning/);
+    expect(container).toBeTruthy();
+  });
+
+  // An UN-pooled token gets no chip: the unchecked box beside it already says so,
+  // and a "not in pool" badge on every row a user has not opted into is noise.
+  it("shows no eligibility chip for an un-pooled token", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        {
+          secret_id: "sec-1",
+          label: "default",
+          is_default: true,
+          auto_eligible: false,
+          auto_status: "not_pooled",
+          limits: { status: "unavailable" },
+        },
+      ],
+    });
+    renderList([secret({ auto_eligible: false })]);
+    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
+    expect(screen.queryByText("not in pool")).toBeNull();
+  });
+
+  // A failed meters fetch must not break the toggle or blank the card: the chip is
+  // secondary information, and an error banner over it would be worse than its
+  // absence. Same stance as the workers fetch above it.
+  it("still renders the toggle when the eligibility fetch fails", async () => {
+    mockApi.getMyRateLimits.mockRejectedValue(new Error("network"));
+    renderList([secret({ auto_eligible: true })]);
+    expect(screen.getByLabelText(/Auto-select from/)).toBeTruthy();
+    // web-ux F9: a failed fetch must SAY it does not know, not fall silent — a
+    // pooled-but-unpickable token rendering no chip is indistinguishable from a
+    // healthy one, which is D11's silent no-op arriving through the error path.
+    expect(await screen.findByText("eligibility unknown")).toBeTruthy();
+    expect(screen.queryByText("never polled")).toBeNull();
+  });
+
+  // web-ux F5: an `auto` worker is bound to the POOL AS A SET, not to any one token,
+  // so deleting a pooled credential shifts spend while being "bound to nothing" by
+  // the old wording's reckoning. D5's argument is that a silent fallback is
+  // acceptable behaviour and unacceptable surprise — and this had become the
+  // surprise. Asserted through the real confirm() the component calls, not through
+  // deleteWarning() directly, so a caller that forgets to pass the flag still fails.
+  it("warns that deleting a pooled token shrinks the auto-selection pool", async () => {
+    const seen: string[] = [];
+    vi.spyOn(window, "confirm").mockImplementation((m?: string) => {
+      seen.push(m ?? "");
+      return false; // refuse, so nothing is deleted
+    });
+    renderList([
+      secret({ is_default: true }),
+      secret({ id: "sec-2", label: "console-key", is_default: false, auto_eligible: true }),
+    ]);
+    fireEvent.click(
+      within(screen.getByTestId("token-sec-2")).getByRole("button", { name: /delete/i }),
+    );
+    expect(seen[0]).toMatch(/auto-selection pool/i);
+    expect(mockApi.deleteAnthropicTokenById).not.toHaveBeenCalled();
+  });
+
+  // …and an UN-pooled token keeps the old, correct wording. Without this the fix
+  // could be "always mention the pool", which would be a different wrong answer.
+  it("does not mention the pool when the token is not in it", async () => {
+    const seen: string[] = [];
+    vi.spyOn(window, "confirm").mockImplementation((m?: string) => {
+      seen.push(m ?? "");
+      return false;
+    });
+    renderList([
+      secret({ is_default: true }),
+      secret({ id: "sec-2", label: "console-key", is_default: false, auto_eligible: false }),
+    ]);
+    fireEvent.click(
+      within(screen.getByTestId("token-sec-2")).getByRole("button", { name: /delete/i }),
+    );
+    expect(seen[0]).not.toMatch(/pool/i);
   });
 });

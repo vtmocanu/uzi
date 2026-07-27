@@ -19,7 +19,7 @@ vi.mock("../lib/api", async (importActual) => {
       // The page reads the user's tokens alongside the workers (PRD #104 M6) to
       // populate the per-row token picker.
       listSecrets: vi.fn(),
-      setWorkerToken: vi.fn(),
+      setWorkerBindMode: vi.fn(),
       createWorker: vi.fn(),
       deleteWorker: vi.fn(),
       hostedConfig: vi.fn(),
@@ -52,6 +52,8 @@ function aSecret(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    // PRD #111 M2: the auto-selection pool opt-in, false unless a test says otherwise.
+    auto_eligible: false,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
     ...over,
@@ -64,6 +66,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     // until someone binds one, which is the state these pre-#104 tests assume.
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
     id: "w1",
     name: "laptop",
     status: "online",
@@ -560,9 +563,15 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
 // ── Worker → token binding (PRD #104 M3/M6) ─────────────────────────────────
 
 describe("WorkersSettings token binding (PRD #104)", () => {
+  // console-key is POOLED, and that is a correction rather than a detail. Two tests
+  // below assert that an auto worker reads as auto-selecting — and with an entirely
+  // un-pooled fixture that copy is now (correctly) suppressed by web-ux F18's guard,
+  // because such a worker resolves pool_empty on every claim and spends the default.
+  // The old fixture made those tests assert the misleading string; pooling one token
+  // restores what they were actually about, which is the auto MODE's rendering.
   const twoTokens = [
     aSecret(),
-    aSecret({ id: "sec-console", label: "console-key", is_default: false }),
+    aSecret({ id: "sec-console", label: "console-key", is_default: false, auto_eligible: true }),
   ];
 
   // The EFFECTIVE token is always stated. An unbound worker says "your default
@@ -617,8 +626,12 @@ describe("WorkersSettings token binding (PRD #104)", () => {
   it("rebinds a worker to a named token by label", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
-    mockApi.setWorkerToken.mockResolvedValue({
-      worker: aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" }),
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({
+        anthropic_bind_mode: "pinned",
+        anthropic_secret_id: "sec-console",
+        anthropic_secret_label: "console-key",
+      }),
     });
     renderPage();
     await screen.findByText("laptop");
@@ -629,23 +642,286 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     expect(picker.className).toContain("bg-raised");
     expect(picker.className).toContain("border-edge");
     fireEvent.change(picker, { target: { value: "console-key" } });
-    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", "console-key"));
+    await waitFor(() =>
+      expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "pinned", "console-key"),
+    );
     // The announcement says WHEN it takes effect — a user who expects to restart
     // something will otherwise go looking for the control to do it.
     expect(await screen.findByText(/from its next claim/i)).toBeTruthy();
   });
 
-  // Selecting "default token" CLEARS the binding — sent as null, not as a label.
+  // Selecting "default token" CLEARS the binding — mode "default", label null.
   it("clears the binding when the picker returns to the default", async () => {
     mockApi.listWorkers.mockResolvedValue({
-      workers: [aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" })],
+      workers: [
+        aWorker({
+          anthropic_bind_mode: "pinned",
+          anthropic_secret_id: "sec-console",
+          anthropic_secret_label: "console-key",
+        }),
+      ],
     });
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
-    mockApi.setWorkerToken.mockResolvedValue({ worker: aWorker() });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker() });
     renderPage();
     await screen.findByText("laptop");
     const picker = await screen.findByLabelText("Anthropic token for laptop");
     fireEvent.change(picker, { target: { value: "" } });
-    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", null));
+    await waitFor(() => expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "default", null));
+  });
+
+  // --- PRD #111 M3: the third mode -----------------------------------------
+
+  // The auto option sends mode "auto" with NO label. The server refuses a label
+  // alongside a non-pinned mode rather than reconciling it, so a picker that sent
+  // the sentinel through as a label would 400 rather than silently mis-bind.
+  it("switches a worker to auto, sending no label", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({ anthropic_bind_mode: "auto" }),
+    });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    fireEvent.change(picker, { target: { value: "\u0000auto" } });
+    await waitFor(() => expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "auto", null));
+    expect(await screen.findByText(/auto-selects from your token pool/i)).toBeTruthy();
+  });
+
+  // An auto worker must READ as auto, not as "spends your default token" — which
+  // is what an id-first render would say, since an auto worker holds no pin. That
+  // is the state auto DEGRADES to when the pool is empty, not what it is.
+  it("describes an auto worker as auto-selecting, not as using the default", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.getByText(/auto-selects from your/i)).toBeTruthy();
+    expect(screen.queryByText(/spends your default token/i)).toBeNull();
+    // …and the picker reflects it rather than showing "default token".
+    const picker = (await screen.findByLabelText(
+      "Anthropic token for laptop",
+    )) as HTMLSelectElement;
+    expect(picker.value).toBe("\u0000auto");
+  });
+
+  // D9 end to end: the server reports the EFFECTIVE mode, so a worker whose pinned
+  // token was deleted arrives as "default" with a null label and must render as
+  // using the default — never as a pin to a token that no longer exists.
+  it("renders a worker whose pinned token was deleted as using the default", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          anthropic_bind_mode: "default",
+          anthropic_secret_id: null,
+          anthropic_secret_label: null,
+        }),
+      ],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.getByText(/spends your default token/i)).toBeTruthy();
+    expect(screen.queryByText(/auto-selects/i)).toBeNull();
+  });
+});
+
+// --- web-ux F18: an auto worker over an EMPTY pool --------------------------------
+
+describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
+  // 🔴 THE FIXTURE HOLDS TOKENS. That is the whole point, and it is why the obvious
+  // fix is wrong: the neighbouring precedent in this component guards on
+  // `tokens.length === 0`, and copying that shape produces a guard that is SILENT in
+  // exactly the case that matters — a user holding several tokens with none opted in.
+  // A fixture with zero tokens would pass against either implementation.
+  const twoUnpooled = [
+    aSecret({ id: "sec-default", label: "default", is_default: true, auto_eligible: false }),
+    aSecret({ id: "sec-spare", label: "spare-key", is_default: false, auto_eligible: false }),
+  ];
+
+  it("says the pool is empty rather than claiming it auto-selects", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    renderPage();
+    // Every claim resolves pool_empty and spends the owner's default. Saying
+    // "auto-selects from your token pool" here is R7's silent no-op moved up one
+    // level, on the surface where the choice is actually made.
+    // Matched on ONE text node: `token pool` is a <Link>, so the sentence is split
+    // across elements and a regex spanning them finds nothing.
+    expect(await screen.findByText(/is empty — its runs spend your default token/i)).toBeTruthy();
+  });
+
+  it("says it auto-selects once ONE token is pooled", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    renderPage();
+    expect(await screen.findByText(/auto-selects from your/i)).toBeTruthy();
+    expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
+  });
+
+  // The DEPS leg, asserted directly, and the fixture is the ORDINARY path rather than
+  // an exotic one: a token is pooled at mount and nothing changes mid-mount.
+  //
+  // That is what makes the bug live rather than defensive. `tokens` starts [] and is
+  // filled asynchronously, so under `[]` deps rebind is created on the first render
+  // with pooledCount === 0 and keeps that value for the life of the mount. Open the
+  // page with a full pool, switch a worker to auto, hear "your token pool is empty".
+  //
+  // It was already caught before this test — by a 5s TIMEOUT on a pre-existing test
+  // whose name says nothing about pooled counts. A guard that works and cannot explain
+  // itself costs the next person the time this one saves.
+  it("announces a non-empty pool for a worker switched to auto after load", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker({ anthropic_bind_mode: "auto" }) });
+    renderPage();
+    await screen.findByText("laptop");
+    fireEvent.change(await screen.findByLabelText("Anthropic token for laptop"), {
+      target: { value: "\u0000auto" },
+    });
+    // Waits for WHICHEVER announcement lands, then asserts which one it was. That is
+    // what makes it fail in milliseconds: under the stale-closure mutation the wrong
+    // announcement appears just as fast as the right one, so there is nothing to time
+    // out on. Waiting only for the CORRECT string would burn the full waitFor timeout
+    // before saying anything, which is the 5s non-explanation this test replaces.
+    await screen.findByText(/from its next claim|token pool is empty/i);
+    expect(
+      screen.queryByText(/token pool is empty/i),
+      "pooledCount is missing from rebind's useCallback deps: the callback captured the " +
+        "count from the render that created it, so opting a token in mid-session does not " +
+        "reach the announcement",
+    ).toBeNull();
+    expect(screen.getByText(/now auto-selects from your token pool/i)).toBeTruthy();
+  });
+
+  // A non-auto worker must be untouched by any of this: the empty pool is irrelevant
+  // to a worker that was never going to consult it.
+  it("leaves a default-mode worker's summary alone", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    renderPage();
+    expect(await screen.findByText(/spends your default token/i)).toBeTruthy();
+    expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
+  });
+
+  // F18's other half. A correct row summary beside a cheerful announcement would
+  // leave the misleading half in the one place a screen-reader user actually hears
+  // it, and the visual and the announced would then disagree.
+  it("announces the empty pool when switching a worker to auto", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({ anthropic_bind_mode: "auto" }),
+    });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    // AUTO_OPTION is a NUL-prefixed sentinel, not a readable value — deliberately a
+    // string no user label can collide with.
+    fireEvent.change(picker, { target: { value: "\u0000auto" } });
+    await waitFor(() => {
+      expect(screen.getByText(/token pool is empty, so its runs spend your default token/i)).toBeTruthy();
+    });
+    // 🔴 AND IT IS AMBER, NOT GREEN. F18 made the two channels agree in WORDS and left
+    // them disagreeing in COLOUR: the row span was text-warn while the announcement
+    // went through one unconditional success Alert, so a GREEN banner read "your token
+    // pool is empty, so its runs spend your default token". That is the same category
+    // error one level down from the one F18 fixed, and this file's own argument is
+    // that the visible and the announced must not disagree.
+    const banner = screen.getByText(/token pool is empty, so its runs spend your default token/i);
+    expect(banner.className, "a success-toned banner cannot carry a warning").toMatch(/text-warn\b/);
+    expect(banner.className).not.toMatch(/text-ok\b/);
+  });
+
+  // The other branches stay green: nothing went wrong, and making every announcement
+  // amber would cost the distinction this fix exists to create.
+  it("keeps an ordinary rebind announcement green", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker({ anthropic_bind_mode: "auto" }) });
+    renderPage();
+    await screen.findByText("laptop");
+    fireEvent.change(await screen.findByLabelText("Anthropic token for laptop"), {
+      target: { value: "\u0000auto" },
+    });
+    const banner = await screen.findByText(/now auto-selects from your token pool/i);
+    expect(banner.className).toMatch(/text-ok\b/);
+  });
+});
+
+
+// --- worker names reach the DOM sanitized -----------------------------------------
+
+describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
+  // 🔴 WORKER NAMES HAVE LESS PROTECTION THAN TOKEN LABELS, NOT MORE. They are
+  // validated for LENGTH ONLY — TrimSpace plus a 200-byte cap — and `workers.name` is
+  // a bare `text NOT NULL` with no CHECK, so a bidi override or a zero-width character
+  // is storable in one.
+  //
+  // React escapes HTML, so there is no XSS here and that is not the claim. Escaping
+  // does nothing to an RLO, which reorders the text AROUND it and can make a worker
+  // render as one it is not — the F12 hazard closed for labels, left open for names.
+  //
+  // MUTATION THIS CATCHES: dropping the strip from the name span. Measured — reverting
+  // it to a bare `{w.name}` reddens exactly this one test, and nothing else.
+  //
+  // The HELPER is stripUnsafeChars, not sanitizeLabel, and this line said the latter
+  // until main's issue #124 work and this branch met in a merge. Both close the same
+  // hazard on the same cell; stripUnsafeChars is the superset (Cc+Cf, sparing \n and
+  // \t) where sanitizeLabel is Cf-only by design, because sanitizeLabel mirrors the Go
+  // validateSecretLabel predicate for TOKEN LABELS and a name has no validator to
+  // mirror. The fixture below plants a bidi override, which both strip, so the fixture
+  // cannot tell them apart — the reason to prefer the superset is the bare ESC a name
+  // can also carry, which only stripUnsafeChars removes.
+  //
+  // The join-token echo below still calls sanitizeLabel, so the two name cells in this
+  // file now disagree about the helper. Left as-is deliberately in the merge that
+  // caused it — the echo was not part of the conflict — and recorded here rather than
+  // fixed silently, because the argument above applies to it too.
+  //
+  // The join-token echo. LOW severity and fixed anyway: the name here is the one the
+  // user typed seconds ago in the same session, so a user can only spoof their own
+  // immediate echo — no cross-tenant path, nothing stored-then-surprising, unlike the
+  // list (any age) and the admin view (other people's). Same class, same one-word fix.
+  //
+  // MUTATION THIS CATCHES: reverting the echo to `{newToken.worker}`. Measured — the
+  // suite passed against the raw form until this test existed.
+  it("strips invisible formatting characters from the join-token echo", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.createWorker.mockResolvedValue({
+      worker: aWorker({ id: "w-new", name: "safe\u202Edrowssap" }),
+      token: "uzi_wk_deadbeef",
+    });
+    const { container } = renderPage();
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner-1/), {
+      target: { value: "safe\u202Edrowssap" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
+    await screen.findByText("uzi_wk_deadbeef");
+    expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).toContain("safe");
+  });
+
+  it("strips invisible formatting characters from a worker name", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ name: "safe\u202Edrowssap" })],
+    });
+    const { container } = renderPage();
+    await screen.findByText(/safe/);
+    expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).toContain("safe");
   });
 });

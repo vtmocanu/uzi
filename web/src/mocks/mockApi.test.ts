@@ -330,7 +330,7 @@ describe("mockApi token delete cascades like ON DELETE SET NULL (PRD #104 D5)", 
     const { workers } = await api.listWorkers();
     const target = workers[0];
     const other = workers[1];
-    await api.setWorkerToken(target.id, "cascade-key");
+    await api.setWorkerBindMode(target.id, "pinned", "cascade-key");
 
     const beforeList = (await api.listWorkers()).workers;
     const beforeOther = beforeList.find((w) => w.id === other?.id);

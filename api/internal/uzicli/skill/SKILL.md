@@ -100,7 +100,9 @@ uzi worker list
 uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
+uzi worker set-token <worker-id> --auto
 uzi token list
+uzi token pool <label> --on|--off
 uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
@@ -245,20 +247,43 @@ as inert data.
 - `uzi worker list` — your workers. `uzi worker rm <worker-id>` — delete one of
   your workers (its runs requeue). There is no `worker create`: minting a join
   token is a web action, because the token can read decrypted secrets.
-- `uzi worker set-token <worker-id> <label>` — point a worker at one of your
-  named Anthropic tokens, so its runs spend that credential instead of your
-  default one; `--default` clears the binding again. It takes effect on the
-  worker's **next claim** — no restart, no new join token — and `worker list`
-  shows the binding as `anthropic_secret_label` (null ⇒ your default). Rebinding
-  is allowed from the CLI, unlike minting, because it hands you no credential you
-  do not already own. Two caveats worth knowing: a worker's **chat** runs still
-  spend your default token (the binding covers the run lane), and deleting a
-  bound token silently returns its workers to the default rather than failing.
-- `uzi token list` — your named Anthropic tokens (id, label, default flag, created
-  date; never the value). It is READ-ONLY here: adding, renaming, set-defaulting and
+- `uzi worker set-token <worker-id> <label>|--default|--auto` — choose which
+  Anthropic credential a worker's runs spend. A **label** pins it to that token;
+  **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
+  the tokens you opted into the pool with `uzi token pool`, preferring the account
+  with the most rate-limit headroom (PRD #111). Exactly one of the three is
+  required. It takes effect on the worker's **next claim** — no restart, no new
+  join token — and `worker list` shows `anthropic_bind_mode` alongside
+  `anthropic_secret_label`. Rebinding is allowed from the CLI, unlike minting,
+  because it hands you no credential you do not already own. Three caveats worth
+  knowing: a worker's **chat** runs still spend your default token whatever the
+  mode (the binding covers the run lane); deleting a pinned token silently returns
+  its workers to the default rather than failing, and `anthropic_bind_mode` then
+  reports `default` rather than a pin to a token that is gone; and `--auto` with an
+  empty or entirely stale pool also falls back to your default, so it never fails a
+  run for want of a candidate.
+- `uzi token list` — your named Anthropic tokens (id, label, default flag, pool
+  opt-in, created date; never the value). Adding, renaming, set-defaulting and
   deleting a token are web-only, because they mint or replace a credential and must
   not be reachable from a CLI token (PRD #104 D8, the same reason `uzi worker` has no
   `create`). Use the labels this lists as the argument to `uzi worker set-token`.
+- `uzi token pool <label> --on|--off` — opt one of your tokens into or out of the
+  pool an `auto` worker may spend from (PRD #111). It is the ONE token write the CLI
+  can reach, and it has its own narrow route for exactly that reason: it mints
+  nothing and reveals nothing, it only re-points spend among tokens you already hold.
+  The pool is empty by default on purpose — a pool that helped itself to every
+  credential would spend the one you reserved for something else. **Opting a token in
+  does not guarantee it gets picked**: the selector also needs a fresh rate-limit
+  reading for it. `uzi token list` shows that as two separate columns — `POOL` is
+  your opt-in, `ELIGIBLE` is whether the selector could pick it *right now*
+  (`eligible`, or `no_reading` / `stale` / `unmeasured` / `below_threshold` when it
+  could not; `-` when the token is not pooled, `?` when the reading could not be
+  fetched). Check `ELIGIBLE` after opting a token in: a token uzi has never managed
+  to poll stays unpickable while looking active. Under `--json` the same answer is
+  the `auto_status` field, always present, and **`null` when it is not known** (the
+  meters read failed) — which is not the same as "not eligible", so branch on null
+  before you branch on the value. An un-pooled token reports `not_pooled` there
+  rather than the table's `-`.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

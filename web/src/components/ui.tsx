@@ -167,6 +167,8 @@ export function Badge({
   title,
   dot = false,
   pulse = false,
+  wrap = false,
+  ...aria
 }: {
   children: ReactNode;
   tone?: BadgeTone;
@@ -175,12 +177,20 @@ export function Badge({
   // pulse animates the dot (dot must also be set) — used for a still-running state,
   // mirroring StatusPill's running pulse.
   pulse?: boolean;
+  // wrap opts OUT of whitespace-nowrap (web-ux F20). The default stays nowrap because
+  // most badges are one or two words and a wrapped status pill looks broken — but a
+  // badge carrying a sentence-length string overflows the viewport instead, measured
+  // at 389px on a 375px screen. The caller knows which it is; the component cannot.
+  wrap?: boolean;
+  "aria-describedby"?: string;
 }) {
   return (
     <span
       title={title}
+      {...aria}
       className={cx(
-        "inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+        "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+        wrap ? "whitespace-normal" : "whitespace-nowrap",
         BADGE_TONES[tone],
       )}
     >

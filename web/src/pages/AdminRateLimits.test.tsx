@@ -40,7 +40,18 @@ function row(name: string, limits: MyRateLimits, vault_locked = false): AdminRat
     tokens:
       limits.status === "no_token"
         ? []
-        : [{ secret_id: `sec-${name}`, label: "default", is_default: true, limits }],
+        : [
+            {
+              secret_id: `sec-${name}`,
+              label: "default",
+              is_default: true,
+              // PRD #111 M2 rides every token row; these fixtures are about the
+              // rate-limit classification, so they stay un-pooled.
+              auto_eligible: false,
+              auto_status: "not_pooled" as const,
+              limits,
+            },
+          ],
   };
 }
 

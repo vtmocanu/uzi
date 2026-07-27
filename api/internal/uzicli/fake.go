@@ -54,6 +54,18 @@ type FakeClient struct {
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
+	// SetTokenAutoEligible capture (PRD #111 M2): the secret id the command
+	// RESOLVED the label to, and the boolean it sent. The id is what proves the
+	// label→id resolution happened client-side against the caller's own list rather
+	// than the label being posted to the server.
+	LastPoolSecretID string
+	LastPoolValue    bool
+	PoolSecret       apitypes.SecretDTO
+
+	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
+	// meters, each carrying the server-computed auto-selection status.
+	SelfMeters []apitypes.TokenRateLimitDTO
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets []apitypes.SecretDTO
 
@@ -62,7 +74,11 @@ type FakeClient struct {
 	// same value the command passes for --default, so the tests assert on both.
 	LastSetTokenWorkerID string
 	LastSetTokenLabel    string
-	SetTokenWorker       apitypes.WorkerDTO
+	// LastSetTokenMode is the PRD #111 M3 bind mode the command sent. Recorded
+	// separately from the label because the two are what a caller can get WRONG
+	// together — "auto" with a leftover label is the realistic half-updated client.
+	LastSetTokenMode string
+	SetTokenWorker   apitypes.WorkerDTO
 
 	// Agent memory (PRD #90): ListMemory returns Memories; DeleteMemory records the
 	// id it was asked to purge.
@@ -192,14 +208,31 @@ func (f *FakeClient) ListSecrets(context.Context) ([]apitypes.SecretDTO, error) 
 	return f.Secrets, nil
 }
 
+func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	f.LastPoolSecretID = id
+	f.LastPoolValue = eligible
+	if f.Err != nil {
+		return apitypes.SecretDTO{}, f.Err
+	}
+	return f.PoolSecret, nil
+}
+
+func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.SelfMeters, nil
+}
+
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.LastDeletedWorkerID = id
 	return f.Err
 }
 
-func (f *FakeClient) SetWorkerToken(_ context.Context, id, label string) (apitypes.WorkerDTO, error) {
+func (f *FakeClient) SetWorkerBindMode(_ context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
 	f.LastSetTokenWorkerID = id
 	f.LastSetTokenLabel = label
+	f.LastSetTokenMode = mode
 	if f.Err != nil {
 		return apitypes.WorkerDTO{}, f.Err
 	}

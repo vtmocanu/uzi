@@ -11,6 +11,11 @@ import {
   HealthFlag,
   derivePlanRevision,
 } from "./RunView";
+// ?raw rather than node:fs — the web tsconfig has no node types, and this repo
+// already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
+// and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
+// against the real file under both tsc and vitest.
+import runViewSource from "./RunView.tsx?raw";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -79,6 +84,10 @@ function run(over: Partial<Run>): Run {
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,
@@ -974,5 +983,63 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
     // The superseded v1 is preserved in the collapsed history accordion.
     expect(container.textContent).toContain("superseded");
     expect(container.textContent).toContain("v1 body");
+  });
+});
+
+// PRD #111 M1: the credential chip must be WIRED INTO the page, not merely exist.
+//
+// Measured before this test was written: deleting `<RunCredential run={run} />` from
+// RunView left the entire web suite green — 94 files, 1069 tests, exit 0. The
+// component had its own unit tests and the page fixtures had gained two fields, but
+// nothing anywhere asserted the two were connected, so M1's only user-visible web
+// surface was effectively untested.
+//
+// A SOURCE assertion rather than a render one, and the limit is worth stating: the
+// chip sits inside PageHeader's titleNode, deep in the page component, which this
+// file does not render (it exports and tests the panels, not the page — rendering it
+// needs a router, the auth context and a live WS stream). So this proves the wiring
+// EXISTS; RunCredential.test.tsx proves what it renders. Together they cover what a
+// single page-level render would, and this half reddens on exactly the mutation that
+// went undetected.
+describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
+  // 🔴 A SOURCE-TEXT CONTROL IS SATISFIED BY DISABLED CODE, and the first version of
+  // this guard was. `toContain` over raw file text does not know what a comment is,
+  // so `{/* <RunCredential run={run} /> */}` passed while the chip rendered nowhere.
+  // Measured: deleting the JSX reddened, commenting it out left all 42 green.
+  //
+  // The generalisation is worth more than the fix, because this is the SECOND
+  // presence-over-source control on this branch (with M3-D's backfill assertion):
+  // a control that asserts something EXISTS in source must strip comments first, or
+  // it proves only that the text is present, not that it runs. Note the direction
+  // matters — an ABSENCE assertion (see rateLimits.ts's "derives nothing" guard) is
+  // correct to ignore commented-out code, because disabled code is not a second
+  // implementation. Presence and absence have opposite relationships to comments.
+  // (This said THIRD while naming two; the commit that introduced it argued in its
+  // own message that it is two and not three, so the artefact a reader finds here
+  // carried the very miscount the commit was written to correct.)
+  //
+  // 🔴 STRIPPING COMMENTS CLOSES ONE MEMBER OF THE CLASS, NOT THE CLASS. The class is
+  // DISABLED CODE, and a comment is only one way to disable something. Measured
+  // against RunView.tsx: `{/* … */}`, `/* … */` and `// …` all redden now, but
+  // `{false && <RunCredential run={run} />}` still PASSES — and it is not a comment,
+  // so no amount of comment-stripping reaches it. The honest ceiling of any
+  // source-text presence guard is "the text is present", never "it runs", which is
+  // what the block comment above already says and what stays true after this fix.
+  // Closing the rest needs a real render, which this file cannot do (the chip sits in
+  // PageHeader's titleNode and the page needs a router, the auth context and a live
+  // WS stream). ACKNOWLEDGED GAP, covered by the web-ux browser pass — recorded here
+  // so the next reader does not see three comment forms handled and conclude the
+  // class is closed.
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "") // JSX comments
+    .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+    .replace(/^\s*\/\/.*$/gm, ""); // line comments
+
+  it("renders the credential chip in the run header", () => {
+    expect(live).toContain("<RunCredential run={run} />");
+  });
+
+  it("imports the component it renders", () => {
+    expect(live).toContain('from "../components/RunCredential"');
   });
 });

@@ -292,7 +292,11 @@ type Run struct {
 	MrWebUrl             pgtype.Text        `json:"mr_web_url"`
 	PrdDonePath          pgtype.Text        `json:"prd_done_path"`
 	// When the PRD-link patch edge was consumed (patched, no-match, MR closed unmerged, or superseded). NULL with prd_done_path set = still pending.
-	PrdPatchSettledAt pgtype.Timestamptz `json:"prd_patch_settled_at"`
+	PrdPatchSettledAt     pgtype.Timestamptz `json:"prd_patch_settled_at"`
+	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
+	AnthropicSelectReason pgtype.Text        `json:"anthropic_select_reason"`
+	AnthropicHeadroomPct  pgtype.Int2        `json:"anthropic_headroom_pct"`
 }
 
 type RunMessage struct {
@@ -406,15 +410,16 @@ type User struct {
 }
 
 type UserSecret struct {
-	ID         uuid.UUID          `json:"id"`
-	UserID     uuid.UUID          `json:"user_id"`
-	Kind       string             `json:"kind"`
-	Ciphertext []byte             `json:"ciphertext"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
-	SealedWith string             `json:"sealed_with"`
-	Label      string             `json:"label"`
-	IsDefault  bool               `json:"is_default"`
+	ID           uuid.UUID          `json:"id"`
+	UserID       uuid.UUID          `json:"user_id"`
+	Kind         string             `json:"kind"`
+	Ciphertext   []byte             `json:"ciphertext"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	SealedWith   string             `json:"sealed_with"`
+	Label        string             `json:"label"`
+	IsDefault    bool               `json:"is_default"`
+	AutoEligible bool               `json:"auto_eligible"`
 }
 
 type UserVault struct {
@@ -447,6 +452,7 @@ type Worker struct {
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 }
 
 type WorkerUpgradeMute struct {
