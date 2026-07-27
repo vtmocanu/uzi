@@ -294,6 +294,14 @@ type Store interface {
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
+	// Per-run credential attribution (PRD #111 M1): the two owner-scoped metadata
+	// reads that give openAnthropic the id + label to record, and the write that
+	// records them. Both reads return the label ALONGSIDE the id from one row —
+	// resolving the id and then looking its label up separately would be an
+	// unscoped cross-tenant read, so there is deliberately no such query.
+	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
+	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
+	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
@@ -764,9 +772,49 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
-// openAnthropic opens the decrypted Anthropic token for one run — the one secret
-// the run lane, the judge lane and the chat lane all deliver, and the ONE place
-// credential resolution happens. The vault-dispatch logic (dek needs unlock,
+// claimCred is the concrete Anthropic credential ONE claim spends: the identity to
+// record on the run, the label to snapshot alongside it, and the plaintext to ship
+// in the claim payload. It exists because openAnthropic used to hand back only
+// []byte — the credential was chosen and then forgotten, which is exactly why a run
+// could never answer "which account paid for this?" (PRD #111 M1, D8).
+//
+// Token is secret bytes. Nothing may log this struct whole.
+type claimCred struct {
+	ID    uuid.UUID
+	Label string
+	Token []byte
+}
+
+// Selection reasons recorded in runs.anthropic_select_reason — the MODE that named
+// the credential, which is what a user actually needs to read (D20: an auto pick and
+// a default fallback can name the same token, and PRD #104's compatibility path
+// creates a row labelled literally "default", so the label alone answers nothing).
+//
+// M1 can only ever distinguish these two, because auto does not exist yet: a
+// resolved binding (a worker's, or the judge lane's) is "pinned", the absence of one
+// is "default". PRD #111 M4 adds "auto", "best_of_pool", "pool_empty", "pool_stale"
+// and "open_failed" to this vocabulary; the column carries no CHECK until then
+// (see migration 00086 for why).
+const (
+	selectReasonDefault = "default"
+	selectReasonPinned  = "pinned"
+)
+
+// selectReasonFor names the mode that produced a claim's secretID override, in M1's
+// two-value vocabulary. It takes the OVERRIDE rather than the resolved credential on
+// purpose: after resolution both cases are just an id, and "the owner's default" and
+// "a binding that happens to name the default token" are different facts that a user
+// reading the run view needs told apart.
+func selectReasonFor(secretID *uuid.UUID) string {
+	if secretID == nil {
+		return selectReasonDefault
+	}
+	return selectReasonPinned
+}
+
+// openAnthropic resolves AND opens the Anthropic credential for one run — the one
+// secret the run lane, the judge lane and the chat lane all deliver, and the ONE
+// place credential resolution happens. The vault-dispatch logic (dek needs unlock,
 // legacy master opens regardless, nil vault → master box) lives in secretopen,
 // shared with the rate-limit poller (PRD #53); this method maps its sentinels back
 // to workersvc's domain errors, preserving the exact prior behavior: a lock
@@ -775,33 +823,121 @@ var errVaultLocked = errors.New("vault locked during claim")
 // never includes secret bytes).
 //
 // secretID is the binding-else-default seam (PRD #104 M1): nil resolves the user's
-// default token, non-nil resolves that specific credential. All three lanes pass
-// nil today; M3 threads a worker's anthropic_secret_id through it and M4 the
-// judge lane's, so neither has to restructure this function — which is what keeps
-// them file-disjoint, and what keeps resolution in one place instead of three
-// copies drifting apart (R4). A bound id that is not the caller's is ErrNoSecret,
-// i.e. errCredentialUnavailable, never another user's credential (D11).
-func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) ([]byte, error) {
-	var tok []byte
+// default token, non-nil resolves that specific credential. The run lane passes a
+// worker's anthropic_secret_id (M3) or the owner's judge binding for self_improve
+// (M4), the judge lane its own, and the chat lane always nil (chat is deliberately
+// not bindable, D5). Keeping every lane on this one function is what keeps
+// resolution in one place instead of three copies drifting apart (R4). A bound id
+// that is not the caller's is ErrNoSecret, i.e. errCredentialUnavailable, never
+// another user's credential (D11).
+//
+// 🔴 IT NOW RESOLVES THE DEFAULT EXPLICITLY, AND THAT IS THE POINT (PRD #111 D8).
+// The nil case used to hand the whole job to secretopen.Open, which resolves
+// "the user's default of this kind" INSIDE its ciphertext query and returns only
+// plaintext — so there was no id for the caller to record, and a run could not name
+// what it spent. Now the default is resolved to (id, label) first and the open
+// always goes by id, which makes the recorded id provably the opened one.
+//
+// The resolution is equivalent, not merely similar: GetDefaultUserSecretMeta's
+// predicate (user_id AND kind AND is_default) is character-identical to
+// GetUserSecretCiphertext's, both match at most one row under 00077's partial unique
+// index, and the open then reads that row's own sealed_with and kind for the DEK AAD.
+// Same row, same crypto.
+//
+// The one thing that DOES change is a race window, and it is deliberate: between
+// resolving the id and opening it the user could set a different default, and this
+// run now opens the id it resolved rather than whatever the default became. That is
+// D8's entire purpose — recorded id == opened id — and it is the safer of the two
+// orderings, so do not "fix" it. The narrow cost, accepted knowingly: if the token is
+// DELETED inside that window the open now fails (errCredentialUnavailable, a terminal
+// run failure) where the single-statement form would have opened the new default.
+// PRD #111 D14 adds a retry for the auto lane specifically; a run whose owner deletes
+// the credential mid-claim failing is the same outcome as deleting it a moment
+// earlier.
+//
+// Both metadata lookups are OWNER-SCOPED IN THEIR OWN PREDICATE, and that is not
+// decoration: they run BEFORE the open, so an unscoped by-id lookup would put another
+// user's label in hand at exactly the point M1 records it — a claim that then fails
+// on the open, having already leaked what it was going to record.
+func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (claimCred, error) {
+	var meta struct {
+		ID    uuid.UUID
+		Label string
+	}
 	var err error
 	if secretID != nil {
-		tok, err = secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, *secretID)
+		var row store.GetUserSecretMetaByIDRow
+		row, err = s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
+			ID:     *secretID,
+			UserID: userID,
+		})
+		meta.ID, meta.Label = row.ID, row.Label
 	} else {
-		tok, err = secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+		var row store.GetDefaultUserSecretMetaRow
+		row, err = s.q.GetDefaultUserSecretMeta(ctx, store.GetDefaultUserSecretMetaParams{
+			UserID: userID,
+			Kind:   store.KindAnthropicToken,
+		})
+		meta.ID, meta.Label = row.ID, row.Label
 	}
+	if err != nil {
+		// pgx.ErrNoRows here is "no such credential for this user", which is the
+		// SAME fact secretopen.ErrNoSecret carried before and must keep producing
+		// the identical failure-reason text: a token-less user's run has always
+		// failed with this string, and it is read by e2e and handler assertions.
+		// Anything else is a real lookup error, surfaced verbatim (no secret bytes).
+		if errors.Is(err, pgx.ErrNoRows) {
+			return claimCred{}, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+		}
+		return claimCred{}, fmt.Errorf("anthropic credential lookup: %w", err)
+	}
+
+	tok, err := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, meta.ID)
 	switch {
 	case err == nil:
-		return tok, nil
+		return claimCred{ID: meta.ID, Label: meta.Label, Token: tok}, nil
 	case errors.Is(err, secretopen.ErrVaultLocked):
-		return nil, errVaultLocked
+		return claimCred{}, errVaultLocked
 	case errors.Is(err, secretopen.ErrNoSecret):
-		return nil, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+		return claimCred{}, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
 	case errors.Is(err, secretopen.ErrUndecryptable):
-		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
+		return claimCred{}, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	default:
 		// A DB lookup/internal error, surfaced verbatim (carries no secret bytes).
-		return nil, err
+		return claimCred{}, err
 	}
+}
+
+// recordRunCredential persists WHICH credential a claim spent, on the run it was
+// assembled for (PRD #111 M1). Called by all three lanes, always AFTER a successful
+// open — an unopened credential was never spent and must never be recorded as if it
+// were.
+//
+// A failure here fails the claim, deliberately. The alternative (log and carry on)
+// would deliver a payload whose spend is attributable to nothing, which is the
+// silent-wrong-attribution failure this milestone exists to remove; and it is not
+// costly, because the run is 'claimed' with no payload delivered, which
+// SweepClaimedNeverStarted already requeues at ClaimGrace. A 0-row result is the one
+// case that is NOT an error: it means the run vanished under us (its forge
+// connection cascade-deleted the repo → run), which every other claim-path reader
+// treats as errRunVanished and drops.
+func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, reason string) error {
+	n, err := s.q.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
+		AnthropicSecretID:     pgUUID(cred.ID),
+		AnthropicSecretLabel:  pgText(cred.Label),
+		AnthropicSelectReason: pgText(reason),
+		// NULL until M4 has a measured headroom to record; M5 renders it.
+		AnthropicHeadroomPct: pgtype.Int2{},
+		ID:                   run.ID,
+		UserID:               run.UserID,
+	})
+	if err != nil {
+		return fmt.Errorf("record run anthropic credential: %w", err)
+	}
+	if n == 0 {
+		return errRunVanished
+	}
+	return nil
 }
 
 // claimSecretID resolves WHICH credential a run-lane claim spends, and is the one
@@ -873,10 +1009,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
-	anthropic, err := s.openAnthropic(ctx, run.UserID, secretID)
+	cred, err := s.openAnthropic(ctx, run.UserID, secretID)
 	if err != nil {
 		return nil, err
 	}
+	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
+	// opened at this point, so from the run's perspective it is already the account
+	// this claim commits to, whether or not the rest of assembly succeeds.
+	if err := s.recordRunCredential(ctx, run, cred, selectReasonFor(secretID)); err != nil {
+		return nil, err
+	}
+	anthropic := cred.Token
 
 	// Only the templates allocated to this run's owner ride the claim (PRD #18
 	// M7): builtin/global defaults ± the owner's overlay + the owner's own

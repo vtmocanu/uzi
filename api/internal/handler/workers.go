@@ -303,6 +303,14 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		v := r.MrIid.Int64
 		dto.MrIID = &v
 	}
+	// PRD #111 M1. Mapped INDEPENDENTLY, not as a pair: the FK nulls the id when the
+	// credential is deleted while the snapshotted label stays, so a historical run
+	// legitimately carries a label with no id and the UI still names the account.
+	if r.AnthropicSecretID.Valid {
+		s := uuid.UUID(r.AnthropicSecretID.Bytes).String()
+		dto.AnthropicSecretID = &s
+	}
+	dto.AnthropicSecretLabel = textPtrValue(r.AnthropicSecretLabel.Valid, r.AnthropicSecretLabel.String)
 	// PRD #37. A decode error should be impossible (the API validates every write
 	// and both columns carry a jsonb_typeof CHECK); it is logged and treated as
 	// "not reported" rather than failing the read of an otherwise-fine run.

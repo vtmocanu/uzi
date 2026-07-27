@@ -114,6 +114,51 @@ func (q *Queries) GetDefaultUserSecretID(ctx context.Context, arg GetDefaultUser
 	return id, err
 }
 
+const getDefaultUserSecretMeta = `-- name: GetDefaultUserSecretMeta :one
+SELECT id, label FROM user_secrets
+WHERE user_id = $1 AND kind = $2 AND is_default
+`
+
+type GetDefaultUserSecretMetaParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Kind   string    `json:"kind"`
+}
+
+type GetDefaultUserSecretMetaRow struct {
+	ID    uuid.UUID `json:"id"`
+	Label string    `json:"label"`
+}
+
+// Resolve the user's default secret of a kind to its id AND its label, in one
+// owner-scoped read (PRD #111 M1, D8). This is GetDefaultUserSecretID plus the
+// label, and the two exist side by side rather than one replacing the other
+// because their callers want different things: the poller and the secrets handler
+// want only the id, the claim path wants the label too so the run can SNAPSHOT
+// which account it spent.
+//
+// The predicate is character-identical to GetUserSecretCiphertext's
+// (WHERE user_id AND kind AND is_default, :112) on purpose. D8 replaces
+// "open the default" with "resolve the default, then open THAT id", and the
+// equivalence of the two resolutions is what makes that a no-op for behavior: same
+// row, same sealed_with, same kind-derived DEK AAD. The partial unique index from
+// 00077 makes at most one row match, which is what keeps this :one.
+//
+// Both columns come from ONE owner-scoped row on purpose. Resolving the id here
+// and then looking the label up separately by id would be a cross-tenant read with
+// no owner predicate; there is deliberately no such second query to reach for.
+//
+// pgx.ErrNoRows means the user has no secret of the kind at all, and the claim
+// path MUST keep mapping that to its existing "no Anthropic token configured for
+// this user" credential failure — a token-less user's run has always failed that
+// way, and leaking a different error from here would silently rewrite
+// runs.failure_reason for a case that has not changed.
+func (q *Queries) GetDefaultUserSecretMeta(ctx context.Context, arg GetDefaultUserSecretMetaParams) (GetDefaultUserSecretMetaRow, error) {
+	row := q.db.QueryRow(ctx, getDefaultUserSecretMeta, arg.UserID, arg.Kind)
+	var i GetDefaultUserSecretMetaRow
+	err := row.Scan(&i.ID, &i.Label)
+	return i, err
+}
+
 const getUserSecretCiphertext = `-- name: GetUserSecretCiphertext :one
 SELECT ciphertext, sealed_with FROM user_secrets
 WHERE user_id = $1 AND kind = $2 AND is_default
@@ -241,6 +286,45 @@ func (q *Queries) GetUserSecretIDByLabel(ctx context.Context, arg GetUserSecretI
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const getUserSecretMetaByID = `-- name: GetUserSecretMetaByID :one
+SELECT id, label FROM user_secrets
+WHERE id = $1 AND user_id = $2
+`
+
+type GetUserSecretMetaByIDParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetUserSecretMetaByIDRow struct {
+	ID    uuid.UUID `json:"id"`
+	Label string    `json:"label"`
+}
+
+// The by-id counterpart of GetDefaultUserSecretMeta (PRD #111 M1): the label of
+// ONE named credential, for the same snapshot, on the bound paths (a worker's
+// binding, the judge lane's).
+//
+// Owner-scoped in the predicate exactly as GetUserSecretCiphertextByID is
+// (WHERE id AND user_id, :127), so a caller supplying another user's secret id
+// gets no rows rather than that user's label. That matters more here than it looks:
+// the id is opened by secretopen.OpenByID, which re-scopes and would refuse a
+// foreign row anyway — but this query runs FIRST, and without the predicate the
+// claim would fail with another user's label already in hand at the exact point
+// M1 records it and M5 renders it.
+//
+// Deliberately NOT filtered on kind, matching GetUserSecretCiphertextByID: the
+// open reads the row's own kind for the DEK AAD, and adding a kind predicate here
+// would change what an (already impossible) mis-kinded binding fails WITH, for no
+// gain. pgx.ErrNoRows means "not this user's secret, or gone", which the claim path
+// maps to the same credential failure OpenByID's ErrNoSecret produces today.
+func (q *Queries) GetUserSecretMetaByID(ctx context.Context, arg GetUserSecretMetaByIDParams) (GetUserSecretMetaByIDRow, error) {
+	row := q.db.QueryRow(ctx, getUserSecretMetaByID, arg.ID, arg.UserID)
+	var i GetUserSecretMetaByIDRow
+	err := row.Scan(&i.ID, &i.Label)
+	return i, err
 }
 
 const insertUserSecret = `-- name: InsertUserSecret :one

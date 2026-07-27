@@ -437,6 +437,40 @@ JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
 WHERE r.id = @run_id;
 
+-- name: SetRunAnthropicSecret :execrows
+-- Record WHICH Anthropic credential this claim spends (PRD #111 M1). Written by
+-- every claim lane — run, judge and chat — after a SUCCESSFUL open, so the
+-- recorded id is provably the id whose ciphertext was decrypted (D8) rather than
+-- whatever the user's default happened to be a moment later.
+--
+-- The label is a SNAPSHOT, not a denormalisation to keep in sync: 00086's FK nulls
+-- the id when the token is deleted, and a rename rewrites the label in place, so
+-- the snapshot is the only thing that keeps a finished run's history readable
+-- after either. It is written from the SAME owner-scoped row that produced the id
+-- (GetDefaultUserSecretMeta / GetUserSecretMetaByID), never looked up separately.
+--
+-- Owner-scoped even though the caller only ever passes the run it just claimed.
+-- That is the same self-standing-scope argument ListRunsForUser's rv.user_id join
+-- predicate makes: without it this write is safe only because of a fact maintained
+-- in another file (ClaimRun/ClaimChatRun are user-scoped), and it costs nothing to
+-- make it true here instead. A mismatched pair returns 0 rows rather than writing.
+-- The FK is the other half — recording a credential the run's owner does not own
+-- is rejected by the database, not by this predicate.
+--
+-- reason is the mode that named the credential; headroom is NULL until M4 has one
+-- to record (see 00086). updated_at follows house style and is safe here
+-- specifically because the run is 'claimed' at this instant: ClaimRun's affinity
+-- predicate reads r.updated_at only for status = 'queued' rows (:406), and
+-- ListActiveRunsForHealth deliberately excludes 'claimed'. No reader of
+-- runs.updated_at applies to a claimed run.
+UPDATE runs
+SET anthropic_secret_id     = @anthropic_secret_id,
+    anthropic_secret_label  = @anthropic_secret_label,
+    anthropic_select_reason = @anthropic_select_reason,
+    anthropic_headroom_pct  = sqlc.narg('anthropic_headroom_pct'),
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id;
+
 -- name: SetRunRunning :execrows
 -- claimed/awaiting_approval → running, AND running → running: the worker reports
 -- this state more than once per run (once on claim, again after checkout with the

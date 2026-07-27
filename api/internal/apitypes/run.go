@@ -101,10 +101,36 @@ type RunDTO struct {
 	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
 	// nil slice) on the list/create/worker DTOs, which never drive the picker.
 	OwnAgents []RepoAgent `json:"own_agents"`
+	// Which Anthropic credential this run's claim actually spent (PRD #111 M1) —
+	// the answer to "which account paid for this run?", which run_usage alone could
+	// never give. Both null for a run claimed before the feature landed, and for a
+	// run that has not been claimed yet.
+	//
+	// The two are NOT redundant and they go null independently. The label is a
+	// SNAPSHOT taken at claim time, so it survives the token being renamed or
+	// deleted; the id is live and goes null (ON DELETE SET NULL, migration 00086)
+	// when the token is deleted. So `id == null, label != null` is the normal state
+	// of a historical run whose credential is gone — render the label, and treat the
+	// id as a link target only when present.
+	//
+	// The label is USER-SUPPLIED text (validateSecretLabel permits Unicode Cf,
+	// including bidi overrides), so any consumer writing it to a terminal must
+	// sanitize; the CLI routes it through cellText for exactly this.
+	//
+	// This DTO is owner-or-admin scoped throughout (ListRuns owner-only,
+	// AdminListRuns admin-only, GetRun owner-or-admin), which is why the label rides
+	// unconditionally here as failure_reason does. The SHARED board is a different
+	// struct with a different rule — a token label names another user's billing
+	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
+	AnthropicSecretID    *string `json:"anthropic_secret_id"`
+	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
 	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
 	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
 	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;
 	// nil on the create/worker DTO paths, which never render usage.
+	//
+	// Since PRD #111 M1 it can finally be read TOGETHER with the two fields above:
+	// what a run cost, and which credential it cost it against.
 	Usage *UsageDTO `json:"usage,omitempty"`
 }
 

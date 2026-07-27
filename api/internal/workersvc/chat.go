@@ -174,10 +174,19 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 
 	// nil, and it stays nil: chat is deliberately NOT bindable (PRD #104 D1), so a
 	// bound worker's chat runs still spend the owner's default token.
-	anthropic, err := s.openAnthropic(ctx, run.UserID, nil)
+	cred, err := s.openAnthropic(ctx, run.UserID, nil)
 	if err != nil {
 		return nil, err
 	}
+	// Chat records its credential too (PRD #111 M1). Its reason is always "default"
+	// by construction — the nil above is the whole reason chat is not bindable — but
+	// the RECORD is not redundant: it is what lets M4's in-flight bias see chat spend
+	// against a credential at all (D18), and what makes a chat run's cost attributable
+	// alongside every other lane's.
+	if err := s.recordRunCredential(ctx, run, cred, selectReasonFor(nil)); err != nil {
+		return nil, err
+	}
+	anthropic := cred.Token
 
 	defaultModel, err := s.q.GetUserDefaultModel(ctx, run.UserID)
 	if err != nil {

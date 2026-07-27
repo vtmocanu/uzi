@@ -831,10 +831,27 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** PRD #111 M1: which Anthropic credential this run's claim actually spent —
+   *  what run_usage alone could never say. Both null for a run claimed before the
+   *  feature landed, and for a run not yet claimed.
+   *
+   *  They go null INDEPENDENTLY and that is the design, not a bug to defend
+   *  against: the label is a snapshot taken at claim time and survives the token
+   *  being renamed or deleted, while the id goes null when the token is deleted
+   *  (ON DELETE SET NULL). So `anthropic_secret_id === null` with a non-null label
+   *  is the normal shape of a historical run — render the label, and treat the id
+   *  as a link target only when it is there.
+   *
+   *  The label is USER-AUTHORED text. It is safe as JSX (React escapes it) but must
+   *  never be interpolated into HTML or a URL unescaped. */
+  anthropic_secret_id: string | null;
+  anthropic_secret_label: string | null;
   /** PRD #40: the run's rolled-up token/cost totals (greatest-wins per model,
    *  summed across models — the server's run_usage_totals view). Present only when
    *  the run has usage rows; absent/null for a pre-feature run, so the UI shows
-   *  nothing rather than a fabricated 0. On both the list rows and the detail read. */
+   *  nothing rather than a fabricated 0. On both the list rows and the detail read.
+   *  Since PRD #111 M1 it can be read together with the credential above: what the
+   *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
 }
 

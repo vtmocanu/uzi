@@ -484,6 +484,21 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.StopKind != nil && *r.StopKind != "" {
 		rows = append(rows, []string{"STOP_KIND", sanitizeTTY(*r.StopKind)})
 	}
+	// Which Anthropic credential this run spent (PRD #111 M1). Emitted only when the
+	// server recorded one — a pre-feature or still-queued run has nothing to say and
+	// must not print a blank row.
+	//
+	// Through cellText, NOT sanitizeTTY, and the difference is load-bearing here in a
+	// way it is not for the rows above. This is the first genuinely USER-AUTHORED
+	// string in this block: validateSecretLabel rejects control characters and U+FFFD
+	// but NOT unicode.Cf, so a bidi-override label is storable, and uzicli.Printer.Table
+	// does not sanitize what it is handed. cellText is the table-cell wrapper — it
+	// applies sanitizeTTY (which does strip Cf), folds newlines and tabs, and caps
+	// the length — so it is the only one of the two that keeps a hostile label from
+	// reordering or unaligning the rail it is printed in.
+	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
+		rows = append(rows, []string{"ANTHROPIC_TOKEN", cellText(*r.AnthropicSecretLabel)})
+	}
 	return p.Table(nil, rows)
 }
 

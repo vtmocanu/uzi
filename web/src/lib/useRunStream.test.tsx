@@ -82,6 +82,8 @@ function fakeRun(): Run {
     agent_source: null,
     agent_exclusions: null,
     own_agents: null,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,

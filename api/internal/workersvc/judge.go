@@ -169,10 +169,18 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 	if err != nil {
 		return nil, err
 	}
-	anthropic, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
+	cred, err := s.openAnthropic(ctx, run.UserID, judgeSecret)
 	if err != nil {
 		return nil, err
 	}
+	// The judge lane records what it spent exactly as the run lane does (PRD #111
+	// M1). It is the lane where this matters MOST: the judge binding exists so
+	// retrospectives can be billed to a different account, and until now nothing in
+	// the data said whether they actually were.
+	if err := s.recordRunCredential(ctx, run, cred, selectReasonFor(judgeSecret)); err != nil {
+		return nil, err
+	}
+	anthropic := cred.Token
 
 	var targetRunID *string
 	var signal *JudgeSignal

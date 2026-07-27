@@ -66,3 +66,63 @@ func TestRenderRunDetailForgeAwareMRColumn(t *testing.T) {
 		t.Errorf("a GitLab run must render an MR column, got:\n%s", gl)
 	}
 }
+
+// TestRenderRunDetailAnthropicToken pins `uzi run get`'s ANTHROPIC_TOKEN row
+// (PRD #111 M1) and, more importantly, the sanitization it goes through.
+//
+// The label is the first genuinely USER-AUTHORED string this block renders, and the
+// two facts that make it dangerous are both measured, not assumed:
+// validateSecretLabel (handler/secrets.go) rejects control characters and U+FFFD but
+// NOT unicode.Cf, so a bidi-override label is storable and passes the DB CHECK; and
+// uzicli.Printer.Table does not sanitize what it is handed — it joins the cells and
+// flushes. cellText is what closes that, and this asserts it rather than the row's
+// mere presence, because a row rendered through the wrong helper looks identical
+// until someone stores a hostile label.
+func TestRenderRunDetailAnthropicToken(t *testing.T) {
+	render := func(label *string) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+		r := apitypes.RunDTO{
+			ID: "run-1", Kind: "issue", Status: "completed",
+			IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+			AnthropicSecretLabel: label,
+		}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+
+	label := "console-key"
+	if out := render(&label); !strings.Contains(out, "ANTHROPIC_TOKEN") || !strings.Contains(out, "console-key") {
+		t.Errorf("a run with a recorded credential must name it, got:\n%s", out)
+	}
+
+	// Absent and empty both render NO row: a run that cannot say which account it
+	// billed must not appear to have said something. Empty is unreachable through the
+	// API (user_secrets.label is NOT NULL with a 1..64 CHECK) and is pinned anyway,
+	// because the guard has to be emptiness-based rather than a nil check.
+	if out := render(nil); strings.Contains(out, "ANTHROPIC_TOKEN") {
+		t.Errorf("a run with no recorded credential must render no row, got:\n%s", out)
+	}
+	empty := ""
+	if out := render(&empty); strings.Contains(out, "ANTHROPIC_TOKEN") {
+		t.Errorf("an empty label must render no row, got:\n%s", out)
+	}
+
+	// A bidi override (U+202E RIGHT-TO-LEFT OVERRIDE) plus a CSI escape and a newline:
+	// the escape would repaint the terminal, the override would visually reverse the
+	// label so it READS as a different account, and the newline would break the table
+	// rail. All three must be gone, and the printable text must survive.
+	hostile := "safe‮dnetsop\x1b[31m\nnext-line"
+	out := render(&hostile)
+	for _, bad := range []string{"‮", "\x1b", "\n\nnext-line"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hostile label reached the terminal carrying %q, got:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "safe") || !strings.Contains(out, "next-line") {
+		t.Errorf("sanitizing dropped the printable text too, got:\n%q", out)
+	}
+}

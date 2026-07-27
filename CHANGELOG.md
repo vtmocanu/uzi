@@ -12,6 +12,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Every run now names the Anthropic credential it spent.** The run view carries a `token
+  <label>` chip and `uzi run get` an `ANTHROPIC_TOKEN` row, on all three lanes (issue/ci_fix,
+  judge and chat). Until now a run recorded what it cost but not which account paid, which was
+  a distinction without a difference while a user could hold one token and stopped being one
+  the moment PRD #104 let them hold several. The label is a snapshot taken when the run was
+  claimed, so it survives that token being renamed or deleted: a finished run keeps naming the
+  account it billed even after the credential is gone. Runs claimed before this landed show
+  nothing rather than a guess (PRD #111 M1).
+
 - **A Model column in the run view's per-agent usage table.** The usage panel named the run's
   model only once, in the top strip — the main thread's. A run is multi-model (a subagent can
   pin its own model, PRD #37; the owner's default governs the lead, PRD #69), so the per-agent

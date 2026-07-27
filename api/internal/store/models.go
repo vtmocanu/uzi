@@ -292,7 +292,11 @@ type Run struct {
 	MrWebUrl             pgtype.Text        `json:"mr_web_url"`
 	PrdDonePath          pgtype.Text        `json:"prd_done_path"`
 	// When the PRD-link patch edge was consumed (patched, no-match, MR closed unmerged, or superseded). NULL with prd_done_path set = still pending.
-	PrdPatchSettledAt pgtype.Timestamptz `json:"prd_patch_settled_at"`
+	PrdPatchSettledAt     pgtype.Timestamptz `json:"prd_patch_settled_at"`
+	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
+	AnthropicSelectReason pgtype.Text        `json:"anthropic_select_reason"`
+	AnthropicHeadroomPct  pgtype.Int2        `json:"anthropic_headroom_pct"`
 }
 
 type RunMessage struct {

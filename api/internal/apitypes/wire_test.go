@@ -71,6 +71,9 @@ var runDTOKeys = []string{
 	"pipeline_ref", "pipeline_web_url", "fix_verdict", "claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",
 	"agent_exclusions", "own_agents",
+	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
+	// snapshot and outlives the id, so both keys are always on the wire.
+	"anthropic_secret_id", "anthropic_secret_label",
 }
 
 func TestRunDTOTags(t *testing.T) {
