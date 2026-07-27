@@ -855,6 +855,23 @@ UPDATE runs SET status = 'failed',
     updated_at         = now()
 WHERE id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- limit_wait excluded EXPLICITLY (PRD #35) — the third statement in this file to
+  -- need it, for the same reason as SetRunRunning and SetRunAwaitingApproval above:
+  -- the negative predicate on the line above ADMITS a parked run. Auto-stopping one
+  -- would be wrong on the merits, not merely unreachable: its message writes are not
+  -- in a permanent-failure loop, they have simply STOPPED, because the worker went
+  -- away by design and the server owns the resume.
+  --
+  -- The reason to spend a clause on an unreachable case is that the invariant is
+  -- currently stated in a DIFFERENT PACKAGE from the one that enforces it.
+  -- workersvc/autostop.go's ` + "`" + `if run.Status != "running"` + "`" + ` is the only thing excluding
+  -- a park today, and that line's own comment justifies itself entirely in terms of
+  -- ` + "`" + `queued` + "`" + ` and PRD #108's requeue streak — parking is not mentioned there, because
+  -- it did not exist when it was written. Someone relaxing that Go line later (to
+  -- cover awaiting_approval, say) would make parked runs auto-stoppable with no SQL
+  -- backstop and no failing test. This is that backstop, written where the guard is
+  -- ENFORCED rather than where it is currently derived.
+  AND status <> 'limit_wait'
 `
 
 type FailRunAutoStopParams struct {

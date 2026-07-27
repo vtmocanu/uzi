@@ -43,18 +43,57 @@
 -- column list selected FROM runs and cannot reach a run_messages payload — the
 -- "paused: usage limit (five_hour)" line is unbuildable without it.
 --
--- NO CHECK on rate_limit_type, deliberately, and this is the same argument
--- 00086_run_anthropic_secret.sql made for anthropic_select_reason: the vocabulary
--- is the SDK's, not ours, so an SDK pin bump can add a member and a CHECK written
--- today "would have been rewritten before it ever guarded anything". 00089 closed
--- that column only once its set stopped moving. The Go allowlist is the guard here,
--- and a test pins it against the installed SDK typings.
 ALTER TABLE runs
     ADD COLUMN wait_on_limit    boolean     NOT NULL DEFAULT false,
     ADD COLUMN limit_resets_at  timestamptz,
     ADD COLUMN retry_not_before timestamptz,
     ADD COLUMN limit_wait_count int         NOT NULL DEFAULT 0,
     ADD COLUMN rate_limit_type  text;
+
+-- rate_limit_type IS closed, in the SAME migration that adds the column, and that
+-- is a deliberate departure from 00086's precedent rather than an oversight of it.
+--
+-- 00086 left anthropic_select_reason open and said why: "M4 adds five values inside
+-- this same PRD, so a CHECK written then would have been rewritten before it ever
+-- guarded anything". The discriminating fact there was that the VOCABULARY WAS
+-- STILL MOVING while the PRD ran; 00089 closed it the moment it stopped. This
+-- column's six members are closed at authoring — they are the whole
+-- SDKRateLimitInfo.rateLimitType union at the pinned @anthropic-ai/claude-agent-sdk
+-- (sdk.d.ts) — plus the server's own 'unknown' coercion. Nothing inside PRD #35 adds
+-- a seventh. The only mover is an SDK pin bump, which is external, rare, and
+-- accompanied by a failing test (below) rather than by silence.
+--
+-- WHY A CHECK AT ALL, given the column is display-only — and it is the same
+-- argument 00089 makes, which applies here MORE strongly than it did there. Nothing
+-- branches on this value: it is not read by the state machine, the claim path, any
+-- sweep gate, or the promotion predicate. So a wrong value has no failing consumer
+-- anywhere. It renders as itself in the run view, means nothing to the user, means
+-- nothing to a support query, and now also composes an M5 Slack line. The database
+-- is the only reader positioned to notice.
+--
+-- The CHECK is strictly WEAKER than the Go allowlist the park path applies, so on
+-- the shipped path it can never fire — which is the point. It exists for the writers
+-- that bypass that path: a backfill, an admin tool, a second writer added later, or
+-- a refactor that moves the coercion. An auditor demonstrated the exposure by
+-- storing 5009 bytes containing a control character straight into this column.
+--
+-- HONEST COST, stated rather than buried: if an SDK bump adds a seventh member and
+-- Go is taught it without this migration being amended, a park carrying that value
+-- raises 23514 at runtime — a display nicety turning into a failed run. 00089
+-- accepted exactly that risk and mitigated it the same way this does, with
+-- TestRateLimitTypeVocabularyMatchesCheck, which PARSES THE LIST BELOW out of this
+-- file and compares it to the Go allowlist. Drift therefore reddens at `go test`,
+-- where a developer is, instead of at park time, where a user is.
+--
+-- NULL stays legal and is not an eighth value: every run predating this migration
+-- has one, as does every run that never parks, so a CHECK rejecting NULL would fail
+-- against the existing table at migration time.
+ALTER TABLE runs
+    ADD CONSTRAINT runs_rate_limit_type_check
+        CHECK (rate_limit_type IS NULL OR rate_limit_type IN (
+            'five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet',
+            'seven_day_overage_included', 'overage', 'unknown'
+        ));
 
 -- users --------------------------------------------------------------------
 --
@@ -100,12 +139,43 @@ CREATE INDEX idx_runs_limit_wait_retry
 -- UPDATE: silently rewriting a user's parked run to some other status on a rollback
 -- would lose work that the up-migration promised to resume. Cancel or let the parked
 -- runs drain first.
+--
+-- 🔴 THAT FAIL-LOUD PROPERTY IS ENTIRELY LOAD-BEARING ON GOOSE'S TRANSACTION
+-- WRAPPER, SO DO NOT ADD THE "NO TRANSACTION" ANNOTATION TO THIS FILE.
+-- (Named without its leading plus-goose token on purpose: goose's parser treats ANY
+-- comment line containing that token as an annotation, so merely NAMING it in prose
+-- makes the whole file unparseable at boot — "not supported: invalid annotation",
+-- with every migration after it unapplied. Measured here, on this comment.)
+-- Run in autocommit, the sequence below does not stop at the failing statement: the
+-- DROP INDEX commits, the narrowing ADD CONSTRAINT raises 23514 and is skipped, and
+-- every DROP COLUMN after it commits anyway. The instance is then left with `runs`
+-- carrying NO status CHECK AT ALL — status becomes free text — and the parked run's
+-- five columns gone, which is precisely the data loss the loud failure exists to
+-- prevent. No migration in this repo carries that annotation today, so this is
+-- unreachable as shipped; it is written here because the natural reason to reach for
+-- it is CREATE INDEX CONCURRENTLY, and this is the migration that creates an index
+-- on `runs`, the table that grows without bound. An operator who wants a concurrent
+-- index must split it into its own migration and leave this one transactional.
 DROP INDEX idx_runs_limit_wait_retry;
 
+-- Bare DROP CONSTRAINT, with NO `IF EXISTS`, and the omission is deliberate — it
+-- deviates from 00074's precedent on purpose, so please do not "fix" it.
+-- IF EXISTS turns the one failure mode that is loud and immediate into one that is
+-- silent and deferred: against a database whose status constraint carries a
+-- different auto-generated name, the drop would be skipped, the ADD below would
+-- succeed under the new name, the OLD narrow constraint would survive alongside it,
+-- and then every park would raise 23514 at runtime on a healthy-looking instance.
+-- Failing at boot, on the operator's terminal, naming the constraint, is strictly
+-- better than failing months later on a user's run. The same reasoning applies to
+-- the Up section's drop.
 ALTER TABLE runs DROP CONSTRAINT runs_status_check;
 ALTER TABLE runs ADD CONSTRAINT runs_status_check
     CHECK (status IN ('queued', 'claimed', 'running', 'awaiting_approval',
                       'completed', 'failed', 'cancelled'));
+
+-- runs_rate_limit_type_check needs no explicit drop: DROP COLUMN rate_limit_type
+-- below takes its own constraints with it. Spelled out because its absence here
+-- otherwise reads as the omission it is not.
 
 ALTER TABLE users DROP COLUMN wait_on_limit;
 
