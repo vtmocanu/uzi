@@ -115,6 +115,16 @@ any chip for "as of last sync". A stale **closed** is the case to watch for
 practice, since merging an MR closes its issue and the card leaves the
 board before the state would ever go stale.
 
+## Card labels
+
+Each card also shows its other GitLab labels as small chips, so `bug` or
+`security` is visible without opening the issue. Workflow markers are left
+off: the `PRD` label, the `PRDLESS` escape hatch and the `autopilot` label
+(whatever your admin has configured those to be), plus the card's own column
+label, since a card sitting in `Planned` doesn't need a `Planned` chip too.
+A card carrying many labels shows the first few and a **`+N`** count with the
+rest on hover, so one heavily-labelled issue can't stretch its column.
+
 ## Attention strip
 
 When any of your runs on this board is **awaiting approval**, or the

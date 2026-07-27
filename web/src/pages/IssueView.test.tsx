@@ -181,8 +181,12 @@ describe("IssueView PRDLESS toggle (PRD #22 M4)", () => {
 });
 
 describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
-  // The badge is queried by its distinctive title, since the issue also renders a
-  // label chip named "PRDLESS" — the title disambiguates the badge from the chip.
+  // The badge is queried by its distinctive title rather than its text. That used to
+  // be necessary because the issue ALSO rendered a label chip named "PRDLESS" and the
+  // title was the only thing telling the two apart; since PRD #102 M4 the shared
+  // chipLabels predicate excludes PRDLESS unconditionally, so there is no chip to
+  // collide with. Kept as the query anyway: it is the assertion that does not move
+  // when the label is renamed in settings.
   const BADGE_TITLE = "PRD-link gate bypassed by label";
 
   it("shows the PRDLESS badge, not 'no PRD link', when enabled and labeled", async () => {
@@ -210,6 +214,30 @@ describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
     await screen.findByText("A small typo fix");
     expect(screen.getByText("no PRD link")).toBeTruthy();
     expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+  });
+});
+
+// PRD #102 M4. The issue view had its own ad-hoc chip filter (column, plus PRDLESS
+// only while its badge showed), so PRD and autopilot chips rendered here and not on
+// the board. Both surfaces now share chipLabels.
+describe("IssueView label chips (PRD #102 M4)", () => {
+  it("chips content labels and drops every workflow marker", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({
+        labels: ["PRD", "autopilot", "PRDLESS", "In Progress", "bug"],
+        column: "In Progress",
+        has_prd_link: true,
+      }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("bug")).toBeTruthy();
+    expect(screen.queryByText("PRD")).toBeNull();
+    expect(screen.queryByText("autopilot")).toBeNull();
+    // The issue's own column already names the header badge; a second copy of it as
+    // a chip is the duplication Decision 6's column exclusion exists to prevent.
+    expect(screen.getAllByText("In Progress")).toHaveLength(1);
   });
 });
 

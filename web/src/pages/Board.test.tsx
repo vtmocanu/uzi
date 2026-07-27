@@ -49,12 +49,13 @@ function aCard(over: Partial<Card> = {}): Card {
   } as Card;
 }
 
-function renderCard(over: Partial<Card> = {}) {
+function renderCard(over: Partial<Card> = {}, chips: string[] = []) {
   return render(
     <MemoryRouter>
       <IssueCard
         card={aCard(over)}
         repoId="repo-1"
+        chips={chips}
         gate={{ enabled: true, reason: "" }}
         starting={false}
         onStart={vi.fn()}
@@ -106,6 +107,39 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
   });
 });
 
+// PRD #102 M4. The predicate itself is unit-tested in labelChips.test.ts; these cover
+// what the card does with the result, which is the half a pure test cannot see.
+describe("IssueCard label chips (PRD #102 M4)", () => {
+  it("renders each chip it is handed", () => {
+    renderCard({}, ["bug", "security"]);
+    expect(screen.getByText("bug")).toBeTruthy();
+    expect(screen.getByText("security")).toBeTruthy();
+  });
+
+  it("renders no chip row at all when nothing survives the filter", () => {
+    // A card whose only labels are workflow markers must not grow an empty row.
+    const { container } = renderCard({ labels: ["PRD", "autopilot"] }, []);
+    expect(container.querySelectorAll("span[title]").length).toBe(0);
+  });
+
+  it("caps the visible chips and reports the rest as +N rather than dropping them", () => {
+    // The lane is a fixed w-72; an issue wearing eight labels must not push the card
+    // several rows taller than its neighbours.
+    renderCard({}, ["a", "b", "c", "d", "e", "f"]);
+    expect(screen.getByText("+2")).toBeTruthy();
+    expect(screen.queryByText("e")).toBeNull();
+    expect(screen.queryByText("f")).toBeNull();
+    // Withheld, not lost: the remainder is on the +N title.
+    expect(screen.getByText("+2").getAttribute("title")).toBe("e, f");
+  });
+
+  it("strips format characters out of a chip, which is forge-supplied text (#124)", () => {
+    const { container } = renderCard({}, ["se\u202Ecurity"]);
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("security")).toBeTruthy();
+  });
+});
+
 // PRD #102 Decision 14a. M1 renames the implicit column's DISPLAY string only. Two
 // strings must survive it: `OPEN_KEY` (the internal "") and the literal `"open"`
 // move() sends, which the server matches with EqualFold. A blind Open→Backlog replace
@@ -117,7 +151,13 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     path_with_namespace: "grp/proj",
     web_url: "https://gitlab.example.com/grp/proj",
     forge_type: "gitlab",
-    columns: [{ label_name: "Planned" }, { label_name: "In Progress" }] as BoardData["columns"],
+    columns: [
+      { label_name: "Planned" },
+      { label_name: "In Progress" },
+    ] as BoardData["columns"],
+    // The card WEARS its column label as well as sitting in that column — without
+    // that, the column-exclusion arm of the predicate is never exercised here and a
+    // fold that drops it still passes.
     cards: [aCard({ iid: 7, column: "In Progress", labels: ["PRD", "In Progress", "bug"] })],
     pipeline: null,
     ...over,
@@ -189,5 +229,18 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     drop(laneFor("Planned"), 7);
     await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
     expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 7, "Planned");
+  });
+
+  it("chips a card's content labels and not its column or workflow labels", async () => {
+    // The board-level half of M4: the exclusion set is board.columns + the configured
+    // PRD/autopilot/PRDLESS names, both of which live here and not in the card.
+    renderBoard();
+    await screen.findByText("Backlog");
+    const lane = laneFor("In Progress");
+    expect(within(lane).getByText("bug")).toBeTruthy();
+    // "PRD" is the configured membership label; "In Progress" is this card's own
+    // column and already names the lane it sits in.
+    expect(within(lane).queryByText("PRD")).toBeNull();
+    expect(within(lane).getAllByText("In Progress")).toHaveLength(1);
   });
 });

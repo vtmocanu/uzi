@@ -5,6 +5,7 @@ import { hasAnthropicToken } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
+import { chipLabels } from "../lib/labelChips";
 import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
@@ -34,7 +35,7 @@ export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel } = useAuth();
+  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel } = useAuth();
 
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -87,10 +88,11 @@ export function IssueView() {
   // Forge-first — wait for the 200 and adopt the returned card's labels; no
   // optimistic update, so a failed write leaves the issue's labels untouched.
   const prdlessApplied = !!issue && issue.labels.includes(prdlessLabel);
-  // The bypass badge stands in for the "no PRD link" warning when the feature is
-  // on and the label is applied. When it shows, the PRDLESS label is filtered out
-  // of the raw chip list below so it never renders twice (S1).
-  const showPrdlessBadge = !!issue && !issue.has_prd_link && prdlessEnabled && prdlessApplied;
+  // The bypass badge stands in for the "no PRD link" warning when the feature is on
+  // and the label is applied (its condition is inlined at the badge below). It used
+  // to also drive a conditional filter that kept the PRDLESS label from rendering
+  // twice (S1); since PRD #102 M4 the shared chipLabels predicate excludes PRDLESS
+  // unconditionally, so the double-render is impossible and the flag is gone.
   const togglePrdless = async () => {
     if (!issue) return;
     setError("");
@@ -140,16 +142,29 @@ export function IssueView() {
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
-                {issue.labels
-                  .filter((l) => l && l !== issue.column && !(showPrdlessBadge && l === prdlessLabel))
-                  .map((l) => (
-                    <span
-                      key={l}
-                      className="rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted"
-                    >
-                      {l}
-                    </span>
-                  ))}
+                {/* Same predicate the board cards use (PRD #102 M4, Decision 6), so
+                    the two surfaces agree on what is a content label. The issue view
+                    knows only its own column, so that is the column exclusion set.
+                    This is a behavior change here: PRD / autopilot / PRDLESS chips
+                    used to render on this page and no longer do — PRDLESS was already
+                    suppressed whenever its badge showed, and the Mark/Remove button
+                    below still surfaces the label's state when it does not.
+                    Issue #124: a label name is forge-supplied, so strip it for
+                    display while the React key keeps the raw string. */}
+                {chipLabels(issue.labels, {
+                  prdLabel,
+                  prdlessLabel,
+                  autopilotLabel,
+                  columnLabels: [issue.column],
+                }).map((l) => (
+                  <span
+                    key={l}
+                    title={stripUnsafeChars(l)}
+                    className="rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted"
+                  >
+                    {stripUnsafeChars(l)}
+                  </span>
+                ))}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
                 {!issue.has_prd_link &&
                   (prdlessEnabled && prdlessApplied ? (

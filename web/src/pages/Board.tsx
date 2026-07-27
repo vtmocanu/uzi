@@ -30,6 +30,7 @@ import {
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
+import { boundedChips, chipLabels } from "../lib/labelChips";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
@@ -63,7 +64,7 @@ function columnLabel(card: CardData): string {
 export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
-  const { prdlessEnabled, prdlessLabel } = useAuth();
+  const { prdlessEnabled, prdlessLabel, prdLabel, autopilotLabel } = useAuth();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -317,6 +318,18 @@ export function Board() {
     return cols;
   }, [board]);
 
+  // Label-chip exclusions (PRD #102 M4, Decision 6). The column set is the SAVED
+  // board columns; ColumnSettings' suggester builds its own from unsaved edit state.
+  const chipExclusions = useMemo(
+    () => ({
+      prdLabel,
+      prdlessLabel,
+      autopilotLabel,
+      columnLabels: (board?.columns ?? []).map((c) => c.label_name),
+    }),
+    [board, prdLabel, prdlessLabel, autopilotLabel],
+  );
+
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
     for (const c of board?.cards ?? []) {
@@ -509,6 +522,7 @@ export function Board() {
                     card={card}
                     repoId={repoId}
                     projectWebUrl={board?.web_url}
+                    chips={chipLabels(card.labels, chipExclusions)}
                     gate={startRunGate({
                       hasPrdLink: card.has_prd_link,
                       prdlessBypass: prdlessEnabled && card.labels.includes(prdlessLabel),
@@ -574,6 +588,7 @@ export function IssueCard({
   card,
   repoId,
   projectWebUrl,
+  chips,
   gate,
   starting,
   onStart,
@@ -590,6 +605,11 @@ export function IssueCard({
   card: CardData;
   repoId: string;
   projectWebUrl?: string;
+  // The card's chip-worthy labels, already filtered by chipLabels() (PRD #102 M4).
+  // Passed in rather than derived here: the exclusion set is board-level state
+  // (columns + the configured workflow labels), and keeping it out of the card is
+  // what lets this component mount in a test without an auth provider.
+  chips: string[];
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
@@ -604,6 +624,10 @@ export function IssueCard({
   dimmed: boolean;
 }) {
   const prdlessApplied = card.labels.includes(prdlessLabel);
+  // Chips are bounded (PRD #102 M4): a lane is a fixed w-72, so an issue wearing a
+  // dozen labels would push the card several rows taller than its neighbours and
+  // bury the run badges. The remainder is not dropped — it rides the "+N" title.
+  const { shown: shownChips, overflow: chipOverflow, hidden: hiddenChips } = boundedChips(chips);
   // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
   // stays on the forge), so they are not draggable.
   const draggable = !card.closed;
@@ -699,6 +723,34 @@ export function IssueCard({
         {card.pipeline && <PipelineBadge pipeline={card.pipeline} />}
         {card.pipeline && <FixCiButton pipeline={card.pipeline} busy={fixCiBusy} onClick={onFixCi} />}
       </div>
+      {/* Label chips (PRD #102 M4). Deliberately their OWN row below the badges and
+          in the quiet border/muted treatment the issue view already uses, so they
+          never compete with the run/pipeline badges for the eye — those stay the
+          card's loudest element after the title. Wrapping (not scrolling) keeps the
+          lane's width fixed; per-chip truncation keeps one long label from doing the
+          same job a hundred short ones would. */}
+      {shownChips.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+          {/* Issue #124: a label name is forge-supplied like the title, so it is
+              stripped where it is DISPLAYED (text and the truncation tooltip) while
+              the React key stays the raw string — identity is never built from the
+              stripped value. */}
+          {shownChips.map((l) => (
+            <span
+              key={l}
+              title={stripUnsafeChars(l)}
+              className="max-w-full truncate rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted"
+            >
+              {stripUnsafeChars(l)}
+            </span>
+          ))}
+          {chipOverflow > 0 && (
+            <span className="text-[11px] text-faint" title={stripUnsafeChars(hiddenChips.join(", "))}>
+              +{chipOverflow}
+            </span>
+          )}
+        </div>
+      )}
       {(run || card.author) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
           {run?.status === "running" && run.worker_name && <span>{run.worker_name}</span>}
@@ -829,13 +881,18 @@ function ColumnSettings({
 
   // Suggest labels seen on cards that are not already columns and not the
   // configured PRD/autopilot/PRDLESS labels (those are workflow markers, never
-  // columns).
+  // columns). Same predicate the cards' chips use (PRD #102 M4), but excluding
+  // `names` — the UNSAVED edit state — rather than board.columns, so a label just
+  // added above stops being offered before Save.
   const suggestions = useMemo(() => {
     const seen = new Set<string>();
     for (const c of board.cards) for (const l of c.labels) seen.add(l);
-    return [...seen]
-      .filter((l) => l !== prdLabel && l !== autopilotLabel && l !== prdlessLabel && !names.includes(l))
-      .sort();
+    return chipLabels([...seen], {
+      prdLabel,
+      prdlessLabel,
+      autopilotLabel,
+      columnLabels: names,
+    }).sort();
   }, [board.cards, names, prdLabel, autopilotLabel, prdlessLabel]);
 
   const add = (name: string) => {
