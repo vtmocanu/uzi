@@ -355,6 +355,19 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		dto.AnthropicSecretID = &s
 	}
 	dto.AnthropicSecretLabel = textPtrValue(r.AnthropicSecretLabel.Valid, r.AnthropicSecretLabel.String)
+	// PRD #111 M5. Mapped independently of BOTH fields above, for the same reason and
+	// one more: the reason is present on every M1-era run (all three lanes write one)
+	// while the headroom is present only on an auto pick, so a run legitimately
+	// carries a reason with no headroom. Rendering must branch on each, never on the
+	// pair.
+	dto.AnthropicSelectReason = textPtrValue(r.AnthropicSelectReason.Valid, r.AnthropicSelectReason.String)
+	if r.AnthropicHeadroomPct.Valid {
+		// SMALLINT 0..100 with a CHECK, widened to int for the wire: JSON has one
+		// number type and a *int16 would only invite a client to think the range is
+		// meaningful to it. The range lives in the database and in autoselect, not here.
+		v := int(r.AnthropicHeadroomPct.Int16)
+		dto.AnthropicHeadroomPct = &v
+	}
 	// PRD #37. A decode error should be impossible (the API validates every write
 	// and both columns carry a jsonb_typeof CHECK); it is logged and treated as
 	// "not reported" rather than failing the read of an otherwise-fine run.

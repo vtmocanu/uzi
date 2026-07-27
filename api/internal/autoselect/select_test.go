@@ -447,13 +447,21 @@ func TestSelectIsTotal(t *testing.T) {
 // append reaching every other reader. Cheap, and the alternative (a package-level
 // var) is a shared mutable slice by definition.
 func TestAllReasonsIsAFreshSlice(t *testing.T) {
+	// Compared against the SECOND call rather than a named constant, so reordering the
+	// vocabulary cannot break this the way pinning AllReasons()[0] to a specific reason
+	// did when M5 folded three more in at the front.
+	before := AllReasons()
 	first := AllReasons()
 	first[0] = "clobbered"
-	if AllReasons()[0] != ReasonAuto {
-		t.Fatal("AllReasons hands out a shared backing array")
+	if AllReasons()[0] != before[0] {
+		t.Fatal("AllReasons hands out a shared backing array; one caller's append or write " +
+			"would then corrupt every other reader's view of a CLOSED set")
 	}
-	if len(AllReasons()) != 5 {
-		t.Fatalf("AllReasons has %d entries; migration 00089's CHECK is the union of these and "+
-			"workersvc's three, so a change here needs one there", len(AllReasons()))
+	// Eight since M5 folded workersvc's three static reasons in here, so the whole
+	// vocabulary has ONE Go home. Migration 00089's CHECK is the same eight and three
+	// separate guards compare against it — workersvc's, the CLI's, and the web's — so a
+	// change to this number is a change to four artefacts and must be deliberate.
+	if len(AllReasons()) != 8 {
+		t.Fatalf("AllReasons has %d entries, want 8", len(AllReasons()))
 	}
 }

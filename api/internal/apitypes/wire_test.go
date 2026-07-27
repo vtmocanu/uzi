@@ -74,6 +74,12 @@ var runDTOKeys = []string{
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
 	"anthropic_secret_id", "anthropic_secret_label",
+	// PRD #111 M5: the MODE that named it, and the measured headroom of an auto pick
+	// (D20). Four keys, three independent nullabilities — the label outlives the id,
+	// the reason is present on every claimed run, and the headroom only on an auto
+	// pick — so all four are always PRESENT on the wire and a client branches per
+	// field rather than on the group.
+	"anthropic_select_reason", "anthropic_headroom_pct",
 }
 
 func TestRunDTOTags(t *testing.T) {

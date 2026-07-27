@@ -819,28 +819,17 @@ type claimCred struct {
 // a default fallback can name the same token, and PRD #104's compatibility path
 // creates a row labelled literally "default", so the label alone answers nothing).
 //
-// These three are the static half of a CLOSED vocabulary; autoselect owns the other
-// five (auto, best_of_pool, pool_empty, pool_stale, open_failed). Migration 00089's
-// CHECK is the union, and TestSelectReasonVocabularyMatchesCheck parses that CHECK to
-// keep the two halves and the constraint in step: a ninth value added in Go and
-// forgotten in SQL is a constraint violation at claim time, which is a FAILED RUN.
+// These are ALIASES, not a second definition. The whole eight-value vocabulary lives
+// in autoselect (see Reason there for why it hosts even the non-auto three), and
+// migration 00089's CHECK is the same eight; these exist only so the claim path reads
+// in its own idiom rather than saying string(autoselect.ReasonPinned) on every line.
+// Aliasing means a rename upstream is a compile error here, which a second set of
+// string literals would not be.
 const (
-	selectReasonDefault = "default"
-	selectReasonPinned  = "pinned"
-	// selectReasonJudge is the judge lane's own value, and it is not decoration.
-	// Recording "pinned" here would tell a user their WORKER was bound to this
-	// credential when in fact their own judge binding chose it (D4) — a different
-	// setting, on a different page, that they would then go and not find. D20 makes
-	// the run view name the mode, so a wrong mode is a user-facing wrong answer.
-	selectReasonJudge = "judge"
+	selectReasonDefault = string(autoselect.ReasonDefault)
+	selectReasonPinned  = string(autoselect.ReasonPinned)
+	selectReasonJudge   = string(autoselect.ReasonJudge)
 )
-
-// staticSelectReasons is the non-auto half of the vocabulary, for the guard that
-// compares Go against migration 00089's CHECK. A fresh slice, for AllReasons's
-// reason.
-func staticSelectReasons() []string {
-	return []string{selectReasonDefault, selectReasonPinned, selectReasonJudge}
-}
 
 // secretChoice is WHICH credential a claim should spend and WHY: the override
 // openAnthropic takes (nil ⇒ the owner's default), the reason to record, and the

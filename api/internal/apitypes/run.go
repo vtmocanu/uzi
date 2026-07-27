@@ -130,6 +130,39 @@ type RunDTO struct {
 	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// AnthropicSelectReason is the MODE that named that credential, and it is why
+	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
+	// fallback can name the SAME token, so "which account paid" and "why that account"
+	// are different questions — and PRD #104's compatibility path creates a row
+	// labelled literally `default`, so the label is not even a reliable hint.
+	//
+	// One of eight server-generated values (autoselect.Reason, closed by migration
+	// 00089's CHECK): default, pinned, judge, auto, best_of_pool, pool_empty,
+	// pool_stale, open_failed. Null for a run claimed before M1.
+	//
+	// A CLOSED SERVER ENUM, not free text: it describes the OWNER'S OWN configuration
+	// and can carry no cross-tenant content, which is why it rides this DTO under the
+	// owner-or-admin scoping already in force rather than needing a gate of its own.
+	//
+	// Clients must render an UNRECOGNISED value honestly rather than dropping or
+	// guessing at it — the API is deployed separately, so a newer server can ship a
+	// ninth reason this client has never heard of.
+	AnthropicSelectReason *string `json:"anthropic_select_reason"`
+	// AnthropicHeadroomPct is the measured headroom of an AUTO pick, in percentage
+	// points, and null on every other lane because nothing measured them.
+	//
+	// The RAW min(100-five, 100-seven) — deliberately not the in-flight-penalised
+	// rank the selector actually ordered on. The raw number is the one a user can see
+	// in their own meters; the rank is an internal ordering key that appears nowhere
+	// else in the product and moves when somebody else's run starts.
+	//
+	// It is also null on D14's retry, where the pick would not open and the fallback
+	// was spent: the reading described the credential that FAILED, and attaching it to
+	// the one that succeeded would attribute a measurement to a token nothing measured.
+	//
+	// Derived from the owner's own gauge rows, so it carries no cross-tenant content
+	// either; an admin reading it is consistent with the admin rate-limits view.
+	AnthropicHeadroomPct *int `json:"anthropic_headroom_pct"`
 	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
 	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
 	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;

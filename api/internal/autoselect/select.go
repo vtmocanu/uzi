@@ -7,16 +7,34 @@ import (
 )
 
 // Reason is WHY a claim spent the credential it spent, persisted in
-// runs.anthropic_select_reason and rendered by M5. These five are the auto lane's
-// share of a CLOSED vocabulary; workersvc owns the other three (default, pinned,
-// judge), and migration 00089's CHECK is the union of both halves. The two homes
-// are kept honest by TestSelectReasonVocabularyMatchesCheck in workersvc, which
-// parses that CHECK — because a value added in Go and forgotten in SQL is a
-// constraint violation at claim time, i.e. a failed run, and one removed from Go
-// but left in SQL is a promise nothing keeps.
+// runs.anthropic_select_reason and rendered by M5. It is a CLOSED vocabulary of
+// eight, and this is its ONE Go home.
+//
+// The three static reasons live here rather than in workersvc, which is where they
+// started. Taxonomically they belong there — `default` and `pinned` have nothing to
+// do with auto-selection — but M5 needs the whole set readable from `cmd/uzi` (which
+// must not import the server) and from a web guard, and two of the eight were locked
+// in an unexported workersvc function. One home beats the neater taxonomy: a
+// vocabulary split across packages is a vocabulary that drifts, which is D21's
+// argument applied to itself.
+//
+// Migration 00089's CHECK is the same eight values, and
+// TestSelectReasonVocabularyMatchesCheck parses that CHECK and compares. A value
+// added in Go and forgotten in SQL is a constraint violation at claim time, i.e. a
+// FAILED RUN; one removed from Go but left in SQL is a promise nothing keeps.
 type Reason string
 
 const (
+	// ReasonDefault: no binding named a credential, so the owner's default paid.
+	// Produced by workersvc, on every lane that resolves nothing more specific.
+	ReasonDefault Reason = "default"
+	// ReasonPinned: the claiming worker's binding (workers.anthropic_secret_id).
+	ReasonPinned Reason = "pinned"
+	// ReasonJudge: the owner's JUDGE binding, for judge and self_improve runs. Its
+	// own value rather than `pinned` because D20 makes the run view name the MODE,
+	// and "pinned" would send a user looking for a worker binding that does not
+	// exist — the choice was made by their judge setting, on a different page.
+	ReasonJudge Reason = "judge"
 	// ReasonAuto: picked from the eligible set — the feature working as designed.
 	ReasonAuto Reason = "auto"
 	// ReasonBestOfPool: every measurable pooled token was below MinHeadroom, so the
@@ -42,11 +60,34 @@ const (
 	ReasonOpenFailed Reason = "open_failed"
 )
 
-// AllReasons is the auto lane's half of the reason vocabulary, in a form a guard
-// can enumerate. Returns a fresh slice: a package-level var would let one caller's
-// append corrupt every other reader's view of a CLOSED set.
+// AllReasons is the WHOLE reason vocabulary, in a form a guard can enumerate. Three
+// guards do: workersvc's, which compares it against migration 00089's CHECK; the
+// CLI's, which requires a rendering for each; and the web's, which requires the same
+// of the TypeScript union.
+//
+// Returns a fresh slice: a package-level var would let one caller's append corrupt
+// every other reader's view of a CLOSED set.
 func AllReasons() []Reason {
-	return []Reason{ReasonAuto, ReasonBestOfPool, ReasonPoolEmpty, ReasonPoolStale, ReasonOpenFailed}
+	return []Reason{
+		ReasonDefault, ReasonPinned, ReasonJudge,
+		ReasonAuto, ReasonBestOfPool, ReasonPoolEmpty, ReasonPoolStale, ReasonOpenFailed,
+	}
+}
+
+// FellBackFromAuto reports whether an `auto` worker ended up spending something the
+// selector did not choose. The three fallback reasons are the ones a user needs told
+// apart from an ordinary default, because the WORKER is configured for auto and the
+// run did not get it — a different situation, with a different fix, from a worker
+// that was never auto in the first place.
+//
+// Exported because both renderers ask the same question and neither should re-derive
+// the membership: adding a fourth fallback reason must change one list, not three.
+func (r Reason) FellBackFromAuto() bool {
+	switch r {
+	case ReasonPoolEmpty, ReasonPoolStale, ReasonOpenFailed:
+		return true
+	}
+	return false
 }
 
 // Outcome is the ranker's answer.

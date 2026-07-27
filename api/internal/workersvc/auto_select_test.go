@@ -609,7 +609,7 @@ func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
 		t.Fatalf("parsed no quoted values out of %s; the guard is reading the wrong thing", path)
 	}
 
-	fromGo := staticSelectReasons()
+	var fromGo []string
 	for _, r := range autoselect.AllReasons() {
 		fromGo = append(fromGo, string(r))
 	}
@@ -629,9 +629,6 @@ func TestSelectReasonVocabularyMatchesCheck(t *testing.T) {
 // open_failed, is one of them.
 func TestEveryProducedReasonIsInTheVocabulary(t *testing.T) {
 	known := map[string]bool{}
-	for _, r := range staticSelectReasons() {
-		known[r] = true
-	}
 	for _, r := range autoselect.AllReasons() {
 		known[string(r)] = true
 	}
