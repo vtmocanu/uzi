@@ -30,15 +30,28 @@ const PrdlessLabelColor = "#ec9a29"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
-// GitLab's label create API. In Progress / Upcoming / Later are the common-board
-// reference set; Human Review (PRD #12) is where the automation parks a card once
-// its MR is open, and sits directly after In Progress — the two workflow columns
-// lead, the backlog buckets follow. GetBoard retrofits this exact order onto
-// boards seeded before Human Review existed.
+// GitLab's label create API. In Progress / Later come from the common-board
+// reference set; Human Review (PRD #12) is where the automation parks a card
+// once its MR is open, and sits directly after In Progress.
+//
+// The order is READING ORDER = FLOW ORDER (PRD #102 Decision 2): the implicit
+// Backlog lane is intake, then Planned ("somebody picked this"), In Progress
+// ("an agent has it"), Human Review ("its MR is open"), and Later for work
+// deliberately deferred. That deliberately replaces the convention this comment
+// used to state — "the two workflow columns lead, the backlog buckets follow" —
+// which seeded Planned's predecessor (Upcoming) AFTER Human Review, so a column
+// meaning "selected, not yet started" rendered past the review lane. Planned
+// keeps Upcoming's color so an operator's palette does not shift under them.
+//
+// The Human Review retrofit is unaffected by the reorder: humanReviewPlacement
+// (handler/board.go) anchors the column at In Progress's position + 1, never at
+// an absolute index, so a board seeded before Human Review existed still gets it
+// in the right place. Existing boards are NOT renamed or reordered (Decision 3);
+// the manual procedure is in docs/configuration.md.
 var DefaultColumns = []forge.Label{
+	{Name: "Planned", Color: "#6699cc"},
 	{Name: board.ColumnInProgress, Color: "#1f75cb"},
 	{Name: board.ColumnHumanReview, Color: "#6e49cb"},
-	{Name: "Upcoming", Color: "#6699cc"},
 	{Name: "Later", Color: "#999999"},
 }
 

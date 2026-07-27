@@ -244,10 +244,13 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
 		return true // non-fatal: render with existing columns, retry next load
 	}
-	// Bump the columns Human Review displaces (the backlog buckets) up one so the
-	// new column lands right after In Progress with a distinct position — the same
-	// order fresh boards seed (In Progress, Human Review, then the rest). The shift
-	// is a no-op when appending (In Progress absent).
+	// Bump the columns Human Review displaces up one so the new column lands right
+	// after In Progress with a distinct position — the same RELATIVE placement fresh
+	// boards seed. (PRD #102 Decision 2 moved Planned ahead of In Progress, so a
+	// fresh board no longer leads with In Progress; humanReviewPlacement anchors off
+	// In Progress's position rather than an absolute index, which is what keeps this
+	// retrofit correct either way.) The shift is a no-op when appending (In Progress
+	// absent).
 	if err := h.q.ShiftBoardColumnsFrom(r.Context(), store.ShiftBoardColumnsFromParams{
 		RepoID:       repo.ID,
 		FromPosition: int32(pos),
