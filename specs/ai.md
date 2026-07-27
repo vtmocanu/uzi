@@ -12369,10 +12369,29 @@ migration.
   rule under test. It still fired zero times.
 - **`PhaseSince` resets on every restart, and this reason holds unconditionally.** It is the Ready
   condition's `LastTransitionTime` (`readyCondition`, assigned on the settled path). Measured across
-  every pod on the cluster carrying both a restart and a Ready condition: the transition sits 1 to 23
-  seconds after `lastState.terminated.finishedAt`, never near `pod.startTime`. The decisive specimen
-  has 115 restarts — pod `startTime` five months before its Ready transition, two seconds after the
-  last termination. So "after `RegisterConvergenceGrace` has elapsed" is never true on a flapper.
+  **every pod on the cluster carrying both a restart and a Ready condition** — a whole-cluster
+  snapshot, 135 pods scanned, four specimens. The values are inline because the capture was
+  session-local and this file is not:
+
+  ```
+  kube-system/kube-controller-manager-…-lkzzq      1 restart     Ready = finishedAt + 23s
+  kube-system/kube-controller-manager-…-vvmxm      1 restart     Ready = finishedAt + 13s
+  prod-apps/legacy-web-app-…      115 restarts  Ready = finishedAt +  2s
+  cloud-provider-system/guest-cluster-…     1 restart     Ready = finishedAt +  1s
+  ```
+
+  In all four the transition sits 1 to 23 seconds after `lastState.terminated.finishedAt` and never
+  near `pod.startTime`. **The 115-restart row is decisive:** pod `startTime` 2026-02-12, Ready
+  transition 2026-07-26 — five months later, two seconds after the last termination. So on a flapping
+  pod `now - PhaseSince` is bounded by the container's alive time, and "after
+  `RegisterConvergenceGrace` has elapsed" is never true.
+- **Unplanned cross-path corroboration, and it is the strongest single observation in the run.** The
+  database's `worker_upgrade_reports.phase_since` for the measured worker reads `11:07:11+00`,
+  **identical to the `Ready` condition timestamp read directly off the pod through the apiserver**.
+  Two observers on entirely separate paths — the kubelet's own condition, and the controller's
+  derivation of it POSTed through the wire contract and persisted — agreeing to the second. It
+  confirms both that `PhaseSince` really is the Ready transition and that the register-gap
+  measurement was anchored on the right field.
 
 **The measurement the issue demanded as a precondition** was the 45s-vs-5m interaction, so a
 legitimate roll could not read as failure: pod Ready → worker registered is ~2s, bounded ~32s. The
@@ -12394,9 +12413,17 @@ producing.
    worker whose registration is *rejected* stays alive, Ready and permanently `offline` while the
    controller's signal stays fresh over a separate path. The causes are non-transient and fleet-wide
    (`UZI_SECRET_KEY` rotation, join-token change, NetworkPolicy or DNS), so every hosted worker would
-   badge `upgrade_failed` at once, for an auth incident. A live specimen was captured in exactly that
-   state: 16 hours `offline` with a NULL heartbeat and an empty version, on a row the sweeper's
-   `WHERE status = 'online'` can never reach. **So the issue's "no permanent-red failure mode" claim
+   badge `upgrade_failed` at once, for an auth incident. A live specimen sat in exactly that state:
+
+   ```
+   worker d26fb0f9   status=offline   version=''   last_heartbeat_at=NULL
+   created 2026-07-26 20:10, still in that state at 2026-07-27 12:20 — 16 hours
+   ```
+
+   **The 16 hours is the load-bearing part, and the mechanism goes with it:** because
+   `MarkStaleWorkersOffline` is `WHERE status = 'online'`, that row has **never once reached
+   `'online'`**, so nothing in the sweeper can ever touch it. It is not a worker that went offline; it
+   is a worker the offline path cannot reach. **So the issue's "no permanent-red failure mode" claim
    is true of its mechanism and false as a safety property.**
 
 ### The guard is at the ENTRY, and that placement is the commit's most important property
@@ -12416,6 +12443,22 @@ signal; either alone is satisfiable by a build that ignores the conjunct.** The 
 the constant itself: expressing the boundary as `flapWindow ± time.Second` pins the comparison but
 not the NUMBER — halving the constant left the whole suite green — so literal 9m and 11m cases
 bracket it.
+
+**The mutation matrix gives those gaps their real cost, and it is the argument for why the guards
+needed their own fixtures rather than riding on the trajectory tests.** Before the pins landed the
+suite tolerated **any `flapWindow` above 30 seconds** — 31 seconds, one hour, one year, all green —
+and the lower bound came from one fixture's literal 30s uptime rather than from any assertion about
+the value. Driven end to end, with the suite green, those wrong constants would have shown a user:
+
+- `flapWindow = 24h`: a worker with 5 restarts, currently up 11 minutes, badges `Upgrade failed`. A
+  false red expiring only after a day of continuous uptime.
+- the defensive `if t.IsZero() { t = now }` tidy on the nil-`Running` skip: a **healthy** worker whose
+  `seed-nix` retried 5× and then **succeeded**, agent clean for two hours, badges
+  `Upgrade failed — seed-nix: Completed (5 restarts, last exit 0)`. **The real 133-tick trajectory is
+  bit-identical under this fold**, so no test watching the crash loop could ever have seen it.
+
+That last one is the sharpest result in the whole run: a trajectory test over real samples is not
+coverage of a guard whose whole job is a case the trajectory does not contain.
 
 - **`flapWindow` is its own constant, equal to `stuckAge` by coincidence of value and not of
   meaning.** `stuckAge` bounds how long a *reasonless pod* may sit before it is called stuck; this
@@ -12454,6 +12497,14 @@ bracket it.
   that nothing exits on a sub-10-minute cadence. That is an inference from those containers' design
   intent — nobody watched them over time — and it is the load-bearing half. A future report of a
   periodically exiting sidecar invalidates it rather than surprising it.
+- **🔴 THE SLOW CRASH LOOP IS INVISIBLE, AT EVERY SHA, AND IT IS A WORSE WORKER THAN THE ONE #145
+  REPORTED.** Measured end to end: a worker with 20 restarts, currently up 11 minutes, on roughly a
+  15-minute death cycle renders `up to date` with no attention strip — before this fix and after it.
+  **This is the design's stated limit, not a defect**, and the owner confirmed it is recorded as a
+  known bound rather than filed as an issue. The reason it cannot simply be fixed is that the recency
+  conjunct is **simultaneously** what stops a healthy worker being pinned permanently red and what
+  makes a slow loop invisible: at a fixed window you cannot keep one without the other. Whoever next
+  touches `flapWindow` is trading directly between these two, and should know that is the trade.
 
 ### The data-integrity half: a report must not blank fields it did not measure
 
@@ -12515,6 +12566,65 @@ block, and commit 2 made preserved blocks LESS reachable, not more.** Commit 1's
 DB-level data integrity — the row keeps the incident for whoever reads the table, which is exactly
 what the issue complained about. Only the near-term rendering payoff was overstated.
 
+**And commit 1 alone is invisible to a user — measured through the chain, not argued.** Two ticks on
+one worker row (stuck with 5 restarts and exit 1, then recovered): the database **keeps** the
+diagnostics, which is commit 1 working, while the browser receives `up_to_date`,
+`upgrade_detail=null` and all three `upgrade_blocking_*` null, because they are gated on
+`upgrade_failed`. The wipe fix is realized to a human only through a later `stuck` tick. Commit 1's
+own message predicted this; it is now measured end to end rather than reasoned.
+
+### The headline criterion is MEASURED END TO END, and the flicker is gone at the BADGE
+
+This is the only measurement of the thing the issue actually complained about, and the distinction
+between phase and badge is the point: the complaint was a **user-visible** flicker. The whole chain
+was driven with **shipped code at every stage** — `deriveRollHealth` → the real `reconcile.Loop`
+report mapper (so the wire bytes are what the controller would POST) → `handler.ControllerStatus` →
+`UpsertWorkerRollHealth` against a **live Postgres** → `ListWorkersByUser` → `workerDTOFromRow` →
+`ClassifyUpgradeWithTarget` → the badge components under jsdom, over 133 real
+`kubectl get pod -o json` samples of the crash-looping pod, each sample's own capture time as `now`.
+
+```
+tree                        up_to_date  upgrading  upgrade_failed  badge transitions
+pre-fix (commit 1 only)         41          5            87              12
+with commit 2                   18          5           110               4
+```
+
+Rendered strip on a real tick: `Upgrade failed / worker: CrashLoopBackOff (6 restarts, last exit 1)`.
+**Positive control:** the identical probe against the pre-fix parent, where all 15 hostile fixtures
+report `settled` with zeroed diagnostics — so the green is a real result rather than an instrument
+that cannot fire.
+
+**What the instrument could NOT show, recorded because a validation's bounds are part of its
+result.** No live cluster and no live agent: the trajectory is a busybox flapper's real kubelet
+state, and the agent was never the subject. One pod and one worker, so nothing here measures a fleet
+or concurrent rolls. HTTP routing and auth were bypassed — `RequireController`, the chi routes and
+the browser fetch are untested. **jsdom proves the string is in the DOM, not that a human can read
+it**: no layout, no contrast, no screen reader. And the CLI is untested end to end.
+
+> **One claim about the CLI does not reproduce and is corrected here rather than repeated.** It was
+> relayed that `api/cmd/uzi/worker.go` prints `upgrade_detail` into a terminal, so #159's mis-named
+> container reaches operators that way. It does not: `uzi worker list`'s table renders
+> `upgradeCell(w)`, which switches on `UpgradeStatus` alone and never touches the detail string. The
+> substance survives by a different route — the same command under `--json` serializes the whole
+> `WorkerDTO`, detail included, and that is the form built for agents to parse. Wrong mechanism,
+> right conclusion, which is this branch's own recurring shape arriving one more time.
+
+**A denominator difference that is NOT a conflict — recorded so nobody "reconciles" it later.** The
+design and the public comment compute over a **123-sample** subset; the end-to-end validation
+computes over **133**; the directory holds 134 files, one caught mid-write and empty. **All of them
+agree the Ready/running sample count is 41**, which is the numerator every rate depends on, so no
+published figure moves. Different totals over the same meaningful subset.
+
+**The durable half of the method is the provenance table, and it was earned rather than reasoned.**
+The architect recorded, per observation, whether it is **retained, expired, or re-observable — with
+the command to re-take each**. That practice exists because one of its own measurements **expired
+mid-review**: the pod it was taken from rolled away before anyone captured it, briefly making a
+figure published as measured unre-derivable. It was re-taken on the replacement pod, which is why the
+register gap is two samples across two ReplicaSets rather than one. **Carry the commands, not the
+files:** session scratchpads do not survive and `.claude/agent-team-tasks/` is gitignored, so any
+evidence that matters has to live inline in this file — which is why the specimen values above are
+transcribed here rather than cited.
+
 ### The readiness probe, declined with a technical argument beside the security one
 
 The worker is outbound-only and `entrypoint.sh` `exec`s straight to the agent, so a probe means an
@@ -12557,6 +12667,19 @@ another agent's file. Same shape as `CLAUDE.md`'s "name throwaways outside the `
 being the strong rule and "be careful with globs" the weak one. A rule that removes the failure mode
 beats a rule that relies on noticing.
 
+> **⚠ AND THAT PROTECTION STOPS AT `git add` — MEASURED ON THIS BRANCH, BY THE COMMIT THAT WROTE THE
+> PARAGRAPH ABOVE.** `git add specs/ai.md` stages one path, but a bare `git commit` afterwards
+> commits **the whole index**, including whatever another agent staged in the interval. That is
+> exactly what happened here: a concurrent writer staged 135 files while this section was being
+> edited, and the follow-up commit swept all of them into a commit whose own message said "one
+> markdown file, zero code". Recovered with `git reset --soft HEAD~1` — which restores the index
+> untouched, so the other agent's staged work was handed back exactly as found — and re-committed as
+> `git commit -- specs/ai.md`, the pathspec form, which commits only that path whatever else is
+> staged. **So the durable rule is `git commit -- <path>`, not `git add <path>`**; the standing
+> instruction names only the weaker half. Recorded here because the paragraph above was the very
+> claim being written when it was falsified, which is this section's subject arriving one level up:
+> the rule-holder is not the person best placed to notice their own instance.
+
 **A published figure was wrong before it was re-derived, and the correction is the record.** The
 design said the rule fires on 33 of 41 `settled` ticks; replaying the identical 123 samples through
 the *shipped* code gives **23**. The 33 came from a probe counter **two design generations behind**,
@@ -12575,16 +12698,30 @@ like a suite that executed nothing. Read the file; never conclude from the tally
 
 ### Filed rather than folded
 
-**Issue #159** — on the flapping path the verdict and the subject are computed from two different
-containers by construction: `flappingContainer` decides *whether*, and the `blockingContainer` →
-`mostRestartedContainer` fall-through decides *who*. Measured twice independently, and it runs both
-ways: a flapping `worker` beside a longer-worn `dind` names the dind, and a flapping dind beside a
-worn worker names the worker, with the subject's exit code reported because `lastTermination` reads
-the subject's. Unreachable today (single-container restricted-tier workers), and the minimal fix
-compiles green with **zero existing assertions changed**, because every current fixture is
-single-container and the two selections coincide. **Filed rather than folded because the 123-sample
-measurement was single-container and is therefore SILENT on this path, not supportive of it** — a
-change to what the report names must not ride on a measurement that could not observe it.
+**Issue #159, and it got substantially worse as validation went on** — on the flapping path the
+verdict and the subject are computed from two different containers by construction:
+`flappingContainer` decides *whether*, and the `blockingContainer` → `mostRestartedContainer`
+fall-through decides *who*. It runs both ways, so neither container is the guaranteed subject: a
+flapping `worker` beside a longer-worn `dind` names the dind, and a flapping dind beside a worn
+worker names the worker, with the wrong container's exit code reported because `lastTermination`
+reads the subject's.
+
+**The realistic case is the one that reads worst, and it is reachable on any docker-tier worker.** A
+flapping `worker` beside a `seed-nix` that retried 6× and then **Completed** renders
+`Upgrade failed — seed-nix: Completed (6 restarts, last exit 0)`: an init container that *succeeded*,
+named under a failure heading, with exit code 0, while the agent crash-loops. A reader is told the
+thing that worked is the thing that failed. The wrong name also reaches `likelyCause` and the
+copy-`kubectl` affordance, both of which key off it.
+
+**This is not a regression** — before this branch all of those pods reported `settled` silently, so
+it trades silence for a confident wrong pointer. **Filed rather than folded** because the
+133-sample measurement was single-container and is therefore SILENT on this path rather than
+supportive of it, and because the one-line fix leaves the real trajectory **unchanged** (same
+18/5/110 split, same 4 transitions) and the suite green **with and without it**. Every current
+fixture is single-container, so the two selections coincide and a fixture where they agree proves
+nothing; the discriminating fixture is a two-container pod where the flapping container is *not* the
+most-restarted one. A change to what the report names must not ride on a measurement that could not
+observe it.
 
 **Not run, deliberately, with reasons:** `./e2e/run-e2e.sh`, because it is a docker-compose harness
 and the phase half is controller-side and k8s-only, so it cannot reach `deriveRollHealth`; and the
