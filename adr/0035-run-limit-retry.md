@@ -231,6 +231,18 @@ someone later "simplifies" it:
   `stale`, `Measured` is false, no leg contributes, and no fresh gauge row exists to
   cross-check against — so the stamp is the worker's reported reset.
 
+  **↳ Corrected 2026-07-28, after the fallback ruling landed: "the worker's reported
+  reset" is only half the sentence, and the missing half matters more than the stated
+  one.** When the worker reports no reset either — the ordinary case on the
+  `terminal_reason` path, which carries no timestamp — nothing at all has spoken, and
+  the stamp is the exponential fallback (`15m << priorParks`, capped at 4h). **That
+  makes this configuration the fallback's PRINCIPAL consumer rather than an edge**: it
+  is the one shape in which all three information sources are silent together, by
+  construction rather than by chance. The property this bullet claims still holds — D2
+  changes nothing here versus the naive design — but a reader checking it against the
+  code would find the fallback and reasonably conclude the property had broken. It has
+  not; the fallback is what fills the space the naive design left undefined.
+
 **A run with no recorded credential** (`anthropic_secret_id IS NULL` — a pre-feature
 run, or a claim whose recording failed) skips **both** legs. Without an exclusion id,
 the eligible leg could fire on the dead credential's own stale-but-eligible reading
