@@ -26,12 +26,12 @@ import {
   buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
-  prepareCheckDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
   type CheckRunner,
 } from "./self-improve.js";
+import { installJsDeps } from "./js-deps.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -381,12 +381,31 @@ export class RunRunner {
         const changed = await this.git.changedFiles(barePath, trackingRef);
         // M9: the checks execute agent-authored code as the worker uid, so they run
         // under a SCRUBBED replacement env (no join token / API URL / PAT / OAuth token
-        // by construction) with the run's provisioned toolchains on PATH. `npm ci
-        // --ignore-scripts` installs deps best-effort so vitest/tsc exist; a failure
+        // by construction) with the run's provisioned toolchains on PATH. The frozen
+        // `--ignore-scripts` install runs best-effort so vitest/tsc exist; a failure
         // just leaves the check honestly skipped.
+        //
+        // PRD #121 M2: this used the hardcoded `["web", "agent"]` dir list; it now
+        // reuses the same lockfile-driven installer the executor runs pre-plan, so
+        // there is ONE install path instead of two that can drift. For the uzi repo
+        // that discovery resolves to exactly web/ + agent/ (the only two tracked
+        // package.json files, both with a package-lock.json), which is what
+        // SELF_IMPROVE_CHECKS pre-flights on — asserted in js-deps.test.ts. The
+        // executor has already installed these once; re-running is deliberate, because
+        // the agent may have edited a package.json or lockfile during the run and the
+        // checks must test what it actually left behind.
         const checkEnv = buildCheckEnv(process.env, runHome ?? os.tmpdir(), result.toolEnv);
-        for (const note of await prepareCheckDeps(runnerClone.path, checkEnv).catch(() => [])) {
-          runLog.info("self-improve: dependency install", note);
+        const deps = await installJsDeps(runnerClone.path, checkEnv).catch(() => ({ results: [], truncated: false }));
+        for (const note of deps.results) {
+          runLog.info("self-improve: dependency install", { ...note });
+        }
+        // A truncated scan means `results` is a PREFIX of the repo's project dirs, so a
+        // check may be about to run somewhere provisioning never reached. Say so rather
+        // than let the notes above read as full coverage.
+        if (deps.truncated) {
+          runLog.warn("self-improve: dependency discovery hit its bound; some dirs were not installed", {
+            installed_dirs: deps.results.length,
+          });
         }
         const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
         const checks = await runSelfImproveChecks(runnerClone.path, checkRunner);

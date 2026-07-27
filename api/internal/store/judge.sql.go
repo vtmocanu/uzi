@@ -276,34 +276,52 @@ func (q *Queries) ListRunInputsForRun(ctx context.Context, arg ListRunInputsForR
 	return items, nil
 }
 
-const listToolResultPayloadsForRun = `-- name: ListToolResultPayloadsForRun :many
-SELECT payload FROM run_messages
-WHERE run_id = $1 AND kind = 'tool_result'
+const listToolTraceForRun = `-- name: ListToolTraceForRun :many
+SELECT seq, kind, payload FROM run_messages
+WHERE run_id = $1 AND kind IN ('tool_use', 'tool_result')
 ORDER BY seq ASC
 LIMIT $2
 `
 
-type ListToolResultPayloadsForRunParams struct {
+type ListToolTraceForRunParams struct {
 	RunID uuid.UUID `json:"run_id"`
 	Lim   int32     `json:"lim"`
 }
 
-// The tool_result message payloads of a run, oldest first, capped by @lim — the input
-// to the API-side command-not-found scan (Decision 4). Only tool_result kind; the
-// scan never decides anything, it just flags missing-executable evidence for the judge.
-func (q *Queries) ListToolResultPayloadsForRun(ctx context.Context, arg ListToolResultPayloadsForRunParams) ([][]byte, error) {
-	rows, err := q.db.Query(ctx, listToolResultPayloadsForRun, arg.RunID, arg.Lim)
+type ListToolTraceForRunRow struct {
+	Seq     int32  `json:"seq"`
+	Kind    string `json:"kind"`
+	Payload []byte `json:"payload"`
+}
+
+// The tool trace of a run — the agent's tool_use invocations AND their tool_result
+// output — oldest first, capped by @lim. Input to the API-side command-not-found
+// scan (Decision 4) and to its later-ran-green suppression (PRD #121 M3). The scan
+// never decides anything, it just flags missing-executable evidence for the judge.
+//
+// WIDENED from tool_result-only (was ListToolResultPayloadsForRun). The COMMAND the
+// agent typed lives ONLY in tool_use ({id, name, input}); tool_result carries
+// {tool_use_id, content, is_error} and no command at all. A successful `tsc --noEmit`
+// prints NOTHING, so no heuristic over tool_result text can tell that tsc ran — the
+// invocation side is the only place that evidence exists.
+//
+// seq is projected, not just payload, because "X later ran green" is an ORDERING
+// claim. It used to be expressible only as "a larger slice index", correct solely by
+// virtue of this ORDER BY and unassertable by the pure scan function, which received
+// a bare [][]byte. Shaped exactly like ListRunToolWindow (runtime.sql), ASC not DESC.
+func (q *Queries) ListToolTraceForRun(ctx context.Context, arg ListToolTraceForRunParams) ([]ListToolTraceForRunRow, error) {
+	rows, err := q.db.Query(ctx, listToolTraceForRun, arg.RunID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := [][]byte{}
+	items := []ListToolTraceForRunRow{}
 	for rows.Next() {
-		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
+		var i ListToolTraceForRunRow
+		if err := rows.Scan(&i.Seq, &i.Kind, &i.Payload); err != nil {
 			return nil, err
 		}
-		items = append(items, payload)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

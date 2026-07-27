@@ -360,9 +360,34 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 	// is NOT consulted: the wire's controller_reported_at. See RollSignal.ObservedAt.
 	signalFresh := s != nil && s.Phase != "" && in.Now.Sub(s.ObservedAt) <= p.ControllerSignalTTL
 
-	// The INV-5 ceiling. Gates ONLY the two rows a controller can assert (R1/R2): past
-	// the window the controller stops being believed about this roll and the row
+	// The INV-5 ceiling. Gates R2 ONLY (issue #151): past the window the controller
+	// stops being believed when it claims a roll is still IN PROGRESS, and the row
 	// classifies by version compare alone, so a suppressed `outdated` re-appears.
+	//
+	// It deliberately does NOT gate R1. The two directions are not symmetric, and the
+	// reason is not the soft one about false alarms being self-limiting:
+	//
+	//   - The controller already OWNS these workers' lifecycle — it renders and patches
+	//     their Deployments. A compromised controller does not need to ASSERT
+	//     `upgrade_failed`; it can CAUSE it fleet-wide. Gating R1 bounds nothing an
+	//     attacker cannot reach directly.
+	//   - The suppression direction this invariant exists for is already conceded
+	//     elsewhere: B-1 (a controller reporting a stale tag with phase=settled) makes
+	//     the fleet read `up_to_date` indefinitely, the ceiling never engages, and D10's
+	//     third amendment accepts that with "keep the behaviour, make it visible".
+	//
+	// What gating R1 cost, measured on worker d26fb0f9 (dev-cluster, 2026-07-26): the
+	// anchor arms on the FIRST non-terminal report, which for a hosted worker is while
+	// it is still being provisioned and nothing is wrong yet. That worker spent 33m50s
+	// of a 45m budget pod-less before its pod could even appear, leaving a 70-SECOND
+	// window in which the truthful `upgrade_failed` could be seen. So the ceiling
+	// measures "how long have we believed a roll is in progress" while being read as
+	// "how long may a pod be broken before we say so".
+	//
+	// Past the ceiling a `stuck` report is therefore STILL believed. R1 keeps its two
+	// other guards (`signalFresh`, and a `stuck` phase derived from current pod state),
+	// so the alert self-clears the moment the pod goes Ready — what it loses is only its
+	// expiry, which is the point.
 	ceilingOK := s == nil || s.UpgradingSince == nil || in.Now.Sub(*s.UpgradingSince) < p.MaxUpgradingWindow
 
 	// Decision 9: for a hosted worker the target is the tag the controller actually
@@ -374,7 +399,8 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 		target = s.RolledTag
 	}
 
-	if hosted && signalFresh && ceilingOK && s.Phase == PhaseStuck {
+	// R1 is NOT ceiling-gated — see the ceilingOK comment above (issue #151).
+	if hosted && signalFresh && s.Phase == PhaseStuck {
 		return UpgradeStatusUpgradeFailed, stuckDetail(s), target // R1
 	}
 	if hosted && signalFresh && ceilingOK && s.Phase == PhaseRolling {

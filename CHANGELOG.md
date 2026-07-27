@@ -8,9 +8,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **The judge's missing-tool scan no longer flags a tool the run actually ran.** `scanCommandNotFound` used to text-match any `command not found` hit and report that tool as missing even when the same run later ran it successfully through an npm script (`node_modules/.bin/tsc`, `vitest`, `eslint`); it now checks up to a bounded window of the run's tool-invocation trace and drops a hit once that tool is seen running clean later in the run (PRD #121).
+
 - **Browser launches on hosted k8s workers get `--no-sandbox` again.** The worker's `CMD` is `npm run start`, and npm's run-script prepends `/app/node_modules/.bin` to `PATH` — so on the non-root (single-uid) start the real `agent-browser` CLI shadowed the PRD #87 shim, and every launch silently lost the flags the shim injects. Chromium then aborted on the setuid sandbox that the worker hardening makes impossible. The entrypoint now pins the runner PATH on both start modes, so the shim resolves first on k8s as it always did on compose. Runner children also stop resolving the worker's own `node_modules/.bin` (`tsx`, `tsc`, `esbuild`, …), which is the intended boundary (PRD #120, issue #120).
 
 ### Added
+
+- **JS dependency provisioning before the agent's first turn.** A run touching a JS repo (npm, pnpm, yarn, or bun, including monorepo workspaces) now gets its cloned repo's dependencies installed automatically: the worker detects the lockfile and kicks off a frozen, `--ignore-scripts` install as the run starts, overlapping it with the plan turn (and the approval wait, on human-gated runs) so it's ready before the agent's first implement turn, instead of the agent discovering a missing `node_modules` mid-task. Runs under the same runner-uid + scrubbed-env sandbox that already runs the repo's tests; an unrecognized layout or a failed install is skipped honestly, same as before (PRD #121).
 
 - **A Model column in the run view's per-agent usage table.** The usage panel named the run's
   model only once, in the top strip — the main thread's. A run is multi-model (a subagent can

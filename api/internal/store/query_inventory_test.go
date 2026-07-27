@@ -453,8 +453,13 @@ var queryInventory = []queryPin{
 		"direct call, judge_integration_test.go:65 (TestClaimRunDockerRepoAllowlistLiveDB also calls it, but only as fixture setup)"},
 	{"GetActiveJudgeRunForWorkerTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:91"},
-	{"ListToolResultPayloadsForRun", "judge.sql", "TestJudgeQueriesLiveDB",
-		"direct call, judge_integration_test.go:84"},
+	{"ListToolTraceForRun", "judge.sql", "TestJudgeQueriesLiveDB",
+		"direct call, judge_integration_test.go — a RENAME of ListToolResultPayloadsForRun, " +
+			"not an arrival (PRD #121 M3 widened it to kind IN (tool_use, tool_result) and " +
+			"projected seq). The pin got stronger with the rename: it was a bare row-count, " +
+			"and now asserts the kind filter, the projection and the ASC ordering, so a " +
+			"fold of ORDER BY seq ASC → DESC reddens it. It did not before — the old query " +
+			"returned [][]byte and threw the ordering guarantee away at the type boundary"},
 	{"ListRunInputsForRun", "judge.sql", "TestListRunInputsForRunLiveDB",
 		"WAS the one UNPINNED row, and this mechanism is how it was found — it named a query " +
 			"nobody was looking at, outside the work that motivated the inventory. Now pinned by " +

@@ -164,10 +164,16 @@ func TestP2CeilingHoldsWhileTheControllerRotatesEveryFieldItControls(t *testing.
 	}
 	now = now.Add(testTTL / 2)
 	i++
-	sig = postUpgrading(sig, now, phases[i%len(phases)], tags[i%len(tags)], "final reason")
+	// The final post is pinned to `rolling` rather than continuing the rotation. Since
+	// #151 the ceiling gates R2 only, so `stuck` is believed past the window BY DESIGN
+	// and a final post landing there (which `phases[i%2]` did, by construction) would
+	// redden this test for a reason that has nothing to do with anchor forgery. The
+	// rotation through both phases still happens above — it is the attack — but the
+	// property is only observable through the suppressing direction.
+	sig = postUpgrading(sig, now, PhaseRolling, tags[i%len(tags)], "final reason")
 
 	status, _ := ClassifyUpgrade(fleetInput(now, sig), ceilingParams())
-	if status == UpgradeStatusUpgrading || status == UpgradeStatusUpgradeFailed {
+	if status == UpgradeStatusUpgrading {
 		t.Fatalf("with the tag rotated %d times across %v (window %v) the worker is still %q. "+
 			"The anchor is being reset by something the CONTROLLER supplies — most likely keyed on "+
 			"(worker, target_tag) or rewritten whenever a field changes.", i, now.Sub(t0), testWindow, status)
@@ -243,43 +249,92 @@ func TestP4NoWireFieldCanExtendTheWindow(t *testing.T) {
 	anchor := t0.Add(-testWindow - time.Second)
 	now := t0
 
-	for _, tc := range []struct{ name, tag, reason, phase string }{
-		{"plain", "0.11.7", "Pulling image", PhaseRolling},
-		{"huge tag", "999.999.999", "Pulling image", PhaseRolling},
-		{"stuck phase", "0.11.7", "CrashLoopBackOff", PhaseStuck},
-		{"empty tag", "", "", PhaseRolling},
-		{"garbage tag", "not-a-version", "whatever", PhaseRolling},
+	// Every case here is `rolling`, and that is a consequence of #151 rather than an
+	// oversight: the window is only observable through R2 now, so a `stuck` case could
+	// no longer distinguish "a wire field extended the window" from "R1 is deliberately
+	// ungated". The stuck arm's own behaviour past the ceiling is pinned by
+	// TestCeilingGatesUpgradingButNotUpgradeFailed.
+	for _, tc := range []struct{ name, tag, reason string }{
+		{"plain", "0.11.7", "Pulling image"},
+		{"huge tag", "999.999.999", "Pulling image"},
+		{"empty tag", "", ""},
+		{"garbage tag", "not-a-version", "whatever"},
+		{"crashloop reason on a rolling phase", "0.11.7", "CrashLoopBackOff"},
 	} {
 		sig := &RollSignal{
-			Phase: tc.phase, ObservedAt: now, UpgradingSince: &anchor,
+			Phase: PhaseRolling, ObservedAt: now, UpgradingSince: &anchor,
 			RolledTag: tc.tag, BlockingReason: tc.reason,
 		}
 		status, _ := ClassifyUpgrade(fleetInput(now, sig), ceilingParams())
-		if status == UpgradeStatusUpgrading || status == UpgradeStatusUpgradeFailed {
+		if status == UpgradeStatusUpgrading {
 			t.Errorf("%s: past the ceiling the controller is still believed (%q). Some wire value is "+
 				"feeding the window or the anchor.", tc.name, status)
 		}
 	}
+
+	// The phase itself is a wire field, so pin that it cannot buy MORE time either: a
+	// `stuck` report past the ceiling is believed (#151), but it must not re-arm R2 for
+	// a subsequent `rolling` report on the same anchor.
+	stuck := &RollSignal{
+		Phase: PhaseStuck, ObservedAt: now, UpgradingSince: &anchor,
+		RolledTag: "0.11.7", BlockingReason: "CrashLoopBackOff",
+	}
+	if status, _ := ClassifyUpgrade(fleetInput(now, stuck), ceilingParams()); status != UpgradeStatusUpgradeFailed {
+		t.Fatalf("precondition: a past-ceiling `stuck` report must be believed, got %q", status)
+	}
+	after := &RollSignal{
+		Phase: PhaseRolling, ObservedAt: now.Add(time.Second), UpgradingSince: &anchor,
+		RolledTag: "0.11.7",
+	}
+	if status, _ := ClassifyUpgrade(fleetInput(now.Add(time.Second), after), ceilingParams()); status == UpgradeStatusUpgrading {
+		t.Errorf("a `stuck` report bought the controller a fresh window for `rolling`; the ceiling "+
+			"is being re-armed by the phase, got %q", status)
+	}
 }
 
-// The ceiling gates ONLY the rows a controller can assert. Past it, a genuinely stuck
-// pod stops being reported as `upgrade_failed` and falls back to version compare —
-// worth pinning explicitly, because it is a deliberate loss of fidelity: past the
-// window we no longer trust the reporter, so we cannot repeat its diagnosis either.
-func TestCeilingAlsoStopsUpgradeFailedNotJustUpgrading(t *testing.T) {
+// The ceiling gates R2 and NOT R1 (issue #151). This test used to assert the opposite
+// and is inverted deliberately — read `ceilingOK`'s comment in upgrade.go for why the
+// two directions are not symmetric.
+//
+// Both halves are asserted in ONE function on purpose: two independent tests are each
+// satisfied by a classifier that ignores the ceiling entirely (one wants it to bite,
+// the other wants it not to), so only the PAIR distinguishes "gates R2 only" from
+// "gates nothing".
+func TestCeilingGatesUpgradingButNotUpgradeFailed(t *testing.T) {
 	now := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
 	anchor := now.Add(-testWindow - time.Minute)
-	sig := &RollSignal{
+
+	// R1, past the ceiling: still believed. A stuck pod is a fact about the CURRENT pod
+	// state, so this alert self-clears when the pod recovers; expiring it on a timer only
+	// ever hid a truthful alarm.
+	stuck := &RollSignal{
 		Phase: PhaseStuck, ObservedAt: now, UpgradingSince: &anchor,
 		RolledTag: "0.11.7", BlockingContainer: "seed-nix", BlockingReason: "CrashLoopBackOff",
 	}
-	status, _ := ClassifyUpgrade(fleetInput(now, sig), ceilingParams())
-	if status == UpgradeStatusUpgradeFailed {
-		t.Errorf("past the ceiling a `stuck` report is still believed; the ceiling must gate BOTH "+
-			"controller-asserted rows, got %q", status)
+	status, detail := ClassifyUpgrade(fleetInput(now, stuck), ceilingParams())
+	if status != UpgradeStatusUpgradeFailed {
+		t.Errorf("past the ceiling a truthful `stuck` report must STILL be believed (#151): "+
+			"want %q, got %q. If this reddens because ceilingOK was put back on R1, the worker "+
+			"that motivated #151 goes silent 70 seconds after its pod could first appear.",
+			UpgradeStatusUpgradeFailed, status)
+	}
+	if detail != "seed-nix: CrashLoopBackOff" {
+		t.Errorf("the diagnosis must survive the ceiling too, got %q", detail)
+	}
+
+	// R2, past the ceiling: NOT believed. This is the direction INV-5 exists for — a
+	// controller claiming a roll is still in progress can otherwise suppress `outdated`
+	// forever, silently.
+	rolling := &RollSignal{
+		Phase: PhaseRolling, ObservedAt: now, UpgradingSince: &anchor, RolledTag: "0.11.7",
+	}
+	status, _ = ClassifyUpgrade(fleetInput(now, rolling), ceilingParams())
+	if status == UpgradeStatusUpgrading {
+		t.Errorf("past the ceiling a `rolling` report must stop suppressing the version compare; "+
+			"INV-5 is gone, got %q", status)
 	}
 	if status != UpgradeStatusOutdated {
-		t.Errorf("want %q, got %q", UpgradeStatusOutdated, status)
+		t.Errorf("want %q past the ceiling, got %q", UpgradeStatusOutdated, status)
 	}
 }
 
