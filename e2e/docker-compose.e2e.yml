@@ -139,6 +139,25 @@ services:
       # The harness seeds a gauge row directly (like the master-sealed row it stages
       # for user2) and asserts the read endpoints; disabled ⇒ readings serve stale.
       UZI_USAGE_POLL_INTERVAL: "0"
+      # PRD #111 M6: PIN the auto-selection freshness window instead of inheriting it.
+      #
+      # The shipped default is 3x UZI_USAGE_POLL_INTERVAL, and the line above disables
+      # the poller — so the default computes to ZERO here, nothing is ever fresh, and an
+      # `auto` worker can only ever fall back. That is correct behaviour (R2) and it is
+      # also why the HAPPY path cannot be driven in this stack without this line: the two
+      # cases are the same knob, so one stack cannot both have "the default is 0" and "a
+      # fresh reading is fresh".
+      #
+      # Pinning it lets the harness drive BOTH outcomes from synced_at, which exercises
+      # the freshness mechanism itself rather than a side effect of the poll interval. The
+      # default's arithmetic (interval 0 => staleness 0) is pinned exactly in config's own
+      # unit test, where an arithmetic default belongs.
+      #
+      # This is a deliberate exception to "the harness asserts the SHIPPED defaults", and
+      # it is the only autoselect knob overridden: MIN_HEADROOM, HEADROOM_TIE_PCT and
+      # INFLIGHT_PENALTY all stay at their shipped values so the phase ranks against the
+      # policy a real deployment gets.
+      UZI_AUTOSELECT_MAX_STALENESS: 10m
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
     depends_on:

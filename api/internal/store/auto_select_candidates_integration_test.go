@@ -90,13 +90,25 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 		return row.ID
 	}
 
-	// busy   — pooled, a fresh reading, and runs on it across three lanes
-	// idle   — pooled, a fresh reading, no runs at all (the LEFT JOIN's 0 case)
-	// unread — pooled, NO gauge row at all (the other LEFT JOIN's miss)
-	// unpool — NOT pooled, with a perfect reading (must still be returned)
+	// The design note's SEVEN discriminating shapes, one per behaviour the two queries
+	// could disagree on. Authored deliberately, not snapshotted: a set drawn from
+	// whatever demo data happens to hold does not discriminate, which is the whole
+	// point of the table.
+	//
+	//   busy    (1,7) pooled, fresh reading, runs on it across three lanes
+	//   idle    (1)   pooled, fresh reading, no runs at all — the rollup's 0 case
+	//   unread  (2)   pooled, NO gauge row at all — the gauge LEFT JOIN's miss
+	//   halfnul (3)   pooled, a row whose five_hour_pct is NULL — D12
+	//   aged    (4)   pooled, a complete reading with an ancient synced_at
+	//   noreset (6)   pooled, complete and fresh, both resets_at NULL — +inf
+	//   unpool  (5)   NOT pooled, a perfect reading — must still be RETURNED
+	//   foreign       another tenant's, for the scoping assertions
 	busy := mkSecret(owner, "busy-key", true, true)
 	idle := mkSecret(owner, "idle-key", false, true)
 	unread := mkSecret(owner, "unread-key", false, true)
+	halfnul := mkSecret(owner, "half-measured-key", false, true)
+	aged := mkSecret(owner, "aged-key", false, true)
+	noreset := mkSecret(owner, "no-reset-key", false, true)
 	unpool := mkSecret(owner, "reserved-key", false, false)
 	foreign := mkSecret(stranger, "stranger-key", true, true)
 
@@ -119,6 +131,48 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	mkGauge(idle, owner, 5, 5)
 	mkGauge(unpool, owner, 0, 0)
 	mkGauge(foreign, stranger, 0, 0)
+
+	// Case 3 (D12): a row exists and measured only ONE window. This also catches a
+	// query that COALESCEs a NULL pct to 0, which would silently turn "we know
+	// nothing" into "this token is completely free" — the single worst direction for
+	// this bug, since an unmeasured token would then win every ranking.
+	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		UserSecretID: halfnul, UserID: owner,
+		FiveHourPct: pgtype.Int2{}, // NULL
+		SevenDayPct: pgtype.Int2{Int16: 30, Valid: true},
+		Source:      pgtype.Text{String: "usage_endpoint", Valid: true},
+		SyncedAt:    pgtype.Timestamptz{Time: synced, Valid: true},
+	}); uerr != nil {
+		t.Fatalf("upsert half-measured gauge: %v", uerr)
+	}
+
+	// Case 4: a complete reading that aged out. Catches a query that omits synced_at
+	// entirely — every other case would still pass, because Classify's other gates
+	// would answer first.
+	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		UserSecretID: aged, UserID: owner,
+		FiveHourPct: pgtype.Int2{Int16: 10, Valid: true},
+		SevenDayPct: pgtype.Int2{Int16: 10, Valid: true},
+		Source:      pgtype.Text{String: "usage_endpoint", Valid: true},
+		SyncedAt:    pgtype.Timestamptz{Time: synced.Add(-90 * 24 * time.Hour), Valid: true},
+	}); uerr != nil {
+		t.Fatalf("upsert aged gauge: %v", uerr)
+	}
+
+	// Case 6: fresh and fully measured, but the poller reported no reset for either
+	// window (00080 makes both nullable). +inf must survive the round trip as NULL
+	// rather than arriving as a zero time, which would sort BEFORE every real reset
+	// and make this token win every tie — the exact inversion of the rule.
+	if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+		UserSecretID: noreset, UserID: owner,
+		FiveHourPct: pgtype.Int2{Int16: 20, Valid: true},
+		SevenDayPct: pgtype.Int2{Int16: 20, Valid: true},
+		// both resets_at deliberately left NULL
+		Source:   pgtype.Text{String: "usage_endpoint", Valid: true},
+		SyncedAt: pgtype.Timestamptz{Time: synced, Valid: true},
+	}); uerr != nil {
+		t.Fatalf("upsert no-reset gauge: %v", uerr)
+	}
 
 	connID, repoID := uuid.New(), uuid.New()
 	mustExec(ctx, t, pool,
@@ -178,8 +232,8 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 	}
 	// --- 4 + 6. Every one of the owner's tokens, pooled or not; none of the
 	// stranger's.
-	if len(rows) != 4 {
-		t.Fatalf("got %d candidate rows, want 4 (busy, idle, unread, reserved): %+v", len(rows), rows)
+	if len(rows) != 7 {
+		t.Fatalf("got %d candidate rows, want 7 (the design note's seven shapes): %+v", len(rows), rows)
 	}
 	if _, leaked := byID[foreign]; leaked {
 		t.Fatal("the stranger's token appeared in the owner's candidate list; the outer WHERE is not owner-scoped")
@@ -290,6 +344,121 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 		if why, same := sameCandidate(fromMeter, fromRank); !same {
 			t.Fatalf("the two queries disagree about %v: %s\n  settings: %+v\n  ranking:  %+v",
 				m.UserSecretID, why, fromMeter, fromRank)
+		}
+	}
+
+	// --- Every fixture case is actually EXERCISED ----------------------------
+	// A meta-assertion, and not ceremony: the seven shapes above are only worth
+	// authoring if each one reaches Classify as the state it was built to represent.
+	// A fixture that silently degenerates — a NULL that arrived as 0, an ancient
+	// synced_at that the query dropped — still produces a row, still passes the
+	// differential (both queries would degenerate identically), and quietly stops
+	// discriminating. Asserting the STATUS is what pins the shape to its purpose.
+	//
+	// MaxStaleness is 15m here so `aged` classifies stale on its own merits rather
+	// than because a zero policy makes everything stale, which would let three of
+	// these cases pass for the same wrong reason.
+	classifyPolicy := autoselect.Policy{MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute}
+	for _, tc := range []struct {
+		name   string
+		id     uuid.UUID
+		want   autoselect.Status
+		shapes string
+	}{
+		{"busy", busy, autoselect.StatusEligible, "case 1+7: fresh, measurable, with in-flight runs"},
+		{"idle", idle, autoselect.StatusEligible, "case 1: fresh and measurable"},
+		{"unread", unread, autoselect.StatusNoReading, "case 2: no gauge row at all"},
+		{"half-measured", halfnul, autoselect.StatusUnmeasured, "case 3: one window NULL (D12)"},
+		{"aged", aged, autoselect.StatusStale, "case 4: the reading aged out"},
+		{"no-reset", noreset, autoselect.StatusEligible, "case 6: fresh, measurable, NULL resets"},
+		{"reserved", unpool, autoselect.StatusNotPooled, "case 5: not opted in"},
+	} {
+		got := autoselect.Classify(autoselectrow.FromCandidateRow(byID[tc.id]), classifyPolicy, time.Now())
+		if got.Status != tc.want {
+			t.Errorf("%s classified %q, want %q — %s. The fixture has degenerated and is no "+
+				"longer discriminating anything", tc.name, got.Status, tc.want, tc.shapes)
+		}
+	}
+	// Case 6's payload specifically: NULL must arrive as nil, not as a zero time.
+	if c := autoselectrow.FromCandidateRow(byID[noreset]); c.FiveResetsAt != nil || c.SevenResetsAt != nil {
+		t.Errorf("a NULL reset round-tripped as %v/%v, want nil on both — a zero time is a real, "+
+			"orderable instant that sorts before every genuine reset", c.FiveResetsAt, c.SevenResetsAt)
+	}
+
+	// --- The A/B/C = 80/75/70 intransitivity case, end to end ----------------
+	// R1 at the STORE layer. The unit test proves Select's arithmetic; this proves the
+	// same answer survives the real query, the real pgtype unwrapping and the real
+	// row order — which is where a future refactor would put a sort.Slice over an
+	// intransitive `less` and where the unit fixtures could not see it.
+	//
+	// C carries by far the soonest reset, so any implementation that lets it into the
+	// tie cluster picks it. With T=5 the cluster is {80,75} and B wins on its reset.
+	abcOwner := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		abcOwner, fmt.Sprintf("abc-%s@e2e", abcOwner))
+	abc := map[string]uuid.UUID{}
+	for _, tc := range []struct {
+		label   string
+		pct     int16
+		resetIn time.Duration
+	}{
+		{"a-80", 20, 2 * time.Hour},
+		{"b-75", 25, time.Hour},
+		{"c-70", 30, time.Minute}, // the bait
+	} {
+		id := mkSecret(abcOwner, tc.label, false, true)
+		abc[tc.label] = id
+		if uerr := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+			UserSecretID: id, UserID: abcOwner,
+			FiveHourPct:      pgtype.Int2{Int16: tc.pct, Valid: true},
+			SevenDayPct:      pgtype.Int2{Int16: 0, Valid: true},
+			FiveHourResetsAt: pgtype.Timestamptz{Time: time.Now().UTC().Add(tc.resetIn), Valid: true},
+			Source:           pgtype.Text{String: "usage_endpoint", Valid: true},
+			SyncedAt:         pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		}); uerr != nil {
+			t.Fatalf("upsert %s gauge: %v", tc.label, uerr)
+		}
+	}
+	abcRows, aerr := q.ListAutoSelectCandidates(ctx, abcOwner)
+	if aerr != nil {
+		t.Fatalf("ListAutoSelectCandidates(abc): %v", aerr)
+	}
+	if len(abcRows) != 3 {
+		t.Fatalf("got %d A/B/C rows, want 3", len(abcRows))
+	}
+	abcCands := make([]autoselect.Candidate, 0, 3)
+	for _, r := range abcRows {
+		abcCands = append(abcCands, autoselectrow.FromCandidateRow(r))
+	}
+
+	// 🔴 EVERY PERMUTATION, and the reason is a measured near-miss rather than rigour
+	// for its own sake. The first version of this ran Select once, over the query's
+	// own `ORDER BY s.id` — and the ids are gen_random_uuid(), so the order was
+	// random per run. Under the cluster-guard mutation that fixture picks C for SOME
+	// orderings and B for others, which makes it a FLAKY guard: it would have passed
+	// here, passed in CI, and failed for somebody once a month. Measured: with the
+	// guard removed, order (A,B,C) yields C while (C,A,B) yields B.
+	//
+	// That order-dependence is not an artefact of the test — it IS the intransitivity
+	// symptom. So asserting over all 3! orderings tests the property directly and
+	// deterministically, which is strictly better than pinning the row order would
+	// have been.
+	perms := [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, perm := range perms {
+		shuffled := []autoselect.Candidate{abcCands[perm[0]], abcCands[perm[1]], abcCands[perm[2]]}
+		out := autoselect.Select(shuffled, classifyPolicy, time.Now())
+		if !out.Picked {
+			t.Fatalf("A/B/C order %v picked nothing (reason %q)", perm, out.Reason)
+		}
+		if out.SecretID == abc["c-70"] {
+			t.Fatalf("order %v picked the 70-headroom token through the real query. It is 10 points "+
+				"outside a 5-point tie window, and only an INTRANSITIVE pairwise comparator lets it "+
+				"in (A ties B, B ties C, A does not tie C) — R1, and the reason the ranking is "+
+				"anchored to H* rather than compared pairwise", perm)
+		}
+		if out.SecretID != abc["b-75"] {
+			t.Fatalf("order %v picked %v, want b-75 — the cluster is {80,75} and 75 resets sooner",
+				perm, out.SecretID)
 		}
 	}
 
