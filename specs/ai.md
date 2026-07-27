@@ -12333,3 +12333,43 @@ Two things worth keeping:
   logs, the improve_uzi backlog), not something this work established. Same reduction-not-a-close
   register as `--ignore-scripts` in §398 — say what was measured, and say what rests on an
   assumption.
+
+## 418. PRD #116 — a THIRD result state, "blocked", decided at render time and nowhere else
+
+A PreToolUse denial is the guardrail working as designed, and the agent recovers from it, so painting
+it red made healthy runs look broken. The live case (#115): the lead's `Explore` spawn was denied, it
+used `researcher` instead, the run finished fine — and the feed showed a red "✗ error". So
+`tool_result` now has three presentation states, not two: an exported pure
+`classifyResultState(isError, text): "ok" | "error" | "blocked"` in `web/src/components/RunEvent.tsx`.
+A denial renders a neutral chip with a warn-tinted `⊘` glyph and starts **collapsed**; a genuine error
+keeps the red `✗` and still auto-expands, because that one still wants attention.
+
+- **What it keys off.** All 15 deny reasons in `agent/src/guardrails.ts` carry the phrase
+  `"denied by guardrail"`. The web match is `.includes`, deliberately NOT `.startsWith` — that
+  tolerates the two colon-less `?? "denied by guardrail"` fallbacks and survives a future
+  `<tool_use_error>…</tool_use_error>` SDK wrapper around the text. `web/` and `agent/` are separate
+  npm packages, so the phrase cannot be imported; the coupling is pinned from the **agent** side by
+  `agent/test/guardrails.test.ts`, both behaviourally (all 15 deny paths driven through the public
+  API — the constants are module-private — asserting 15 *distinct* reasons, so the table cannot be
+  fifteen copies of one path) and structurally (a source scan of the `REASON_*` literals, so a FUTURE
+  16th reason added without the phrase fails too, which the behavioural half can never cover). Both
+  agent-side assertions are `startsWith`, stricter than what the web needs on purpose: the web
+  tolerates a wrapper it does not control, the agent promises text it does.
+
+- **`is_error` stays TRUE. This is presentation-only.** The persisted `run_messages` frame stays
+  honest to exactly what the SDK emitted — and historical frames cannot be rewritten anyway. Nothing
+  else reads a `tool_result` block's `is_error`: `isErrorResult` (`agent/src/sdk-messages.ts`) only
+  inspects the terminal `type:"result"` frame, and all three consumers (`sdk-executor.ts`,
+  `chat-executor.ts`, `judge-runner.ts`) gate it behind `isResult(msg)`. So no executor, run-health,
+  error-count or judge path changes. Detection being render-time is also what gives historical runs
+  the calm chip for free: no persisted marker, no migration, and `ChatMessages` inherits it because it
+  renders through the same row.
+
+- **The honest limit.** The phrase coupling is real. If the pinned claude-agent-sdk moved the
+  PreToolUse-deny path onto its `<tool_use_error>` wrapper AND changed the text, every blocked chip
+  would silently revert to red with no test failing on the web side — and nobody would notice, because
+  the run still works. `.includes` plus the agent-side phrase test are the cheap mitigations chosen,
+  not a close. The durable fix, if it ever regresses, is the structured marker the PRD documents as
+  the alternative: tag the message at `agent/src/sdk-messages.ts` `mapUser` with an additive
+  `denied: true` through the opaque `jsonb` payload. Deliberately NOT built now — it touches agent,
+  protocol and web for a cosmetic change.

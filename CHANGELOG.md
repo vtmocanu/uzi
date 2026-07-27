@@ -6,6 +6,27 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **A guardrail denial no longer reads as a failure in the run activity feed.** When a
+  PreToolUse guardrail denies a call — a `git push`, an env or `/proc` read, an unassembled
+  subagent — the agent recovers and the run carries on, but the feed painted the result with
+  the same red "✗ error" badge as a genuine tool crash, so a healthy run looked broken to
+  anyone watching. Such results now render a third, calm state: a neutral "⊘ blocked" chip
+  (only the glyph is warn-tinted, because a full warn chip would collide with the
+  "plan awaiting approval" and slow-duration tints) that stays collapsed rather than
+  auto-expanding, since a handled and recovered-from denial does not want attention. A real
+  failure is untouched — still red, still auto-expanded. The chat surface inherits it, as it
+  renders through the same row. Detection is render-time, keyed off the `"denied by guardrail"`
+  phrase all 15 deny reasons carry, so historical runs get the calm chip too with no persisted
+  marker and no migration; `is_error` is deliberately left true on the stored frame, which
+  keeps it honest to what the SDK emitted and leaves every executor, run-health and judge path
+  untouched. The coupling to that phrase is real and is pinned from the agent side, since the
+  two are separate npm packages: `agent/test/guardrails.test.ts` now drives all 15 deny paths
+  through the public API and also scans the reason literals in source, so a future 16th reason
+  added without the phrase fails there rather than silently turning its chip red again
+  (issue #116).
+
 ## [0.11.11] - 2026-07-27
 
 ### Added

@@ -6,6 +6,7 @@ import {
   CommandBlock,
   RunEventRow,
   buildToolIndex,
+  classifyResultState,
   describeError,
   describeStatus,
   formatDuration,
@@ -468,6 +469,116 @@ describe("result chips (PRD #38 Decision 13)", () => {
     const pre = container.querySelector("pre");
     expect(pre?.textContent?.startsWith("[image omitted]")).toBe(true);
     expect(pre?.textContent).toContain("after image");
+  });
+});
+
+describe("guardrail-deny 'blocked' chip (PRD #116)", () => {
+  // The live #115 reason: the lead tried to spawn the SDK built-in `Explore`
+  // subagent and the subagent guard denied it (REASON_UNKNOWN_SUBAGENT).
+  const DENY = "denied by guardrail: only the run's assembled subagents may be invoked";
+
+  const renderResult = (payload: Record<string, unknown>) =>
+    render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Agent", input: { subagent_type: "Explore", description: "map the feed" } } })}
+        result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", ...payload } })}
+        live={false}
+      />,
+    );
+
+  it("classifies the three states, tolerating every phrase variant", () => {
+    expect(classifyResultState(false, "all good")).toBe("ok");
+    expect(classifyResultState(true, "boom\nstack")).toBe("error");
+    expect(classifyResultState(true, DENY)).toBe("blocked");
+    // Colon-less fallback (guardrails.ts:539/:786).
+    expect(classifyResultState(true, "denied by guardrail")).toBe("blocked");
+    // A future <tool_use_error> SDK wrapper — the reason why the match is
+    // .includes and not .startsWith.
+    expect(classifyResultState(true, "<tool_use_error>denied by guardrail: x</tool_use_error>")).toBe(
+      "blocked",
+    );
+    // Gated on is_error: a SUCCESSFUL result that merely quotes the phrase is not
+    // reclassified.
+    expect(classifyResultState(false, DENY)).toBe("ok");
+  });
+
+  it("labels a guardrail denial 'blocked', never 'error'", () => {
+    const { getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    expect(chip.textContent).toContain("blocked");
+    expect(chip.textContent).not.toContain("error");
+    expect(chip.textContent).toContain("⊘");
+  });
+
+  it("starts COLLAPSED (unlike a genuine error) and expands on click", () => {
+    const { container, getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(true);
+    fireEvent.click(chip);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    expect(pre?.hasAttribute("hidden")).toBe(false);
+    // …and it re-labels for the open state, like any normal collapsible result.
+    expect(chip.getAttribute("aria-label")).toBe("Hide Agent blocked output");
+  });
+
+  it("uses a NON-danger tone: neutral chip + body, warn only on the ⊘ glyph", () => {
+    const { container, getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    const pre = container.querySelector("pre");
+    // Nothing in the row carries a danger colour (border-/bg-/text-danger).
+    for (const el of Array.from(container.querySelectorAll("*"))) {
+      expect(el.className.toString()).not.toMatch(/(border|bg|text)-danger/);
+    }
+    // The chip reuses the neutral success frame verbatim…
+    expect(chip.className).toContain("border-edge bg-raised/50 text-muted hover:border-edge-strong");
+    expect(pre?.className).toContain("border-edge bg-ink");
+    // …and only the glyph is warn-tinted (Decision 4: no full warn chip).
+    const glyph = Array.from(chip.querySelectorAll("span")).find((s) => s.textContent === "⊘");
+    expect(glyph?.className).toContain("text-warn");
+    expect(chip.className).not.toContain("text-warn");
+  });
+
+  it("preserves the raw deny reason verbatim in the body", () => {
+    const { container } = renderResult({ content: DENY, is_error: true });
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent).toBe(DENY);
+    expect(pre?.getAttribute("aria-label")).toBe("Tool blocked output");
+  });
+
+  it("also blocks on the colon-less fallback and a wrapped reason", () => {
+    for (const content of [
+      "denied by guardrail",
+      "<tool_use_error>denied by guardrail: reading /proc is not permitted</tool_use_error>",
+    ]) {
+      const { getByRole, unmount } = renderResult({ content, is_error: true });
+      const chip = getByRole("button", { name: /show Agent blocked output/i });
+      expect(chip.textContent).toContain("blocked");
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      unmount();
+    }
+  });
+
+  it("leaves a NON-guardrail error unchanged: red ✗ error, auto-expanded", () => {
+    const { container, getByRole } = renderResult({ content: "boom\nstack", is_error: true });
+    const chip = getByRole("button", { name: /hide Agent error output/i });
+    expect(chip.textContent).toContain("error");
+    expect(chip.textContent).toContain("✗");
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    expect(chip.className).toContain("border-danger/40 bg-danger/10 text-danger");
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(false);
+    expect(pre?.className).toContain("border-danger/40 bg-danger/[0.08]");
+    expect(pre?.getAttribute("aria-label")).toBe("Tool error output");
+  });
+
+  it("does not reclassify a SUCCESS result that merely mentions the phrase", () => {
+    const { getByRole } = renderResult({ content: `note: ${DENY}` });
+    const chip = getByRole("button", { name: /show 1 line of Agent output/i });
+    expect(chip.textContent).toContain("1 line");
+    expect(chip.textContent).toContain("✓");
+    expect(chip.textContent).not.toContain("blocked");
   });
 });
 

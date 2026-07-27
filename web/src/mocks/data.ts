@@ -1803,11 +1803,17 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_result", "coder", { tool_use_id: "tu-3", content: "ok" }, 203),
   dm("tool_use", "coder", { id: "tu-4", name: "Bash", input: { command: "cd web && npx vitest run src/components/RunEvent.test.tsx" } }, 200),
   dm("tool_result", "coder", { tool_use_id: "tu-4", content: "✓ 14 tests passed" }, 199),
+  // PRD #116: the real #115 story — the lead tried to spawn the SDK built-in
+  // `Explore` subagent, the subagent guard denied it (guardrails.ts), and the run
+  // carried on. It must read as a neutral "⊘ blocked" chip, not a red error.
+  dm("tool_use", "lead", { id: "tu-5", name: "Agent", input: { subagent_type: "Explore", description: "map the remaining render paths" } }, 198),
+  dm("tool_result", "lead", { tool_use_id: "tu-5", content: "denied by guardrail: only the run's assembled subagents may be invoked", is_error: true }, 198),
+  dm("text", "lead", { text: "I'll use the researcher subagent instead." }, 197),
   dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", model: "claude-opus-4-8", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
-  dm("tool_use", "coder", { id: "tu-5", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
-  dm("tool_result", "coder", { tool_use_id: "tu-5", content: "ok" }, 192),
-  dm("tool_use", "coder", { id: "tu-6", name: "Bash", input: { command: "cd web && npm run typecheck && npm test" } }, 190),
-  dm("tool_result", "coder", { tool_use_id: "tu-6", content: "typecheck clean\n✓ 61 tests passed" }, 188),
+  dm("tool_use", "coder", { id: "tu-6", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
+  dm("tool_result", "coder", { tool_use_id: "tu-6", content: "ok" }, 192),
+  dm("tool_use", "coder", { id: "tu-7", name: "Bash", input: { command: "cd web && npm run typecheck && npm test" } }, 190),
+  dm("tool_result", "coder", { tool_use_id: "tu-7", content: "typecheck clean\n✓ 61 tests passed" }, 188),
   dm("status", null, { text: "pushing branch agent/issue-18 and opening the MR" }, 185),
   dm("status", null, {
     event: "result",

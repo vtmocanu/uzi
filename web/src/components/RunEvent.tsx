@@ -318,6 +318,27 @@ export function resultToText(content: unknown): { text: string; hadNonText: bool
   return { text: "", hadNonText: false };
 }
 
+// GUARDRAIL_DENY_MARK is the stable, deliberate phrase every one of the 15
+// guardrail deny reasons carries (agent/src/guardrails.ts:92-111), plus the two
+// colon-less `?? "denied by guardrail"` fallbacks (:539/:786). `web/` and `agent/`
+// are separate npm packages, so the phrase cannot be imported — the contract is
+// pinned from the agent side by agent/test/guardrails.test.ts. Matched with
+// `.includes`, NOT `.startsWith`, so it survives the colon-less fallback and a
+// possible future `<tool_use_error>…</tool_use_error>` SDK wrapper (PRD #116).
+const GUARDRAIL_DENY_MARK = "denied by guardrail";
+
+export type ResultState = "ok" | "error" | "blocked";
+
+// classifyResultState maps a tool_result to its presentation state (PRD #116).
+// "blocked" is gated on is_error deliberately: over-matching would need a
+// genuinely FAILING result whose text also contains the exact phrase — negligible.
+// The state is purely presentational — `is_error` stays true on the persisted
+// frame, and no executor/health/judge path is touched (PRD #116 Decision 2).
+export function classifyResultState(isError: boolean, text: string): ResultState {
+  if (!isError) return "ok";
+  return text.includes(GUARDRAIL_DENY_MARK) ? "blocked" : "error";
+}
+
 // ── durations ───────────────────────────────────────────────────────────────
 
 // formatDuration renders a millisecond span terse: "0.8s", "12.4s", "1m 05s".
@@ -546,20 +567,51 @@ function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMess
 
 // ── per-kind rows ───────────────────────────────────────────────────────────
 
+// Per-state chip/body presentation (PRD #116 Decision 4). "blocked" reuses the
+// NEUTRAL success frame verbatim — only its ⊘ glyph is warn-tinted, because
+// --warn already means "plan awaiting approval" (:765) and slow duration (:531),
+// so a fully warn chip would collide semantically.
+const RESULT_TONE: Record<ResultState, { glyph: string; glyphClass: string; chip: string; body: string; aria: string }> = {
+  ok: {
+    glyph: "✓",
+    glyphClass: "text-ok",
+    chip: "border-edge bg-raised/50 text-muted hover:border-edge-strong",
+    body: "border-edge bg-ink",
+    aria: "Tool output",
+  },
+  error: {
+    glyph: "✗",
+    glyphClass: "text-danger",
+    chip: "border-danger/40 bg-danger/10 text-danger",
+    body: "border-danger/40 bg-danger/[0.08]",
+    aria: "Tool error output",
+  },
+  blocked: {
+    glyph: "⊘",
+    glyphClass: "text-warn",
+    chip: "border-edge bg-raised/50 text-muted hover:border-edge-strong",
+    body: "border-edge bg-ink",
+    aria: "Tool blocked output",
+  },
+};
+
 // ToolResultBody renders a result as a collapsed inline chip that expands into a
-// focusable code block (PRD #38 Decision 13). Labels: "✗ error" / "✓ ok"
-// (empty or whitespace-only output) / "✓ N lines". The body stays MOUNTED but
-// hidden while collapsed, so its text is always in the DOM (pairing/test
-// assertions); a dropped non-text block surfaces as a "[image omitted]" first
-// line. Errors auto-expand with a danger tint.
+// focusable code block (PRD #38 Decision 13). Labels: "✗ error" / "⊘ blocked"
+// (a guardrail denial, PRD #116) / "✓ ok" (empty or whitespace-only output) /
+// "✓ N lines". The body stays MOUNTED but hidden while collapsed, so its text is
+// always in the DOM (pairing/test assertions); a dropped non-text block surfaces
+// as a "[image omitted]" first line. Errors auto-expand with a danger tint; a
+// blocked result is handled-and-recovered, so it stays neutral and collapsed.
 function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: string }) {
   const rec = asRecord(result.payload) ?? {};
   const isError = rec["is_error"] === true;
   const { text, hadNonText } = resultToText(rec["content"]);
   const empty = text.trim() === "";
   const lineCount = empty ? 0 : text.split("\n").length;
+  const state = classifyResultState(isError, text);
+  const tone = RESULT_TONE[state];
 
-  const [open, setOpen] = useState(isError);
+  const [open, setOpen] = useState(state === "error");
   const bodyRef = useRef<HTMLPreElement>(null);
   const userToggled = useRef(false);
   // Move keyboard focus into the body only when the USER opens it — never on the
@@ -568,20 +620,32 @@ function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: s
     if (open && userToggled.current) bodyRef.current?.focus();
   }, [open]);
 
-  const label = isError ? "error" : empty ? "ok" : `${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  const label =
+    state === "error"
+      ? "error"
+      : state === "blocked"
+        ? "blocked"
+        : empty
+          ? "ok"
+          : `${lineCount} line${lineCount === 1 ? "" : "s"}`;
   // Name the tool in the a11y label when the call is known (paired), like the mock
   // ("Show 3 lines of Bash output"). An orphan result has no call, so it keeps the
   // tool-agnostic wording (PRD #38 M6 NIT).
   const of = toolName ? `${toolName} ` : "";
-  const showLabel = isError
-    ? `Show ${of}error output`
-    : empty
-      ? `Show ${of}output`
-      : `Show ${label} of ${of}output`;
+  const showLabel =
+    state === "error"
+      ? `Show ${of}error output`
+      : state === "blocked"
+        ? `Show ${of}blocked output`
+        : empty
+          ? `Show ${of}output`
+          : `Show ${label} of ${of}output`;
   const ariaLabel = open
-    ? isError
+    ? state === "error"
       ? `Hide ${of}error output`
-      : `Hide ${of}output`
+      : state === "blocked"
+        ? `Hide ${of}blocked output`
+        : `Hide ${of}output`
     : showLabel;
 
   const bodyText = empty ? (hadNonText ? "" : "(no output)") : text;
@@ -599,13 +663,11 @@ function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: s
         }}
         className={cx(
           "inline-flex min-h-[24px] items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-medium",
-          isError
-            ? "border-danger/40 bg-danger/10 text-danger"
-            : "border-edge bg-raised/50 text-muted hover:border-edge-strong",
+          tone.chip,
         )}
       >
-        <span aria-hidden="true" className={cx("font-bold", isError ? "text-danger" : "text-ok")}>
-          {isError ? "✗" : "✓"}
+        <span aria-hidden="true" className={cx("font-bold", tone.glyphClass)}>
+          {tone.glyph}
         </span>
         {label}
       </button>
@@ -614,10 +676,10 @@ function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: s
         hidden={!open}
         tabIndex={0}
         role="group"
-        aria-label={isError ? "Tool error output" : "Tool output"}
+        aria-label={tone.aria}
         className={cx(
           "mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border px-2.5 py-2 font-mono text-xs text-muted",
-          isError ? "border-danger/40 bg-danger/[0.08]" : "border-edge bg-ink",
+          tone.body,
         )}
       >
         {body}
