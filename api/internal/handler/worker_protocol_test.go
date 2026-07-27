@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -226,6 +227,68 @@ func TestSanitizeSelfReported(t *testing.T) {
 	// Trims, strips control chars, caps length.
 	if got := sanitizeSelfReported("  1.2.3\x07-m4 \n ", maxSelfReportedBytes); got != "1.2.3-m4" {
 		t.Fatalf("sanitizeSelfReported = %q, want %q", got, "1.2.3-m4")
+	}
+	// Issue #124: format characters (Cf) too, not only controls (Cc). The two categories
+	// are DISJOINT, so IsControl alone never saw any of these — and this function carries
+	// a recommendation's Target (judge_worker.go:369), which is a filename, so a surviving
+	// bidi override lets a review name one file and point at another. Corpus mirrored from
+	// TestSanitizeTTYStripsControlAndFormatChars (api/cmd/uzi/tui_render_test.go:61).
+	for _, tc := range []struct{ name, in, want string }{
+		{"RLO bidi override", "a\u202Eb", "ab"},
+		{"LRO bidi override", "a\u202Db", "ab"},
+		{"bidi isolate", "a\u2066b", "ab"},
+		{"RTL mark", "a\u200Fb", "ab"},
+		{"zero-width space", "a\u200Bb", "ab"},
+		{"zero-width joiner", "a\u200Db", "ab"},
+		{"BOM", "a\uFEFFb", "ab"},
+		{"soft hyphen", "a\u00ADb", "ab"},
+		// The ESC BYTE is what makes a sequence an escape sequence; stripping it leaves
+		// inert literal text, which is correct and is what sanitizeTTY's own case asserts.
+		{"CSI cursor move loses its ESC", "a\x1b[2Jb", "a[2Jb"},
+		// C1 as a RUNE, and DEL: neither is caught by a naive r < 0x20 predicate.
+		{"C1 control rune", "a\u009bb", "ab"},
+		{"DEL", "a\x7fb", "ab"},
+		// A real filename target must survive untouched — the rule is a category test,
+		// not an ASCII allowlist.
+		{"an ordinary target is unchanged", "api/internal/forge/gitlab.go", "api/internal/forge/gitlab.go"},
+		{"non-Latin text survives", "\u65e5\u672c\u8a9e", "\u65e5\u672c\u8a9e"},
+		// Cn/Co are NOT stripped: the predicate is Cc|Cf, not the whole C category. U+E000
+		// is private use, which Unicode will never assign, so this fixture cannot rot.
+		{"private-use code point survives", "a\ue000b", "a\ue000b"},
+	} {
+		if got := sanitizeSelfReported(tc.in, maxSelfReportedBytes); got != tc.want {
+			t.Errorf("%s: sanitizeSelfReported(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+	// TRIM ORDER (#124 follow-up). TrimSpace runs BEFORE the strip and Cf is not
+	// White_Space, so one format character at each edge shielded the adjacent ASCII space
+	// from the trim; the loop then removed the Cf and left the space. BOTH halves are
+	// asserted, because the plain-whitespace row is what makes the padded row a defect
+	// rather than a design choice — without it the fix is unfalsifiable in the direction
+	// that matters. It bites on `target`, a COORDINATE: " api/foo.go " and "api/foo.go" are
+	// different (category, target) pairs, so one Cf-padded run and one clean run become two
+	// backlog groups a human reads as identical.
+	for _, tc := range []struct{ name, in, want string }{
+		{"Cf-padded edges lose the whitespace too", "\u200b  api/internal/forge/gitlab.go  \u200b", "api/internal/forge/gitlab.go"},
+		{"leading Cf alone", "\u202e  api/foo.go", "api/foo.go"},
+		{"trailing Cf alone", "api/foo.go  \ufeff", "api/foo.go"},
+		{"plain whitespace still trims (the control)", "  plain surrounding spaces  ", "plain surrounding spaces"},
+		{"interior whitespace is untouched", "api/foo bar.go", "api/foo bar.go"},
+	} {
+		if got := sanitizeSelfReported(tc.in, maxSelfReportedBytes); got != tc.want {
+			t.Errorf("%s: sanitizeSelfReported(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+
+	// The PROPERTY, asserted independently of any per-case expectation: whatever survives
+	// is neither Cc nor Cf. A table can only cover the codepoints someone thought of.
+	// No whitespace exemption here — this sink is single-line by contract.
+	for _, in := range []string{"a\u202Eb", "a\x1b[2Jb", "a\u200db\ufeffc", "x\ty\nz"} {
+		for _, r := range sanitizeSelfReported(in, maxSelfReportedBytes) {
+			if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+				t.Errorf("sanitizeSelfReported(%q) let %U through", in, r)
+			}
+		}
 	}
 	long := strings.Repeat("a", 100)
 	if got := sanitizeSelfReported(long, maxSelfReportedBytes); len(got) > maxSelfReportedBytes+4 {

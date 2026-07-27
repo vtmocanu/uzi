@@ -37,6 +37,7 @@ import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
+import { stripUnsafeChars } from "../lib/safeText";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -558,7 +559,13 @@ export function Board() {
   );
 }
 
-function IssueCard({
+/**
+ * One board card. Exported for the same reason RunView factors out its panels: `Board`
+ * itself needs routing, four API mocks and a drag context to mount, and this file had NO
+ * test at all — so an assertion about a card could not otherwise be written, and the #124
+ * strip on `card.title` would have shipped unverified.
+ */
+export function IssueCard({
   card,
   repoId,
   projectWebUrl,
@@ -632,7 +639,9 @@ function IssueCard({
           draggable={false}
           className="font-medium leading-snug text-fg hover:text-brand-hover"
         >
-          {card.title}
+          {/* Issue #124: the forge issue title, writable by anyone who can open an issue
+              on the repo. Display only — the link targets card.iid, not this string. */}
+          {stripUnsafeChars(card.title)}
         </Link>
         <div className="flex shrink-0 items-center gap-1.5">
           {isHttpsUrl(card.web_url) && (

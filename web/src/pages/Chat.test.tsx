@@ -87,6 +87,26 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124 / item 7. The audit enumerated judge-DTO consumers and so missed this page:
+// a run title reaches a FOURTH surface through Chat's `run?.issue_title` fallback, and the
+// derived chat title beside it is agent-written. One strip covers both branches.
+describe("ChatList — the conversation title carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of the derived title", async () => {
+    mockApi.listChats.mockResolvedValue(
+      chatList([aChat({ id: "a", title: "Fix the \u202Eparser\u200B bug", status: "running" })]),
+    );
+    const { container } = render(
+      <MemoryRouter>
+        <ChatList />
+      </MemoryRouter>,
+    );
+    // Anchored on the closed-enum status, not the title.
+    await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+  });
+});
+
 describe("ChatList — conversation list from fixtures", () => {
   it("renders each conversation's title and status", async () => {
     mockApi.listChats.mockResolvedValue(

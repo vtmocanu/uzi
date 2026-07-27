@@ -117,6 +117,28 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124, item 9. The issue TITLE and DESCRIPTION are both forge-supplied, and the
+// issue's own audit list names descriptions alongside titles. The description renders
+// through <Markdown>, which is hardened against raw HTML and dangerous URL schemes —
+// neither of which is a bidi override, so that pipeline does not close this.
+describe("IssueView — the forge title and description carry no format characters (#124)", () => {
+  it("strips bidi/zero-width characters from both", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({
+        title: "Fix the \u202Eparser\u200B bug",
+        description: "The \u202Eapproved fix is in `api/`.",
+      }),
+    });
+    const { container } = renderIssueView();
+    // Anchored on the iid chip, not on either cleaned string.
+    await waitFor(() => expect(screen.getByText("#7")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+    expect(container.textContent).toContain("The approved fix is in");
+  });
+});
+
 describe("IssueView PRDLESS toggle (PRD #22 M4)", () => {
   it("hides the toggle when the feature is disabled", async () => {
     setAuth(false);

@@ -48,8 +48,13 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
 
+	// workers.token_hash is globally UNIQUE (00020), so a constant literal collides on
+	// workers_token_hash_key the SECOND time this runs against a DB that outlives the
+	// invocation -- a KEEP_STACK=1 re-run, not CI, which spins a throwaway Postgres per
+	// invocation. The failure reads as a real one (issue #107). tokenHash() derives 32
+	// unique bytes from two uuid.New()s, which is what every other LiveDB test here does.
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: userID, Name: "laptop", TokenHash: []byte{0xaa, 0xbb},
+		UserID: userID, Name: "laptop", TokenHash: tokenHash(),
 		AnthropicBindMode: "default",
 	})
 	if err != nil {
@@ -123,7 +128,7 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	// A SECOND worker holds ONLY an active chat: busy=true, active_runs=0 (the exact
 	// case the naive "busy = active_runs > 0" derivation would get wrong).
 	wkr2, err := q.CreateWorker(ctx, store.CreateWorkerParams{
-		UserID: userID, Name: "chat-only", TokenHash: []byte{0xcc, 0xdd},
+		UserID: userID, Name: "chat-only", TokenHash: tokenHash(),
 		AnthropicBindMode: "default",
 	})
 	if err != nil {

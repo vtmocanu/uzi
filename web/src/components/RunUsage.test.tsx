@@ -214,3 +214,129 @@ describe("RunUsagePanel $0 cost (Decision 8)", () => {
     expect(container.textContent).not.toContain("$0.00");
   });
 });
+
+// Issue #152: `Td`'s colour branch was ADDITIVE — a left cell got `text-muted text-fg`
+// both. Equal specificity, so stylesheet order decided it, and `.text-fg` precedes
+// `.text-muted` in the built CSS (re-measured 2026-07-27 on `npm run build`: 24360 vs
+// 24602; the issue measured 24294/24536, so the ORDER is the durable fact, not the
+// offsets). `text-muted` therefore always won and the
+// left-cell rule was dead. The Agent, Phase and Model columns therefore rendered dim
+// against the approved mocks.
+//
+// Asserting BOTH halves is the point: `expect(classes).toContain("text-fg")` alone passes
+// against the buggy code, because the buggy code emits `text-fg` too — it just also emits
+// the class that beats it. The absence is the whole assertion.
+function tableWithHeader(container: HTMLElement, first: string): HTMLTableElement {
+  const table = [...container.querySelectorAll("table")].find(
+    (t) => t.querySelector("thead th")?.textContent?.trim() === first,
+  );
+  if (!table) throw new Error(`table with first header "${first}" not found`);
+  return table;
+}
+function cellClasses(table: HTMLTableElement, row: number, col: number): string[] {
+  const cell = table.tBodies[0]!.rows[row]?.cells[col];
+  if (!cell) throw new Error(`no cell at row ${row}, col ${col}`);
+  return [...cell.classList];
+}
+
+describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
+  it("gives a left-aligned body cell text-fg and NOT text-muted", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+
+    for (const [label, table, col] of [
+      ["phase", tableWithHeader(container, "Phase"), 0],
+      ["agent", tableWithHeader(container, "Agent"), 0],
+      ["model", tableWithHeader(container, "Agent"), 1], // PRD #93's Model column, `left mono`
+    ] as const) {
+      const classes = cellClasses(table, 0, col);
+      expect(classes, `${label} column must be readable`).toContain("text-fg");
+      expect(classes, `${label} column must NOT also carry the muted class that beats it`).not.toContain("text-muted");
+    }
+  });
+
+  it("leaves the numeric columns muted, so the fix did not just brighten everything", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    // Right-aligned, non-total: still the dim treatment the mock asks for. Without this,
+    // `text-fg` everywhere would pass the test above and lose the whole visual hierarchy.
+    const classes = cellClasses(tableWithHeader(container, "Phase"), 0, 1);
+    expect(classes).toContain("text-muted");
+    expect(classes).not.toContain("text-fg");
+  });
+
+  it("keeps the total row emphasised and unmuted, left cell included", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const table = tableWithHeader(container, "Phase");
+    const last = table.tBodies[0]!.rows.length - 1;
+    for (const col of [0, 1]) {
+      const classes = cellClasses(table, last, col);
+      expect(classes).toContain("font-semibold");
+      expect(classes).toContain("text-fg");
+      expect(classes).not.toContain("text-muted");
+    }
+  });
+});
+
+// Item 8: three mechanical a11y defects, all pre-existing, found by web-ux while measuring
+// the #152 contrast fix. Attribute assertions, so the positive control is cheap — drop the
+// attribute, confirm the case reds — and therefore still required.
+describe("RunUsagePanel accessibility (item 8)", () => {
+  function panel() {
+    return render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+  }
+
+  it("names both scroll regions, and adds NO tab stop (WCAG 2.1.1 is already satisfied)", () => {
+    const { container } = panel();
+    const wrappers = [...container.querySelectorAll("div.overflow-x-auto")];
+    // Both breakdown tables, not one: the per-agent table overflows harder than the
+    // per-phase one (600 vs 560 minimum width against a 301px viewport).
+    expect(wrappers.length).toBe(2);
+    for (const w of wrappers) {
+      expect(w.getAttribute("role")).toBe("region");
+      // A region role without an accessible name is not exposed as a landmark at all.
+      // …and the name must not repeat the role the AT announces immediately after it:
+      // "Per-phase usage table, scrollable" then the table role reads as
+      // "…table, scrollable … table, Per-phase usage". `scrollable` stays — that is the
+      // part with no other way to be announced, and the reason the region earns its place.
+      const label = w.getAttribute("aria-label") ?? "";
+      expect(label).toMatch(/scrollable$/);
+      expect(label).not.toMatch(/\btable\b/);
+      // …and NO tabIndex, asserted rather than merely omitted. Chrome focuses overflowing
+      // scrollers natively (web-ux, Chrome 150 at 375px: Tab lands here, ArrowRight scrolls
+      // scrollLeft 0 -> 299), and it
+      // does so ONLY while they overflow — so an unconditional tab stop is dead weight at
+      // every desktop width. This assertion stops it being re-added as an "improvement" on
+      // the strength of the property read that produced the original finding.
+      //
+      // It encodes a CHROME-SCOPED measurement, not a universal rule: see RunUsage.tsx for
+      // what a future engine measurement would have to show, and why the answer there would
+      // be a CONDITIONAL tabIndex rather than deleting this case.
+      expect(w.hasAttribute("tabindex")).toBe(false);
+    }
+    // The two names must DIFFER: two adjacent scrollable data regions with one name is
+    // the case a screen-reader user cannot navigate between.
+    expect(wrappers[0]!.getAttribute("aria-label")).not.toBe(wrappers[1]!.getAttribute("aria-label"));
+  });
+
+  it("names both tables and scopes every column header (WCAG 1.3.1)", () => {
+    const { container } = panel();
+    const tables = [...container.querySelectorAll("table")];
+    expect(tables.length).toBe(2);
+    expect(tables.map((t) => t.getAttribute("aria-label"))).toEqual(["Per-phase usage", "Per-agent usage"]);
+    // Every th is a COLUMN header here; a data cell read without its column is a number
+    // with no meaning. Asserted over all of them so a new column cannot skip it.
+    const ths = [...container.querySelectorAll("th")];
+    expect(ths.length).toBeGreaterThan(0);
+    for (const th of ths) expect(th.getAttribute("scope")).toBe("col");
+  });
+
+  it("hides the decorative disclosure triangles from assistive tech", () => {
+    const { container } = panel();
+    // <details>/<summary> conveys expanded state natively, so an announced triangle is a
+    // second and contradictory reading of the same fact.
+    const glyphs = [...container.querySelectorAll("summary span")].filter((s) =>
+      /[▸▾]/.test(s.textContent ?? ""),
+    );
+    expect(glyphs.length).toBe(4); // two per <details>, one for each open state
+    for (const g of glyphs) expect(g.getAttribute("aria-hidden")).toBe("true");
+  });
+});

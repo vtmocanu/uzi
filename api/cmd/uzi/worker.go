@@ -37,18 +37,39 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
+				// Issue #124: `version` is WORKER SELF-REPORTED, and Printer.Table Fprintln's
+				// cells through a tabwriter with no scrub of its own (uzicli/output.go) — so
+				// this was the one free-text sink in the CLI not routed through sanitizeTTY,
+				// while every other one is. Pre-item-6 the exposure was Cf-only, since the Cc
+				// half was already stripped at ingest; ingest now strips both, and this covers
+				// rows written before that. compactText is the shape the neighbouring table
+				// cells already use.
+				// Sanitize BEFORE the placeholder, not after: a version that is nothing but
+				// format characters compacts to "" and must still read as "-", not as a blank
+				// cell. (A judge could not do this, but a hostile worker holding a valid join
+				// token could, and that is whose string this is.)
+				//
+				// `w.Name` IS sanitized too, through cellText (= compactText plus the tab fold
+				// a column rail needs). This paragraph used to say the opposite — that a name
+				// is deliberately left raw because `worker list` shows only the CALLER's own
+				// workers, so its author and its only reader are the same person. That argument
+				// holds for the SPOOFING half and does not cover the rest: worker names are
+				// validated for LENGTH ONLY (handler/workers.go: TrimSpace + a 200-byte cap)
+				// and workers.name is a bare `text` with no CHECK, so unlike a token label an
+				// ESC is storable in one, and an embedded newline breaks the tabwriter rail for
+				// every FOLLOWING row — a name can forge a table row in its owner's own output.
+				// The admin/all-users mode this paragraph anticipated is not hypothetical either,
+				// it is just not a FLAG on this command: `uzi admin workers` (admin.go) has
+				// printed names cross-tenant since PRD #64 M7, and rendered them raw until
+				// PRD #111 M5 put cellText on that cell. A sanitized cell beside an unsanitized
+				// one in the same row is worse than either, because it reads as though the
+				// question was considered.
+				version := compactText(strOr(w.Version, ""))
+				if version == "" {
+					version = "-"
+				}
 				rows = append(rows, []string{
-					// cellText on the NAME, not just on the token label two cells over.
-					// Worker names are validated for LENGTH ONLY (handler/workers.go:
-					// TrimSpace + a 200-byte cap) and workers.name is a bare `text` with
-					// no CHECK, so unlike a token label an ESC is storable in one — the
-					// ANSI-injection class validateSecretLabel has always refused is live
-					// here. An embedded newline additionally breaks the tabwriter rail for
-					// every following row, i.e. a name can FORGE a table row.
-					//
-					// A sanitized cell beside an unsanitized one in the same row is worse
-					// than either, because it reads as though the question was considered.
-					w.ID, cellText(w.Name), w.Status, strOr(w.Version, "-"), upgradeCell(w), bindModeCell(w),
+					w.ID, cellText(w.Name), w.Status, version, upgradeCell(w), bindModeCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an

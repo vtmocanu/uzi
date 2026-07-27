@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -85,6 +87,99 @@ func TestValidateAndScrubReviewCapsAndStripsControl(t *testing.T) {
 	// Markdown newline/tab preserved.
 	if !strings.Contains(sub.SummaryMd, "\n") || !strings.Contains(sub.SummaryMd, "\t") {
 		t.Error("markdown newline/tab should be preserved in the summary")
+	}
+}
+
+// Issue #124 at the SOURCE. Cc and Cf are DISJOINT categories, so the IsControl-only
+// predicate this replaced never saw a bidi override — and judge output is LLM-derived text
+// influenced by whatever the run looked at, so an approving sentence could be persisted in a
+// form that RENDERS inside a rejecting review. Trojan Source (CVE-2021-42574).
+//
+// Both scrubbers on this path are exercised here, because they are different functions with
+// different whitespace postures and only one of them carries the filename:
+// sanitizeReviewText for Summary/Rationale (keeps \n and \t), sanitizeSelfReported for
+// Target and Model (single-line, keeps neither). Corpus mirrored from
+// TestSanitizeTTYStripsControlAndFormatChars (api/cmd/uzi/tui_render_test.go:61).
+func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
+	req := validReview()
+	req.Summary = "The review \u202Eapproved\u202C this\u200B change"
+	req.Model = "haiku\u200D-x"
+	req.Recommendations[0].Rationale = "line1\nline2\ttabbed \u2066spoofed\u2069"
+	// The headline case: a target is a FILENAME, so a surviving override lets a review name
+	// one file while pointing at another.
+	req.Recommendations[0].Target = "api/internal/\u202Eforge/gitlab.go"
+	sub, err := validateAndScrubReview(req)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	// The PROPERTY, over every free-text field the submission carries: nothing that
+	// survives is Cc or Cf, except the two whitespace characters the markdown fields keep.
+	// Asserted as a property rather than per-codepoint because a table only ever covers
+	// what someone thought of.
+	fields := map[string]string{"summary": sub.SummaryMd, "model": sub.JudgeModel}
+	for i, rec := range sub.Recommendations {
+		fields[fmt.Sprintf("rec[%d].target", i)] = rec.Target
+		fields[fmt.Sprintf("rec[%d].rationale", i)] = rec.RationaleMd
+	}
+	for name, v := range fields {
+		for _, r := range v {
+			if r == '\n' || r == '\t' {
+				continue
+			}
+			if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+				t.Errorf("%s: %U survived ingest (value %q)", name, r, v)
+			}
+		}
+	}
+
+	// …and the text is still the text, not mangled: stripping must remove the invisible
+	// characters and nothing else.
+	if sub.SummaryMd != "The review approved this change" {
+		t.Errorf("summary = %q, want the same prose with the format chars gone", sub.SummaryMd)
+	}
+	if sub.Recommendations[0].Target != "api/internal/forge/gitlab.go" {
+		t.Errorf("target = %q, want the honest filename", sub.Recommendations[0].Target)
+	}
+	if sub.JudgeModel != "haiku-x" {
+		t.Errorf("model = %q, want %q", sub.JudgeModel, "haiku-x")
+	}
+	// The whitespace posture is per-function and must not drift: the MARKDOWN field keeps
+	// \n and \t (its sink is whitespace-pre-wrap), which is the whole reason
+	// sanitizeReviewText is separate from the single-line sanitizeSelfReported.
+	if !strings.Contains(sub.Recommendations[0].RationaleMd, "\n") ||
+		!strings.Contains(sub.Recommendations[0].RationaleMd, "\t") {
+		t.Errorf("rationale lost its newline/tab: %q", sub.Recommendations[0].RationaleMd)
+	}
+	// Trim order, same defect as sanitizeSelfReported: an edge Cf shielded the adjacent
+	// space from the TrimSpace that runs before the strip. Cosmetic on a pre-wrap sink,
+	// fixed for consistency — two scrubbers three files apart disagreeing on this is how
+	// the next reader concludes one of them is wrong.
+	reqTrim := validReview()
+	reqTrim.Summary = "\u200b  a summary with padded edges  \u200b"
+	reqTrim.Recommendations[0].Rationale = "  plain surrounding spaces  "
+	subTrim, err := validateAndScrubReview(reqTrim)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if subTrim.SummaryMd != "a summary with padded edges" {
+		t.Errorf("Cf-padded summary kept its edge whitespace: %q", subTrim.SummaryMd)
+	}
+	// The control that makes the row above a defect rather than a choice.
+	if subTrim.Recommendations[0].RationaleMd != "plain surrounding spaces" {
+		t.Errorf("plain whitespace must still trim: %q", subTrim.Recommendations[0].RationaleMd)
+	}
+
+	// Cn/Co are NOT stripped — the predicate is Cc|Cf, not the whole C category. U+E000 is
+	// private use, which Unicode will never assign, so this fixture cannot rot.
+	req2 := validReview()
+	req2.Summary = "a\ue000b"
+	sub2, err := validateAndScrubReview(req2)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if sub2.SummaryMd != "a\ue000b" {
+		t.Errorf("a private-use code point must survive: got %q", sub2.SummaryMd)
 	}
 }
 

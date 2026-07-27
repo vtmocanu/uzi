@@ -258,6 +258,55 @@ func normalizeNewlines(s string) string {
 // applies it to the templated draft; the M3 POST handler re-applies it to the
 // CLIENT-supplied body, which may have been edited or replaced (the "the draft was inert"
 // invariant does not survive the round-trip, so it must be re-established server-side).
+// COMPOSITION ORDER IS A SECURITY PROPERTY HERE, not a style choice. This function is
+// written outside-in, so the natural place to "add one more pass" is the OUTSIDE — and that
+// is the wrong side. The invariant:
+//
+//	No pass that can introduce a "\n", or delete bytes preceding a "/", may run AFTER
+//	StripUnfencedSlashLines. Any character-class normalization over an issue body — a Cf
+//	strip, a Unicode line-separator normalization, NFKC — must therefore run at or INSIDE
+//	normalizeNewlines's position.
+//
+// EXACTLY ONE PASS DOES RUN AFTER IT, and the rule above is not a description of the code
+// unless you know why that is safe: ScrubSecretShapes replaces with the non-empty,
+// non-slash literal "[redacted]" (:488), so a scrubbed span still leaves a token at the
+// line start and firstNonSpaceIsSlash answers false. Measured on the shipped package:
+//
+//	"glpat-AAAAAAAAAAAAAAAAAAAA/label ~backdoor\nplain text"
+//	  repl "[redacted]"  ->  "[redacted]/label ~backdoor\n…"   inert
+//	  repl ""            ->  "/label ~backdoor\n…"             LIVE
+//
+// Changing that replacement to "" arms this — a single line, no fences, the cheapest
+// possible arming. Note it is the INVERSE shape of the two triggers below: those
+// manufacture a line break, this one deletes bytes before a "/".
+//
+// Why: StripUnfencedSlashLines decides what is a quick-action line with
+// firstNonSpaceIsSlash, a BYTE scan skipping only ' ' and '\t', over strings.Split(body,
+// "\n"). Anything that is not one of those bytes hides the slash from it, and anything that
+// is not "\n" hides the line break. Two triggers are known and both are inert TODAY only
+// because GitLab's own extractor anchors at ^/ and makes the symmetric miss:
+//
+//	stripCf AFTER   "harmless\n<ZWSP>/label ~backdoor"  ->  "harmless\n/label ~backdoor"   LIVE
+//	stripCf BEFORE  same input                          ->  "harmless"                     dropped
+//	normalize AFTER "harmless <U+2028>/label ~backdoor" ->  "harmless\n/label ~backdoor"   LIVE
+//	normalize BEFORE same input                         ->  "harmless"                     dropped
+//
+// So a pass composed onto the outside converts an INERT line into a live GitLab quick
+// action, in a body this code writes to the user's forge. Nothing in the render path can
+// catch it, because the body is assembled here on the server (:122 and :157 fence
+// RationaleMd/SummaryMd into it).
+//
+// A bonus worth recording, running in the SAFE direction: SanitizeTitle defangs a leading
+// quick-action character with TrimLeft(s, " /"), a BYTE trim — so a title of
+// "<ZWSP>/label …" previously kept its "/" at index 1 and slipped past. With Cf stripped at
+// review ingest the string now reaches SanitizeTitle as "/label …" and IS defanged. Same
+// ordering principle, arriving as a fix rather than a hazard.
+//
+// Deliberately NOT done: adding U+2028/U+2029 to any strip predicate. "\n" is exempt by
+// design, so anyone who can place a U+2028 can place a "\n" and get the same rendering —
+// stripping the separators buys no display integrity and re-introduces a divergence from
+// sanitizeTTY. The real asymmetry is that U+2028 is invisible to anything splitting on
+// "\n", which is a WRITE-PATH hazard, which is what this comment is for.
 func SanitizeFiledBody(body string) string {
 	return ScrubSecretShapes(StripUnfencedSlashLines(normalizeNewlines(body)))
 }
@@ -439,17 +488,17 @@ func firstNonSpaceIsSlash(s string) bool {
 // structure-anchored to keep the false-positive surface off git SHAs/UUIDs; this is
 // defense-in-depth, NOT a standalone control (the human gate is primary).
 var secretShapes = []*regexp.Regexp{
-	regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`),                                // Slack
-	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`),                                           // Anthropic
-	regexp.MustCompile(`glpat-[A-Za-z0-9_-]+`),                                            // GitLab PAT
-	regexp.MustCompile(`uz[caw]_[A-Za-z0-9_-]{16,}`),                                      // uzi Bearer creds
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                // AWS access key id
-	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),                                      // GitHub token
-	regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),                                           // Google API key
-	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),      // JWT
-	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`), // PEM
-	regexp.MustCompile(`(?i)\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s@/]+@`),  // DB URL creds
-	regexp.MustCompile(`(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]+`),               // bearer header
+	regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`),                                                       // Slack
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`),                                                                  // Anthropic
+	regexp.MustCompile(`glpat-[A-Za-z0-9_-]+`),                                                                   // GitLab PAT
+	regexp.MustCompile(`uz[caw]_[A-Za-z0-9_-]{16,}`),                                                             // uzi Bearer creds
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                                       // AWS access key id
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),                                                             // GitHub token
+	regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),                                                                  // Google API key
+	regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),                             // JWT
+	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),              // PEM
+	regexp.MustCompile(`(?i)\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s@/]+@`), // DB URL creds
+	regexp.MustCompile(`(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]+`),                                      // bearer header
 }
 
 // ScrubSecretShapes replaces every recognized secret shape with "[redacted]".

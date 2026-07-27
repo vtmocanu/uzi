@@ -50,6 +50,16 @@ export interface RunContext {
   /** Checked-out worktree the executor edits and commits in (local only). */
   worktreePath: string;
   branch: string;
+  /** The commit `branch` was cut from in the runner clone (git.ts `RunnerClone.baseCommit`).
+   *  The executor states it in the lead's prompts so the lead does not have to infer the
+   *  branch's parent from the clone's default branch — which is a FROZEN MIRROR taken when
+   *  the worker first cloned the repo, and so may sit at, behind, or ahead of this commit.
+   *  Optional: the M2 stub executor ignores it, like every field below `emit`. */
+  baseCommit?: string;
+  /** The default branch's tip (git.ts `RunnerClone.defaultBranchCommit`). Carried
+   *  alongside `baseCommit` because on a RESUME the two differ and name different diffs;
+   *  the prompt is wrong on exactly the prior-work runs if it only ever sees one. */
+  defaultBranchCommit?: string;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */

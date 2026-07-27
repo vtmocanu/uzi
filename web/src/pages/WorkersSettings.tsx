@@ -16,6 +16,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
@@ -291,12 +292,15 @@ export function WorkersSettings() {
               surprising. The worker LIST renders names created at any time, and the
               admin view renders other people's. Fixed anyway because it is the same
               class and the same one-word fix.
-              
-              The remaining unsanitized uses of a worker name in this file are
-              CONSIDERED, not missed: the aria-labels and the announce() strings. Those
-              are React props and live-region text — escaped, no injection — where a
-              bidi override could at most reorder an announcement whose visible
-              counterpart is already sanitized. Recorded so nobody re-derives it. */}
+
+              This paragraph used to add that the aria-labels were CONSIDERED and left
+              raw. Issue #124 has since stripped both of them (stripUnsafeChars, below),
+              and the delete confirm's own comment gives the reason this one under-rated:
+              a live region is the ONLY thing a screen-reader user gets before a
+              destructive choice, so reordering it is not cosmetic. What is still raw is
+              the announce() strings; the argument holds there — escaped, no injection,
+              and every visible counterpart is sanitized — but it is a smaller claim than
+              the one this comment used to make. Recorded so nobody re-derives it. */}
           <SectionTitle className="text-ok">Join token for “{sanitizeLabel(newToken.worker)}”</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
@@ -407,14 +411,24 @@ export function WorkersSettings() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    {/* sanitizeLabel on the NAME, for F12's reason applied to a field
-                        with LESS protection than a token label, not more: worker names
-                        are validated for LENGTH ONLY, so a bidi override or a
-                        zero-width character is storable in one. React escapes HTML, so
-                        there is no XSS here — but escaping does nothing to an RLO, which
+                    {/* Own workers here, but stripped for the same reason and with the
+                        same helper as the admin fleet list (RunsList.tsx): the field is
+                        unstripped at ingest, and one page treating it as safe while the
+                        other does not is how the next reader picks the wrong precedent.
+
+                        F12's argument reaches the same cell from the other side and is
+                        why the helper is stripUnsafeChars rather than sanitizeLabel: a
+                        worker name is validated for LENGTH ONLY, so it has LESS
+                        protection than a token label, not more. React escapes HTML, so
+                        there is no XSS — but escaping does nothing to an RLO, which
                         reorders the text around it and can make a worker render as one
-                        it is not. The CLI's two name cells got the same treatment. */}
-                    <span className="font-medium text-fg">{sanitizeLabel(w.name)}</span>
+                        it is not, and nothing rejects a bare ESC either. sanitizeLabel
+                        is Cf-only by design (it mirrors the Go validateSecretLabel
+                        predicate for token labels); stripUnsafeChars is Cc+Cf, so it is
+                        the superset, and it is what the same field's two aria-labels
+                        below already use. The CLI's two name cells got the equivalent
+                        treatment via cellText. */}
+                    <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
                     </span>
@@ -424,7 +438,8 @@ export function WorkersSettings() {
                       ) : (
                         w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
                       )}
-                      {w.version && <span>· v{w.version}</span>}
+                      {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
+                      {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
                       {w.last_heartbeat_at && (
                         <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                       )}
@@ -545,7 +560,7 @@ export function WorkersSettings() {
                         restart, no re-minted join token. */}
                     {tokens.length > 1 && confirmingDelete !== w.id && (
                       <Select
-                        aria-label={`Anthropic token for ${w.name}`}
+                        aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
                         className="h-8 max-w-[11rem] text-xs"
                         // Driven by the MODE first (PRD #111 M3): an auto worker
                         // selects the sentinel, everything else falls back to the
@@ -614,7 +629,18 @@ export function WorkersSettings() {
                     ref={confirmRef}
                     tabIndex={-1}
                     role="group"
-                    aria-label={`Confirm deleting ${w.name}`}
+                    // Issue #124, and the one w.name site where the consequence is NOT
+                    // cosmetic: this is the accessible name of a DESTRUCTIVE confirmation and
+                    // the only thing a screen-reader user gets before choosing. A name
+                    // crafted so the announcement reads as a different worker turns a
+                    // self-inflicted typo risk into a wrong-target delete.
+                    //
+                    // The field is unstripped at ingest (handler/workers.go:388 trims and
+                    // length-caps, no Cc/Cf). Owner-set, so per-owner surfaces are
+                    // self-inflicted — but the ADMIN fleet list (RunsList.tsx) renders names
+                    // cross-user, which is why the strip is unconditional rather than argued
+                    // per surface.
+                    aria-label={`Confirm deleting ${stripUnsafeChars(w.name)}`}
                     // The label alone would DEFEAT this control for a screen reader.
                     // Focusing a named container announces its accessible NAME —
                     // "Confirm deleting base (M), group" — which sounds like a routine

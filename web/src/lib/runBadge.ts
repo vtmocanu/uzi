@@ -5,6 +5,7 @@
 
 import { isTerminalRun, type LatestRun, type RunHealth, type StopKind } from "./api";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
+import { stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -169,8 +170,51 @@ export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | nul
     label: `⚠ ${label}${elapsed}`,
     tone: "warning",
     pulse: true,
-    title: run.health_reason ?? undefined,
+    title: badgeTitle(run.health_reason),
   };
+}
+
+/**
+ * Issue #124 for the badge TOOLTIP, which is an ATTRIBUTE — and a whole-subtree
+ * `container.textContent` assertion cannot see attribute values. That is why this class keeps
+ * recurring: text is covered INCIDENTALLY by any subtree assertion, attributes only where
+ * someone wrote an explicit check (`Judge.test.tsx` via getByLabelText,
+ * `WorkerUpgradeBadge.test.tsx` via `span[title]` — so coverage exists, it is just never free).
+ *
+ * TWO renderers consume this descriptor, not five. The five `title={…}` badge sites share a
+ * `{label, tone, title}` SHAPE, not a constructor:
+ *
+ *   Board.tsx          <- runBadge()        here            covered
+ *   RunHealthBadge.tsx <- healthBadge()     here            covered
+ *   JudgeRunBadge.tsx  <- judgeBadge()      judgeBadge.ts   not reached by this fix
+ *   WorkerRunBadge.tsx <- workerRunBadge()  workerRuns.ts   not reached by this fix
+ *   CIFixRunHeader.tsx <- fixVerdictChip()  fixVerdict.ts   not reached by this fix
+ *
+ * The three others need nothing TODAY, checked rather than assumed: `judgeBadge` is a closed
+ * verdict lookup plus a count; `workerRunBadge` has TWO arms, a template over two numbers and
+ * the literal "Holds an active run"; `fixVerdictChip` is four literals. But they are
+ * where the next untrusted interpolation would land without a strip, and composing here
+ * cannot reach them — so this placement prevents drift between the two constructors it owns,
+ * NOT across all five. (An earlier version of this comment claimed the opposite; the drift it
+ * said it was preventing is the drift that already exists.)
+ *
+ * Stripped at the descriptor rather than at the two renderers because this function's output
+ * is display-only by construction — never posted back, never a key — so it is still a display
+ * transform and not a boundary one.
+ *
+ * Covers BOTH title sources, which is why the fix does not depend on settling their
+ * provenance separately:
+ *   - `failure_reason` is worker-supplied and ingest does not strip it
+ *     (workersvc `sanitizeFailureReason` is stripNUL + truncate). `service.go` writes
+ *     `err.Error()` straight in, and a hostile repo can shape the error an agent fails
+ *     with — attacker-influenceable, owner-only audience.
+ *   - `health_reason` is server-composed as far as was traced, and NOT exhaustively so.
+ *     The CLI already routes it through `sanitizeTTY` (cmd/uzi/run.go), so the web was the
+ *     inconsistent side of a decision the CLI had already made.
+ */
+function badgeTitle(reason: string | null | undefined): string | undefined {
+  const clean = reason ? stripUnsafeChars(reason) : "";
+  return clean === "" ? undefined : clean;
 }
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
@@ -202,7 +246,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         label: "failed",
         tone: "danger",
         pulse: false,
-        title: run.failure_reason ?? undefined,
+        title: badgeTitle(run.failure_reason),
       };
     case "completed":
       // A completed run with an MR becomes a link chip (ok-accented), carrying the

@@ -39,6 +39,22 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124, item 9: cross-run memory is agent-written free text, same untrusted class as
+// judge output. Title and body both render raw.
+describe("Memory — agent-written entries carry no format characters (#124)", () => {
+  it("strips bidi/zero-width characters from title and body", async () => {
+    mockApi.listMemory.mockResolvedValue({
+      memories: [aMemory({ title: "gcc is \u202Ebaked in 0.8.3", body: "No need to \u202Einstall\u200B build-essential." })],
+    });
+    const { container } = render(<MemoryComponent />);
+    // Anchored on the repo name, which the mutation cannot move.
+    await waitFor(() => expect(screen.getByText(/vtmocanu\/uzi/)).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("gcc is baked in 0.8.3")).toBeTruthy();
+    expect(container.textContent).toContain("No need to install build-essential.");
+  });
+});
+
 describe("Memory list + grouping", () => {
   it("renders the empty state when the user has no memory", async () => {
     mockApi.listMemory.mockResolvedValue({ memories: [] });

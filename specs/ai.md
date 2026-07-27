@@ -9678,10 +9678,10 @@ kind-path alias, which has no token id to offer), so a newly added non-default t
 waits one interval for its first reading. Auto-failover on exhaustion is explicitly
 out of scope (D3) — it needs its own policy design for which token, chosen when, and
 how `run_usage` attributes a mid-run switch. **PRD #111 supplied exactly that design
-and it is no longer out of scope: §420-§428.** It answers *which* by headroom over an
+and it is no longer out of scope: §423-§431.** It answers *which* by headroom over an
 opt-in pool, *when* at claim time (never mid-run), and the attribution question by
 recording the credential on the run itself — the gap this paragraph names is the one
-§426 closes. The endpoint's auth also moved since (D23, §427).
+§429 closes. The endpoint's auth also moved since (D23, §430).
 
 ## 355. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
 
@@ -9705,7 +9705,7 @@ recording the credential on the run itself — the gap this paragraph names is t
 **This heading stopped being literally true on 2026-07-27 (PRD #111 D13).** There is
 now exactly one Bearer-reachable write in this route tree that is not the rebind:
 `PATCH /me/secrets/anthropic_token/{id}/auto-eligible`, mounted as its own narrow
-route under `RequireUser` **precisely so that D8's group is not moved** — see §427.
+route under `RequireUser` **precisely so that D8's group is not moved** — see §430.
 Every bullet above still holds as written; what changed is that the exception is no
 longer a single one. Recorded rather than rewritten, because a decision that gained a
 sibling is not the same artifact as one that was wrong.
@@ -10568,10 +10568,12 @@ that is necessary and not sufficient for half the UI.
 unrecognised value renders as data, never replaced by a placeholder that would claim
 knowledge the binary does not have.
 
-**Known gap, filed not fixed.** The web has the same `Cf` hole: `RunView.tsx:955`
-renders judge free text as escaped plain text — safe against markup injection, since
-React never interprets it, but the browser's own bidi algorithm still reorders a plain
-text node. Filed as issue #124; D7 covers the TUI's render path, not the web's.
+**Known gap, filed not fixed — CLOSED since, see §420 (2026-07-27).** The web had the
+same `Cf` hole: `RunView.tsx:955` renders judge free text as escaped plain text — safe
+against markup injection, since React never interprets it, but the browser's own bidi
+algorithm still reorders a plain text node. Filed as issue #124; D7 covered the TUI's
+render path, not the web's. §420 closes it at the web renderer AND at review ingest,
+converging on this section's predicate.
 
 See [prds/done/112-uzi-tui.md](../prds/done/112-uzi-tui.md) D7, R4 and Known Gaps.
 
@@ -12810,8 +12812,216 @@ observe it.
 and the phase half is controller-side and k8s-only, so it cannot reach `deriveRollHealth`; and the
 live-DB sweep on the phase commit, because nothing in it edits a query. In both cases a green would
 have been evidence for a change the run never executed.
+# PRD-less — Issue #124: untrusted display text, sanitized at both ends
 
-## 420. PRD #111 — three forks settled before drafting, and a ranking that is ANCHORED rather than pairwise
+Serves no PRD; filed and fixed as a standalone security issue. Recorded because it sets
+rules a rebuild needs and a bug-only changelog entry would not carry: which layers sanitize,
+why there is exactly one predicate for "unsafe" rather than one per call site, what the
+sanitizer must never touch, and in what ORDER passes over a forge-bound body may compose.
+
+## 420. Issue #124 — untrusted display text is stripped of `Cc`+`Cf` at BOTH the renderer and ingest, and the coordinate is exempt
+
+Serves human: the judge feature's "attacker-influencable text" premise (Feature #46, the
+admin-may-file item) and Feature #83's trust model — trust the user who owns the worker,
+never the repo code the agent read. Judge output is LLM text influenced by whatever the run
+looked at, so it is exactly that class. Closes the gap §371 filed.
+
+**The threat is bytes-honest REORDERING, not injection.** React already escapes HTML
+(`RunView.test.tsx` pins it), so the gap was never markup. The browser's bidirectional
+algorithm reorders what a human READS while the string's bytes stay intact — U+202E
+RIGHT-TO-LEFT OVERRIDE and its relatives can make an approving sentence render inside a
+rejecting review, or a recommendation's `target` visually name a file it does not point at.
+Trojan Source (CVE-2021-42574) in the review surface. Zero-width characters (U+200B,
+ZWJ/ZWNJ, U+FEFF, U+00AD) are the same Unicode category (`Cf`, format) and additionally
+defeat the reader's search over text that is on screen.
+
+**Render-time STRIP, not an input-side REJECT — the two boundaries want different verbs.**
+The renderer strip runs at every display site a judge-, run-, or forge-derived string reaches
+(judge free text, run titles, board/issue/proposal/memory titles and descriptions, the CLI's
+worker table). A review the user already paid for must stay readable, and a renderer has
+nothing to refuse to — so it strips and keeps the whitespace (`\n`, `\t`) that the
+`whitespace-pre-wrap` surfaces need. An input gate has a caller to reject; a renderer does
+not, which is why it is not the same function as the ingest-side one.
+
+**One predicate, converged on deliberately, not two independently-derived ones.** The answer
+to "which characters are unsafe in untrusted display text" is
+`unicode.IsControl(r) || unicode.In(r, unicode.Cf)` — `\p{Cc}\p{Cf}` with the `u` flag in
+TypeScript, the same domain because Go's `IsControl` stops at Latin-1. The api already
+answered it twice and the two do different things with it, so convergence had to pick one:
+
+- **`sanitizeTTY` (the CLI's renderer scrub) is the one to converge on**: it STRIPS and
+  already spares `\t`/`\n`, i.e. it is the renderer-shaped half of the existing pair. The
+  web corpus mirrors its test corpus for the same reason.
+- **`hasUnsafeChar` (`workersvc`) is NOT**: it REJECTS the whole value and has no whitespace
+  exception, correctly, because it guards an INPUT GATE. Re-deriving a render rule from it
+  would be inventing a third rule and calling it convergence.
+
+**Both ends are sanitized, and neither makes the other redundant — belt and suspenders, each
+covering a gap the other cannot.** This is the part a rebuild gets wrong by picking one:
+
+- **Ingest** (the review POST) is required because the file-issue draft is assembled
+  SERVER-side from the stored `target` + `rationale_md`, so a format character in judge
+  output reaches a real forge issue on a path no render-site strip can stand in front of.
+- **Renderer** is required because ingest fixes nothing already stored. Both review-POST
+  scrubbers tested `IsControl` only, and `Cc`/`Cf` are disjoint categories, so every
+  character named above was persisted; those rows still render.
+
+**The COORDINATE is exempt, and the exemption is the load-bearing half.** The judge backlog
+dedups, keys, selects and disposes by the pair `(category, target)`, and posts that pair back
+to the API. So the strip is applied to the RENDERED CHILD only — the text node, the
+`aria-label` — never to a value used as a React key, a selection key, or a request field; the
+key builder composes only the raw value, and that boundary is ASSERTED, not merely intended.
+Normalizing on the way in or at the key would send the server a coordinate it cannot match,
+and would let two distinct pre-existing coordinates collapse onto one. The failure is SILENT
+in the worst way available: HTTP 200 with `updated: 0`, leaving pre-existing rows permanently
+undisposable with no error anywhere. The raw value stays the identity; only its appearance is
+cleaned.
+
+**The two ingest scrubbers keep DIFFERENT whitespace postures on purpose.** They look
+inconsistent and the next reader will want to unify them:
+
+- The multi-line review scrubber (summary/rationale) spares `\n`/`\t` — it guards markdown.
+- The single-line self-reported scrubber (`target`, `judge_model`, worker `version`, phase)
+  spares nothing — it guards identifiers, where a newline is itself the defect.
+
+**Both scrubbers trim AFTER the strip, not only before.** `Cf` is not `White_Space`, so a
+format character at either edge shields the adjacent space from a leading trim and the space
+survives the strip. Tidiness on the markdown sink; on the identifier sink it is correctness,
+because `" api/foo.go "` and `"api/foo.go"` are different coordinates, so the same
+recommendation raised on two runs (one padded, one not) becomes two backlog groups a human
+reads as identical — and it looks clean rather than obviously junk.
+
+**A content-suppression vector closed with it, unrelated to rendering.** Before the strip,
+format characters passed the filter and CONSUMED CAP BUDGET: a ZWSP is 3 bytes, so 85 of them
+exhaust the 255-byte `target` cap. A judge could store a recommendation whose target was
+nothing but invisible characters, and several such rows collapse toward indistinguishable
+strings under `(category, target)` dedup. No bidi required.
+
+**Two costs, accepted knowingly, and they are different KINDS of cost.** Stripping `Cf`
+removes U+200D ZWJ, so emoji family sequences in judge prose degrade into their components —
+cosmetic. It also removes U+200C ZWNJ, which is **orthographically required** in Persian and
+several Indic scripts, where removing it joins words that must stay separate: a correctness
+cost in those scripts, at rest and irreversible. **Carving ZWNJ back out is the forbidden
+fix** — it reopens a zero-width hole, and `sanitizeTTY` has shipped with exactly this cost for
+a long time. A review that can lie about which file it names is worse.
+
+**`\p{C}` is the wrong predicate, and the fixture that proves it is `Co`, not `Cn`.**
+`\p{C}` is `Cc|Cf|Cn|Co|Cs`, so it also swallows private-use (`Co`) and unassigned (`Cn`)
+codepoints — legitimate text merely unknown to an engine's Unicode table. `Cn` is the wrong
+corpus pin because Unicode assigns new codepoints over time and an unassigned one can become
+assigned, silently narrowing what the fixture tests; `Co` (U+E000) is rot-proof, because the
+private-use area will never be assigned. Two more ways to get the web regex wrong, neither of
+which throws: without the `u` flag it degrades to a class of LITERAL characters (strips
+nothing hostile and eats ordinary letters), and without `g` only the first offender goes —
+which passes any test that plants exactly one.
+
+**Scope, stated so nobody reads it as more.** Lone surrogates (`Cs`) are NOT stripped — the
+Go predicate does not cover them either, no judge output produces them, and React renders them
+as a replacement character; convergence is worth more than the extra category. Combining marks
+(`Mn`) and markdown *structural* spoofing remain out of scope for the reasons §371 records for
+the TUI.
+
+**Coverage is per-surface by construction, not a blanket filter — and a real, tracked gap
+follows from that shape.** Nothing enforces that a new sink adopts the strip; each call site
+opts in. `agent_label` reaches the same surfaces and does not go through it — filed as **#164**
+and deliberately left open, so this issue's scope stayed the enumerated list of sinks it
+actually audited.
+
+## 421. Issue #124 — a composition-order invariant on the filed-issue body: nothing may run OUTSIDE the quick-action strip
+
+Serves human: "the human … reviews an API-templated editable draft … and files it"
+(Feature #46, filing) — the body this code composes is written to the user's real forge.
+
+**The invariant, which outlives the current pass list:**
+
+> Any character-class normalization over an issue body — a `Cf` strip, a Unicode
+> line-separator normalization, NFKC, anything that can turn a non-`"\n"` byte sequence into
+> `"\n"` or delete bytes before a `/` — must run at or INSIDE the newline-normalization
+> position. The unfenced-slash strip must be the LAST pass to see the text.
+
+**Why the order is a security property and not style.** The slash strip decides what is a
+GitLab quick-action line by scanning bytes for the first non-space character over
+`strings.Split(body, "\n")`. Anything that is not a space or tab hides the slash from it, and
+anything that is not `"\n"` hides the line break. Measured both ways:
+
+```
+strip Cf AFTER    "harmless\n<ZWSP>/label ~backdoor"   ->  "harmless\n/label ~backdoor"   LIVE
+strip Cf BEFORE   same input                           ->  "harmless"                     dropped
+normalize AFTER   "harmless <U+2028>/label ~backdoor"  ->  "harmless\n/label ~backdoor"   LIVE
+normalize BEFORE  same input                           ->  "harmless"                     dropped
+```
+
+So a pass composed onto the OUTSIDE converts an inert line into a **live quick action** in a
+body uzi writes to the forge. Both triggers are inert today only because GitLab's own
+extractor anchors at `^/` and makes the symmetric miss — that is a fact about someone else's
+parser, not a defense. The function is written outside-in, so "add one more pass" naturally
+lands on exactly the wrong side; that is why this is written down rather than left to be
+re-derived.
+
+**The web's draft-seed strip obeys the same rule from the other side.** The file-issue form
+strips the SEED it receives (uzi-supplied: a server draft templated from the stored
+recommendation) and never filters the controlled input's `value=`, which would silently
+rewrite the user's own typing. Stripping the seed happens BEFORE the server's slash pass ever
+sees the POSTed body, which is the safe side of this invariant.
+
+**Deliberately NOT done: adding U+2028/U+2029 to any strip predicate.** `"\n"` is exempt by
+design, so anyone who can place a U+2028 can place a `"\n"` and get the same rendering —
+stripping the separators buys no display integrity and re-introduces a divergence from the
+one predicate in §420. Their real asymmetry is being invisible to anything splitting on
+`"\n"`, which is a write-path hazard, which is what this invariant covers.
+
+# PRD-less — Issue #105: the lead's own branch coordinates
+
+Serves no PRD; a judge recommendation fixed as a standalone issue. Recorded because the
+rule it establishes (what a prompt may say about git refs) is re-derived wrongly by default.
+
+## 422. Issue #105 — the lead is told the OID its branch was cut from; branch NAMES are named only to be forbidden
+
+Serves human: Feature #4's run model (the agent works a branch and opens an MR, never
+`main`) — a lead that cannot name its own branch diff delegates the wrong one.
+
+**The observed defect.** A lead handed a subagent `git diff main...HEAD` as "the branch
+diff" and got a multi-megabyte diff across ~100 unrelated commits. The worker had always
+known the right answer and simply never said it.
+
+**The distinction that settles it is REF NAME vs OID, not two-dot vs three-dot.** Multiple
+agents asserted a dot-count rule and each was wrong in some reachable topology. What is
+actually true: against the fresh base OID, three-dot is the correct branch diff and two-dot
+is broken; against the clone's own default-branch REF, BOTH forms are wrong. That ref is a
+**frozen mirror** — the worker's bare is refreshed with `+refs/heads/*:refs/remotes/origin/*`,
+which updates remote-tracking refs and never `refs/heads/*`, so the bare's `refs/heads/main`
+is pinned at the moment the repo was FIRST cloned and the runner clone inherits it. Measured
+on a bare whose origin gained 4 commits after that first clone, `main..HEAD` and `main...HEAD`
+were **identical** and both wrong.
+
+**So the note's rule is: prescribe OIDs, name branches only to FORBID them, predict nothing.**
+The clone's `main` can sit equal to, behind, or ahead of the base, so any predicted symptom
+is wrong in some topology — an earlier draft predicted "reports every commit it gained as a
+deletion" and was wrong in the very topology measured above.
+
+**Two commits are carried, because on a resume they answer different questions.** The seed
+OID is the branch's own previously-pushed tip (what THIS run added) while the default
+branch's tip is the fork point (the whole branch). Carrying only one makes the note wrong on
+precisely the runs that carry prior work, which is the population it exists for — and on the
+fixed `self_improve` branch that resume shape is the normal case, not the exception.
+
+**Best-effort, and silence beats a false commit.** An unresolvable default branch yields no
+second OID and the note makes the narrower claim; an absent or malformed base yields no note
+at all. A run never fails over this.
+
+**Only OIDs are threaded into the prompt, never the base REF.** The note sits outside every
+untrusted fence, and on a fresh branch that ref is the untrusted repo's own default-branch
+NAME — putting it there would be repo-controlled text in the one position §417 identifies as
+the injection those fences exist to stop. A hex object name cannot carry a newline or markup;
+anything failing that shape is dropped rather than rendered.
+
+**Both phases carry it, first turn only.** The plan turn needs it to write correct
+instructions; the implement turn needs it because DELEGATING a diff command is where the
+defect was observed. Later turns ride a resumed session that already read it.
+
+# PRD #111 — Auto-select the Anthropic token per run by rate-limit headroom (the per-worker `auto` bind mode)
+
+## 423. PRD #111 — three forks settled before drafting, and a ranking that is ANCHORED rather than pairwise
 
 Since PRD #104 a user can hold several named Anthropic credentials. Two gaps remained: the binding
 was static and manual while the per-token rate-limit gauge (#53/#104 M5) went unconsumed, and a run
@@ -12821,7 +13031,7 @@ recorded what it *cost* but never which credential *paid*.
 is the originating ask they serve.** The contract now carries them — `specs/human.md`, Feature #111,
 approved 2026-07-27 — so this section is an ELABORATION of those items, not their record, and the
 elaboration is replaceable while they are not. A reader must not take them for AI choices.
-Everything from the ranking paragraph down, and all of §421-§428, is AI design.
+Everything from the ranking paragraph down, and all of §424-§431, is AI design.
 
 - **D1 — a per-worker THIRD bind mode**, not a per-user global toggle. A worker is `default`,
   `pinned:<token>` or `auto`, so a user can auto-balance most workers while keeping the
@@ -12867,7 +13077,7 @@ The package is PURE — `time` and `uuid`, nothing else — which is what lets t
 tested from hand-written fixtures with no database. A test parses the package's own imports so the
 first `import "context"` fails rather than being noticed later.
 
-## 421. PRD #111 D22 — the tie-break reads the BINDING window's reset, and it is the only place a five/seven swap is observable
+## 424. PRD #111 D22 — the tie-break reads the BINDING window's reset, and it is the only place a five/seven swap is observable
 
 "Soonest reset" is under-specified until you say *of what*. The reset compared is the **binding
 window's**: `five_hour_resets_at` when `five_hour_pct >= seven_day_pct`, else `seven_day_resets_at`;
@@ -12890,7 +13100,7 @@ populated, therefore passes against a correct and a broken ranker alike. The dis
 has the two windows DISAGREEING about which one binds, and asserts that the swap leaves `Classify`
 identical while flipping the pick.
 
-## 422. PRD #111 D14 — the retry gate is "a credential the SELECTOR named", NOT "auto mode"; the literal wording prescribes a useless retry
+## 425. PRD #111 D14 — the retry gate is "a credential the SELECTOR named", NOT "auto mode"; the literal wording prescribes a useless retry
 
 D7 says auto-selection never fails a run. **Without D14 that is simply untrue**: `recoverClaimAssembly`
 maps `errCredentialUnavailable` to a TERMINAL run failure, so a token that clears the gauge gate and
@@ -12921,7 +13131,7 @@ Three axes, each with its own reason:
 The recorded headroom is **NULL** on the retry. The measurement described the credential that would
 not open; attaching it to the one that did would attribute a reading to a token nothing measured.
 
-## 423. PRD #111 D20 — the run view names the MODE, and the vocabulary is eight values with three homes and three guards
+## 426. PRD #111 D20 — the run view names the MODE, and the vocabulary is eight values with three homes and three guards
 
 The label alone cannot answer the user's question, because **an auto pick and a default fallback can
 name the same token** — and PRD #104's compatibility path creates a row labelled literally `default`,
@@ -12979,7 +13189,7 @@ three fallbacks are amber, `best_of_pool` is info — its own hint says the pool
 and everything else is neutral. Tone and link are ONE predicate (link iff the tone is not neutral)
 so they cannot drift.
 
-## 424. PRD #111 — what "auto" does NOT mean, the six live-eligibility states, and what this PRD leaves unmet
+## 427. PRD #111 — what "auto" does NOT mean, the six live-eligibility states, and what this PRD leaves unmet
 
 🔴 **The fallback spends the owner default, and the owner default NEVER consults `auto_eligible`.**
 So a token deliberately kept *out* of the pool can still pay for a run, if it happens to be the
@@ -13019,7 +13229,7 @@ renumbered at landing; migrations run at boot, so a branch image on a live clust
 versions, and a landing renumber then leaves that cluster's `goose_db_version` pointing at versions
 the tree no longer has — which strict goose refuses to boot on.
 
-## 425. PRD #111 — four ways a mutation result is meaningless, all four measured on this branch
+## 428. PRD #111 — four ways a mutation result is meaningless, all four measured on this branch
 
 Mutation testing is the discipline this repo leans on hardest, and this PRD produced a catalogue of
 how it lies. Each of these was hit, not theorised, and each produced a result that read as a
@@ -13049,14 +13259,14 @@ down the stack.** A phase left one extra credential behind and broke a different
 later, which asserts "exactly two anthropic tokens" and found three. The teardown carries a positive
 check of its own, because a bare restore is not an assertion.
 
-## 426. PRD #111 — the per-run attribution record, and the seam that makes the RECORDED id the id that was OPENED
+## 429. PRD #111 — the per-run attribution record, and the seam that makes the RECORDED id the id that was OPENED
 
-Serves the originating ask's third clause, "show me which token each run actually used". §420-§425
+Serves the originating ask's third clause, "show me which token each run actually used". §423-§428
 cover how a token is *chosen*; nothing there says how the choice is *recorded*, and the recording is
 half the feature — a run that names the wrong account is worse than one that names none.
 
 **Four columns on `runs`, and the label is a SNAPSHOT rather than a join.** The credential id, a
-label snapshot, the select reason (§423's eight values) and the headroom the selector measured. The
+label snapshot, the select reason (§426's eight values) and the headroom the selector measured. The
 id carries a composite FK to `user_secrets (user_id, id)`, so the **database** rejects a run
 recording another user's credential rather than a Go check one refactor away from being bypassed.
 The label is copied because the id does not survive: the FK nulls it on delete and a rename rewrites
@@ -13109,9 +13319,9 @@ candidate can be opened. It is vacuous where it was specified: vault unlock is a
 already made upstream by the claim, so by the time the selector runs the owner's vault is unlocked by
 construction. There is no per-token signal short of attempting the decrypt, and attempting it for
 every candidate would decrypt secrets we are not going to spend. The residual — one individually
-undecryptable token — is caught at open time by D14 (§422), which is the right place for it.
+undecryptable token — is caught at open time by D14 (§425), which is the right place for it.
 
-## 427. PRD #111 — one classifier for two callers, one policy from four knobs, and the two auth-surface decisions the pool forced
+## 430. PRD #111 — one classifier for two callers, one policy from four knobs, and the two auth-surface decisions the pool forced
 
 **D21 — the eligibility gate has exactly one implementation, and the status is computed
 SERVER-SIDE.** The settings page renders each token's live eligibility and the ranker gates
@@ -13170,9 +13380,9 @@ autopilot and judge PUTs share it and must stay cookie-only. The route-mount tes
 **limiter**, not the auth middleware, so it cannot catch a mistake here — the guard has to assert
 both that a Bearer request reaches the GET *and* that those two PUTs still 401.
 
-## 428. PRD #111 pre-PR — `pool_stale` is an umbrella, the empty-pool guard counts the POOL, and a worker name is storable ANSI
+## 431. PRD #111 pre-PR — `pool_stale` is an umbrella, the empty-pool guard counts the POOL, and a worker name is storable ANSI
 
-Three findings that changed shipped behaviour *after* §420-§427 were written. Each is a rule a
+Three findings that changed shipped behaviour *after* §423-§430 were written. Each is a rule a
 rebuild re-derives wrongly by default, which is why they are recorded rather than left to the diff.
 
 **`pool_stale` is an UMBRELLA and its own name under-describes it.** The reason covers three

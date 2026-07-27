@@ -1110,7 +1110,11 @@ export interface NotificationList {
 // recommendations. Every free-text field (summary_md, each rationale_md, target)
 // was validated + capped + secret-scrubbed at the review POST and is UNTRUSTED
 // judge/worker output — the run page renders it as escaped text (never markdown/
-// HTML). verdict/category/confidence are closed enums.
+// HTML), through lib/safeText's stripUnsafeChars. Escaping alone is NOT the whole
+// guarantee (issue #124): the browser honours Cf bidi overrides, which were persisted
+// by two IsControl-only ingest scrubbers until those learned Cf too — so rows written
+// before that still need the renderer-side strip.
+// verdict/category/confidence are closed enums.
 export type ReviewVerdict = "ideal" | "ok" | "issues";
 export type ReviewStatus = "complete" | "failed";
 export type RecommendationCategory =
@@ -1208,8 +1212,8 @@ export interface IssueDraft {
 // across all their runs, and disposes a whole group in one call. Every free-text
 // field below (rationale_preview, run_title, target) is UNTRUSTED judge/worker
 // output, shipped as PLAIN TEXT and rendered as escaped React text (never Markdown /
-// dangerouslySetInnerHTML) — the no-raw-render guarantee is CLIENT-side, matching
-// RunView's handling of the same fields.
+// dangerouslySetInnerHTML) and stripped of Cc/Cf by lib/safeText (issue #124) — both
+// guarantees are CLIENT-side, matching RunView's handling of the same fields.
 
 // The ?bucket= filter matches the GROUP rollup, not a member. "all" is unfiltered;
 // the other four are the #94 ladder's rungs. Default is "todo".

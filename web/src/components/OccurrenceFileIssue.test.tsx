@@ -163,6 +163,25 @@ async function openDraft(over: Partial<IssueDraft> = {}, repos: Repo[] = [repoOp
   return { ...view, onFiled };
 }
 
+// Issue #124 / LOW-1. The SAME `setTitle(draft.title)` / `setDescription(draft.description)`
+// pair exists here and in RunView's RecommendationFiler, and this one is reachable only
+// through the occurrence expander — which is exactly how it went unnoticed. Two components,
+// two fixes; asserting only the page-level one would leave this path filing hostile text.
+describe("OccurrenceFileIssue — the seeded draft carries no format characters (#124)", () => {
+  it("strips Cf from title and description at the seed, not from what the user types", async () => {
+    await openDraft({
+      title: "Improve the \u202Ereviewer",
+      description: "## What the judge found\n\n\u200Bmalicious\u202E line",
+    });
+    const title = screen.getByDisplayValue(/Improve the/) as HTMLInputElement;
+    const body = screen.getByDisplayValue(/What the judge found/) as HTMLTextAreaElement;
+    expect(title.value).not.toMatch(/[\p{Cf}]/u);
+    expect(body.value).not.toMatch(/[\p{Cf}]/u);
+    expect(title.value).toBe("Improve the reviewer");
+    expect(body.value).toContain("\n");
+  });
+});
+
 describe("OccurrenceFileIssue — reaching it through the Judge occurrence expander (PRD #98 M3)", () => {
   it("is behind the expander, and drafts for the occurrence clicked — not the group's first", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(backlog());

@@ -25,6 +25,10 @@ function Stat({ label, value, cost, children }: { label: string; value: string; 
 function Th({ children, left }: { children: ReactNode; left?: boolean }) {
   return (
     <th
+      // WCAG 1.3.1: without scope, a screen reader cannot tie a data cell to its header,
+      // and these tables are all numbers — a figure read without its column is worse than
+      // unread. Every Th here is a column header; there are no row headers in this file.
+      scope="col"
       className={cx(
         "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint",
         left ? "text-left" : "text-right",
@@ -43,7 +47,16 @@ function Td({ children, left, total, mono }: { children: ReactNode; left?: boole
       className={cx(
         "px-2.5 py-1.5",
         left ? cx("text-left", mono ? "font-mono" : "font-sans") : "text-right font-mono tabular-nums",
-        total ? "font-semibold text-fg" : cx("text-muted", left && "text-fg"),
+        // Issue #152: these three are mutually EXCLUSIVE, and the non-total branch used to
+        // be additive — a left cell got `text-muted` AND `text-fg`. Same specificity, so
+        // stylesheet order decides it, and in the built CSS `.text-fg` precedes
+        // `.text-muted` (re-measured 2026-07-27 on `npm run build`: 24360 vs 24602; the
+        // issue measured 24294/24536, so the ORDER is the durable fact, not the offsets).
+        // `text-muted` therefore always won and the left-cell rule was dead, silently
+        // dimming the Agent, Phase and Model columns against the approved mocks. Cosmetic,
+        // but a contrast regression — and the shape reappears easily: never hand cx() two
+        // colour classes for one element and expect the later argument to win.
+        total ? "font-semibold text-fg" : left ? "text-fg" : "text-muted",
         !total && "border-b border-edge/50",
       )}
     >
@@ -133,12 +146,41 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
 
       <details className="mt-3 group" open>
         <summary className="cursor-pointer list-none text-xs text-muted marker:content-none">
-          <span className="text-faint group-open:hidden">▸ </span>
-          <span className="hidden text-faint group-open:inline">▾ </span>
+          {/* <details>/<summary> already conveys expanded state natively, so an announced
+              triangle is a second, contradictory reading of the same fact. Matches
+              AgentChip's status dot two functions down — consistency, not a new rule. */}
+          <span aria-hidden="true" className="text-faint group-open:hidden">▸ </span>
+          <span aria-hidden="true" className="hidden text-faint group-open:inline">▾ </span>
           Per-phase breakdown
         </summary>
-        <div className="mt-2 overflow-x-auto">
-          <table className="w-full min-w-[560px] border-collapse text-xs">
+        {/* This scrolls at narrow widths (560 wide in a 301 viewport) and holds nothing
+            focusable. It carries role + a name and DELIBERATELY NO `tabIndex`.
+            Driven for real in Chrome 150 at 375px: Tab from the summary already lands on
+            this div (Chrome focuses overflowing scrollers natively, `tabIndex` -1, no
+            attribute) and ArrowRight scrolls it 0 -> 299 (web-ux, re-measured in Chrome 150 at
+            375px during item 8 verification: scrollLeft 0 -> 200 -> 299, max 299 — read the
+            SETTLED value, since Chrome animates the scroll and an intermediate read lies).
+            So on the MEASURED engine there is
+            no 2.1.1 failure to fix, and Chrome makes it focusable ONLY while it actually
+            overflows — an unconditional tabIndex={0} would plant a permanent empty tab stop
+            at every desktop width (1280px: scrollWidth == clientWidth == 950, Tab skips it).
+            The real defect was the missing role/name: a keyboard user landed on an
+            unlabelled generic div with no announced purpose.
+
+            THIS IS A SCOPED DECISION, NOT A UNIVERSAL ONE, and the test asserting the
+            attribute's ABSENCE encodes it — so read this before treating that assertion as
+            a rule. Keyboard-focusable scrollers are a recent Chrome behaviour and are not
+            universal; on an engine without it, a scroll region containing nothing focusable
+            IS keyboard-unreachable, which is the original 2.1.1 concern, and the standard
+            guidance adds tabindex="0" precisely because of that variance, accepting the
+            empty tab stop as the cheaper cost. Safari and Firefox are UNTESTED here
+            (agent-browser drives Chrome only). To revisit: measure Tab reaching the div and
+            an arrow key scrolling it on the engine in question, at a width where it
+            overflows AND one where it does not. If it is unreachable there, a CONDITIONAL
+            tabIndex (set only while scrollWidth > clientWidth) is the fix that satisfies
+            both engines — not an unconditional one, and not deleting this test. */}
+        <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-phase usage, scrollable">
+          <table aria-label="Per-phase usage" className="w-full min-w-[560px] border-collapse text-xs">
             <thead>
               <tr>
                 <Th left>Phase</Th>
@@ -176,12 +218,15 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
       {agents.length > 0 && (
         <details className="mt-3 group" open>
           <summary className="cursor-pointer list-none text-xs text-muted marker:content-none">
-            <span className="text-faint group-open:hidden">▸ </span>
-            <span className="hidden text-faint group-open:inline">▾ </span>
+            <span aria-hidden="true" className="text-faint group-open:hidden">▸ </span>
+            <span aria-hidden="true" className="hidden text-faint group-open:inline">▾ </span>
             Per-agent breakdown
           </summary>
-          <div className="mt-2 overflow-x-auto">
-            <table className="w-full min-w-[600px] border-collapse text-xs">
+          {/* See the per-phase wrapper above. The names differ because two ADJACENT
+              unlabelled data tables is precisely where a screen-reader user loses which
+              one they are in. */}
+          <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-agent usage, scrollable">
+            <table aria-label="Per-agent usage" className="w-full min-w-[600px] border-collapse text-xs">
               <thead>
                 <tr>
                   <Th left>Agent</Th>
