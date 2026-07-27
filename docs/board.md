@@ -176,10 +176,11 @@ board before the state would ever go stale.
 Each card also shows its other GitLab labels as small chips, so `bug` or
 `security` is visible without opening the issue. Workflow markers are left
 off: the `PRD` label, the `PRDLESS` escape hatch and the `autopilot` label
-(whatever your admin has configured those to be), plus the card's own column
-label, since a card sitting in `Planned` doesn't need a `Planned` chip too.
-A card carrying many labels shows the first few and a **`+N`** count with the
-rest on hover, so one heavily-labelled issue can't stretch its column.
+(whatever your admin has configured those to be), plus every configured
+column label, since a column already has its own lane. A card carrying many
+labels shows the first few and a **`+N`** count, with the rest available by
+hovering or by tabbing to the count, so one heavily-labelled issue can't
+stretch its column.
 
 ## Attention strip
 

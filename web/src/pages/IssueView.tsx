@@ -142,15 +142,27 @@ export function IssueView() {
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
-                {/* Same predicate the board cards use (PRD #102 M4, Decision 6), so
-                    the two surfaces agree on what is a content label. The issue view
-                    knows only its own column, so that is the column exclusion set.
-                    This is a behavior change here: PRD / autopilot / PRDLESS chips
-                    used to render on this page and no longer do — PRDLESS was already
-                    suppressed whenever its badge showed, and the Mark/Remove button
-                    below still surfaces the label's state when it does not.
-                    Issue #124: a label name is forge-supplied, so strip it for
-                    display while the React key keeps the raw string. */}
+                {/* Same predicate the board cards use (PRD #102 M4, Decision 6). The
+                    issue view knows only its own column, so that is the column
+                    exclusion set — which means the two surfaces do NOT agree on a
+                    CONFLICTED issue: the board excludes every configured column label,
+                    so an issue carrying two of them chips neither there, while here the
+                    second one still chips. An earlier version of this comment claimed
+                    they agree; they agree on the ordinary case only, and the sentence
+                    above names exactly why (review m-4 / fact-check R2).
+
+                    This is a behavior change here: PRD / autopilot / PRDLESS chips used
+                    to render on this page and no longer do. Where each one's state went:
+                    autopilot to the badge below, PRDLESS to the bypass badge or the
+                    Mark/Remove button. Both PRDLESS surfaces are gated on
+                    `prdlessEnabled && !issue.closed`, so on a CLOSED issue, or with the
+                    feature off, the label genuinely has no surface here. That is
+                    accepted rather than unnoticed — an earlier comment claimed nothing
+                    becomes unobservable, which is false in exactly those two cases
+                    (review m-5).
+
+                    Issue #124: a label name is forge-supplied, so strip it for display
+                    while the React key keeps the raw string. */}
                 {chipLabels(issue.labels, {
                   prdLabel,
                   prdlessLabel,

@@ -31,8 +31,16 @@ const PrdlessLabelColor = "#ec9a29"
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
 // GitLab's label create API. In Progress / Later come from the common-board
-// reference set; Human Review (PRD #12) is where the automation parks a card
-// once its MR is open, and sits directly after In Progress.
+// reference set; Human Review (PRD #12) is where the automation parks a card when
+// its run COMPLETES, and sits directly after In Progress.
+//
+// "once its MR is open" is what this sentence said until 2026-07-27, and it was
+// false — pre-existing, and carried through the PRD #102 M2 rewrite of this comment
+// without being checked. runlifecycle maps `completed` to ColumnHumanReview in BOTH
+// notifierDecision and reconcilerDecision with no MR condition anywhere, so a run
+// that completes without opening one still parks here; docs/board.md had it right all
+// along ("with or without a merge request"). MR state drives only the later rework
+// flip back to In Progress on an unmerged close (forgesvc/mr_watch.go).
 //
 // The order is READING ORDER = FLOW ORDER (PRD #102 Decision 2): the implicit
 // Backlog lane is intake, then Planned ("somebody picked this"), In Progress

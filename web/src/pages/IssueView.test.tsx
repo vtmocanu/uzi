@@ -218,9 +218,11 @@ describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
   });
 });
 
-// PRD #102 M4. The issue view had its own ad-hoc chip filter (column, plus PRDLESS
-// only while its badge showed), so PRD and autopilot chips rendered here and not on
-// the board. Both surfaces now share chipLabels.
+// PRD #102 M4. The issue view had its own ad-hoc chip filter (column, plus PRDLESS only
+// while its badge showed), so PRD and autopilot chips rendered here. Not "and not on the
+// board", which is how this read until the fact-check: before a02e3184 the board
+// rendered no chips AT ALL, so there was no predicate divergence to describe — M4 gave
+// the board chips and gave both surfaces one predicate in the same change.
 describe("IssueView label chips (PRD #102 M4)", () => {
   it("chips content labels and drops every workflow marker", async () => {
     setAuth(true);
