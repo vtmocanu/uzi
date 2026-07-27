@@ -248,7 +248,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.CreateRun(cmd.Context(), repoID, issue)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd))
 			if err != nil {
 				return err
 			}
@@ -257,6 +257,9 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	create.Flags().String("repo", "", "repo id to run against (see 'uzi repo list')")
 	create.Flags().Int64("issue", 0, "the PRD issue IID to run")
+	create.Flags().Bool("wait-on-limit", false,
+		"park this run until the Anthropic usage window reopens instead of failing it; "+
+			"omit to inherit your Settings default, or pass --wait-on-limit=false to force off")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
@@ -964,6 +967,41 @@ func relAge(t time.Time) string {
 	default:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	}
+}
+
+// waitOnLimitFlag resolves `--wait-on-limit` into the TRI-STATE the create endpoint
+// takes (PRD #35 Decision 7): nil omits the key so the server stamps the run from the
+// owner's Settings default, &true opts this run in, &false opts it explicitly out.
+//
+// 🔴 THE DEFAULT VALUE IN THE FLAG DEFINITION IS NOT THE DEFAULT BEHAVIOUR, and that
+// is the trap this function exists to remove. `Bool("wait-on-limit", false, …)` makes
+// GetBool return false when the flag is absent — identical to `--wait-on-limit=false`.
+// Passing that straight through would send `"wait_on_limit": false` on EVERY CLI-created
+// run and silently override the user's own Settings default, which is precisely the
+// regression the server's field comment cites for taking a *bool. Changed() is what
+// separates "the user said false" from "the user said nothing"; pflag sets it for
+// `--wait-on-limit` and for `--wait-on-limit=false` alike, and leaves it false when the
+// flag is absent, which is exactly the three-way split needed.
+//
+// There is NO precedent for a tri-state flag in this CLI — `--force`, `--with-token`
+// and `--follow` are all plain switches whose false is a real default rather than an
+// absence — so this is the first, and the Changed() idiom is the standard pflag answer
+// rather than an invention. A `--no-wait-on-limit` twin was the alternative and loses:
+// two flags need a mutual-exclusion check, and they can be passed together.
+//
+// Note `--wait-on-limit false` (a SPACE, not `=`) does not set false — pflag reads a
+// bare bool flag as true and leaves `false` as a positional argument. `create` is
+// cobra.NoArgs, so that mistake is a loud usage error rather than a silent inversion,
+// which is why it needs no guard of its own.
+func waitOnLimitFlag(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed("wait-on-limit") {
+		return nil
+	}
+	v, err := cmd.Flags().GetBool("wait-on-limit")
+	if err != nil {
+		return nil
+	}
+	return &v
 }
 
 // limitWaitLine is the ONE sentence every CLI surface renders for a parked run

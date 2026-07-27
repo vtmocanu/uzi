@@ -1195,3 +1195,75 @@ func TestRunLogsFollowRidesOutALimitWaitPark(t *testing.T) {
 		t.Errorf("a park notice reached STDOUT, which is the --json NDJSON stream an agent parses line by line:\n%s", out.String())
 	}
 }
+
+// TestRunCreateWaitOnLimitIsTriState is the whole point of the flag, and the case that
+// makes it more than a switch: OMITTING it must send NOTHING, so the server stamps the
+// run from the owner's Settings default (PRD #35 Decision 7, and the requirement
+// specs/human.md states as "wait_on_limit on run creation for CLI/API callers").
+//
+// The fake keeps the POINTER, so all three states are distinguishable here. A bool
+// capture would collapse the first two rows into one and the test would pass against
+// exactly the implementation it exists to reject.
+func TestRunCreateWaitOnLimitIsTriState(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "queued"}}
+		env := fakeEnv(fc)
+		env.Stdout = &bytes.Buffer{}
+		env.Stderr = &bytes.Buffer{}
+		args := append([]string{"run", "create", "--repo", "p1", "--issue", "42"}, extra...)
+		if code := Main(env, args); code != uzicli.ExitOK {
+			t.Fatalf("run create %v exit = %d, want 0", extra, code)
+		}
+		return fc
+	}
+
+	// 🔴 THE ROW THAT MATTERS. The flag is DEFINED with a default of false, so GetBool
+	// returns false here — identical to an explicit --wait-on-limit=false. Passing that
+	// through would send "wait_on_limit": false on every CLI-created run and silently
+	// override the user's own Settings default. Only Changed() separates them.
+	if got := run(t).LastCreateWaitOnLimit; got != nil {
+		t.Errorf("omitting --wait-on-limit sent %v, want nil — an absent flag must send NO key so the server inherits the user's Settings default; sending false here silently opts every CLI-created run out", *got)
+	}
+
+	if got := run(t, "--wait-on-limit").LastCreateWaitOnLimit; got == nil || !*got {
+		t.Errorf("--wait-on-limit sent %v, want an explicit true", got)
+	}
+
+	// Explicit false is a DIFFERENT statement from absent: "this run, specifically, must
+	// not park", overriding a default that is on.
+	if got := run(t, "--wait-on-limit=false").LastCreateWaitOnLimit; got == nil || *got {
+		t.Errorf("--wait-on-limit=false sent %v, want an explicit false — it must override a user default of true, not fall back to it", got)
+	}
+
+	// The repo/issue arguments still ride through unchanged.
+	fc := run(t, "--wait-on-limit")
+	if fc.LastCreateRepoID != "p1" || fc.LastCreateIssueIID != 42 {
+		t.Errorf("create sent repo=%q issue=%d, want p1/42", fc.LastCreateRepoID, fc.LastCreateIssueIID)
+	}
+}
+
+// `--wait-on-limit false` (a SPACE instead of `=`) must FAIL LOUDLY rather than
+// silently meaning true. pflag reads a bare bool flag as true and leaves "false" as a
+// positional argument; `create` is cobra.NoArgs, so the stray argument is a usage
+// error. This pins that it stays loud — if `create` ever gains positional arguments,
+// this inversion becomes silent and needs a guard of its own.
+func TestRunCreateWaitOnLimitSpaceFormIsAUsageError(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1"}}
+	env := fakeEnv(fc)
+	env.Stdout = &bytes.Buffer{}
+	env.Stderr = &bytes.Buffer{}
+
+	code := Main(env, []string{"run", "create", "--repo", "p1", "--issue", "42", "--wait-on-limit", "false"})
+	if code != uzicli.ExitUsage {
+		t.Errorf("`--wait-on-limit false` exit = %d, want %d (usage) — the space form must not silently mean true", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error still created a run; the command must refuse before calling the API")
+	}
+}
