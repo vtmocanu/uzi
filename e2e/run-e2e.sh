@@ -4709,6 +4709,11 @@ pass "an empty pool falls back to the owner default and records pool_empty (dist
 apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 
 # ── leave the stack exactly as this phase found it ──────────────────────────────
+# The three runs this phase created are NOT deleted, and that is checked rather than
+# assumed: measured at this commit, nothing after this line reads /api/runs at all —
+# the only later references are this phase's own cancels. `uzi run list` matches
+# GET /api/runs ~3100 lines EARLIER, so it is unaffected. If a later phase ever starts
+# counting runs, this is the note that says why it broke.
 # 🔴 THIS IS NOT TIDINESS. The harness is one sequential stack, so anything left
 # behind is an input to every later phase — and the first version of this block
 # omitted the token delete, which broke PRD #104's binding phase 350 lines further
@@ -4726,6 +4731,14 @@ curl -fsS -b "$JAR" -X DELETE "$BASE/api/me/secrets/anthropic_token/$AS_SPARE_SE
 apiget /api/me/secrets \
   | jq -e '[.secrets[] | select(.kind == "anthropic_token")] | length == 1' >/dev/null \
   || fail "the auto-selection phase leaked a token into the rest of the suite"
+# The POOL FLAGS are restored by step (c) above — where pool_empty comes from — and
+# until this line that was an ACCIDENT rather than a restore: reorder or drop step (c)
+# and they leak, with nothing to catch it, at the same attribution distance that made
+# the token leak expensive. Symmetric with the count check above, and it is the check
+# that would notice.
+apiget /api/me/secrets \
+  | jq -e '[.secrets[] | select(.kind == "anthropic_token" and .auto_eligible)] | length == 0' >/dev/null \
+  || fail "the auto-selection phase left a token in the pool; a later phase would inherit it"
 # And the default's gauge goes back to the 55/12 the rate-limit phase seeded, so a
 # later reader of /api/me/rate-limits sees what that phase established rather than what
 # this one needed.

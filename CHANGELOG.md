@@ -18,9 +18,10 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   tokens you opted into the pool, so it needs no restart and no new join token to change what
   it spends. Existing workers are untouched: one with a pinned token stays pinned, one without
   stays on your default. A worker whose pinned token you later delete now says plainly that it
-  uses your default, rather than showing a pin to a token that no longer exists. **The
-  selector itself lands next** — until then an auto worker spends your default token, which is
-  also what it falls back to when the pool is empty or its readings are stale (PRD #111 M3).
+  uses your default, rather than showing a pin to a token that no longer exists. If you set a
+  worker to auto while your pool is **empty**, the row says so rather than claiming it
+  auto-selects: every claim would spend your default token, and finding that out from a
+  finished run is too late (PRD #111 M3).
 
 - **An opt-in pool for auto-selecting Anthropic tokens.** Settings → Anthropic tokens gains a
   per-token "Auto-select from this token" toggle, and `uzi token pool <label> --on|--off` does
@@ -32,10 +33,30 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   uzi has never managed to read a usage figure for can never be picked, and without the chip it
   would sit there looking active. The status is computed server-side from the same rule the
   selector uses, so the page cannot promise something the selector will not do (PRD #111 M2).
-  The selector itself lands in a later change. New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
+  New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
   `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_MAX_STALENESS` and
   `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
   [docs/configuration.md](docs/configuration.md).
+
+- **uzi now picks the Anthropic token, per claim, by rate-limit headroom.** A worker set to
+  auto spends whichever of your pooled tokens has the most room left — headroom being whichever
+  of the 5-hour and 7-day windows is fuller, since both have to allow the run. Two tokens within
+  a few points of each other are separated by which one **replenishes soonest**, and it is the
+  reset of the window actually holding it back that counts: a 5-hour reset does not relieve a
+  7-day cap. A small bias against tokens with runs already in flight keeps several claims
+  arriving together from piling onto the same credential. Operators can tune all of it
+  (`UZI_AUTOSELECT_*`); nobody has to.
+
+  **It never fails a run**, and the ways it can decline to pick are worth knowing apart: nothing
+  opted in, nothing with a current reading — which is also what a switched-off usage poller
+  looks like — or a chosen token whose stored value would not decrypt. Each falls back to your
+  default token and says which happened, in the run view and in `uzi run get`.
+
+  🔴 **"Auto" does not mean "only my pool".** The fallback spends your **default** token, and
+  that path does not consult the opt-in — so a token you deliberately kept *out* of the pool can
+  still pay for a run if it happens to be your default. There is no third option, because
+  failing the run would be worse; if you want a credential never spent by ordinary runs, it must
+  not be your default either (PRD #111 M4).
 
 - **Every run now names the Anthropic credential it spent, and why that one.** The credential
   is **recorded on all three lanes** (issue/ci_fix, judge and chat) and **shown in the run

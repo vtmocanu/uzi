@@ -1,7 +1,7 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
 **GitLab Issue**: [#111](https://gitlab.example.com/vtmocanu/uzi/-/issues/111)
-**Status**: **IN PROGRESS** (created 2026-07-22; implementation started 2026-07-27 on `feature/prd-111-auto-select-token`)
+**Status**: **COMPLETE, with one success criterion UNMET** (created 2026-07-22; implemented 2026-07-27 on `feature/prd-111-auto-select-token`) — see "Status at PR time" at the foot of this file.
 **Priority**: Medium
 **Related**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://gitlab.example.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
 
@@ -522,3 +522,51 @@ already-applied head makes every upgraded instance refuse to boot.
   no failures, a recorded fallback reason.
 - `run-e2e.sh` green including the new auto-selection phase, **and** the auto
   path validated on dev-cluster hosted workers (CLAUDE.md's k8s-primary rule).
+
+
+## Status at PR time
+
+M1–M7 are implemented and gated. Two things a reader needs that the milestone table
+above does not say.
+
+### The k8s validation is UNMET, not narrowed
+
+"the auto path validated on dev-cluster hosted workers" is a success criterion and it
+did not happen. It is deferred to a follow-up issue rather than dropped, because three
+of its prerequisites are outside this run's boundary: a published branch image, a
+cross-repo ArgoCD values change in `argo-apps`, and authorization to spend real
+Anthropic quota against a real account. `/prd-full` stops at PR creation, so a deploy
+was never inside it either.
+
+**The two environments cover different halves**, which is the argument for doing it at
+all rather than treating the compose e2e as a substitute:
+
+| | compose e2e | dev-cluster |
+|---|---|---|
+| poller | disabled (`UZI_USAGE_POLL_INTERVAL=0`) | shipped default, 5m, running |
+| `UZI_AUTOSELECT_*` | `MAX_STALENESS` pinned, the rest shipped | all four shipped |
+| gauge | seeded rows | **real readings from real tokens** |
+| can exercise | the poller-disabled fallback | a live gauge, and the **hosted** worker path |
+
+Neither substitutes for the other. Compose *structurally cannot* exercise a live gauge:
+`MAX_STALENESS` defaults to 3× the poll interval, so with the poller off it computes to
+0, nothing is ever fresh, and the happy path is undrivable — one stack cannot hold both
+"the default is 0" and "a fresh reading is fresh", because they are the same knob. That
+is why the overlay pins it, and why the arithmetic it stopped exercising moved into
+`config`'s own tests.
+
+The assertion nothing else reaches is the **hosted worker** (`uzi-workers` namespace),
+which shares the `workers` table and `claimSecretID` with external workers.
+
+### 🔴 Deploying this branch would COMMIT the draft migration numbers
+
+`00086`–`00089` are drafts, renumbered at landing above whatever `main`'s head is then,
+per CLAUDE.md. Migrations run at boot with strict goose and no `allow-missing`, so a
+branch image started on a live cluster records those versions in `goose_db_version` —
+and a landing renumber then leaves that cluster pointing at versions the tree no longer
+has, which the boot runner refuses to start on. Renumber before any such deploy, or
+accept a manual repair.
+
+*(Measured before the PR: `origin/main`'s head was still `00085_run_prd_done_path.sql`,
+so the renumber was a no-op at that moment. Re-check immediately before the merge, not
+before composing it.)*
