@@ -145,6 +145,11 @@ func TestSplit(t *testing.T) {
 // It asserts BOTH directions on purpose. Missing-package is the drift that matters
 // (a new denylist entry whose CLI stays observable), but an extra entry here means a
 // package was dropped from the denylist and this map kept claiming to bar it.
+//
+// KNOWN LIMIT, stated so nobody mistakes this for more than it is: this checks that
+// you wrote SOMETHING, not that you wrote the RIGHT thing. A denylist entry mapped to
+// a misspelled binary passes here (mutation-verified). Only the derivation knows the
+// true bin set; short of evaluating nixpkgs in a unit test, the real guard is review.
 func TestDeniedExecutablesCoverDenylist(t *testing.T) {
 	for pkg := range denylist {
 		execs, ok := deniedPackageExecutables[pkg]
@@ -155,6 +160,11 @@ func TestDeniedExecutablesCoverDenylist(t *testing.T) {
 		if len(execs) == 0 {
 			t.Errorf("denylisted package %q maps to an empty executable list", pkg)
 		}
+		for _, e := range execs {
+			if strings.TrimSpace(e) == "" {
+				t.Errorf("denylisted package %q maps an empty executable name", pkg)
+			}
+		}
 	}
 	for pkg := range deniedPackageExecutables {
 		if !denylist[pkg] {
@@ -163,26 +173,54 @@ func TestDeniedExecutablesCoverDenylist(t *testing.T) {
 	}
 }
 
+// TestDeniedExecutablesAreNotInstallablePackages is the assertion that catches the
+// `fly` defect: flyctl symlinks its binary to `fly`, but nixpkgs `fly` is the
+// Concourse CI client — a different, NOT-denylisted, installable tool. Listing the
+// alias made an installable package's CLI permanently unreportable.
+//
+// The rule: a suppressed executable may share a name with a package only if that
+// package is itself denied. Anything else suppresses something someone can install.
+func TestDeniedExecutablesAreNotInstallablePackages(t *testing.T) {
+	for exec := range deniedExecutableSet {
+		if knownInstallablePackages[exec] && !denylist[exec] {
+			t.Errorf("executable %q is suppressed but names an installable, non-denylisted package: "+
+				"a real missing-tool finding for it could never be reported", exec)
+		}
+	}
+}
+
+// knownInstallablePackages are nixpkgs attribute names that collide with an executable
+// some denylisted package installs. Hand-maintained and deliberately short: it exists
+// to pin collisions we have actually found, not to mirror nixpkgs. Verified at the rev
+// agent/devbox-global/devbox.lock pins.
+var knownInstallablePackages = map[string]bool{
+	"fly": true, // "Command line interface to Concourse CI" - NOT flyctl
+}
+
 // TestDeniedExecutableCoversDivergentNames is the case a name-equality check fails.
 // The package is `awscli`/`azure-cli`/`google-cloud-sdk`; the command a shell reports
-// missing is `aws`/`az`/`gcloud`. Denied() answers about the former and would say no
-// to all three of the latter.
+// missing is `aws`/`az`/`gcloud`.
 func TestDeniedExecutableCoversDivergentNames(t *testing.T) {
-	for _, cmd := range []string{"glab", "gh", "aws", "az", "gcloud", "gsutil", "bq", "sam", "oci", "fly"} {
+	for _, cmd := range []string{
+		"glab", "gh", "aws", "az", "gcloud", "gsutil", "bq", "sam", "oci",
+		"git-credential-gcloud.sh", "docker-credential-gcloud", "op", "bw",
+	} {
 		if !DeniedExecutable(cmd) {
 			t.Errorf("DeniedExecutable(%q) = false, want true", cmd)
 		}
 	}
-	// Sanity in the other direction: an ordinary tool must stay reportable, or the
-	// suppression would swallow real missing-tool findings.
-	for _, cmd := range []string{"file", "perl", "fmt", "helm", "kubeconform", "jq", "go"} {
+	// Path forms: the exec.LookPath error the judge scan matches carries a full path,
+	// so a bare map lookup misses it. Measured as a real bypass before basenaming.
+	for _, cmd := range []string{"/usr/local/bin/glab", "./glab", "/usr/bin/aws"} {
+		if !DeniedExecutable(cmd) {
+			t.Errorf("DeniedExecutable(%q) = false, want true (path form must be basenamed)", cmd)
+		}
+	}
+	// Ordinary tools must stay reportable, or the suppression swallows real findings.
+	// `fly` is here deliberately: it is Concourse CI, not flyctl.
+	for _, cmd := range []string{"file", "perl", "fmt", "helm", "kubeconform", "jq", "go", "fly"} {
 		if DeniedExecutable(cmd) {
 			t.Errorf("DeniedExecutable(%q) = true, want false", cmd)
 		}
-	}
-	// Denied() takes a package and genuinely does NOT answer for these, which is why
-	// DeniedExecutable exists rather than reusing it.
-	if Denied("aws") || Denied("az") {
-		t.Error("Denied() unexpectedly matched an executable name; the divergence this test documents has changed")
 	}
 }

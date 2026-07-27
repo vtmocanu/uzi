@@ -574,15 +574,20 @@ func TestPrescanIgnoresFrameKeysOnToolUse(t *testing.T) {
 	}
 }
 
-// TestScanSuppressesDenylistedCredentialCLIs pins the fix for the recommendation that
-// could never be actioned. `glab` is barred by toolprofile's Decision 6 denylist even
-// against an explicit admin allowlist, so a run whose agent reaches for it will always
-// see command-not-found. The scan keys on that string rather than on capability, so it
-// re-emitted `install_worker_tool: glab` on every such run — twice in 21 runs before
-// this, both surviving triage as permanent, unactionable backlog.
+// TestScanSuppressesDenylistedCredentialCLIs pins the deterministic half of the fix.
+// A credential-bearing CLI is barred by toolprofile's Decision 6 denylist, so a run
+// whose agent reaches for one always sees command-not-found; the scan keys on that
+// string rather than on whether the tool could ever be installed, so it kept producing
+// `install_worker_tool` recommendations nobody could action.
+//
+// SCOPE, stated because the commit that added this initially overclaimed: the two
+// observed glab recommendations (runs b64b98f3, 1dfc65b4) came from `complete` MODEL
+// reviews, not from the deterministic fallback — a target of "file, glab" is free text
+// no fallback emits. This filter closes the deterministic path; JUDGE_SYSTEM_PROMPT
+// closes the model path. Neither alone would have prevented those two.
 //
 // The `aws` case is the one a name-equality check against the denylist would miss: the
-// denylisted PACKAGE is `awscli`, and the command a shell reports is `aws`.
+// denylisted PACKAGE is `awscli` and the command a shell reports is `aws`.
 func TestScanSuppressesDenylistedCredentialCLIs(t *testing.T) {
 	rows := rawResultRows(
 		`{"content":"glab: command not found"}`,
@@ -606,5 +611,32 @@ func TestScanSuppressesDenylistedCredentialCLIs(t *testing.T) {
 		if slices.Contains(cmds, denied) {
 			t.Errorf("%q is denylisted and can never be installed; it must not surface as a missing tool (got %v)", denied, cmds)
 		}
+	}
+}
+
+// TestScanSuppressesDenylistedCLIsInPathForm covers the bypass a bare map lookup left
+// open. reExecNotFound captures `/` and `.`, so Go's exec.LookPath error arrives as a
+// FULL PATH — measured leaking `/usr/local/bin/glab` and `./glab` past the filter
+// before DeniedExecutable basenamed its input. The sh/bash forms exclude `/`, which is
+// why only the exec: form leaked and why a single fixture would have missed it.
+func TestScanSuppressesDenylistedCLIsInPathForm(t *testing.T) {
+	rows := rawResultRows(
+		`{"content":"exec: \"/usr/local/bin/glab\": executable file not found in $PATH"}`,
+		`{"content":"exec: \"./glab\": executable file not found in $PATH"}`,
+		`{"content":"exec: \"/usr/bin/jq\": executable file not found in $PATH"}`,
+	)
+
+	var cmds []string
+	for _, c := range scanCommandNotFound(rows) {
+		cmds = append(cmds, c.Command)
+	}
+	for _, c := range cmds {
+		if strings.Contains(c, "glab") {
+			t.Errorf("path-form denied CLI leaked through as %q (got %v)", c, cmds)
+		}
+	}
+	// The ordinary tool must still be reported, path form and all.
+	if len(cmds) == 0 {
+		t.Errorf("the non-denied path-form miss should still be reported, got %v", cmds)
 	}
 }

@@ -183,12 +183,23 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 		forEachNotFound(text, func(cmd, evidence string) {
 			cmd = normalizeCommandToken(cmd)
 			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
-			// barred by Decision 6 and rejected even when an admin allowlists it
-			// (toolprofile.Denied). Reporting it missing produced an `install_worker_tool`
-			// recommendation that can never be actioned, and did so REPEATEDLY — the scan
-			// keys on a command-not-found string, not on capability, so `glab` recurred on
-			// every run whose agent reached for it and read as unaddressed backlog forever.
-			// Observing one of these absent is the policy working, not a finding.
+			// barred by Decision 6 and rejected when an admin allowlists it
+			// (toolprofile.Denied). Recommending its installation can never be actioned,
+			// so observing it absent is the policy working rather than a finding.
+			//
+			// FILTERED HERE, at collection, and that placement is load-bearing rather than
+			// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
+			// caught later (in suppressResolved, or downstream at recommendation time)
+			// would still consume a candidate slot and crowd out a genuine miss — the
+			// precise failure the cap's own comment above documents at length.
+			//
+			// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
+			// the sampled trace and can emit the same recommendation on its own; both
+			// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
+			// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
+			// the barred class so the model reclassifies to adjust_template/improve_agent,
+			// which is the actionable category — that prompt line, not this filter, is
+			// what addresses those two.
 			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
