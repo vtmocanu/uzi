@@ -23,7 +23,7 @@ every JS-touching run and was flagged repeatedly by the judge:
 Two structural companions surfaced by the same reviews:
 
 1. **Pre-scan false positives.** The API's `scanCommandNotFound`
-   (`api/internal/workersvc/judge.go:82`) is a judge-time regex scan of the
+   (`api/internal/workersvc/judge.go`) is a judge-time regex scan of the
    finished run's `tool_result` payloads for `foo: command not found` (a text-pattern
    match, not an exit code). It flags a tool from a **single command-not-found hit**,
    with no notion that the agent later ran that tool successfully via an npm script
@@ -114,15 +114,15 @@ Three coherent parts (the same judge reviews flagged all three):
   install-failure → honest skip).
 - [x] **M2 — Pre-agent provisioning at the right lifecycle point, with defined join
   semantics.** Call the M1 installer inside the executor **after `provisionRunTools`
-  (`sdk-executor.ts:240`) and before the plan turn (`:266`)** — NOT at `runner.ts:~210`,
+  (the call site in `sdk-executor.ts`) and before the plan turn** — NOT at `runner.ts:~210`,
   which predates `toolEnv` and would use the image's npm instead of the run's
   provisioned node. Kick it off async so it **overlaps the plan turn** (and, on
   human-gated runs, the `awaiting_approval` wait), then **join it before the first
   implement turn** so the agent never races it and never collides with an
   agent-initiated `npm ci` in the same dir (npm has no cross-process `node_modules`
-  lock). `prepareCheckDeps` at `runner.ts:388` collapses to reusing M1. **Wall-clock:**
+  lock). `prepareCheckDeps` at its `claim.kind === "self_improve"` call site in `runner.ts` collapses to reusing M1. **Wall-clock:**
   near-zero for human-gated runs (hidden behind the approval wait); for **autopilot**
-  (`gatePlan` short-circuits with no wait, `runner.ts:587-607`) the overlap window is
+  (`gatePlan`'s autopilot branch in `runner.ts` short-circuits with no wait) the overlap window is
   only the plan turn, so a slow install can add real wall-clock before implement —
   acceptable, and stated honestly rather than claimed away.
 - [x] **M3 — Pre-scan accuracy (`scanCommandNotFound`).** Suppress a `ToolMiss` for a
@@ -149,7 +149,7 @@ Three coherent parts (the same judge reviews flagged all three):
   have nothing to suppress and would read as full coverage while discriminating nothing.
 - [ ] **M4 — Gate honesty (net-new machinery — heaviest milestone; may split).** This
   is NOT just surfacing an existing signal: the ran/failed/skipped mapping today lives
-  only in self-improve's `defaultCheckRunner` (`self-improve.ts:227-249`) for hardcoded
+  only in self-improve's `defaultCheckRunner` (`defaultCheckRunner` in `self-improve.ts`) for hardcoded
   uzi checks on self_improve runs, and nothing anywhere extracts or tracks a *plan's
   declared gate commands*. M4 needs net-new work: extract the gate commands a plan
   declares, track whether each actually ran, and annotate the MR / downgrade the
@@ -211,7 +211,7 @@ postinstall download, so `npm ci --ignore-scripts` installs a fully-runnable esb
 common JS gate toolchain (vitest, vite, tsc, eslint) works under `--ignore-scripts`.
 
 So `--ignore-scripts` stays the default: it preserves the codebase's existing
-defense-in-depth posture (`self-improve.ts:151-152` documents it as a supply-chain
+defense-in-depth posture (the `buildCheckEnv` security comment block, now in `agent/src/sdk-env.ts`, documents it as a supply-chain
 *reduction*), it matches what the extracted routine already does (M1 becomes a pure
 relocation, no install-behavior change), and it works for the toolchain that motivated
 this PRD. The exception is a package with a *genuine* native postinstall (e.g.
@@ -331,8 +331,11 @@ Two limits, stated because their absence is what made the old text dangerous:
   `--ignore-scripts` alone does not hold this line for yarn or pnpm — plus the existing
   runner-uid + scrubbed-env sandbox, the same boundary that already runs the repo's tests.
   **Caveat:** on a `#58` single-uid start there is no
-  runner-uid split (`self-improve.ts`, the single-uid branch of the check-env comment
-  block), so isolation is weaker there; since k8s
+  runner-uid split (`agent/src/sdk-env.ts`, the single-uid branch of the `buildCheckEnv`
+  security comment block — *the fix that replaced this bullet's original stale line number
+  named `self-improve.ts`, which is where that block used to live before M2 moved it; a
+  second fact-check pass caught it. Correcting a stale anchor by hand is itself a claim
+  about where code lives now*), so isolation is weaker there; since k8s
   is now the primary runtime (CLAUDE.md), verify the k8s worker posture
   (`docs/proc-hardening.md`) rather than assuming the split holds everywhere.
 - **Install latency on every JS run.** Mitigated by overlapping with the plan +
