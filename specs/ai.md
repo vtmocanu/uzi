@@ -12333,3 +12333,65 @@ Two things worth keeping:
   logs, the improve_uzi backlog), not something this work established. Same reduction-not-a-close
   register as `--ignore-scripts` in §398 — say what was measured, and say what rests on an
   assumption.
+
+## 418. PRD #116 — a THIRD result state, "blocked", decided at render time and nowhere else
+
+A PreToolUse denial is the guardrail working as designed, and the agent recovers from it, so painting
+it red made healthy runs look broken. The live case (#115): the lead's `Explore` spawn was denied, it
+used `researcher` instead, the run finished fine — and the feed showed a red "✗ error". So
+`tool_result` now has three presentation states, not two: an exported pure
+`classifyResultState(isError, text): "ok" | "error" | "blocked"` in `web/src/components/RunEvent.tsx`.
+A denial renders a neutral chip with a warn-tinted `⊘` glyph and starts **collapsed**; a genuine error
+keeps the red `✗` and still auto-expands, because that one still wants attention.
+
+- **What it keys off, and why the anchor is per LINE.** All 15 deny reasons in
+  `agent/src/guardrails.ts` carry the phrase `"denied by guardrail"`. The web requires that phrase to
+  START one of the text's lines, after leading whitespace and an optional `<tool_use_error>` open tag.
+  Neither of the two obvious tests is right. `startsWith` over the whole text fails an SDK wrapper and
+  a denial that is one of several content blocks `resultToText` joins with `\n` — and note it must be
+  the PHRASE it anchors on, not "phrase + colon", because the two `?? "denied by guardrail"` fallbacks
+  have no colon to anchor on. But a plain `.includes` — which is what this shipped
+  as first, and what the PRD recommends — over-matches in a way this very change made likelier: a
+  genuinely FAILING command whose output quotes the phrase would render calm and collapsed, and the
+  concrete case is our own gate, since a red `cd agent && npm test` prints `node --test` titles like
+  ``ok 14 - the ".git access" deny reason starts with "denied by guardrail"``. That is the PRD's own
+  "under-alarming a real problem" risk arriving for real, so the anchor moved to the line, which
+  satisfies every real shape while a mid-line mention stays red. `web/` and `agent/` are separate
+  npm packages, so the phrase cannot be imported; the coupling is pinned from the **agent** side by
+  `agent/test/guardrails.test.ts`, both behaviourally (all 15 deny paths driven through the public
+  API — the constants are module-private — asserting 15 *distinct* reasons, so the table cannot be
+  fifteen copies of one path) and structurally (a source scan of the `REASON_*` literals, so a FUTURE
+  16th reason added without the phrase fails too, which the behavioural half can never cover). Both
+  agent-side assertions are `startsWith`, stricter than what the web needs on purpose: the web
+  tolerates a wrapper it does not control, the agent promises text it does.
+
+- **`is_error` stays TRUE. This is presentation-only.** The persisted `run_messages` frame stays
+  honest to exactly what the SDK emitted — and historical frames cannot be rewritten anyway. **The
+  guarantee that nothing downstream shifts comes from the frame being UNCHANGED, not from nobody
+  reading it, and the difference matters.** It is tempting to record that a `tool_result` block's
+  `is_error` is read only by the renderer — the PRD says so, inheriting a pre-#121 survey — and it is
+  false: `api/internal/workersvc/judge.go`'s `toolResultOutcome` parses that exact field, feeding
+  `observedGreenTools`, which is what suppresses a missing-tool finding when the run demonstrably ran
+  the tool. (`isErrorResult` in `agent/src/sdk-messages.ts` genuinely does only inspect the terminal
+  `type:"result"` frame — that part of the survey holds; it is the "and nothing else" that does not.)
+  Recorded because that sentence is precisely what would license the tempting simplification of
+  flipping a denial to non-error at the source — after which a guardrail-denied Bash result would
+  count as green evidence that its command ran, silently suppressing the missing-tool flag PRD #121
+  exists to raise. Detection being render-time is also what gives historical runs
+  the calm chip for free: no persisted marker, no migration, and `ChatMessages` inherits it because it
+  renders through the same row.
+
+- **The honest limit, and how close it actually is.** The phrase coupling is real: if the pinned
+  claude-agent-sdk moved the PreToolUse-deny path onto its `<tool_use_error>` wrapper AND changed the
+  text, every blocked chip would silently revert to red with no test failing on the web side — and
+  nobody would notice, because the run still works. **The nearer miss is not the wrapper, though, and
+  it is one line of SDK code wide.** That same pinned binary builds a PREFIXED form of the very same
+  denial — `` `${hookName} hook error: ${reason}` `` — and yields it immediately BEFORE the raw-reason
+  one; the bare reason reaches the `tool_result` only because the consumer keeps the last yield.
+  Reorder those two, or drop the second, and every denial arrives mid-line. A line anchor is *more*
+  exposed to that than `.includes` was, which is why the hook-error preamble is stripped alongside the
+  wrapper — cheap mitigations, chosen with eyes open, not a close. It is also a stronger argument for
+  the structured marker below than the wrapper risk is. The durable fix, if it ever regresses, is the structured marker the PRD documents as
+  the alternative: tag the message at `agent/src/sdk-messages.ts` `mapUser` with an additive
+  `denied: true` through the opaque `jsonb` payload. Deliberately NOT built now — it touches agent,
+  protocol and web for a cosmetic change.
