@@ -78,6 +78,64 @@ func Denied(pkg string) bool {
 	return denylist[base]
 }
 
+// deniedPackageExecutables maps each denylisted PACKAGE to the executables it puts on
+// PATH. The denylist above is keyed by package name, which is right for provisioning
+// (a package name is what an admin allowlists and what devbox installs) and wrong for
+// anything observing a SHELL, where only the executable ever appears.
+//
+// The two diverge exactly where it would hurt: `awscli` installs `aws`, `azure-cli`
+// installs `az`, `google-cloud-sdk` installs gcloud/gsutil/bq. A name-equality check
+// against the denylist would cover glab and quietly miss every one of those.
+//
+// The key set MUST equal the denylist's key set; TestDeniedExecutablesCoverDenylist
+// asserts it in both directions, so adding a package to the denylist without naming
+// its executables fails the build rather than silently narrowing the check.
+var deniedPackageExecutables = map[string][]string{
+	"glab": {"glab"},
+	"gh":   {"gh"},
+	"hub":  {"hub"},
+	"tea":  {"tea"},
+	// The AWS CLI ships as `aws` from either package generation.
+	"awscli":      {"aws"},
+	"awscli2":     {"aws"},
+	"aws-sam-cli": {"sam"},
+	"azure-cli":   {"az"},
+	// The Google SDK is one package and three credentialed entry points.
+	"google-cloud-sdk": {"gcloud", "gsutil", "bq"},
+	"gcloud":           {"gcloud"},
+	"kubelogin":        {"kubelogin"},
+	"oci-cli":          {"oci"},
+	"doctl":            {"doctl"},
+	// flyctl is invoked as either name.
+	"flyctl": {"flyctl", "fly"},
+	"heroku": {"heroku"},
+	"vault":  {"vault"},
+	"op":     {"op"},
+	"bw":     {"bw"},
+}
+
+// deniedExecutableSet is the flattened reverse index of deniedPackageExecutables,
+// built once so lookups are O(1) on a hot scan path.
+var deniedExecutableSet = func() map[string]bool {
+	s := make(map[string]bool)
+	for _, execs := range deniedPackageExecutables {
+		for _, e := range execs {
+			s[e] = true
+		}
+	}
+	return s
+}()
+
+// DeniedExecutable reports whether cmd is an executable installed by a denylisted,
+// credential-bearing package — i.e. a command that can never legitimately be added to
+// a worker, so observing it missing is not a gap to report but the policy working.
+//
+// Distinct from Denied, which takes a PACKAGE name. Callers that observe shell output
+// (the judge's command-not-found scan) want this one.
+func DeniedExecutable(cmd string) bool {
+	return deniedExecutableSet[cmd]
+}
+
 // pkgNameRe bounds a well-formed package token: a nix-ish package name with an
 // optional `@version` suffix. Rejects shell metacharacters, paths, and spaces so a
 // desired entry can't smuggle anything past the allowlist check.

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 )
 
 const (
@@ -181,7 +182,14 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 
 		forEachNotFound(text, func(cmd, evidence string) {
 			cmd = normalizeCommandToken(cmd)
-			if cmd == "" || shellNames[cmd] || seen[cmd] || len(out) >= judgeMissCandidateCap {
+			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
+			// barred by Decision 6 and rejected even when an admin allowlists it
+			// (toolprofile.Denied). Reporting it missing produced an `install_worker_tool`
+			// recommendation that can never be actioned, and did so REPEATEDLY — the scan
+			// keys on a command-not-found string, not on capability, so `glab` recurred on
+			// every run whose agent reached for it and read as unaddressed backlog forever.
+			// Observing one of these absent is the policy working, not a finding.
+			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
 			seen[cmd] = true

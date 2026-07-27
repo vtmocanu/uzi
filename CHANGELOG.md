@@ -31,6 +31,22 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   without the phrase — or written in a form the scan cannot read — fails there rather than
   silently turning its chip red again (issue #116).
 
+### Fixed
+
+- **The judge no longer recommends installing a tool that policy permanently forbids.**
+  A credential-bearing CLI such as `glab`, `gh`, `aws` or `az` is barred outright, even
+  against an explicit admin allowlist, because a logged-in one reachable from the agent's
+  shell would defeat the rule that the worker holds the forge credential and the agent does
+  not. But the missing-tool scan keys on a `command not found` string rather than on whether
+  the tool could ever be installed, so every run whose agent reached for one produced an
+  install-worker-tool recommendation nobody could action. Two had been sitting in the
+  backlog reading as unaddressed work. Seeing one of these absent is the policy working, so
+  the scan now drops them; ordinary missing tools are unaffected and still reported. The
+  suppression matches on the EXECUTABLE rather than the package name, which is the part
+  that is easy to get wrong: the barred package is `awscli` while the command a shell
+  reports is `aws`, so a name comparison would have covered `glab` and quietly missed the
+  whole cloud-CLI half of the list.
+
 ## [0.11.12] - 2026-07-27
 
 ### Fixed

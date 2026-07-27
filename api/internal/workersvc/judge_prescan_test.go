@@ -573,3 +573,38 @@ func TestPrescanIgnoresFrameKeysOnToolUse(t *testing.T) {
 			bare, attached)
 	}
 }
+
+// TestScanSuppressesDenylistedCredentialCLIs pins the fix for the recommendation that
+// could never be actioned. `glab` is barred by toolprofile's Decision 6 denylist even
+// against an explicit admin allowlist, so a run whose agent reaches for it will always
+// see command-not-found. The scan keys on that string rather than on capability, so it
+// re-emitted `install_worker_tool: glab` on every such run — twice in 21 runs before
+// this, both surviving triage as permanent, unactionable backlog.
+//
+// The `aws` case is the one a name-equality check against the denylist would miss: the
+// denylisted PACKAGE is `awscli`, and the command a shell reports is `aws`.
+func TestScanSuppressesDenylistedCredentialCLIs(t *testing.T) {
+	rows := rawResultRows(
+		`{"content":"glab: command not found"}`,
+		`{"content":"aws: command not found"}`,
+		`{"content":"az: command not found"}`,
+		`{"content":"jq: command not found"}`,
+	)
+
+	got := scanCommandNotFound(rows)
+
+	var cmds []string
+	for _, c := range got {
+		cmds = append(cmds, c.Command)
+	}
+	// jq is an ordinary tool and MUST survive: a suppression that swallows real
+	// findings would be a worse defect than the one being fixed.
+	if !slices.Contains(cmds, "jq") {
+		t.Fatalf("jq should still be reported as missing, got %v", cmds)
+	}
+	for _, denied := range []string{"glab", "aws", "az"} {
+		if slices.Contains(cmds, denied) {
+			t.Errorf("%q is denylisted and can never be installed; it must not surface as a missing tool (got %v)", denied, cmds)
+		}
+	}
+}

@@ -136,3 +136,53 @@ func TestSplit(t *testing.T) {
 		}
 	}
 }
+
+// TestDeniedExecutablesCoverDenylist pins the two maps together. denylist is keyed by
+// PACKAGE and deniedPackageExecutables maps package -> executables; anything observing
+// a shell can only see the executable, so a gap here silently narrows DeniedExecutable
+// without failing anything else.
+//
+// It asserts BOTH directions on purpose. Missing-package is the drift that matters
+// (a new denylist entry whose CLI stays observable), but an extra entry here means a
+// package was dropped from the denylist and this map kept claiming to bar it.
+func TestDeniedExecutablesCoverDenylist(t *testing.T) {
+	for pkg := range denylist {
+		execs, ok := deniedPackageExecutables[pkg]
+		if !ok {
+			t.Errorf("denylisted package %q has no executables mapped: DeniedExecutable cannot see its CLI", pkg)
+			continue
+		}
+		if len(execs) == 0 {
+			t.Errorf("denylisted package %q maps to an empty executable list", pkg)
+		}
+	}
+	for pkg := range deniedPackageExecutables {
+		if !denylist[pkg] {
+			t.Errorf("deniedPackageExecutables names %q, which is not on the denylist", pkg)
+		}
+	}
+}
+
+// TestDeniedExecutableCoversDivergentNames is the case a name-equality check fails.
+// The package is `awscli`/`azure-cli`/`google-cloud-sdk`; the command a shell reports
+// missing is `aws`/`az`/`gcloud`. Denied() answers about the former and would say no
+// to all three of the latter.
+func TestDeniedExecutableCoversDivergentNames(t *testing.T) {
+	for _, cmd := range []string{"glab", "gh", "aws", "az", "gcloud", "gsutil", "bq", "sam", "oci", "fly"} {
+		if !DeniedExecutable(cmd) {
+			t.Errorf("DeniedExecutable(%q) = false, want true", cmd)
+		}
+	}
+	// Sanity in the other direction: an ordinary tool must stay reportable, or the
+	// suppression would swallow real missing-tool findings.
+	for _, cmd := range []string{"file", "perl", "fmt", "helm", "kubeconform", "jq", "go"} {
+		if DeniedExecutable(cmd) {
+			t.Errorf("DeniedExecutable(%q) = true, want false", cmd)
+		}
+	}
+	// Denied() takes a package and genuinely does NOT answer for these, which is why
+	// DeniedExecutable exists rather than reusing it.
+	if Denied("aws") || Denied("az") {
+		t.Error("Denied() unexpectedly matched an executable name; the divergence this test documents has changed")
+	}
+}
