@@ -10,6 +10,13 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **The crossed-off steps in the dashboard's "Get the factory running" checklist are
+  legible again.** The strikethrough was drawn in a border token (`--edge-strong`) sitting
+  at roughly 1.9:1 against the card, while the struck text beside it is at roughly 6.9:1 —
+  so the line marking a step done was all but invisible, in both the ember and mission
+  themes. The decoration now inherits the muted text colour, which keeps it legible in
+  every theme without adding a token (issue #60).
+
 - **Two objects the chart declares were being deleted from the rendered manifest, so
   restricted-tier hosted workers could not be provisioned.** A Helm template comment
   ending `*/ -}}` immediately before a `---` trims the newline as well, gluing the
