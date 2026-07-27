@@ -13457,6 +13457,16 @@ park a run for years, and cannot spend more than its own owner's retry budget.
 - `RUN_LIMIT_MAX_PARK` (default **8d**, not 7d: the longest SDK window is seven days and a reset
   stamped at its far edge needs room for jitter and clock skew) caps how far one park may reach; a
   computed stamp beyond it **fails the run instead of parking**.
+- **🔴 THE TWO CAPS ARE NOT SYMMETRIC IN HOW THEY READ THEIR ENV, AND THE ASYMMETRY IS DELIBERATE.**
+  The budget uses a non-negative int parser, so `0` is accepted and honoured. The ceiling uses the
+  duration parser, which accepts only a **strictly positive** value and silently falls back to the
+  default otherwise — so `RUN_LIMIT_MAX_PARK=0` does **not** remove the clamp, and there is no env
+  spelling that does. That is correct and must not be "fixed" into symmetry: the budget is a policy
+  knob an operator may legitimately zero to get today's behaviour back, while the ceiling is the
+  security bound that stops a compromised worker parking a run for years, and a bound with an off
+  switch is not a bound. (The in-process zero value *does* fail every park — a params struct that
+  omits the ceiling makes every computed stamp exceed it — but that is a construction error, not a
+  reachable configuration.)
 - The two **compose**: a run can hold the one-active-per-issue lock for at most
   `MAX_WAITS × MAX_PARK` ≈ **40 days** at the defaults. That figure must be recomputed if either
   default moves; cancel-while-parked is the escape hatch.
