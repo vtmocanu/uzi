@@ -208,6 +208,12 @@ const AUTO_STATUS_CHIPS: Record<AutoStatus, AutoStatusChip> = {
     tone: "neutral",
     label: "not in pool",
     hint: "Auto-selection never picks this token. Opt it in to let an auto worker spend it.",
+    // Required by the exhaustive Record above, and NOT because any surface renders
+    // it today: the settings row suppresses this state (the unchecked box beside it
+    // already says so) and the admin view does not read auto_status at all. An
+    // earlier version of this comment claimed the admin view needed it, which read
+    // as though that page rendered the chip — it does not. Widening the admin
+    // surface is PRD #104 M5's, not this PRD's.
   },
   no_reading: {
     tone: "warning",
@@ -225,11 +231,69 @@ const AUTO_STATUS_CHIPS: Record<AutoStatus, AutoStatusChip> = {
     hint: "Opted in, but the last usage reading is too old to steer a choice — auto-selection skips it until a fresh one lands. A token uzi is currently backing off from also reads this way.",
   },
   below_threshold: {
-    tone: "warning",
+    // NOT `warning`, deliberately, and the difference is not cosmetic. The three
+    // states above mean the selector SKIPS this token. This one means the opposite in
+    // the case that matters: per D10, when every pooled token is below the threshold
+    // the emptiest of them is still picked — "least consumed" has a best answer even
+    // when every answer is poor. Wearing the same amber as `stale` would say "not in
+    // play" about a token that is very much in play.
+    tone: "info",
     label: "low headroom",
     hint: "Opted in and current, but below the headroom threshold, so auto-selection prefers other tokens. It is still picked if every pooled token is this low.",
   },
 };
+
+// AutoChipState is what the settings row actually renders, which is NOT the same as
+// the server's status (PRD #111 M2, web-ux F1/F9). Three states exist only on the
+// client and none of them is a server answer:
+//
+//   - "pending": the meters fetch has not resolved. Before this existed, a pooled
+//     token rendered NO chip while loading — visually identical to a healthy one,
+//     which is the silent no-op D11 exists to prevent arriving through a spinner.
+//   - "unknown": the meters fetch FAILED, or returned no row for this token. Same
+//     hazard through the error path, and the honest answer is "we could not check".
+//   - "contradiction": the toggle says pooled and the status says not_pooled. Two
+//     independently-fetched sources disagreeing about one token — a slow
+//     /me/rate-limits after a fast /me/secrets reproduces it against a real server.
+//     Rendering it would show a checked box beside "not in pool"; we show nothing
+//     rather than assert a contradiction, and it resolves on the next poll.
+export type AutoChipState =
+  | { kind: "hidden" }
+  | { kind: "chip"; chip: AutoStatusChip };
+
+// autoChipFor decides what a POOLED token's row shows. Callers gate on
+// secret.auto_eligible before calling: an un-pooled token shows nothing at all,
+// because the unchecked box beside it already says so.
+export function autoChipFor(
+  pooled: boolean,
+  status: AutoStatus | string | undefined,
+  fetchState: "pending" | "ready" | "failed",
+): AutoChipState {
+  if (!pooled) return { kind: "hidden" };
+  if (fetchState === "pending") {
+    return {
+      kind: "chip",
+      chip: {
+        tone: "neutral",
+        label: "checking…",
+        hint: "Checking whether auto-selection can currently pick this token.",
+      },
+    };
+  }
+  if (fetchState === "failed" || status === undefined) {
+    return {
+      kind: "chip",
+      chip: {
+        tone: "neutral",
+        label: "eligibility unknown",
+        hint: "uzi could not read this token's usage figures just now, so whether auto-selection can pick it is unknown. It is still opted in.",
+      },
+    };
+  }
+  // The contradiction. Suppressed rather than rendered — see AutoChipState.
+  if (status === "not_pooled") return { kind: "hidden" };
+  return { kind: "chip", chip: autoStatusChip(status) };
+}
 
 // autoStatusChip renders the server's answer. It takes the string the API sent and
 // nothing else — no reading, no clock — which is what makes "the UI cannot disagree

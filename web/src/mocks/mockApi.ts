@@ -5,6 +5,7 @@
 
 import {
   ApiError,
+  type AutoStatus,
   type BindMode,
   type AgentSelectionInput,
   type AgentTemplate,
@@ -898,6 +899,33 @@ function sessionBody() {
   };
 }
 
+// rejectInvisibleLabel mirrors the server's validateSecretLabel Cf rule (PRD #111).
+//
+// The mock is this repo's BROWSABLE SPEC, and until this existed it accepted labels
+// production rejects — which is how a browser pass managed to store a bidi-override
+// label and demonstrate F12 against a build that was supposed to make it impossible.
+// A mock that disagrees with the API about what is valid teaches the wrong lesson and
+// leaves the new error copy with nowhere to be seen.
+//
+// Control characters are not re-checked here: the real validator rejects them too,
+// but they cannot be typed into the field, so the Cf half is the one a demo exercises.
+function rejectInvisibleLabel(label: string): void {
+  if (/\p{Cf}/u.test(label)) {
+    throw new ApiError(
+      400,
+      "Label must not contain invisible formatting characters (zero-width spaces and joiners, bidirectional overrides, the byte-order mark): they let two different tokens look identical, or make a label read as a different account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one of these characters. Use a plain name.",
+    );
+  }
+}
+
+// pooledFixtureStatus is each demo token's eligibility WHEN POOLED, so toggling one
+// off and on again returns it to the state its fixture describes instead of
+// flattening every token to `eligible`.
+const pooledFixtureStatus: Record<string, AutoStatus> = {
+  "sec-never-polled": "no_reading",
+  "sec-low": "below_threshold",
+};
+
 export const mockApi = {
   // ── Auth: instant and fake. Any credentials sign in as the admin. ──────────
   // The session bootstrap carries the instance labels alongside the user, mirroring
@@ -1165,6 +1193,7 @@ export const mockApi = {
     requireUnlockedVault();
     const trimmed = label.trim();
     if (trimmed === "") throw new ApiError(400, "label must not be empty");
+    rejectInvisibleLabel(trimmed);
     const anthropic = () => secrets.filter((s) => s.kind === "anthropic_token");
     if (anthropic().some((s) => s.label.toLowerCase() === trimmed.toLowerCase())) {
       throw new ApiError(409, "a token with that label already exists");
@@ -1201,6 +1230,7 @@ export const mockApi = {
     if (body.label !== undefined) {
       const trimmed = body.label.trim();
       if (trimmed === "") throw new ApiError(400, "label must not be empty");
+      rejectInvisibleLabel(trimmed);
       if (
         secrets.some(
           (s) => s.id !== id && s.kind === row.kind && s.label.toLowerCase() === trimmed.toLowerCase(),
@@ -1229,11 +1259,17 @@ export const mockApi = {
     const meter = mockMyTokenRateLimits.find((t) => t.secret_id === id);
     if (meter) {
       meter.auto_eligible = autoEligible;
-      // The mock's fixtures all carry a fresh, roomy reading, so opting in reaches
-      // `eligible`. It does NOT re-implement the gate: the real status is computed
-      // server-side by autoselect.Classify and this is a two-value stand-in, which
-      // is why it lives here and not in lib/rateLimits.ts.
-      meter.auto_status = autoEligible ? "eligible" : "not_pooled";
+      // Opting OUT is always `not_pooled` — that gate comes first server-side too.
+      // Opting IN restores the token's OWN fixture state rather than hard-coding
+      // `eligible` (web-ux F2): the four states the feature exists for — never
+      // polled, stale, no usage data, low headroom — were unreachable in the demo
+      // because this line asserted every pooled token is pickable, which is the very
+      // thing the chip exists to disprove.
+      //
+      // This does NOT re-implement the gate. The real status is autoselect.Classify's
+      // answer, computed server-side; this restores a fixture value, which is why it
+      // lives here and not in lib/rateLimits.ts.
+      meter.auto_status = autoEligible ? (pooledFixtureStatus[id] ?? "eligible") : "not_pooled";
     }
     return delay({ secret: { ...row } });
   },

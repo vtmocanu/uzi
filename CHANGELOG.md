@@ -31,8 +31,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   headroom` when it could not. That is the point of the chip rather than decoration: a token
   uzi has never managed to read a usage figure for can never be picked, and without the chip it
   would sit there looking active. The status is computed server-side from the same rule the
-  selector uses, so the page cannot promise something the selector will not do. The selector
-  itself lands next (PRD #111 M2). New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
+  selector uses, so the page cannot promise something the selector will not do (PRD #111 M2).
+  The selector itself lands in a later change. New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
   `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_MAX_STALENESS` and
   `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
   [docs/configuration.md](docs/configuration.md).

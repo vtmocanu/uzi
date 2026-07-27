@@ -341,7 +341,7 @@ describe("AnthropicTokens", () => {
 
   it("reflects the pool opt-in and toggles it both ways", async () => {
     renderList([secret({ auto_eligible: false })]);
-    const box = screen.getByLabelText("Auto-select from this token") as HTMLInputElement;
+    const box = screen.getByLabelText(/Auto-select from/) as HTMLInputElement;
     expect(box.checked).toBe(false);
 
     fireEvent.click(box);
@@ -349,7 +349,7 @@ describe("AnthropicTokens", () => {
 
     cleanup();
     renderList([secret({ auto_eligible: true })]);
-    const on = screen.getByLabelText("Auto-select from this token") as HTMLInputElement;
+    const on = screen.getByLabelText(/Auto-select from/) as HTMLInputElement;
     expect(on.checked).toBe(true);
     fireEvent.click(on);
     await waitFor(() => expect(mockApi.setTokenAutoEligible).toHaveBeenCalledWith("sec-1", false));
@@ -403,8 +403,52 @@ describe("AnthropicTokens", () => {
   it("still renders the toggle when the eligibility fetch fails", async () => {
     mockApi.getMyRateLimits.mockRejectedValue(new Error("network"));
     renderList([secret({ auto_eligible: true })]);
-    expect(screen.getByLabelText("Auto-select from this token")).toBeTruthy();
-    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
+    expect(screen.getByLabelText(/Auto-select from/)).toBeTruthy();
+    // web-ux F9: a failed fetch must SAY it does not know, not fall silent — a
+    // pooled-but-unpickable token rendering no chip is indistinguishable from a
+    // healthy one, which is D11's silent no-op arriving through the error path.
+    expect(await screen.findByText("eligibility unknown")).toBeTruthy();
     expect(screen.queryByText("never polled")).toBeNull();
+  });
+
+  // web-ux F5: an `auto` worker is bound to the POOL AS A SET, not to any one token,
+  // so deleting a pooled credential shifts spend while being "bound to nothing" by
+  // the old wording's reckoning. D5's argument is that a silent fallback is
+  // acceptable behaviour and unacceptable surprise — and this had become the
+  // surprise. Asserted through the real confirm() the component calls, not through
+  // deleteWarning() directly, so a caller that forgets to pass the flag still fails.
+  it("warns that deleting a pooled token shrinks the auto-selection pool", async () => {
+    const seen: string[] = [];
+    vi.spyOn(window, "confirm").mockImplementation((m?: string) => {
+      seen.push(m ?? "");
+      return false; // refuse, so nothing is deleted
+    });
+    renderList([
+      secret({ is_default: true }),
+      secret({ id: "sec-2", label: "console-key", is_default: false, auto_eligible: true }),
+    ]);
+    fireEvent.click(
+      within(screen.getByTestId("token-sec-2")).getByRole("button", { name: /delete/i }),
+    );
+    expect(seen[0]).toMatch(/auto-selection pool/i);
+    expect(mockApi.deleteAnthropicTokenById).not.toHaveBeenCalled();
+  });
+
+  // …and an UN-pooled token keeps the old, correct wording. Without this the fix
+  // could be "always mention the pool", which would be a different wrong answer.
+  it("does not mention the pool when the token is not in it", async () => {
+    const seen: string[] = [];
+    vi.spyOn(window, "confirm").mockImplementation((m?: string) => {
+      seen.push(m ?? "");
+      return false;
+    });
+    renderList([
+      secret({ is_default: true }),
+      secret({ id: "sec-2", label: "console-key", is_default: false, auto_eligible: false }),
+    ]);
+    fireEvent.click(
+      within(screen.getByTestId("token-sec-2")).getByRole("button", { name: /delete/i }),
+    );
+    expect(seen[0]).not.toMatch(/pool/i);
   });
 });

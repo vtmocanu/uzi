@@ -158,15 +158,22 @@ function okReading(
 // the two meter pairs are visibly different rather than duplicates.
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
 
+// 🔴 auto_eligible HERE MUST AGREE WITH mockSecrets, TOKEN FOR TOKEN. The settings
+// row draws its toggle from mockSecrets and its chip from this list, so a
+// disagreement renders a checked box beside "not in pool" — which is what the demo
+// build shipped until this was fixed, and exactly the contradiction the feature
+// exists to prevent. The component now suppresses a chip that disagrees with the
+// toggle rather than drawing it, so a mistake here degrades to a missing chip; that
+// is a backstop, not a licence to let these drift.
 export const mockMyTokenRateLimits: TokenRateLimits[] = [
   {
     secret_id: "sec-default",
     label: "default",
     is_default: true,
-    // Pooled and pickable, so the demo shows the PRD #111 chip in its healthy
-    // state next to a token that is NOT pooled — the contrast is the point.
-    auto_eligible: true,
-    auto_status: "eligible" as const,
+    // NOT pooled — the reserved-credential case D2 exists for. Its contrast with
+    // console-key below is the thing worth seeing on a cold load.
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
     limits: mockMyRateLimits,
   },
   {
@@ -176,9 +183,34 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     secret_id: "sec-console",
     label: "console-key",
     is_default: false,
-    auto_eligible: false,
-    auto_status: "not_pooled" as const,
+    // Pooled AND pickable: the healthy chip, which had been rendering on no row at all.
+    auto_eligible: true,
+    auto_status: "eligible" as const,
     limits: okReading(34, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
+  },
+  {
+    // F2: `never polled` — pooled, but uzi has NEVER read a usage figure for it, so
+    // the selector can never pick it. This is R7's silent no-op, and without a
+    // fixture carrying it the state the chip mechanism exists to surface was
+    // unreachable in the demo build. `unavailable` is what a token with no gauge row
+    // actually returns.
+    secret_id: "sec-never-polled",
+    label: "refused-key",
+    is_default: false,
+    auto_eligible: true,
+    auto_status: "no_reading" as const,
+    limits: { status: "unavailable" as const },
+  },
+  {
+    // F2: `low headroom` — pooled, current, and nearly spent. Distinct from the three
+    // above in the way F4 is about: per D10 this token IS still picked when every
+    // pooled token is this low, so it must not wear the same "skipped" tone.
+    secret_id: "sec-low",
+    label: "nearly-spent",
+    is_default: false,
+    auto_eligible: true,
+    auto_status: "below_threshold" as const,
+    limits: okReading(93, 40 * MIN, 88, 1 * D, 3),
   },
 ];
 
@@ -616,6 +648,28 @@ export const mockSecrets: SecretMeta[] = [
     auto_eligible: true,
     created_at: daysAgo(9),
     updated_at: daysAgo(9),
+  },
+  // Two more pooled tokens so the states that MATTER are browsable (F2): a token
+  // the poller has never reached, and one that is nearly spent. Both are pooled —
+  // an un-pooled token shows no chip at all, so only a pooled one can demonstrate
+  // that opting in is not the same as being pickable.
+  {
+    id: "sec-never-polled",
+    kind: "anthropic_token",
+    label: "refused-key",
+    is_default: false,
+    auto_eligible: true,
+    created_at: daysAgo(3),
+    updated_at: daysAgo(3),
+  },
+  {
+    id: "sec-low",
+    kind: "anthropic_token",
+    label: "nearly-spent",
+    is_default: false,
+    auto_eligible: true,
+    created_at: daysAgo(12),
+    updated_at: daysAgo(1),
   },
 ];
 

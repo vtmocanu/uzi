@@ -22,14 +22,36 @@
 // shows the label alone rather than guessing one.
 
 import type { Run } from "../lib/api";
+import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { Badge } from "./ui";
 
-export function RunCredential({ run }: { run: Pick<Run, "anthropic_secret_label"> }) {
+export function RunCredential({
+  run,
+}: {
+  run: Pick<Run, "anthropic_secret_id" | "anthropic_secret_label">;
+}) {
   const label = run.anthropic_secret_label;
   if (!label) return null;
+  // The label is user-authored and reaches a renderer without necessarily having
+  // passed the server validator — see lib/sanitizeLabel for the three routes. React
+  // escaping does not touch a bidi override.
+  const safe = sanitizeLabel(label);
+  // web-ux F8: a run whose credential was DELETED is otherwise indistinguishable
+  // from one whose credential still exists — the DTO says so (the id is null while
+  // the snapshotted label survives) and the chip was ignoring it. Saying "deleted"
+  // is the difference between "go look at this token" and "this token is gone".
+  const deleted = run.anthropic_secret_id == null;
   return (
-    <Badge tone="neutral" title="The Anthropic credential this run's claim spent">
-      token {label}
+    <Badge
+      tone="neutral"
+      title={
+        deleted
+          ? "The Anthropic credential this run's claim spent. It has since been deleted; the name is the one recorded when the run was claimed."
+          : "The Anthropic credential this run's claim spent"
+      }
+    >
+      token {safe}
+      {deleted && " (deleted)"}
     </Badge>
   );
 }

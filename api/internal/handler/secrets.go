@@ -667,8 +667,22 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 //     after them, so a label can be made to read as a different account entirely.
 //   - Zero-widths make two DISTINCT tokens render identically: `work` and
 //     `work`+U+200B are different rows that look the same in a browser, and 00077's
-//     unique index is on `lower(label)`, which does not fold them. So the
-//     collision the index exists to prevent stays possible while looking prevented.
+//     unique index is on `lower(label)`, which does not fold them.
+//
+// 🔴 THE SECOND HAZARD IS NARROWED, NOT CLOSED, AND THE DIFFERENCE MATTERS. The bidi
+// half is fully closed — every reordering codepoint is `Cf`. The identical-rendering
+// half is not: measured, these are all still accepted because NONE of them is `Cf` —
+// U+3164 HANGUL FILLER and U+FFA0 (both `Lo`), U+2800 BRAILLE PATTERN BLANK (`So`),
+// U+00A0 NBSP and U+3000 IDEOGRAPHIC SPACE (both `Zs`). So `work` and `work`+U+3164
+// remain two rows a browser draws identically.
+//
+// That residual is ACCEPTED, deliberately, and the list must not grow here: the set
+// of blank-rendering codepoints is unbounded, homoglyphs (`work` with a Cyrillic о)
+// are the same class with no character rule reaching them at all, and this repo has
+// now settled on the `control + Cf` pair in three places — a longer list here would
+// make the three disagree about what a label is. A comment claiming a closed hazard
+// is how the next person skips checking, which is why this one says what it does not
+// cover.
 //
 // The predicate is the pair this repo has already settled on twice — sanitizeTTY
 // (cmd/uzi/run.go) and workersvc.hasUnsafeChar — rather than a third spelling of
@@ -700,10 +714,11 @@ func validateSecretLabel(raw string) (string, error) {
 			return "", errors.New("label must not contain control characters")
 		}
 		if unicode.In(r, unicode.Cf) {
-			return "", errors.New("label must not contain invisible formatting characters " +
+			return "", errors.New("Label must not contain invisible formatting characters " +
 				"(zero-width spaces and joiners, bidirectional overrides, the byte-order mark): " +
 				"they let two different tokens look identical, or make a label read as a different " +
-				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one")
+				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one " +
+				"of these characters. Use a plain name.")
 		}
 	}
 	return label, nil

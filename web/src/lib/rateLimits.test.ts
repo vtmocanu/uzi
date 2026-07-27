@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
 import {
+  autoChipFor,
   autoStatusChip,
   formatAgo,
   formatCountdown,
@@ -192,13 +193,63 @@ describe("autoStatusChip", () => {
     expect(autoStatusChip("not_pooled").tone).toBe("neutral");
   });
 
-  // The three states that mean "opted in, and it will never be picked as things
-  // stand" all warn. That is R7's silent no-op made visible — the reason the
-  // status is surfaced at all.
-  it("warns on every opted-in-but-unpickable state", () => {
-    for (const s of ["no_reading", "unmeasured", "stale", "below_threshold"] as AutoStatus[]) {
+  // The three states that mean "opted in, and the selector SKIPS it" warn. That is
+  // R7's silent no-op made visible — the reason the status is surfaced at all.
+  it("warns on every state where the selector skips the token", () => {
+    for (const s of ["no_reading", "unmeasured", "stale"] as AutoStatus[]) {
       expect(autoStatusChip(s).tone).toBe("warning");
     }
+  });
+
+  // …and `below_threshold` deliberately does NOT (web-ux F4). It is the one state
+  // that means the opposite in the case that matters: per D10, when every pooled
+  // token is below the threshold the emptiest of them is STILL picked. Four states
+  // sharing one amber said "not in play" about a token that is very much in play.
+  it("does not warn on low headroom, which is still picked when the whole pool is low", () => {
+    expect(autoStatusChip("below_threshold").tone).not.toBe("warning");
+    // And it stays visually distinct from the calm "not opted in" state, so the row
+    // does not read as though nothing were wrong.
+    expect(autoStatusChip("below_threshold").tone).not.toBe(autoStatusChip("not_pooled").tone);
+  });
+
+  // autoChipFor is what the row actually renders, and its three client-only states
+  // are the ones that used to degrade to the PRE-FEATURE appearance: no chip at all,
+  // which is indistinguishable from a healthy pooled token (web-ux F1/F9).
+  describe("autoChipFor", () => {
+    it("shows nothing for an un-pooled token", () => {
+      expect(autoChipFor(false, "not_pooled", "ready").kind).toBe("hidden");
+    });
+
+    it("says it is checking while the meters load, rather than showing nothing", () => {
+      const d = autoChipFor(true, undefined, "pending");
+      expect(d.kind).toBe("chip");
+      expect(d.kind === "chip" && d.chip.label).toBe("checking…");
+    });
+
+    it("admits it does not know when the meters fetch fails", () => {
+      const d = autoChipFor(true, undefined, "failed");
+      expect(d.kind === "chip" && d.chip.label).toBe("eligibility unknown");
+    });
+
+    // A token the meters list does not mention is the same epistemic state as a
+    // failed fetch: we have no answer for it, and saying nothing would look healthy.
+    it("admits it does not know when the token has no meter row", () => {
+      const d = autoChipFor(true, undefined, "ready");
+      expect(d.kind === "chip" && d.chip.label).toBe("eligibility unknown");
+    });
+
+    // 🔴 The F1 contradiction. The toggle says pooled and the status says not pooled —
+    // two independently-fetched sources disagreeing about one token, which a slow
+    // /me/rate-limits after a fast /me/secrets reproduces against a real server.
+    // Rendering it puts a checked box beside "not in pool".
+    it("suppresses the chip when the toggle and the status contradict each other", () => {
+      expect(autoChipFor(true, "not_pooled", "ready").kind).toBe("hidden");
+    });
+
+    it("shows the server's answer when the two agree", () => {
+      const d = autoChipFor(true, "no_reading", "ready");
+      expect(d.kind === "chip" && d.chip.label).toBe("never polled");
+    });
   });
 
   // The server deploys separately, so a newer API can send a status this bundle

@@ -176,13 +176,19 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 		grp := &users[len(users)-1]
-		// The pool flag + live status ride the admin view too (PRD #111 M2). Not
-		// optional: this is the same DTO the self view uses, so leaving them zero
-		// would report every token as un-pooled with an empty status — a uniform,
-		// confident, wrong answer, which is worse than an absent field. AutoEligible
-		// is pgtype.Bool here because the admin query LEFT JOINs user_secrets; the
-		// token-less row is skipped above, so .Bool is the real value by the time it
-		// is read.
+		// The pool flag + live status ride the admin view too (PRD #111 M2). NOTHING
+		// RENDERS THEM TODAY — the admin page reads neither field — so this is an API
+		// contract choice, not a rendering requirement, and an earlier version of this
+		// comment overstated it. The reason it is still right: this is the SAME DTO the
+		// self view uses, so leaving them zero would put `auto_eligible: false` and an
+		// empty status on the wire for every token in the factory. A field that is
+		// absent is honest; a field that is present and uniformly wrong is what a
+		// future admin surface would build on. Widening that surface is PRD #104 M5's
+		// job, not this PRD's.
+		//
+		// AutoEligible is pgtype.Bool here because the admin query LEFT JOINs
+		// user_secrets; the token-less row is skipped above, so .Bool is the real value
+		// by the time it is read.
 		grp.Tokens = append(grp.Tokens, apitypes.TokenRateLimitDTO{
 			SecretID:     uuid.UUID(u.UserSecretID.Bytes).String(),
 			Label:        u.Label.String,
