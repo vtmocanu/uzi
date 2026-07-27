@@ -76,4 +76,4 @@ The counters behind all of this live in the api process, not in the database. **
 
 Two costs worth knowing before you read a graph and wonder: a rejected oversize batch now performs one indexed run lookup where it previously touched the database not at all (that is how an oversize loop stays visible at all), and an auto-stopped run's `looping` flag is **erased** when it goes terminal — every terminal path clears run health. The log lines above and this page are the only durable record of why a run carries `stop_kind=auto_stopped`.
 
-Related: [Run health](run-health.md) · [Configuration](configuration.md) · [CLI](cli.md)
+Related: [Run health](run-health.md) · [Paused on a usage limit](run-limit-wait.md) · [Configuration](configuration.md) · [CLI](cli.md)
