@@ -36,16 +36,31 @@ const maxSelfReportedBytes = 64
 const maxAdvertisedConcurrentRuns = 256
 
 // sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
-// control characters (so no terminal escapes reach a log or the UI), and truncate
-// to max bytes (the length check runs after each whole rune is written, so it
-// never splits a multi-byte rune — the cap is max..max+3 bytes). It sanitizes
-// rather than rejects — these fields are observability, and a register must never
-// fail over cosmetic input (it would wedge the worker's retry loop).
+// control AND format characters (so no terminal escape and no bidi override reaches
+// a log, a terminal or the UI), and truncate to max bytes (the length check runs
+// after each whole rune is written, so it never splits a multi-byte rune — the cap
+// is max..max+3 bytes). It sanitizes rather than rejects — these fields are
+// observability, and a register must never fail over cosmetic input (it would wedge
+// the worker's retry loop).
+//
+// The Cf half is issue #124 at the SOURCE, and this function is where its headline
+// case lands: it carries a review recommendation's `Target` (judge_worker.go:369),
+// which is a FILENAME. Cc and Cf are disjoint categories, so IsControl alone never
+// saw U+202E — meaning a judge could persist a target that visually names a
+// different file than the one it points at, and every reader downstream (web, CLI,
+// TUI) inherited it. The predicate now matches sanitizeTTY (api/cmd/uzi/run.go:524)
+// and hasUnsafeChar (workersvc/agent_selection.go:236); those two and this are the
+// codebase's one answer to "unsafe in untrusted display text".
+//
+// NO whitespace exception here, deliberately, and that is the difference from
+// sanitizeReviewText (judge_worker.go:381) rather than an oversight: these are
+// single-line identifiers — a worker version, a pod phase, a target — where a
+// newline is already something to drop.
 func sanitizeSelfReported(s string, max int) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
 			continue
 		}
 		b.WriteRune(r)

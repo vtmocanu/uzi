@@ -375,14 +375,33 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 }
 
 // sanitizeReviewText bounds an untrusted multi-line markdown field: trim, cap to max
-// bytes, and drop control characters EXCEPT newline and tab (so the markdown structure
-// survives while terminal escapes do not). The byte check runs after each whole rune
-// is written, so it never splits a multi-byte rune.
+// bytes, and drop control AND format characters EXCEPT newline and tab (so the markdown
+// structure survives while terminal escapes and bidi overrides do not). The byte check
+// runs after each whole rune is written, so it never splits a multi-byte rune.
+//
+// The Cf half is issue #124 at the SOURCE. Cc and Cf are disjoint, so IsControl alone
+// never saw U+202E RIGHT-TO-LEFT OVERRIDE and the zero-width family — and judge output
+// is LLM-derived text influenced by whatever the run looked at, so an approving sentence
+// could be made to render inside a rejecting review. Trojan Source (CVE-2021-42574) in
+// the review surface. Same predicate as sanitizeTTY (api/cmd/uzi/run.go:524), which has
+// long applied it on the CLI's own render path, and as the single-line
+// sanitizeSelfReported (handler/worker_protocol.go:44).
+//
+// THE \n / \t EXCEPTION IS KEPT, and it is the whole reason this stays a separate
+// function from sanitizeSelfReported: this sink is `whitespace-pre-wrap` markdown, so
+// dropping them would reflow every multi-line review. sanitizeTTY makes the same
+// exception for the same reason.
+//
+// ACCEPTED COST, stated rather than discovered later: Cf includes U+200D ZERO WIDTH
+// JOINER, so an emoji family sequence in judge prose degrades into its component emoji
+// — at rest, irreversibly, for rows written from here on. Existing rows are untouched.
+// The alternative is letting a bidi override persist so a review can lie about which
+// file it names, which is worse, and this is already what the CLI has shipped.
 func sanitizeReviewText(s string, max int) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+		if (unicode.IsControl(r) || unicode.In(r, unicode.Cf)) && r != '\n' && r != '\t' {
 			continue
 		}
 		b.WriteRune(r)
