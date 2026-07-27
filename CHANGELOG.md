@@ -61,6 +61,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   a worker the cluster keeps reporting as stuck keeps its badge until the pod recovers
   (issue #151). See [docs/worker-upgrades.md](docs/worker-upgrades.md).
 
+- **A self-improve check could outlive its 15-minute cap and orphan a process.** The
+  wall-clock cap was enforced by `execFile`'s own `timeout`, which kills from the worker
+  uid, and under the runner-uid split that is `EPERM` against a process running as
+  `runner`. Measured: a 2-second cap called back at 2008ms carrying `EPERM` while the
+  runner's `sleep 120` was still alive six seconds later. Checks now run as a detached
+  process group that is killed as a group (issue #153).
+
+- **A check no longer runs against dependencies its own install failed to build.** The
+  `node_modules` pre-flight treated a surviving directory as "deps ready", but a failed
+  `npm ci` leaves the previous tree intact with the new dependency absent, so the install
+  failed, the directory remained, the pre-flight passed, and the check reported a
+  real-looking failure that was really a stale tree. The signal is now the gap between
+  what the manifest declares and what the tree contains (issue #154).
+
 - **The `/nix` guidance stopped flickering out of the upgrade detail strip.** A fast-failing
   `seed-nix` init container alternates between `CrashLoopBackOff` and `Error` as kubelet
   cycles it (a measured 71/29 split), and the explanation was gated on the first reason
