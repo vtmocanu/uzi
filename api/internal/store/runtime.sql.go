@@ -2575,7 +2575,10 @@ WITH prev AS (
        -- the anchor, so diagnostics-without-anchor could not arise. That coupling is
        -- not a property either statement states, and the moment a terminal report
        -- carries a diagnostic the narrow guard skips the clear silently. Widened so
-       -- the clear does not depend on the other query's phase behaviour.
+       -- the clear does not depend on the other query's phase behaviour. The live-DB
+       -- test CONSTRUCTS that row (diagnostics present, anchor forced NULL) rather
+       -- than waiting for it to become reachable, so the guard is pinned by a test
+       -- instead of by the coupling.
        AND (r.upgrading_since IS NOT NULL
             OR r.blocking_container IS NOT NULL
             OR r.blocking_reason IS NOT NULL

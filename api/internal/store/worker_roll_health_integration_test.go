@@ -267,6 +267,12 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 // a row that was never observed, so per-column COALESCE is not the fix and the control
 // below (a report carrying only a reason) is what separates the two.
 //
+// THE PHASE IS THE DISCRIMINATOR, not "the report carries nothing", and the `rolling`
+// case below is what separates THOSE two. A `rolling` report with no diagnostics is a
+// measurement — the pod-less Recreate gap looked and had nothing to blame — so it must
+// blank. Preserving there leaks the previous roll's reason into rollingDetail, which
+// reads BlockingReason first, and out through upgrade_detail, which is ungated.
+//
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
 // e2e/run-store-it.sh.
 func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
@@ -325,9 +331,12 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 		return fmt.Sprintf("container=%s reason=%s restarts=%d exit=%s", s(d.container), s(d.reason), d.restarts, e)
 	}
 	// report builds an upsert carrying an explicit diagnostic block, the shape the
-	// controller sends for a pod it could blame a container for.
+	// controller sends for a pod it could blame a container for. PhaseSince is stamped
+	// from the same instant so the test can prove a report LANDED, not merely that the
+	// diagnostics survived it.
 	report := func(phase string, at time.Time, container, reason string, restarts int32, exit *int32) store.UpsertWorkerRollHealthParams {
 		p := rollReport(workerID, phase, at)
+		p.PhaseSince = ts(at)
 		p.BlockingContainer = pgtype.Text{String: container, Valid: container != ""}
 		p.BlockingReason = pgtype.Text{String: reason, Valid: reason != ""}
 		p.RestartCount = restarts
@@ -335,6 +344,17 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 			p.LastExitCode = pgtype.Int4{Int32: *exit, Valid: true}
 		}
 		return p
+	}
+	// readLanded returns the fields a report ALWAYS writes, whatever its phase. If a
+	// preservation assertion passes while these did not move, the settled report was
+	// rejected outright and the test proved nothing about preservation.
+	readLanded := func(what string) (phase string, observedAt, phaseSince time.Time) {
+		if err := pool.QueryRow(ctx,
+			`SELECT phase, observed_at, phase_since FROM worker_upgrade_reports WHERE worker_id = $1`, workerID).
+			Scan(&phase, &observedAt, &phaseSince); err != nil {
+			t.Fatalf("read landed fields (%s): %v", what, err)
+		}
+		return phase, observedAt, phaseSince
 	}
 
 	t0 := time.Now().UTC().Truncate(time.Second)
@@ -355,8 +375,18 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 	// This is the exact param set the controller produces for a Ready pod — no
 	// container, no reason, restart_count 0, no exit code — because the settled arm
 	// returns before the blocking-container lookup runs.
-	if _, err := q.UpsertWorkerRollHealth(ctx, report("settled", t0.Add(time.Minute), "", "", 0, nil)); err != nil {
+	settledAt := t0.Add(time.Minute)
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("settled", settledAt, "", "", 0, nil)); err != nil {
 		t.Fatalf("upsert the settled report: %v", err)
+	}
+	// The settled report LANDED. Without this the preservation assertion below is also
+	// satisfied by an upsert that rejected the row entirely, which would be a different
+	// bug wearing this one's green.
+	if phase, observed, since := readLanded("after the settled report"); phase != "settled" ||
+		!observed.Equal(settledAt) || !since.Equal(settledAt) {
+		t.Errorf("the settled report did not land: phase=%q observed_at=%v phase_since=%v, want settled/%v/%v. "+
+			"The diagnostics assertion below cannot distinguish 'preserved' from 'the whole report was rejected' "+
+			"on its own.", phase, observed, since, settledAt, settledAt)
 	}
 	if got := readDiag("after the settled report"); got.container == nil || *got.container != "agent" ||
 		got.reason == nil || *got.reason != "CrashLoopBackOff" || got.restarts != 5 ||
@@ -394,6 +424,10 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 	// container name and exit code must go, or the row names a container that no longer
 	// exists beside a reason about a pod that never started. Per-column COALESCE keeps
 	// them and is why this is a CASE over the whole block.
+	//
+	// `FailedCreate` is an EXAMPLE, not a constant. rollhealth.go carries whatever reason
+	// the ReplicaFailure condition holds ("Nothing here hardcodes FailedCreate"), so this
+	// fixture must not be read as pinning that string.
 	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(3*time.Minute), "", "FailedCreate", 0, nil)); err != nil {
 		t.Fatalf("upsert the pod-less report: %v", err)
 	}
@@ -404,18 +438,54 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 			"container name beside a fresh reason describes a row that was never observed.", show(got))
 	}
 
+	// ---- THE DISCRIMINATING CASE: a `rolling` report with NOTHING must BLANK. ----
+	//
+	// This is what separates "the phase decides" from the tempting "the report carries
+	// nothing" rule, which fixes the headline symptom and passes every assertion above.
+	//
+	// deriveRollHealth has two branches that return `rolling` carrying no diagnostics
+	// at all: the pod-less Recreate gap (measured ~1.4s, on EVERY release) and the
+	// stale-pod-only branch. Both LOOKED and had nothing to blame, so both are
+	// measurements. Preserve there and a healthy mid-roll worker inherits the previous
+	// roll's reason — and rollingDetail reads BlockingReason FIRST, so R2's
+	// upgrade_detail reads "CrashLoopBackOff" for a worker that is fine. That string is
+	// not gated the way the three blocking_* DTO fields are: it is the badge's own
+	// title attribute, so it renders.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(4*time.Minute), "agent", "CrashLoopBackOff", 5, &exit1)); err != nil {
+		t.Fatalf("re-arm before the rolling check: %v", err)
+	}
+	if got := readDiag("armed for the rolling check"); got.reason == nil {
+		t.Fatalf("precondition: diagnostics must be present before testing that `rolling` blanks them")
+	}
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("rolling", t0.Add(5*time.Minute), "", "", 0, nil)); err != nil {
+		t.Fatalf("upsert the pod-less rolling report: %v", err)
+	}
+	if got := readDiag("after a diagnostic-free `rolling` report"); got.container != nil || got.reason != nil ||
+		got.restarts != 0 || got.exitCode != nil {
+		t.Errorf("a `rolling` report carrying no diagnostics did not blank them: %s. Unlike `settled`, a "+
+			"rolling report DID run the blocking-container lookup and found nothing to blame — that is an "+
+			"observation, not a gap. Preserving here carries the previous roll's reason into a healthy "+
+			"Recreate gap, and rollingDetail reads BlockingReason first, so the badge's title would say "+
+			"CrashLoopBackOff for a worker that is fine.", show(got))
+	}
+
 	// ---- THE CLEAR, half one: a register at an UNCHANGED version keeps them. ----
 	//
 	// Same rule the INV-5 anchor holds: a register is evidence the pod came back, only a
 	// version MOVE is evidence the roll completed. A crash-looping agent re-registers on
 	// every start, so clearing on any register would wipe the diagnostics of exactly the
 	// worker whose diagnostics are worth reading, several times a minute.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(6*time.Minute), "seed-nix", "CreateContainerConfigError", 4, &exit137)); err != nil {
+		t.Fatalf("re-arm before the register checks: %v", err)
+	}
 	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
 		ID: workerID, Version: pgtype.Text{String: "0.11.0", Valid: true},
 	}); err != nil {
 		t.Fatalf("register at the same version: %v", err)
 	}
-	if got := readDiag("after a register at the same version"); got.reason == nil || *got.reason != "FailedCreate" {
+	if got := readDiag("after a register at the same version"); got.container == nil ||
+		*got.container != "seed-nix" || got.reason == nil || *got.reason != "CreateContainerConfigError" ||
+		got.restarts != 4 {
 		t.Errorf("registering at an UNCHANGED version cleared the diagnostics: %s. A crash-looping "+
 			"agent re-registers on every start, so this would blank the row of the worst-off worker in "+
 			"the fleet on a loop.", show(got))
@@ -436,6 +506,40 @@ func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
 		t.Errorf("a version move left the diagnostics behind: %s. They describe a pod that no longer "+
 			"exists; carrying them into the next release is how a fixed worker keeps looking broken.",
 			show(got))
+	}
+
+	// ---- THE GUARD: diagnostics with a NULL anchor still clear on a version move. ----
+	//
+	// The `cleared` CTE used to be guarded by `upgrading_since IS NOT NULL` alone. That
+	// was equivalent only by a coupling neither statement states: a report carrying
+	// diagnostics is `rolling` or `stuck`, and a non-terminal report always stamps the
+	// anchor, so a diagnostics-without-anchor row could not arise. It is therefore not
+	// reachable through the public API today, and CONSTRUCTING it is the point — the
+	// widened guard is pinned by a test rather than by that coupling, which commit 2
+	// is in a position to break the moment a terminal report carries a diagnostic.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(20*time.Minute), "agent", "CrashLoopBackOff", 9, &exit1)); err != nil {
+		t.Fatalf("populate before forcing the anchor NULL: %v", err)
+	}
+	mustExec(ctx, t, pool, `UPDATE worker_upgrade_reports SET upgrading_since = NULL WHERE worker_id = $1`, workerID)
+	var anchor *time.Time
+	if err := pool.QueryRow(ctx, `SELECT upgrading_since FROM worker_upgrade_reports WHERE worker_id = $1`, workerID).
+		Scan(&anchor); err != nil {
+		t.Fatalf("read the forced anchor: %v", err)
+	}
+	if anchor != nil {
+		t.Fatalf("precondition: the anchor must be NULL for this case, got %v", anchor)
+	}
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: workerID, Version: pgtype.Text{String: "0.11.8", Valid: true},
+	}); err != nil {
+		t.Fatalf("register a move against a NULL anchor: %v", err)
+	}
+	if got := readDiag("version move with a NULL anchor"); got.container != nil || got.reason != nil ||
+		got.restarts != 0 || got.exitCode != nil {
+		t.Errorf("a version move left the diagnostics behind on a row whose anchor was already NULL: %s. "+
+			"The clear's guard must ask whether there is anything to clear, not whether the INV-5 anchor "+
+			"happens to be set — otherwise the diagnostics clear silently depends on the upsert's phase "+
+			"behaviour rather than on the version move.", show(got))
 	}
 
 	// ---- And the clear is not a one-shot: the next incident records again. ----

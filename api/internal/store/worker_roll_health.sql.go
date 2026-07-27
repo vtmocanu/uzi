@@ -195,55 +195,73 @@ ON CONFLICT (worker_id) DO UPDATE SET
     -- ================= THE DIAGNOSTIC BLOCK: ALL FOUR, OR NONE =================
     -- A REPORT MUST NOT BLANK FIELDS IT DID NOT MEASURE (issue #145).
     --
-    -- deriveRollHealth returns ` + "`" + `settled` + "`" + ` the instant the pod's Ready condition is
-    -- True, BEFORE the blocking-container lookup — so a settled report carries the
-    -- ZERO of every field here (no container, no reason, restart_count 0, no exit
-    -- code) rather than an observation that they are absent. Written as bare
-    -- EXCLUDED.*, as these four arms used to be, that erased the real diagnostics: a
-    -- worker with 5 restarts and exit 1 persisted as pristine, at exactly the moment
-    -- somebody was reading the row to debug it. ` + "`" + `phase` + "`" + ` and ` + "`" + `pod_phase` + "`" + ` above are NOT
-    -- in this block because a settled report genuinely measures both.
+    -- THE PHASE IS THE DISCRIMINATOR, because the phase is what decides whether the
+    -- controller ran the measurement at all. deriveRollHealth returns ` + "`" + `settled` + "`" + ` the
+    -- instant the pod's Ready condition is True, BEFORE the blocking-container lookup,
+    -- so a settled report carries the ZERO of every field here (no container, no
+    -- reason, restart_count 0, no exit code) — it never looked. Every ` + "`" + `rolling` + "`" + ` or
+    -- ` + "`" + `stuck` + "`" + ` report DID look, so whatever it carries, zeros included, is an
+    -- observation and must land. Written as bare EXCLUDED.*, as these four arms used
+    -- to be, the settled zeros erased the real diagnostics: a worker with 5 restarts
+    -- and exit 1 persisted as pristine, at exactly the moment somebody was reading the
+    -- row to debug it. ` + "`" + `phase` + "`" + ` and ` + "`" + `pod_phase` + "`" + ` above are NOT in this block because a
+    -- settled report genuinely measures both.
     --
-    -- THE FOUR MOVE TOGETHER, and that is why this is a CASE over the block rather
-    -- than a COALESCE per column. deriveRollHealth fills all four from ONE container
-    -- status, or leaves all four zero. Per-column preservation would pair a fresh
+    -- "THE REPORT CARRIES NOTHING" IS THE WRONG PREDICATE, and it is the tempting one
+    -- — it needs no knowledge of the controller and it fixes the headline symptom.
+    -- It conflates "never looked" with "looked and found nothing to blame", and only
+    -- the phase separates those. Two deriveRollHealth branches return ` + "`" + `rolling` + "`" + ` with
+    -- no diagnostics at all (the pod-less Recreate gap, and the stale-pod-only
+    -- branch); preserving there would carry the PREVIOUS roll's reason into a healthy
+    -- mid-Recreate tick, and rollingDetail (upgrade.go) reads BlockingReason FIRST, so
+    -- R2's upgrade_detail would read "CrashLoopBackOff" for a worker that is fine.
+    -- That string is NOT gated the way the three blocking_* DTO fields are — it is the
+    -- badge's own title attribute (WorkerUpgradeBadge.tsx) — so it renders.
+    --
+    -- THE FOUR MOVE TOGETHER, which is why this is a CASE over the block rather than a
+    -- COALESCE per column. deriveRollHealth fills all four from ONE container status,
+    -- or leaves all four zero. Per-column preservation would pair a fresh
     -- restart_count with a stale blocking_container and describe a row that was never
     -- observed — most visibly on the pod-less ReplicaFailure branch, which reports a
-    -- reason with no container at all and must therefore clear the last pod's name.
-    -- The predicate is repeated verbatim in each arm and MUST STAY IDENTICAL: that
-    -- identity is the atomicity, so changing one arm alone silently ends it.
+    -- reason with NO container and must therefore clear the last pod's name. The
+    -- predicate is repeated verbatim in each arm and MUST STAY IDENTICAL: that
+    -- identity is the atomicity, so changing one arm alone silently ends it. It is
+    -- deliberately the same ` + "`" + `IN ('rolling', 'stuck')` + "`" + ` set the anchor arm below uses.
+    --
+    -- A uniform COALESCE would ALSO have been a silent no-op on restart_count, which
+    -- is ` + "`" + `integer NOT NULL DEFAULT 0` + "`" + ` (migration 00083) and arrives as @restart_count,
+    -- not sqlc.narg — so EXCLUDED.restart_count is never NULL and half the issue's own
+    -- symptom ("5 restarts AND exit 1") would have survived the fix.
+    --
+    -- THIS IS DATA INTEGRITY, NOT A CONTROL AGAINST A LYING CONTROLLER, and the
+    -- distinction belongs in the file whose header enumerates three real security
+    -- properties. The wipe lever is unchanged and intentionally so: a controller that
+    -- reports ` + "`" + `stuck` + "`" + ` or ` + "`" + `rolling` + "`" + ` with empty diagnostics still writes zeros here,
+    -- because those phases assert that the lookup ran. What is fixed is an HONEST
+    -- controller destroying its own earlier measurement.
     --
     -- NO CLEAR HERE, for the same reason upgrading_since has none below: a clear the
     -- controller can trigger by reporting hands the reset to the reporting party. The
     -- ONLY clear is the worker's own authenticated re-registration moving
     -- workers.version — RegisterWorker in runtime.sql, one statement, one round trip.
     --
-    -- Preserving these under ` + "`" + `settled` + "`" + ` changes no CLASSIFICATION: they reach
-    -- ClassifyUpgrade only through stuckDetail (R1, phase=stuck) and rollingDetail
-    -- (R2, phase=rolling), and workerDTOFromRow surfaces them only when the status is
-    -- upgrade_failed. This is a data-integrity fix on a display-only table.
-    blocking_container     = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
-                                    OR EXCLUDED.blocking_reason IS NOT NULL
-                                    OR EXCLUDED.restart_count <> 0
-                                    OR EXCLUDED.last_exit_code IS NOT NULL
+    -- CHANGES NO RENDERED OUTPUT TODAY, so do not look for a UI difference to verify
+    -- it — the live-DB test is the evidence. The preserved values are reachable only
+    -- on a ` + "`" + `settled` + "`" + ` row, and workerDTOFromRow nulls the three blocking_* fields
+    -- unless the status is upgrade_failed (which requires phase=stuck), while R1/R2's
+    -- detail strings require phase stuck/rolling, where EXCLUDED wins anyway. Commit 2
+    -- is what makes them displayable; the detail string it feeds must then not present
+    -- a pinned older observation as a current one.
+    blocking_container     = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.blocking_container
                                   ELSE worker_upgrade_reports.blocking_container END,
-    blocking_reason        = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
-                                    OR EXCLUDED.blocking_reason IS NOT NULL
-                                    OR EXCLUDED.restart_count <> 0
-                                    OR EXCLUDED.last_exit_code IS NOT NULL
+    blocking_reason        = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.blocking_reason
                                   ELSE worker_upgrade_reports.blocking_reason END,
-    restart_count          = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
-                                    OR EXCLUDED.blocking_reason IS NOT NULL
-                                    OR EXCLUDED.restart_count <> 0
-                                    OR EXCLUDED.last_exit_code IS NOT NULL
+    restart_count          = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.restart_count
                                   ELSE worker_upgrade_reports.restart_count END,
-    last_exit_code         = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
-                                    OR EXCLUDED.blocking_reason IS NOT NULL
-                                    OR EXCLUDED.restart_count <> 0
-                                    OR EXCLUDED.last_exit_code IS NOT NULL
+    last_exit_code         = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.last_exit_code
                                   ELSE worker_upgrade_reports.last_exit_code END,
     controller_reported_at = EXCLUDED.controller_reported_at,
