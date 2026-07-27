@@ -525,6 +525,10 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 
 Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/121-clone-js-deps-provision.md`.
 
+**Ratified [user 2026-07-27].** Derived by the team during implementation and put to the
+owner, rather than stated up front: the original trust-posture premise was found false
+during the work, and the constraint below is what replaced it.
+
 - A run's dependency install must never execute code the cloned repo authored: it
   runs pre-approval, so it has to clear the same bar as `repo_devbox_opt_in` (per-repo
   opt-in, default OFF, a repo's devbox scripts never executed).
