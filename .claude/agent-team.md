@@ -457,6 +457,28 @@ before SENDING, not before COMPOSING** — three of five crossings on PRD #108 w
 a lead verifying at SHA `N`, writing a long dispatch, and sending it after the
 worker reached `N+1`.
 
+**And when the send is a RE-SEND, name the tip you verified against and what you saw**
+— *"verified before sending: tip `X`, clean tree, no `Y` started."* That is the
+recipient-side half, and it is a different mechanism from the rule above, aimed at a
+different moment: verify-before-sending tries to PREVENT the crossing, this makes a
+crossing **cheap when it happens anyway**. Both are needed, because the sender-side rule
+demonstrably does not eliminate the problem. Measured on PRD #102: **five of the coder's
+last six messages crossed one of the lead's**, with the lead following the
+verify-before-sending rule throughout — the gap between verifying and sending is not zero
+when the dispatch is long, and a long dispatch is exactly when it matters.
+
+Every one of those five resolved the same way: the recipient re-derived against HEAD and
+answered "already done, tip `Z`". That works, and it costs a full round-trip each time. A
+named tip converts an ambiguous re-dispatch into a **checkable claim** — one `git rev-parse`
+tells the recipient whether the message is stale or new, with no round-trip at all.
+
+**The asymmetry is what makes it worth stating rather than leaving to judgement: a recycled
+or cold-started agent CANNOT tell a re-dispatch from new scope.** It has no memory of the
+first send. To it, an instruction to do work it already did is indistinguishable from an
+instruction to do work it has not started, and the only thing that separates them is the
+tip the sender claims to have seen. (The same run had the mirror case: a `TaskUpdate`
+setting `owner` on a completed task woke the idle agent and read as new scope. Same fix.)
+
 Two lead-side failures worth naming because neither is a stale-read:
 - **Asserting a completed action from having INSTRUCTED it.** The lead told a
   validator "the coder restaged the outage test" — it had only told the coder to.
