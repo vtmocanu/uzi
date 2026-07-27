@@ -875,7 +875,23 @@ describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
   // does nothing to an RLO, which reorders the text AROUND it and can make a worker
   // render as one it is not — the F12 hazard closed for labels, left open for names.
   //
-  // MUTATION THIS CATCHES: dropping sanitizeLabel from the name span. Measured.
+  // MUTATION THIS CATCHES: dropping the strip from the name span. Measured — reverting
+  // it to a bare `{w.name}` reddens exactly this one test, and nothing else.
+  //
+  // The HELPER is stripUnsafeChars, not sanitizeLabel, and this line said the latter
+  // until main's issue #124 work and this branch met in a merge. Both close the same
+  // hazard on the same cell; stripUnsafeChars is the superset (Cc+Cf, sparing \n and
+  // \t) where sanitizeLabel is Cf-only by design, because sanitizeLabel mirrors the Go
+  // validateSecretLabel predicate for TOKEN LABELS and a name has no validator to
+  // mirror. The fixture below plants a bidi override, which both strip, so the fixture
+  // cannot tell them apart — the reason to prefer the superset is the bare ESC a name
+  // can also carry, which only stripUnsafeChars removes.
+  //
+  // The join-token echo below still calls sanitizeLabel, so the two name cells in this
+  // file now disagree about the helper. Left as-is deliberately in the merge that
+  // caused it — the echo was not part of the conflict — and recorded here rather than
+  // fixed silently, because the argument above applies to it too.
+  //
   // The join-token echo. LOW severity and fixed anyway: the name here is the one the
   // user typed seconds ago in the same session, so a user can only spoof their own
   // immediate echo — no cross-tenant path, nothing stored-then-surprising, unlike the
