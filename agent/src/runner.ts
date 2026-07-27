@@ -7,7 +7,14 @@ import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
-import type { AgentSelection, AgentSource, AgentTemplate, ClaimResponse, StateRequest } from "./protocol.js";
+import type {
+  AgentSelection,
+  AgentSource,
+  AgentTemplate,
+  ClaimResponse,
+  StateAck,
+  StateRequest,
+} from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
 import {
   describeRepoAgentNote,
@@ -181,7 +188,11 @@ export class RunRunner {
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
     let observedSessionId: string | undefined;
-    const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): Promise<void> =>
+    // Returns the server's acknowledgement (PRD #35), which every caller here still
+    // ignores. Widened from Promise<void> so the park branch can read it without
+    // re-plumbing this closure; the annotation is the only change, and awaiting a
+    // value nobody binds behaves exactly as before.
+    const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): ReturnType<WorkerClient["reportState"]> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
 
     // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
@@ -605,7 +616,9 @@ export class RunRunner {
     planMd: string,
     batcher: MessageBatcher,
     steering: SteeringChannel,
-    reportState: (body: StateRequest) => Promise<void>,
+    // Ignored by the gate, but typed to match the client (PRD #35): a gate that
+    // narrowed the return would make the park branch unable to reuse this closure.
+    reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],

@@ -753,6 +753,40 @@ export interface StateRequest {
   rate_limit_type?: string;
 }
 
+/**
+ * What the server answered a state report with (PRD #35's park acknowledgement
+ * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
+ * REAL status has always been on the wire; `reportState` used to discard it.
+ *
+ * 🔴 THE PARK DECISION KEYS ON `status`, NEVER ON `applied`. A caller deciding
+ * whether to preserve on-disk state must test `status === "limit_wait"` positively.
+ * `applied` is diagnostics only, and using it here is a trap with a live failure
+ * mode: "not parked" has five causes, and on THREE of them — the retry budget
+ * exhausted, the RUN_LIMIT_MAX_PARK clamp exceeded, and the `wait_on_limit=false`
+ * coercion — the server *fails the run and answers 200*, so `applied` is **true**.
+ * Those three are the designed terminal paths for a run that keeps hitting limits,
+ * i.e. the exact population this feature serves, so an `applied`-keyed branch leaks
+ * the clone, the plugin dir and up to ~170 MB of run HOME on the most common cause
+ * of all.
+ *
+ * Testing one literal positively is also why there is no enumeration of the five
+ * causes: the default arm becomes "the run is not parked", so an unforeseen cause, a
+ * future status, an older server and a parse failure all land on the safe side by
+ * construction. An enumeration would go stale; this cannot.
+ */
+export interface StateAck {
+  /** Whether the server applied the transition. Diagnostics and logging only —
+   *  see the warning above before branching on it. */
+  applied: boolean;
+  /** The run's authoritative status after the report, as the server reported it.
+   *  A plain string, NOT `RunState`: `RunState` is what a worker may REPORT, while
+   *  this is any status a run may hold ("queued", "cancelled", …).
+   *  `undefined` when the server's answer carried no readable status — an older
+   *  server, an unparseable body, or a 4xx recognised as already-terminal by its
+   *  text. Undefined must always be treated as "not parked". */
+  status?: string;
+}
+
 export interface UserInput {
   id: number;
   kind: InputKind;
