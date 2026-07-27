@@ -210,6 +210,52 @@ this PRD supersedes that stance for sustained limits.
      The clamp is server-side because a compromised worker must not park a run for
      years.
 
+     **↳M2 RULING (2026-07-27) — the exponential form STANDS; the shipped flat 15m
+     constant (`workersvc/limitwait.go`, `limitParkFallback`) is a regression and is to
+     be changed.** The coder flagged the constant honestly and its supporting finding is
+     CORRECT and must survive the fix: the classifier's primary signal is
+     `terminal_reason`, which names the cause and **carries no timestamp**, so a limit
+     death with no reset is an ordinary outcome rather than a malformed report. The
+     conclusion drawn from it is backwards — that finding establishes the unknown-reset
+     path is **common**, which argues for *more* coverage, not less.
+
+     **The decisive argument, which neither the constant nor the escalation made: an
+     exponential schedule's error is recoverable in one direction and fatal in the
+     other, and it errs on the recoverable side.** If the window actually reopened
+     early, the first resume succeeds and the schedule never advances — the pessimism
+     costs nothing. If the window is genuinely long, the schedule buys the hours the run
+     needs. A flat constant inverts exactly that: it costs nothing when the guess was
+     pessimistic and **kills the run** when it was optimistic. At
+     `RUN_LIMIT_MAX_WAITS=5`, flat 15m spends the whole budget in **75 minutes**, while
+     `15/30/60/120/240` spans **7h45m** — and the five-hour window is this PRD's
+     headline case, so the flat form fails precisely the run the PRD exists to save,
+     burning five clone-and-resume cycles doing it.
+
+     **Exposure is narrower than Decision 4 assumed, but not narrow.** Steps 1-3 of the
+     computation (worker reset → dead-credential gauge cross-check → `NextAvailable`)
+     supply a base in most cases, so the fallback is reached only when all three are
+     silent. That is the standing state for **any deployment with the usage poller
+     disabled** (`UZI_USAGE_POLL_INTERVAL=0`): nothing refreshes `synced_at`, every
+     candidate classifies `stale`, `Measured` is false, and neither the cross-check nor
+     `NextAvailable` can contribute. Combined with the coder's own `terminal_reason`
+     finding, that is a whole class of deployment for which the fallback is the **usual**
+     path rather than the corner. *(Consequence worth knowing: the e2e overlay sets
+     `UZI_USAGE_POLL_INTERVAL=0`, so M6 exercises this branch by construction.)*
+
+     🔴 **Implement the exponent against the VARIABLE, not against this prose.**
+     `limitParkInput.LimitWaitCount` is *"how many times this run has ALREADY parked"*
+     and the budget guard reads `LimitWaitCount >= MaxWaits`, so it is **0 on the first
+     park**. The `2^(n−1)` above is written for a 1-based attempt number; applied
+     literally to that field it yields **7.5 minutes** on the first park. The correct
+     form is `15m << LimitWaitCount`, capped at 4h. *(The cap does not bind at the
+     default budget — the fifth park is exactly 4h — so it guards an operator who raises
+     `RUN_LIMIT_MAX_WAITS`, rather than constraining anything at 5.)*
+
+     What the coder got right and must be kept: the base stays **15 minutes** and stays a
+     **constant rather than an env knob** — it is the answer to "we know nothing", and an
+     operator with something to say has `RUN_LIMIT_MAX_WAITS` and `RUN_LIMIT_MAX_PARK` to
+     say it with. Only the schedule changes.
+
      **↳M0 — the jitter is the MECHANISM, not a garnish, and it must not be
      "simplified" away.** Decision 6e makes promotion pool-aware, which manufactures a
      correlated **wave**: N runs parked against one exhausted credential all become
@@ -1063,6 +1109,41 @@ this PRD supersedes that stance for sustained limits.
   **The milestone graph is unchanged** — none of the four rulings moves a file
   between lanes; (b) lands in the agent lane and the seam, (a)/(c)/(d) in the api
   lane, and the M4 constraints remove a collision rather than creating one.
+- 2026-07-27 — **M2 divergence ruled: the exponential fallback stands; the shipped
+  flat 15m constant is a regression.** `workersvc/limitwait.go`'s `limitParkFallback`
+  replaced Decision 4's `15m × 2^(limit_wait_count−1)` with a flat 15 minutes. It was
+  flagged honestly by the coder as "a constant nobody specified" and endorsed as filling
+  a gap; it does not fill a gap, it **replaces a specified behaviour** answered in the
+  same Decision being implemented. The coder's supporting finding is right and survives
+  the fix — `terminal_reason` names the cause and carries no timestamp, so an
+  unknown-reset limit death is ordinary rather than malformed — but the conclusion
+  inverts it: that finding makes the unknown path COMMON, which argues for more coverage.
+  **The argument that settles it, made by neither side: an exponential schedule's error
+  is recoverable in one direction and fatal in the other, and it errs on the recoverable
+  side.** Pessimism costs nothing (the first resume succeeds and the schedule never
+  advances); optimism kills the run. Flat 15m spends the whole default budget in 75
+  minutes against a five-hour window — this PRD's headline case. Exposure is narrower
+  than Decision 4 assumed (steps 1-3 usually supply a base) but is the STANDING state
+  for any deployment with the usage poller disabled, where nothing is `Measured` and
+  neither the cross-check nor `NextAvailable` can contribute — and the e2e overlay is
+  one such deployment, so M6 exercises the branch by construction. Implementation trap
+  recorded with the ruling: `LimitWaitCount` is the count BEFORE the increment, so
+  `2^(n−1)` applied literally gives 7.5 minutes on the first park; the correct form is
+  `15m << LimitWaitCount`.
+
+  **Second reported divergence — `plan_approved`'s non-empty-plan requirement — is NOT
+  one, and the spec draft's provenance claim is wrong.** Decision 6b has carried that
+  requirement since M0 rev 2 (`1605b78d`): *"the skip must ALSO require a non-empty
+  `plan_md`, and the PRD's rule does not … the worker's gate is `plan_approved &&
+  claim.plan_md non-empty && session resumable`"*. The code implements exactly that
+  (`sdk-executor.ts`, `planApproved === true && !!sessionId && !!approvedPlan?.trim()`).
+  So `specs/ai.md`'s *"the non-empty-plan requirement the PRD's rule lacked"* describes
+  the behaviour correctly and its **provenance** incorrectly — it reads the original
+  Decision 6b sentence and misses the ↳M0 addendum directly beneath it. Worth correcting
+  rather than letting stand: filed as written it records an implementation-time AI
+  decision where the truth is a documented design ruling, which is exactly the
+  distinction the human/ai spec split exists to keep.
+
 - 2026-07-27 — **Two M1 rulings recorded, in both cases because the CODE disagreed
   with a Decision as written and the code was right.**
 
