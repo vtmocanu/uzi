@@ -117,10 +117,19 @@ ON CONFLICT (worker_id) DO UPDATE SET
     --   * SHARED with upgrading_since: nothing in this statement empties these columns
     --     INDEPENDENTLY of what the report carries. A `settled` report cannot reset
     --     them, which is the forgeability the anchor's own block describes.
-    --   * NOT SHARED: the anchor is unreachable from a report at all, while these four
-    --     are simply WRITTEN by every non-terminal report — zeros included, per the
-    --     bound above. "Only a re-registration can empty this" is therefore true of
-    --     the anchor and FALSE of the diagnostics.
+    --   * NOT SHARED: the anchor is WRITE-ONCE from a report — a non-terminal report may
+    --     stamp it while it is NULL (the INSERT arm above, and the COALESCE below) and
+    --     may never move or clear it afterwards. These four are REWRITTEN by every
+    --     non-terminal report, zeros included, per the bound above. So the contrast is
+    --     repeat-writability and emptying, not reachability, and "only a re-registration
+    --     can empty this" is true of the anchor and FALSE of the diagnostics.
+    --
+    --     (This line used to say the anchor is "unreachable from a report at all",
+    --     which this file contradicts twice — the INSERT's CASE stamps it from a
+    --     report's own phase and observed_at, and the anchor block below says so in
+    --     prose: "non-terminal phase, no anchor yet -> stamp it". The ceiling's ARMING
+    --     is exactly that stamp, so a reader who believed the absolute would hunt for
+    --     the arming elsewhere, or read the COALESCE as an inconsistency to tidy away.)
     --
     -- So what RegisterWorker's version-move clear provides is not exclusivity. It is
     -- the only thing that empties the block WITHOUT a report, which is exactly what a

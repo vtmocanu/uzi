@@ -708,6 +708,23 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 			h.Phase, protocol.PhaseSettled, flapWindow+time.Second)
 	}
 
+	// --- 2b. THE OTHER SIDE OF THE SAME BOUNDARY. Ready, 5 restarts, up 9m59s. ---
+	//
+	// Case 2 ALONE IS VACUOUS and that is not a hypothetical: "up 10m1s -> settled"
+	// passes against an implementation whose guard never fires at all. Only the
+	// DISAGREEMENT between the pair is signal. One second on the other side of
+	// flapWindow, with every other input identical to case 2 — same restart count, same
+	// pod age — so the only thing that can explain a different verdict is the conjunct
+	// under test.
+	stillFlapping := ready(runningFor(workerPod("w2b", want, 4*time.Hour), "worker", 5, flapWindow-time.Second, exit1, false),
+		testNow.Add(-(flapWindow - time.Second)))
+	if h := deriveRollHealth([]corev1.Pod{*stillFlapping}, want, "", testNow); h.Phase == protocol.PhaseSettled {
+		t.Errorf("Phase = %q for a container up %v — one second INSIDE flapWindow, with the same 5 "+
+			"restarts and the same 4h pod age as the settled case above. If both sides of this boundary "+
+			"read the same, the recency conjunct is not being evaluated at all and case 2 proves nothing.",
+			h.Phase, flapWindow-time.Second)
+	}
+
 	// --- 3. Ready, 2 restarts, up 5s. Recency without the count. ---
 	//
 	// One OOM or one node hiccup restarts a container recently. A recency-only rule
@@ -767,6 +784,58 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 	if nh.BlockingReason != "Restarting" {
 		t.Errorf("BlockingReason = %q, want %q — with no termination to quote, the fallback token must "+
 			"still be true of the pod, and \"not ready\" is not", nh.BlockingReason, "Restarting")
+	}
+}
+
+// 🔴 A NON-RUNNING CONTAINER WITH A HIGH RESTART COUNT MUST NOT FLAG. This is the
+// counterfactual for flappingContainer's `State.Running == nil` skip, and it is the
+// normal case on every worker pod rather than an edge.
+//
+// `seed-nix` is a PLAIN init container — no RestartPolicy, so not a native sidecar. It
+// runs once, exits, and stays Terminated for the pod's whole remaining life. Since the
+// rule scans all containers, this loop reads that status on every tick of every pod in
+// the fleet.
+//
+// THE MUTATION THIS TEST EXISTS TO CATCH IS DELETING THE NIL CHECK, not changing the
+// count. With the check gone, an absent Running state reads as a zero StartedAt; the
+// obvious "hardening" of that (`if t.IsZero() { t = now }`) makes it "up 0 seconds",
+// which SATISFIES the recency conjunct — so the container flags forever, with no uptime
+// that could ever clear it because it will never run again.
+//
+// RestartCount is 5 ON PURPOSE. With 0 the container fails the restart conjunct anyway
+// and the case passes identically whether or not the nil check exists — a fixture where
+// broken and correct agree, which proves nothing. 5 is what makes the guard falsifiable.
+//
+// What this test does NOT establish: whether Kubernetes really persists an init
+// container's RestartCount after a retry finally succeeds. That needs a live pod and it
+// is not what is being pinned here — this is a hand-built ContainerStatus whose values
+// are chosen to make the mutation redden. The guard is correct regardless: a container
+// that is not running cannot be flapping.
+func TestNonRunningContainerWithRestartsDoesNotFlag(t *testing.T) {
+	const want = "hash-new"
+
+	// A healthy Ready pod whose init container finished long ago, after retries.
+	pod := ready(workerPod("w1", want, 3*time.Hour), testNow.Add(-3*time.Hour))
+	pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses, corev1.ContainerStatus{
+		Name:         "seed-nix",
+		RestartCount: 5,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Reason: "Completed", FinishedAt: metav1.NewTime(testNow.Add(-3 * time.Hour)),
+		}},
+	})
+	// And the worker itself running happily since then, never restarted.
+	pod = runningFor(pod, "worker", 0, 3*time.Hour, nil, false)
+
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+	if h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. seed-nix has 5 restarts and NO Running state — it exited hours "+
+			"ago and will never run again. \"Is it flapping right now\" is unanswerable for a container "+
+			"that is not running, so it must be skipped; scoring its absent StartedAt as \"up 0 seconds\" "+
+			"pins a healthy worker red permanently, with no uptime that could ever clear it.",
+			h.Phase, protocol.PhaseSettled)
+	}
+	if h.BlockingContainer != "" {
+		t.Errorf("BlockingContainer = %q, want empty — a settled pod must blame nobody", h.BlockingContainer)
 	}
 }
 

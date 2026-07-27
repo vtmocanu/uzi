@@ -405,15 +405,51 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // says the same thing one step removed. Do not "simplify" it back.
 //
 // Init containers first, then app containers, matching blockingContainer: an init
-// container blocks everything behind it, so it is the honest one to name. A container
-// that is not Running cannot be flapping by this definition — it is either Waiting or
-// Terminated, which the arms below already see.
+// container blocks everything behind it, so it is the honest one to name.
 //
-// SCANS ALL CONTAINERS, NOT JUST THE WORKER, and that is a deliberate behaviour change
-// worth stating out loud because nobody asked for it: a flapping dind sidecar will
-// report the worker as failed, naming dind. That is honest (docker runs really are
-// broken) and it matches how blockingContainer and mostRestartedContainer already
-// treat the pod, but it is wider than "the agent keeps dying".
+// 🔴 A CONTAINER THAT IS NOT RUNNING IS SKIPPED, NOT SCORED, AND THE DIFFERENCE IS THE
+// WHOLE GUARD. "Is this container flapping right now" is UNANSWERABLE for a container
+// that is not running, so the honest answer is to exclude it. Reading its absent
+// StartedAt as a zero time gives the same verdict today — now.Sub(zero) is decades, so
+// it fails the recency conjunct — but for the wrong reason, and the wrong reason is
+// fragile in a specific and likely way: a later defensive tidy of the form
+// `if t.IsZero() { t = now }`, which looks like hardening, silently turns it into "up 0
+// seconds", which SATISFIES the conjunct. Every gate would stay green while the
+// container became permanently flagged. The skip cannot be flipped by that edit.
+//
+// THIS IS THE NORMAL CASE, NOT AN EDGE CASE: `seed-nix` is a plain init container (no
+// RestartPolicy — not a native sidecar), so it runs once, exits, and is Terminated for
+// the pod's ENTIRE remaining life. Every healthy worker pod in the fleet presents a
+// non-Running container to this loop on every tick.
+//
+// The hazard that makes the skip load-bearing rather than tidy — REASONED, NOT MEASURED,
+// and the guard is justified without it: a failed init container is retried and its
+// RestartCount increments, and that count persists on the ContainerStatus after the
+// retry finally succeeds. A worker whose nix seed was flaky-but-eventually-successful —
+// PRD #113's own motivating incident — would then carry RestartCount >= 3 and no Running
+// state FOREVER. Under an "up 0 seconds" reading that pod is red permanently, with no
+// uptime that could ever clear it, because the container will never run again. Whether
+// kubelet really persists the count that way has NOT been verified against a live pod
+// and does not need to be: a non-Running container cannot be flapping, so skipping it is
+// correct on its own terms and costs nothing if the state turns out to be unreachable.
+//
+// SCANS ALL CONTAINERS, NOT JUST THE WORKER — a deliberate, user-accepted behaviour
+// change, stated out loud because nobody asked for it. A flapping dind sidecar reports
+// the worker as failed, naming dind. Honest (docker runs really are broken) and it
+// matches how blockingContainer and mostRestartedContainer already treat the pod, but it
+// is wider than "the agent keeps dying", and the dind sidecars are `RestartPolicy:
+// Always` native sidecars whose RestartCount accumulates across the pod's life exactly
+// like the worker's. So a fleet-wide sidecar image or config change can satisfy this
+// predicate on EVERY worker at once. That correlated case is accepted rather than
+// overlooked: if every worker's docker really is broken, badging every worker is TRUE —
+// which is exactly what separates it from the auth-rejection path that ruled out the
+// api-side heartbeat design, where the fleet would go red for something no worker did.
+//
+// PERMANENCE IS BOUNDED TO GENUINE CRASH-LOOPS, which is where permanence is correct: no
+// container in the worker pod is designed to exit on a periodic cadence (seed-nix exits
+// once; dind and dind-init are long-running daemons), and none carries a LIVENESS probe
+// that could flap it — the only probes under controller/ are two dind StartupProbes, and
+// a StartupProbe failure kills the container rather than cycling it.
 func flappingContainer(p *corev1.Pod, now time.Time) *corev1.ContainerStatus {
 	for _, set := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
 		for i := range set {
