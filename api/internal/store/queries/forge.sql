@@ -167,6 +167,16 @@ WHERE repo_id = @repo_id AND position >= @from_position;
 -- Issues cache -------------------------------------------------------------
 
 -- name: UpsertIssue :one
+-- BOTH COLUMN LISTS DELIBERATELY OMIT board_position, and that omission is the ONLY
+-- thing protecting manual board order (PRD #102 M5) from being reset once a minute.
+-- board_position is uzi-owned — it is never in the forge payload — while every other
+-- column here is forge-derived and must be overwritten on every sync. Naming the SET
+-- columns explicitly (rather than EXCLUDED.*) is what makes "exclude the uzi-owned
+-- one" the default instead of something to remember. Omitting it from the INSERT list
+-- likewise leaves a newly synced row at the column default, NULL, which is Decision
+-- 7b's "cards synced after a freeze take the fallback rather than jumping to the top".
+-- Do not add `board_position = EXCLUDED.board_position` here. Guarded behaviourally by
+-- TestUpsertIssuePreservesBoardPositionLiveDB, because a comment cannot catch an edit.
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, web_url, author,
     has_prd_link, forge_updated_at, synced_at
@@ -183,7 +193,74 @@ SET title            = EXCLUDED.title,
 RETURNING *;
 
 -- name: ListIssuesByRepo :many
-SELECT * FROM issues WHERE repo_id = $1 ORDER BY forge_issue_iid ASC;
+-- The board payload's issue half, and the ONLY caller is handler.buildBoard — so this
+-- ORDER BY is the board's rendered order, and changing it changes nothing else.
+--
+-- NULLS LAST is Postgres's default for ASC; it is written out because it is
+-- load-bearing rather than incidental (PRD #102 Decision 7b). A card nobody has
+-- dragged has board_position NULL and therefore sorts after every positioned card,
+-- falling back to issue number among its peers. Two consequences the client depends
+-- on: a board where nothing has ever been dragged renders byte-for-byte the
+-- `forge_issue_iid ASC` order it rendered before M5, and an issue synced after a
+-- freeze lands at the BOTTOM of its column rather than jumping to the top. Because
+-- positions are board-global and the client buckets by column while preserving
+-- relative order, globally-last is within-column-last.
+--
+-- This clause is also why the web client's "Manual" sort mode is the identity
+-- function: the payload already arrives in the manual order. web/src/lib/boardOrder.ts
+-- names this query in its comment; the coupling is pinned by
+-- TestListIssuesByRepoBoardOrderLiveDB.
+SELECT * FROM issues WHERE repo_id = $1
+ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC;
+
+-- name: SetBoardOrderPositions :exec
+-- The freeze (PRD #102 Decision 7b): number the submitted iids 1000, 2000, 3000, …
+-- in submitted order. Board-global, so a card dragged between columns keeps a number
+-- that still means something in its destination.
+--
+-- The ::bigint cast on the ordinal expression is load-bearing: sqlc's inference is
+-- weaker on expressions than on columns, and an uncast expression here generates as
+-- interface{} rather than a usable typed value.
+--
+-- THE UNKNOWN-IID RULE IS THIS JOIN, not a code path. An iid the client listed but
+-- the server no longer holds (evicted by DeleteIssuesNotIn between render and submit)
+-- simply fails to match and updates zero rows. It is a per-iid no-op by construction,
+-- never a 404, so one stale card can never fail a whole freeze — and there is no
+-- branch anyone can forget to write.
+--
+-- The gap of 1000 is not consumed by anything today: every write is a full renumber,
+-- and no code path inserts between two neighbours. It is kept because dense→gapped
+-- later is a data migration while gapped→dense is free.
+UPDATE issues i
+SET board_position = v.pos
+FROM (
+    SELECT u.iid AS iid, (u.ord * 1000)::bigint AS pos
+    FROM unnest(@iids::bigint[]) WITH ORDINALITY AS u(iid, ord)
+) v
+WHERE i.repo_id = @repo_id AND i.forge_issue_iid = v.iid;
+
+-- name: ClearBoardOrderExcept :exec
+-- The other half of the freeze, and the reason closed cards keep a NULL order
+-- (PRD #102 Decision 7b). The client submits only non-closed cards, so any row that
+-- holds a position and is absent from the list is nulled here. Without this, a card
+-- that had a position and has since closed would keep a stale number and, when it
+-- reopens on the forge, land at an arbitrary rank in its new column — precisely the
+-- hazard 7b names. It also implements "an open card omitted from a submit falls to
+-- the bottom of its column".
+--
+-- MUST run in the same transaction as SetBoardOrderPositions: between the two the
+-- board is torn (some rows renumbered, others still holding old numbers), and the
+-- board polls every 10s, so a GET landing in that window would render a scrambled
+-- order.
+--
+-- `<> ALL('{}')` is TRUE for every row, so an EMPTY iids array wipes every position
+-- on the board — the same trap DeleteIssuesNotIn documents for its keep-set. The
+-- handler guards len(iids) == 0 by running neither statement.
+UPDATE issues
+SET board_position = NULL
+WHERE repo_id = @repo_id
+  AND board_position IS NOT NULL
+  AND forge_issue_iid <> ALL(@iids::bigint[]);
 
 -- name: ListLatestRunsForRepo :many
 -- The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
