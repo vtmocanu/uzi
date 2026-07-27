@@ -9654,7 +9654,11 @@ the save-time poke still refreshes only the **default** (its only caller is the
 kind-path alias, which has no token id to offer), so a newly added non-default token
 waits one interval for its first reading. Auto-failover on exhaustion is explicitly
 out of scope (D3) — it needs its own policy design for which token, chosen when, and
-how `run_usage` attributes a mid-run switch.
+how `run_usage` attributes a mid-run switch. **PRD #111 supplied exactly that design
+and it is no longer out of scope: §397-§404.** It answers *which* by headroom over an
+opt-in pool, *when* at claim time (never mid-run), and the attribution question by
+recording the credential on the run itself — the gap this paragraph names is the one
+§403 closes. The endpoint's auth also moved since (D23, §404).
 
 ## 355. Token CRUD stays cookie-only; only the rebind is Bearer-reachable (D8)
 
@@ -9674,6 +9678,14 @@ how `run_usage` attributes a mid-run switch.
 - `PATCH /api/workers/{id}` **is** `RequireUser` (so `uzi worker set-token` works):
   it mints nothing and returns no credential, it re-points a worker between tokens
   the caller already owns.
+
+**This heading stopped being literally true on 2026-07-27 (PRD #111 D13).** There is
+now exactly one Bearer-reachable write in this route tree that is not the rebind:
+`PATCH /me/secrets/anthropic_token/{id}/auto-eligible`, mounted as its own narrow
+route under `RequireUser` **precisely so that D8's group is not moved** — see §404.
+Every bullet above still holds as written; what changed is that the exception is no
+longer a single one. Recorded rather than rewritten, because a decision that gained a
+sibling is not the same artifact as one that was wrong.
 
 ## 356. Absent vs explicit-null in the binding PATCH — `json.RawMessage`, not `*string`
 

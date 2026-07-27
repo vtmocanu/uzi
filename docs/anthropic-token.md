@@ -139,9 +139,10 @@ token still wins with a couple of runs on it.
 ### 🔴 "Auto" does not mean "only my pool"
 
 **Auto-selection never fails a run.** If it cannot pick — nothing is pooled,
-nothing has a fresh reading, or the token it picked will not open — the run
-falls back to your **default token**, and your default is spent *whether or
-not it is in the pool*. The fallback does not consult the opt-in.
+no pooled token has a reading it can rank, or the token it picked will not
+open — the run falls back to your **default token**, and your default is
+spent *whether or not it is in the pool*. The fallback does not consult the
+opt-in.
 
 So a token you deliberately kept **out** of the pool can still pay for a run,
 if it happens to be your default. That is not a bug and there is no third
@@ -163,13 +164,13 @@ view and an `ANTHROPIC_TOKEN` row in `uzi run get`:
 | `console-key — default` | nothing named a token, so your default paid |
 | `review-key — judge binding` | your judge setting chose it, not a worker's |
 | `default — default (auto: no tokens in the pool)` | the worker is on auto and you have pooled nothing |
-| `default — default (auto: no fresh usage readings)` | the worker is on auto and no pooled token had a current reading |
+| `default — default (auto: no fresh usage readings)` | the worker is on auto and no pooled token had a reading it could rank — never polled, polled without percentages, or aged out |
 | `default — default (auto: the chosen token would not open)` | auto picked one, its stored value would not decrypt, so your default paid |
 
 The last three are the fallbacks, shown in amber and linked to this page,
 because in each case the worker is set to auto and auto did not happen. They
-are different problems: pool one in, look at why the readings are missing, or
-re-paste the token that would not open.
+are different problems: pool one in, look at why the readings are
+missing or unusable, or re-paste the token that would not open.
 
 A run whose token you later delete still names it, with **(deleted)** — the
 name is a snapshot taken when the run was claimed, so history stays readable.

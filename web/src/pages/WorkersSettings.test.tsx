@@ -797,6 +797,29 @@ describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
   // render as one it is not — the F12 hazard closed for labels, left open for names.
   //
   // MUTATION THIS CATCHES: dropping sanitizeLabel from the name span. Measured.
+  // The join-token echo. LOW severity and fixed anyway: the name here is the one the
+  // user typed seconds ago in the same session, so a user can only spoof their own
+  // immediate echo — no cross-tenant path, nothing stored-then-surprising, unlike the
+  // list (any age) and the admin view (other people's). Same class, same one-word fix.
+  //
+  // MUTATION THIS CATCHES: reverting the echo to `{newToken.worker}`. Measured — the
+  // suite passed against the raw form until this test existed.
+  it("strips invisible formatting characters from the join-token echo", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.createWorker.mockResolvedValue({
+      worker: aWorker({ id: "w-new", name: "safe\u202Edrowssap" }),
+      token: "uzi_wk_deadbeef",
+    });
+    const { container } = renderPage();
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner-1/), {
+      target: { value: "safe\u202Edrowssap" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
+    await screen.findByText("uzi_wk_deadbeef");
+    expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).toContain("safe");
+  });
+
   it("strips invisible formatting characters from a worker name", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [aWorker({ name: "safe\u202Edrowssap" })],

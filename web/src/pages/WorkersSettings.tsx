@@ -262,7 +262,20 @@ export function WorkersSettings() {
 
       {newToken && (
         <Card className="space-y-3 border-ok/40">
-          <SectionTitle className="text-ok">Join token for “{newToken.worker}”</SectionTitle>
+          {/* sanitizeLabel here too, and the reason it is LOW rather than the same
+              severity as the list: this name is the one the user typed into the create
+              form seconds ago, in the same session — a user can only spoof their own
+              immediate echo, with no cross-tenant path and nothing stored-then-
+              surprising. The worker LIST renders names created at any time, and the
+              admin view renders other people's. Fixed anyway because it is the same
+              class and the same one-word fix.
+              
+              The remaining unsanitized uses of a worker name in this file are
+              CONSIDERED, not missed: the aria-labels and the announce() strings. Those
+              are React props and live-region text — escaped, no injection — where a
+              bidi override could at most reorder an announcement whose visible
+              counterpart is already sanitized. Recorded so nobody re-derives it. */}
+          <SectionTitle className="text-ok">Join token for “{sanitizeLabel(newToken.worker)}”</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown once and never again (only its hash is stored). Set it as{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_WORKER_TOKEN</code> on the
