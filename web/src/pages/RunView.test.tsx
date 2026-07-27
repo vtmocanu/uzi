@@ -1,7 +1,16 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary, JudgePanel, RunHeading, RunCompletedLine, derivePlanRevision } from "./RunView";
+import {
+  PlanPanel,
+  AgentRosterSummary,
+  JudgePanel,
+  RunHeading,
+  RunCompletedLine,
+  RunFailureReason,
+  HealthFlag,
+  derivePlanRevision,
+} from "./RunView";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -213,6 +222,40 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
 // was the one render site in this batch that no test reached — dropping its strip left the
 // whole file green, which is why RunHeading is now extracted the way the panels beside it
 // already are.
+// Issue #124, the TEXT channel for the two fields 96ed275a fixed on the ATTRIBUTE channel.
+// Both are asserted SEPARATELY and each is mutated on its own, because they render in
+// DIFFERENT branches of RunView and no single fixture reaches both — a case planting a Cf in
+// `failure_reason` passes with `health_reason` still raw, which is exactly the shape that let
+// three earlier defects through. Each fixture gives its field a real non-empty value rather
+// than relying on a default, since `RunView.test.tsx` setting both to `null` is why nothing
+// caught these.
+describe("RunFailureReason — the worker-supplied failure reason (#124, text channel)", () => {
+  it("strips bidi/zero-width characters out of the rendered reason", () => {
+    const { container } = render(
+      <RunFailureReason run={run({ failure_reason: "the repo \u202Eapproved\u200B this" })} />,
+    );
+    // The rendered TEXT is the assertion — a `title` check here would be measuring what
+    // 96ed275a already fixed, on a surface that carries no title at all.
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toBe("the repo approved this");
+  });
+
+  it("renders nothing when there is no reason", () => {
+    const { container } = render(<RunFailureReason run={run({ failure_reason: null })} />);
+    expect(container.textContent).toBe("");
+  });
+});
+
+describe("HealthFlag — the health reason (#124, text channel)", () => {
+  it("strips bidi/zero-width characters out of the rendered reason", () => {
+    const { container } = render(
+      <HealthFlag run={run({ status: "running", health: "stalled", health_reason: "no output for \u202E20m\u200B" })} />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toContain("no output for 20m");
+  });
+});
+
 // Issue #124: `run.branch` is WORKER-supplied and ingest stores it as
 // `stripNULParam(req.Branch)` — NUL only, no Cc/Cf. Extracted to be assertable at all;
 // before that, dropping the strip left the whole file green.

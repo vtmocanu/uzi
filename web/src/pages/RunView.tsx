@@ -97,7 +97,12 @@ function LiveElapsed({ since }: { since: string }) {
 // only, so health_reason is always present here (no gating needed). It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
 // re-render. Renders nothing for a healthy run or a non-flaggable status.
-function HealthFlag({ run }: { run: Run }) {
+/**
+ * The stuck/health pill. Exported for the same reason RunHeading and RunCompletedLine are:
+ * `RunView` needs routing, a live stream and a dozen API mocks to mount, and `health_reason`
+ * renders only in this branch — so without this the strip below could not be asserted.
+ */
+export function HealthFlag({ run }: { run: Run }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 30_000);
@@ -115,7 +120,11 @@ function HealthFlag({ run }: { run: Run }) {
     >
       ⚠ {healthFlagLabel(run.health)}
       {stuck}
-      {run.health_reason && <span className="font-normal"> — {run.health_reason}</span>}
+      {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
+          attribute (runBadge's descriptor) and missed it here, where it renders as body
+          text — the mirror of 4a739bff, which fixed text and missed the attribute. Same
+          field, opposite channel, one commit apart. */}
+      {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
     </span>
   );
 }
@@ -322,11 +331,7 @@ export function RunView() {
               <p className={cx("text-sm font-semibold", stopped ? "text-fg" : "text-danger")}>
                 Run {stopped ? "stopped" : "failed"}
               </p>
-              {run.failure_reason && (
-                <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
-                  {run.failure_reason}
-                </p>
-              )}
+              <RunFailureReason run={run} stopped={stopped} />
               {duration && <p className="mt-0.5 text-xs text-muted">Ran for {duration}.</p>}
             </div>
             {/* The MR link is the run's whole output; surface it even on a failed or
@@ -752,6 +757,24 @@ export function PlanPanel({
  * `run.branch` is WORKER-supplied and ingest stores it as `stripNULParam(req.Branch)` — NUL
  * only, no Cc/Cf — so it has the same profile as every other field this batch closed.
  */
+/**
+ * The failed/stopped hero's reason line, extracted so it can be asserted at all — it renders
+ * in a different `RunView` branch from HealthFlag, so no single fixture reaches both.
+ *
+ * Issue #124, TEXT channel. `failure_reason` is worker-supplied, ingest is `stripNUL` +
+ * truncate (`sanitizeFailureReason`), and `service.go` writes `err.Error()` straight in — so
+ * a hostile repo can shape the error an agent fails with. This is the LARGER of the two
+ * surfaces that carry it: a paragraph of body text, versus a tooltip you have to hover.
+ */
+export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean }) {
+  if (!run.failure_reason) return null;
+  return (
+    <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
+      {stripUnsafeChars(run.failure_reason)}
+    </p>
+  );
+}
+
 export function RunCompletedLine({
   run,
   duration,

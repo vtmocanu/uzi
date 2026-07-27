@@ -175,15 +175,31 @@ export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | nul
 }
 
 /**
- * Issue #124 for the badge TOOLTIP. `RunBadge.title` is rendered as a `title` attribute at
- * five sites (Board, RunHealthBadge, JudgeRunBadge, WorkerRunBadge, CIFixRunHeader), and an
- * attribute is a sink `container.textContent` cannot see — so every #124 test in the repo is
- * structurally blind to it, exactly like the upgrade-badge tooltip was.
+ * Issue #124 for the badge TOOLTIP, which is an ATTRIBUTE — and a whole-subtree
+ * `container.textContent` assertion cannot see attribute values. That is why this class keeps
+ * recurring: text is covered INCIDENTALLY by any subtree assertion, attributes only where
+ * someone wrote an explicit check (`Judge.test.tsx` via getByLabelText,
+ * `WorkerUpgradeBadge.test.tsx` via `span[title]` — so coverage exists, it is just never free).
  *
- * Stripped HERE, where the descriptor is composed, rather than at the five renderers: this
- * function's output is display-only by construction (a badge descriptor, never posted back,
- * never a key), so it is still a display transform and not a boundary one — and one place
- * cannot drift out of step with four others.
+ * TWO renderers consume this descriptor, not five. The five `title={…}` badge sites share a
+ * `{label, tone, title}` SHAPE, not a constructor:
+ *
+ *   Board.tsx          <- runBadge()        here            covered
+ *   RunHealthBadge.tsx <- healthBadge()     here            covered
+ *   JudgeRunBadge.tsx  <- judgeBadge()      judgeBadge.ts   not reached by this fix
+ *   WorkerRunBadge.tsx <- workerRunBadge()  workerRuns.ts   not reached by this fix
+ *   CIFixRunHeader.tsx <- fixVerdictChip()  fixVerdict.ts   not reached by this fix
+ *
+ * The three others need nothing TODAY, checked rather than assumed: their titles are a closed
+ * verdict enum plus a count, a template over two numbers, and four literals. But they are
+ * where the next untrusted interpolation would land without a strip, and composing here
+ * cannot reach them — so this placement prevents drift between the two constructors it owns,
+ * NOT across all five. (An earlier version of this comment claimed the opposite; the drift it
+ * said it was preventing is the drift that already exists.)
+ *
+ * Stripped at the descriptor rather than at the two renderers because this function's output
+ * is display-only by construction — never posted back, never a key — so it is still a display
+ * transform and not a boundary one.
  *
  * Covers BOTH title sources, which is why the fix does not depend on settling their
  * provenance separately:

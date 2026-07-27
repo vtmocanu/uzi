@@ -398,6 +398,22 @@ describe("runBadge title — format characters (#124)", () => {
     expect(titleOf(reason)).toBe(reason);
   });
 
+  it("covers the OTHER badgeTitle call site — healthBadge's arm (#124)", () => {
+    // `badgeTitle` has TWO call sites: `runBadge(run.failure_reason)` and
+    // `healthBadge(run.health_reason)`. Every other case in this describe builds through
+    // `runBadge`, so reverting healthBadge's call alone left them all green — a call site
+    // with no assertion, which is the same shape as a channel with no assertion.
+    const b = healthBadge(
+      { health: "stalled", status: "running", health_since: null, health_reason: "no output for \u202E20m\u200B" } as never,
+      Date.now(),
+    );
+    // Narrowed rather than cast, like titleOf above: `RunBadge` is a union whose `mr`
+    // variant has no title, and a cast would hide a real regression here.
+    if (b === null || b.kind !== "badge") throw new Error(`expected a badge for a stalled run, got ${b?.kind}`);
+    expect(b.title ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(b.title).toBe("no output for 20m");
+  });
+
   it("keeps an absent reason absent rather than turning it into an empty tooltip", () => {
     // `title=""` renders a real (empty) tooltip box in some engines, so a reason that is
     // nothing but format characters must collapse to undefined, not to "".

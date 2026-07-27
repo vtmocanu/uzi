@@ -336,7 +336,8 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
       // Issue #124. Weaker provenance than the rest of the batch — `classifyWithTarget`
       // sets this from uzi's own CPVersion or the CONTROLLER's reported tag, not from a
       // worker — so this is for the ASYMMETRY as much as the tier: `upgrade_detail`
-      // composes the same value into its own sentence six lines away and IS stripped.
+      // composes the same value into its own sentence and IS stripped, at :66 (the badge's
+      // title attribute) and :241 (the detail panel's text) in this file.
       // Same value, two treatments, is what makes the next reader guess.
       divergentTargets.add(stripUnsafeChars(w.upgrade_target));
     }

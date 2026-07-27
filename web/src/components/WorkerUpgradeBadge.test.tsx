@@ -99,7 +99,10 @@ describe("WorkerUpgradeBadge — upgrade_detail carries no format characters (#1
   });
 
   it("strips the divergent upgrade_target in the fleet panel's sentence", () => {
-    // Same value `upgrade_detail` composes six lines away, which 4a739bff already strips.
+    // The same value `upgrade_detail` composes into its own sentence, stripped in this file
+    // at :66 (title attribute, 4a739bff) and :241 (detail panel text, f399ab26). Naming the
+    // file and lines rather than a distance: "six lines away" resolved nowhere, and only ever
+    // fit in workersvc/upgrade.go, a file that sentence never named.
     const { container } = render(
       <FleetUpgradePanel
         workers={[aWorker({ kind: "hosted", upgrade_target: "0.11\u202E.7\u200B", upgrade_status: "outdated" })]}
@@ -111,9 +114,9 @@ describe("WorkerUpgradeBadge — upgrade_detail carries no format characters (#1
   });
 
   it("strips it in the badge's title ATTRIBUTE too, which textContent cannot see", () => {
-    // The attribute is a sink a rendered-text sweep misses by construction, and it carries
-    // the same field. Asserted on the attribute directly for that reason — the assertion
-    // above would pass with this one broken.
+    // A whole-subtree `container.textContent` assertion cannot see attribute values, so the
+    // case above would pass with this one broken. Attributes are never covered incidentally
+    // the way text is — only where someone writes an explicit check, as here.
     const { container } = render(
       <WorkerUpgradeBadge worker={aWorker({ upgrade_detail: "running 0.11.0\u202E, target 0.11.7\u200B" })} />,
     );
