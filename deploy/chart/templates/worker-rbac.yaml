@@ -171,7 +171,7 @@ imagePullSecrets:
   The controller's ServiceAccount is unchanged — one identity, now bound into two
   namespaces. That is exactly the reach we intend: the controller creates workers in
   the restricted default AND the privileged docker tier, and nowhere else.
-*/ -}}
+*/}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
