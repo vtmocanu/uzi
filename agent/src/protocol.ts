@@ -370,6 +370,23 @@ export interface ClaimResponse {
    *  session declines to re-emit signal_plan.
    *  Absent on an older server ⇒ treat as false, i.e. plan as today. */
   plan_approved?: boolean;
+  /** The run's PERSISTED subagent selection (`runs.agent_source` /
+   *  `agent_exclusions`), replayed on every claim (PRD #35).
+   *
+   *  It ships because `plan_approved` ships, and the two come from ONE human verdict.
+   *  Normally the selection reaches the worker on the approve_plan verdict — but a
+   *  run resumed with `plan_approved` already true HAS NO VERDICT to carry it, so
+   *  without this the worker falls through to resolveAgentSelection's "absent"
+   *  default and a human who excluded a subagent at the gate gets it back after a
+   *  park, silently. Decision 6b's premise is "we may skip the gate BECAUSE the human
+   *  approved"; honouring the approval while dropping the exclusions that were part
+   *  of the same decision honours half a verdict.
+   *
+   *  ABSENT — not an empty selection — when the run never reached a gate. The
+   *  worker's absent-default is correct there and must stay reachable, so treat a
+   *  missing key as "absent", never as "source own with no exclusions". Also absent
+   *  from an older server, which is the same case and wants the same handling. */
+  agent_selection?: AgentSelection;
   /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
    *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
    *  `auto_approve` above, and for the same reason: an unattended resume must not

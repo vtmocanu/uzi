@@ -431,20 +431,24 @@ export class SdkExecutor implements Executor {
       let approvedPlan: string;
       // The agent selection the approve verdict carried (PRD #37).
       //
-      // ⚠ RESIDUAL ON THE PRE-APPROVED RESUME PATH — the OLDER-SERVER FALLBACK only.
-      // A current server delivers the persisted selection on the claim (PRD #35: it
-      // rides next to `plan_approved`, because both come from the same human verdict
-      // and propagating one without the other honours half a decision). This branch
-      // is what happens when it is absent: resolveAgentSelection applies its
-      // documented "absent" default — repo when a roster was detected, else own, no
-      // exclusions — exactly as an autopilot run does.
+      // The persisted selection now arrives ON THE CLAIM (PRD #35), so a pre-approved
+      // resume honours the same human verdict that let it skip the gate. This block
+      // used to describe a LIVE DEFECT — the claim carried no selection and a human
+      // who excluded a subagent got it back after a park. That is fixed; what follows
+      // is about the one path that still resolves without a selection.
       //
-      // WHAT THAT COSTS, stated fully because an earlier version of this comment
-      // understated it and got one claim wrong outright:
+      // WHEN THE CLAIM CARRIES NOTHING there are two cases and they want the SAME
+      // handling, which is why neither is special-cased:
+      //   - the run never reached a gate, so there is no human verdict to honour and
+      //     the absent-default IS the correct answer, not a degradation; and
+      //   - the server predates the field.
       //
-      //  1. The larger effect is not exclusions, it is the SOURCE. A human who chose
-      //     `own` gets the `repo` roster after a park whenever the clone has agents.
-      //     Exclusions being dropped is the smaller, secondary case.
+      // WHAT THE ABSENT-DEFAULT DOES, kept because it is what the second case gets
+      // and because an earlier version of this comment understated it and got one
+      // claim wrong outright:
+      //
+      //  1. The larger effect is not exclusions, it is the SOURCE — `own` becomes
+      //     `repo` whenever the clone has a roster. Dropped exclusions are secondary.
       //  2. "Every subagent is still drawn from the same vetted set" — WHAT THIS
       //     COMMENT USED TO SAY — IS FALSE. selectSubagents("repo", …) returns
       //     subagentsFromTemplates(repoTemplates, …): the CLONED REPO's
@@ -455,13 +459,25 @@ export class SdkExecutor implements Executor {
       //     admin's scoping surface there), while `repo` gives every subagent the
       //     run's whole surviving skill set.
       //
-      // The SECURITY claim does survive, and was checked rather than assumed: repo
-      // agents carry REPO_AGENT_DENIED_TOOLS, canonicalized against aliases so a
+      // The SECURITY claim holds throughout, and was checked rather than assumed:
+      // repo agents carry REPO_AGENT_DENIED_TOOLS, canonicalized against aliases so a
       // `tools: [Task]` cannot slip through; sdk-executor re-enforces it; and the
-      // Agent-guard hook's allowSet is rebuilt from the RESOLVED selection. So this
-      // is a roster and scoping difference, not a guardrail bypass — but do not read
-      // "not a bypass" as "no difference", which is where the old wording led.
-      let approvedSelection: AgentSelectionParse = { status: "absent" };
+      // Agent-guard hook's allowSet is rebuilt from the RESOLVED selection. A roster
+      // and scoping difference, never a guardrail bypass — but do not read "not a
+      // bypass" as "no difference", which is where the old wording led.
+      // Seeded from the run's PERSISTED selection when the claim carried one, so a
+      // pre-approved resume honours the same human verdict that let it skip the gate.
+      // The gated path below overwrites this from the approve verdict as before.
+      //
+      // `{status: "absent"}` when the claim carried nothing. That is the right answer
+      // for a run that never reached a gate — and for an older server that predates
+      // the field — because resolveAgentSelection's absent-default (repo when a
+      // roster was detected, else own) is exactly what such a run should get. It is
+      // NOT folded into "invalid": absence is not a signal to distrust, and forcing
+      // `own` would pin every gate-less run to a source this code guessed.
+      let approvedSelection: AgentSelectionParse = ctx.approvedSelection
+        ? { status: "ok", selection: ctx.approvedSelection }
+        : { status: "absent" };
 
       if (preApproved) {
         ctx.emit({
@@ -628,7 +644,7 @@ export class SdkExecutor implements Executor {
       // implement prompt. Malformed selection resolves to `own`, never repo — true of
       // an INVALID selection, and it does NOT generalise to "we never silently pick
       // repo": an ABSENT selection resolves to repo when a roster was detected, which
-      // is exactly the older-server resume path described further up.
+      // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
       const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
       if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });

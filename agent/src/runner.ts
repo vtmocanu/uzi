@@ -341,6 +341,11 @@ export class RunRunner {
         // it must plan.
         planApproved: (claim.plan_approved ?? false) && !!sessionId,
         approvedPlan: claim.plan_md ?? undefined,
+        // The persisted selection, replayed on the claim (PRD #35). Passed through
+        // unconditionally rather than gated on planApproved: it is the run's
+        // selection whether or not this particular resume skips the gate, and the
+        // executor only reads it on the path that has no verdict to supply one.
+        approvedSelection: claim.agent_selection,
         signal: cancel.signal,
         // Persist the SDK session id the moment the executor learns it, so a
         // re-queued run can resume it. Best-effort.

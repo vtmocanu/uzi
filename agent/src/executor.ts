@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
+import type { AgentSelection, AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
@@ -116,6 +116,13 @@ export interface RunContext {
    *  meaningful with `planApproved`; the executor refuses to skip the gate without
    *  it, because an empty plan would enter implement with no instructions. */
   approvedPlan?: string;
+  /** The run's persisted subagent selection, replayed on the claim (PRD #35).
+   *
+   *  Used on the pre-approved resume path, where there is no approve_plan verdict to
+   *  carry it. Absent means the run never reached a gate (or the server predates the
+   *  field), and the executor then applies resolveAgentSelection's absent-default —
+   *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
+  approvedSelection?: AgentSelection;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
