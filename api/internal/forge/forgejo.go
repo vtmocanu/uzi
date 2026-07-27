@@ -683,10 +683,15 @@ func (f *forgejo) DefaultBranchProtection(ctx context.Context, projectID int64, 
 // the GitLab driver and the issue cache (state='opened' filter) already use —
 // Forgejo says "open".
 func toForgejoIssue(i *gitea.Issue) Issue {
+	// Labels starts as a non-nil empty slice for the same reason the GitLab driver
+	// normalizes it: the append loop below leaves it nil for a label-less issue, and
+	// a nil slice caches as the jsonb scalar `null`, which survives the round trip
+	// and ships as JSON null to every consumer.
 	issue := Issue{
 		IID:         i.Index,
 		Title:       i.Title,
 		State:       forgejoIssueState(i.State),
+		Labels:      []string{},
 		Description: i.Body,
 		WebURL:      i.HTMLURL,
 		UpdatedAt:   i.Updated,

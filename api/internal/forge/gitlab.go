@@ -534,12 +534,26 @@ func toMergeRequest(mr *gitlab.MergeRequest) MergeRequest {
 // toIssue maps a client-go issue to the neutral domain type. A nil author (rare
 // but possible for system issues) yields an empty Author; a nil UpdatedAt
 // yields the zero time, which the sync engine treats as "no HWM advance".
+//
+// Labels is normalized to a non-nil slice. GitLab returns no labels array at all
+// for an issue carrying none, so []string(i.Labels) is nil, which json.Marshal
+// writes into the cache as the jsonb scalar `null` rather than `[]` — a value the
+// column's NOT NULL does not exclude and that decodes back to nil without error.
+// This is the belt; handler.decodeLabels is the braces, and it is the one that
+// matters for rows already stored.
+//
+// Unreachable until PRD #102 M6, whose additive fetch is the first thing that
+// caches an issue with no labels at all.
 func toIssue(i *gitlab.Issue) Issue {
+	labels := []string(i.Labels)
+	if labels == nil {
+		labels = []string{}
+	}
 	issue := Issue{
 		IID:         i.IID,
 		Title:       i.Title,
 		State:       i.State,
-		Labels:      []string(i.Labels),
+		Labels:      labels,
 		Description: i.Description,
 		WebURL:      i.WebURL,
 	}

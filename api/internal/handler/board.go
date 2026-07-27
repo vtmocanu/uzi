@@ -428,6 +428,44 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*ap
 	return out
 }
 
+// decodeLabels turns a cached issue's labels jsonb into the slice every card DTO
+// ships. It GUARANTEES a non-nil result, which is the whole reason it exists as a
+// function rather than two inline unmarshals.
+//
+// The column is `jsonb NOT NULL DEFAULT '[]'`, and SQL NOT NULL does not exclude
+// the jsonb scalar `null` — a distinct value that json.Unmarshal decodes into a
+// nil slice with NO error, so the error branch below never sees it. A nil slice
+// marshals as JSON `null`, not `[]`, and the web then calls .filter and .includes
+// on it.
+//
+// Unreachable before PRD #102 M6: the sync filter guaranteed every cached issue
+// carried the PRD label, so labels was never empty. The additive fetch caches open
+// issues regardless of label, and an issue with NO labels at all is the ordinary
+// shape of a freshly filed one.
+//
+// Fixed on the READ side deliberately. The driver mapping is fixed too (a nil
+// []string for a label-less issue is where the null originates), but that alone
+// would leave every row already stored as jsonb null broken, because the nil
+// survives the round trip without ever erroring.
+func decodeLabels(raw []byte) []string {
+	var labels []string
+	if err := json.Unmarshal(raw, &labels); err != nil {
+		return []string{}
+	}
+	return nonNilLabels(labels)
+}
+
+// nonNilLabels is decodeLabels' guarantee on its own, for the card builder that
+// takes labels straight from a forge response rather than from the cache
+// (handler/issues.go's create path). Same reason: a nil []string marshals as JSON
+// null and the web calls .filter on it.
+func nonNilLabels(labels []string) []string {
+	if labels == nil {
+		return []string{}
+	}
+	return labels
+}
+
 // assembleCards builds the board's cards from the cached issues, the newest run
 // per issue (runRows, one row per issue that has run), the column position map,
 // and the board viewer. It is the pure, DB-free core of the board payload: it
@@ -443,10 +481,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 
 	cards := make([]cardDTO, 0, len(issues))
 	for _, is := range issues {
-		var labels []string
-		if err := json.Unmarshal(is.Labels, &labels); err != nil {
-			labels = []string{}
-		}
+		labels := decodeLabels(is.Labels)
 		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 		card := cardDTO{
 			IID:        is.ForgeIssueIid,
@@ -893,10 +928,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
 // Three production callers: MoveIssue, SetIssuePrdless and CreateIssue (issues.go).
 func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
-	var labels []string
-	if err := json.Unmarshal(is.Labels, &labels); err != nil {
-		labels = []string{}
-	}
+	labels := decodeLabels(is.Labels)
 	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 	card := cardDTO{
 		IID:        is.ForgeIssueIid,
