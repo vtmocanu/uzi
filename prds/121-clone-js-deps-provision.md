@@ -1,7 +1,11 @@
 # PRD #121: Pre-provision cloned-repo JS deps before the agent works (+ pre-scan accuracy + gate honesty)
 
 **GitLab Issue**: [#121](https://gitlab.example.com/vtmocanu/uzi/-/issues/121)
-**Status**: Draft (created 2026-07-22; revised same day after a fable adversarial review — reversed the install-flags decision to keep `--ignore-scripts` (the esbuild premise was empirically false, tested), rescoped M4 as net-new machinery, fixed the M2 hoist point to after `provisionRunTools`, added the trust-posture rationale and a k8s single-uid hedge; see the Decision Log)
+**Status**: **Implemented, awaiting the acceptance run (2026-07-27).** M1, M2, M3 and M6 are done and in MR !119. **M4 is SPLIT OUT** into its own increment (see its milestone entry). **M5 is the acceptance run and has NOT happened** — it needs the worker image built and deployed, and a green `./e2e/run-e2e.sh` does **not** substitute for it (the harness runs `UZI_E2E_EXECUTOR=stub`, so it executed zero lines of the agent-side change). This PRD therefore stays in `prds/` rather than moving to `prds/done/`: the repo's archive convention is that the acceptance run has been performed, and it has not.
+
+*The substantive output of implementation was not the feature. The PRD's Trust posture premise — that a frozen `--ignore-scripts` install runs no repo-authored code — was found **FALSE for yarn and pnpm**, measured, and that section is rewritten. `specs/human.md` now carries the resulting constraint as user-ratified contract.*
+
+*Earlier status, retained because the decisions still bind: Draft (created 2026-07-22; revised same day after a fable adversarial review — reversed the install-flags decision to keep `--ignore-scripts` (the esbuild premise was empirically false, tested), rescoped M4 as net-new machinery, fixed the M2 hoist point to after `provisionRunTools`, added the trust-posture rationale and a k8s single-uid hedge; see the Decision Log).*
 **Priority**: Medium
 
 ## Problem
