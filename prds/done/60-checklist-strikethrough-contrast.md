@@ -50,9 +50,10 @@ This is the only site with the defect: the other `line-through` usages
       - Visual check done in headless Chromium against
         `VITE_UZI_MOCK=1 npm run dev`, at 3/4 steps done. In both themes the
         struck text's `color` and `text-decoration-color` measure identical —
-        ember `rgb(148,158,176)` on `rgb(15,18,26)` (~7.0:1), mission
+        ember `rgb(148,158,176)` on `rgb(15,18,26)` (~6.9:1), mission
         `rgb(148,163,184)` on `rgb(11,17,32)` (~7.4:1), against ~1.9:1 and
-        ~2.5:1 before. Both clear the 3:1 WCAG 1.4.11 floor the old line missed.
+        ~2.5:1 before. The line is text presentation, so SC 1.4.3 governs at
+        4.5:1: the old values missed it, both new ones clear it.
 
 ## Success Criteria
 
