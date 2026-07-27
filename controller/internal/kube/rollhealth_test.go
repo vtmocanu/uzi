@@ -605,6 +605,220 @@ func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
 	}
 }
 
+// runningFor is running() with the TWO fields issue #145's rule actually reads chosen
+// per case instead of baked in: how long the CURRENT instance has been up, and whether
+// there is a last termination at all.
+//
+// running() cannot serve here and the difference is the whole point. It hardcodes
+// `StartedAt = testNow-1m`, so a "Ready + restarts" case built on it would read `stuck`
+// under both the shipped and the fixed derivation — by accident of that one minute
+// being inside flapWindow, not because the rule works. Every case below therefore
+// states its uptime and says why that number.
+//
+// lastTerm nil builds the shape MEASURED on a real crash-looping pod: a container
+// instance with restartCount 6 and `"lastState": {}`. It is not a defensive nil; it is
+// what killed a finishedAt-anchored design.
+func runningFor(p *corev1.Pod, container string, restarts int32, up time.Duration, lastTerm *corev1.ContainerStateTerminated, init bool) *corev1.Pod {
+	st := corev1.ContainerStatus{
+		Name:         container,
+		RestartCount: restarts,
+		State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(testNow.Add(-up))}},
+	}
+	if lastTerm != nil {
+		st.LastTerminationState.Terminated = lastTerm
+	}
+	if init {
+		p.Status.InitContainerStatuses = append(p.Status.InitContainerStatuses, st)
+	} else {
+		p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, st)
+	}
+	return p
+}
+
+// Issue #145 — A READY POD IS NOT SETTLED WHILE A CONTAINER IS FLAPPING.
+//
+// The worker container has no readiness probe, so `Ready` means the kubelet started the
+// process, not that the agent works. A container that starts, dies 40s later and repeats
+// is Ready for most of every cycle, so the unguarded early return reported `settled` on
+// those ticks — the badge alternated, and because `settled` returns BEFORE the
+// blocking-container lookup the report carried zeroed diagnostics over the real ones.
+//
+// Each case below is here because a WRONG implementation passes the others:
+//
+//  1. the defect itself.
+//  2. a count-only rule fails it — and so does a rule whose recency check sits inside
+//     the switch instead of at the entry. This is the most important case in the file.
+//  3. a recency-only rule fails it.
+//  4. the healthy roll; any rule that over-fires fails it.
+//  5. a finishedAt-anchored rule fails it — the shape measured on a real pod.
+func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
+	const want = "hash-new"
+	exit1 := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+
+	// --- 1. THE DEFECT. Ready, 5 restarts, this instance up 30s. ---
+	//
+	// 30s because that is the shape measured live: `sleep 40; exit 1` is Ready for most
+	// of each cycle. Any value well inside flapWindow does; the point is that the
+	// container came up recently and has died repeatedly.
+	pod := ready(runningFor(workerPod("w1", want, 20*time.Minute), "worker", 5, 30*time.Second, exit1, false),
+		testNow.Add(-30*time.Second))
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+	if h.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. The pod is Ready, but its container has died 5 times and the "+
+			"current instance is 30s old — Ready means the kubelet started the process, not that the "+
+			"agent works, because the worker container has NO readiness probe.", h.Phase, protocol.PhaseStuck)
+	}
+	if h.BlockingContainer != "worker" || h.RestartCount != 5 {
+		t.Errorf("BlockingContainer = %q RestartCount = %d, want worker/5. The whole point of withholding "+
+			"`settled` is that the report then carries the diagnostics a settled report never collects.",
+			h.BlockingContainer, h.RestartCount)
+	}
+	if h.LastExitCode == nil || *h.LastExitCode != 1 {
+		t.Errorf("LastExitCode = %v, want 1 from LastTerminationState — the container is Running NOW and "+
+			"terminated before, which is exactly the crash-loop shape", h.LastExitCode)
+	}
+	// The reason comes from the last termination, because a Running container has no
+	// current-state reason. Without it stuckDetail renders "not ready" about a pod that
+	// IS ready.
+	if h.BlockingReason != "Error" {
+		t.Errorf("BlockingReason = %q, want %q from the last termination. Left empty, the api's "+
+			"stuckDetail substitutes \"not ready\", which is false of a Ready pod.", h.BlockingReason, "Error")
+	}
+
+	// --- 2. 🔴 THE ANTI-PERMANENT-RED CASE. Ready, 5 restarts, up 10m1s. ---
+	//
+	// A worker that restarted 5 times last week and has been up ever since is HEALTHY.
+	// RestartCount is the kubelet's lifetime counter and never decreases, so a rule
+	// built on the count alone pins this red forever — and since #151 removed the INV-5
+	// ceiling from R1, that `upgrade_failed` has no expiry at all.
+	//
+	// It is also the case that fails if the recency conjunct is moved INTO the switch
+	// rather than gating entry to the fall-through: this pod would then reach the arms,
+	// where its 4-hour age trips the reasonless `stuckAge` arm even if the restart arm
+	// is correctly gated. The guard must keep it out of the switch entirely.
+	//
+	// 10m1s, one second past flapWindow, because a boundary is where an off-by-one
+	// lives; the pod is 4h old to make it unmistakably a long-lived worker.
+	recovered := ready(runningFor(workerPod("w2", want, 4*time.Hour), "worker", 5, flapWindow+time.Second, exit1, false),
+		testNow.Add(-(flapWindow + time.Second)))
+	if h := deriveRollHealth([]corev1.Pod{*recovered}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. This worker restarted 5 times and has been up %v since — it is "+
+			"HEALTHY. The verdict must expire on continuous uptime, or a lifetime counter that never "+
+			"decreases pins a working worker red forever with no ceiling to end it.",
+			h.Phase, protocol.PhaseSettled, flapWindow+time.Second)
+	}
+
+	// --- 3. Ready, 2 restarts, up 5s. Recency without the count. ---
+	//
+	// One OOM or one node hiccup restarts a container recently. A recency-only rule
+	// calls that failure; the threshold of 3 is what makes this a non-event, and it is
+	// deliberately the same threshold the not-Ready path uses so the two paths cannot
+	// disagree about one pod.
+	blip := ready(runningFor(workerPod("w3", want, 20*time.Minute), "worker", stuckRestartThreshold-1, 5*time.Second, exit1, false),
+		testNow.Add(-5*time.Second))
+	if h := deriveRollHealth([]corev1.Pod{*blip}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. %d restarts is below the threshold of %d — a single benign restart "+
+			"must not read as a crash loop.", h.Phase, protocol.PhaseSettled, stuckRestartThreshold-1, stuckRestartThreshold)
+	}
+
+	// --- 4. THE HEALTHY ROLL. Ready, 0 restarts. Must not regress. ---
+	//
+	// This is every worker on every release. If it moves, the fix has turned the whole
+	// fleet's badge red — the cry-wolf failure the roll-health feature exists to prevent.
+	healthy := ready(runningFor(workerPod("w4", want, 3*time.Minute), "worker", 0, 90*time.Second, nil, false),
+		testNow.Add(-90*time.Second))
+	hh := deriveRollHealth([]corev1.Pod{*healthy}, want, "", testNow)
+	if hh.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q for a Ready pod that has never restarted", hh.Phase, protocol.PhaseSettled)
+	}
+	if hh.BlockingContainer != "" || hh.RestartCount != 0 || hh.LastExitCode != nil || hh.BlockingReason != "" {
+		t.Errorf("a healthy settled pod carries diagnostics %q/%q/%d/%v, want all empty — blaming a "+
+			"container on a healthy roll points an operator at innocent code",
+			hh.BlockingContainer, hh.BlockingReason, hh.RestartCount, hh.LastExitCode)
+	}
+	if !hh.PhaseSince.Equal(testNow.Add(-90 * time.Second)) {
+		t.Errorf("PhaseSince = %v, want the Ready transition — settled must still date from readiness",
+			hh.PhaseSince)
+	}
+
+	// --- 5. Ready, 5 restarts, up 30s, NO lastState at all. ---
+	//
+	// MEASURED, and it is why the anchor is state.running.startedAt: a real container
+	// instance carried restartCount 6 with `"lastState": {}` across its whole Ready
+	// window. An implementation anchoring recency on lastState.terminated.finishedAt is
+	// BLIND here and reports settled — the defect, unfixed, on the exact shape that
+	// motivated the design.
+	noLast := ready(runningFor(workerPod("w5", want, 20*time.Minute), "worker", 5, 30*time.Second, nil, false),
+		testNow.Add(-30*time.Second))
+	nh := deriveRollHealth([]corev1.Pod{*noLast}, want, "", testNow)
+	if nh.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. This container has no lastState — measured on a real pod, not "+
+			"hypothesised — so a rule needing lastState.terminated.finishedAt cannot see it at all.",
+			nh.Phase, protocol.PhaseStuck)
+	}
+	if nh.BlockingContainer != "worker" || nh.RestartCount != 5 {
+		t.Errorf("BlockingContainer = %q RestartCount = %d, want worker/5 even with no lastState",
+			nh.BlockingContainer, nh.RestartCount)
+	}
+	if nh.LastExitCode != nil {
+		t.Errorf("LastExitCode = %v, want nil — k8s genuinely had no exit code here, and inventing one "+
+			"would be the same class of lie as blanking a measured one", nh.LastExitCode)
+	}
+	if nh.BlockingReason != "Restarting" {
+		t.Errorf("BlockingReason = %q, want %q — with no termination to quote, the fallback token must "+
+			"still be true of the pod, and \"not ready\" is not", nh.BlockingReason, "Restarting")
+	}
+}
+
+// The flicker itself, which a single-tick assertion cannot see — the same discipline
+// TestRollHealthStaysRollingAcrossTicksWhileThePodIsNotReady applies to `rolling`.
+//
+// A crash-looping pod alternates Ready and not-Ready every few tens of seconds, and the
+// badge followed it: settled → stuck → settled → stuck. Asserting one Ready tick reads
+// `stuck` does not prove the flicker is gone; asserting it across the ALTERNATION does.
+// The verdict must hold `stuck` continuously, including on the Ready ticks in between.
+func TestFlappingPodDoesNotFlickerBackToSettledAcrossTicks(t *testing.T) {
+	const want = "hash-new"
+	exit1 := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+
+	// One cycle of the measured trajectory: Ready running, dead, backing off, Ready
+	// again on a fresh instance. Restart counts climb exactly as kubelet's do.
+	ticks := []struct {
+		at   time.Duration // before testNow
+		pod  func(at time.Duration) *corev1.Pod
+		what string
+	}{
+		{90 * time.Second, func(at time.Duration) *corev1.Pod {
+			return ready(runningFor(workerPod("w1", want, time.Hour), "worker", 3, 20*time.Second, exit1, false),
+				testNow.Add(-at))
+		}, "Ready, 3 restarts, instance 20s old"},
+		{60 * time.Second, func(time.Duration) *corev1.Pod {
+			p := workerPod("w1", want, time.Hour)
+			p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, corev1.ContainerStatus{
+				Name: "worker", RestartCount: 3,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}},
+			})
+			return p
+		}, "not Ready, terminated Error"},
+		{40 * time.Second, func(time.Duration) *corev1.Pod {
+			return waiting(workerPod("w1", want, time.Hour), "worker", "CrashLoopBackOff", 4, false)
+		}, "not Ready, CrashLoopBackOff"},
+		{10 * time.Second, func(at time.Duration) *corev1.Pod {
+			return ready(runningFor(workerPod("w1", want, time.Hour), "worker", 4, 5*time.Second, exit1, false),
+				testNow.Add(-at))
+		}, "Ready again, 4 restarts, instance 5s old"},
+	}
+
+	for _, tk := range ticks {
+		h := deriveRollHealth([]corev1.Pod{*tk.pod(tk.at)}, want, "", testNow)
+		if h.Phase != protocol.PhaseStuck {
+			t.Errorf("tick %q: Phase = %q, want %q. The badge alternating settled/stuck across this "+
+				"cycle IS the flicker in issue #145 — one tick reading correctly proves nothing about it.",
+				tk.what, h.Phase, protocol.PhaseStuck)
+		}
+	}
+}
+
 // A-1: a pod-list failure must NOT abort the reconcile cycle.
 //
 // MEASURED on dev-cluster: the deployed controller ServiceAccount answers `no` to

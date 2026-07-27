@@ -39,6 +39,36 @@ import (
 // The correct question is "does a pod matching what the deployment ASKED FOR exist
 // and is it Ready?", which is why every branch below reads pod status and the only
 // use of the deployment is supplying wantHash to match pods against.
+//
+// ============================================================================
+// AND `settled` IS NOT READINESS ALONE (issue #145). READ THIS BEFORE RESTORING
+// THE UNGUARDED EARLY RETURN — IT LOOKS LIKE A SIMPLIFICATION AND IS THE BUG.
+// ============================================================================
+//
+// The worker container has NO readiness probe — MEASURED on the live Deployment,
+// `readinessProbe: null`, only the dind sidecar carries a StartupProbe. So `Ready`
+// means the kubelet started the process, not that the agent works. A container that
+// starts, dies 40 seconds later and repeats is Ready for most of every cycle, and the
+// unguarded early return therefore reported `settled` on those ticks. Two symptoms
+// from that one line: the badge alternated settled/stuck every ~40s, and — since a
+// `settled` report returns before the blocking-container lookup below — the report
+// carried zeroed diagnostics that overwrote the real ones, so a worker with 5 restarts
+// and exit 1 persisted as pristine.
+//
+// THE SIGNAL WAS NEVER MISSING; THIS DERIVATION DISCARDED IT. The pod itself carries
+// `restartCount` and the current instance's start time, which together say "this thing
+// keeps dying" — see flappingContainer.
+//
+// THE OBVIOUS ALTERNATIVE WAS MEASURED AND DOES NOT WORK. The rule first proposed for
+// this was "pod Ready + the worker's own heartbeat says offline, after the register
+// convergence grace". Measured over 123 samples of a real crash-looping pod it fired
+// ZERO times, because the two signals are anti-correlated BY CONSTRUCTION: Ready means
+// the container is Running, the container dies with the agent, so the agent is alive
+// and beat within its 15s interval — it cannot be offline while Ready. (Second,
+// independent reason: PhaseSince is the Ready condition's LastTransitionTime, which
+// RESETS on every restart, so "after the grace elapsed" is never true for a flapping
+// pod.) Do not reach for the heartbeat here; it also does not belong in this module,
+// which reads pods and must not read api state.
 
 const (
 	// stuckRestartThreshold is when repeated restarts alone mean stuck, with no
@@ -73,6 +103,23 @@ const (
 	// deliberately generous — a slow image pull of the browser-inflated agent image
 	// must not read as stuck.
 	stuckAge = 10 * time.Minute
+	// flapWindow is how long a container's CURRENT instance must have been up before it
+	// stops counting as flapping (issue #145). It is kubelet's own backoff-forget
+	// interval: stay up this long and the CrashLoopBackOff is forgotten, which is the
+	// same fact stuckAge's comment and rollhealth_test.go's `running()` helper already
+	// assert from the other side.
+	//
+	// EQUAL TO stuckAge BY COINCIDENCE OF VALUE, NOT OF MEANING, which is why it is its
+	// own constant rather than a reuse. stuckAge bounds how long a REASONLESS pod may sit
+	// before it is called stuck; this bounds how recently a container must have restarted
+	// for a live restart loop to still count as one. Changing one must not silently
+	// change the other.
+	//
+	// It is also deliberately NOT part of the ControllerStuckAge relationship: the api
+	// mirrors stuckAge in its own constant and TestMaxUpgradingWindowExceedsControllerStuckAge
+	// asserts a clamp between them. NOTHING api-side mirrors flapWindow, and nothing
+	// should — the verdict it gates is derived and reported here, not recomputed there.
+	flapWindow = 10 * time.Minute
 )
 
 // blockingReasons are the container waiting reasons that mean stuck immediately,
@@ -178,10 +225,31 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 
 	health := reconcile.RollHealth{PodPhase: string(current.Status.Phase)}
 
-	if ready, at := readyCondition(current); ready {
-		health.Phase = protocol.PhaseSettled
-		health.PhaseSince = at
-		return health
+	// Ready is necessary for `settled` and NOT sufficient (issue #145) — see the header.
+	// A Ready pod with a container in a LIVE restart loop falls through to the
+	// diagnostics lookup and the stuck arms below, which is the same code path a
+	// not-Ready pod takes.
+	//
+	// 🔴 THE GUARD IS HERE, AT THE ENTRY, AND IT MUST STAY HERE. The tempting equivalent
+	// — leave the early return alone and add a recency check to the `RestartCount >=
+	// stuckRestartThreshold` arm below — is NOT equivalent and is dangerous. That arm
+	// reads a RestartCount filled by mostRestartedContainer from the kubelet's LIFETIME
+	// counter, which never decreases. Gating there lets a perfectly healthy worker with
+	// 3 restarts accumulated over days of uptime reach the arm and report `stuck`, and
+	// since issue #151 removed the INV-5 ceiling from R1 that `upgrade_failed` NEVER
+	// EXPIRES. With the guard at the entry, flappingContainer returns nil for that
+	// worker, the early return fires, and the arm stays as unreachable for Ready pods as
+	// it is today. rollhealth_test.go's "Ready + 5 restarts + up 10m1s -> settled" case
+	// is the assertion that fails if this is ever moved into the switch.
+	ready, readyAt := readyCondition(current)
+	var flapping *corev1.ContainerStatus
+	if ready {
+		flapping = flappingContainer(current, now)
+		if flapping == nil {
+			health.Phase = protocol.PhaseSettled
+			health.PhaseSince = readyAt
+			return health
+		}
 	}
 
 	// Not Ready. Find the container to blame, init containers first — that is where the
@@ -213,6 +281,25 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 		if term := lastTermination(subject); term != nil {
 			code := term.ExitCode
 			health.LastExitCode = &code
+		}
+	}
+
+	// A Ready-but-flapping pod has no CURRENT-state reason to report — its container is
+	// Running right now, so neither the Waiting nor the Terminated arm above fires and
+	// BlockingReason is left empty. The api's stuckDetail then substitutes "not ready",
+	// which is FALSE of this pod: it is Ready, it just will not stay up. So supply the
+	// reason from the last termination, and a plain token when even that is absent.
+	//
+	// CONFINED TO THIS ARM on purpose. Every other path's reason is kubelet's own word
+	// for a current state; "Restarting" is a controller-authored token, and widening it
+	// would put invented vocabulary on paths that have a real one. (It is safe against
+	// the switch below either way — neither the last termination's reason nor
+	// "Restarting" is in blockingReasons, so the verdict still comes from the restart
+	// arm, which is the arm that justified entering this branch at all.)
+	if flapping != nil && subject != nil && health.BlockingReason == "" {
+		health.BlockingReason = "Restarting"
+		if term := lastTermination(subject); term != nil && term.Reason != "" {
+			health.BlockingReason = term.Reason
 		}
 	}
 
@@ -287,6 +374,58 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 		for i := range set {
 			if t := set[i].State.Terminated; t != nil && t.ExitCode != 0 {
 				return &set[i]
+			}
+		}
+	}
+	return nil
+}
+
+// flappingContainer returns the first container in a LIVE restart loop, or nil when
+// none is (issue #145). Both conjuncts are load-bearing and neither works alone:
+//
+//   - RestartCount >= stuckRestartThreshold. The count ALONE is the trap: it is the
+//     kubelet's lifetime counter and never decreases, so "Ready + 3 restarts ⇒ broken"
+//     pins a healthy long-lived worker red forever, and post-#151 that verdict has no
+//     expiry. The threshold is deliberately the same one the not-Ready path uses, so
+//     the two paths stop disagreeing about the same pod.
+//   - The current instance has been up less than flapWindow. RECENCY ALONE would fire
+//     on a single benign restart — one OOM, one node hiccup. Together they say "keeps
+//     dying, recently", and the verdict EXPIRES on continuous uptime, which is a
+//     property of the pod rather than of anyone's memory.
+//
+// THE ANCHOR IS state.running.startedAt, NOT lastState.terminated.finishedAt, AND THAT
+// IS MEASURED RATHER THAN PREFERRED. finishedAt is the field that literally dates the
+// last death and it is the obvious choice; the data refuted it. Of 41 running samples
+// from a real crash-looping pod, EIGHT carried no lastState at all — four were before
+// the first restart (correct), but the other four were one entire container instance
+// with restartCount 6 and `"lastState": {}`. A rule needing finishedAt would have been
+// BLIND for that instance's whole Ready window, and the other six instances populated
+// it, so no amount of reading kubelet's documented behaviour would have shown this.
+// state.running.startedAt is present on every running container by construction and
+// says the same thing one step removed. Do not "simplify" it back.
+//
+// Init containers first, then app containers, matching blockingContainer: an init
+// container blocks everything behind it, so it is the honest one to name. A container
+// that is not Running cannot be flapping by this definition — it is either Waiting or
+// Terminated, which the arms below already see.
+//
+// SCANS ALL CONTAINERS, NOT JUST THE WORKER, and that is a deliberate behaviour change
+// worth stating out loud because nobody asked for it: a flapping dind sidecar will
+// report the worker as failed, naming dind. That is honest (docker runs really are
+// broken) and it matches how blockingContainer and mostRestartedContainer already
+// treat the pod, but it is wider than "the agent keeps dying".
+func flappingContainer(p *corev1.Pod, now time.Time) *corev1.ContainerStatus {
+	for _, set := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
+		for i := range set {
+			cs := &set[i]
+			if cs.RestartCount < stuckRestartThreshold {
+				continue
+			}
+			if cs.State.Running == nil {
+				continue
+			}
+			if now.Sub(cs.State.Running.StartedAt.Time) < flapWindow {
+				return cs
 			}
 		}
 	}
