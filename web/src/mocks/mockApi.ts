@@ -17,6 +17,7 @@ import {
   type CliAuthRequestMeta,
   type CliToken,
   type CliTokenScope,
+  type Card,
   type CreatedIssue,
   type Disposition,
   type IssueDraft,
@@ -1774,6 +1775,42 @@ export const mockApi = {
     for (const card of b.cards) if (card.column && !names.has(card.column)) card.column = "";
     return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } });
   },
+  // Manual board order (PRD #102 M5). This is a SECOND IMPLEMENTATION of the server's
+  // freeze, so it is a contract, not a convenience: mockApi.reorder.test.ts pins the
+  // four behaviours below one case each, because a fixture that only walks the happy
+  // path agrees with a broken mock on everything it covers.
+  //
+  // The demo board has no evicted iid and no unlisted open card, so a snapshot-style
+  // fixture would pass against a mock missing (2) and (3) entirely.
+  //
+  //   1. cards are reordered to the submitted iid order;
+  //   2. an iid not on the board is SKIPPED, not thrown on (the server no-ops per iid,
+  //      because an eviction can land between a client's render and its submit);
+  //   3. open cards absent from the list fall to the end in iid order (the mirror of
+  //      the server's ClearBoardOrderExcept nulling them, plus its NULLS-LAST read);
+  //   4. closed cards are untouched and keep their place.
+  reorderBoard: async (repoId: string, iids: number[]) => {
+    const b = state.boards.get(repoId);
+    if (!b) throw new ApiError(404, "board not found");
+    if (iids.length > 0) {
+      const byIID = new Map(b.cards.map((c) => [c.iid, c]));
+      const seen = new Set<number>();
+      const ordered: Card[] = [];
+      for (const iid of iids) {
+        const card = byIID.get(iid);
+        // (2) unknown iid: skip. (Also skips a duplicate, matching the server's dedupe.)
+        if (!card || card.closed || seen.has(iid)) continue;
+        seen.add(iid);
+        ordered.push(card);
+      }
+      // (3) + (4): everything not named keeps a NULL position server-side, which reads
+      // back after the positioned rows, in iid order. Closed cards live here too and so
+      // are never given a rank.
+      const rest = b.cards.filter((c) => !seen.has(c.iid)).sort((x, y) => x.iid - y.iid);
+      b.cards = [...ordered, ...rest];
+    }
+    return delay({ board: { ...b, cards: b.cards.map((c) => ({ ...c })) } });
+  },
   moveIssue: async (repoId: string, iid: number, toColumn: string) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === iid);
@@ -1836,6 +1873,9 @@ export const mockApi = {
       column: "",
       closed: false,
       conflict: false,
+      // A just-created issue is the most recently updated thing on the board, so it
+      // must lead in "Last updated" mode rather than sinking on a zero value.
+      forge_updated_at: new Date().toISOString(),
       latest_run: null,
       pipeline: null,
     };

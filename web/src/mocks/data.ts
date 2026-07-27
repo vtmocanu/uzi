@@ -821,6 +821,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(5),
         latest_run: null,
         pipeline: null,
       },
@@ -836,6 +837,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(90),
         latest_run: null,
         // "canceled" → the neutral tone (also covers skipped / no-CI).
         pipeline: {
@@ -858,6 +860,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(20),
         latest_run: null,
         // "manual" → the attention tone (a human must click play in GitLab).
         pipeline: {
@@ -882,6 +885,7 @@ export const mockBoards: Record<string, Board> = {
         conflict: false,
         // Freshly queued, not yet claimed by a worker: renders the "queued" badge
         // (violet under the mission theme, gray under ember) on the board card.
+        forge_updated_at: minsAgo(240),
         latest_run: latestRun({
           id: "run-queued",
           status: "queued",
@@ -902,6 +906,7 @@ export const mockBoards: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(45),
         latest_run: latestRun({
           id: LIVE_RUN_ID,
           status: "running",
@@ -930,6 +935,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: true,
+        forge_updated_at: minsAgo(1500),
         latest_run: null,
         // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
         pipeline: {
@@ -952,6 +958,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(8),
         latest_run: latestRun({
           id: "run-awaiting",
           status: "awaiting_approval",
@@ -973,6 +980,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(3000),
         latest_run: latestRun({
           id: "run-done",
           status: "completed",
@@ -999,6 +1007,7 @@ export const mockBoards: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(130),
         latest_run: latestRun({
           id: "run-closed",
           status: "completed",
@@ -1022,6 +1031,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(4200),
         latest_run: null,
         pipeline: null,
       },
@@ -1056,6 +1066,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(60),
         latest_run: null,
         pipeline: null,
       },
@@ -1071,6 +1082,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(12),
         latest_run: null,
         pipeline: null,
       },
@@ -1086,6 +1098,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Doing",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(700),
         latest_run: latestRun({
           id: "run-failed",
           status: "failed",
@@ -1109,6 +1122,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(5400),
         latest_run: latestRun({
           id: "run-cancelled",
           status: "cancelled",

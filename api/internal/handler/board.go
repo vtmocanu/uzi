@@ -60,6 +60,20 @@ type cardDTO struct {
 	// Conflict flags an issue that arrived carrying more than one column label;
 	// it is shown in the highest-positioned one until the next move normalizes it.
 	Conflict bool `json:"conflict"`
+	// ForgeUpdatedAt is the issue's forge-side updated_at (issues.forge_updated_at,
+	// NOT NULL), for the board's "Last updated" sort mode (PRD #102 M5).
+	//
+	// It must be set by BOTH card builders — assembleCards AND issueToCard. Missing
+	// it in issueToCard (the single-card path behind MoveIssue and SetIssuePrdless)
+	// is silent: the card comes back with the zero time, marshals as
+	// "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last updated mode
+	// while every other card is fine. The typechecker cannot see it; only a test that
+	// drags in that mode can.
+	//
+	// board_position deliberately does NOT ride the card. The order is expressed by
+	// ListIssuesByRepo's ORDER BY, never as a number the client reasons about, which
+	// is what lets the web client's Manual mode be the identity function.
+	ForgeUpdatedAt time.Time `json:"forge_updated_at"`
 	// LatestRun is the newest run for this issue, or null when it has never run.
 	// It carries only display state (no secrets); the run-view link is owner-only,
 	// so IsMine tells the client whether the viewer may open it.
@@ -444,8 +458,10 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			Column:     col,
 			Closed:     closed,
 			Conflict:   conflict,
-			LatestRun:  latestByIID[is.ForgeIssueIid],
-			Pipeline:   cardPipelines[is.ForgeIssueIid],
+			// Sibling of issueToCard's — keep the two in step (see cardDTO.ForgeUpdatedAt).
+			ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
+			LatestRun:      latestByIID[is.ForgeIssueIid],
+			Pipeline:       cardPipelines[is.ForgeIssueIid],
 		}
 		if is.Author.Valid {
 			a := is.Author.String
@@ -530,6 +546,124 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	b, ok := h.buildBoard(w, r, repo)
+	if !ok {
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// ── Manual order ────────────────────────────────────────────────────────────
+
+// maxBoardOrderIids caps how many iids one freeze may carry. Far above the PRD's
+// own scale expectation (boards here are hundreds of cards); it exists because an
+// array-accepting endpoint must not be handable an unbounded one, not because any
+// real board approaches it. Mirrors maxBoardColumns' shape.
+const maxBoardOrderIids = 5000
+
+type setBoardOrderRequest struct {
+	IIDs []int64 `json:"iids"`
+}
+
+// SetBoardOrder replaces the repo's manual card order wholesale (PRD #102 M5,
+// Decision 7b). The client sends the WHOLE intended order as a board-global iid
+// list and the server's only job is to number it.
+//
+// Why the client owns the order and not the server: the sort mode lives in the
+// browser's localStorage (Decision 8) and two of the five modes are computed from
+// data the server would have to re-derive, so any "put #7 after #12, you work out
+// the rest" contract would need a Go reimplementation of the TypeScript sort. Two
+// implementations of one ordering is a contract needing a differential test, for no
+// benefit.
+//
+// The freeze is board-wide and unconditional on every drop, including one already in
+// Manual mode. Gating it on "the mode is not Manual" reintroduces the exact bug
+// Decision 7b exists to prevent: on an untouched board every position is NULL, so a
+// single written position sorts ahead of every NULL under NULLS LAST and a card
+// dragged to the BOTTOM of its column renders at the TOP.
+//
+// Both statements run in ONE transaction. Between them the board is torn (some rows
+// renumbered, others still holding old numbers and not yet cleared), and the board
+// polls every 10s from possibly more than one tab, so a GET landing in that window
+// would render a scrambled order. The transaction also makes a failure of the second
+// statement roll the first back rather than persist half a freeze. It deliberately
+// does NOT span the forge label write a cross-column drag performs first: that is a
+// separate HTTP call to another system.
+//
+// Concurrency is last-writer-wins across the owner's own tabs and devices, accepted
+// in Decision 7b: boardDTO carries no version or etag for a client to send, and the
+// existing 10s refetch resolves it. There is no second user (issues are per-owner via
+// repos -> forge_connections.user_id), which is what makes that acceptable.
+func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	var req setBoardOrderRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Dedupe preserving first occurrence, the precedent ConfigureColumns sets for its
+	// column names. A duplicate iid is a client bug and must not 400 somebody's drag;
+	// left in, it would consume an ordinal and shift every card after it.
+	seen := make(map[int64]struct{}, len(req.IIDs))
+	iids := make([]int64, 0, len(req.IIDs))
+	for _, iid := range req.IIDs {
+		if _, dup := seen[iid]; dup {
+			continue
+		}
+		seen[iid] = struct{}{}
+		iids = append(iids, iid)
+	}
+	if len(iids) > maxBoardOrderIids {
+		httpx.Error(w, http.StatusBadRequest, "too many issues (max "+strconv.Itoa(maxBoardOrderIids)+")")
+		return
+	}
+
+	// THE EMPTY-LIST GUARD IS LOAD-BEARING, NOT DEFENSIVE TIDINESS. ClearBoardOrderExcept
+	// filters on `forge_issue_iid <> ALL(@iids)`, and `<> ALL('{}')` is TRUE for every
+	// row, so running it with an empty array wipes every position on the board. Same
+	// trap DeleteIssuesNotIn's comment documents for its keep-set. Running neither
+	// statement is also the right answer semantically: an empty submit expresses no
+	// order, so there is nothing to record.
+	if len(iids) > 0 {
+		tx, err := h.pool.Begin(r.Context())
+		if err != nil {
+			slog.Error("begin board order tx", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer tx.Rollback(r.Context())
+		qtx := h.q.WithTx(tx)
+
+		if err := qtx.SetBoardOrderPositions(r.Context(), store.SetBoardOrderPositionsParams{
+			RepoID: repo.ID,
+			Iids:   iids,
+		}); err != nil {
+			slog.Error("set board order positions", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := qtx.ClearBoardOrderExcept(r.Context(), store.ClearBoardOrderExceptParams{
+			RepoID: repo.ID,
+			Iids:   iids,
+		}); err != nil {
+			slog.Error("clear board order", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			slog.Error("commit board order tx", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	// The full board, matching ConfigureColumns and SyncRepo. The client adopts it
+	// wholesale, which is what makes Manual mode "render the payload order" work with
+	// no client-side bookkeeping.
 	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
@@ -761,6 +895,11 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		Column:     col,
 		Closed:     closed,
 		Conflict:   conflict,
+		// Sibling of assembleCards' — this is the single-card path (MoveIssue,
+		// SetIssuePrdless), and omitting it here is the silent half of the bug
+		// cardDTO.ForgeUpdatedAt describes: only a just-dragged card would carry the
+		// zero time, so every other card looks right.
+		ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
 	}
 	if is.Author.Valid {
 		a := is.Author.String

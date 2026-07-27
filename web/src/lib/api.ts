@@ -362,6 +362,12 @@ export interface Card {
   column: string;
   closed: boolean;
   conflict: boolean;
+  // The issue's forge-side updated_at (RFC3339), for the board's "Last updated" sort
+  // mode (PRD #102 M5). Always present: the column is NOT NULL server-side. Compare it
+  // with Date.parse, never as a string — Go trims trailing zeros from RFC3339
+  // fractional seconds, so "…T10:00:00Z" and "…T10:00:00.5Z" do not sort correctly
+  // lexicographically.
+  forge_updated_at: string;
   latest_run: LatestRun | null;
   // CI status of the card's most-recent run's branch (PRD #6), null when that run
   // has no branch, no CI, or the card has never run. Drives the per-card badge and
@@ -1838,6 +1844,13 @@ const realApi = {
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>
     request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, { columns }),
+  // Replace the board's manual card order wholesale (PRD #102 M5). `iids` is the
+  // board-GLOBAL order of every non-closed card, not just the column that changed:
+  // the drop freezes the whole displayed order before it moves anything, so a card
+  // sorted by something other than issue number does not re-sort under the user's
+  // hand. Returns the authoritative board, which the caller adopts wholesale.
+  reorderBoard: (repoId: string, iids: number[]) =>
+    request<{ board: Board }>("PUT", `/repos/${repoId}/board/order`, { iids }),
   getIssue: (repoId: string, iid: number) =>
     request<{ issue: IssueDetail }>("GET", `/repos/${repoId}/issues/${iid}`),
   moveIssue: (repoId: string, iid: number, toColumn: string) =>

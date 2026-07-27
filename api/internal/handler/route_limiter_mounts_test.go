@@ -291,6 +291,13 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/me/slack/override", limSlackDM},
 	{"PUT", "/api/repos/{id}", noLimiter},
 	{"PUT", "/api/repos/{id}/board/columns", noLimiter},
+	// noLimiter is DELIBERATE (PRD #102 M5), and stated here because every other
+	// board WRITE route carries limForge, so a bare row would read as an oversight.
+	// SetBoardOrder makes zero forge calls — it is a uzi-local UPDATE on `issues`.
+	// Putting a drag on the per-user FORGE budget would let a burst of reordering
+	// starve the user's actual forge operations (move, sync, issue create), which is
+	// the thing that budget exists to protect.
+	{"PUT", "/api/repos/{id}/board/order", noLimiter},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},

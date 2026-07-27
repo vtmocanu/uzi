@@ -729,6 +729,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
+				// Manual card order (PRD #102 M5). The other whole-board replace, so it
+				// sits beside the columns route and is a PUT for the same reason.
+				//
+				// DELIBERATELY NOT on forgeLimiter.PerUserMiddleware, unlike every write
+				// route below it — this endpoint makes ZERO forge calls, it is a uzi-local
+				// write. Putting a drag on the per-user FORGE budget would let a burst of
+				// reordering starve the user's actual forge operations (move, sync, issue
+				// create), which is the thing that budget exists to protect.
+				r.Put("/{id}/board/order", h.SetBoardOrder)
 				// The in-app issue view fetches the issue (with its description) live
 				// from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issues/{iid}", h.GetIssueDetail)
