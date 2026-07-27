@@ -167,6 +167,25 @@ So `env -i … --env-file <dummy.env> -p smk-<unique> up` is **NOT isolated**, a
 
 **Both halves are required:** a `ports: !override` overlay **and** an explicit `BASE=http://127.0.0.1:<port>`. `e2e/docker-compose.e2e.yml` is the precedent and exists for exactly this reason.
 
+**Two more things the recipe needs, both found by RUNNING it and neither guessable from reading:**
+
+3. **`UZI_SECRET_KEY` must be genuine base64.** A made-up placeholder does not boot: the refuse-to-start guard fires with `secretbox: UZI_SECRET_KEY is not valid base64` (`api/internal/secretbox/secretbox.go:130`). Generate it, do not invent it:
+
+   ```sh
+   UZI_SECRET_KEY=$(openssl rand -base64 32)
+   ```
+
+4. **smoke.sh needs NO seeded admin, which INVERTS the general rule above for this one script.** Its first assertion is a concurrent first-registration race expecting exactly one admin to win (`scripts/smoke.sh:31`), so a seeded admin makes it fail with `expected exactly 1 admin from the race, got 0`. So:
+
+   - **general isolated stack:** set the seed vars and verify with `compose config` that **the dummy admin is what seeds**;
+   - **smoke.sh:** leave `UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME` **empty**, and verify that **nothing seeds**.
+
+   Naming the exact seed vars above makes it *more* likely someone sets them, which is why this case is spelled out rather than left implied.
+
+**Operational, between attempts:** a failed first `up` leaves a `pgdata` volume initialised with the OLD password, so a retry after changing `POSTGRES_PASSWORD` fails SASL auth. Run `docker compose -p <your-project> down -v` **by explicit project name** between attempts, never a bare `down -v`.
+
+> **Items 3 and 4 exist because this recipe was written into the doc without being executed.** The port half was measured and is correct; the surrounding procedure was assembled from reading and had two defects that only running it could surface. That is the same gap as a comment describing a mechanism nobody re-derived, and **a runbook is the worse place for it, because the reader executes it against real infrastructure instead of merely believing it.** A procedure is not documented until someone has run what is written down.
+
 CI (`.gitlab-ci.yml`, PRD #52) now runs the real gates on every MR + `main`: validate/test across all three toolchains + `helm lint`/`template`, plus kaniko validation builds of the api/web images. `v*` tags additionally publish the images + OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the tag), and k8s deploy is GitOps via ArgoCD to dev-cluster — see `deploy/` (the chart + `deploy/README.md` release runbook). **The compose e2e harness (`./e2e/run-e2e.sh`) is NOT in CI** — it needs docker compose on the runner — so it stays a purely local gate. **`./scripts/smoke.sh` is a different story and the old wording here was wrong about it:** `e2e:kind-smoke` (`.gitlab-ci.yml:730`) stands up a KinD cluster, `helm install`s the chart and runs `bash scripts/smoke.sh` against it. So smoke.sh *does* run in CI. **But only on PROTECTED refs** (`rules: if $CI_COMMIT_REF_PROTECTED == "true"`), i.e. `main` and tags — never on an MR pipeline. So it is a POST-merge gate in CI and still a PRE-merge gate only locally, which is the distinction the previous sentence collapsed. Run both locally before merging; do not read a green MR pipeline as smoke having passed. *(Corrected 2026-07-25: the line read "e2e is deliberately NOT in CI … `./scripts/smoke.sh` stays the local pre-merge gate", which was true when written and became false when PRD #52 M8 added `e2e:kind-smoke` in `67e64972`.)*
 
 **A HELM TEMPLATE COMMENT ENDING `*/ -}}` DIRECTLY BEFORE A `---` DELETES AN OBJECT FROM THE MANIFEST, SILENTLY.** The `-}}` trims the following whitespace *including the newline*, so the document separator is glued onto the previous value and two objects merge into ONE YAML document with duplicate keys — and every YAML parser (ArgoCD's included) keeps the LAST one. Measured 2026-07-27 (issue #149), rendered line 903:
