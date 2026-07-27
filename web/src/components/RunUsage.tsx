@@ -25,6 +25,10 @@ function Stat({ label, value, cost, children }: { label: string; value: string; 
 function Th({ children, left }: { children: ReactNode; left?: boolean }) {
   return (
     <th
+      // WCAG 1.3.1: without scope, a screen reader cannot tie a data cell to its header,
+      // and these tables are all numbers — a figure read without its column is worse than
+      // unread. Every Th here is a column header; there are no row headers in this file.
+      scope="col"
       className={cx(
         "border-b border-edge px-2.5 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-faint",
         left ? "text-left" : "text-right",
@@ -142,12 +146,20 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
 
       <details className="mt-3 group" open>
         <summary className="cursor-pointer list-none text-xs text-muted marker:content-none">
-          <span className="text-faint group-open:hidden">▸ </span>
-          <span className="hidden text-faint group-open:inline">▾ </span>
+          {/* <details>/<summary> already conveys expanded state natively, so an announced
+              triangle is a second, contradictory reading of the same fact. Matches
+              AgentChip's status dot two functions down — consistency, not a new rule. */}
+          <span aria-hidden="true" className="text-faint group-open:hidden">▸ </span>
+          <span aria-hidden="true" className="hidden text-faint group-open:inline">▾ </span>
           Per-phase breakdown
         </summary>
-        <div className="mt-2 overflow-x-auto">
-          <table className="w-full min-w-[560px] border-collapse text-xs">
+        {/* WCAG 2.1.1: this scrolls at narrow widths (measured 560 wide in a 301 viewport)
+            and holds nothing focusable, so without tabIndex a keyboard-only user cannot
+            reach OR scroll it. The clipped content is numbers cut mid-value ("21.", "114."),
+            which reads as a wrong figure rather than as "there is more here" — the reason
+            this is a correctness bug and not only an access one. */}
+        <div className="mt-2 overflow-x-auto" tabIndex={0} role="region" aria-label="Per-phase usage table, scrollable">
+          <table aria-label="Per-phase usage" className="w-full min-w-[560px] border-collapse text-xs">
             <thead>
               <tr>
                 <Th left>Phase</Th>
@@ -185,12 +197,15 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
       {agents.length > 0 && (
         <details className="mt-3 group" open>
           <summary className="cursor-pointer list-none text-xs text-muted marker:content-none">
-            <span className="text-faint group-open:hidden">▸ </span>
-            <span className="hidden text-faint group-open:inline">▾ </span>
+            <span aria-hidden="true" className="text-faint group-open:hidden">▸ </span>
+            <span aria-hidden="true" className="hidden text-faint group-open:inline">▾ </span>
             Per-agent breakdown
           </summary>
-          <div className="mt-2 overflow-x-auto">
-            <table className="w-full min-w-[600px] border-collapse text-xs">
+          {/* See the per-phase wrapper above. The names differ because two ADJACENT
+              unlabelled data tables is precisely where a screen-reader user loses which
+              one they are in. */}
+          <div className="mt-2 overflow-x-auto" tabIndex={0} role="region" aria-label="Per-agent usage table, scrollable">
+            <table aria-label="Per-agent usage" className="w-full min-w-[600px] border-collapse text-xs">
               <thead>
                 <tr>
                   <Th left>Agent</Th>

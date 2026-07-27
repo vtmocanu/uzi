@@ -275,3 +275,55 @@ describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
     }
   });
 });
+
+// Item 8: three mechanical a11y defects, all pre-existing, found by web-ux while measuring
+// the #152 contrast fix. Attribute assertions, so the positive control is cheap — drop the
+// attribute, confirm the case reds — and therefore still required.
+describe("RunUsagePanel accessibility (item 8)", () => {
+  function panel() {
+    return render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+  }
+
+  it("makes both scroll regions keyboard-reachable (WCAG 2.1.1)", () => {
+    const { container } = panel();
+    const wrappers = [...container.querySelectorAll("div.overflow-x-auto")];
+    // Both breakdown tables, not one: the per-agent table overflows harder than the
+    // per-phase one (600 vs 560 minimum width against a 301px viewport).
+    expect(wrappers.length).toBe(2);
+    for (const w of wrappers) {
+      // Without tabindex a scrollable region holding nothing focusable cannot be reached
+      // OR scrolled by keyboard — and the clipped content is numbers cut mid-value, so it
+      // reads as a wrong figure rather than as "there is more here".
+      expect(w.getAttribute("tabindex")).toBe("0");
+      expect(w.getAttribute("role")).toBe("region");
+      // A region role without an accessible name is not exposed as a landmark at all.
+      expect(w.getAttribute("aria-label")).toBeTruthy();
+    }
+    // The two names must DIFFER: two adjacent scrollable data regions with one name is
+    // the case a screen-reader user cannot navigate between.
+    expect(wrappers[0]!.getAttribute("aria-label")).not.toBe(wrappers[1]!.getAttribute("aria-label"));
+  });
+
+  it("names both tables and scopes every column header (WCAG 1.3.1)", () => {
+    const { container } = panel();
+    const tables = [...container.querySelectorAll("table")];
+    expect(tables.length).toBe(2);
+    expect(tables.map((t) => t.getAttribute("aria-label"))).toEqual(["Per-phase usage", "Per-agent usage"]);
+    // Every th is a COLUMN header here; a data cell read without its column is a number
+    // with no meaning. Asserted over all of them so a new column cannot skip it.
+    const ths = [...container.querySelectorAll("th")];
+    expect(ths.length).toBeGreaterThan(0);
+    for (const th of ths) expect(th.getAttribute("scope")).toBe("col");
+  });
+
+  it("hides the decorative disclosure triangles from assistive tech", () => {
+    const { container } = panel();
+    // <details>/<summary> conveys expanded state natively, so an announced triangle is a
+    // second and contradictory reading of the same fact.
+    const glyphs = [...container.querySelectorAll("summary span")].filter((s) =>
+      /[▸▾]/.test(s.textContent ?? ""),
+    );
+    expect(glyphs.length).toBe(4); // two per <details>, one for each open state
+    for (const g of glyphs) expect(g.getAttribute("aria-hidden")).toBe("true");
+  });
+});
