@@ -49,14 +49,17 @@ type CreateSelfImproveRunParams struct {
 // Queue the autonomous self-improvement run against uzi's own repo (Decision 10).
 // Issue-shaped (repo_id + issue_iid from the tracking issue, satisfying the
 // self_improve kind-shape CHECK), auto_approve=true (autopilot-style: no human plan
-// gate — the plan is still emitted as a `plan` run_message and inspectable on the
-// feed, though runs.plan_md stays NULL: SetRunAwaitingApproval, in runtime.sql, is
-// the ONLY writer of that column in the whole schema, and the autopilot branch of
-// the worker's gatePlan reports {status:"running"} and never enters
-// awaiting_approval. Corrected 2026-07-26, PRD #121 M3: this comment claimed
-// plan_md was "stored", which would silently no-op any reader of the column on
-// exactly the mode with no human in the loop), kind='self_improve'. Shaped
-// like CreateCIFixRun — a dedicated insert, NOT createRun, because the normal path
+// gate), kind='self_improve'.
+//
+// The plan is still emitted as a `plan` run_message and is inspectable on the feed,
+// but runs.plan_md stays NULL for every self_improve run: SetRunAwaitingApproval
+// (runtime.sql) is the ONLY writer of that column in the whole schema, and the
+// autopilot branch of the worker's gatePlan reports {status:"running"}, never
+// entering awaiting_approval. This comment used to say plan_md was "stored", which
+// would send any reader of the column to a silent no-op on exactly the mode with no
+// human in the loop (corrected 2026-07-26, PRD #121 M3).
+//
+// Shaped like CreateCIFixRun — a dedicated insert, NOT createRun, because the normal path
 // requires the issue to be in the poller cache and to carry a PRD link, neither of
 // which a just-filed tracking issue has (review B2); the engine snapshots
 // title/description directly. origin_column stays NULL — the tracking issue's
