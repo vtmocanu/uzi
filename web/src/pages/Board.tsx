@@ -1110,12 +1110,33 @@ export function IssueCard({
         // and ring treatment would put the least urgent card on the board at the top
         // of the hierarchy.
         //
-        // The dashed border alone does NOT carry it. Measured against the composited
-        // card background, --edge is 1.25:1 in ember and 1.21:1 in mission, against
-        // WCAG 1.4.11's 3:1 for a non-text indicator — and an ordinary card's border
-        // is ALREADY border-edge, so dashed-versus-solid at 1.2:1 would be the entire
-        // distinction. bg-transparent is the second, non-colour cue, which is exactly
-        // how the Closed LANE earns its separation from its bg-surface/60 neighbours.
+        // NEITHER CUE CLEARS WCAG 1.4.11's 3:1, and that is MEASURED. Sampled from
+        // getComputedStyle on the rendered cards of a mock build, in both themes,
+        // compositing each card's effective background up the tree (the numbers agree
+        // with the same figures derived from the index.css tokens, to 0.01):
+        //
+        //                                        ember    mission
+        //   dashed border vs the non-PRD card    1.39:1   1.35:1
+        //   PRD card bg vs non-PRD card bg       1.09:1   1.09:1
+        //
+        // So the dashed border is near-invisible, and bg-transparent does not rescue
+        // it. The rationale that picked bg-transparent — that it is how the Closed
+        // LANE earns its separation — does not survive measurement either: that lane's
+        // own background separation is 1.03:1 (ember) / 1.04:1 (mission), weaker than
+        // the border it was supposed to be supplementing. What actually distinguishes
+        // the Closed lane is its header text, and what actually distinguishes a
+        // non-PRD card is the BUTTON TEXT below: "Promote to PRD" where a PRD card
+        // says "Start run". Decision 17 says as much itself.
+        //
+        // Kept as approved rather than changed here, because the treatment is the
+        // lead's and web-ux re-measures when M6 lands. The measured fix is one token:
+        // border-faint clears the threshold in both themes (5.16:1 / 5.08:1) and stays
+        // quiet, so it collides with neither `loud` (the warn ring, reserved for
+        // awaiting_approval) nor opacity-40 (mid-drag).
+        //
+        // The one card with NO textual cue is a non-PRD card that has closed on the
+        // forge and not yet been evicted: promotable is false, isPRD is false, so it
+        // renders no button at all. That window is the one docs/board.md documents.
         isPRD ? "bg-raised/80" : "border-dashed bg-transparent",
         loud ? "border-warn/60 ring-2 ring-warn/40" : "border-edge",
         draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
