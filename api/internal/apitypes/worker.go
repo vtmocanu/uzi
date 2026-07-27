@@ -113,6 +113,14 @@ type WorkerDTO struct {
 	// that no longer exists, and each of them would have to re-derive the same rule to
 	// avoid it. The server applies it once instead, so "pinned" here always has an id
 	// beside it.
+	//
+	// THE COST, NAMED SO IT IS NOT READ AS AN OVERSIGHT: "you stored pinned" is
+	// deliberately UNRECOVERABLE through this API. There is no field that reports the
+	// raw column, and adding one would recreate the hazard — a client could then
+	// render the stored value and show a pin to a deleted token. It is not
+	// information a user is missing, because D9 makes such a worker BE on the
+	// default: the mode it resolves under is the only one that describes what its
+	// next claim will spend. Do not "fix" this by exposing the stored value.
 	AnthropicBindMode string `json:"anthropic_bind_mode"`
 }
 

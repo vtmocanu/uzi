@@ -836,11 +836,28 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
 // single page-level render would, and this half reddens on exactly the mutation that
 // went undetected.
 describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
+  // 🔴 A SOURCE-TEXT CONTROL IS SATISFIED BY DISABLED CODE, and the first version of
+  // this guard was. `toContain` over raw file text does not know what a comment is,
+  // so `{/* <RunCredential run={run} /> */}` passed while the chip rendered nowhere.
+  // Measured: deleting the JSX reddened, commenting it out left all 42 green.
+  //
+  // The generalisation is worth more than the fix, because this is the THIRD
+  // presence-over-source control on this branch (with M3-D's backfill assertion):
+  // a control that asserts something EXISTS in source must strip comments first, or
+  // it proves only that the text is present, not that it runs. Note the direction
+  // matters — an ABSENCE assertion (see rateLimits.ts's "derives nothing" guard) is
+  // correct to ignore commented-out code, because disabled code is not a second
+  // implementation. Presence and absence have opposite relationships to comments.
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "") // JSX comments
+    .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+    .replace(/^\s*\/\/.*$/gm, ""); // line comments
+
   it("renders the credential chip in the run header", () => {
-    expect(runViewSource).toContain("<RunCredential run={run} />");
+    expect(live).toContain("<RunCredential run={run} />");
   });
 
   it("imports the component it renders", () => {
-    expect(runViewSource).toContain('from "../components/RunCredential"');
+    expect(live).toContain('from "../components/RunCredential"');
   });
 });

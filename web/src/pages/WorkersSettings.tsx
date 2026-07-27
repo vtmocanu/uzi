@@ -479,14 +479,22 @@ export function WorkersSettings() {
                         disabled={tokenBusy === w.id}
                         onChange={(e) => void rebind(w.id, e.target.value)}
                       >
-                        <option value="">default token</option>
-                        <option value={AUTO_OPTION}>auto (from pool)</option>
-                        {tokens.map((t) => (
-                          <option key={t.id} value={t.label}>
-                            {t.label}
-                            {t.is_default ? " (default)" : ""}
-                          </option>
-                        ))}
+                        {/* web-ux F15: three of four options used to contain the
+                            word "default" — `default token` (the user's default),
+                            `default (default)` (a token NAMED default), and M3's new
+                            auto. The two account-level choices now read as sentences
+                            and the named tokens sit under a group label, so the
+                            question each option answers is different from the others. */}
+                        <option value="">Use my default token</option>
+                        <option value={AUTO_OPTION}>Auto-select from the pool</option>
+                        <optgroup label="Pin to a token">
+                          {tokens.map((t) => (
+                            <option key={t.id} value={t.label}>
+                              {t.label}
+                              {t.is_default ? " (your default)" : ""}
+                            </option>
+                          ))}
+                        </optgroup>
                       </Select>
                     )}
                     {confirmingDelete !== w.id && (
