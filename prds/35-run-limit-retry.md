@@ -1,10 +1,12 @@
 # PRD #35: Retry after Anthropic usage limit — park runs until the limit resets
 
 **GitLab Issue**: [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)
-**Status**: Draft — reviewed 2026-07-12 by 3 agents (design review, security audit, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). Fact-check: every claim verified; four citation nits fixed.
+**Status**: Draft — reviewed 2026-07-12 by 3 agents (design review, security audit, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). **Re-verified 2026-07-27 against HEAD `ca597779`** (1343 commits / 185 merges after authoring) — citations refreshed, six claims refuted, four prescriptions dropped as already-satisfied (marked ↳2026-07-27). The original header claimed "Fact-check: every claim verified"; that was not true of the prior-art paragraph, which was wrong at authoring time against a submodule pointer that never moved — see the Prior-art note below.
 **Priority**: Medium
 **Created**: 2026-07-12
-**Depends on**: PRD #4 (runs/claim/sweeper, done), PRD #42 (worker run slots, done). Related: PRD #40 (token usage — touches the same `mapResult` seam), PRD #47 (run health — a parked run must read as "waiting", not "stalled"), PRD #25 (Slack notice), specs/ai.md §188/§191 (per-user token concurrency budget — the pressure that makes limits likelier; still out of scope here).
+**Depends on**: PRD #4 (runs/claim/sweeper, done), PRD #42 (worker run slots, done).
+**Related (done since authoring, and they change this PRD's surface)**: PRD #111 (auto-select Anthropic credential at claim time — a promoted run re-runs selection, see Decision 6e), PRD #104 (named tokens; `runs.anthropic_secret_id` and siblings), PRD #53 (per-token rate-limit gauge — the server now has its own reset clock, see Decision 4), PRD #108 (auto-stop sweeper pass + `rmTreeForce` cleanup, see Decisions 3 and 6a), issue #105 (resume-dropped degradation — softens Decision 6a), PRD #64 / #112 (CLI + TUI are a third consumer of run status, see M-CLI), PRD #47 (run health — a parked run must read as "waiting", not "stalled"; its exit contract is now on every server-side status write), PRD #40 (token usage, done), PRD #32 (vault gate, done), PRD #25 (Slack notice).
+**Also related**: specs/ai.md §188/§191 (per-user token concurrency budget — the pressure that makes limits likelier; still out of scope here).
 
 ## Problem
 
@@ -16,31 +18,45 @@ seven-day window), the run dies:
    uzi never sees those. But a *sustained* limit (window reset minutes-to-hours out,
    beyond the SDK's retry budget) surfaces as a terminal error result, and the worker
    collapses every error result into a thrown `agent run failed: <subtype>`
-   (`agent/src/sdk-executor.ts:509-522`; for a usage-limit death the subtype is
+   (`agent/src/sdk-executor.ts:858-873`; for a usage-limit death the subtype is
    `error_during_execution`) → `status=failed` with that string as the whole
-   explanation (`agent/src/runner.ts:259-272`). No branch inspects *why*.
+   explanation (`agent/src/runner.ts:460-473`). No branch inspects *why*.
 2. The SDK tells us everything we'd need and uzi throws it away:
    `mapSdkMessage` handles only `assistant|user|result|system(init)`
-   (`agent/src/sdk-messages.ts:135-160`), silently dropping `rate_limit_event`
+   (`agent/src/sdk-messages.ts:221-252`), silently dropping `rate_limit_event`
    frames (`SDKRateLimitInfo`: `status: 'rejected'`, `resetsAt` epoch,
-   `rateLimitType: 'five_hour'|'seven_day'|…`, sdk.d.ts:3984-3999), `api_retry`
+   `rateLimitType: 'five_hour'|'seven_day'|…`, sdk.d.ts:4250-4262), `api_retry`
    progress, and the result frame's `terminal_reason`
-   (`'blocking_limit'|'rapid_refill_breaker'`, sdk.d.ts:6553) that names the
-   usage-limit death explicitly.
+   (`'blocking_limit'|'rapid_refill_breaker'`, sdk.d.ts:6909 — now a 19-member
+   union, both members still present) that names the usage-limit death explicitly.
+   Re-verified 2026-07-27: zero hits for `rate_limit_event`, `api_retry` or
+   `terminal_reason` anywhere in `agent/src/`.
 3. Nothing retries a worker-reported failure. Requeue exists only for worker death
-   (stale heartbeat / register orphan, `runtime.sql:381-410`), and there is no
-   not-before/backoff gate anywhere in the claim path — a requeued run is claimable
-   on the next poll.
+   (stale heartbeat / register orphan, `runtime.sql:818-834` `RequeueRunsOfStaleWorkers`
+   and `:851-864` `RequeueWorkerRuns`), and there is no not-before/backoff gate
+   anywhere in the claim path — a requeued run is claimable on the next poll.
+   Re-verified 2026-07-27: zero hits for `not_before` / `retry_at` / `backoff` /
+   `next_attempt` across all migrations and queries.
 
 Issue #35 (user, Romanian): if we hit the limit, retry after a delay — back off until
 the limit resets; each user can opt in per run or set a default in settings.
 
-Prior art check (inspiration submodules): none of bottega/multica/dot-agent-deck
-handles this — bottega retries once on a stale-OAuth 401 (`retryOn401.ts`), multica's
-lease/attempt retry is worker-death recovery ("Agent-side errors … intentionally
-excluded"), dot-agent-deck fails on any non-200. PRD #42 Decision 12 explicitly
-punted with "the SDK's own retry/backoff is the handler" — correctly scoped to
-shared-token 429 contention; this PRD supersedes that stance for sustained limits.
+Prior art check (inspiration submodules; ↳2026-07-27 rewritten — the original
+paragraph was wrong): **no auto-retry anywhere**, which is the load-bearing half and
+still verified — bottega retries once on a stale-OAuth 401 (`retryOn401.ts`),
+dot-agent-deck fails on any non-200, and multica's retryable set excludes provider
+limits outright (`server/internal/service/task.go:1910`, `retryableReasons` =
+`{runtime_offline, runtime_recovery, timeout, codex_semantic_inactivity}`).
+**But multica does classify usage limits**, contrary to the original claim:
+`server/pkg/taskfailure/failure.go:115` defines `ReasonAgentProviderQuotaLimit`
+("monthly usage limit, credits exhausted. Not retryable until the account is
+topped up") alongside `ReasonAgentProviderCapacityOrRateLimit` (`:120`), matched in
+`classify.go:108-129`. So Decision 8's "opt-out runs still get a better death" has
+direct prior art. **Our deliberate divergence: multica classifies by matching error
+text; we pin to structured SDK signals (Decision 1), which does not rot when a
+provider rewords a message.** PRD #42 Decision 12 explicitly punted with "the SDK's
+own retry/backoff is the handler" — correctly scoped to shared-token 429 contention;
+this PRD supersedes that stance for sustained limits.
 
 ## Solution Overview
 
@@ -50,10 +66,11 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
    failure path.
 2. **Park (opt-in)**: instead of failing, the worker reports a new run status
    **`limit_wait`** carrying `limit_resets_at` + `rate_limit_type`, **preserving the
-   per-run SDK home and worktree on disk** (↳review BLOCKING — see Decision 6). The
-   run's worker slot is released (the execution ends, unlike the slot-holding
-   `awaiting_approval` gate); the SDK session id is already persisted on every state
-   report (`runs.session_id`, `00020_workers_runs.sql:40`).
+   per-run SDK home, the worktree, and the skills plugin dir on disk** (see
+   Decision 6a — three removals, not two). The run's worker slot is released (the
+   execution ends, unlike the slot-holding `awaiting_approval` gate); the SDK session
+   id is already persisted on every state report (`runs.session_id`,
+   `00020_workers_runs.sql:40`).
 3. **Resume with backoff**: the server stamps `retry_not_before = resets_at + jitter`
    (clamped), and a new sweeper pass promotes `limit_wait → queued` once the clock
    passes. The existing claim path resumes the SDK session with worker affinity, and
@@ -66,57 +83,94 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
    failing — but now with an explanatory reason ("Anthropic usage limit
    (five_hour) reached; resets at …") instead of the bare subtype.
 5. **Surface it**: run view + runs list + board card show a "limit wait" pill and a
-   resume countdown; the feed gets a `limit_wait` message; Slack (when enabled)
-   posts a one-line thread notice.
+   resume countdown; the feed gets a `limit_wait` message; the CLI/TUI gain the
+   status (M-CLI); Slack (when enabled) posts a one-line thread notice.
 
 ## Design Decisions
 
 1. **Detection pins to structured SDK signals, never text — `terminal_reason` is
    primary (↳review N5).** The `"Claude AI usage limit reached|<epoch>"` string is a
-   Claude Code product string absent from `@anthropic-ai/claude-agent-sdk` 0.3.201
-   (verified by grep of `sdk.mjs`/`bridge.mjs`). Classification of an error result:
+   Claude Code product string absent from `@anthropic-ai/claude-agent-sdk`
+   **0.3.219** (↳2026-07-27: the pin moved from 0.3.201; re-verified by grep of the
+   installed bundle's `sdk.mjs`/`bridge.mjs` — 0 hits in both). Classification of an
+   error result:
    (a) `SDKResultError.terminal_reason ∈ {blocking_limit, rapid_refill_breaker}`
-   (sdk.d.ts:4015, 6553) ⇒ limit failure; (b) absent a limit-shaped
+   (sdk.d.ts:4282, 6909) ⇒ limit failure; (b) absent a limit-shaped
    `terminal_reason`, the latest captured `rate_limit_event` with
    `status:'rejected'` counts **only when corroborated by a future `resetsAt`** —
    a stale 'rejected' event followed by an unrelated death (e.g. `error_max_turns`)
    must not park the run. `rate_limit_event` is a top-level member of the
-   `SDKMessage` union (sdk.d.ts:3772), so the observer sees it on the normal query
-   iterator. The observer records `resetsAt`, `rateLimitType`, and
-   `overageResetsAt`; `resetsAt` is a bare `number` in the typings — normalize
-   seconds-vs-milliseconds defensively (`< 10^12 ⇒ seconds`) and treat an absent or
-   past value as "unknown".
+   `SDKMessage` union (sdk.d.ts:4019; the type itself at :4237-4245), so the observer
+   sees it on the normal query iterator. The observer records `resetsAt`,
+   `rateLimitType`, and `overageResetsAt`; `resetsAt` is a bare `number` in the
+   typings — normalize seconds-vs-milliseconds defensively (`< 10^12 ⇒ seconds`) and
+   treat an absent or past value as "unknown".
+   **Open (↳2026-07-27)**: `terminal_reason` is also declared on `SDKResultSuccess`
+   (sdk.d.ts:4316), not only on the error variant. M1 must decide whether a *success*
+   result carrying `blocking_limit` is reachable and what it means — the current
+   reading is that it is not a failure and must not park, but that needs a frame
+   from a real session or an SDK-source read before it is asserted.
 2. **Transient vs sustained boundary is the SDK's own retry budget.** `api_retry`
    frames show the SDK retrying with `retry-after` honored; uzi acts only when the
    turn *terminates* in a limit-classified error result. No uzi-side retry loop
-   inside a turn — the 10m in-turn idle timer (`RUN_IDLE_TIMEOUT`,
-   `sdk-executor.ts:49,467`) stays untouched. Optional nicety: map `api_retry` to a
-   terse feed line so a visibly-retrying run doesn't look hung (helps PRD #47 too).
+   inside a turn — the 10m in-turn idle timer stays untouched
+   (`sdk-executor.ts:54` `DEFAULT_IDLE_TIMEOUT_SECONDS`, tripped at `:779`; the value
+   now arrives via `ctx.config?.idle_timeout_seconds` at `:389`, though
+   `RUN_IDLE_TIMEOUT` is still the env, `config.go:621`). Optional nicety: map
+   `api_retry` to a terse feed line so a visibly-retrying run doesn't look hung
+   (helps PRD #47 too).
 3. **A new non-terminal status `limit_wait`, not a reuse of `queued` and not a
    worker-held park.** Reusing `queued` gives no not-before gating and hides the
    state from the user; holding the slot like `awaiting_approval` would pin a worker
    slot for up to days and still get reaped: the server sweeper fails `running` runs
-   past RUN_TIMEOUT=2h (`runtime.sql:358-366`) and five_hour/seven_day resets exceed
-   that. `limit_wait` is: added to the status CHECK
-   (`00020_workers_runs.sql:36-37` — still the inline `00020` constraint; later
-   migrations only touched `runs_kind*`), excluded from every sweeper fail/requeue
-   filter (they match `claimed|running|awaiting_approval` — already exclusive,
-   pinned by test; `SweepIdleChatRuns` is kind-scoped and can't touch it), counted
-   as active by `uq_runs_one_active_per_issue` (intended: no second run on the
-   issue while one is parked), and mapped in the board lifecycle
-   (`runlifecycle/lifecycle.go:143-172`): **notifier** no-op (card doesn't move),
-   **reconciler** `limit_wait → In Progress with act:true` (↳review N3 — an
-   act:false default would leave a pending move marker unhealed and trip the 30m
-   give-up warn).
+   past RUN_TIMEOUT=2h (`runtime.sql:789-801`) and five_hour/seven_day resets exceed
+   that. `limit_wait` is:
+   - added to the status CHECK (`00020_workers_runs.sql:36-37` — still the inline
+     `00020` constraint; the 14 subsequent `ALTER TABLE runs` sites only touch
+     `runs_kind_check` / `runs_kind_shape` (00053, 00058) and
+     `runs_anthropic_select_reason_check` (00089), never the status CHECK);
+   - excluded from every sweeper fail/requeue filter. ↳2026-07-27 **the original
+     argument no longer explains why.** `Sweep` (`service.go:3066`) now runs **nine**
+     counters, not five (`SweepResult`, `service.go:3045-3062`, adds
+     `ChatIdleCompleted`, `ProposalsRecovered`, `HealthChanged`, `AutoStopped`), and
+     PRD #108's auto-stop pass is a **negative** SQL guard — `FailRunAutoStop`
+     (`runtime.sql:731`) matches `status NOT IN ('completed','failed','cancelled')`,
+     which a parked run is inside. Exclusion comes from Go, at
+     `internal/workersvc/autostop.go:210` (`if run.Status != "running"`). The outcome
+     is safe but the "already exclusive, pinned by test" claim must be
+     **re-established** against a pass that did not exist when it was written.
+     Silver lining: that same line calls `s.persistFail.evict(c.runID)`, so the
+     promotion pass needs no `evict` of its own (unlike the requeue sites at
+     `service.go:3089` and `:3153`). `SweepIdleChatRuns` is kind-scoped and
+     `SweepRunningTimeout` carries `kind <> 'chat'` (`runtime.sql:801`), so neither
+     reaches a parked issue run;
+   - **already** counted as active by `uq_runs_one_active_per_issue` — no edit
+     (↳2026-07-27: `00043_ci_fix_runs.sql:27-29` is a negative guard,
+     `WHERE kind = 'issue' AND status NOT IN ('completed','failed','cancelled')`).
+     Intended: no second run on the issue while one is parked;
+   - **already** a notifier no-op — no edit (↳2026-07-27:
+     `runlifecycle/lifecycle.go:143-155` `notifierDecision` has `default: {act:false}`
+     and the `Notify` gate at `:191` fires only for `queued/completed/failed/cancelled`,
+     so the card does not move);
+   - **already** invisible to the PRD #47 health detector — no edit, and it can
+     therefore never read "stalled" (↳2026-07-27: `ListActiveRunsForHealth`,
+     `runtime.sql:1286`, uses a **positive** allowlist
+     `status IN ('queued','running','awaiting_approval')`);
+   - still needing the **reconciler** mapping `limit_wait → In Progress with
+     act:true` (`runlifecycle/lifecycle.go:161-172`; ↳review N3 — an act:false
+     default would leave a pending move marker unhealed and trip the 30m give-up
+     warn).
 4. **The park is server-timed, worker-free, and server-sanitized.** Worker reports
    `{status: "limit_wait", limit_resets_at, rate_limit_type}` via the existing state
    endpoint (the `RunState` union at `agent/src/protocol.ts:15-19` gains the status;
-   the `StateRequest` interface at `protocol.ts:492-524` gains the fields;
-   `workersvc.SetState` dispatch `service.go:753-808` gains a case — the default arm
-   rejects unknown statuses today, so this is required wiring). The execution then
-   ends and the slot frees (PRD #42 concurrency benefits). Server-side handling:
+   the `StateRequest` interface at `protocol.ts:666-710` gains the fields;
+   `workersvc.SetState` dispatch `service.go:2104-2143` gains a case — the default arm
+   rejects unknown statuses today (`:2141`), so this is required wiring). The
+   execution then ends and the slot frees (PRD #42 concurrency benefits).
+   Server-side handling:
    - `rate_limit_type` is **allowlisted against the SDK union**
-     (`five_hour|seven_day|seven_day_opus|seven_day_sonnet|seven_day_overage_included|overage`),
+     (`five_hour|seven_day|seven_day_opus|seven_day_sonnet|seven_day_overage_included|overage`
+     — re-verified 2026-07-27, still exactly these six at sdk.d.ts:4250-4262),
      anything else coerced to `"unknown"` before it reaches the DB, DTOs, feed, or
      Slack (↳audit MAJOR — the state path does no control-char sanitization of
      free text, unlike the register path's `sanitizeSelfReported`; an enum
@@ -127,14 +181,31 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
      `15m × 2^(limit_wait_count−1)` capped at 4h; clamp: if
      `retry_not_before − now > RUN_LIMIT_MAX_PARK` (env, default `8d` — covers a
      seven_day window) the run **fails** with a clear reason instead of parking.
-     The clamp is server-side because the reset is worker-reported and a
-     compromised worker must not park a run for years.
+     The clamp is server-side because a compromised worker must not park a run for
+     years.
+   - ↳2026-07-27 **the "worker-reported is the only source" premise is obsolete.**
+     PRD #53/#104 shipped `anthropic_rate_limits`, keyed on `user_secret_id` with
+     `five_hour_resets_at` / `seven_day_resets_at` (`00080_rate_limits_per_token.sql:40-52`),
+     refreshed by `api/internal/usagepoller/engine.go`. The server therefore holds an
+     **independent** reading of the same clock, which beats clamping an untrusted
+     number. M2 must either cross-check the worker's `limit_resets_at` against the
+     row for the run's credential (preferring the server's when they disagree) or
+     state why not. PRD #53 framed the split itself
+     (`prds/done/53-rate-limits.md:14-16`: *"PRD #35 (retry after limit) handles the
+     recovery; this PRD handles the foresight"*) — the recovery half can now be built
+     on real foresight data.
+   - ↳2026-07-27 **PRD #47 exit contract.** Every server-side status write in
+     `runtime.sql` now carries `health = 'ok', health_reason = NULL,
+     health_since = NULL`. `SetRunLimitWait` and the promotion query must decide
+     whether they do too — a parked run is not unhealthy, so the current reading is
+     yes for both, but it is a deliberate choice and belongs in the query comment.
 5. **Bounded, idempotent, source-guarded parks.** `runs.limit_wait_count` increments
    per park; `RUN_LIMIT_MAX_WAITS` (env, default 5) caps it — the N+1th limit
    failure fails the run ("usage-limit retry budget exhausted"). The
    `SetRunLimitWait` transition applies **only from `status='running'`** (↳review
    N4 + audit m-1): the ownership query filters id+worker_id only
-   (`runtime.sql:177-179`), so without a source guard a worker could park an
+   (`runtime.sql:415-417` — `SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id`),
+   so without a source guard a worker could park an
    `awaiting_approval`/affinity-`queued` run, and a re-delivered state report would
    double-bump the counter — `running`-only makes re-delivery a 0-row no-op and
    legit re-parks always come from `running`. Parking does **not** touch
@@ -142,24 +213,46 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
    counters stay semantically distinct — requeue_count = worker deaths,
    limit_wait_count = limit parks. Documented worst case (↳audit m-2): the caps
    compose to ≈ 40 days (5 × 8d) that one run can hold the one-active-per-issue
-   lock; cancel-while-parked (Decision 11) is the escape hatch, and a compromised
-   worker mislabeling failures as limits buys at most 5 self-scoped retries on its
-   own user's token (informational, accepted).
+   lock — recompute if either env default changes; cancel-while-parked (Decision 11)
+   is the escape hatch, and a compromised worker mislabeling failures as limits buys
+   at most 5 self-scoped retries on its own user's token (informational, accepted).
 6. **Park preserves the on-disk session; resume rides the claim machinery
    (↳review BLOCKING B1 + MAJOR M2 — this decision was rebuilt).**
-   - **(a) Cleanup carve-out.** `RunRunner.execute`'s `finally` unconditionally
-     removes the per-run SDK home (`agent-home/<runId>` — where the resumable
-     session transcript lives) and the worktree on any normal return
-     (`agent/src/runner.ts:273-301`). As first drafted, every park would have
-     resumed into a fresh session. The park path is carved out of terminal cleanup:
-     on a `limit_wait` report the runner returns **without** removing the run home
-     or the worktree (exactly the state a worker-death requeue leaves behind), so
-     `options.resume` (`sdk-executor.ts:314,451`) finds the transcript on resume.
-     Disk is bounded by the park caps; a run that later ends terminally cleans up
-     as today.
+   - **(a) Cleanup carve-out — three removals, not two (↳2026-07-27).**
+     `RunRunner.execute`'s `finally` (`agent/src/runner.ts:474-512`) unconditionally
+     removes **all three** of:
+     1. the runner clone / worktree — `this.git.removeRunnerClone(worktreePath)` (`:486`);
+     2. the skills plugin dir the executor synthesized — `fs.rm(skillsPluginDir(worktreePath))`
+        (`:497`, PRD #16 M4). It sits **outside** the clone, so preserving only 1 and 3
+        would leave a resumed run without it;
+     3. the per-run SDK home where the resumable transcript lives —
+        `rmTreeForce(runHome)` (`:511`; PRD #108 M6 changed this from `fs.rm` because
+        the Go module cache under it is written mode 0555 and `force:true` suppresses
+        ENOENT, not EACCES).
+
+     As first drafted, every park would have resumed into a fresh session. The park
+     path is carved out of terminal cleanup for **all three**: on a `limit_wait`
+     report the runner returns without removing any of them (exactly the state a
+     worker-death requeue leaves behind), so `options.resume`
+     (`sdk-executor.ts:405`, applied at `:763-764`) finds the transcript on resume.
+     A run that later ends terminally cleans up as today.
+
+     **Disk bound (↳2026-07-27, revised upward).** `runner.ts:505` records **167.3 MB
+     of Go module cache measured for one run**, so the parked-disk worst case is
+     roughly `RUN_LIMIT_MAX_WAITS`-concurrent-parked-runs × (clone + plugin dir +
+     up to ~170 MB of run HOME). Still bounded by the park caps, but this is a real
+     number to state in `docs/configuration.md`, not a rounding error.
+
+     **Severity: BLOCKING → MAJOR (↳2026-07-27).** Issue #105 shipped
+     `sessionTranscriptResolvable` / `resumeDropped` / `priorWork`
+     (`agent/src/runner.ts:232-258`): a dropped resume now degrades honestly with a
+     feed line and a prior-work hint in the plan prompt, instead of dying on
+     `error_during_execution`. So a missed carve-out costs context, not the run.
    - **(b) Resume skips the plan gate when the plan was already approved.** The
      executor unconditionally runs Phase-1 planning + `gatePlan` regardless of
-     `ctx.sessionId` (`sdk-executor.ts:316-348`), so a naive resume would
+     `ctx.sessionId` (`sdk-executor.ts:408-520`; re-verified 2026-07-27 — `// ---
+     Phase 1: planning turn ---` at `:408` with no `ctx.sessionId` branch anywhere in
+     `:405-470`, and `ctx.gatePlan` at `:485`/`:500`/`:514`), so a naive resume would
      re-generate a plan, re-park the run at `awaiting_approval` for a human, and
      could even fail with `REASON_NO_PLAN` when the resumed session declines to
      re-emit `signal_plan`. Fix: the claim payload gains `plan_approved` (derived
@@ -171,23 +264,50 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
      planning turn itself dying on a limit) resumes into planning as today.
    - **(c) Affinity actually favors the prior worker.** Promotion resets
      `updated_at`, so `ClaimRun`'s affinity grace window **restarts** at promotion
-     (`runtime.sql:200-203` — predicate + ORDER BY prefer the prior worker); the
-     first draft's "grace will have long expired" was wrong (↳review). Honest
-     residual: if another of the user's workers claims after the fresh 2m grace,
-     the session directory is absent there ⇒ fresh session + branch-attach; with
-     (b)'s `plan_approved` skip this still bypasses the gate but loses conversation
-     context — acceptable, and most users run one worker.
+     (`runtime.sql:464-472` — the predicate
+     `AND (r.worker_id IS NULL OR r.worker_id = @worker_id OR r.updated_at < @affinity_cutoff)`
+     plus `ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC` prefer the prior
+     worker; `WORKER_AFFINITY_GRACE` = 2m, `config.go:628`); the first draft's "grace
+     will have long expired" was wrong (↳review; re-verified 2026-07-27). Honest
+     residual, now partly handled upstream: if another of the user's workers claims
+     after the fresh 2m grace, the session directory is absent there ⇒ fresh session
+     + branch-attach. With (b)'s `plan_approved` skip this still bypasses the gate,
+     and issue #105's `resumeDropped` path (`runner.ts:232-258`) warns and seeds
+     prior work rather than failing — so the cost is conversation context only.
+     Most users run one worker.
    - **(d) Clocks.** Promotion (`limit_wait → queued`) sets `started_at = NULL`
-     (new design intent — the analogous `RequeueClaimedRunToQueued` never needed
-     to, since `claimed` runs have no `started_at`) so the resumed run gets a fresh
-     RUN_TIMEOUT wall; `session_id`, `last_seq`, `worker_id` are left untouched, as
-     in every existing requeue query.
+     (new design intent — the analogous `RequeueClaimedRunToQueued`
+     (`runtime.sql:770`) never needed to, since `claimed` runs have no `started_at`)
+     so the resumed run gets a fresh RUN_TIMEOUT wall; `session_id`, `last_seq`,
+     `worker_id` are left untouched, as in every existing requeue query.
+   - **(e) Which credential a promoted run spends (↳2026-07-27 — NEW, and it must be
+     answered before M1).** PRD #111 shipped auto-select
+     (`api/internal/autoselect/autoselect.go`), which ranks a user's opted-in
+     Anthropic credentials by rate-limit headroom at claim time and skips any below
+     `MinHeadroom` (`StatusBelowThreshold`, `:96-124`). Two consequences this PRD
+     predates:
+     - for multi-token users a park is now **rarer** — the ranker routes around an
+       exhausted credential before the run ever starts;
+     - a promotion re-enters the claim path, so **auto-select runs again and may pick
+       a different credential**. `retry_not_before` was computed from the *original*
+       credential's reset, so the gate can pointlessly delay a run that could execute
+       right now on another token.
+
+     The run already carries `anthropic_secret_id`, `anthropic_secret_label`,
+     `anthropic_select_reason`, `anthropic_headroom_pct`
+     (`00086_run_anthropic_secret.sql:63-66`). Decide one of: **pin** the original
+     credential across the park (simplest, worst utilization); **re-select** freely
+     and accept the stale gate; or **re-select and recompute** `retry_not_before`
+     from the newly chosen credential's `anthropic_rate_limits` row — recommended,
+     and it composes with Decision 4's cross-check. A promotion that finds *any*
+     credential with headroom arguably should not wait at all.
 7. **Opt-in: per-run flag defaulted by a per-user setting.**
    - `users.wait_on_limit` boolean NOT NULL DEFAULT false; `PUT /api/me/wait-on-limit`
      + Settings toggle (exact clone of the autopilot-enabled plumbing,
      `users.sql:43-47`, `handler/autopilot.go`; inherits RequireAuth→ValidateCSRF).
+     All three citations re-verified exact 2026-07-27.
    - `runs.wait_on_limit` boolean NOT NULL DEFAULT false, stamped at creation:
-     `CreateRun` body (today `{issue_iid}` only, `handler/workers.go:408-410`) gains
+     `CreateRun` body (today `{issue_iid}` only, `handler/workers.go:667-669`) gains
      optional `wait_on_limit`; absent ⇒ user default. Autopilot-created runs take
      the user default. The start-run modal shows a pre-checked/unchecked box.
    - The flag rides the claim payload like `auto_approve` (top-level, re-read from
@@ -200,81 +320,137 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
    `failure_reason = "Anthropic usage limit (<type>) reached; resets at <ISO>"`
    (type from the allowlisted enum, no secrets involved) and emits a `limit_hit`
    feed message — strictly better than today's `agent run failed:
-   error_during_execution`.
+   error_during_execution`. (Prior art exists for this half, in multica's
+   `pkg/taskfailure` — see the Prior-art paragraph.)
 9. **Chat lane: message only, no auto-retry.** Chat already survives an erroring
-   turn (parks for the next user message, `chat-executor.ts:455-486`). The same
+   turn (parks for the next user message, `chat-executor.ts:455-486` — the error path
+   is `:465-482`, throwing `chat turn failed: ${errorSubtype}` at `:482`). The same
    classifier upgrades the feed line to "usage limit reached; resets at <t>" so the
    user knows why their chat went quiet. Auto-retrying a conversation turn is out of
    scope.
 10. **Feed + UI + DTO plumbing (↳review N1 — the Go DTO edit is hand-maintained and
-    now named).** New run_message kinds `limit_wait` (payload: resets_at,
-    rate_limit_type, attempt) and `limit_hit` — `run_messages.kind` carries no DB
-    CHECK (PRD #39 Decision 8, its ↳review D12 thread), rendered with explicit cases
+    now named; ↳2026-07-27 — it moved, and gained a consumer).** New run_message kinds
+    `limit_wait` (payload: resets_at, rate_limit_type, attempt) and `limit_hit` —
+    `run_messages.kind` carries no DB CHECK (`00020_workers_runs.sql:74`, confirmed;
+    PRD #39 Decision 8, its ↳review D12 thread), rendered with explicit cases
     in `RunEvent.tsx`/ActivityFeed (escaped, no raw sinks). The new run fields
     (`retry_not_before`, `limit_resets_at`, `limit_wait_count`, `wait_on_limit`)
-    must be added to the hand-maintained `runDTO`/`runToDTO`
-    (`api/internal/handler/workers.go:128-262`) and the web `Run` interface
-    (`web/src/lib/api.ts:518-577`). `RunStatus` union, `RUN_STATUS_TONES` (warn),
-    and the run view header get `limit_wait` with a countdown to
-    `retry_not_before` and "attempt N/cap". Unknown-status fallback means a
-    half-shipped web build degrades to a neutral pill, not a crash (`ui.tsx:207`).
-11. **Cancel while parked works server-side (↳review MAJOR M1 — needs a
-    `hasLivePoller` change, not just SQL).** A parked run keeps `worker_id` and its
-    worker keeps heartbeating for other runs, so `hasLivePoller`
-    (`service.go:1336-1351`) would report a live poller and `SubmitInput` would
-    enqueue a cancel that nothing consumes until resume. Fix: `hasLivePoller`
-    treats `status='limit_wait'` like `'queued'` (no live steering by definition),
-    and `CancelRunServerSide` (`runtime.sql:309-317`) is extended to cover
-    `limit_wait`. This is the escape hatch for the multi-day park (Decision 5's
-    worst case). Approve/reject/follow-up inputs queue as today and deliver on
-    resume.
+    must be added to:
+    - the DTO **type**, which now lives in its own wire package —
+      `api/internal/apitypes/run.go:10` `type RunDTO struct` (it was in
+      `handler/workers.go` when this PRD was written);
+    - `runToDTO`, still in `api/internal/handler/workers.go` but at `:302`;
+    - the web `Run` interface (`web/src/lib/api.ts:779`) and the `RunStatus` union
+      (`:727-734`);
+    - **`web/src/lib/runBadge.ts:10-13` (↳2026-07-27 — a second tone surface this PRD
+      never named)**, the board-card badge taxonomy, whose own comment reads *"Tones
+      mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one color
+      everywhere"*. Missing it yields a `limit_wait` pill that is correct in the run
+      view and neutral-grey on the board;
+    - **the CLI/TUI (↳2026-07-27)** — see M-CLI. `apitypes` is now a shared wire
+      package the CLI constructs directly (`api/cmd/uzi/commands_test.go:138`), so
+      this is a three-consumer change, not two.
+
+    `RunStatus`, `RUN_STATUS_TONES` (warn), and the run view header get `limit_wait`
+    with a countdown to `retry_not_before` and "attempt N/cap". Unknown-status
+    fallback means a half-shipped web build degrades to a neutral pill, not a crash
+    (`ui.tsx:206` opens the map; the fallback
+    `RUN_STATUS_TONES[status] ?? { tone: "neutral" }` is at `:217`).
+11. **Cancel while parked works server-side (↳review MAJOR M1; ↳2026-07-27 — half of
+    this decision was void, and was void at authoring).** A parked run keeps
+    `worker_id` and its worker keeps heartbeating for other runs, so `hasLivePoller`
+    (`service.go:3020-3039`) would report a live poller and `SubmitInput` would
+    enqueue a cancel that nothing consumes until resume. Fix: `hasLivePoller` treats
+    `status='limit_wait'` like `'queued'` (no live steering by definition) — the
+    check at `:3023-3026` is **positive** (`if run.Status == "queued" || !run.WorkerID.Valid`),
+    so this wiring is genuinely required.
+    **`CancelRunServerSide` needs no change.** `runtime.sql:679-690` guards
+    `WHERE id = @id AND user_id = @user_id AND status NOT IN ('completed','failed','cancelled')`
+    — a negative predicate that covers any new non-terminal status for free. This was
+    already true when the PRD was written (`git show 9cbc29a2:…/runtime.sql`, lines
+    309-317, identical predicate), so the original prescription was contradicted by
+    its own citation. This is still the escape hatch for the multi-day park
+    (Decision 5's worst case). Approve/reject/follow-up inputs queue as today and
+    deliver on resume.
 12. **Vault gate composes.** Promoted runs re-enter `queued` and remain subject to
     the vault-unlock claim gate (PRD #32): a run whose reset elapsed while the vault
     is locked simply waits in `queued` like any other run. No special case.
-13. **Migration numbering**: draft `00095_limit_wait.sql` (collision-avoidance only;
-    renumber above the live head at landing per CLAUDE.md — live head today is
-    `00056_oidc.sql`, and PRD #50 has reserved `00057`). One migration: runs columns
-    (`wait_on_limit`, `limit_resets_at`, `retry_not_before`, `limit_wait_count`),
-    users column (`wait_on_limit`), status CHECK widened with `limit_wait`, plus a
-    partial index `(retry_not_before) WHERE status = 'limit_wait'` for the
-    promotion pass (↳audit m-3 — cheap now, moot to retrofit).
+13. **Migration numbering** (↳2026-07-27 — refreshed): draft `00095_limit_wait.sql`
+    (collision-avoidance only; renumber above the live head at landing per
+    CLAUDE.md). **Live head is now `00089_run_select_reason_check.sql`** (62 files;
+    the sequence is sparse — 00003-00009 and 00076 are absent, which is normal here),
+    so the renumber target is **00090+**, and the draft's 00095 leaves a five-wide
+    gap other in-flight PRDs may claim. The old note that "PRD #50 has reserved
+    `00057`" is **void** — 00057 was consumed by `00057_run_health.sql` (PRD #47).
+    One migration: runs columns (`wait_on_limit`, `limit_resets_at`,
+    `retry_not_before`, `limit_wait_count`), users column (`wait_on_limit`), status
+    CHECK widened with `limit_wait`, plus a partial index
+    `(retry_not_before) WHERE status = 'limit_wait'` for the promotion pass
+    (↳audit m-3 — cheap now, moot to retrofit). Verified 2026-07-27: none of the four
+    run columns, nor `users.wait_on_limit`, nor the index name exists today.
+14. **Which run kinds park (↳2026-07-27 — NEW, unresolved).** `runs_kind_check` is now
+    `('issue','ci_fix','chat','judge','self_improve')`
+    (`00053_chat_runs.sql:23`, `00058_run_judge_self_improve_kinds.sql:29`); this PRD
+    reasoned only about issue runs with a chat carve-out (Decision 9). `judge` and
+    `self_improve` runs also spend the owner's Anthropic token and can hit the same
+    limit, and `ClaimRun` (`runtime.sql:441-448`) already carries a judge-specific
+    exemption block. M1 must take a stance per kind rather than inheriting the issue
+    behaviour by default.
 
 ## Milestones
 
+- [ ] **M0 — Resolve the two open questions** (blocks M1): which credential a
+  promoted run spends (Decision 6e), and whether `judge` / `self_improve` runs park
+  (Decision 14). Both are one-paragraph decisions recorded here; neither needs code.
 - [ ] **M1 — Worker detection + park path**: rate-limit observer beside
   `mapSdkMessage` (captures latest `rate_limit_info`), classification per Decision 1
   precedence (terminal_reason primary; corroborated-rejected secondary), typed
   `LimitReachedError` with normalized `resetsAt` + `rateLimitType`, runner branch:
-  opt-in ⇒ report `limit_wait` **and skip run-home/worktree cleanup** (Decision 6a),
-  opt-out ⇒ improved `failure_reason` + `limit_hit` message; resume-skips-gate path
-  (Decision 6b, consuming claim `plan_approved`/`plan_md`); chat feed-line upgrade;
-  unit tests with real-shaped SDK frames (rejected event + corroborating resetsAt,
-  blocking_limit result, stale-rejected + error_max_turns NOT classified, transient
-  api_retry NOT classified, seconds-vs-ms normalization, cleanup carve-out).
-- [ ] **M2 — Schema + server park machinery**: migration (Decision 13),
-  `SetRunLimitWait` transition (source-guarded `running`-only, idempotent on
+  opt-in ⇒ report `limit_wait` **and skip all three cleanups** (Decision 6a —
+  runner clone, skills plugin dir, run HOME), opt-out ⇒ improved `failure_reason` +
+  `limit_hit` message; resume-skips-gate path (Decision 6b, consuming claim
+  `plan_approved`/`plan_md`); chat feed-line upgrade; unit tests with real-shaped SDK
+  frames (rejected event + corroborating resetsAt, blocking_limit result,
+  stale-rejected + error_max_turns NOT classified, transient api_retry NOT
+  classified, seconds-vs-ms normalization, **and a carve-out test that asserts a
+  parked run's `skillsPluginDir` and run HOME both still exist on disk**).
+- [ ] **M2 — Schema + server park machinery**: migration (Decision 13, renumbered
+  00090+), `SetRunLimitWait` transition (source-guarded `running`-only, idempotent on
   re-delivery, allowlists `rate_limit_type`, computes/clamps `retry_not_before`,
   bumps `limit_wait_count`, enforces `RUN_LIMIT_MAX_WAITS` / `RUN_LIMIT_MAX_PARK`
-  fail-instead-of-park), sweeper promotion pass (`limit_wait → queued`,
-  `started_at=NULL`, no `requeue_count` bump), `hasLivePoller` +
-  `CancelRunServerSide` extensions (Decision 11), claim payload gains
-  `wait_on_limit` + `plan_approved` + `plan_md`, DTO fields (Decision 10),
-  sweeper-exclusion tests (a parked run is never RUN_TIMEOUT-failed or
-  stale-requeued; cancel-while-parked applies immediately).
+  fail-instead-of-park, PRD #47 health exit contract per Decision 4), optional
+  cross-check of the worker's reset against `anthropic_rate_limits` (Decision 4),
+  sweeper promotion pass (`limit_wait → queued`, `started_at=NULL`, no
+  `requeue_count` bump, no `persistFail.evict` needed — see Decision 3),
+  `hasLivePoller` extension (Decision 11 — **no `CancelRunServerSide` change**),
+  claim payload gains `wait_on_limit` + `plan_approved` + `plan_md`, DTO fields
+  (Decision 10), sweeper-exclusion tests **re-established against today's nine-pass
+  `Sweep`** — a parked run is never RUN_TIMEOUT-failed, stale-requeued, or
+  auto-stopped (PRD #108); cancel-while-parked applies immediately.
 - [ ] **M3 — Opt-in surfaces**: `users.wait_on_limit` + `PUT /me/wait-on-limit` +
   Settings toggle; `CreateRun` wire + start-modal checkbox defaulting from the user
   setting; autopilot runs inherit the default; tests (default inheritance, explicit
   override, flag survives resume).
 - [ ] **M4 — Web UX**: `RunStatus`/tones/`limit_wait` pill, run-view countdown strip
-  (resets-at + attempt N/cap), runs list + board card badge, `limit_wait`/`limit_hit`
-  render cases in RunEvent/ActivityFeed; vitest coverage incl. escaped rendering.
-- [ ] **M5 — Slack + docs + specs**: notifier gains `statusLabel` + `renderThread`
-  cases for `limit_wait` (else a park edits the root to raw "limit_wait" and posts
-  nothing) and `GetSlackRunContext` selects the reset timestamp for the
-  "paused: usage limit (five_hour); resumes ~<t>" line — `EscapeMrkdwn` applied
-  per-field even though the type is allowlisted upstream; `docs/` page section +
-  `docs/configuration.md` for the new envs; `specs/ai.md` design record;
-  `specs/human.md` addition proposed to the user.
+  (resets-at + attempt N/cap), runs list + board card badge **including
+  `web/src/lib/runBadge.ts`** (Decision 10), `limit_wait`/`limit_hit` render cases in
+  RunEvent/ActivityFeed; vitest coverage incl. escaped rendering.
+- [ ] **M-CLI — CLI + TUI** (↳2026-07-27 — new, and repo-mandated: "New uzi
+  functionality ⇒ check whether `api/cmd/uzi/` needs a matching CLI change"):
+  `terminalRunStatuses` (`api/cmd/uzi/run.go:48`) must not gain `limit_wait` (it is
+  non-terminal) but every status-switch around it must handle it — the
+  awaiting-approval branch at `run.go:842` is the shape to follow — plus the TUI crew
+  lane mapping (`api/cmd/uzi/tui_lanes_test.go:143-152`). A parked run should read as
+  waiting with its countdown, not fall through to a default lane.
+- [ ] **M5 — Slack + docs + specs**: notifier gains `statusLabel` (`slacksvc/notifier.go:588`)
+  + `renderThread` (`:549`) cases for `limit_wait` (else a park edits the root to raw
+  "limit_wait" and posts nothing — both switches have `default:` arms that behave
+  exactly that way today) and `GetSlackRunContext` (`:265`) selects the reset
+  timestamp for the "paused: usage limit (five_hour); resumes ~<t>" line —
+  `EscapeMrkdwn` applied per-field even though the type is allowlisted upstream;
+  `docs/` page section + `docs/configuration.md` for the new envs **and the parked
+  disk cost** (Decision 6a); `specs/ai.md` design record; `specs/human.md` addition
+  proposed to the user.
 - [ ] **M6 — E2E**: stub-executor scenarios — opt-in park → sweeper promotes (short
   test clock) → resume **skips the gate** and completes; opt-out fails with
   explanatory reason; cancel-while-parked cancels immediately; full-stack smoke.
@@ -284,8 +460,9 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
 - A run that hits a sustained usage limit with opt-in enabled ends up `completed`
   after the window resets, with zero human intervention: SDK session resumed (same
   worker) and no second trip through the plan gate for an already-approved plan.
-- A parked run is visibly "waiting" in web (countdown) and Slack, never "stalled",
-  and is never killed by RUN_TIMEOUT or stale-worker sweeps.
+- A parked run is visibly "waiting" in web (countdown), CLI/TUI, and Slack, never
+  "stalled", and is never killed by RUN_TIMEOUT, stale-worker sweeps, or the PRD #108
+  auto-stop pass.
 - Cancelling a parked run takes effect immediately (server-side), not on resume.
 - Opt-out runs fail with a reason that names the limit type and reset time.
 - Transient 429s behave exactly as today (SDK-internal, invisible except optional
@@ -293,6 +470,8 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
 - A compromised worker cannot park a run beyond `RUN_LIMIT_MAX_PARK`, bypass the
   park-count cap, park a run not in `running`, or smuggle a non-enum
   `rate_limit_type` past the server.
+- A promoted run does not sit behind a `retry_not_before` computed from a credential
+  it is no longer going to spend (Decision 6e).
 
 ## Out of Scope
 
@@ -307,6 +486,8 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
   emits the frames, but no work is specific to them.
 - A cumulative wall-clock cap tighter than count×clamp (the ~40d worst case is
   documented in Decision 5; cancel is the escape hatch).
+- Changing PRD #111's auto-select ranking itself — this PRD only decides what a
+  *promotion* does with it (Decision 6e).
 
 ## Decision Log
 
@@ -321,3 +502,21 @@ shared-token 429 contention; this PRD supersedes that stance for sustained limit
   `rate_limit_type`. Minors folded: `running`-only idempotent transition, reconciler
   act:true mapping, DTO plumbing named, promotion index, env renamed
   `RUN_LIMIT_MAX_PARK`, affinity-grace-restarts correction, citation fixes.
+- 2026-07-27 — Staleness re-verification against HEAD `ca597779` (1343 commits since
+  authoring). **The core thesis survives unbuilt**: no rate-limit detection, no
+  not-before gate, and no park status exist anywhere in the tree, and the four
+  load-bearing mechanisms (unconditional plan gate, `SetState`'s rejecting default
+  arm, affinity grace restarting on `updated_at`, worker-death-only requeue set) all
+  re-verified true. **Refuted and fixed**: SDK pin is 0.3.219 not 0.3.201; the DTO
+  moved to `apitypes` and gained the CLI as a third consumer; `CancelRunServerSide`
+  never needed extending (negative guard, true at authoring too); migration head is
+  00089 and PRD #50's 00057 reservation is void; Decision 3's sweeper-exclusion
+  argument no longer covers PRD #108's auto-stop pass; the prior-art paragraph was
+  wrong about multica, which does ship a usage-limit classifier. **Dropped as
+  already-satisfied**: active-run index, notifier no-op, health-detector exclusion,
+  `CancelRunServerSide`. **New scope**: Decision 6e (which credential a promoted run
+  spends, given PRD #111 auto-select), Decision 14 (do judge/self_improve runs
+  park), M-CLI, `runBadge.ts`, the three-way cleanup carve-out, and the PRD #47
+  health exit contract. ~25 further citations had drifted line numbers only and were
+  refreshed in place. Decision 6a downgraded BLOCKING → MAJOR on the strength of
+  issue #105's resume-dropped degradation.
