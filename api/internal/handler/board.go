@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -895,7 +897,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// Forge-first single-label add/remove + incremental cache update
 	// (forgesvc.SetIssueLabel). On failure the cache is untouched and the client
 	// keeps showing the pre-toggle state (no optimistic update on the web side).
-	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, req.Apply)
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdlessLabelColor, req.Apply)
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
 		return
@@ -920,6 +922,111 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
+}
+
+// promotable reports whether an issue may be given the PRD label from the board
+// (PRD #102 Decision 13a). The one exclusion is uzi's own self-improvement
+// tracking issue, which carries selfimprove.TrackingLabel deliberately INSTEAD of
+// a PRD or autopilot label, is open on uzi's own repo, and is therefore cached and
+// rendered by M6's additive fetch like any other non-PRD card.
+//
+// A pure predicate rather than an inline check because the handler cannot be unit
+// tested (h.q is a concrete *store.Queries) and this is the part worth testing.
+func promotable(labels []string) bool {
+	return !slices.Contains(labels, selfimprove.TrackingLabel)
+}
+
+// PromoteIssue applies the configured PRD label to a non-PRD issue, forge-first
+// (PRD #102 Decision 15). One click makes a card uzi's work: it becomes runnable
+// (the Decision 14 gate reads the same label), it stops depending on the toggle to
+// be visible, and it loses the dashed treatment.
+//
+// Mechanically the PRDLESS toggle's shape, with three differences that are not
+// incidental:
+//
+//   - It is apply-only. There is no demote (Decision 15): removing a label in the
+//     forge's own UI is easy and nobody has asked for the button.
+//   - The auto-created label is pinned to PrdLabelColor, not the PRDLESS amber.
+//     Naive reuse of SetIssueLabel would create a missing PRD label in the escape
+//     hatch's color, which is the trap Decision 15 names.
+//   - It refuses the self-improvement tracking issue (Decision 13a). That issue is
+//     open on uzi's own repo, carries TrackingLabel deliberately INSTEAD of a PRD
+//     or autopilot label, and the additive fetch is what makes it visible on the
+//     board at all. Promoting it would slap the PRD label onto internal machinery
+//     and let a self-improve run be started by hand from a card.
+//
+// Returns the refreshed card with its latest_run re-hydrated, exactly like
+// MoveIssue and SetIssuePrdless, so a single-card replace never blanks the run
+// badge.
+func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	iid, err := parseInt64(chi.URLParam(r, "iid"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
+		return
+	}
+
+	// PRDLabel already falls back to the compiled-in default when unset, so label is
+	// never empty here.
+	label, _ := h.settings.PRDLabel(r.Context())
+
+	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "issue not found")
+			return
+		}
+		slog.Error("promote: get issue", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Decision 13a, enforced SERVER-side and not only by hiding the button: the web
+	// hides Promote on this card, but the endpoint is reachable regardless and the
+	// blast radius is a PRD label on uzi's own internal tracking issue.
+	if !promotable(decodeLabels(issue.Labels)) {
+		httpx.Error(w, http.StatusUnprocessableEntity, "this issue is uzi's own self-improvement tracker and cannot be promoted")
+		return
+	}
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// Forge-first, then the incremental cache update (forgesvc.SetIssueLabel). On
+	// failure the cache is untouched and the client keeps showing the pre-promote
+	// state. Applying a label the issue already carries is a local no-op success
+	// with no forge call, so a double click costs nothing.
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdLabelColor, true)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
+		return
+	}
+
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	position := make(map[string]int, len(cols))
+	for _, c := range cols {
+		position[c.LabelName] = int(c.Position)
+	}
+	card := issueToCard(updated, position, repo.ForgeType)
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid, lr.MrWebUrl,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("latest run for promoted card", "error", err)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }

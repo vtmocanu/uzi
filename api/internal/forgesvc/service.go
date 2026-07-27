@@ -28,6 +28,17 @@ import (
 // label reads as an exception, not a column.
 const PrdlessLabelColor = "#ec9a29"
 
+// PrdLabelColor is the color EnsureLabels pins when Promote (PRD #102 Decision 15)
+// applies the PRD label to a repo that somehow lacks it. Green, distinct from both
+// the DefaultColumns palette (blues/purple/grey) and the PRDLESS amber: the PRD
+// label marks work uzi owns, which is neither a column nor an exception.
+//
+// It exists at all because Promote reuses SetIssueLabel, whose apply path
+// auto-creates the label. Passing PrdlessLabelColor there would create a missing
+// PRD label in the escape hatch's amber, which is the naive-reuse bug Decision 15
+// names.
+const PrdLabelColor = "#2da160"
+
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
 // GitLab's label create API. In Progress / Later come from the common-board
@@ -217,14 +228,18 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // Idempotent by a cached-labels diff: when the desired state already holds (apply
 // and the label is already present, or remove and already absent) it is a local
 // no-op success with NO forge call. Otherwise, on apply it first EnsureLabels the
-// label (auto-creating it on the project the first time, pinned to
-// PrdlessLabelColor), then issues one UpdateIssueLabels with a single-element add
-// or remove set. Only on forge success does it upsert the incrementally-updated
+// label (auto-creating it on the project the first time, pinned to color), then
+// issues one UpdateIssueLabels with a single-element add or remove set.
+//
+// color is the label color to pin when apply auto-creates the label, and is
+// ignored on remove. It is a PARAMETER rather than the PRDLESS constant it used to
+// be because Promote (PRD #102 Decision 15) reuses this path: hardcoding the
+// escape hatch's amber would create a missing PRD label in it. Only on forge success does it upsert the incrementally-updated
 // label set — the one label added to / removed from the current cached set, never
 // a wholesale recompute from stale data — carrying HasPrdLink through verbatim
 // (this path never re-derives it). Returns the re-cached row; on a forge error the
 // cache is untouched, so a failed toggle never desyncs the cache from the forge.
-func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label string, apply bool) (store.Issue, error) {
+func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label, color string, apply bool) (store.Issue, error) {
 	var current []string
 	if err := json.Unmarshal(issue.Labels, &current); err != nil {
 		current = []string{}
@@ -240,7 +255,7 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 	if apply {
 		// Auto-create the label on the project the first time it is applied from
 		// uzi (board columns do the same); GitLab label creation needs a color.
-		if err := f.EnsureLabels(ctx, forgeProjectID, []forge.Label{{Name: label, Color: PrdlessLabelColor}}); err != nil {
+		if err := f.EnsureLabels(ctx, forgeProjectID, []forge.Label{{Name: label, Color: color}}); err != nil {
 			return store.Issue{}, err
 		}
 		add = []string{label}

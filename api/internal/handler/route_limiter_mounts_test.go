@@ -260,6 +260,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/repos/{id}/issues", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/move", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/prdless", limForge},
+	// Promote (PRD #102 Decision 15) writes one label to the forge, the same shape
+	// and the same cost as the prdless toggle above it.
+	{"POST", "/api/repos/{id}/issues/{iid}/promote", limForge},
 	{"POST", "/api/repos/{id}/runs", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},

@@ -749,6 +749,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Apply/remove the PRDLESS label from the UI (PRD #22 M4): a forge
 				// label write, so it rides the per-user budget like move.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/prdless", h.SetIssuePrdless)
+				// Promote (PRD #102 Decision 15): add the PRD label to a non-PRD card,
+				// forge-first. Same limiter as the other forge-writing issue routes — it is
+				// one EnsureLabels plus one UpdateIssueLabels, exactly like the prdless
+				// toggle beside it.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/promote", h.PromoteIssue)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 				// Create a PRD issue on the forge (source of truth) → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)
