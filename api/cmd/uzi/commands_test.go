@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -998,6 +999,37 @@ func TestWorkerListShowsVersion(t *testing.T) {
 	}
 	if !strings.Contains(out, "-") {
 		t.Errorf("a worker that never registered a version should render \"-\", not an empty cell:\n%s", out)
+	}
+}
+
+// Issue #124: `version` is worker self-reported and Printer.Table Fprintln's cells through
+// a tabwriter with no scrub of its own, so this was the ONE free-text sink in the CLI not
+// routed through sanitizeTTY while every other one is. A bidi override here reorders a
+// fleet-list row in an operator's terminal.
+func TestWorkerListSanitizesVersion(t *testing.T) {
+	spoof := "0.11\u202e.0\u200b"
+	onlyFormat := "\u202e\u200b"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", Version: &spoof},
+		{ID: "w2", Name: "beta", Status: "online", Version: &onlyFormat},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, r := range out {
+		if unicode.In(r, unicode.Cf) {
+			t.Errorf("%U reached the terminal in a worker-list row:\n%s", r, out)
+		}
+	}
+	if !strings.Contains(out, "0.11.0") {
+		t.Errorf("the version must still be readable once stripped:\n%s", out)
+	}
+	// A version that is NOTHING but format characters compacts to "" and must still read
+	// as the placeholder, not as a blank cell — which is why the sanitize runs before the
+	// strOr fallback rather than after it.
+	if !strings.Contains(out, "-") {
+		t.Errorf("an all-format-character version should render \"-\", not an empty cell:\n%s", out)
 	}
 }
 
