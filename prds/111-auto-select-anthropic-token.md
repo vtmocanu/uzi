@@ -1,7 +1,7 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
 **GitLab Issue**: [#111](https://gitlab.example.com/vtmocanu/uzi/-/issues/111)
-**Status**: **DRAFT** (created 2026-07-22)
+**Status**: **IN PROGRESS** (created 2026-07-22; implementation started 2026-07-27 on `feature/prd-111-auto-select-token`)
 **Priority**: Medium
 **Related**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://gitlab.example.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
 
@@ -151,8 +151,14 @@ vs. `user_secrets` + tokens settings). Phase 2: **M3** (needs the pool). Phase 3
 
 ## Data model
 
-Three additive migrations (draft numbers `00082`–`00084`; renumbered to the next
-free numbers above the live head at landing, per the goose convention):
+Three additive migrations. **The draft numbers `00082`–`00084` written here at
+drafting time are now taken** — `00082_run_stop_kind_auto.sql`,
+`00083_worker_roll_health.sql` and `00084_seed_builtin_skill_allocations.sql`
+landed since, and the live head is `00085_run_prd_done_path.sql` (measured
+2026-07-27). Implementation starts at **`00086`**, and renumbers again above the
+live head at landing if `main` moves under us, per the goose convention. The boot
+runner is strict goose with no `allow-missing`, so landing a version below an
+already-applied head makes every upgraded instance refuse to boot.
 
 - `runs.anthropic_secret_id UUID` + `runs.anthropic_secret_label TEXT`, both
   nullable. `ON DELETE SET NULL` on the id so deleting a token never cascade-
@@ -219,6 +225,23 @@ free numbers above the live head at landing, per the goose convention):
   polls looks active while never being chosen. M2 therefore renders each token's
   live eligibility (fresh / stale / refused / below-threshold), and M6 checks
   whether OAuth setup-tokens can ever produce a fresh gauge at all (see R7).
+- **D13 — The `auto_eligible` toggle ships as its own narrow route, not on the
+  existing token PATCH.** Added 2026-07-27, during implementation, from an
+  auditor pre-flag; the lead re-derived it against the tree before settling it.
+  M2 says "CLI `token` support", and the obvious way to deliver that — extend
+  `PATCH /me/secrets/anthropic_token/{id}` and move it where the CLI can reach it
+  — is wrong. `handler/handler.go` splits the secrets routes deliberately: GET is
+  `RequireUser` (metadata only, CLI-reachable) and **every write is `RequireAuth`,
+  cookie-only**, because "a Bearer-reachable mint would let a stolen `uzc_`
+  replace a user's tokens" (PRD #104 D8). Relocating that PATCH would make
+  rename, rotate and set-default Bearer-reachable as collateral damage. Instead:
+  `PATCH /me/secrets/anthropic_token/{id}/auto-eligible` under `RequireUser`,
+  with the existing writes untouched. The precedent is exact — `PATCH
+  /workers/{id}` is `RequireUser` because "it mints nothing and yields no
+  credential the caller lacks — it only re-points a worker at a token they
+  already hold" — and the toggle is the same class, re-pointing spend among
+  tokens the caller already holds. R5's CLI parity is met without widening the
+  credential-write surface by one route.
 - **D12 — A gauge row with NULL pct is ineligible.** The columns are nullable
   (`00080`); a reading that measured neither window carries no headroom signal,
   so it cannot be ranked and is excluded rather than defaulted to some
