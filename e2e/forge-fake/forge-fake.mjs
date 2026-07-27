@@ -203,6 +203,42 @@ function makeIssue({ iid, title, description, labels, author, project }) {
   };
 }
 
+// --- issue list filtering (PRD #102 M6 / Decision 10) ------------------------
+//
+// BOTH list handlers used to return every recorded issue and ignore `labels` and
+// `state` entirely. The GitLab one even said "the caller filters by label", which is
+// false: the drivers send those as query parameters and trust the server, exactly as
+// they do against a real forge.
+//
+// That made the fake unable to fail. M6 adds a second, open-only, no-label fetch and
+// unions the two keep-sets, so a fake that returns everything to both fetches would let
+// the whole milestone go green while testing nothing — the union would be trivially
+// correct because both halves are the same set.
+//
+// The two vocabularies are deliberately kept apart. GitLab says opened/closed/all;
+// Forgejo says open/closed/all. Accepting Forgejo's "open" in the GitLab handler (or
+// vice versa) would re-hide the exact driver bug the per-driver translation exists to
+// prevent, so each handler recognises only its own forge's spelling.
+function issueMatchesLabels(issue, labelsParam) {
+  if (!labelsParam) return true;
+  const want = String(labelsParam).split(",").map((l) => l.trim()).filter(Boolean);
+  const have = new Set(issue.labels || []);
+  return want.every((l) => have.has(l)); // AND semantics, like both real forges
+}
+// GitLab vocabulary: opened | closed | all (default all).
+function issueMatchesGitLabState(issue, stateParam) {
+  if (!stateParam || stateParam === "all") return true;
+  return (issue.state || "opened") === stateParam;
+}
+// Forgejo vocabulary: open | closed | all (default all). NOTE the missing "ed" — a
+// driver that passes uzi's neutral "opened" through lands here and matches NOTHING,
+// which is the intended way for that bug to surface in e2e.
+function issueMatchesForgejoState(issue, stateParam) {
+  if (!stateParam || stateParam === "all") return true;
+  const forgejoState = forgejoIssueState(issue.state);
+  return forgejoState === stateParam;
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let buf = "";
@@ -752,7 +788,14 @@ const server = https.createServer(
       // reach the board. The driver also asks type=issues; the client-side filter is
       // the guarantee, so returning both here is the honest stress.
       if (method === "GET" && rest === "/issues") {
-        const issues = Object.values(state.issues).map(toForgejoIssue);
+        // Honours `labels` and `state` in FORGEJO's vocabulary (open, not opened).
+        // The PR half is deliberately unfiltered by state: it exists to exercise the
+        // driver's R4 pull_request filter, which must drop them whatever the query said.
+        const labelsParam = url.searchParams.get("labels");
+        const stateParam = url.searchParams.get("state");
+        const issues = Object.values(state.issues)
+          .filter((i) => issueMatchesLabels(i, labelsParam) && issueMatchesForgejoState(i, stateParam))
+          .map(toForgejoIssue);
         const prs = state.mrs.map(mrToForgejoIssue);
         return send(res, 200, [...issues, ...prs]);
       }
@@ -1025,9 +1068,14 @@ const server = https.createServer(
       }
 
       if (method === "GET" && rest === "/issues") {
-        // ListProjectIssues (poller/sync). Return all recorded issues; the caller
-        // filters by label. Keeps a reconcile pass from evicting the cache.
-        return send(res, 200, Object.values(state.issues));
+        // ListProjectIssues (poller/sync). Honours `labels` (AND) and `state`, because
+        // the driver sends both and trusts the server to apply them — see the helpers
+        // above for why returning everything made this fake unable to fail.
+        const labelsParam = url.searchParams.get("labels");
+        const stateParam = url.searchParams.get("state");
+        return send(res, 200, Object.values(state.issues).filter(
+          (i) => issueMatchesLabels(i, labelsParam) && issueMatchesGitLabState(i, stateParam),
+        ));
       }
       if (method === "POST" && rest === "/issues") {
         const body = await readBody(req);
