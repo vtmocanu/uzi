@@ -619,9 +619,63 @@ this PRD supersedes that stance for sustained limits.
    classifier upgrades the feed line to "usage limit reached; resets at <t>" so the
    user knows why their chat went quiet. Auto-retrying a conversation turn is out of
    scope.
+
+   **↳M1 — this Decision STANDS AS WRITTEN, and chat deliberately does NOT adopt the
+   structured kinds.** `chat-executor.ts:495` keeps `kind: "error"` with improved text
+   (`:491-495`, via the shared `classifyLimitFailure` + `describeLimit`). Recorded as a
+   decision rather than left as an unfinished edge, because "the run lane got
+   structured kinds and chat did not" otherwise reads as an omission:
+   - **Chat never parks.** The structured kinds exist to carry `resets_at` for a
+     countdown; a chat turn has no countdown, so the payload would reduce to a
+     `rate_limit_type` and nothing else.
+   - Adopting them would pull the two new kinds into the **chat render surface**,
+     widening the web lane's scope for no user-visible gain over the improved sentence.
+   - **No new trust exposure**, which is the one that was actually checked before
+     ruling rather than reasoned about: that path already renders arbitrary
+     worker-authored text through `kind: "error"`. Had it introduced an untrusted field
+     into a surface not already treating worker text as untrusted, the ruling would have
+     gone the other way.
+
+   **One asymmetry an auditor will grep for, so it is named here: `describeLimit`
+   interpolates the raw `rateLimitType` into prose on this path, which is exactly what
+   Decision 8 forbids on the run path.** It is not a Decision 8 violation. Decision 8
+   guards `runs.failure_reason` — a persisted run field rendered in the run view, the
+   CLI and Slack, reachable with only NUL-strip and a length cap. This is a **feed
+   message**, whose text is worker-authored free text by design and already escaped as
+   such. The consequence to state plainly: **the server's enum allowlist does not reach
+   the chat path at all**, and that is accepted, because it is the pre-existing property
+   of every chat error line rather than something this PRD introduces.
 10. **Feed + UI + DTO plumbing (↳review N1 — the Go DTO edit is hand-maintained and
     now named; ↳2026-07-27 — it moved, and gained a consumer).** New run_message kinds
-    `limit_wait` (payload: resets_at, rate_limit_type, attempt) and `limit_hit` —
+    `limit_wait` (payload: `resets_at`, `rate_limit_type`) and `limit_hit` —
+
+    **↳M1 — `attempt` is DROPPED from that payload; the code is right and this
+    Decision was wrong.** The worker **cannot know it**: the park count is
+    `runs.limit_wait_count`, which the SERVER increments inside `SetRunLimitWait` —
+    strictly after the message is emitted and after the batcher carrying it is closed
+    — and the claim payload does not deliver a prior value either (it carries
+    `requeue_count`, a different counter, for worker deaths). Any emitted `attempt` is
+    therefore a stale N−1 that disagrees with the run row it describes.
+
+    **The counterargument, and what settles it, because otherwise the next reader
+    re-opens this.** A feed row is a historical record, so reading "attempt N" from the
+    live DTO instead means a run that parked three times shows three rows that say the
+    same thing. That is acceptable because **a feed row is inherently distinguished by
+    its own gapless `seq` and timestamp** — two parks are two rows at two times
+    whatever the payload says — and additionally by `resets_at` whenever the reset is
+    known, which is the common case. *(Stated this way on purpose: "distinguished by
+    `resets_at` by construction" is **too strong**. `resets_at` is OMITTED when the
+    reset is unknown — that is precisely the case Decision 4's exponential fallback
+    exists for — so two unknown-reset parks do emit identical payloads. The position in
+    the feed is what always distinguishes them; the timestamp is the field that never
+    goes missing.)* The run-view header reads the authoritative `limit_wait_count` off
+    the DTO, where it is always current.
+
+    **`resets_at` rides the wire as an ISO string, not the SDK's bare number.** The SDK
+    field carries a seconds-versus-milliseconds ambiguity that the worker normalises;
+    putting the normalised form on the wire means no consumer ever re-derives that
+    decision. Omitted entirely when unknown, never `null`, so "unknown" is one shape on
+    the wire rather than two —
     `run_messages.kind` carries no DB CHECK (`00020_workers_runs.sql:74`, confirmed;
     PRD #39 Decision 8, its ↳review D12 thread), rendered with explicit cases
     in `RunEvent.tsx`/ActivityFeed (escaped, no raw sinks). The new run fields
@@ -1009,6 +1063,45 @@ this PRD supersedes that stance for sustained limits.
   **The milestone graph is unchanged** — none of the four rulings moves a file
   between lanes; (b) lands in the agent lane and the seam, (a)/(c)/(d) in the api
   lane, and the M4 constraints remove a collision rather than creating one.
+- 2026-07-27 — **Two M1 rulings recorded, in both cases because the CODE disagreed
+  with a Decision as written and the code was right.**
+
+  **Decision 10 loses `attempt` from the feed payload.** The worker cannot know it:
+  `runs.limit_wait_count` is incremented by the server inside `SetRunLimitWait`,
+  strictly after the message is emitted and after its batcher is closed, and the claim
+  payload carries no prior value (`requeue_count` is a different counter). Any emitted
+  `attempt` is a stale N−1 disagreeing with the row it describes. The counterargument —
+  a feed row is a historical record, so reading the live DTO gives three identical rows
+  for a run that parked three times — is answered by the row's own `seq` and timestamp,
+  which always distinguish two parks, plus `resets_at` whenever it is known. **The
+  original justification offered ("distinguished by `resets_at` by construction") was
+  too strong and is recorded in its corrected form**: `resets_at` is omitted when the
+  reset is unknown, which is exactly the case Decision 4's exponential fallback exists
+  for, so two unknown-reset parks emit identical payloads and the position in the feed
+  is what always separates them. Left uncorrected, the next reader finds that case and
+  re-opens a settled decision believing they found a bug. Also recorded: `resets_at`
+  rides the wire as an **ISO string**, not the SDK's bare number, so no consumer
+  re-derives the seconds-versus-milliseconds normalisation.
+
+  **Decision 9 stands as written: chat keeps `kind: "error"` and does NOT adopt the
+  structured kinds** — chat never parks so there is no countdown to carry, adopting
+  them would widen the web lane into the chat render surface for no visible gain, and
+  the path already renders worker-authored text so there is no new trust exposure (the
+  one leg actually checked rather than reasoned about). One asymmetry named so an
+  auditor does not file it: `describeLimit` interpolates the raw `rateLimitType` into
+  prose here, which Decision 8 forbids on the run path. It is not a violation —
+  Decision 8 guards the persisted `runs.failure_reason`, this is a feed message whose
+  text is untrusted by design — but the consequence is stated plainly: **the enum
+  allowlist does not reach the chat path at all**, and that is pre-existing rather than
+  introduced here.
+
+  **Pattern noted in ADR-35's Consequences**: D4's refutation is the fourth instance in
+  this PRD of "a value was reachable by a fragile derived path while the authoritative
+  source sat one layer away", alongside the truncation fix, the lenient fake, and this
+  `attempt` ruling. Each fix was structural, and each derived path *worked* on the
+  happy path, which is why the shape survives review. The process form of the lesson
+  belongs in `.claude/agent-team.md`, not the ADR.
+
 - 2026-07-27 — **M0 rev 3**, from the M-SEAM review. **Ruling: the promotion-wave
   stampede is real, but the proposed fix cannot work and the existing design already
   contains the mechanism.** Decision 6e makes promotion pool-aware, which manufactures

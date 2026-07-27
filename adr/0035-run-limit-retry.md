@@ -249,6 +249,19 @@ env.
 `autoChoice`** (`service.go:1094-1100`), so the pool legs are inert for them. That
 falls out of the existing code; no kind check was added for it, and none should be.
 
+**D4's refutation is an instance of a shape that recurred four times in this PRD, and
+naming it is worth more than the instance.** Each time, a value was reachable by a
+fragile derived path while the authoritative source sat one layer away: D4 wanted
+"which token will this run pick" from `anthropic_secret_id`, a record of a **past**
+choice; M1 wanted a status by parsing it out of a truncated error string when the
+response body carried it; M1 wanted a park count frozen into a feed row when
+`limit_wait_count` was already on the DTO. In every case the fix was structural — read
+the authoritative source — and in every case the derived path *worked* on the happy
+path, which is why it survives review. It is the same argument PRD #111's D8 makes
+one level down (*recorded id == opened id*). The process form of this lesson belongs
+in `.claude/agent-team.md` alongside the other earned rules, not here; this note
+exists so D4 reads as an instance of a known shape rather than a one-off.
+
 ## Adjacent decisions, recorded elsewhere on purpose
 
 This ADR is deliberately narrow. The other durable shapes of PRD #35 live in the PRD's
