@@ -1520,6 +1520,8 @@ export const mockRuns: Run[] = [
     // Not claimed yet, so no credential was spent — both null (PRD #111 M1).
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,
@@ -1560,6 +1562,9 @@ export const mockRuns: Run[] = [
     own_agents: null,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
+    // M5: the headline case, and D20's own example — `console-key — auto, 62% headroom`.
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: 62,
     claimed_at: minsAgo(1),
     started_at: minsAgo(1),
     finished_at: null,
@@ -1613,6 +1618,9 @@ export const mockRuns: Run[] = [
     own_agents: null,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
+    // M5: an ordinary default, for contrast with the fallback above.
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(9),
     started_at: minsAgo(9),
     finished_at: null,
@@ -1653,6 +1661,10 @@ export const mockRuns: Run[] = [
     own_agents: null,
     anthropic_secret_id: "sec-console",
     anthropic_secret_label: "console-key",
+    // M5: D10's best-of-pool. Every pooled token was under the floor and the emptiest was
+    // spent anyway — the run worked, and the pool is nearly exhausted.
+    anthropic_select_reason: "best_of_pool",
+    anthropic_headroom_pct: 8,
     claimed_at: minsAgo(220),
     started_at: minsAgo(219),
     finished_at: minsAgo(184),
@@ -1699,6 +1711,10 @@ export const mockRuns: Run[] = [
     // the run still names the account it billed after the token is gone.
     anthropic_secret_id: null,
     anthropic_secret_label: "retired-key",
+    // M5: a mode on a DELETED credential. The two are independent fields, so the chip
+    // has to say both things at once.
+    anthropic_select_reason: "pinned",
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(305),
     started_at: minsAgo(304),
     finished_at: minsAgo(120),
@@ -1739,6 +1755,10 @@ export const mockRuns: Run[] = [
     own_agents: null,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
+    // M5: the judge lane's own mode. Rendered `judge binding` and NOT `pinned`, which
+    // would send a user to Settings → Workers for a binding that does not exist.
+    anthropic_select_reason: "judge",
+    anthropic_headroom_pct: null,
     claimed_at: daysAgo(1.2),
     started_at: daysAgo(1.2),
     finished_at: daysAgo(1.1),
@@ -1779,6 +1799,12 @@ export const mockRuns: Run[] = [
     own_agents: null,
     anthropic_secret_id: "sec-default",
     anthropic_secret_label: "default",
+    // M5: the FALLBACK state, and the mock's most important credential row. The worker
+    // is set to auto and the run spent the default anyway because no pooled token had a
+    // fresh reading — the one case where the user's configuration and what actually
+    // happened differ, and the only one a browser pass can judge the amber chip against.
+    anthropic_select_reason: "pool_stale",
+    anthropic_headroom_pct: null,
     claimed_at: null,
     started_at: null,
     finished_at: daysAgo(3),
@@ -2067,6 +2093,8 @@ function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">
     own_agents: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(12),
     started_at: minsAgo(12),
     finished_at: null,
@@ -2306,6 +2334,8 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     own_agents: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_select_reason: null,
+    anthropic_headroom_pct: null,
     claimed_at: minsAgo(6),
     started_at: minsAgo(6),
     finished_at: null,

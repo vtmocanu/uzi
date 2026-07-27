@@ -199,6 +199,8 @@ describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
       own_agents: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
+      anthropic_select_reason: null,
+      anthropic_headroom_pct: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,

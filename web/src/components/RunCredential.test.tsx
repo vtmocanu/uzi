@@ -1,14 +1,39 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render as rtlRender, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { RunCredential } from "./RunCredential";
 
+// A router wrapper, because the chip becomes a <Link> in its FALLBACK states — the
+// one place the user has something to do about what they are reading. Only RunView
+// renders this component and RunView is inside the router, so the dependency costs
+// nothing in production; it costs this wrapper in tests.
+function render(ui: Parameters<typeof rtlRender>[0]) {
+  return rtlRender(<MemoryRouter>{ui}</MemoryRouter>);
+}
+
 afterEach(cleanup);
+
+// cred builds the four credential fields. M5 added two, and every fixture below goes
+// through here so a seventh field lands in one place rather than in nine literals.
+function cred(over: {
+  id?: string | null;
+  label?: string | null;
+  reason?: string | null;
+  headroom?: number | null;
+}) {
+  return {
+    anthropic_secret_id: over.id === undefined ? "sec-1" : over.id,
+    anthropic_secret_label: over.label === undefined ? "console-key" : over.label,
+    anthropic_select_reason: over.reason ?? null,
+    anthropic_headroom_pct: over.headroom ?? null,
+  };
+}
 
 describe("RunCredential (PRD #111 M1)", () => {
   it("names the credential the run spent", () => {
     render(
-      <RunCredential run={{ anthropic_secret_id: "sec-1", anthropic_secret_label: "console-key" }} />,
+      <RunCredential run={cred({})} />,
     );
     expect(screen.getByText(/console-key/)).toBeTruthy();
     expect(screen.queryByText(/deleted/)).toBeNull();
@@ -36,7 +61,7 @@ describe("RunCredential (PRD #111 M1)", () => {
   // reads it, and an implementation that ignored it fails this.
   it("marks the credential as deleted when the id is gone but the label survives", () => {
     render(
-      <RunCredential run={{ anthropic_secret_id: null, anthropic_secret_label: "retired-key" }} />,
+      <RunCredential run={cred({ id: null, label: "retired-key" })} />,
     );
     // The label is still named — that is what the snapshot column is FOR. The FK
     // nulls the id when the token is deleted, so a component gated on the id would
@@ -49,7 +74,7 @@ describe("RunCredential (PRD #111 M1)", () => {
 
   it("renders nothing when no credential was recorded", () => {
     const { container } = render(
-      <RunCredential run={{ anthropic_secret_id: null, anthropic_secret_label: null }} />,
+      <RunCredential run={cred({ id: null, label: null })} />,
     );
     expect(container.textContent).toBe("");
   });
@@ -59,7 +84,7 @@ describe("RunCredential (PRD #111 M1)", () => {
   // must be falsy-based, not a `!== null` that would render a blank chip.
   it("renders nothing for an empty label", () => {
     const { container } = render(
-      <RunCredential run={{ anthropic_secret_id: "sec-1", anthropic_secret_label: "" }} />,
+      <RunCredential run={cred({ label: "" })} />,
     );
     expect(container.textContent).toBe("");
   });
@@ -69,7 +94,7 @@ describe("RunCredential (PRD #111 M1)", () => {
   it("renders a markup-shaped label as text, not markup", () => {
     const { container } = render(
       <RunCredential
-        run={{ anthropic_secret_id: "sec-1", anthropic_secret_label: "<img src=x onerror=1>" }}
+        run={cred({ label: "<img src=x onerror=1>" })}
       />,
     );
     expect(container.querySelector("img")).toBeNull();
@@ -85,10 +110,105 @@ describe("RunCredential (PRD #111 M1)", () => {
   it("strips invisible formatting characters from the label", () => {
     const { container } = render(
       <RunCredential
-        run={{ anthropic_secret_id: "sec-1", anthropic_secret_label: "safe‮drowssap" }}
+        run={cred({ label: "safe‮drowssap" })}
       />,
     );
     expect(container.textContent).not.toContain("‮");
     expect(container.textContent).toContain("safe");
+  });
+});
+
+// --- PRD #111 M5: the chip names the MODE, not just the token -------------------
+
+describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
+  // 🔴 EVERY CASE HERE NAMES THE SAME TOKEN, and that is the fixture design, not an
+  // accident. D20's whole argument is that the label cannot answer the user's
+  // question because an auto pick and a default fallback can name the SAME
+  // credential. A fixture using three different labels would pass against a component
+  // that ignored the reason entirely, which is this repo's documented
+  // broken-and-correct-agree trap.
+  it.each([
+    ["auto", 62, /auto, 62% headroom/],
+    ["default", null, /default/],
+    ["pinned", null, /pinned/],
+    ["judge", null, /judge binding/],
+    ["best_of_pool", 8, /auto \(best of pool\), 8% headroom/],
+  ])("renders %s", (reason, headroom, want) => {
+    render(<RunCredential run={cred({ reason: reason as string, headroom })} />);
+    expect(screen.getByText(/console-key/).textContent).toMatch(want);
+  });
+
+  // The three fallbacks must not read as an ordinary default. The worker is set to
+  // auto and the run did not get it, which is a different situation with a different
+  // fix from a worker that was never auto in the first place.
+  it.each(["pool_empty", "pool_stale", "open_failed"])(
+    "%s says the worker is on auto and why it did not get a pick",
+    (reason) => {
+      render(<RunCredential run={cred({ reason })} />);
+      expect(screen.getByText(/console-key/).textContent).toMatch(/default \(auto:/);
+    },
+  );
+
+  // A run claimed before M1 recorded no mode. The bare label is the truthful
+  // rendering; a guessed "default" would assert something nothing knows.
+  it("shows the bare label for a run with no recorded reason", () => {
+    render(<RunCredential run={cred({ reason: null })} />);
+    const text = screen.getByText(/console-key/).textContent ?? "";
+    expect(text).not.toMatch(/—/);
+  });
+
+  // The API ships separately from this bundle, so a newer server can send a ninth
+  // reason. Rendering it verbatim is honest; dropping it or guessing is not.
+  it("passes an unrecognised reason through rather than dropping it", () => {
+    render(<RunCredential run={cred({ reason: "some_future_reason" })} />);
+    expect(screen.getByText(/console-key/).textContent).toMatch(/some_future_reason/);
+  });
+
+  // The headroom rides only where the server measured one. D14's retry records
+  // open_failed with a NULL headroom precisely because the reading described the
+  // credential that would NOT open — attaching it to the one that did would
+  // attribute a measurement to a token nothing measured.
+  it("omits the headroom when the server recorded none", () => {
+    render(<RunCredential run={cred({ reason: "open_failed", headroom: null })} />);
+    expect(screen.getByText(/console-key/).textContent).not.toMatch(/headroom/);
+  });
+
+  // A deleted credential AND a mode, together: the two are independent fields and a
+  // renderer that handled either alone would pass every test above.
+  it("shows both the deleted marker and the mode", () => {
+    render(<RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} />);
+    const text = screen.getByText(/retired-key/).textContent ?? "";
+    expect(text).toMatch(/\(deleted\)/);
+    expect(text).toMatch(/pinned/);
+  });
+});
+
+// --- the link to the page that fixes it ----------------------------------------
+
+describe("RunCredential links only where there is something to do", () => {
+  // PRD #104 M5 already ships the per-token meters and eligibility chips on
+  // Settings → Anthropic tokens, so a fallback POINTS AT THEM rather than rebuilding
+  // a meter in the run header.
+  it.each(["pool_empty", "pool_stale", "open_failed"])("links on %s", (reason) => {
+    const { container } = render(<RunCredential run={cred({ reason })} />);
+    const link = container.querySelector("a");
+    expect(link).not.toBeNull();
+    // The user's OWN settings page. /admin/rate-limits is admin-only and would 403
+    // for exactly the person reading their own run.
+    expect(link?.getAttribute("href")).toBe("/settings");
+  });
+
+  // A link where nothing is wrong is a dead end dressed as an action.
+  it.each(["auto", "default", "pinned", "judge", "best_of_pool"])("does not link on %s", (reason) => {
+    const { container } = render(<RunCredential run={cred({ reason })} />);
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  // Nothing left to look at: the credential is gone from Settings too.
+  it("does not link a deleted credential", () => {
+    const { container } = render(
+      <RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} />,
+    );
+    expect(container.querySelector("a")).toBeNull();
   });
 });

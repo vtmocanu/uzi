@@ -866,6 +866,23 @@ export interface Run {
    *  never be interpolated into HTML or a URL unescaped. */
   anthropic_secret_id: string | null;
   anthropic_secret_label: string | null;
+  /** PRD #111 M5: the MODE that named that credential, and the measured headroom of
+   *  an auto pick (D20). The label alone could never answer the user's question,
+   *  because an auto pick and a default fallback can name the SAME token — and PRD
+   *  #104's compatibility path creates a row labelled literally `default`, so the
+   *  label is not even a reliable hint at the mode.
+   *
+   *  Three INDEPENDENT nullabilities across the four fields, so branch per field and
+   *  never on the group: the label outlives the id, the reason is present on every
+   *  run claimed since M1, and the headroom only on an auto pick (and not on D14's
+   *  retry, where the reading described the credential that would not open).
+   *
+   *  🔴 RENDER THE REASON; NEVER RE-DERIVE IT. Same rule as AutoStatus and for the
+   *  same reason: it is the server's own record of what its selector did, and a UI
+   *  that reconstructed it from the other fields would eventually disagree with the
+   *  thing that actually spent the money. */
+  anthropic_select_reason: SelectReason | string | null;
+  anthropic_headroom_pct: number | null;
   /** PRD #40: the run's rolled-up token/cost totals (greatest-wins per model,
    *  summed across models — the server's run_usage_totals view). Present only when
    *  the run has usage rows; absent/null for a pre-feature run, so the UI shows
@@ -991,6 +1008,26 @@ export type MyRateLimits =
  *  Reconstructing it here from `limits` — a `100 - pct`, a synced_at comparison —
  *  reintroduces exactly the drift the field exists to remove, and nothing would fail
  *  when the two disagreed. */
+/** SelectReason is WHY a run spent the credential it spent (PRD #111 M5, D20) — the
+ *  MODE that named it. A CLOSED set of eight, mirroring autoselect.Reason in Go and
+ *  migration 00089's CHECK in SQL; selectReasonMatchesMigration in
+ *  runCredential.test.ts parses that migration and pins the three in step.
+ *
+ *  Typed as `SelectReason | string` on the wire rather than as the union alone: the
+ *  API is deployed separately from this bundle, so a newer server can ship a ninth
+ *  reason, and a union that lied about being total would make a renderer's exhaustive
+ *  switch look safe while dropping it. The renderer handles the unknown case
+ *  explicitly instead. */
+export type SelectReason =
+  | "default"
+  | "pinned"
+  | "judge"
+  | "auto"
+  | "best_of_pool"
+  | "pool_empty"
+  | "pool_stale"
+  | "open_failed";
+
 export type AutoStatus =
   | "eligible"
   | "not_pooled"

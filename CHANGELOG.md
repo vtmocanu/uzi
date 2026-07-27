@@ -37,16 +37,27 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
   [docs/configuration.md](docs/configuration.md).
 
-- **Every run now names the Anthropic credential it spent.** The credential is **recorded on
-  all three lanes** (issue/ci_fix, judge and chat) and **shown in the run view** as a `token
-  <label>` chip and by `uzi run get` as an `ANTHROPIC_TOKEN` row. A chat conversation has its
-  own view and does not show the chip yet, though its spend is recorded like any other run's.
-  Until now a run recorded what it cost but not which account paid, which was
-  a distinction without a difference while a user could hold one token and stopped being one
-  the moment PRD #104 let them hold several. The label is a snapshot taken when the run was
-  claimed, so it survives that token being renamed or deleted: a finished run keeps naming the
-  account it billed even after the credential is gone. Runs claimed before this landed show
-  nothing rather than a guess (PRD #111 M1).
+- **Every run now names the Anthropic credential it spent, and why that one.** The credential
+  is **recorded on all three lanes** (issue/ci_fix, judge and chat) and **shown in the run
+  view** as a `token <label> — <mode>` chip and by `uzi run get` as an `ANTHROPIC_TOKEN` row.
+  A chat conversation has its own view and does not show the chip yet, though its spend is
+  recorded like any other run's. Until now a run recorded what it cost but not which account
+  paid, which was a distinction without a difference while a user could hold one token and
+  stopped being one the moment PRD #104 let them hold several. The label is a snapshot taken
+  when the run was claimed, so it survives that token being renamed or deleted: a finished run
+  keeps naming the account it billed even after the credential is gone, and says `(deleted)`
+  so it is not mistaken for one you can still go and look at. Runs claimed before this landed
+  show nothing rather than a guess.
+
+  **The mode is there because the label alone cannot answer the question.** An automatic pick
+  and a fallback to your default can name the *same* token, so the chip says which of them
+  happened: `console-key — auto, 62% headroom`, `console-key — pinned`, `default — judge
+  binding`. When an `auto` worker did *not* get an automatic pick, it says so and says why —
+  `default (auto: no fresh usage readings)` — and links to Settings → Anthropic tokens, which
+  is where that particular problem gets fixed. Those runs are the only ones that carry a
+  warning colour: nothing failed, but your pool did no work, which is usually a setting you
+  can change. `uzi worker list` also gains a **TOKEN** column, so the three-way choice the CLI
+  could already *set* is finally one it can *show* (PRD #111 M1 + M5).
 
 - **A Model column in the run view's per-agent usage table.** The usage panel named the run's
   model only once, in the top strip — the main thread's. A run is multi-model (a subagent can
