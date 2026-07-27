@@ -11861,7 +11861,8 @@ four managers and turned an *inferred* second pnpm vector into a fact.
   parses any flag** — exit 0, repo JS executed, both spellings, and this is the layout
   `yarn set version berry` produces rather than a contrived fixture; pnpm executes a repo-local
   `.pnpmfile.cjs` despite `--ignore-scripts`, and separately **fetches and runs** the pnpm a repo
-  names in `packageManager` (`manage-package-manager-versions`, default ON since 9.7); bun ran the
+  names in `packageManager` (`manage-package-manager-versions`, on by default on the version
+  measured — but see the pnpm-11 residual below); bun ran the
   cloned repo's own `postinstall` without the flag; npm showed no `packageManager` handoff, and a
   repo `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
 - **The ruling: restore the premise, do not renegotiate it.** The alternative — accept that repo
@@ -11873,9 +11874,14 @@ four managers and turned an *inferred* second pnpm vector into a fact.
   path by which a cloned repo executes its own code, pre-approval, on every run touching that
   manager. Tests pin the flags per manager so the property stays checkable instead of becoming
   folklore.
-- **`--ignore-scripts` matters MORE on bun, not less.** bun already declines to run a *dependency's*
-  scripts unless it is in `trustedDependencies`, so the untrusted thing the flag stops there is the
-  cloned repo's own `postinstall` — the one arm where `--ignore-scripts` is the only thing holding.
+- **`--ignore-scripts` matters MORE on bun, not less.** bun's own flag documentation defines it as
+  "skip lifecycle scripts in the **project's** `package.json` (dependency scripts are never run)" —
+  so the untrusted thing the flag stops on bun is the cloned repo's own `postinstall`, the one arm
+  where `--ignore-scripts` is the only thing holding. *(This bullet used to say bun "declines to run
+  a dependency's scripts unless it is in `trustedDependencies`", which overstates it: per the
+  fact-check, bun also ships a default-trusted allowlist of popular packages, so the dependency side
+  is not a pure opt-in. Restated in bun's own wording, which is what the mitigation rests on and
+  does not depend on the allowlist question either way.)*
 - **The module's env contract changed, and that is the visible cost.** It otherwise adds, defaults
   and merges **no** environment key — the caller's scrubbed env passes through byte for byte, a
   property an audit checked and a test pins. `YARN_IGNORE_PATH` is a single hardening key, in the
@@ -11891,9 +11897,19 @@ four managers and turned an *inferred* second pnpm vector into a fact.
   as what was: bun entirely (no binary in the image, so its row rests on one uncorroborated probe —
   `bunfig.toml` `preload` is the obvious untested candidate and the largest gap); corepack shims
   (present but not enabled — `corepack enable` would make `packageManager` drive download-and-execute
-  for yarn *and* npm); a real Berry as the `yarn` on PATH (`YARN_IGNORE_PATH` is a yarn-1 mechanism);
-  and lockfile-embedded specifiers (`git:`/`file:`/`link:`, arbitrary `resolved` URLs) plus `.npmrc`
-  registry redirection.
+  for yarn *and* npm); a real Berry as the `yarn` on PATH (untested — but see the next bullet, the
+  mitigation probably does carry); and lockfile-embedded specifiers (`git:`/`file:`/`link:`,
+  arbitrary `resolved` URLs) plus `.npmrc` registry redirection.
+- **`YARN_IGNORE_PATH` PROBABLY CARRIES ONTO BERRY, and this used to say the opposite.** The old
+  wording dismissed Berry with "`YARN_IGNORE_PATH` is a yarn-1 mechanism". Re-derived from Berry's
+  source at `master` (`yarnpkg-core/sources/Configuration.ts`): Berry defines its **own** `ignorePath`
+  boolean setting, default `false`, and `checkYarnPath` returns `null` — no proxy — when it is true.
+  Berry reads settings from the environment with `ENVIRONMENT_PREFIX = 'yarn_'` + camelCase, so
+  `YARN_IGNORE_PATH` maps to `ignorePath`, and it is **not** in `IGNORED_ENV_VARIABLES` — unlike
+  `ignoreScripts`, which Berry deliberately *does* ignore from the environment so a CI-inherited
+  `YARN_IGNORE_SCRIPTS` cannot shadow `enableScripts`. **Still a source read and not an execution**,
+  so "Berry untested" stands as a caveat; what does not stand is the false reasoning that used to
+  prop it up.
 - **NO SINGLE ENVIRONMENT EXECUTED ALL FOUR ARMS, and yarn is the residual that matters most.**
   This is the sharpest limit here and the easiest to miss, because the reports read as complete
   coverage when taken together. The shipped worker image is `FROM node:22-alpine`, which carries
@@ -11903,6 +11919,21 @@ four managers and turned an *inferred* second pnpm vector into a fact.
   validator — two partial coverages, not one complete one. What does hold for yarn: the argv **and**
   `YARN_IGNORE_PATH` are pinned by a mutation-folded test, and the `yarnPath` probes were run inside
   the pinned `node:22-alpine` by other agents.
+- **🔴 ON pnpm 11 THE `manage-package-manager-versions` FLAG IS LIKELY A SILENT NO-OP, AND THE
+  VECTOR REOPENS.** pnpm's own settings documentation records `pmOnFail` as **"Added in: v11.0.0"**,
+  default **`download`**, describing that default as matching "the previous
+  `managePackageManagerVersions: true` behavior" — i.e. fetch and run the pnpm the repo declares,
+  which is exactly the vector the flag was added to close. The v11 settings page carries no
+  `managePackageManagerVersions` section of its own. So on pnpm 11 the closing flag is
+  `--config.pm-on-fail=ignore`, and the shipped `--config.manage-package-manager-versions=false`
+  addresses a setting that no longer exists. **The no-op half is INFERENCE, not measurement**
+  (reported: pnpm silently accepts an unknown `--config.<key>`, measured on pnpm 10 with
+  `--config.this-key-does-not-exist=false` exiting 0 with no warning; not re-measured on 11 by me,
+  and no pnpm exists in the shipped image to measure it in). This is reachable rather than
+  hypothetical **because pnpm arrives through the provisioned toolchain**, which is precisely where
+  a pnpm 11 can turn up. Treat it as the live half of the "a manager that grows a new repo-file exec
+  path would reopen this silently" warning above — here the manager did not grow a path, it *renamed
+  the setting that closed one*.
 - **`--ignore-scripts` bounds what runs at install time, not what the install PLACES on disk.**
   Attacker-chosen code landing in `node_modules` executes when the agent later runs a gate. Not a
   *new* exposure — the repo's own test files already execute under the same uid — but a different
@@ -12092,9 +12123,37 @@ is entitled to make yet.
   under the runner uid with the scrubbed env" are different claims and only the second is M5.
 - **The plan-turn race stays open by design** (§399) — it cannot be closed without giving up the
   overlap that is the feature's premise.
-- **yarn Berry monorepos get ZERO provisioning.** A root `workspaces` + `yarn.lock` prunes the
-  subtree to one root install, and Berry rejects the classic `--frozen-lockfile`, so the root install
-  fails honestly and no member is attempted.
+- **yarn Berry monorepos get ZERO provisioning — conclusion unchanged, MECHANISM CORRECTED
+  2026-07-27.** A root `workspaces` + `yarn.lock` prunes the subtree to one root install, and that
+  root install does not succeed, so no member is attempted.
+
+  **This bullet used to say "Berry rejects the classic `--frozen-lockfile`". That is FALSE; Berry
+  ACCEPTS it.** Re-derived from Berry's own source at `master`:
+  `plugin-essentials/sources/commands/install.ts` declares
+  `frozenLockfile = Option.Boolean('--frozen-lockfile', {hidden: true})` and passes it to
+  `reportOptionDeprecations` with a deprecation message, **no `error` key**, and
+  `callback: () => this.immutable = this.frozenLockfile`; `yarnpkg-core/sources/StreamReport.ts`
+  returns an exit code only `if (deprecationReport.hasErrors())`, so that path returns `null` and
+  the install **proceeds** with `immutable = true`. The command's own docstring calls it a
+  backward-compatibility alias for `--immutable`.
+
+  The two real mechanisms, in the order a run meets them:
+  1. **On the shipped image the `yarn` on PATH is yarn 1.22.22, which cannot install a Berry
+     project at all** — and `YARN_IGNORE_PATH=1` is precisely what stops it proxying to the repo's
+     Berry release, so the mitigation §398 needs is also what guarantees yarn 1 meets Berry alone.
+     This is the arm that actually fires today.
+  2. **If a real Berry ever is the `yarn` on PATH, the flag it rejects is `--ignore-scripts`, not
+     `--frozen-lockfile`** — Berry's `install` declares no such option (its full `Option.*` list is
+     json, immutable, immutable-cache, refresh-lockfile, check-cache, check-resolutions,
+     inline-builds, mode, cache-folder, frozen-lockfile, ignore-engines, non-interactive,
+     prefer-offline, production, registry, silent, network-timeout), so an unknown-option usage
+     error is what ends it.
+
+  **Both are SOURCE-DERIVED, not executed** — no Berry install was run in any validation
+  environment (see §398's coverage limit). The failure is honest in either case, which is why the
+  conclusion survived the correction. Provenance worth keeping: the M3 reviewer measured the right
+  thing originally (Berry rejects `--ignore-scripts`) and the flag flipped between that report and
+  the docs, with nobody re-deriving it — including me, when I wrote this section from the PRD.
 - **pnpm and bun are absent from the shipped worker image** (`agent/templates/base/Dockerfile` →
   `node:22-alpine`; neither its `apk add` nor `devbox-global/devbox.json` supplies them), so those
   arms are **dormant** — a pnpm or bun repo ENOENTs into an honest skip today. They become reachable
