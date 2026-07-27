@@ -30,10 +30,15 @@ upgraded automatically**, since nothing in uzi can restart a container on your m
 it is a reminder to pull and restart, not a fault. **no badge** — nothing to compare and
 nothing claimed: a locally built worker reports no version, and an api built outside a release
 turns comparison off fleet-wide, the normal state of a development setup. One case here is
-*not* benign: a hosted worker that has **never** run has no version to compare either, so a
-worker failing long enough eventually falls back to no badge. A hosted worker with no badge and
-no `VERSION` never started — check its deployment rather than reading absence as "nothing to
-report".
+*not* benign: a hosted worker that has **never** run has no version to compare either. A hosted
+worker with no badge and no `VERSION` never started — check its deployment rather than reading
+absence as "nothing to report".
+
+A failing hosted worker no longer decays into that state. Until 0.11.9 an **upgrade failed**
+badge expired after a fixed window and the row fell back to version comparison, which for a
+worker that never registered meant no badge at all: the alert went quiet while the worker was
+still broken. As long as the cluster keeps reporting the worker as stuck, the badge now stays.
+It clears when the pod recovers, not on a timer.
 
 ## When an upgrade fails
 

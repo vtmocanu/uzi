@@ -109,38 +109,31 @@ func TestPodlessBlockedWorkerReachesTheAttentionSet(t *testing.T) {
 	}
 }
 
-// THE RESIDUAL HALF OF #148, PINNED RATHER THAN FIXED — read this before treating the
-// issue as closed. IT IS TRACKED AS ISSUE #151, which already carries the owner's own
-// recommendation, so this test has a known expiry date.
+// THE RESIDUAL HALF OF #148, NOW CLOSED BY #151. This function replaces
+// TestPodlessBlockedWorkerGoesSilentAgainPastTheCeiling, which pinned the gap and whose
+// own comment instructed whoever closed #151 to delete it in the same commit. Same
+// scenario, same fixtures, inverted expectation — kept rather than dropped, because the
+// silence it documented is the exact regression a future re-gating of R1 would reintroduce.
 //
-// MEASURED, not predicted: past MaxUpgradingWindow the INV-5 ceiling stops gating R1 as
-// well as R2, so the api stops believing the controller about a worker it is asserting is
-// BROKEN. The fallback is version compare, the worker never registered, and R5 answers
-// `unknown` — which is not in the attention set. So the fix above alerts for
-// MaxUpgradingWindow and then goes silent again, permanently.
+// The gap it pinned, for the record: the ceiling used to gate R1 as well as R2, so past
+// MaxUpgradingWindow the api stopped believing the controller about a worker it was
+// asserting is BROKEN. The fallback is version compare; a worker that never registered
+// reports "" and R5 answers `unknown`, which is not in the attention set. So #148's fix
+// alerted for the remainder of the window and then went silent again, permanently.
 //
-// MEASURED ON A REAL CLUSTER TOO, which is what makes this urgent rather than theoretical
-// (#151, dev-cluster, 0.11.8): the anchor armed at 20:10:28 while the worker was pod-less
-// and nothing was yet wrong, the pod finally appeared at 20:44:18 having spent 33m50s of the
+// MEASURED ON A REAL CLUSTER (#151, dev-cluster, 0.11.8), which is what made it urgent
+// rather than theoretical: the anchor armed at 20:10:28 while the worker was pod-less and
+// nothing was yet wrong, the pod finally appeared at 20:44:18 having spent 33m50s of the
 // budget, the age arm could not fire before 20:54:18, and the ceiling expired at 20:55:28 —
 // a 70-SECOND window out of 45 minutes in which `upgrade_failed` was reachable at all. The
 // flip to `unknown` was observed 73 seconds after the correct `upgrade_failed`, while the DB
-// row still said `phase=stuck`. So the ceiling measures "how long have we believed a roll is
-// in progress" and is being read as "how long may a pod be broken before we say so"; every
-// provisioning delay is charged against the detection budget.
+// row still said `phase=stuck`.
 //
-// Why this branch does not fix it. #151's recommendation is to drop `ceilingOK` from R1 only
-// and leave R2 gated — a one-line change in upgrade.go — on the ground that the two threats
-// are NOT symmetric: a liar asserting `upgrading` is silent and indefinite, while a liar
-// asserting `upgrade_failed` is loud and self-limiting, because an operator looks, sees
-// healthy workers and escalates about the controller. That reasoning is sound and is the
-// owner's. It is still a change to an owner-accepted invariant, made in a different issue,
-// with its own test surface (INV-5's P1/P2 properties) — so it belongs to #151, not here.
-//
-// Pinned so the gap is a fact in the suite rather than a surprise, and so #151's fix
-// REDDENS this test deliberately instead of finding it by accident. If you are here because
-// this test failed while landing #151: that is exactly right — delete it and say so.
-func TestPodlessBlockedWorkerGoesSilentAgainPastTheCeiling(t *testing.T) {
+// Note what the fix does NOT do, because it bounds what this test proves: the anchor still
+// arms on the first non-terminal report and still clears only on a version move. R2 remains
+// gated on it, so a worker that blipped once can still badge `outdated` on a later healthy
+// roll. That is a separate defect in the same anchor, tracked on its own.
+func TestPodlessBlockedWorkerStaysLoudPastTheCeiling(t *testing.T) {
 	t0 := time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC)
 	anchor := t0
 	p := ceilingParams()
@@ -155,19 +148,27 @@ func TestPodlessBlockedWorkerGoesSilentAgainPastTheCeiling(t *testing.T) {
 	t.Logf("at anchor+%v: status=%q detail=%q attention=%v",
 		p.MaxUpgradingWindow-time.Minute, status, detail, InUpgradeAttentionSet(status))
 
-	// Past it: the controller is still reporting `stuck` every poll, freshly.
-	past := t0.Add(p.MaxUpgradingWindow + time.Minute)
-	status, detail = ClassifyUpgrade(podlessInput(past, podlessBlocked(past, &anchor)), p)
-	t.Logf("at anchor+%v: status=%q detail=%q attention=%v",
-		p.MaxUpgradingWindow+time.Minute, status, detail, InUpgradeAttentionSet(status))
+	// Past it: the controller is still reporting `stuck` every poll, freshly — and is
+	// still believed. Two multiples so this cannot pass by landing just inside some other
+	// bound; the second is 24x the window.
+	for _, elapsed := range []time.Duration{p.MaxUpgradingWindow + time.Minute, 24 * p.MaxUpgradingWindow} {
+		past := t0.Add(elapsed)
+		status, detail = ClassifyUpgrade(podlessInput(past, podlessBlocked(past, &anchor)), p)
+		t.Logf("at anchor+%v: status=%q detail=%q attention=%v",
+			elapsed, status, detail, InUpgradeAttentionSet(status))
 
-	if status != UpgradeStatusUnknown {
-		t.Errorf("past the ceiling: status = %q, want %q. This test PINS a known gap rather than a "+
-			"desired behaviour — if the ceiling was split so R1 survives it, this is the test that "+
-			"should have been deleted in the same commit.", status, UpgradeStatusUnknown)
-	}
-	if InUpgradeAttentionSet(status) {
-		t.Errorf("past the ceiling: %q is in the attention set, which would mean the residual gap this "+
-			"test documents is closed. Good — remove the test.", status)
+		if status != UpgradeStatusUpgradeFailed {
+			t.Errorf("at anchor+%v: status = %q, want %q. The alert expired — this is #148's residual "+
+				"reopening, which means ceilingOK is gating R1 again.",
+				elapsed, status, UpgradeStatusUpgradeFailed)
+		}
+		if !InUpgradeAttentionSet(status) {
+			t.Errorf("at anchor+%v: %q is not in the attention set, so nobody is told about a worker "+
+				"that cannot get a pod.", elapsed, status)
+		}
+		if detail != "pod: FailedCreate" {
+			t.Errorf("at anchor+%v: the diagnosis must survive the ceiling with the alert, got %q",
+				elapsed, detail)
+		}
 	}
 }
