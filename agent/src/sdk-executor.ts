@@ -428,6 +428,7 @@ export class SdkExecutor implements Executor {
           // Judge rec (run 51757591): the commit this branch was cut from, so the lead
           // does not infer the parent from the clone's freshly-fetched default branch.
           baseCommit: ctx.baseCommit,
+          defaultBranchCommit: ctx.defaultBranchCommit,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -445,6 +446,7 @@ export class SdkExecutor implements Executor {
           // See above. The fixed self_improve branch is routinely seeded off a previous
           // cycle's tip, so its base is the least guessable of the three kinds.
           baseCommit: ctx.baseCommit,
+          defaultBranchCommit: ctx.defaultBranchCommit,
         });
       } else {
         planPrompt = buildPlanPrompt({
@@ -460,6 +462,7 @@ export class SdkExecutor implements Executor {
           priorWork: ctx.priorWork,
           // See above.
           baseCommit: ctx.baseCommit,
+          defaultBranchCommit: ctx.defaultBranchCommit,
         });
       }
       const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
@@ -617,6 +620,7 @@ export class SdkExecutor implements Executor {
           // First turn only (buildImplementPrompt gates it): this is the phase where the
           // lead hands a subagent a diff command, which is where the wrong one was seen.
           baseCommit: ctx.baseCommit,
+          defaultBranchCommit: ctx.defaultBranchCommit,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;

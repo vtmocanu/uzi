@@ -301,6 +301,7 @@ export class RunRunner {
         // The seed resolved this in the bare; forwarding it is what stops the lead from
         // guessing the branch's parent (judge rec, run 51757591).
         baseCommit: runnerClone.baseCommit,
+        defaultBranchCommit: runnerClone.defaultBranchCommit,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,

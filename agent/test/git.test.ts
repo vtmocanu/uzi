@@ -83,6 +83,9 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     // resume case below). Nothing has committed yet, so the checkout point IS HEAD.
     assert.match(rc.baseCommit, /^[0-9a-f]{40}$/, "baseCommit must be a full resolved SHA");
     assert.strictEqual(rc.baseCommit, gitIn(rc.path, ["rev-parse", "HEAD"]));
+    // On a FRESH branch the seed IS the default tip, so the two commits coincide — which
+    // is what lets the prompt state one command instead of two.
+    assert.strictEqual(rc.defaultBranchCommit, rc.baseCommit);
   });
 
   it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
@@ -135,11 +138,17 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     // freshly fetched and pointing somewhere else entirely, so a diff written against it
     // spans commits this branch never touched.
     assert.strictEqual(second.baseCommit, sha1, "resume seeds off the branch's origin tip");
+    const originDefault = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     assert.notStrictEqual(
       second.baseCommit,
-      gitIn(fx.originPath, ["rev-parse", "HEAD"]),
+      originDefault,
       "…and that tip is NOT the default branch's, which is exactly why the base has to be reported",
     );
+    // The SECOND commit, and the reason it exists: on a resume `baseCommit..HEAD` is only
+    // what this run adds, so the branch diff needs the default tip as well. A note carrying
+    // one commit is wrong on exactly the runs that carry prior work.
+    assert.strictEqual(second.defaultBranchCommit, originDefault, "the default tip is reported alongside the base");
+    assert.notStrictEqual(second.defaultBranchCommit, second.baseCommit, "…and on a resume the two differ");
   });
 
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a

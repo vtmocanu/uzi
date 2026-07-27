@@ -153,8 +153,19 @@ export interface RunnerClone {
    *  the default): `git diff <base>..HEAD` = this run's work alone; `main...HEAD` also folds
    *  in the prior run's commits; `main..HEAD` additionally reports every default-branch
    *  commit as a DELETION, which is the multi-megabyte diff a lead handed a subagent on run
-   *  51757591. prompt.ts turns this into the note that names the right command. */
+   *  51757591. prompt.ts turns this into the note that names the right command.
+   *
+   *  NOT the branch's fork point on a resume — see defaultBranchCommit, which is the
+   *  distinction that makes the note correct on the runs that carry prior work. */
   baseCommit: string;
+  /** The DEFAULT branch's current tip in the bare. Equal to `baseCommit` on a fresh
+   *  branch (the seed IS the default tip); on a resume it is the other commit the lead
+   *  may want, because `baseCommit` is then the branch's own previously-pushed tip and
+   *  `baseCommit..HEAD` shows only what THIS run added.
+   *
+   *  Best-effort, exactly like priorCommits: a repo with no resolvable default branch
+   *  yields undefined and the prompt says less rather than saying something false. */
+  defaultBranchCommit?: string;
 }
 
 /**
@@ -316,6 +327,9 @@ export class GitCache {
       // Best-effort by construction — a repo with no resolvable default branch, or any
       // rev-list failure, yields 0 rather than failing a run over prompt colour.
       const priorCommits = resume ? await this.commitsAheadOfDefault(barePath, baseSha) : 0;
+      // On a FRESH branch the seed already IS the default tip, so no second lookup. On a
+      // resume they differ, and the difference is exactly what the lead cannot infer.
+      const defaultBranchCommit = resume ? await this.defaultBranchSha(barePath) : baseSha;
       this.log.info("runner clone: seeding", { branch, base: baseRef, resume, prior_commits: priorCommits, path: clonePath });
 
       // The seed clone + checkout run as the RUNNER uid (PRD #51 M4), so the clone +
@@ -339,7 +353,7 @@ export class GitCache {
       // likely SUCCEED QUIETLY rather than fail loudly.
       await this.disableAutoMaintenance(clonePath, /* asRunner */ true);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
-      return { path: clonePath, branch, priorCommits, baseCommit: baseSha };
+      return { path: clonePath, branch, priorCommits, baseCommit: baseSha, defaultBranchCommit };
     });
   }
 
@@ -372,6 +386,16 @@ export class GitCache {
   /** Commits reachable from `sha` but not from the repo's default branch. Best-effort:
    *  any failure (no resolvable default, an unexpected rev-list error) answers 0, so a
    *  caller can treat a non-zero count as "there is prior work here" and nothing else. */
+  /** The default branch's tip as a full OID, or undefined when it cannot be resolved.
+   *  Best-effort by construction (same posture as commitsAheadOfDefault): this feeds a
+   *  prompt note, and a run must never fail because a repo has no default branch. */
+  private async defaultBranchSha(barePath: string): Promise<string | undefined> {
+    const ref = await this.defaultBranchRef(barePath).catch(() => undefined);
+    if (!ref) return undefined;
+    const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : undefined;
+  }
+
   private async commitsAheadOfDefault(barePath: string, sha: string): Promise<number> {
     const defaultRef = await this.defaultBranchRef(barePath).catch(() => undefined);
     if (!defaultRef) return 0;

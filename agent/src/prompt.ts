@@ -223,22 +223,40 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 // that uzi should be stating the fact rather than each run rediscovering it.
 //
 // The worker has always known the answer: git.ts resolves the base in the bare and checks
-// the branch out at it. Measured on a resume-shaped clone (prior pushed work on the branch,
-// 5 newer commits on the default branch):
+// the branch out at it. But it is TWO facts on a resume, not one, and conflating them is
+// how a note meant to fix this would go wrong on exactly the runs that carry prior work:
 //
-//   git diff <base>..HEAD   -> this run's work alone            (1 file)
-//   git diff main...HEAD    -> + the PRIOR run's commits        (2 files; merge-base sits
-//                                                                behind the seeded base)
-//   git diff main..HEAD     -> + every default-branch commit as a DELETION (7 files)
+//   fresh branch  base == the default branch's tip
+//                 `git diff <base>..HEAD` IS the branch diff. One command, no ambiguity.
 //
-// so neither default-branch form answers "what did this branch change"; only the explicit
-// base does.
+//   resume        base == the branch's OWN previously-pushed tip (git.ts:312), so
+//                 `git diff <base>..HEAD` shows only what THIS run added, and the whole
+//                 branch is `git diff <default>...HEAD` — THREE dots, because the fork
+//                 point is behind both and merge-base is what finds it.
+//
+// Measured on a purpose-built resume-shaped clone (prior pushed work on the branch, 5
+// newer commits on the default branch):
+//
+//   git diff <base>..HEAD       -> this run's work alone                   (1 file)
+//   git diff <default>...HEAD   -> + the PRIOR run's commits               (2 files)
+//   git diff <default>..HEAD    -> + every default-branch commit as a DELETION (7 files)
+//
+// So the honest statement is NOT "three-dot is wrong" — three-dot against the default
+// branch is the correct BRANCH diff, and the brief that prompted this change had that
+// backwards. What is wrong is the TWO-dot form, always, and what is ambiguous is which of
+// the two diffs you meant. The note below names both and lets the lead pick.
 
-/** Bound + shape for a base commit before it is spoken in a prompt. The value is uzi's own
- *  `rev-parse` output, not repo text, so this is hygiene rather than containment — but the
- *  note sits OUTSIDE every fence, so the one thing that must hold unconditionally is that
- *  it cannot carry a newline or markup. A hex object name cannot; anything else is dropped
- *  rather than rendered. */
+/** Bound + shape for a base commit before it is spoken in a prompt. The values are uzi's
+ *  own `rev-parse` output, not repo text, so this is hygiene rather than containment — but
+ *  the note sits OUTSIDE every fence, so the one thing that must hold unconditionally is
+ *  that it cannot carry a newline or markup. A hex object name cannot; anything else is
+ *  dropped rather than rendered.
+ *
+ *  Worth being explicit about WHY there is nothing else to guard: only `baseSha` and the
+ *  default tip are threaded here, never `baseRef`. On a fresh branch that ref is the
+ *  UNTRUSTED repo's own default-branch NAME (git.ts:312), and naming it in a prompt would
+ *  put repo-controlled text outside every fence — the exact residual promptSafeDir's
+ *  comment says the charset clamp does not close. An OID cannot carry that. */
 const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
 
 /**
@@ -247,18 +265,39 @@ const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
  * it is uzi's own statement of fact about the clone, not repo- or user-supplied text.
  *
  * Absent/malformed base ⇒ nothing is injected. Saying nothing leaves the lead exactly where
- * it is today; naming a commit that is not the parent would be worse than silence.
+ * it is today; naming a commit that is not the parent would be worse than silence — which is
+ * also why a resume with an UNRESOLVABLE default branch falls back to the narrower claim
+ * ("what this run added") rather than asserting a branch diff it cannot name the base for.
  */
-export function baseCommitNote(baseCommit: string | undefined): string {
+export function baseCommitNote(baseCommit: string | undefined, defaultBranchCommit?: string): string {
   if (!baseCommit || !BASE_COMMIT_RE.test(baseCommit)) return "";
+  const dflt = defaultBranchCommit && BASE_COMMIT_RE.test(defaultBranchCommit) ? defaultBranchCommit : undefined;
+  const shared = [
+    `Pass the explicit commit to any subagent you ask to review a diff. Do NOT write the`,
+    `diff against the default branch by name with two dots (\`main..HEAD\`): this clone's`,
+    `default branch was fetched fresh, so that form reports every commit it gained as a`,
+    `deletion.`,
+  ];
+  // Fresh: the seed IS the default tip, so there is exactly one diff and one command.
+  if (!dflt || dflt === baseCommit) {
+    return [
+      `Your branch was created at commit ${baseCommit}, the default branch's tip at clone`,
+      `time. To see exactly what this branch changed, use \`git diff ${baseCommit}..HEAD\``,
+      `(and \`git log ${baseCommit}..HEAD\`).`,
+      ...shared,
+    ].join("\n");
+  }
+  // Resume: two different questions, two different commands. Stating only the first would
+  // be wrong on precisely the runs that carry prior work — the population priorWorkNote
+  // exists for.
   return [
-    `Your branch was created at commit ${baseCommit}. To see exactly what this branch`,
-    `changed, use \`git diff ${baseCommit}..HEAD\` (and \`git log ${baseCommit}..HEAD\`), and`,
-    `pass that commit to any subagent you ask to review the diff.`,
-    `Do NOT diff against the default branch here: this clone's default branch was fetched`,
-    `fresh and is NOT this branch's parent, so \`main..HEAD\` reports every commit the`,
-    `default branch gained as a deletion, and \`main...HEAD\` folds in work that earlier`,
-    `runs already pushed to this branch.`,
+    `This clone was seeded at commit ${baseCommit}. That is your branch's OWN`,
+    `previously-pushed tip, not the default branch, so the two diffs you might want are`,
+    `different commands:`,
+    `  - what THIS run has added:  \`git diff ${baseCommit}..HEAD\``,
+    `  - the whole branch, including work earlier runs pushed:`,
+    `      \`git diff ${dflt}...HEAD\`  (THREE dots — the fork point is behind both)`,
+    ...shared,
   ].join("\n");
 }
 
@@ -427,6 +466,10 @@ export interface PlanPromptInput {
   /** The commit the runner clone cut this branch from (git.ts `RunnerClone.baseCommit`).
    *  Absent ⇒ no note. See baseCommitNote. */
   baseCommit?: string;
+  /** The default branch's tip (git.ts `RunnerClone.defaultBranchCommit`). Equal to
+   *  `baseCommit` on a fresh branch; on a resume it is the branch's true fork point and
+   *  the note names both. Absent ⇒ the note makes the narrower claim. */
+  defaultBranchCommit?: string;
 }
 
 /**
@@ -438,7 +481,7 @@ export interface PlanPromptInput {
 export function buildPlanPrompt(input: PlanPromptInput): string {
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
-  const baseNote = baseCommitNote(input.baseCommit);
+  const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
@@ -499,6 +542,8 @@ export interface ImplementPromptInput {
    *  which happens in this phase, and it is a different (unfenced, one-line) fact from the
    *  #157 note, which is why both phases carry one. See baseCommitNote. */
   baseCommit?: string;
+  /** The default branch's tip. See baseCommitNote. */
+  defaultBranchCommit?: string;
 }
 
 /**
@@ -525,7 +570,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   if (depsNote) lines.push("", depsNote);
   // The base commit, first turn only — this is the phase where the lead delegates a
   // "review the diff" task to a subagent, which is where the wrong diff spec was observed.
-  const baseNote = input.first ? baseCommitNote(input.baseCommit) : "";
+  const baseNote = input.first ? baseCommitNote(input.baseCommit, input.defaultBranchCommit) : "";
   if (baseNote) lines.push("", baseNote);
   if (input.followUp) {
     lines.push(
@@ -615,8 +660,11 @@ export interface SelfImprovePlanPromptInput {
   priorWork?: PriorWork;
   /** The commit the runner clone cut this branch from. Worth MORE here than on an issue
    *  run: the self_improve branch is FIXED and long-lived, so its base is routinely a
-   *  previous cycle's tip rather than the default branch. See baseCommitNote. */
+   *  previous cycle's tip rather than the default branch — i.e. the RESUME shape is the
+   *  normal case here, not the exception. See baseCommitNote. */
   baseCommit?: string;
+  /** The default branch's tip. See baseCommitNote. */
+  defaultBranchCommit?: string;
 }
 
 /**
@@ -639,7 +687,7 @@ export function buildSelfImprovePlanPrompt(input: SelfImprovePlanPromptInput): s
   // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
-  const baseNote = baseCommitNote(input.baseCommit);
+  const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   return [
     "You are running an AUTONOMOUS self-improvement task on uzi's own repository.",
     `You are on the fixed branch \`${input.branch}\`, which may already carry an open`,
@@ -725,6 +773,8 @@ export interface CIFixPlanPromptInput {
   priorWork?: PriorWork;
   /** The commit the runner clone cut this branch from. See baseCommitNote. */
   baseCommit?: string;
+  /** The default branch's tip. See baseCommitNote. */
+  defaultBranchCommit?: string;
 }
 
 // CI job logs are the most attacker-influenceable text uzi ever feeds an agent:
@@ -757,7 +807,7 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const openTag = `<job_log_${nonce}>`;
   const closeTag = `</job_log_${nonce}>`;
   const priorNote = priorWorkNote(input.priorWork);
-  const baseNote = baseCommitNote(input.baseCommit);
+  const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,
