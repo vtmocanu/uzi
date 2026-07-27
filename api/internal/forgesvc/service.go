@@ -282,57 +282,169 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 	})
 }
 
-// FullSync fetches the complete PRD-labeled set (state=all, no lower bound),
-// upserts every issue into the cache, then evicts cache rows absent from the
-// fresh set. This is the only path that observes de-labeling and deletion, so
-// it doubles as the reconcile pass and the manual Refresh. Returns the max
-// forge updated_at seen, so a caller tracking a high-water-mark can advance it.
+// FullSync fetches the complete PRD-labeled set (state=all, no lower bound) and,
+// since PRD #102 M6, every OPEN issue regardless of label — an ADDITIVE second
+// fetch, not a widening of the first (Decision 9). It upserts both, then evicts
+// cache rows absent from the UNION of the two. This is the only path that
+// observes de-labeling and deletion, so it doubles as the reconcile pass and the
+// manual Refresh. Returns the high-water-mark a caller may advance to; see
+// advanceHWM for why that is not simply the later of the two fetches.
+//
+// BOTH fetches must succeed before anything is deleted (Decision 11). A union
+// missing one half is not authoritative, and treating it as one wipes whatever
+// the failed half owns — the entire non-PRD backlog, every poll, on a transient
+// forge error. There is deliberately no "the extra fetch is best-effort, log and
+// continue" path: a soft-fail would also advance the shared high-water-mark past
+// a window nobody read (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (time.Time, error) {
-	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{s.prdLabel(ctx)}})
+	prdLabel := s.prdLabel(ctx)
+	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{prdLabel}})
 	if err != nil {
 		// Abort BEFORE any eviction: a failed/partial fetch must never be
 		// treated as an authoritative empty set, or a transient forge error
-		// would wipe the cache. Eviction only runs below, after a clean fetch.
+		// would wipe the cache. Eviction only runs below, after BOTH fetches
+		// have come back clean.
 		return time.Time{}, err
 	}
+	openIssues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{State: forge.StateOpened})
+	if err != nil {
+		return time.Time{}, err
+	}
+	extra := withoutLabel(openIssues, prdLabel)
+
 	maxUpdated, err := s.upsertIssues(ctx, repoID, issues)
 	if err != nil {
 		return time.Time{}, err
 	}
-	// A clean fetch that legitimately returns zero PRD issues DOES evict
+	if _, err := s.upsertIssues(ctx, repoID, extra); err != nil {
+		return time.Time{}, err
+	}
+	// A clean PAIR of fetches that legitimately returns zero issues DOES evict
 	// everything — the forge is the source of truth (empty means empty).
-	keep := make([]int64, len(issues))
-	for i, is := range issues {
-		keep[i] = is.IID
+	keep := make([]int64, 0, len(issues)+len(extra))
+	for _, is := range issues {
+		keep = append(keep, is.IID)
+	}
+	for _, is := range extra {
+		keep = append(keep, is.IID)
 	}
 	if _, err := s.q.DeleteIssuesNotIn(ctx, store.DeleteIssuesNotInParams{RepoID: repoID, KeepIids: keep}); err != nil {
 		return time.Time{}, err
 	}
-	return maxUpdated, nil
+	return advanceHWM(maxUpdated, maxUpdatedAt(openIssues)), nil
 }
 
-// IncrementalSync fetches only issues updated at/after hwm and upserts them. It
-// cannot see de-labeling or deletion (the filter structurally excludes them) —
-// that is FullSync's job. Returns the advanced high-water-mark (the larger of
-// hwm and the max updated_at returned by the forge). The bound is inclusive at
-// second granularity, so the boundary row is re-fetched and deduped by upsert.
+// IncrementalSync fetches only issues updated at/after hwm and upserts them —
+// the PRD-labeled set (state=all) plus the additive open, no-label set, the same
+// pair FullSync takes. It cannot see de-labeling or deletion (the filters
+// structurally exclude them) — that is FullSync's job. Returns the advanced
+// high-water-mark, never lower than the one it was given. The bound is inclusive
+// at second granularity, so the boundary row is re-fetched and deduped by upsert.
+//
+// Either fetch failing returns the CALLER'S hwm unchanged, along with the error
+// (Decision 11a). Returning nil with an advanced mark after a half-failure is
+// what would make the next pass skip the failed path's window until the next
+// full reconcile, roughly ten minutes at shipped defaults.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, hwm time.Time) (time.Time, error) {
-	opts := forge.ListIssuesOptions{Labels: []string{s.prdLabel(ctx)}}
+	prdLabel := s.prdLabel(ctx)
+	opts := forge.ListIssuesOptions{Labels: []string{prdLabel}}
+	openOpts := forge.ListIssuesOptions{State: forge.StateOpened}
 	if !hwm.IsZero() {
 		opts.UpdatedAfter = &hwm
+		openOpts.UpdatedAfter = &hwm
 	}
 	issues, err := f.ListIssues(ctx, forgeProjectID, opts)
 	if err != nil {
 		return hwm, err
 	}
+	openIssues, err := f.ListIssues(ctx, forgeProjectID, openOpts)
+	if err != nil {
+		return hwm, err
+	}
 	maxUpdated, err := s.upsertIssues(ctx, repoID, issues)
 	if err != nil {
 		return hwm, err
 	}
-	if maxUpdated.After(hwm) {
-		return maxUpdated, nil
+	if _, err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, prdLabel)); err != nil {
+		return hwm, err
+	}
+	if advanced := advanceHWM(maxUpdated, maxUpdatedAt(openIssues)); advanced.After(hwm) {
+		return advanced, nil
 	}
 	return hwm, nil
+}
+
+// withoutLabel drops the issues carrying label from a fetch result. It is what
+// makes the second fetch ADDITIVE rather than overlapping (Decision 9): an
+// unfiltered open fetch necessarily re-returns the open issues the PRD fetch
+// already owns, and those belong to the PRD path, whose semantics (state=all,
+// eviction on de-labeling) are defined against ITS snapshot.
+//
+// Matching is exact, like every other label comparison in this package — board
+// column labels, the PRDLESS toggle — and, more to the point, like the filter the
+// forge itself applied to the first fetch. A looser match here would classify an
+// issue differently from the way the forge classified it, and those two are the
+// one pair that must not disagree: an issue in both halves is written twice, an
+// issue in neither is evicted.
+func withoutLabel(issues []forge.Issue, label string) []forge.Issue {
+	out := make([]forge.Issue, 0, len(issues))
+	for _, is := range issues {
+		if slices.Contains(is.Labels, label) {
+			continue
+		}
+		out = append(out, is)
+	}
+	return out
+}
+
+// maxUpdatedAt returns the largest forge updated_at in a fetch result, or the
+// zero time for an empty one. Unlike upsertIssues' return it is computed over the
+// RAW result, before withoutLabel drops the rows the PRD path owns: the value is
+// used only as a lower bound on WHEN the forge was read, and a row that was read
+// and then discarded witnesses that reading just as well as one that was kept.
+func maxUpdatedAt(issues []forge.Issue) time.Time {
+	var max time.Time
+	for _, is := range issues {
+		if is.UpdatedAt.After(max) {
+			max = is.UpdatedAt
+		}
+	}
+	return max
+}
+
+// advanceHWM combines the two fetches' max forge updated_at into the single
+// high-water-mark the poller carries per repo (Decision 11a). It takes the
+// MINIMUM of the two, never the maximum, and the reason is the gap between them.
+//
+// The fetches are separate round trips: the PRD fetch observes the forge at some
+// instant tA, the open fetch at a later tB. Everything the PAIR is known to have
+// seen is bounded by tA, the EARLIER of the two. An issue updated in (tA, tB)
+// that carries the PRD label appears in neither result — too late for the first
+// fetch, dropped by withoutLabel from the second — so a mark taken from the later
+// fetch steps straight over an update nobody observed, and the next
+// IncrementalSync asks only for what came after it. The row then sits stale until
+// the next full reconcile.
+//
+// prdMax and openMax are lower bounds on tA and tB respectively, since no issue
+// can report an updated_at later than the moment it was read. The smaller of the
+// two is therefore a lower bound on tA and safe to keep.
+//
+// The zero cases are NOT symmetric, and the asymmetry is the fetch order:
+//   - openMax zero constrains nothing. It says the window held no open issues,
+//     not that the window went unread, and the open fetch ran AFTER the PRD one,
+//     so prdMax <= tA < tB stands on its own.
+//   - prdMax zero is the pre-M6 "nothing to advance to" case and is preserved:
+//     the caller keeps the mark it already had. Advancing to openMax instead
+//     would be unsound for exactly the reason above, openMax being free to exceed
+//     tA.
+func advanceHWM(prdMax, openMax time.Time) time.Time {
+	if prdMax.IsZero() || openMax.IsZero() {
+		return prdMax
+	}
+	if openMax.Before(prdMax) {
+		return openMax
+	}
+	return prdMax
 }
 
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at

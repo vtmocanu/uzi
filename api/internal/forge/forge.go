@@ -332,7 +332,9 @@ type Forge interface {
 	// EnsureLabels creates any of the given labels that do not already exist on
 	// the project (by name). Existing labels are left untouched.
 	EnsureLabels(ctx context.Context, projectID int64, labels []Label) error
-	// ListIssues returns issues matching opts, always across state=all.
+	// ListIssues returns issues matching opts. State defaults to StateAll (the
+	// zero value), which is what every pre-M6 caller relies on; each driver
+	// translates it into its own request vocabulary.
 	ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error)
 	// GetIssue returns one issue by its project-scoped IID. Its Description is
 	// populated (the run-create path snapshots it), unlike the cached list rows.
