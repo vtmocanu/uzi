@@ -11,7 +11,7 @@
 // still never merges to main.
 
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 // SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
@@ -256,6 +256,27 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
             : `prerequisite missing: ${check.requires}`,
       });
     }
+    // #154: a SURVIVING `node_modules` is not the same as an installed one. The
+    // existence check above passes for a tree the installer failed to build, and the
+    // check then runs against stale deps and reports a real-looking failure — the exact
+    // outcome the status mapping below exists to prevent.
+    //
+    // Measured, and this is the shape the fix is keyed to: with `package.json` declaring
+    // a dependency the lockfile does not carry, `npm ci` REFUSES (EUSAGE, "can only
+    // install packages when your package.json and package-lock.json … are in sync"),
+    // exits 1, and leaves the previous `node_modules` intact — with the newly-declared
+    // dependency absent from it. So the tell is not the directory, it is the gap between
+    // what the manifest declares and what the tree contains.
+    if (check.requires === "node_modules") {
+      const missing = missingDeclaredDeps(cwd);
+      if (missing.length > 0) {
+        return Promise.resolve({
+          name: check.name,
+          status: "skipped" as const,
+          detail: `dependencies out of date in the worker (missing: ${missing.slice(0, 3).join(", ")})`,
+        });
+      }
+    }
     // PRD #51 M4: the check runs agent-authored test code (go test / vitest / tsc) — an
     // untrusted surface — so under the `runner` uid (setpriv wrapper); single-uid (#58)
     // runs it directly. ENOENT/127 still classify as "skipped" (the wrapper preserves the
@@ -326,6 +347,41 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
       });
     });
   };
+}
+
+/**
+ * The dependencies `<cwd>/package.json` DECLARES that are absent from its
+ * `node_modules` (#154). Empty ⇒ nothing contradicts "the deps are installed".
+ *
+ * DERIVED FROM WHAT THE PROJECT DECLARES, never a flat requirement, and that is the
+ * load-bearing part rather than a nicety: `npm ci` on a ZERO-DEPENDENCY project exits 0
+ * and creates no `node_modules` at all (measured), so any unconditional requirement would
+ * turn a genuine success into a reported failure — the same lie as passing a stale tree,
+ * pointing the other way. A project that declares nothing yields `[]` here and its check
+ * runs, exactly as before.
+ *
+ * Deliberately conservative about what counts as declared:
+ *   - `dependencies` + `devDependencies` only. `optionalDependencies` may legitimately be
+ *     absent (that is what optional means — a platform-mismatched binary is not installed
+ *     and nothing is wrong), and `peerDependencies` may be intentionally unmet.
+ *   - An unreadable or malformed package.json yields `[]`. We cannot tell, and unknown
+ *     must never be reported as a failure.
+ * Presence is a shallow existence check per package (`node_modules/<name>`, scope-aware),
+ * not a version match: the goal is to catch a tree the installer did not build, not to
+ * re-implement `npm ci`'s own reconciliation.
+ */
+export function missingDeclaredDeps(cwd: string): string[] {
+  let declared: string[];
+  try {
+    const parsed = JSON.parse(readFileSync(`${cwd}/package.json`, "utf8")) as {
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
+    declared = [...Object.keys(parsed.dependencies ?? {}), ...Object.keys(parsed.devDependencies ?? {})];
+  } catch {
+    return [];
+  }
+  return declared.filter((name) => !existsSync(`${cwd}/node_modules/${name}`));
 }
 
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:

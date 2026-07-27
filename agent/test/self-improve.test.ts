@@ -10,6 +10,7 @@ import {
   defaultCheckRunner,
   flagGuardPaths,
   prepareCheckDeps,
+  missingDeclaredDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -248,6 +249,91 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
     assert.equal(r.status, "failed");
     assert.equal(r.detail, "exit 3");
     assert.ok(!JSON.stringify(r).includes(secret), "command output must never reach the CheckResult");
+  });
+});
+
+// #154: the `requires: "node_modules"` pre-flight treated a SURVIVING directory as
+// "deps ready". Measured: with package.json declaring a dependency the lockfile does not
+// carry, `npm ci` refuses (EUSAGE), exits 1, and leaves the previous node_modules intact
+// with the new dependency absent from it. The directory is therefore not the signal — the
+// gap between what the manifest declares and what the tree contains is.
+describe("stale-dependency pre-flight (#154)", () => {
+  const mkProject = (manifest: string, installed: string[] | null): string => {
+    const wt = mkdtempSync(join(tmpdir(), "si-stale-"));
+    mkdirSync(join(wt, "web"), { recursive: true });
+    writeFileSync(join(wt, "web", "package.json"), manifest);
+    if (installed !== null) {
+      mkdirSync(join(wt, "web", "node_modules"), { recursive: true });
+      for (const name of installed) mkdirSync(join(wt, "web", "node_modules", name), { recursive: true });
+    }
+    return wt;
+  };
+  const npmCheck: SelfImproveCheck = {
+    name: "web: npm test",
+    cwd: "web",
+    // Would EXIT 0 if it ever ran — so any "skipped" below came from the pre-flight,
+    // and any "passed" proves the pre-flight let it through.
+    command: "sh",
+    args: ["-c", "exit 0"],
+    requires: "node_modules",
+  };
+  const env = { PATH: process.env.PATH, HOME: tmpdir() };
+
+  it("skips when a declared dependency is missing from a SURVIVING node_modules", async () => {
+    // Exactly the measured EUSAGE aftermath: the install refused, the old tree remains,
+    // the newly-declared dep never landed.
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0","dep-b":"1.0.0"}}', ["dep-a"]);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "skipped", "a check must never run against a tree the installer failed to build");
+    assert.match(r.detail, /dependencies out of date/);
+    assert.match(r.detail, /dep-b/, "the reason must name what is missing, so a reader can act on it");
+  });
+
+  it("runs the check when every declared dependency is present", async () => {
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0"},"devDependencies":{"dep-c":"1.0.0"}}', ["dep-a", "dep-c"]);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "passed", "a healthy tree must still produce real evidence");
+  });
+
+  it("handles scoped packages, which live one directory deeper", async () => {
+    const missing = mkProject('{"name":"w","dependencies":{"@scope/pkg":"1.0.0"}}', []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, missing)).status, "skipped");
+    const present = mkProject('{"name":"w","dependencies":{"@scope/pkg":"1.0.0"}}', ["@scope/pkg"]);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, present)).status, "passed");
+  });
+
+  it("does NOT require optional or peer deps, which may legitimately be absent", async () => {
+    // An optional dep skipped for a platform mismatch is not a broken tree, and a peer
+    // dep may be intentionally unmet. Requiring either would fabricate a skip.
+    const wt = mkProject(
+      '{"name":"w","optionalDependencies":{"fsevents":"2.0.0"},"peerDependencies":{"react":"18.0.0"}}',
+      [],
+    );
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("does NOT fabricate a skip when the manifest is unreadable — unknown is not a failure", async () => {
+    const wt = mkProject("{not json", []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("leaves the zero-dependency project alone (the trap this must not fall into)", async () => {
+    // `npm ci` on a project declaring NO dependencies exits 0 and creates no
+    // node_modules at all — measured. The requirement is derived from what is declared,
+    // so a project declaring nothing has nothing to be missing. The pre-existing
+    // directory-existence pre-flight still governs that case and is untouched.
+    const wt = mkProject('{"name":"w","version":"1.0.0"}', []);
+    assert.deepEqual(missingDeclaredDeps(join(wt, "web")), []);
+    assert.equal((await defaultCheckRunner(env, 5000)(npmCheck, wt)).status, "passed");
+  });
+
+  it("still reports a bare clone as 'not installed', not as 'out of date'", async () => {
+    // No node_modules at all is the ORIGINAL pre-flight's case and keeps its wording —
+    // the two reasons point a reader at different problems.
+    const wt = mkProject('{"name":"w","dependencies":{"dep-a":"1.0.0"}}', null);
+    const r = await defaultCheckRunner(env, 5000)(npmCheck, wt);
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "dependencies not installed in the worker");
   });
 });
 
