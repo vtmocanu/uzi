@@ -279,7 +279,11 @@ as inert data.
   (`eligible`, or `no_reading` / `stale` / `unmeasured` / `below_threshold` when it
   could not; `-` when the token is not pooled, `?` when the reading could not be
   fetched). Check `ELIGIBLE` after opting a token in: a token uzi has never managed
-  to poll stays unpickable while looking active.
+  to poll stays unpickable while looking active. Under `--json` the same answer is
+  the `auto_status` field, always present, and **`null` when it is not known** (the
+  meters read failed) — which is not the same as "not eligible", so branch on null
+  before you branch on the value. An un-pooled token reports `not_pooled` there
+  rather than the table's `-`.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

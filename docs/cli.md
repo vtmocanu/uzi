@@ -388,7 +388,7 @@ point individual workers at them. The CLI can **read** that set and **move a
 worker between its members** — it cannot change the set itself:
 
 ```sh
-uzi token list                                 # labels, default flag, timestamps
+uzi token list                                 # labels, default flag, pool opt-in, live eligibility
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 ```

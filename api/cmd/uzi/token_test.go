@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -339,5 +340,72 @@ func TestTokenListSurvivesAMetersFailure(t *testing.T) {
 					"look the same as eligible", got)
 			}
 		}
+	}
+}
+
+// TestTokenListJSONCarriesLiveEligibility is D23-JSON. `uzi token list` computed the
+// eligibility map and then DISCARDED it on the --json branch, so the human table
+// gained an ELIGIBLE column while a script still saw only the opt-in flag and could
+// not learn that a pooled token will never be picked — R7's silent no-op surviving on
+// exactly the surface this CLI exists to serve (its audience is agents). The
+// endpoint's one CLI call site is that listing, so there was no other command a
+// script could reach it through.
+//
+// The three states the table distinguishes must survive into JSON, and they must not
+// collapse: a pooled token with a status carries it, a token the meters did not
+// mention carries null (unknown, NOT "not eligible"), and the field is always
+// PRESENT so a consumer can tell null from absent.
+//
+// MUTATIONS THIS CATCHES, both measured: reverting to `p.JSON(secrets)` (no
+// auto_status key at all), and emitting "" instead of null for the unknown case.
+func TestTokenListJSONCarriesLiveEligibility(t *testing.T) {
+	fc := poolFake()
+	fc.SelfMeters = []apitypes.TokenRateLimitDTO{
+		{SecretID: "s2", Label: "console-key", AutoEligible: true, AutoStatus: "below_threshold"},
+		{SecretID: "s1", Label: "default", AutoEligible: false, AutoStatus: "not_pooled"},
+		// s3 (spare-key) is deliberately absent: the "unknown" case.
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "token", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(out), &items); err != nil {
+		t.Fatalf("token list --json is not a JSON array: %v\n%s", err, out)
+	}
+	if len(items) != 3 {
+		t.Fatalf("got %d items, want 3", len(items))
+	}
+	byLabel := map[string]map[string]any{}
+	for _, it := range items {
+		byLabel[it["label"].(string)] = it
+	}
+	// The embedded SecretDTO's keys are unchanged — a wrapper object would break
+	// every script reading `.[].label` today, which this follow-up is not entitled
+	// to do.
+	for _, k := range []string{"id", "kind", "label", "is_default", "auto_eligible", "created_at", "updated_at"} {
+		if _, ok := byLabel["console-key"][k]; !ok {
+			t.Errorf("the JSON item lost SecretDTO's %q key", k)
+		}
+	}
+	if got := byLabel["console-key"]["auto_status"]; got != "below_threshold" {
+		t.Errorf("pooled token's auto_status = %v, want the server's below_threshold — a script must "+
+			"be able to learn a pooled token will never be picked", got)
+	}
+	if got := byLabel["default"]["auto_status"]; got != "not_pooled" {
+		t.Errorf("un-pooled token's auto_status = %v, want not_pooled — the table can lean on the POOL "+
+			"column beside it, a JSON consumer wants the answer", got)
+	}
+	// Present-and-null, never absent and never "". A pooled token whose eligibility
+	// is unknown must not be indistinguishable from one that is fine.
+	raw, ok := byLabel["spare-key"]["auto_status"]
+	if !ok {
+		t.Fatal("auto_status is ABSENT for the token the meters did not mention; null and absent are " +
+			"different answers and a consumer cannot tell an omitted field from an old CLI")
+	}
+	if raw != nil {
+		t.Errorf("unmentioned token's auto_status = %#v, want null — \"\" would read as a status the "+
+			"server never sent", raw)
 	}
 }

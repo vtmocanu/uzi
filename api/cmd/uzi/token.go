@@ -64,7 +64,31 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(secrets)
+				// 🔴 THE JSON BRANCH CARRIES THE ELIGIBILITY TOO, AND FOR A WHILE IT DID
+				// NOT (PRD #111 D23-JSON). The map above was computed and then discarded
+				// here, so the human table gained an ELIGIBLE column while a script still
+				// saw only the opt-in flag and could not learn that a pooled token will
+				// never be picked — R7's silent no-op, surviving on exactly the surface
+				// this CLI exists to serve. `SelfRateLimits` has one CLI call site, this
+				// one, so there was no other command a script could reach it through. Two
+				// tells it was an oversight rather than a decision: a discarded second HTTP
+				// request on every --json invocation, and no comment explaining the split.
+				//
+				// The ?-vs-- distinction eligibilityCell is careful about needs an
+				// equivalent here, and `null` is it: a pooled token whose eligibility is
+				// UNKNOWN (the meters read failed, or did not mention it) must not look
+				// like one that is fine. null, "" and absent must not collapse — so the
+				// field is always present, and it is null exactly when the answer is not
+				// known.
+				out := make([]tokenListItem, 0, len(secrets))
+				for _, s := range secrets {
+					item := tokenListItem{SecretDTO: s}
+					if status, ok := eligibility[s.ID]; ok {
+						item.AutoStatus = &status
+					}
+					out = append(out, item)
+				}
+				return p.JSON(out)
 			}
 			rows := make([][]string, 0, len(secrets))
 			for _, s := range secrets {
@@ -179,6 +203,31 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(list, pool)
 	return cmd
+}
+
+// tokenListItem is `uzi token list --json`'s element: the server's SecretDTO plus
+// the live eligibility (PRD #111 D23-JSON).
+//
+// A CLI-LOCAL composed struct, not a field on SecretDTO, and that is D23's own
+// ruling rather than a convenience. Putting auto_status on SecretDTO was considered
+// and rejected: it would add a THIRD query feeding autoselect.Classify, widening the
+// differential surface D21 exists to keep narrow, for a worse result — the status
+// without the meters beside it is less useful than the meters. It would also make
+// GET /api/me/secrets ship a field the handler cannot populate from its own query,
+// i.e. a uniformly empty string, which is the confident-wrong-answer shape this PRD
+// keeps refusing.
+//
+// Embedded, so the JSON is SecretDTO's keys plus one. A wrapper object would break
+// every script that reads `.[].label` today, which is not a change this follow-up is
+// entitled to make.
+//
+// The pointer is the contract: null means "not known" (the meters read failed, or
+// the server did not mention this token), never "not eligible". A token that is
+// genuinely un-pooled gets the server's own word for it, `not_pooled` — the JSON
+// consumer wants the answer, where the table can lean on the POOL column beside it.
+type tokenListItem struct {
+	apitypes.SecretDTO
+	AutoStatus *string `json:"auto_status"`
 }
 
 // eligibilityCell renders one token's live auto-selection status for `uzi token
