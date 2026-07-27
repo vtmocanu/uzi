@@ -11,25 +11,31 @@
 // pair, U+FEFF, U+00AD SOFT HYPHEN) are the same category and additionally defeat search
 // over the rendered string: the reader cannot find text that is on screen.
 //
-// The predicate CONVERGES on the one the api already holds untrusted repo-agent
-// descriptions to — `hasUnsafeChar` in api/internal/workersvc/agent_selection.go:236,
-// `unicode.IsControl(r) || unicode.In(r, unicode.Cf)` — because there should be exactly one
-// answer in this codebase to "which characters are unsafe in untrusted display text". Two
-// deliberate differences, both forced by this being a different KIND of boundary:
+// The predicate CONVERGES on `sanitizeTTY` (api/cmd/uzi/run.go:524), because there should
+// be exactly one answer in this codebase to "which characters are unsafe in untrusted
+// display text" — and sanitizeTTY is the RIGHT copy of that answer to converge on, not
+// `hasUnsafeChar` (workersvc/agent_selection.go:236). Both share the predicate
+// `unicode.IsControl(r) || unicode.In(r, unicode.Cf)`; the difference is what they do with
+// it, and this surface needs sanitizeTTY's half:
 //
-//   * It STRIPS rather than rejects. hasUnsafeChar guards an input gate, where refusing the
-//     whole value is the right answer. This is a renderer: a review the user already paid
-//     for must still be readable, and there is nothing to refuse to.
-//   * It KEEPS `\n` and `\t`. The surfaces are `whitespace-pre-wrap`, so dropping them
-//     would mangle legitimate multi-line judge output. This matches the api's OTHER
-//     scrubber, sanitizeReviewText (handler/judge_worker.go:381), which already exempts
-//     both at review ingest.
+//   * sanitizeTTY STRIPS and already spares `\t` and `\n`. That is a RENDERER scrub, which
+//     is what this is: a review the user already paid for must stay readable, there is
+//     nothing to refuse to, and the surfaces are `whitespace-pre-wrap` so dropping the two
+//     whitespace characters would mangle legitimate multi-line judge output.
+//   * hasUnsafeChar REJECTS the whole value and has no whitespace exception, because it
+//     guards an input gate that does not need one. Re-deriving the exception from it would
+//     be inventing a third rule and calling it convergence.
 //
-// WHY THE WEB SIDE AT ALL, given the api scrubs at ingest: sanitizeReviewText drops
-// `IsControl` only. Cc and Cf are disjoint categories, so every character named above
-// survives ingest today and reaches the browser. Closing it at ingest as well is the right
-// end state and does not make this redundant — a review stored before that lands still
-// renders through here.
+// The corpus in safeText.test.ts deliberately mirrors sanitizeTTY's own
+// (api/cmd/uzi/tui_render_test.go:61), including its two controls: a property loop
+// asserting nothing that survives is Cc or Cf, and an astral-plane passthrough that catches
+// an over-broad predicate.
+//
+// WHY THE WEB SIDE AT ALL: the two review-POST ingest scrubbers are `IsControl`-only —
+// `sanitizeReviewText` (handler/judge_worker.go:381) for summary/rationale, and
+// `sanitizeSelfReported` (handler/worker_protocol.go:44) for `target`. Cc and Cf are
+// disjoint, so every character named above survived ingest and was persisted. Closing that
+// at the source does not make this redundant: rows written before it still render here.
 //
 // NOT applied at the API boundary, deliberately. `target` is a COORDINATE: the page matches
 // dispositions and filed issues by (category, target) and posts that pair back. Normalizing
@@ -44,6 +50,21 @@
  * The negative lookahead is what carves out `\n` and `\t`: a character class cannot
  * subtract, and enumerating the surviving Cc ranges by hand invites an off-by-one on the
  * C1 block.
+ *
+ * THREE WAYS TO GET THIS WRONG, none of which throws. Measured on node 26, on the literal
+ * string `<RLO>a<RLO>b<ZWSP>c`, against which the shipped form yields `"abc"`:
+ *
+ *   * Without `u` this is not a property escape at all — it degrades to a character class
+ *     of the LITERAL characters `p { C c } f`. That is worse than the no-op it looks like:
+ *     it strips none of the hostile input and eats ordinary letters, yielding
+ *     `"<RLO>a<RLO>b<ZWSP>"` — the `c` is gone and every override survived. (Confirmed
+ *     directly: `/[\p{Cc}]/g.test("pCc")` is `true` and `/[\p{Cc}\p{Cf}]/g.test("\u202E")`
+ *     is `false`.)
+ *   * Without `g` only the first offender goes: `"a<RLO>b<ZWSP>c"`. That reads as a working
+ *     fix in any test that plants exactly one, which is why there is a case for it below.
+ *   * `\p{C}` would be over-broad — it includes `Cn` (unassigned), so a code point assigned
+ *     after the engine's Unicode table would be stripped out of legitimate text. Measured
+ *     on `a\u{E0002}b`: this form keeps it, `\p{C}` yields `"ab"`.
  */
 const UNSAFE_CHAR = /(?![\n\t])[\p{Cc}\p{Cf}]/gu;
 

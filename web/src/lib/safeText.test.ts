@@ -1,11 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { stripUnsafeChars } from "./safeText";
 
-// Issue #124. The corpus below is deliberately the SAME set the api pins for its own
-// untrusted-text predicate (api/internal/workersvc/agent_selection_test.go:98-110 — an ANSI
-// escape, U+202E, a zero-width joiner), extended with the rest of the class the issue names.
-// Convergence is the point: two answers to "which characters are unsafe in untrusted
-// display text" is how one surface quietly stops matching the other.
+// Issue #124. The corpus below deliberately MIRRORS the one the api pins for `sanitizeTTY`
+// (api/cmd/uzi/tui_render_test.go:61), which is the scrubber this util converges on — a
+// renderer scrub that strips and spares `\t`/`\n`, not the `hasUnsafeChar` input gate that
+// rejects and has no whitespace exception. Convergence is the point: two answers to "which
+// characters are unsafe in untrusted display text" is how one surface quietly stops
+// matching the other, and mirroring the corpus is what keeps the two answers observably
+// equal rather than merely intended to be.
 //
 // EVERY hostile character here is written as a `\u` ESCAPE, never as a literal. The api's
 // Go fixture makes the opposite choice and can afford to; this file cannot, for two reasons
@@ -41,11 +43,63 @@ describe("stripUnsafeChars", () => {
   });
 
   it("removes control characters, including the ANSI escape the api's corpus names", () => {
+    // The ESC BYTE is what makes a sequence an escape sequence; stripping it leaves "[2J"
+    // as inert literal text. That is correct, and it is what sanitizeTTY's own case asserts
+    // — an earlier version of THAT test expected "ab" here and was pinning a behaviour the
+    // scrubber does not and should not have.
+    expect(stripUnsafeChars("a\u001B[2Jb")).toBe("a[2Jb");
     expect(stripUnsafeChars(`${ESC}[31mALERT${ESC}[0m`)).toBe("[31mALERT[0m");
     expect(stripUnsafeChars("a\u0000b\u0007c\u007Fd")).toBe("abcd");
-    // C1 (U+0080–U+009F) is inside Go's IsControl domain — its implementation stops at
-    // Latin-1 — so it is inside ours.
+    // C1 as a RUNE (U+009B), not as a raw byte: the raw byte is invalid UTF-8 and decodes
+    // to U+FFFD, a printable replacement char. Both predicates operate on decoded code
+    // points. U+0085 and U+009F bracket the block.
+    expect(stripUnsafeChars("a\u009Bb")).toBe("ab");
     expect(stripUnsafeChars("a\u0085b\u009Fc")).toBe("abc");
+  });
+
+  it("removes the directional MARKS, not only the overrides (sanitizeTTY's RTL-mark case)", () => {
+    // U+200E/U+200F are Cf too and are the subtlest of the family: no visible glyph, no
+    // paired terminator, and they still flip the resolved direction of neutral runs.
+    expect(stripUnsafeChars("a\u200Fb")).toBe("ab");
+    expect(stripUnsafeChars("a\u200Eb")).toBe("ab");
+  });
+
+  it("PROPERTY: nothing that survives is Cc or Cf, whatever went in", () => {
+    // Asserted independently of any per-case expectation, mirroring sanitizeTTY's own
+    // property loop. A per-case table can only ever cover the codepoints someone thought
+    // of; this covers the category, which is what the predicate actually claims.
+    for (const input of ["a\u001B[2Jb", "a\u009Bb", "a\u007Fb", "a\u202Eb", "a\uFEFFb", "\u009B\uFFFD", ""]) {
+      for (const ch of stripUnsafeChars(input)) {
+        expect(/[\p{Cc}\p{Cf}]/u.test(ch), `${JSON.stringify(input)} let ${JSON.stringify(ch)} through`).toBe(false);
+      }
+    }
+  });
+
+  it("keeps code points that are merely NOT ASSIGNED, which is what rules out \\p{C}", () => {
+    // The discriminating case, and it exists because a control found the corpus could not
+    // see this: swapping the predicate for `\p{C}` passed all ten other assertions. `C` is
+    // Cc|Cf|Cn|Co|Cs, so it also swallows private-use and unassigned code points — text
+    // that is legitimate, merely unknown to this engine's Unicode table.
+    //
+    // U+E000 is the private-use area, which Unicode will never assign, so this fixture
+    // cannot rot. Measured: the shipped predicate keeps it; `\p{C}` yields "ab".
+    expect(stripUnsafeChars("a\uE000b")).toBe("a\uE000b");
+    expect(stripUnsafeChars("a\uF8FFb")).toBe("a\uF8FFb");
+    // …and a currently-unassigned code point likewise. Weaker as a fixture (a future
+    // Unicode revision could assign it), so it rides alongside the PUA case, not instead.
+    expect(stripUnsafeChars("a\u{E0002}b")).toBe("a\u{E0002}b");
+    // But U+E0001 LANGUAGE TAG is genuinely Cf and must still go — the point is precision,
+    // not leniency.
+    expect(stripUnsafeChars("a\u{E0001}b")).toBe("ab");
+  });
+
+  it("passes astral-plane code points through, which catches an over-broad predicate", () => {
+    // U+1D11E MUSICAL SYMBOL G CLEF, sanitizeTTY's own passthrough case. It is a surrogate
+    // PAIR in JS, so a predicate written over UTF-16 code units rather than code points —
+    // or one reaching for `\p{C}`, which swallows unassigned — mangles it here and nowhere
+    // else in this file.
+    expect(stripUnsafeChars("a\u{1D11E}b")).toBe("a\u{1D11E}b");
+    expect([...stripUnsafeChars("\u{1D11E}")].length).toBe(1);
   });
 
   it("PRESERVES newline and tab, which the pre-wrap surfaces need", () => {

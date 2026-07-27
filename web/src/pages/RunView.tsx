@@ -952,10 +952,14 @@ export function JudgePanel({ run }: { run: Run }) {
               whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
               markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
               (ScrubSecrets + control-strip) does NOT cover markdown/link injection.
-              Issue #124: escaping is not sufficient on its own either — the ingest scrub
-              drops Cc and NOT Cf, so a bidi override survives it and reorders what a human
-              reads. stripUnsafeChars closes that at the render site; see lib/safeText.ts for
-              why it is here and not at the API boundary (`target` is a coordinate). */}
+              Issue #124: escaping is not sufficient on its own either. TWO scrubbers run at
+              the review POST, not one — `sanitizeReviewText` (handler/judge_worker.go:381)
+              for summary/rationale, `sanitizeSelfReported` (handler/worker_protocol.go:44)
+              for `target` — and both were `IsControl`-only, so Cf bidi overrides were
+              persisted and reorder what a human reads. Both now strip Cf as well, but rows
+              written before that still render through here, which is why the renderer-side
+              strip is not redundant. See lib/safeText.ts for why it sits at the render site
+              and not at the API boundary (`target` is a coordinate the page posts back). */}
           {review.summary_md.trim() !== "" && (
             <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(review.summary_md)}</p>
           )}

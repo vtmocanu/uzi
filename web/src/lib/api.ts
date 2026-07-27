@@ -1014,8 +1014,9 @@ export interface NotificationList {
 // was validated + capped + secret-scrubbed at the review POST and is UNTRUSTED
 // judge/worker output — the run page renders it as escaped text (never markdown/
 // HTML), through lib/safeText's stripUnsafeChars. Escaping alone is NOT the whole
-// guarantee (issue #124): the review-POST scrub drops Cc only, so a Cf bidi override
-// survives it and the browser reorders what a human reads.
+// guarantee (issue #124): the browser honours Cf bidi overrides, which were persisted
+// by two IsControl-only ingest scrubbers until those learned Cf too — so rows written
+// before that still need the renderer-side strip.
 // verdict/category/confidence are closed enums.
 export type ReviewVerdict = "ideal" | "ok" | "issues";
 export type ReviewStatus = "complete" | "failed";
