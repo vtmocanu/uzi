@@ -84,6 +84,107 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 	return items, nil
 }
 
+const listAutoSelectCandidates = `-- name: ListAutoSelectCandidates :many
+SELECT s.id                     AS user_secret_id,
+       s.label                  AS label,
+       s.auto_eligible          AS auto_eligible,
+       rl.five_hour_pct,
+       rl.five_hour_resets_at,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.synced_at,
+       COALESCE(f.n, 0)::bigint AS in_flight_runs
+FROM user_secrets s
+LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
+LEFT JOIN (
+    SELECT r.anthropic_secret_id AS sid, count(*) AS n
+    FROM runs r
+    WHERE r.user_id = $1
+      AND r.anthropic_secret_id IS NOT NULL
+      AND r.status IN ('claimed', 'running', 'awaiting_approval')
+    GROUP BY r.anthropic_secret_id
+) f ON f.sid = s.id
+WHERE s.user_id = $1
+  AND s.kind = 'anthropic_token'
+ORDER BY s.id
+`
+
+type ListAutoSelectCandidatesRow struct {
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	Label            string             `json:"label"`
+	AutoEligible     bool               `json:"auto_eligible"`
+	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
+	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
+	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+	InFlightRuns     int64              `json:"in_flight_runs"`
+}
+
+// Every anthropic_token one user holds, with its gauge reading and the number of
+// runs currently spending it, for PRD #111 M4's ranker.
+//
+// 🔴 DELIBERATELY NOT FILTERED ON auto_eligible, and that is not an oversight to be
+// "optimised" away. The whole eligibility gate lives in ONE place
+// (autoselect.Classify, D21); filtering here would split it between SQL and Go, and
+// the ranker could then no longer tell "the user pooled nothing" from "the user
+// pooled tokens that are all stale" — different fallback reasons that send a user to
+// different places (settings vs. the poller). The WHERE clause is ownership and
+// kind, which are facts about which rows EXIST, never about which are pickable.
+//
+// Both LEFT JOINs are load-bearing for the same reason. A token with no gauge row
+// must appear and classify `no_reading` rather than vanish — that row IS R7's silent
+// no-op made visible — and a token with no runs on it must yield 0 rather than
+// disappear from the ranking the moment it is idle, which is precisely when it
+// should win.
+//
+// The in-flight rollup counts EVERY lane and EVERY reason (D18): it models
+// concurrent spend against a credential, and nothing about how a run acquired that
+// credential changes the quota it consumes. So chat and judge runs count (M1 made
+// them countable for the first time), and it does not filter on
+// anthropic_select_reason — excluding fallback-chosen runs would blind the bias to
+// exactly the pile-up a fallback creates. `awaiting_approval` counts because the
+// worker holds the session and resumes on the same token; that one is a deliberate
+// conservative choice, not an oversight.
+//
+// @user_id appears twice on purpose, once in each scope. sqlc collapses repeated
+// named params into ONE argument; writing $1 in one place and @user_id in the other
+// yields two, which is a confusing Params struct rather than a bug — but only until
+// someone passes different values to them.
+//
+// ORDER BY s.id makes the row order deterministic. autoselect.Select is
+// order-independent by construction, so this is for readable diffs and reproducible
+// tests, not for correctness.
+func (q *Queries) ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID) ([]ListAutoSelectCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listAutoSelectCandidates, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutoSelectCandidatesRow{}
+	for rows.Next() {
+		var i ListAutoSelectCandidatesRow
+		if err := rows.Scan(
+			&i.UserSecretID,
+			&i.Label,
+			&i.AutoEligible,
+			&i.FiveHourPct,
+			&i.FiveHourResetsAt,
+			&i.SevenDayPct,
+			&i.SevenDayResetsAt,
+			&i.SyncedAt,
+			&i.InFlightRuns,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRateLimits = `-- name: ListRateLimits :many
 SELECT
     u.id            AS user_id,

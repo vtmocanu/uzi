@@ -10,9 +10,9 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)
@@ -73,97 +73,11 @@ func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 			Label:        row.Label,
 			IsDefault:    row.IsDefault,
 			AutoEligible: row.AutoEligible,
-			AutoStatus:   string(h.autoStatus(rowToCandidate(row))),
+			AutoStatus:   string(h.autoStatus(autoselectrow.FromRateLimitRow(row))),
 			Limits:       limits,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": tokens})
-}
-
-// autoselectPolicy assembles the operator-set auto-selection knobs (PRD #111 D6)
-// into the pure ranker's Policy. One place, so the handler and M4's claim path
-// cannot classify against different thresholds — which would produce exactly the
-// lie D21 forbids, with the settings page and the selector disagreeing about the
-// same token.
-func (h *Handler) autoselectPolicy() autoselect.Policy {
-	return autoselect.Policy{
-		MinHeadroom:     h.cfg.AutoselectMinHeadroom,
-		HeadroomTiePct:  h.cfg.AutoselectHeadroomTiePct,
-		MaxStaleness:    h.cfg.AutoselectMaxStaleness,
-		InflightPenalty: h.cfg.AutoselectInflightPenalty,
-	}
-}
-
-// rowToCandidate lifts one per-user rate-limit row into the ranker's Candidate
-// (PRD #111 M2, B3). It fills EVERY field the row carries, which is the point.
-//
-// 🔴 THIS IS THE SEAM D21'S DIFFERENTIAL TEST STANDS ON, AND IT DID NOT EXIST.
-// The pinned test is "M2's query and M4's query produce identical Candidate values
-// except InFlight" — and until this function, M2's path never materialised a
-// Candidate at all: eligibility was computed from four loose arguments inside this
-// file, leaving SecretID, Label, FiveResetsAt and SevenResetsAt zero even though
-// ListRateLimitsForUserRow carries all four. M4 would then have written its own
-// row→Candidate conversion and the differential test would have compared M4 against
-// itself — two implementations of one rule, drifting invisibly, which is exactly what
-// D21 exists to prevent.
-//
-// Classify reads none of the four extra fields today. They are populated anyway
-// because the contract is "this row, as the ranker sees it", not "the subset the
-// current gate happens to consult": a partly-zeroed Candidate is indistinguishable
-// from one whose data really is absent.
-func rowToCandidate(row store.ListRateLimitsForUserRow) autoselect.Candidate {
-	c := autoselect.Candidate{
-		SecretID:     row.UserSecretID,
-		Label:        row.Label,
-		AutoEligible: row.AutoEligible,
-		// HasReading comes from synced_at's validity, which is the LEFT JOIN's own miss
-		// signal: the column is NOT NULL in the table, so an invalid one can only mean
-		// the join matched nothing. That distinction is the whole of D16 — never polled
-		// vs. aged out — and it is why the query must keep LEFT JOINing.
-		HasReading: row.SyncedAt.Valid,
-	}
-	if row.SyncedAt.Valid {
-		t := row.SyncedAt.Time
-		c.SyncedAt = &t
-	}
-	if row.FiveHourPct.Valid {
-		v := row.FiveHourPct.Int16
-		c.FiveHourPct = &v
-	}
-	if row.SevenDayPct.Valid {
-		v := row.SevenDayPct.Int16
-		c.SevenDayPct = &v
-	}
-	if row.FiveHourResetsAt.Valid {
-		t := row.FiveHourResetsAt.Time
-		c.FiveResetsAt = &t
-	}
-	if row.SevenDayResetsAt.Valid {
-		t := row.SevenDayResetsAt.Time
-		c.SevenResetsAt = &t
-	}
-	// InFlight stays zero deliberately: only M4's ranking query counts concurrent runs
-	// per credential, and it is NOT part of the gate — which is precisely why the
-	// differential test can require the two queries to agree on everything else.
-	return c
-}
-
-// adminRowToCandidate is the admin twin. Its row nullable-wraps the user_secrets
-// columns (the query LEFT JOINs users → user_secrets, so a token-less user yields a
-// row with no secret at all); callers skip that row before reaching here, which is
-// why .Bool and .String are the real values by this point.
-func adminRowToCandidate(row store.ListRateLimitsRow) autoselect.Candidate {
-	return rowToCandidate(store.ListRateLimitsForUserRow{
-		UserSecretID:     uuid.UUID(row.UserSecretID.Bytes),
-		Label:            row.Label.String,
-		AutoEligible:     row.AutoEligible.Bool,
-		FiveHourPct:      row.FiveHourPct,
-		FiveHourResetsAt: row.FiveHourResetsAt,
-		SevenDayPct:      row.SevenDayPct,
-		SevenDayResetsAt: row.SevenDayResetsAt,
-		Source:           row.Source,
-		SyncedAt:         row.SyncedAt,
-	})
 }
 
 // autoStatus classifies ONE candidate's live auto-selection eligibility (PRD #111 M2).
@@ -174,7 +88,7 @@ func adminRowToCandidate(row store.ListRateLimitsRow) autoselect.Candidate {
 // diverge on some edge, and the divergence would surface as a settings page promising
 // a token is eligible while the selector quietly skips it, with no test failing.
 func (h *Handler) autoStatus(c autoselect.Candidate) autoselect.Status {
-	return autoselect.Classify(c, h.autoselectPolicy(), time.Now()).Status
+	return autoselect.Classify(c, h.cfg.AutoselectPolicy(), time.Now()).Status
 }
 
 // AdminRateLimits returns every user's meters + staleness (PRD #53), grouped BY USER
@@ -241,7 +155,7 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 			Label:        u.Label.String,
 			IsDefault:    u.IsDefault.Bool,
 			AutoEligible: u.AutoEligible.Bool,
-			AutoStatus:   string(h.autoStatus(adminRowToCandidate(u))),
+			AutoStatus:   string(h.autoStatus(autoselectrow.FromAdminRateLimitRow(u))),
 			Limits:       limits,
 		})
 	}

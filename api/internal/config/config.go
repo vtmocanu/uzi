@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 )
@@ -749,6 +750,25 @@ func Load() (Config, error) {
 // down at boot), in which case login attempts retry discovery and the SSO button
 // must stay visible (PRD #45, Decision 8/9).
 func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
+
+// AutoselectPolicy assembles the four UZI_AUTOSELECT_* knobs into the pure ranker's
+// Policy (PRD #111 D6).
+//
+// 🔴 IT IS A METHOD SO THERE CAN ONLY BE ONE. The policy is read in two places that
+// must never disagree: the settings page classifies each token's live eligibility,
+// and the claim path ranks on the same predicate. Two literals mapping four fields
+// each is D21's failure in a new costume — and it fails SILENTLY, because both sides
+// would be internally consistent while promising a token is eligible that the
+// selector skips, with nothing going red. A shared constructor is the only version of
+// "one policy" that a future field addition cannot quietly break.
+func (c Config) AutoselectPolicy() autoselect.Policy {
+	return autoselect.Policy{
+		MinHeadroom:     c.AutoselectMinHeadroom,
+		HeadroomTiePct:  c.AutoselectHeadroomTiePct,
+		MaxStaleness:    c.AutoselectMaxStaleness,
+		InflightPenalty: c.AutoselectInflightPenalty,
+	}
+}
 
 // loadOIDC reads and validates the OIDC SSO config and the password-login
 // kill-switch (PRD #45, Decision 8). UZI_OIDC_ISSUER_URL enables the feature;
