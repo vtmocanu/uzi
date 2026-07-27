@@ -106,13 +106,16 @@ const listAutopilotCandidateIssues = `-- name: ListAutopilotCandidateIssues :man
 
 SELECT forge_issue_iid, author
 FROM issues
-WHERE repo_id = $1 AND state = 'opened' AND jsonb_exists(labels, $2)
+WHERE repo_id = $1 AND state = 'opened'
+  AND jsonb_exists(labels, $2)
+  AND jsonb_exists(labels, $3)
 ORDER BY forge_issue_iid ASC
 `
 
 type ListAutopilotCandidateIssuesParams struct {
-	RepoID uuid.UUID `json:"repo_id"`
-	Label  string    `json:"label"`
+	RepoID   uuid.UUID `json:"repo_id"`
+	Label    string    `json:"label"`
+	PrdLabel string    `json:"prd_label"`
 }
 
 type ListAutopilotCandidateIssuesRow struct {
@@ -124,14 +127,24 @@ type ListAutopilotCandidateIssuesRow struct {
 // The poller's post-sync detector reads/writes these. Detection lives in the
 // poller, never in forgesvc, whose sync methods are shared with CreateIssue and the
 // manual board Refresh and must never spawn runs (review finding B3).
-// Open cached issues in a repo carrying the autopilot label. The cache holds only
-// PRD-labelled issues (the sync filter), so a match here already carries BOTH the
-// PRD and autopilot labels (Decision 8: an autopilot label without the PRD label is
-// invisible to uzi). Closed issues are excluded — autopilot only drives forward
-// progress on open work. author rides along for the adder→author attribution
-// fallback (Decision 3); has_prd_link is re-checked by the shared run-create path.
+// Open cached issues in a repo carrying BOTH the autopilot label and the PRD label
+// (Decision 8: an autopilot label without the PRD label is invisible to uzi).
+//
+// The PRD predicate is explicit as of PRD #102 M6. This comment used to say the
+// cache holds only PRD-labelled issues, so a match on the autopilot label already
+// implied the PRD one — true while the sync filter was the only way into the cache,
+// and false the moment M6's additive fetch started caching every OPEN issue
+// regardless of label. Without the predicate a stranger's issue carrying the
+// autopilot label becomes a candidate here, and the detector then either starts an
+// unattended run on it or posts a comment on it.
+//
+// Closed issues are excluded — autopilot only drives forward progress on open work.
+// author rides along for the adder→author attribution fallback (Decision 3);
+// has_prd_link and the PRD label are BOTH re-checked by the shared run-create path,
+// which is the enforcement point. This predicate is what stops the detector doing
+// forge work (a label-events read, a comment) on issues that were never uzi's.
 func (q *Queries) ListAutopilotCandidateIssues(ctx context.Context, arg ListAutopilotCandidateIssuesParams) ([]ListAutopilotCandidateIssuesRow, error) {
-	rows, err := q.db.Query(ctx, listAutopilotCandidateIssues, arg.RepoID, arg.Label)
+	rows, err := q.db.Query(ctx, listAutopilotCandidateIssues, arg.RepoID, arg.Label, arg.PrdLabel)
 	if err != nil {
 		return nil, err
 	}
