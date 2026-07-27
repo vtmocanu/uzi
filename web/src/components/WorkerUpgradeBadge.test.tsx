@@ -97,6 +97,18 @@ describe("WorkerUpgradeBadge — upgrade_detail carries no format characters (#1
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(container.textContent).toContain("running 0.11.0, target 0.11.7");
   });
+
+  it("strips it in the badge's title ATTRIBUTE too, which textContent cannot see", () => {
+    // The attribute is a sink a rendered-text sweep misses by construction, and it carries
+    // the same field. Asserted on the attribute directly for that reason — the assertion
+    // above would pass with this one broken.
+    const { container } = render(
+      <WorkerUpgradeBadge worker={aWorker({ upgrade_detail: "running 0.11.0\u202E, target 0.11.7\u200B" })} />,
+    );
+    const title = container.querySelector("span[title]")?.getAttribute("title") ?? "";
+    expect(title).not.toMatch(/[\p{Cf}]/u);
+    expect(title).toBe("running 0.11.0, target 0.11.7");
+  });
 });
 
 describe("the attention set (Decision 1)", () => {

@@ -58,7 +58,12 @@ export function WorkerUpgradeBadge({ worker }: { worker: Worker }) {
       className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs ${TONE_CLASS[p.tone]}`}
       // The detail is the sentence the api derived ("running 0.11.0, target 0.11.7"), so
       // the badge and its explanation cannot disagree — the api computed both.
-      title={worker.upgrade_detail ?? undefined}
+      //
+      // Issue #124: stripped HERE TOO, not only where the same field renders as text 175
+      // lines down. An ATTRIBUTE is a sink a per-render-site sweep misses by construction —
+      // `container.textContent` cannot see it, so no test asserting over rendered text can
+      // either. A tooltip is drawn by the browser and honours bidi exactly like body text.
+      title={worker.upgrade_detail ? stripUnsafeChars(worker.upgrade_detail) : undefined}
     >
       {p.label}
     </span>
