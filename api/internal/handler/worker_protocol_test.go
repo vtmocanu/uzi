@@ -260,6 +260,26 @@ func TestSanitizeSelfReported(t *testing.T) {
 			t.Errorf("%s: sanitizeSelfReported(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
 		}
 	}
+	// TRIM ORDER (#124 follow-up). TrimSpace runs BEFORE the strip and Cf is not
+	// White_Space, so one format character at each edge shielded the adjacent ASCII space
+	// from the trim; the loop then removed the Cf and left the space. BOTH halves are
+	// asserted, because the plain-whitespace row is what makes the padded row a defect
+	// rather than a design choice — without it the fix is unfalsifiable in the direction
+	// that matters. It bites on `target`, a COORDINATE: " api/foo.go " and "api/foo.go" are
+	// different (category, target) pairs, so one Cf-padded run and one clean run become two
+	// backlog groups a human reads as identical.
+	for _, tc := range []struct{ name, in, want string }{
+		{"Cf-padded edges lose the whitespace too", "\u200b  api/internal/forge/gitlab.go  \u200b", "api/internal/forge/gitlab.go"},
+		{"leading Cf alone", "\u202e  api/foo.go", "api/foo.go"},
+		{"trailing Cf alone", "api/foo.go  \ufeff", "api/foo.go"},
+		{"plain whitespace still trims (the control)", "  plain surrounding spaces  ", "plain surrounding spaces"},
+		{"interior whitespace is untouched", "api/foo bar.go", "api/foo bar.go"},
+	} {
+		if got := sanitizeSelfReported(tc.in, maxSelfReportedBytes); got != tc.want {
+			t.Errorf("%s: sanitizeSelfReported(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+
 	// The PROPERTY, asserted independently of any per-case expectation: whatever survives
 	// is neither Cc nor Cf. A table can only cover the codepoints someone thought of.
 	// No whitespace exemption here — this sink is single-line by contract.

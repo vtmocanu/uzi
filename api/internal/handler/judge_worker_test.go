@@ -151,6 +151,25 @@ func TestValidateAndScrubReviewStripsFormatChars(t *testing.T) {
 		!strings.Contains(sub.Recommendations[0].RationaleMd, "\t") {
 		t.Errorf("rationale lost its newline/tab: %q", sub.Recommendations[0].RationaleMd)
 	}
+	// Trim order, same defect as sanitizeSelfReported: an edge Cf shielded the adjacent
+	// space from the TrimSpace that runs before the strip. Cosmetic on a pre-wrap sink,
+	// fixed for consistency — two scrubbers three files apart disagreeing on this is how
+	// the next reader concludes one of them is wrong.
+	reqTrim := validReview()
+	reqTrim.Summary = "\u200b  a summary with padded edges  \u200b"
+	reqTrim.Recommendations[0].Rationale = "  plain surrounding spaces  "
+	subTrim, err := validateAndScrubReview(reqTrim)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if subTrim.SummaryMd != "a summary with padded edges" {
+		t.Errorf("Cf-padded summary kept its edge whitespace: %q", subTrim.SummaryMd)
+	}
+	// The control that makes the row above a defect rather than a choice.
+	if subTrim.Recommendations[0].RationaleMd != "plain surrounding spaces" {
+		t.Errorf("plain whitespace must still trim: %q", subTrim.Recommendations[0].RationaleMd)
+	}
+
 	// Cn/Co are NOT stripped — the predicate is Cc|Cf, not the whole C category. U+E000 is
 	// private use, which Unicode will never assign, so this fixture cannot rot.
 	req2 := validReview()

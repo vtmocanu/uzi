@@ -68,7 +68,18 @@ func sanitizeSelfReported(s string, max int) string {
 			break
 		}
 	}
-	return b.String()
+	// TRIM AGAIN, and the order is the whole point. TrimSpace above runs BEFORE the strip,
+	// and Cf is not White_Space — so one format character at each edge shields the adjacent
+	// ASCII space from the trim, the loop then removes the Cf, and the space survives.
+	// Measured: "<ZWSP>  api/foo.go  <ZWSP>" came out as "  api/foo.go  " while the plain
+	// "  api/foo.go  " came out clean, which is what makes it a defect rather than a choice.
+	//
+	// It matters here beyond tidiness because this function guards `target`, a COORDINATE:
+	// " api/foo.go " and "api/foo.go" are different (category, target) pairs, so the same
+	// recommendation raised on two runs — one Cf-padded, one not — becomes two backlog
+	// groups a human reads as identical. Newly reachable as of the Cf strip, and it now
+	// looks CLEAN rather than obviously junk, which is worse.
+	return strings.TrimSpace(b.String())
 }
 
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
@@ -124,8 +135,9 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// version is the sibling self-reported field from the same join-token-
 	// authenticated (but untrusted) worker, bound for the DB + worker list UI.
-	// Cap + strip control chars so a hostile worker can't smuggle unbounded text
-	// or terminal escapes there. Sanitize (never reject) — it is observability.
+	// Cap + strip control AND format chars (Cc/Cf) so a hostile worker can't smuggle
+	// unbounded text, terminal escapes, or a bidi override there. Sanitize (never
+	// reject) — it is observability.
 	version := sanitizeSelfReported(req.Version, maxSelfReportedBytes)
 	// max_concurrent_runs is the sibling self-reported cap (PRD #42). It is pure
 	// observability the server never enforces AND it flows into the fleet UI's

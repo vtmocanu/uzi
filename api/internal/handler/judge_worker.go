@@ -392,11 +392,27 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 // dropping them would reflow every multi-line review. sanitizeTTY makes the same
 // exception for the same reason.
 //
-// ACCEPTED COST, stated rather than discovered later: Cf includes U+200D ZERO WIDTH
-// JOINER, so an emoji family sequence in judge prose degrades into its component emoji
-// — at rest, irreversibly, for rows written from here on. Existing rows are untouched.
-// The alternative is letting a bidi override persist so a review can lie about which
-// file it names, which is worse, and this is already what the CLI has shipped.
+// ACCEPTED COSTS — two of them, and they are different KINDS of cost, so both are on the
+// record rather than only the cheap one:
+//
+//   - U+200D ZERO WIDTH JOINER goes, so an emoji family sequence in judge prose degrades
+//     into its component emoji. Cosmetic.
+//   - U+200C ZERO WIDTH NON-JOINER goes too, and that is NOT cosmetic: it is
+//     orthographically required in Persian and several Indic scripts, where removing it
+//     joins two words that must stay separate and changes what the text says. A
+//     correctness cost in those scripts, accepted knowingly.
+//
+// Both are at rest, irreversible, and apply only to rows written from here on. Carving
+// ZWNJ out would reopen a zero-width hole, and sanitizeTTY (api/cmd/uzi/run.go) has
+// shipped with exactly this cost for a long time. The alternative — letting a bidi
+// override persist so a review can lie about which file it names — is worse.
+//
+// AND THIS CLOSED A CONTENT-SUPPRESSION VECTOR, not only a rendering one. Before the Cf
+// strip these characters passed the filter and CONSUMED CAP BUDGET: a ZWSP is 3 bytes, so
+// 85 of them exhaust the whole 255-byte `target` cap. A judge could store a recommendation
+// whose target was nothing but invisible characters — and target is a coordinate, so
+// several such rows collapse toward indistinguishable strings and conflate under
+// (category, target) dedup and disposition keying. That needed no bidi at all.
 func sanitizeReviewText(s string, max int) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
@@ -409,5 +425,11 @@ func sanitizeReviewText(s string, max int) string {
 			break
 		}
 	}
-	return b.String()
+	// Trim again: TrimSpace above runs BEFORE the strip and Cf is not White_Space, so an
+	// edge format character shields the adjacent whitespace from it. See the fuller note on
+	// sanitizeSelfReported (handler/worker_protocol.go), where it is load-bearing because
+	// that function guards a coordinate. Here it is tidiness — the sink is pre-wrap markdown
+	// — but leaving the two functions inconsistent is how the next reader concludes one of
+	// them is wrong.
+	return strings.TrimSpace(b.String())
 }
