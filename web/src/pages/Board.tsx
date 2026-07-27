@@ -31,8 +31,18 @@ import {
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
 import { boundedChips, chipLabels } from "../lib/labelChips";
+import {
+  dropIntent,
+  insertionEdgeFor,
+  isSortMode,
+  neighbourAnchor,
+  sortCards,
+  SORT_MODES,
+  type DropAnchor,
+  type SortMode,
+} from "../lib/boardOrder";
 import { prefs } from "../lib/prefs";
-import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
+import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Select, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
@@ -92,6 +102,43 @@ export function Board() {
       return next;
     });
   };
+
+  // Board-wide sort mode (PRD #102 M5, Decision 7a/8). Per-browser, per repo, exactly
+  // like hideEmpty — the ORDER is durable in the DB, but the choice of whether to
+  // honour it is a view preference.
+  //
+  // The default is "manual", which on a board nobody has dragged IS forge_issue_iid
+  // ASC (every board_position is NULL and the SQL falls back to iid), so the feature
+  // is invisible until someone wants it rather than something they have to go and pick.
+  //
+  // Read through isSortMode so a stale or hand-edited localStorage value degrades to
+  // Manual instead of selecting no comparator. The useEffect re-read mirrors
+  // hideEmpty's and is load-bearing for the same reason: the route swaps :id without
+  // remounting, so a lazy useState initialiser only ever runs for the first repo. That
+  // bug has been fixed once in this file already.
+  const sortModeKey = `uzi.board.${repoId}.sortMode`;
+  const [sortMode, setSortModeState] = useState<SortMode>(() => {
+    const v = prefs.get<string>(sortModeKey, "manual");
+    return isSortMode(v) ? v : "manual";
+  });
+  useEffect(() => {
+    const v = prefs.get<string>(`uzi.board.${repoId}.sortMode`, "manual");
+    setSortModeState(isSortMode(v) ? v : "manual");
+  }, [repoId]);
+  const setSortMode = useCallback(
+    (next: SortMode) => {
+      setSortModeState(next);
+      prefs.set(`uzi.board.${repoId}.sortMode`, next);
+    },
+    [repoId],
+  );
+
+  // The live insertion point during a drag: which card the pointer is over and which
+  // edge. Driven by dragIid + this state, never by reading e.dataTransfer in
+  // onDragOver — the HTML drag-and-drop model puts the drag data store in protected
+  // mode for every event except dragstart and drop, so getData() there returns "".
+  const [insertAt, setInsertAt] = useState<DropAnchor | null>(null);
+  const [reordering, setReordering] = useState(false);
 
   // Start-run preconditions, refreshed alongside the board: whether the user has a
   // worker and an Anthropic token. Whether an issue already has an active run now
@@ -253,8 +300,10 @@ export function Board() {
     }
   };
 
-  const move = async (toKey: string, iid: number) => {
-    if (toKey === CLOSED_KEY) return; // Closed is not a drop target in the MVP.
+  // move returns whether the forge write succeeded, so a cross-column drop can stop
+  // before it freezes the order (PRD #102 M5). Nothing else about it changed.
+  const move = async (toKey: string, iid: number): Promise<boolean> => {
+    if (toKey === CLOSED_KEY) return false; // Closed is not a drop target in the MVP.
     setError("");
     // Suppress the auto-move toast for this card: a poll landing between the
     // server commit below and the local setBoard would otherwise diff the new
@@ -276,9 +325,11 @@ export function Board() {
       // still sees the moved column as its baseline, then release it.
       const timer = setTimeout(() => suppressToastIids.current.delete(iid), 11000);
       suppressTimers.current.push(timer);
+      return true;
     } catch (err) {
       suppressToastIids.current.delete(iid); // the move failed — nothing to suppress
       setError(err instanceof ApiError ? err.message : "Move failed");
+      return false;
     }
   };
 
@@ -330,16 +381,108 @@ export function Board() {
     [board, prdLabel, prdlessLabel, autopilotLabel],
   );
 
+  // TWO NAMED CARD SETS, kept distinct even though the filter is the identity today
+  // (PRD #102 M5, Decision 7b). This is structure, not decoration: the payload-set rule
+  // is the difference between a freeze that is correct and one that silently NULLs
+  // every card the viewer had hidden, and the way that rule gets broken is somebody
+  // reaching for whichever array is nearest to hand. Naming them makes it structural
+  // rather than remembered.
+  //
+  //   payloadCards — drives the FREEZE. Never filtered.
+  //   renderCards  — drives the LANES. M6's non-PRD toggle filters HERE, one line.
+  const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
+  const renderCards = payloadCards;
+
+  // columnKeys is the board's lane order for the freeze: the implicit Backlog column
+  // first, then the configured ones. Closed is excluded — closed cards never enter the
+  // freeze at all.
+  const columnKeys = useMemo(
+    () => [OPEN_KEY, ...(board?.columns ?? []).map((c) => c.label_name)],
+    [board],
+  );
+
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
-    for (const c of board?.cards ?? []) {
+    // Sorting ALL render cards (closed included) means the Closed lane follows the mode
+    // too, which is what a board-wide switcher implies.
+    for (const c of sortCards(renderCards, sortMode)) {
       const key = columnKeyForCard(c);
       const arr = map.get(key) ?? [];
       arr.push(c);
       map.set(key, arr);
     }
     return map;
-  }, [board]);
+  }, [renderCards, sortMode]);
+
+  // applyDrop is THE single order-computing path. A pointer drop and a keyboard ↑/↓
+  // both land here with the same three arguments, so the two gestures cannot drift:
+  // if a reviewer finds a second one, that is the defect, not an implementation detail.
+  //
+  // Sequence for a cross-column drop is move() THEN reorder, which refines Decision
+  // 7b's "freeze, then move" rather than contradicting it — 7b's worked example is a
+  // WITHIN-column drag, so its "move" is the reposition, and that is folded into the
+  // freeze here (one write, no insert-between mechanism). The order of the column
+  // LABEL write against the freeze is a case 7b never reaches. Move-first, because
+  // reorder returns the authoritative board and the client adopts it: freeze-first
+  // would render the new ORDER while the card is still in its OLD column (the forge
+  // call has not returned), so the card visibly snaps back to its old lane and jumps
+  // again about a second later. A failed forge write also then leaves NOTHING written,
+  // which is the existing snap-back contract; freeze-first would renumber the board
+  // around a move that never happened.
+  //
+  // THE FREEZE IS UNCONDITIONAL, including a drop while already in Manual mode.
+  // Gating it on "mode != manual" reintroduces the exact bug Decision 7b exists to
+  // prevent: on an untouched board every position is NULL, so one written position
+  // sorts ahead of every NULL under NULLS LAST and a card dragged to the BOTTOM of its
+  // column renders at the TOP.
+  const applyDrop = useCallback(
+    async (dragIid: number, destKey: string, anchor: DropAnchor | null) => {
+      if (destKey === CLOSED_KEY) return; // Closed is not a drop target.
+      const intent = dropIntent({
+        payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
+        columnKeys,
+        sortMode,
+        dragIid,
+        destColumnKey: destKey,
+        anchor,
+      });
+      if (!intent) return;
+      setReordering(true);
+      try {
+        if (intent.columnChanged && !(await move(destKey, dragIid))) {
+          return; // move() surfaced the error and left the card where it was
+        }
+        const { board: fresh } = await api.reorderBoard(repoId, intent.iids);
+        // No optimistic reorder: the card does not visually move until the server's
+        // authoritative board replaces this one, matching move()'s snap-back contract.
+        setBoard(fresh);
+        setSortMode("manual");
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Could not save the new order");
+      } finally {
+        setReordering(false);
+      }
+    },
+    // move/setBoard/setError are stable enough for this callback's purpose; the state
+    // it genuinely depends on is listed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [payloadCards, columnKeys, sortMode, repoId, setSortMode],
+  );
+
+  // moveCard is the keyboard path (PRD #102 M5, lead ruling 1). It builds the anchor a
+  // drop would have produced and hands it to the SAME applyDrop, so there is no second
+  // reorder call and no second freeze. columnChanged is always false here, so the
+  // forge is never touched by a keyboard move.
+  const moveCard = useCallback(
+    async (card: CardData, direction: "up" | "down") => {
+      const lane = cardsByColumn.get(columnKeyForCard(card)) ?? [];
+      const anchor = neighbourAnchor(lane, card.iid, direction);
+      if (!anchor) return; // already at that end
+      await applyDrop(card.iid, columnKeyForCard(card), anchor);
+      pushToast(`#${card.iid} moved ${direction} in ${columnLabel(card)}`);
+    },
+    [cardsByColumn, applyDrop, pushToast],
+  );
 
   if (loading) {
     return (
@@ -388,6 +531,22 @@ export function Board() {
         description={`Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here.`}
         actions={
           <>
+            {/* A real <label> around the repo's Select, so the control is named for a
+                screen reader without any custom markup. */}
+            <label className="flex select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+              Sort
+              <Select
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value as SortMode)}
+                className="py-1 text-xs"
+              >
+                {SORT_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </Select>
+            </label>
             <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
               <input
                 type="checkbox"
@@ -491,10 +650,14 @@ export function Board() {
               }}
               onDragLeave={() => setDropTarget((t) => (t === col.key ? null : t))}
               onDrop={(e) => {
+                // The LANE drop now means "append to the end of this column", which is
+                // what it already effectively did — a card-level drop stopPropagation()s
+                // so this only fires on lane whitespace or an empty lane.
                 e.preventDefault();
                 setDropTarget(null);
+                setInsertAt(null);
                 const iid = Number(e.dataTransfer.getData("text/plain"));
-                if (iid) move(col.key, iid);
+                if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
@@ -516,13 +679,69 @@ export function Board() {
                 </span>
               </div>
               <div className="flex flex-col gap-2">
-                {cards.map((card) => (
+                {cards.map((card, i) => (
                   <IssueCard
                     key={card.iid}
                     card={card}
                     repoId={repoId}
                     projectWebUrl={board?.web_url}
                     chips={chipLabels(card.labels, chipExclusions)}
+                    laneLabel={col.label}
+                    // Reorder controls exist only in a droppable lane, and only where
+                    // there is somewhere to go. Closed is not a drop target, so its
+                    // cards get neither.
+                    canMoveUp={col.droppable && !card.closed && i > 0}
+                    canMoveDown={col.droppable && !card.closed && i < cards.length - 1}
+                    reordering={reordering}
+                    onMoveUp={() => moveCard(card, "up")}
+                    onMoveDown={() => moveCard(card, "down")}
+                    // Never an edge on the dragged card itself.
+                    insertionEdge={
+                      col.droppable && insertAt?.iid === card.iid && dragIid !== card.iid
+                        ? insertAt.before
+                          ? "top"
+                          : "bottom"
+                        : null
+                    }
+                    onCardDragOver={
+                      col.droppable
+                        ? (e) => {
+                            // preventDefault or the drop is refused. Deliberately NOT
+                            // stopPropagation: the lane's own onDragOver still has to
+                            // fire to keep the lane highlight.
+                            e.preventDefault();
+                            if (dragIid == null || dragIid === card.iid) return;
+                            const r = e.currentTarget.getBoundingClientRect();
+                            const edge = insertionEdgeFor(r.top, r.height, e.clientY);
+                            setInsertAt((prev) =>
+                              prev && prev.iid === card.iid && prev.before === (edge === "top")
+                                ? prev
+                                : { iid: card.iid, before: edge === "top" },
+                            );
+                          }
+                        : undefined
+                    }
+                    onCardDragLeave={
+                      col.droppable
+                        ? () => setInsertAt((prev) => (prev?.iid === card.iid ? null : prev))
+                        : undefined
+                    }
+                    onCardDrop={
+                      col.droppable
+                        ? (e) => {
+                            // stopPropagation is REQUIRED: without it the lane's onDrop
+                            // runs afterwards and issues a second, anchor-less drop.
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const iid = Number(e.dataTransfer.getData("text/plain"));
+                            const r = e.currentTarget.getBoundingClientRect();
+                            const edge = insertionEdgeFor(r.top, r.height, e.clientY);
+                            setDropTarget(null);
+                            setInsertAt(null);
+                            if (iid) applyDrop(iid, col.key, { iid: card.iid, before: edge === "top" });
+                          }
+                        : undefined
+                    }
                     gate={startRunGate({
                       hasPrdLink: card.has_prd_link,
                       prdlessBypass: prdlessEnabled && card.labels.includes(prdlessLabel),
@@ -543,7 +762,10 @@ export function Board() {
                       e.dataTransfer.setData("text/plain", String(card.iid));
                       setDragIid(card.iid);
                     }}
-                    onDragEnd={() => setDragIid(null)}
+                    onDragEnd={() => {
+                      setDragIid(null);
+                      setInsertAt(null);
+                    }}
                     dimmed={dragIid === card.iid}
                   />
                 ))}
@@ -589,6 +811,16 @@ export function IssueCard({
   repoId,
   projectWebUrl,
   chips,
+  laneLabel,
+  canMoveUp,
+  canMoveDown,
+  reordering,
+  onMoveUp,
+  onMoveDown,
+  insertionEdge,
+  onCardDragOver,
+  onCardDragLeave,
+  onCardDrop,
   gate,
   starting,
   onStart,
@@ -610,6 +842,24 @@ export function IssueCard({
   // (columns + the configured workflow labels), and keeping it out of the card is
   // what lets this component mount in a test without an auth provider.
   chips: string[];
+  // The card's lane name, for the reorder buttons' accessible names (PRD #102 M5).
+  laneLabel: string;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  // A reorder is in flight anywhere on the board: disable every ↑/↓ so a second press
+  // cannot compute an order from a board the first press is about to replace.
+  reordering: boolean;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  // Which edge of this card the pointer is nearest during a drag, or null. Rendered as
+  // an INSET ring rather than a border-width change: growing the box would reflow the
+  // lane under the pointer mid-drag.
+  insertionEdge: "top" | "bottom" | null;
+  // Card-level drag handlers, attached only in a droppable lane (undefined otherwise,
+  // which is what keeps the Closed lane inert without a second guard in the handler).
+  onCardDragOver?: (e: React.DragEvent<HTMLDivElement>) => void;
+  onCardDragLeave?: () => void;
+  onCardDrop?: (e: React.DragEvent<HTMLDivElement>) => void;
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
@@ -653,11 +903,20 @@ export function IssueCard({
       draggable={draggable}
       onDragStart={draggable ? onDragStart : undefined}
       onDragEnd={draggable ? onDragEnd : undefined}
+      onDragOver={onCardDragOver}
+      onDragLeave={onCardDragLeave}
+      onDrop={onCardDrop}
       className={cx(
         "group rounded-lg border bg-raised/80 p-3 text-sm transition-colors",
         loud ? "border-warn/60 ring-2 ring-warn/40" : "border-edge",
         draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
         dimmed && "opacity-40",
+        // An INSET shadow, so the card's box size never changes and the lane does not
+        // reflow under the pointer mid-drag — the one interaction where layout
+        // stability matters most. `--brand` is the theme's brand channel triple
+        // (index.css), so the rule follows ember/mission like every other accent.
+        insertionEdge === "top" && "shadow-[inset_0_2px_0_0_rgb(var(--brand))]",
+        insertionEdge === "bottom" && "shadow-[inset_0_-2px_0_0_rgb(var(--brand))]",
       )}
     >
       <div className="flex items-start justify-between gap-2">
@@ -673,6 +932,43 @@ export function IssueCard({
           {stripUnsafeChars(card.title)}
         </Link>
         <div className="flex shrink-0 items-center gap-1.5">
+          {/* Keyboard reorder (PRD #102 M5). NOT redundant with the drag: native HTML5
+              drag-and-drop has no keyboard initiation path in any mainstream browser,
+              so without these a keyboard or screen-reader user cannot reorder at all
+              (WCAG 2.1.1 level A) and has no affordance telling them ordering exists.
+              No title/aria-label on a draggable card changes that.
+
+              Revealed on hover/focus with OPACITY, never `hidden` or `display:none` —
+              those remove the buttons from the tab order and recreate exactly the
+              problem they exist to solve. group-focus-within keeps them visible while
+              either one is focused. They drive the same applyDrop, hence the same
+              unconditional whole-board freeze, as a drop. */}
+          {(canMoveUp || canMoveDown) && (
+            <span className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+              <button
+                type="button"
+                draggable={false}
+                disabled={!canMoveUp || reordering}
+                onClick={onMoveUp}
+                aria-label={`Move issue #${card.iid} up in ${laneLabel}`}
+                title={`Move issue #${card.iid} up in ${laneLabel}`}
+                className="rounded px-1 text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                draggable={false}
+                disabled={!canMoveDown || reordering}
+                onClick={onMoveDown}
+                aria-label={`Move issue #${card.iid} down in ${laneLabel}`}
+                title={`Move issue #${card.iid} down in ${laneLabel}`}
+                className="rounded px-1 text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
+              >
+                ↓
+              </button>
+            </span>
+          )}
           {isHttpsUrl(card.web_url) && (
             <a
               href={card.web_url}

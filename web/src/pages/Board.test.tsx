@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listSecrets: vi.fn(),
       listRuns: vi.fn(),
       moveIssue: vi.fn(),
+      reorderBoard: vi.fn(),
     },
   };
 });
@@ -56,6 +57,13 @@ function renderCard(over: Partial<Card> = {}, chips: string[] = []) {
         card={aCard(over)}
         repoId="repo-1"
         chips={chips}
+        laneLabel="Backlog"
+        canMoveUp={false}
+        canMoveDown={false}
+        reordering={false}
+        onMoveUp={vi.fn()}
+        onMoveDown={vi.fn()}
+        insertionEdge={null}
         gate={{ enabled: true, reason: "" }}
         starting={false}
         onStart={vi.fn()}
@@ -197,6 +205,7 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     mockApi.listSecrets.mockResolvedValue({ secrets: [] });
     mockApi.listRuns.mockResolvedValue({ runs: [] });
     mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 7, column: "" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
   });
 
   const renderBoard = () =>
@@ -242,5 +251,292 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     // column and already names the lane it sits in.
     expect(within(lane).queryByText("PRD")).toBeNull();
     expect(within(lane).getAllByText("In Progress")).toHaveLength(1);
+  });
+});
+
+// PRD #102 M5. The sort/reorder half of the board, driven through the KEYBOARD
+// controls wherever possible — not for accessibility credit but because it is the only
+// DOM-drivable path to the reorder logic: simulating an HTML5 drag in jsdom means
+// hand-forging dataTransfer and getBoundingClientRect (which returns zeroes, jsdom
+// having no layout), while clicking a button does not.
+describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
+  // localStorage-backed prefs. This jsdom build does not expose window.localStorage
+  // (see mockApi.test.ts), so back it with a Map, the same approach prefs.test.ts uses.
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
+  let store: Map<string, string>;
+
+  // Four open cards in the implicit Backlog lane plus one in another column. The
+  // Backlog cards' forge_updated_at order is deliberately the REVERSE of their iid
+  // order: PRD freeze-test 1 requires a fixture where the mode order and the iid order
+  // genuinely differ, because where they coincide an implementation that falls back to
+  // iid passes.
+  const cards = () => [
+    aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"], forge_updated_at: "2026-01-01T00:00:00Z" }),
+    aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD"], forge_updated_at: "2026-02-01T00:00:00Z" }),
+    aCard({ iid: 3, title: "issue three", column: "", labels: ["PRD"], forge_updated_at: "2026-03-01T00:00:00Z" }),
+    aCard({ iid: 4, title: "issue four", column: "", labels: ["PRD"], forge_updated_at: "2026-04-01T00:00:00Z" }),
+    aCard({ iid: 9, title: "issue nine", column: "Planned", labels: ["PRD"], forge_updated_at: "2026-05-01T00:00:00Z" }),
+    aCard({ iid: 99, title: "issue closed", column: "", labels: ["PRD"], closed: true, forge_updated_at: "2026-06-01T00:00:00Z" }),
+  ];
+
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [{ label_name: "Planned" }] as BoardData["columns"],
+    cards: cards(),
+    pipeline: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    store = installStorage();
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: false,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 1, column: "Planned" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  const laneFor = (label: string) => {
+    const lane = screen.getByText(label).parentElement?.parentElement;
+    if (!lane) throw new Error(`no lane for ${label}`);
+    return lane;
+  };
+
+  const moveBtn = (iid: number, dir: "up" | "down") =>
+    screen.getByRole("button", { name: new RegExp(`Move issue #${iid} ${dir} in`) });
+
+  const orderSubmitted = () => {
+    const calls = mockApi.reorderBoard.mock.calls;
+    return calls[calls.length - 1][1] as number[];
+  };
+
+  // C1 — PRD freeze-test 2, THE discriminating case.
+  it("freezes the WHOLE board on an untouched board in the default Manual mode", async () => {
+    // This is the one a mode-gated freeze fails and everything either side of it
+    // passes. On an untouched board every board_position is NULL, so writing a single
+    // position sorts that one card ahead of every NULL under NULLS LAST, and a card
+    // dragged to the BOTTOM of its column renders at the TOP.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+
+    const iids = orderSubmitted();
+    // Every OPEN card, not one iid, and not just the lane that changed.
+    expect(iids).toHaveLength(5);
+    expect(new Set(iids)).toEqual(new Set([1, 2, 3, 4, 9]));
+    // …and card 1 really moved one place down within Backlog.
+    expect(iids.slice(0, 4)).toEqual([2, 1, 3, 4]);
+  });
+
+  it("excludes closed cards from the freeze", async () => {
+    // A frozen position on a closed card would ride an issue that later reopens on the
+    // forge and drop it at an arbitrary rank in its new column.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    expect(orderSubmitted()).not.toContain(99);
+  });
+
+  // C4 — ruling 1 constraint (i): ONE code path.
+  it("a keyboard move and the equivalent drop submit an IDENTICAL order", async () => {
+    // Two paths that agree today and drift later is the failure the constraint exists
+    // to prevent, and only a comparison catches it.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    const viaKeyboard = orderSubmitted();
+
+    cleanup();
+    mockApi.reorderBoard.mockClear();
+    renderBoard();
+    await screen.findByText("Backlog");
+    // The equivalent drop: card 1 onto card 2's BOTTOM half. jsdom reports a zero rect,
+    // so clientY 0 against top 0 / height 0 resolves to "bottom" — the pinned boundary
+    // in insertionEdgeFor, which is why that boundary is asserted in the unit suite.
+    const card2 = screen.getByText("issue two").closest("div[draggable]") as HTMLElement;
+    fireEvent.drop(card2, { dataTransfer: { getData: () => "1" }, clientY: 0 });
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    expect(orderSubmitted()).toEqual(viaKeyboard);
+  });
+
+  // C5 — the buttons are reachable, named and bounded.
+  it("exposes keyboard reorder controls named for the card and the direction", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const down = moveBtn(1, "down");
+    // In the tab order without a hover. `hidden`/`display:none` would remove them and
+    // recreate the exact problem they exist to solve, so assert focusability rather
+    // than a CSS class.
+    down.focus();
+    expect(document.activeElement).toBe(down);
+    expect(down.getAttribute("aria-label")).toBe("Move issue #1 down in Backlog");
+  });
+
+  it("disables the reorder controls at the ends of a column", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Backlog holds 1,2,3,4 in payload order: 1 cannot go up, 4 cannot go down.
+    expect((moveBtn(1, "up") as HTMLButtonElement).disabled).toBe(true);
+    expect((moveBtn(1, "down") as HTMLButtonElement).disabled).toBe(false);
+    expect((moveBtn(4, "down") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("gives a single-card lane no reorder controls at all", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Card 9 is alone in Planned: both directions are impossible, so neither button
+    // should exist rather than existing permanently disabled.
+    expect(screen.queryByRole("button", { name: /Move issue #9/ })).toBeNull();
+  });
+
+  it("gives a closed card no reorder controls", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(screen.queryByRole("button", { name: /Move issue #99/ })).toBeNull();
+  });
+
+  // C2 — the mode flip, both directions.
+  it("switches the board to Manual after a successful reorder and persists it", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Start somewhere other than Manual so the flip is observable.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    expect(store.get("uzi.board.repo-1.sortMode")).toBe('"updated"');
+
+    // Under `updated` the lane renders 4,3,2,1, so card 4 is FIRST and its up button
+    // is disabled; card 1 is last and can move up.
+    fireEvent.click(moveBtn(1, "up"));
+    await waitFor(() => expect(store.get("uzi.board.repo-1.sortMode")).toBe('"manual"'));
+  });
+
+  it("leaves the mode ALONE when the reorder fails", async () => {
+    mockApi.reorderBoard.mockRejectedValue(new Error("boom"));
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "title" } });
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    expect(store.get("uzi.board.repo-1.sortMode")).toBe('"title"');
+  });
+
+  it("freezes the order of the CURRENT mode, not the iid order", async () => {
+    // The trap Decision 7b exists for: dragging while sorted by Last updated must leave
+    // every OTHER card where it visually sat. A freeze that fell back to iid would
+    // re-sort the board under the user's hand and read as having scrambled it.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    // Backlog now displays 4,3,2,1 (newest first) — the reverse of iid order.
+    fireEvent.click(moveBtn(4, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    expect(orderSubmitted().slice(0, 4)).toEqual([3, 4, 2, 1]);
+  });
+
+  it("renders the mode's order, and Manual renders the payload order untouched", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const titlesIn = (lane: HTMLElement) =>
+      within(lane)
+        .getAllByRole("link", { name: /^issue / })
+        .map((a) => a.textContent);
+
+    // Manual is the identity over the payload: 1,2,3,4 as the server sent them.
+    expect(titlesIn(laneFor("Backlog"))).toEqual(["issue one", "issue two", "issue three", "issue four"]);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    expect(titlesIn(laneFor("Backlog"))).toEqual(["issue four", "issue three", "issue two", "issue one"]);
+  });
+
+  // C3 — the forge write goes first, and a failure stops everything.
+  it("writes the column label BEFORE freezing on a cross-column drop", async () => {
+    const calls: string[] = [];
+    mockApi.moveIssue.mockImplementation(async () => {
+      calls.push("move");
+      return { card: aCard({ iid: 1, column: "Planned" }) };
+    });
+    mockApi.reorderBoard.mockImplementation(async () => {
+      calls.push("reorder");
+      return { board: aBoard() };
+    });
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.drop(laneFor("Planned"), { dataTransfer: { getData: () => "1" } });
+    await waitFor(() => expect(calls).toEqual(["move", "reorder"]));
+  });
+
+  it("never freezes when the forge write fails", async () => {
+    // Freeze-first would renumber the board around a move that never happened; the
+    // existing contract is that a failed forge write leaves NOTHING written.
+    mockApi.moveIssue.mockRejectedValue(new Error("forge down"));
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.drop(laneFor("Planned"), { dataTransfer: { getData: () => "1" } });
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.reorderBoard).not.toHaveBeenCalled();
+  });
+
+  it("does not touch the forge for a within-column reorder", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).not.toHaveBeenCalled();
+  });
+
+  it("degrades a corrupt persisted mode to Manual instead of breaking the board", async () => {
+    store.set("uzi.board.repo-1.sortMode", '"not-a-mode"');
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("manual");
   });
 });

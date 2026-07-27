@@ -64,6 +64,62 @@ and board views.
 
 ![Dragging a card between board columns, relabeling the underlying GitLab issue](img/board-move-card.png)
 
+## Ordering and sorting
+
+The **Sort** control in the board toolbar chooses how cards are ordered inside
+every column:
+
+- **Manual** (the default): your own order, the one you set by moving cards
+  around. On a board nobody has ever reordered this is exactly issue-number
+  order, so the board looks the same as it always did until you decide
+  otherwise.
+- **Issue number**: plain numeric order. This is the way back once you have
+  reordered something and want to ignore your own order for a moment.
+- **Recent run activity**: cards whose latest agent run was touched most
+  recently come first. Cards that have never run go last.
+- **Last updated**: most recently changed on GitLab first.
+- **Title**: alphabetical.
+
+The sort choice is remembered per board, on this browser. The order itself is
+different: it is stored with your account, so it follows you to any browser or
+device you sign in from. It is yours, not the team's; another person looking at
+the same GitLab project sees their own board and their own order.
+
+### Two ways to reorder a card
+
+Both do exactly the same thing, so use whichever suits you.
+
+**With the keyboard.** Focus a card, or hover it, and use the small **up** and
+**down** buttons next to the issue number. Each press moves the card one place
+within its column, and the buttons are disabled at the top and bottom. They are
+reachable by tabbing, and each one is announced with the card and the direction
+("Move issue #42 down in Planned"), so this works without a mouse.
+
+**By dragging.** Pick a card up and drop it where you want it. A line appears on
+the edge of the card you are hovering to show where it will land. Dropping onto
+another column moves it there and changes its label on GitLab, exactly as
+before; dropping within a column only changes the order and writes nothing to
+GitLab.
+
+### What a reorder records
+
+Moving one card records the order of the **whole board**, exactly as it looks to
+you at that moment, and switches the board to **Manual**. That is deliberate:
+if only the moved card were recorded, every other card would fall back to
+issue-number order the moment the board switched to Manual, and a single drag
+would look like it had scrambled everything.
+
+Two consequences worth knowing:
+
+- Reordering one card while sorted by, say, **Last updated** freezes that
+  Last-updated arrangement as your manual order. It is the arrangement you were
+  looking at, which is usually what you meant, but it does replace whatever
+  order you had recorded before.
+- Issues that arrive after you last reordered appear at the **bottom** of their
+  column rather than jumping to the top, in issue-number order among
+  themselves. Closing an issue clears its place, so an issue that reopens later
+  comes back at the bottom too.
+
 ## Automatic moves
 
 Starting a run moves its issue for you: **Start run** puts the card in **In
