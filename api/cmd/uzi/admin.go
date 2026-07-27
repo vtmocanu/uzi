@@ -89,7 +89,17 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(ws))
 			for _, w := range ws {
-				rows = append(rows, []string{w.ID, w.OwnerEmail, w.Name, w.Status})
+				// 🔴 THE CROSS-TENANT ONE. This prints another user's worker name into an
+				// ADMIN's terminal, and worker names are validated for length only — no
+				// control-character check, no Cf check, and workers.name carries no CHECK.
+				// So a crafted name is terminal control injection into someone else's
+				// session, and an embedded newline forges a row in a table an admin reads
+				// to make decisions. Strictly worse than the token-label case, where the
+				// validator had already put ANSI out of reach.
+				//
+				// The render site is the trust boundary and does not depend on the
+				// validator holding; hardening the validator is a separate change.
+				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status})
 			}
 			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS"}, rows)
 		},

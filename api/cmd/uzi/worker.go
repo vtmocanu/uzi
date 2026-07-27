@@ -38,7 +38,17 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
 				rows = append(rows, []string{
-					w.ID, w.Name, w.Status, strOr(w.Version, "-"), upgradeCell(w), bindModeCell(w),
+					// cellText on the NAME, not just on the token label two cells over.
+					// Worker names are validated for LENGTH ONLY (handler/workers.go:
+					// TrimSpace + a 200-byte cap) and workers.name is a bare `text` with
+					// no CHECK, so unlike a token label an ESC is storable in one — the
+					// ANSI-injection class validateSecretLabel has always refused is live
+					// here. An embedded newline additionally breaks the tabwriter rail for
+					// every following row, i.e. a name can FORGE a table row.
+					//
+					// A sanitized cell beside an unsanitized one in the same row is worse
+					// than either, because it reads as though the question was considered.
+					w.ID, cellText(w.Name), w.Status, strOr(w.Version, "-"), upgradeCell(w), bindModeCell(w),
 				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an

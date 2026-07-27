@@ -234,3 +234,65 @@ func TestBindModeCellPinnedWithNoLabel(t *testing.T) {
 		t.Fatalf("cell = %q, want default — a pin with no credential resolves as the default (D9)", got)
 	}
 }
+
+// TestWorkerNamesAreSanitizedForTheTerminal is the render-site defense for a field
+// that has LESS protection than a token label, not more.
+//
+// 🔴 WORKER NAMES ARE VALIDATED FOR LENGTH ONLY. handler/workers.go is TrimSpace plus
+// a 200-byte cap — no control-character check, no Cf check — and `workers.name` is a
+// bare `text NOT NULL` with no CHECK (00020). So unlike a token label, an ESC is
+// STORABLE in a worker name: the ANSI-injection class validateSecretLabel has always
+// refused is live here, and an embedded newline breaks the tabwriter rail for every
+// following row, i.e. a name can forge a table row.
+//
+// This asserts what the RENDERER does with what it is handed, which is a different
+// question from what the server accepts on write and sits on the other side of a trust
+// boundary. Hardening the validator is a separate change; the render site must hold
+// without it.
+//
+// MUTATION THIS CATCHES: reverting either cell to the raw `w.Name`. Measured on both.
+func TestWorkerNamesAreSanitizedForTheTerminal(t *testing.T) {
+	hostile := "safe‮dnetsop\x1b[31m\nforged\trow"
+	for _, tc := range []struct {
+		name string
+		args []string
+		fc   *uzicli.FakeClient
+	}{
+		{
+			name: "uzi worker list",
+			args: []string{"worker", "list"},
+			fc: &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+				{ID: "w1", Name: hostile, Status: "online", AnthropicBindMode: "default"},
+			}},
+		},
+		{
+			// 🔴 THE CROSS-TENANT ONE. This prints ANOTHER user's worker name into an
+			// admin's terminal, beside their email — so a crafted name is terminal
+			// control injection into someone else's session, and a forged row lands in
+			// a table an admin reads to make decisions.
+			name: "uzi admin workers",
+			args: []string{"admin", "workers"},
+			fc: &uzicli.FakeClient{AdminWorkers: []apitypes.AdminWorkerDTO{
+				{WorkerDTO: apitypes.WorkerDTO{ID: "w1", Name: hostile, Status: "online"}, OwnerEmail: "victim@uzi.test"},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, code := runCLI(t, fakeEnv(tc.fc), tc.args...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			// The first two are the shared floor; the last two are what tell cellText
+			// and sanitizeTTY apart — only cellText folds a newline and a tab, and a
+			// newline in a table cell is what forges a row.
+			for _, bad := range []string{"‮", "\x1b", "\nforged", "\trow"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("a hostile worker name reached the terminal carrying %q: %q", bad, out)
+				}
+			}
+			if !strings.Contains(out, "safe") {
+				t.Errorf("sanitizing dropped the printable text too: %q", out)
+			}
+		})
+	}
+}

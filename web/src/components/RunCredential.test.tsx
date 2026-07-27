@@ -118,6 +118,19 @@ describe("RunCredential (PRD #111 M1)", () => {
   });
 });
 
+// chipText is the VISIBLE text of the chip: everything inside the badge minus the
+// sr-only description. Reading container.textContent directly would fold the hint in
+// and make /auto/ match on a run whose hint merely mentions auto-selection — a
+// fixture where a correct and a broken renderer agree, which is the trap this file
+// keeps being about.
+function chipText(container: HTMLElement): string {
+  const badge = container.querySelector("span");
+  if (!badge) return "";
+  const sr = badge.querySelector(".sr-only");
+  const full = badge.textContent ?? "";
+  return sr ? full.replace(sr.textContent ?? "", "") : full;
+}
+
 // --- PRD #111 M5: the chip names the MODE, not just the token -------------------
 
 describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
@@ -134,8 +147,8 @@ describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
     ["judge", null, /judge binding/],
     ["best_of_pool", 8, /auto \(best of pool\), 8% headroom/],
   ])("renders %s", (reason, headroom, want) => {
-    render(<RunCredential run={cred({ reason: reason as string, headroom })} />);
-    expect(screen.getByText(/console-key/).textContent).toMatch(want);
+    const { container } = render(<RunCredential run={cred({ reason: reason as string, headroom })} />);
+    expect(chipText(container)).toMatch(want);
   });
 
   // The three fallbacks must not read as an ordinary default. The worker is set to
@@ -144,24 +157,23 @@ describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
   it.each(["pool_empty", "pool_stale", "open_failed"])(
     "%s says the worker is on auto and why it did not get a pick",
     (reason) => {
-      render(<RunCredential run={cred({ reason })} />);
-      expect(screen.getByText(/console-key/).textContent).toMatch(/default \(auto:/);
+      const { container } = render(<RunCredential run={cred({ reason })} />);
+      expect(chipText(container)).toMatch(/default \(auto:/);
     },
   );
 
   // A run claimed before M1 recorded no mode. The bare label is the truthful
   // rendering; a guessed "default" would assert something nothing knows.
   it("shows the bare label for a run with no recorded reason", () => {
-    render(<RunCredential run={cred({ reason: null })} />);
-    const text = screen.getByText(/console-key/).textContent ?? "";
-    expect(text).not.toMatch(/—/);
+    const { container } = render(<RunCredential run={cred({ reason: null })} />);
+    expect(chipText(container)).not.toMatch(/—/);
   });
 
   // The API ships separately from this bundle, so a newer server can send a ninth
   // reason. Rendering it verbatim is honest; dropping it or guessing is not.
   it("passes an unrecognised reason through rather than dropping it", () => {
-    render(<RunCredential run={cred({ reason: "some_future_reason" })} />);
-    expect(screen.getByText(/console-key/).textContent).toMatch(/some_future_reason/);
+    const { container } = render(<RunCredential run={cred({ reason: "some_future_reason" })} />);
+    expect(chipText(container)).toMatch(/some_future_reason/);
   });
 
   // The headroom rides only where the server measured one. D14's retry records
@@ -169,15 +181,18 @@ describe("RunCredential mode rendering (PRD #111 M5, D20)", () => {
   // credential that would NOT open — attaching it to the one that did would
   // attribute a measurement to a token nothing measured.
   it("omits the headroom when the server recorded none", () => {
-    render(<RunCredential run={cred({ reason: "open_failed", headroom: null })} />);
-    expect(screen.getByText(/console-key/).textContent).not.toMatch(/headroom/);
+    const { container } = render(<RunCredential run={cred({ reason: "open_failed", headroom: null })} />);
+    expect(chipText(container)).not.toMatch(/headroom/);
   });
 
   // A deleted credential AND a mode, together: the two are independent fields and a
   // renderer that handled either alone would pass every test above.
   it("shows both the deleted marker and the mode", () => {
-    render(<RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} />);
-    const text = screen.getByText(/retired-key/).textContent ?? "";
+    const { container } = render(
+      <RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} />,
+    );
+    const text = chipText(container);
+    expect(text).toMatch(/retired-key/);
     expect(text).toMatch(/\(deleted\)/);
     expect(text).toMatch(/pinned/);
   });
@@ -189,7 +204,7 @@ describe("RunCredential links only where there is something to do", () => {
   // PRD #104 M5 already ships the per-token meters and eligibility chips on
   // Settings → Anthropic tokens, so a fallback POINTS AT THEM rather than rebuilding
   // a meter in the run header.
-  it.each(["pool_empty", "pool_stale", "open_failed"])("links on %s", (reason) => {
+  it.each(["pool_empty", "pool_stale", "open_failed", "best_of_pool"])("links on %s", (reason) => {
     const { container } = render(<RunCredential run={cred({ reason })} />);
     const link = container.querySelector("a");
     expect(link).not.toBeNull();
@@ -199,7 +214,7 @@ describe("RunCredential links only where there is something to do", () => {
   });
 
   // A link where nothing is wrong is a dead end dressed as an action.
-  it.each(["auto", "default", "pinned", "judge", "best_of_pool"])("does not link on %s", (reason) => {
+  it.each(["auto", "default", "pinned", "judge"])("does not link on %s", (reason) => {
     const { container } = render(<RunCredential run={cred({ reason })} />);
     expect(container.querySelector("a")).toBeNull();
   });
@@ -210,5 +225,48 @@ describe("RunCredential links only where there is something to do", () => {
       <RunCredential run={cred({ id: null, label: "retired-key", reason: "pinned" })} />,
     );
     expect(container.querySelector("a")).toBeNull();
+  });
+});
+
+
+// --- the chip's STRUCTURE, which the text assertions above cannot see -------------
+
+describe("RunCredential chip structure (web-ux F19/F20/F21)", () => {
+  // F19. `token default — default` was D20's own motivating input and it rendered as
+  // the same word twice with nothing marking which was which — a token NAME then a
+  // MODE, reading as a stutter or a bug. The roles are told apart typographically, so
+  // the assertion is that the label sits in its own element carrying weight, not that
+  // the text happens to differ.
+  it("sets the label apart from the mode typographically", () => {
+    const { container } = render(<RunCredential run={cred({ label: "default", reason: "default" })} />);
+    const weighted = container.querySelector("span.font-semibold");
+    expect(weighted, "the label needs its own weighted element, or the two 'default's are indistinguishable").not.toBeNull();
+    expect(weighted?.textContent).toBe("default");
+    // …and the mode is NOT inside it.
+    expect(weighted?.textContent).not.toMatch(/—/);
+  });
+
+  // F20. Measured at 375px: `token nearly-spent — default (auto: the chosen token
+  // would not open)` is 389px wide and overflows the document. The em dash is not the
+  // cause; a pill carrying a sentence-length reason and refusing to wrap is.
+  it("lets the chip wrap rather than overflowing the viewport", () => {
+    const { container } = render(<RunCredential run={cred({ reason: "open_failed" })} />);
+    const badge = container.querySelector("span");
+    expect(badge?.className).not.toMatch(/whitespace-nowrap/);
+    expect(badge?.className).toMatch(/whitespace-normal/);
+  });
+
+  // F21. WCAG 2.5.3 Label in Name: an aria-label here REPLACES the visible text, so a
+  // voice-control user saying "click token default" matches nothing. The explanation
+  // is DESCRIBED instead, leaving the visible text as the accessible name.
+  it("describes the chip without replacing its accessible name", () => {
+    const { container } = render(<RunCredential run={cred({ reason: "pool_stale" })} />);
+    const badge = container.querySelector("span[aria-describedby]");
+    expect(badge, "the chip should carry aria-describedby").not.toBeNull();
+    expect(badge?.getAttribute("aria-label"), "an aria-label would REPLACE the visible name").toBeNull();
+    const described = container.querySelector(`#${badge?.getAttribute("aria-describedby")}`);
+    expect(described?.textContent).toMatch(/no pooled token had a current usage reading/);
+    // The visible label survives in the name, which is the whole property.
+    expect(badge?.textContent).toMatch(/console-key/);
   });
 });

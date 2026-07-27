@@ -371,10 +371,24 @@ describe("AnthropicTokens", () => {
         },
       ],
     });
-    renderList([secret({ auto_eligible: true })]);
+    const { container } = renderList([secret({ auto_eligible: true })]);
     // "never polled" is autoStatusChip's rendering of no_reading — rendered, not
     // re-derived: nothing in this component looks at `limits`.
     expect(await screen.findByText("never polled")).toBeTruthy();
+
+    // 🔴 AND THE SKIP NOTE IS ACTUALLY AMBER — web-ux F22. It read `text-warning`,
+    // which is NOT a class in this project (the tailwind token is `warn`), so it
+    // silently inherited the body --fg and rendered grey beside an amber chip. A
+    // tailwind class that does not resolve fails COMPLETELY silently: nothing errors,
+    // the element just inherits, which is exactly why it survived review.
+    //
+    // Asserted on the class rather than the computed colour because jsdom does not
+    // run tailwind — so this pins the one thing that WAS wrong (the stem) and is
+    // honest about not proving the pixel.
+    const note = screen.getByText(/auto-selection skips it/);
+    expect(note.className, "text-warning is not a class here; the token is warn").toMatch(/\btext-warn\b/);
+    expect(note.className).not.toMatch(/text-warning/);
+    expect(container).toBeTruthy();
   });
 
   // An UN-pooled token gets no chip: the unchecked box beside it already says so,

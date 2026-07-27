@@ -23,11 +23,21 @@ export interface CredentialDescription {
   /** The hover explanation. Always present, because the mode phrase is necessarily
    *  terse and "default (auto: no fresh usage readings)" is not self-explaining. */
   hint: string;
-  /** True when the worker was set to `auto` and the selector did NOT pick — the run
-   *  ran on the owner's default instead. Surfaced separately from the phrase so a
-   *  caller can style it: this is the one state where the user's configuration and
-   *  what happened differ, which is worth noticing rather than reading past. */
-  fellBack: boolean;
+  /** How much attention the state deserves, and the rule behind it is the one the
+   *  settings page already uses (web-ux F4): AMBER where the selector SKIPPED the
+   *  token, INFO where it still picked one but the news is worth reading, NEUTRAL
+   *  where nothing is unusual.
+   *
+   *  `best_of_pool` is info rather than neutral (F17) because the tone ordering was
+   *  inverted without it: a run whose pool is nearly exhausted — the fixture is 8%
+   *  headroom — rendered identically to a healthy `auto, 62% headroom`, while
+   *  `pool_stale`, where the run completed exactly as configured-minus-auto, wore
+   *  amber. Info also matches `low headroom` on the settings page, which is the same
+   *  condition seen from the token side. */
+  tone: "neutral" | "info" | "warning";
+  /** Whether to link to the page where this can be acted on. ONE rule, so the two
+   *  cannot drift: link iff the tone is not neutral. Nothing unusual, nowhere to go. */
+  linked: boolean;
   /** True when the credential has since been deleted (web-ux F8). The id is a live
    *  FK the server nulls on delete (00086's SET NULL) while the snapshotted label
    *  survives, so this is the NORMAL shape of a historical run — the difference
@@ -45,7 +55,9 @@ export interface CredentialDescription {
 // own mode, because that is what actually happened: the worker is configured for auto,
 // the selector declined, and the owner's default paid. A user reading a bare "default"
 // on a worker they set to auto would reasonably think the setting had been lost.
-const REASON_PHRASES: Record<SelectReason, { mode: string; hint: string }> = {
+type Phrase = { mode: string; hint: string; tone?: "info" | "warning" };
+
+const REASON_PHRASES: Record<SelectReason, Phrase> = {
   default: {
     mode: "default",
     hint: "No binding named a credential, so this run spent your default Anthropic token.",
@@ -68,21 +80,35 @@ const REASON_PHRASES: Record<SelectReason, { mode: string; hint: string }> = {
   best_of_pool: {
     // Named rather than folded into `auto`: every pooled token was under the headroom
     // floor and the emptiest was picked anyway. The run worked and the pool is nearly
-    // exhausted, which is a thing to know rather than an error.
+    // exhausted, which is a thing to know rather than an error — hence info, not
+    // neutral and not amber (F17).
     mode: "auto (best of pool)",
-    hint: "Every token in your pool was below the headroom threshold, so auto-selection spent the least-consumed of them rather than falling back.",
+    hint: "Every token in your pool was below the headroom threshold, so auto-selection spent the least-consumed of them rather than falling back. Your pool is nearly exhausted.",
+    tone: "info",
   },
   pool_empty: {
+    // Pure configuration, and fixed in one click on the page this links to.
     mode: "default (auto: no tokens in the pool)",
     hint: "This worker is set to auto, but no token is opted into the pool, so the run spent your default token. Opt one in on Settings → Anthropic tokens.",
+    tone: "warning",
   },
   pool_stale: {
+    // HEDGED, per F16. This can be the user's half (tokens uzi has never managed to
+    // poll) or the system's (the poller is disabled — R2), and the copy cannot tell
+    // which from here. The previous wording asserted the user's half by sending them
+    // to the eligibility chips, which is wrong advice half the time.
     mode: "default (auto: no fresh usage readings)",
-    hint: "This worker is set to auto, but no pooled token had a current usage reading to rank on, so the run spent your default token. Check the pool's eligibility chips on Settings → Anthropic tokens.",
+    hint: "This worker is set to auto, but no pooled token had a current usage reading to rank on, so the run spent your default token. Either uzi has not managed to read those tokens — the eligibility chips on Settings → Anthropic tokens will say — or usage polling is switched off for this instance.",
+    tone: "warning",
   },
   open_failed: {
+    // NOT a configuration problem (F16). A ciphertext would not decrypt, so the
+    // action is to ROTATE that credential — inspecting eligibility chips tells the
+    // user nothing, because the token was eligible; it was the OPEN that failed. The
+    // rotate form is on the same page, so the link target is unchanged.
     mode: "default (auto: the chosen token would not open)",
-    hint: "Auto-selection picked a token and it could not be decrypted, so the run spent your default token rather than failing.",
+    hint: "Auto-selection picked a token and its stored value could not be decrypted, so the run spent your default token rather than failing. Re-paste that token on Settings → Anthropic tokens to fix it.",
+    tone: "warning",
   },
 };
 
@@ -102,17 +128,6 @@ const REASON_PHRASES: Record<SelectReason, { mode: string; hint: string }> = {
  *  place to forget. */
 export const SELECT_REASONS = Object.keys(REASON_PHRASES) as SelectReason[];
 
-// FALLBACK_REASONS mirrors autoselect.Reason.FellBackFromAuto in Go. Two lists, and
-// the duplication is deliberate rather than overlooked: the alternative is another
-// wire field carrying a boolean the client can derive from one it already has, and
-// runCredential.test.ts pins the two lists against each other by parsing the Go
-// source, so a fourth fallback reason cannot land on one side alone.
-const FALLBACK_REASONS: ReadonlySet<string> = new Set<SelectReason>([
-  "pool_empty",
-  "pool_stale",
-  "open_failed",
-]);
-
 /** describeCredential turns a run's four credential fields into what the chip shows.
  *
  *  Takes the RUN rather than loose arguments so a caller cannot pass the headroom of
@@ -130,7 +145,13 @@ export function describeCredential(
   const deleted = run.anthropic_secret_id == null;
   const reason = run.anthropic_select_reason;
   if (reason == null || reason === "") {
-    return { mode: "", hint: "The Anthropic credential this run's claim spent.", fellBack: false, deleted };
+    return {
+      mode: "",
+      hint: "The Anthropic credential this run's claim spent.",
+      tone: "neutral",
+      linked: false,
+      deleted,
+    };
   }
   const known = REASON_PHRASES[reason as SelectReason];
   if (!known) {
@@ -141,7 +162,8 @@ export function describeCredential(
     return {
       mode: reason,
       hint: `This uzi build does not recognise the selection mode “${reason}”. It is shown as-is rather than guessed at.`,
-      fellBack: false,
+      tone: "neutral",
+      linked: false,
       deleted,
     };
   }
@@ -150,5 +172,6 @@ export function describeCredential(
   // on, which appears nowhere else in the product.
   const pct = run.anthropic_headroom_pct;
   const mode = pct == null ? known.mode : `${known.mode}, ${pct}% headroom`;
-  return { mode, hint: known.hint, fellBack: FALLBACK_REASONS.has(reason), deleted };
+  const tone = known.tone ?? "neutral";
+  return { mode, hint: known.hint, tone, linked: tone !== "neutral", deleted };
 }

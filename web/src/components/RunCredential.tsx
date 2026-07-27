@@ -50,43 +50,55 @@ export function RunCredential({
   // web-ux F8 is `deleted`: a run whose credential was DELETED is otherwise
   // indistinguishable from one whose credential still exists. Saying so is the
   // difference between "go look at this token" and "this token is gone".
-  const { mode, hint, fellBack, deleted } = describeCredential(run);
-
-  // A fallback is the ONE state where the user's configuration and what happened
-  // differ: the worker is set to auto and the run spent the default anyway. Amber so
-  // it is noticed. Not an error — D7 is that auto never fails a run — but it does mean
-  // the pool did no work, which is usually a settings or poller problem the user can
-  // fix, and which is invisible if it wears the same neutral chip as an ordinary
-  // default.
-  const tone = fellBack ? "warning" : "neutral";
+  const { mode, hint, tone, linked, deleted } = describeCredential(run);
+  const hintId = `run-credential-hint-${run.anthropic_secret_id ?? "gone"}`;
 
   const chip = (
     <Badge
-      tone={tone}
+      tone={tone === "warning" ? "warning" : tone === "info" ? "info" : "neutral"}
+      // web-ux F20: this badge carries sentence-length reasons —
+      // `default (auto: the chosen token would not open)` measured 389px against a
+      // 375px viewport and overflowed the document. The em dash is not the cause; a
+      // pill that cannot wrap is.
+      wrap
+      // web-ux F21: the explanation is DESCRIBED, never the accessible NAME. An
+      // aria-label here would replace the visible text, so a voice-control user saying
+      // "click token default" would match nothing — WCAG 2.5.3 Label in Name. The
+      // sr-only span below is the same pattern this file's sibling uses for D6_HINT.
+      aria-describedby={hintId}
       title={
         deleted
           ? `${hint} The credential has since been deleted; the name is the one recorded when the run was claimed.`
           : hint
       }
     >
-      token {safe}
+      {/* web-ux F19. `token default — default` was the exact input D20 named as its
+          motivating case, and it rendered as the same word twice with nothing marking
+          which was which — it reads as a stutter or a bug. The LABEL is set in medium
+          weight, as WorkersSettings already does for a pinned worker, so the two roles
+          are told apart typographically rather than by position. */}
+      token <span className="font-semibold">{safe}</span>
       {deleted && " (deleted)"}
       {mode && ` — ${mode}`}
+      <span id={hintId} className="sr-only">
+        {hint}
+      </span>
     </Badge>
   );
 
-  // Only a FALLBACK is a link, and the narrowness is the point. PRD #104 M5 already
-  // ships the per-token meters and eligibility chips on Settings → Anthropic tokens,
-  // so this points at them rather than rebuilding a meter in the run header — but only
-  // where the user has something to DO there. On an ordinary `auto` or `pinned` run
-  // nothing is wrong and a link would be a dead end dressed as an action; on a deleted
-  // credential there is nothing left to look at.
+  // Only a non-neutral state is a link, and it is ONE rule so the two cannot drift:
+  // link iff the tone is not neutral. PRD #104 M5 already ships the per-token meters
+  // and eligibility chips on Settings → Anthropic tokens, so this points at them
+  // rather than rebuilding a meter in the run header — but only where the user has
+  // something to DO there. On an ordinary `auto` or `pinned` run nothing is wrong and
+  // a link is a dead end dressed as an action; on a deleted credential there is
+  // nothing left to look at.
   //
   // The USER'S OWN settings page, deliberately not /admin/rate-limits: that route is
   // admin-only and would 403 for exactly the person reading their own run.
-  if (!fellBack) return chip;
+  if (!linked) return chip;
   return (
-    <Link to="/settings" className="no-underline" aria-label={`${hint} Open your Anthropic tokens.`}>
+    <Link to="/settings" className="no-underline">
       {chip}
     </Link>
   );

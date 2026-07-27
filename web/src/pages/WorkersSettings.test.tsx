@@ -547,9 +547,15 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
 // ── Worker → token binding (PRD #104 M3/M6) ─────────────────────────────────
 
 describe("WorkersSettings token binding (PRD #104)", () => {
+  // console-key is POOLED, and that is a correction rather than a detail. Two tests
+  // below assert that an auto worker reads as auto-selecting — and with an entirely
+  // un-pooled fixture that copy is now (correctly) suppressed by web-ux F18's guard,
+  // because such a worker resolves pool_empty on every claim and spends the default.
+  // The old fixture made those tests assert the misleading string; pooling one token
+  // restores what they were actually about, which is the auto MODE's rendering.
   const twoTokens = [
     aSecret(),
-    aSecret({ id: "sec-console", label: "console-key", is_default: false }),
+    aSecret({ id: "sec-console", label: "console-key", is_default: false, auto_eligible: true }),
   ];
 
   // The EFFECTIVE token is always stated. An unbound worker says "your default
@@ -704,5 +710,100 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     await screen.findByText("laptop");
     expect(screen.getByText(/spends your default token/i)).toBeTruthy();
     expect(screen.queryByText(/auto-selects/i)).toBeNull();
+  });
+});
+
+// --- web-ux F18: an auto worker over an EMPTY pool --------------------------------
+
+describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
+  // 🔴 THE FIXTURE HOLDS TOKENS. That is the whole point, and it is why the obvious
+  // fix is wrong: the neighbouring precedent in this component guards on
+  // `tokens.length === 0`, and copying that shape produces a guard that is SILENT in
+  // exactly the case that matters — a user holding several tokens with none opted in.
+  // A fixture with zero tokens would pass against either implementation.
+  const twoUnpooled = [
+    aSecret({ id: "sec-default", label: "default", is_default: true, auto_eligible: false }),
+    aSecret({ id: "sec-spare", label: "spare-key", is_default: false, auto_eligible: false }),
+  ];
+
+  it("says the pool is empty rather than claiming it auto-selects", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    renderPage();
+    // Every claim resolves pool_empty and spends the owner's default. Saying
+    // "auto-selects from your token pool" here is R7's silent no-op moved up one
+    // level, on the surface where the choice is actually made.
+    // Matched on ONE text node: `token pool` is a <Link>, so the sentence is split
+    // across elements and a regex spanning them finds nothing.
+    expect(await screen.findByText(/is empty — its runs spend your default token/i)).toBeTruthy();
+  });
+
+  it("says it auto-selects once ONE token is pooled", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    renderPage();
+    expect(await screen.findByText(/auto-selects from your/i)).toBeTruthy();
+    expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
+  });
+
+  // A non-auto worker must be untouched by any of this: the empty pool is irrelevant
+  // to a worker that was never going to consult it.
+  it("leaves a default-mode worker's summary alone", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    renderPage();
+    expect(await screen.findByText(/spends your default token/i)).toBeTruthy();
+    expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
+  });
+
+  // F18's other half. A correct row summary beside a cheerful announcement would
+  // leave the misleading half in the one place a screen-reader user actually hears
+  // it, and the visual and the announced would then disagree.
+  it("announces the empty pool when switching a worker to auto", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoUnpooled });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({ anthropic_bind_mode: "auto" }),
+    });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    // AUTO_OPTION is a NUL-prefixed sentinel, not a readable value — deliberately a
+    // string no user label can collide with.
+    fireEvent.change(picker, { target: { value: "\u0000auto" } });
+    await waitFor(() => {
+      expect(screen.getByText(/token pool is empty, so its runs spend your default token/i)).toBeTruthy();
+    });
+  });
+});
+
+
+// --- worker names reach the DOM sanitized -----------------------------------------
+
+describe("WorkersSettings sanitizes worker names (PRD #111 pre-PR)", () => {
+  // 🔴 WORKER NAMES HAVE LESS PROTECTION THAN TOKEN LABELS, NOT MORE. They are
+  // validated for LENGTH ONLY — TrimSpace plus a 200-byte cap — and `workers.name` is
+  // a bare `text NOT NULL` with no CHECK, so a bidi override or a zero-width character
+  // is storable in one.
+  //
+  // React escapes HTML, so there is no XSS here and that is not the claim. Escaping
+  // does nothing to an RLO, which reorders the text AROUND it and can make a worker
+  // render as one it is not — the F12 hazard closed for labels, left open for names.
+  //
+  // MUTATION THIS CATCHES: dropping sanitizeLabel from the name span. Measured.
+  it("strips invisible formatting characters from a worker name", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ name: "safe\u202Edrowssap" })],
+    });
+    const { container } = renderPage();
+    await screen.findByText(/safe/);
+    expect(container.textContent).not.toContain("\u202E");
+    expect(container.textContent).toContain("safe");
   });
 });

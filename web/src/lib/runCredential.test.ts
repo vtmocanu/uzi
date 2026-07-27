@@ -80,15 +80,30 @@ describe("the reason vocabulary is one vocabulary", () => {
 });
 
 describe("describeCredential", () => {
-  // fellBack is what the chip colours on, and it must be true for exactly the three
-  // fallbacks. Too wide and an ordinary default wears a warning; too narrow and the
-  // one state where the user's configuration and reality differ looks routine.
-  it("flags exactly the three auto fallbacks", () => {
-    const fell: string[] = [];
+  // The tone ordering, which web-ux F17 found inverted. Amber for exactly the three
+  // fallbacks (the selector skipped the pool), info for best_of_pool (it picked, and
+  // the pool is nearly exhausted), neutral for the rest. Too wide and an ordinary
+  // default wears a warning; too narrow and the one state where the user's
+  // configuration and reality differ looks routine.
+  it("assigns amber to exactly the three fallbacks and info to best_of_pool", () => {
+    const byTone: Record<string, string[]> = { neutral: [], info: [], warning: [] };
     for (const reason of SELECT_REASONS) {
-      if (describeCredential(run({ anthropic_select_reason: reason })).fellBack) fell.push(reason);
+      byTone[describeCredential(run({ anthropic_select_reason: reason })).tone].push(reason);
     }
-    expect(fell.sort()).toEqual(["open_failed", "pool_empty", "pool_stale"]);
+    expect(byTone.warning.sort()).toEqual(["open_failed", "pool_empty", "pool_stale"]);
+    expect(byTone.info).toEqual(["best_of_pool"]);
+    expect(byTone.neutral.sort()).toEqual(["auto", "default", "judge", "pinned"]);
+  });
+
+  // ONE rule, asserted as one: link iff the tone is not neutral. Two independent
+  // predicates would drift the first time a reason changed tone.
+  it("links exactly the non-neutral states", () => {
+    for (const reason of SELECT_REASONS) {
+      const got = describeCredential(run({ anthropic_select_reason: reason }));
+      expect(got.linked, `${reason} tone=${got.tone} linked=${got.linked}`).toBe(
+        got.tone !== "neutral",
+      );
+    }
   });
 
   it("appends the headroom only when the server measured one", () => {
@@ -116,7 +131,8 @@ describe("describeCredential", () => {
   it("passes an unrecognised reason through verbatim", () => {
     const got = describeCredential(run({ anthropic_select_reason: "some_future_reason" }));
     expect(got.mode).toBe("some_future_reason");
-    expect(got.fellBack).toBe(false);
+    expect(got.tone).toBe("neutral");
+    expect(got.linked).toBe(false);
   });
 
   // The id and the reason are independent fields; `deleted` must not depend on the

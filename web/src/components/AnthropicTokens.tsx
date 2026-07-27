@@ -327,8 +327,17 @@ function TokenRow({
                   up, the state rendered and the meaning withheld. It is visible copy
                   now, and the sr-only description mirrors D6_HINT's pattern from the
                   Delete button above. */}
+              {/* 🔴 `text-warn`, not `text-warning` — web-ux F22. `warning` is not a
+                  class in this project; the tailwind token is `warn`. The computed
+                  colour was rgb(228,232,240), the inherited body --fg, beside a chip at
+                  rgb(251,191,36): the amber pairing the F3 fix intended silently did not
+                  happen. A tailwind class that does not resolve fails COMPLETELY
+                  silently — nothing errors, the element just inherits — which is why it
+                  survived review, and why six other instances of the same typo exist
+                  elsewhere in this codebase. Those predate this PRD and are being
+                  raised separately rather than ridden in on a token-selection change. */}
               {skipped && (
-                <span className="text-xs text-warning">— auto-selection skips it</span>
+                <span className="text-xs text-warn">— auto-selection skips it</span>
               )}
               <span id={autoHintId} className="sr-only">
                 {decision.chip.hint}

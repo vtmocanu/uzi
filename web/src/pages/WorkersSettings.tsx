@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
+
+import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
@@ -39,6 +41,11 @@ export function WorkersSettings() {
   // The user's named tokens, for the per-worker picker (PRD #104 M3/M6). Read
   // alongside the workers so a rebind can offer labels without a second round trip.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
+  // How many of them are opted into the auto-selection pool (web-ux F18). An `auto`
+  // worker with ZERO pooled tokens resolves pool_empty on every claim and spends the
+  // owner's default, so the page must not say it auto-selects. Derived rather than
+  // fetched: auto_eligible already rides SecretMeta.
+  const pooledCount = tokens.filter((t) => t.auto_eligible).length;
   // Which worker's rebind is in flight, so only that row's picker disables.
   const [tokenBusy, setTokenBusy] = useState("");
   const [loading, setLoading] = useState(true);
@@ -108,9 +115,15 @@ export function WorkersSettings() {
         );
         setWorkers((prev) => prev.map((w) => (w.id === worker.id ? worker : w)));
         announce(
-          mode === "auto"
-            ? `${worker.name} now auto-selects from your token pool, from its next claim.`
-            : mode === "default"
+          // F18's other half. A correct row summary beside a cheerful "now
+          // auto-selects from your token pool" would leave the misleading half in the
+          // one place a screen-reader user actually HEARS it — and the visual and the
+          // announced would then disagree, which is worse than not fixing either.
+          mode === "auto" && pooledCount === 0
+            ? `${worker.name} is set to auto-select, but your token pool is empty, so its runs spend your default token.`
+            : mode === "auto"
+              ? `${worker.name} now auto-selects from your token pool, from its next claim.`
+              : mode === "default"
               ? `${worker.name} now spends your default token, from its next claim.`
               : `${worker.name} now spends ${choice}, from its next claim.`,
         );
@@ -120,9 +133,13 @@ export function WorkersSettings() {
         setTokenBusy("");
       }
     },
-    // announce is stable (a setState wrapper); listing it keeps the lint rule happy
-    // without re-creating rebind on every render.
-    [],
+    // announce is stable (a setState wrapper). pooledCount is NOT — it is derived from
+    // `tokens` on every render — and it MUST be in the deps: with `[]` the callback
+    // would capture the count from the render that created it, so a user who opted a
+    // token in and then switched a worker to auto would hear the empty-pool
+    // announcement anyway (web-ux F18). The cost is re-creating rebind when the token
+    // set changes, which is exactly when its behaviour changes.
+    [pooledCount],
   );
 
   useEffect(() => {
@@ -355,7 +372,14 @@ export function WorkersSettings() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <span className="font-medium text-fg">{w.name}</span>
+                    {/* sanitizeLabel on the NAME, for F12's reason applied to a field
+                        with LESS protection than a token label, not more: worker names
+                        are validated for LENGTH ONLY, so a bidi override or a
+                        zero-width character is storable in one. React escapes HTML, so
+                        there is no XSS here — but escaping does nothing to an RLO, which
+                        reorders the text around it and can make a worker render as one
+                        it is not. The CLI's two name cells got the same treatment. */}
+                    <span className="font-medium text-fg">{sanitizeLabel(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
                     </span>
@@ -387,7 +411,29 @@ export function WorkersSettings() {
                           auto worker does only when its pool is empty, not what it IS.
                           The server already resolves a pinned-but-idless worker to
                           `default` (D9), so no rule is re-derived here. */}
-                      {w.anthropic_bind_mode === "auto" ? (
+                      {w.anthropic_bind_mode === "auto" && pooledCount === 0 ? (
+                        // web-ux F18. An auto worker whose owner has pooled NOTHING
+                        // resolves pool_empty on every claim and spends the default —
+                        // and the page said "auto-selects from your token pool" with a
+                        // straight face. That is R7's silent no-op moved up one level:
+                        // M2 closed it on the TOKEN surface (a pooled token that can
+                        // never be picked shows why), and it stayed open on the WORKER
+                        // surface, which is where the choice is actually made.
+                        //
+                        // 🔴 THE CONDITION IS `pooled`, NOT `tokens.length`, and the
+                        // neighbouring precedent below is the trap: copying its
+                        // `tokens.length === 0` shape produces a guard that is silent
+                        // in exactly the case that matters — a user holding four tokens
+                        // with none opted in. auto_eligible rides SecretMeta already,
+                        // so this costs no fetch.
+                        <span className="text-warn">
+                          auto-selects, but your{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            token pool
+                          </Link>{" "}
+                          is empty — its runs spend your default token
+                        </span>
+                      ) : w.anthropic_bind_mode === "auto" ? (
                         <span>
                           auto-selects from your{" "}
                           <Link to="/settings" className="underline hover:text-fg">
