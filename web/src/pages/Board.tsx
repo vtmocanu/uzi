@@ -3,7 +3,7 @@
 // card — a failed move snaps back because nothing moved optimistically).
 // Column identity follows multica's status-color language
 // (packages/views/issues/components/status-icon.tsx / status-heading.tsx):
-// every column gets a stable accent dot, Open is neutral, Closed is muted and
+// every column gets a stable accent dot, Backlog is neutral, Closed is muted and
 // not a drop target. Cards are content-first (multica board-card.tsx): title,
 // meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
 // auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
@@ -52,9 +52,11 @@ function columnKeyForCard(card: CardData): string {
 }
 
 // columnLabel is the human name of the column a card sits in (for toasts).
+// "Backlog" is the DISPLAY name of the implicit column (PRD #102 M1); its key is
+// still OPEN_KEY ("") and move() still sends the wire string "open" — see move().
 function columnLabel(card: CardData): string {
   if (card.closed) return "Closed";
-  if (card.column === "") return "Open";
+  if (card.column === "") return "Backlog";
   return card.column;
 }
 
@@ -258,6 +260,9 @@ export function Board() {
     // column against the stale baseline and false-toast a move the user just made.
     suppressToastIids.current.add(iid);
     try {
+      // "open" is the WIRE name of the implicit column, matched server-side with
+      // EqualFold (handler/board.go). The M1 Open→Backlog rename is display-only:
+      // renaming this literal (or OPEN_KEY) breaks drag-to-Backlog.
       const to = toKey === OPEN_KEY ? "open" : toKey;
       const { card } = await api.moveIssue(repoId, iid, to);
       // Forge-first: the server applied the label change and returned the
@@ -298,7 +303,7 @@ export function Board() {
 
   const columns = useMemo(() => {
     const cols: { key: string; label: string; droppable: boolean; accent: string }[] = [
-      { key: OPEN_KEY, label: "Open", droppable: true, accent: "bg-faint" },
+      { key: OPEN_KEY, label: "Backlog", droppable: true, accent: "bg-faint" },
     ];
     (board?.columns ?? []).forEach((c, i) => {
       cols.push({

@@ -13,10 +13,12 @@ import { Alert, Badge, Button, Card } from "../components/ui";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
 
-// columnLabel names the column the issue sits in, for the header chip.
+// columnLabel names the column the issue sits in, for the header chip. "Backlog"
+// is the display name of the implicit column (PRD #102 M1) — the stored column is
+// still the empty string, and the board's move wire string is still "open".
 function columnLabel(issue: IssueDetail): string {
   if (issue.closed) return "Closed";
-  if (issue.column === "") return "Open";
+  if (issue.column === "") return "Backlog";
   return issue.column;
 }
 

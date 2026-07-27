@@ -1,11 +1,34 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { IssueCard } from "./Board";
-import type { Card } from "../lib/api";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { Board, IssueCard } from "./Board";
+import { api, type Board as BoardData, type Card } from "../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
-afterEach(cleanup);
+// The full Board mounts four endpoints and reads the configured label names off the
+// auth context; mock both so the drag test below stays offline.
+vi.mock("../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    api: {
+      getBoard: vi.fn(),
+      listWorkers: vi.fn(),
+      listSecrets: vi.fn(),
+      listRuns: vi.fn(),
+      moveIssue: vi.fn(),
+    },
+  };
+});
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+const mockApi = vi.mocked(api);
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 function aCard(over: Partial<Card> = {}): Card {
   return {
@@ -21,6 +44,7 @@ function aCard(over: Partial<Card> = {}): Card {
     closed: false,
     conflict: false,
     latest_run: null,
+    pipeline: null,
     ...over,
   } as Card;
 }
@@ -79,5 +103,91 @@ describe("IssueCard — the forge title carries no format characters (#124)", ()
     renderCard({ title: "Add a \u202Emetrics dashboard", iid: 7 });
     const link = screen.getByRole("link", { name: /metrics dashboard/ });
     expect(link.getAttribute("href")).toBe("/repos/repo-1/issues/7");
+  });
+});
+
+// PRD #102 Decision 14a. M1 renames the implicit column's DISPLAY string only. Two
+// strings must survive it: `OPEN_KEY` (the internal "") and the literal `"open"`
+// move() sends, which the server matches with EqualFold. A blind Open→Backlog replace
+// breaks drag-to-Backlog, and nothing else in the suite would have noticed — which is
+// why this mounts the whole Board rather than a card.
+describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)", () => {
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [{ label_name: "Planned" }, { label_name: "In Progress" }] as BoardData["columns"],
+    cards: [aCard({ iid: 7, column: "In Progress", labels: ["PRD", "In Progress", "bug"] })],
+    pipeline: null,
+    ...over,
+  });
+
+  const laneFor = (label: string) => {
+    // <lane><header><dot/><span>{label}</span><count/></header><cards/></lane>
+    const lane = screen.getByText(label).parentElement?.parentElement;
+    if (!lane) throw new Error(`no lane for ${label}`);
+    return lane;
+  };
+
+  const drop = (lane: HTMLElement, iid: number) =>
+    fireEvent.drop(lane, { dataTransfer: { getData: () => String(iid) } });
+
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: false,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 7, column: "" }) });
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  it("labels the implicit column Backlog and no lane reads Open", async () => {
+    const { container } = renderBoard();
+    await screen.findByText("Backlog");
+    expect(within(container).queryByText("Open")).toBeNull();
+  });
+
+  it('still sends the wire string "open" when a card is dropped on Backlog', async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    drop(laneFor("Backlog"), 7);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    // Not "Backlog", not "" — the server matches this literal with EqualFold.
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 7, "open");
+  });
+
+  it("sends a real column's label unchanged, so only the implicit key is translated", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    drop(laneFor("Planned"), 7);
+    await waitFor(() => expect(mockApi.moveIssue).toHaveBeenCalledTimes(1));
+    expect(mockApi.moveIssue).toHaveBeenCalledWith("repo-1", 7, "Planned");
   });
 });
