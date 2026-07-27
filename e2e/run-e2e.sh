@@ -5068,14 +5068,38 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null 2>&1 \
     || fail "could not recreate the agent with UZI_DIND_SOCKET set"
   # Wait for the recreated worker to boot, probe (with the readiness wait), and log its wiring.
+  #
+  # 🔴 CAPTURE THEN MATCH IN BASH, never `compose logs agent | grep -q`. Same SIGPIPE defect
+  # documented at the secret-hygiene corpus gate: under `set -euo pipefail`, `grep -q` exits
+  # on the match, the writer upstream dies of SIGPIPE, and pipefail promotes that to the
+  # pipeline's status — so a MATCH is reported as a failure once the stream passes the ~64 KB
+  # pipe buffer. The agent is the chattiest service here, so it crosses that quickly.
+  #
+  # The CONSEQUENCE differs from the leak scan's, which is why it is worth spelling out
+  # rather than cross-referencing. These are positive assertions (`… || fail`), so the bug
+  # makes them fail SPURIOUSLY: the `&& break` below never fires, the loop burns its full 45s,
+  # and the `|| fail` then reports a worker that had in fact wired itself correctly. A false
+  # RED, and an intermittent one. The leak scan's `… && fail` failed the opposite way, silently
+  # passing. Same mechanism, opposite outcome — do not assume one implies the other.
+  #
+  # ⚠️ THIS PATH IS NOT EXERCISED BY ANY RUN IN THIS BRANCH. It is inside the
+  # `--profile agent-docker` block (PRD #83 M2), which is opt-in and off by default, so the
+  # green e2e that accompanies this change never entered it. Verified by `bash -n`, by the
+  # mechanism being identical to the one measured at the corpus gate, and by checking the
+  # patterns below match the same literals the greps did — not by execution.
   det_end=$((SECONDS + 45))
+  DIND_AGENT_LOGS=""
   while [ $SECONDS -lt $det_end ]; do
-    "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' && break
+    DIND_AGENT_LOGS="$("${COMPOSE[@]}" logs agent 2>&1)"
+    [[ "$DIND_AGENT_LOGS" == *'"docker_wired":true'* ]] && break
     sleep 1
   done
-  "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' \
+  # Quoted substrings are matched LITERALLY inside a `[[ == ]]` pattern, so the `[` and `]` of
+  # capabilities:["docker"] are ordinary characters here and need none of the ERE escaping the
+  # `grep -qE` form required.
+  [[ "$DIND_AGENT_LOGS" == *'"docker_wired":true'* ]] \
     || fail "the worker did not self-detect the sidecar (no docker_wired:true) via UZI_DIND_SOCKET"
-  "${COMPOSE[@]}" logs agent 2>&1 | grep -qE '"capabilities":\["docker"\]' \
+  [[ "$DIND_AGENT_LOGS" == *'"capabilities":["docker"]'* ]] \
     || fail 'the worker did not report capabilities:["docker"] at register'
   pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
