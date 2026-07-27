@@ -187,6 +187,8 @@ Invalid values for any of the above fall back to their defaults (the same lenien
 
 **A parked run's disk cost.** A run that parks at `limit_wait` deliberately keeps its git clone/worktree, its skills plugin dir, and its per-run SDK home on the worker's disk instead of cleaning up, so a resume can pick up the same session rather than starting fresh. One run's SDK home alone has been measured holding 167.3 MB of Go module cache (see `UZI_HOME_RECLAIM` below). So size worker disk for roughly `RUN_LIMIT_MAX_WAITS` concurrently parked runs times (one clone + one plugin dir + up to ~170 MB of run HOME) — the caps above bound *how many* parks and *how long*, not how much each one holds on disk.
 
+**The two caps are asymmetric on purpose, and there is no env spelling that removes the park ceiling.** `RUN_LIMIT_MAX_WAITS=0` is honored and means "never park" — a legitimate policy choice an operator may zero away. `RUN_LIMIT_MAX_PARK=0` is not honored: it silently falls back to `192h` (see its own row), because it is a security bound rather than a policy knob, and a bound with an off switch is not a bound.
+
 `config.Load` also parses `WORKER_HEARTBEAT_INTERVAL` and `WORKER_POLL_INTERVAL` into the server's `Config` struct, but nothing on the API side reads those two fields back out (the sweeper acts on `WORKER_HEARTBEAT_STALE`, not on them) — they are not server knobs despite being parsed here. The values that actually matter are the **worker's own copy** of the same-named variables, consumed by the `agent` binary and wired to the `agent` compose service; see the Worker container table below.
 
 ### Worker container (`agent`)
