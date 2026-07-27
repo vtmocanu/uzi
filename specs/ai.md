@@ -13474,16 +13474,49 @@ park a run for years, and cannot spend more than its own owner's retry budget.
   precedent). They count different failures — worker deaths versus limit parks — and a shared
   counter lets one exhaust the other's budget.
 
-**🔴 THE SHIPPED UNKNOWN-RESET FALLBACK IS A FLAT 15 MINUTES, AND IT IS A KNOWN REGRESSION UNDER AN
-OPEN FIX — DO NOT COPY IT INTO A REBUILD.** When nothing says when the window reopens — the worker
-reported no usable reset, the gauge has none, no pooled alternative contributes — the code currently
-takes `now + 15m`. Decision 4 prescribes `15m × 2^(limit_wait_count−1)` capped at 4h, **the
-architect has ruled the flat constant a regression rather than an alternative, and the PRD's form
-stands.** This paragraph deliberately records the code as it is, because that is what the system
-does today; **it becomes a plain statement of the exponential form once the fix actually lands, and
-not before.** The case is **ordinary, not defensive**, which is why it is worth the argument at all:
-the classifier's primary signal names the cause outright and carries no timestamp of its own, so a
-limit death with no reset is a normal outcome rather than a malformed report.
+**When nothing says when the window reopens, the wait is an EXPONENTIAL schedule doubling from a
+15-minute base and capped at 4h** — the worker reported no usable reset, the gauge has none, and no
+pooled alternative contributes. Base and cap are **constants, not env knobs**: this is the answer to
+"we know nothing", and an operator with something to say about their limits has the two caps above
+to say it with.
+
+```
+priorParks:  0     1     2    3    4    5+
+wait:       15m   30m   1h   2h   4h   4h (capped)
+```
+
+Across the default 5-park budget that is **~7h45m** of parking before the run fails honestly. **The
+4h cap does not bind at the default budget** — the fifth park is exactly 4h — so it constrains
+nothing today and exists for an operator who *raises* the budget.
+
+**🔴 THE PRD's LITERAL FORMULA SHIPS A BUG, AND A SPEC RECORDING ONLY THE FORMULA WOULD REPRODUCE
+IT.** Decision 4 writes `15m × 2^(limit_wait_count−1)`, which assumes a **1-based attempt number**.
+But the count is incremented **in the same statement as the transition**, so the computation reads
+the value *before* the park — **0 on the first one** (the budget guard reads `>= MaxWaits` for the
+same reason). Applied literally to that 0-based field the formula yields `2^(−1)`, i.e. a
+**7.5-minute first park**. The implementation is therefore a **shift by the prior count**, and the
+invariant to check any future change against is the one both readings agree on: **the first park
+waits 15 minutes.**
+
+**🔴 THE SHIFT IS BOUNDED, AND THE GUARD IS NOT DECORATION.** A duration here is an int64 of
+**nanoseconds**, so an unguarded `15m << 64` is **negative** — a `retry_not_before` in the past,
+which is exactly the immediate-repromotion loop this whole computation exists to prevent. The bound
+is operator-reachable through the retry budget, i.e. by the same operator the 4h cap exists for, so
+it is a real path and not a theoretical one. A test asserts the result stays positive at an absurd
+prior count.
+
+**This branch is not a corner case, and that is the strongest argument for getting it right.** Two
+independent reasons it is ordinary: the classifier's **primary** signal names the cause outright and
+carries **no timestamp of its own**, so a limit death with no reset is a normal outcome rather than
+a malformed report; and on any deployment with the usage poller disabled nothing refreshes the
+gauge's sync timestamp, so every candidate classifies stale, `Measured` is false, and **the worker
+report, the gauge cross-check and the pool leg all go silent together** — the fallback becomes that
+deployment's *usual* path rather than its exception. uzi's own e2e overlay sets exactly that, so the
+end-to-end suite exercises this branch **by construction**.
+
+*(Recorded history, because this was got wrong once and the wrong version was endorsed before anyone
+checked it against the PRD: a flat 15m constant shipped first and was ruled a regression, not an
+alternative. The paragraph below is why.)*
 
 **The reasoning generalises past this knob and is the reason to prefer a schedule over a constant
 anywhere a retry clock is guessed: an exponential schedule's error is recoverable in one direction
@@ -13841,18 +13874,29 @@ on this exact plan, and is recorded server-side. What is skipped is asking a hum
 same plan a second time because the worker lost a token window; the alternative is not more
 oversight, it is an unattended run parked at a gate.
 
-**⚠ ONE RESIDUAL ON THE PRE-APPROVED PATH, on the OLDER-SERVER fallback only, and an earlier
-statement of it was wrong.** The persisted agent selection rides the claim next to `plan_approved`,
-because both come from the same human verdict and propagating one without the other honours half a
-decision. When it is absent, the resume falls back to the documented default. The cost is **not**
-merely dropped exclusions: the larger effect is the **source** — a human who chose their own
-templates gets the repo roster after a park whenever the clone has agents, and those are the cloned
-repo's own agent files, a **different set**, not the same set differently filtered. The skill-scoping
-regime changes with the source too. The **security** claim does survive and was checked rather than
-assumed: repo agents carry their denied-tool set canonicalized against aliases, the executor
-re-enforces it, and the agent-guard hook's allow-set is rebuilt from the resolved selection. So this
-is a roster and scoping difference, **not a guardrail bypass** — but "not a bypass" must not be read
-as "no difference".
+**🔴 THE PERSISTED AGENT SELECTION RIDES THE CLAIM BESIDE `plan_approved`, AND BOTH HALVES MUST BE
+CONSUMED — HONOURING ONE WITHOUT THE OTHER HONOURS HALF A HUMAN DECISION.** They come from the same
+verdict, and Decision 6b's whole premise is that the gate may be skipped **because** the human
+approved; dropping the exclusions that were part of that same approval contradicts the premise the
+skip rests on. The worker takes the selection **unconditionally**, not gated on `plan_approved` — it
+is the run's selection whether or not this particular resume skips the gate, and the executor reads
+it only on the path that has no verdict of its own to supply one.
+
+**That contract was briefly HALF-LANDED, which is the shape worth recording: the server put the
+selection on the wire and the worker still resolved "absent", so the data was present and nothing
+read it.** A human who excluded a subagent at the gate got it back after a park, and no signal
+anywhere said so. A wire field is not a delivered decision until a consumer reads it.
+
+**⚠ THE REMAINING RESIDUAL IS NOW GENUINELY A FALLBACK — an OLDER SERVER that sends no selection —
+rather than the live path, and an earlier statement of the cost was wrong.** When the selection is
+absent the resume falls back to the documented default, and the cost is **not** merely dropped
+exclusions: the larger effect is the **source** — a human who chose their own templates gets the
+repo roster whenever the clone has agents, and those are the cloned repo's own agent files, a
+**different set**, not the same set differently filtered. The skill-scoping regime changes with the
+source too. The **security** claim does survive and was checked rather than assumed: repo agents
+carry their denied-tool set canonicalized against aliases, the executor re-enforces it, and the
+agent-guard hook's allow-set is rebuilt from the resolved selection. So this is a roster and scoping
+difference, **not a guardrail bypass** — but "not a bypass" must not be read as "no difference".
 
 **Affinity actually favours the prior worker, contrary to the first draft.** Promotion resets the
 row's update timestamp, so the claim path's affinity grace window **restarts** at promotion. Honest
@@ -14024,18 +14068,16 @@ not on the DTO, and a denominator in a separately-released binary would be a sec
 Steer-queue labels gain a **suffix**, never a replacement: a park changes nothing about whether a
 follow-up was handed to the worker, only whether anything is currently acting on it.
 
-**🔴 WHAT THIS INCREMENT DOES NOT DELIVER, at the time of writing — the feature is DORMANT until the
-opt-in path lands.** The columns exist and the machinery is wired, but nothing writes the opt-in
-flag: it is `false` on every row, so every limit still fails the run (with the better reason). A
-rebuild must not read the sections above as describing a working feature end to end.
+**🔴 WHAT THIS INCREMENT DOES NOT DELIVER.** *(This list previously opened "the feature is DORMANT
+until the opt-in path lands", which was true when written and stopped being true hours later. The
+opt-in path and the Slack surface have both landed; a stale "not delivered" list is worse than none,
+because it is read as a work queue.)*
 
-- **The opt-in server half is unbuilt**: no per-user setting endpoint, no per-run toggle endpoint,
-  and none of the four creation paths stamps the flag. The web Settings and run-view controls call
-  endpoints that do not yet exist.
-- **The Slack surface is unbuilt** — the notifier's status label and thread render have no case for
-  the parked status, so a park would edit the thread root to the raw status string and post nothing.
 - **The end-to-end scenario is unbuilt** (opt-in park ⇒ promotion ⇒ resume skips the gate ⇒
-  completes; opt-out fails with the explanatory reason; cancel-while-parked).
+  completes; opt-out fails with the explanatory reason; cancel-while-parked). This is the one gap
+  that matters most against the fallback schedule above: the e2e overlay disables the usage poller,
+  which is precisely the configuration under which the exponential fallback becomes the *usual*
+  path, so the suite would exercise that branch by construction — and does not yet.
 - **The migration number is a draft.** It must be renumbered above the live head on the landing
   rebase; the boot runner is strict, so landing below an already-applied head makes every upgraded
   instance refuse to boot.
