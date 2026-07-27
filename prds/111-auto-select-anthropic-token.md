@@ -314,8 +314,33 @@ already-applied head makes every upgraded instance refuse to boot.
   and `anthropic_headroom_pct` on `runs`. M5 as drafted had nowhere to persist
   "why it fell back", and M1 is already altering `runs`; folding them in costs
   one migration instead of a fourth and leaves M5 render-only.
-- **D20 — The run view names the MODE, not just the token.** `<label> — auto,
-  62% headroom` vs `<label> — default` vs `<label> — pinned`. The label alone
+- **D20 — The run view names the MODE, not just the token. All EIGHT reason
+  values get a rendering.** ~~`<label> — auto, 62% headroom` vs `<label> —
+  default` vs `<label> — pinned`.~~ **Those three were the whole vocabulary when
+  this was drafted; `00089` closed it at eight, and naming three of eight is an
+  under-specification of M5 rather than a stale doc — an implementer following the
+  original literally ships three renderings and silently drops five.** Corrected
+  2026-07-27, mid-M5, from a fact-check.
+
+  | reason | rendering | why it is not "just a fallback" |
+  |---|---|---|
+  | `default` | `<label> — default` | |
+  | `pinned` | `<label> — pinned` | |
+  | `judge` | `<label> — judge binding` | **a MODE, not a fallback.** The user's judge setting chose it; no worker binding is involved, so "pinned" would send them hunting for one that does not exist |
+  | `auto` | `<label> — auto, N% headroom` | |
+  | `best_of_pool` | `<label> — auto, N% headroom (best of pool)` | still an auto pick — every pooled token was below `MIN_HEADROOM` (D10) |
+  | `pool_empty` | `<label> — default (no tokens in the pool)` | fix: opt a token in |
+  | `pool_stale` | `<label> — default (no fresh readings in the pool)` | fix: the poller cannot read them (D11/R7) |
+  | `open_failed` | `<label> — default (the auto pick could not be opened)` | **the D14 case** — must not look ordinary |
+
+  **`judge` exists BECAUSE of this decision**, which is what makes the omission
+  circular rather than merely incomplete: `00086`'s comment records that the judge
+  lane borrowed `pinned` while the vocabulary held two values and M4 gave it its
+  own *because D20 makes the run view name the mode*. The decision created the
+  value and then had no slot for it.
+
+  The four fallback reasons are **different problems with different fixes**, which
+  is the argument for naming them rather than collapsing to "fallback". The label alone
   cannot answer the user's actual question, because an auto pick and a default
   fallback can name the same token; PRD #104's compat path also creates a row
   labelled literally `default`, so the label is not even a reliable hint. (The
@@ -342,6 +367,16 @@ already-applied head makes every upgraded instance refuse to boot.
   which is the one outcome D7 exists to forbid. So: on `auto` mode **and**
   `errCredentialUnavailable`, retry once against what the worker would have used
   without auto (the owner default, per D9), and record `reason=open_failed`.
+  **Precisely: the gate is "only a credential the SELECTOR ITSELF NAMED", not "on
+  auto mode".** Corrected 2026-07-27 — the implementation gates on `autoPicked()`,
+  which additionally requires the reason to be `auto` or `best_of_pool`, and that
+  is **narrower than this decision's original wording and right**. An auto worker
+  whose pool was empty or entirely stale carries `pool_empty`/`pool_stale` with a
+  **nil** id; under the original text it would retry, and that retry would re-open
+  the owner's default — *the identical credential that just failed*. The code
+  avoids a guaranteed-useless second attempt the decision prescribed. Stated here
+  because M7 copies this into `specs/ai.md`, and "retries on auto mode" is the
+  sentence a future implementer would restore the broken behaviour from.
   Explicitly **not** for `errVaultLocked` — that path already requeues the run
   (its `errVaultLocked` arm requeues), which is transient and correct; retrying it would convert a
   wait into a spend on the wrong account.
