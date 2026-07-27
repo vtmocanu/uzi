@@ -8,8 +8,10 @@
 //
 // Failure semantics are copied from cc-statusline (D5): a malformed response never
 // overwrites the last good row; a definitive HTTP refusal with no usable fallback
-// arms a fixed 15-minute per-user backoff (in-process, no knob) so a refusing
-// credential is not hammered every interval; a transport error just waits for the
+// arms a fixed 15-minute PER-TOKEN backoff (in-process, no knob, keyed by
+// user_secret_id since PRD #104 M5 — this said "per-user" until PRD #111 and had
+// been wrong since the gauge was repointed at tokens) so a refusing credential is
+// not hammered every interval; a transport error just waits for the
 // next tick. A vault-locked (dek-sealed) owner is skipped and their last reading
 // kept (D3); a master-sealed token opens regardless of lock state — both handled
 // by secretopen's dispatch, so this engine needs no separate vault gate.

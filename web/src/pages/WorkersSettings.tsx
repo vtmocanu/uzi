@@ -18,6 +18,17 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
 const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
+// The picker's <option> values encode the MODE, not just a label, because since
+// PRD #111 M3 there are three kinds of choice and only one of them names a token.
+// AUTO_OPTION is a sentinel rather than a label, and deliberately a string no label
+// can collide with: labels are user-authored, so a bare "auto" would be ambiguous
+// the moment someone names a token `auto`.
+//
+// Module scope, not inside the component: declared in the render path it was
+// re-created on every render, and a value used as an <option> identity has no
+// business being a new string each time.
+const AUTO_OPTION = "\u0000auto";
+
 const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
 
 export function WorkersSettings() {
@@ -84,13 +95,6 @@ export function WorkersSettings() {
   // picker returns to "default token". The change lands on the worker's NEXT
   // claim — no restart — which the announcement says, because a user who expects
   // to restart something will otherwise go looking for the control to do it.
-  // The picker's <option> values encode the MODE, not just a label, because since
-  // PRD #111 M3 there are three kinds of choice and only one of them names a token.
-  // AUTO_OPTION is a sentinel rather than a label, and it is deliberately a string
-  // no label can collide with: labels are user-authored, so a bare "auto" would be
-  // ambiguous the moment someone names a token `auto`.
-  const AUTO_OPTION = "\u0000auto";
-
   const rebind = useCallback(
     async (workerId: string, choice: string) => {
       setError("");
