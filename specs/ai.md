@@ -11784,6 +11784,12 @@ Since PRD #104 a user can hold several named Anthropic credentials. Two gaps rem
 was static and manual while the per-token rate-limit gauge (#53/#104 M5) went unconsumed, and a run
 recorded what it *cost* but never which credential *paid*.
 
+⚠️ **PROVENANCE: D1, D2 and D3 below are USER-STATED, settled with the user before drafting, and so
+is the originating ask they serve.** They are recorded here because `specs/human.md` has no Feature
+#111 section yet — an edit to that file needs user approval and one is pending. Until it lands, this
+section is the only record of three items that belong in the contract, and a reader must not take
+them for AI choices. Everything from the ranking paragraph down, and all of §398-§404, is AI design.
+
 - **D1 — a per-worker THIRD bind mode**, not a per-user global toggle. A worker is `default`,
   `pinned:<token>` or `auto`, so a user can auto-balance most workers while keeping the
   retrospective one pinned. It composes with `workers.anthropic_secret_id` (00078) rather than
@@ -11998,3 +12004,124 @@ A related shape, from the same branch: **an e2e phase owes a teardown even when 
 down the stack.** A phase left one extra credential behind and broke a different phase 350 lines
 later, which asserts "exactly two anthropic tokens" and found three. The teardown carries a positive
 check of its own, because a bare restore is not an assertion.
+
+## 403. PRD #111 — the per-run attribution record, and the seam that makes the RECORDED id the id that was OPENED
+
+Serves the originating ask's third clause, "show me which token each run actually used". §397-§402
+cover how a token is *chosen*; nothing there says how the choice is *recorded*, and the recording is
+half the feature — a run that names the wrong account is worse than one that names none.
+
+**Four columns on `runs`, and the label is a SNAPSHOT rather than a join.** The credential id, a
+label snapshot, the select reason (§400's eight values) and the headroom the selector measured. The
+id carries a composite FK to `user_secrets (user_id, id)`, so the **database** rejects a run
+recording another user's credential rather than a Go check one refactor away from being bypassed.
+The label is copied because the id does not survive: the FK nulls it on delete and a rename rewrites
+`user_secrets.label` in place, so a join would make a run's history read "unknown" the moment a user
+tidies up their tokens and would silently re-label historical runs on a rename. Both are kept on
+purpose — the snapshot answers "which account was this?" forever, the id keeps it JOINable to
+`run_usage` (per-token cost) while the token exists.
+
+🔴 **`ON DELETE SET NULL` needs a COLUMN LIST on a composite FK.** A bare `SET NULL` nulls every
+referencing column, which here includes `runs.user_id` — `NOT NULL` since the runs table was born.
+Deleting a token that any run had recorded would then fail the constraint and the DELETE would error
+out, silently until the first user with run history tidied up. `SET NULL (anthropic_secret_id)`
+(Postgres 15+) nulls only the record. Two earlier migrations hit the same trap.
+
+**D8 — the recorded id is provably the OPENED id, and that cost a deliberate race.** Resolution used
+to hand the nil (default) case to a single ciphertext query that resolved "this user's default"
+*inside* the SQL and returned only plaintext, so no id ever escaped and a run could not name what it
+spent. The default is now resolved to `(id, label)` first and **every** open goes by id. The
+resolution is equivalent, not merely similar: the two predicates are character-identical and match at
+most one row under the one-default partial unique index. What changes is a window — between resolving
+and opening, the user could set a different default, and the run now opens what it resolved. That is
+the entire point, and the safer ordering; **do not "fix" it.** The narrow accepted cost is that a
+token DELETED inside that window now fails the claim where the single-statement form would have
+opened the new default. Both metadata lookups are owner-scoped **in their own predicate**, because
+they run *before* the open: an unscoped by-id lookup would put another user's label in hand at
+exactly the point it gets recorded, on a claim that then fails on the open.
+
+**D4/D5 — auto is a RUN-LANE placement decision, and the other two lanes keep their explicit
+bindings.** A `self_improve` run resolves the owner's judge binding; the judge lane forks to its own
+assemble path earlier; chat is always the owner default and is not bindable at all. Auto-spreading
+the judge lane would defeat the whole purpose of binding review spend separately. Extending auto
+there later is clean and deliberately not done here.
+
+**D9 — `pinned` with a NULL id resolves as `default`, and no CHECK can say so.** The obvious
+constraint ("pinned implies a non-NULL id") would make a *legal* token delete fail, because the
+binding FK is `ON DELETE SET NULL` and deliberately leaves the mode alone. So the rule lives in
+resolution, where it already lived for an unset binding before the mode column existed. The id is
+read in exactly one of the three modes, so a stale id left by a mode change cannot leak into a claim,
+and **the API reports the EFFECTIVE mode** so no client re-derives the rule and no UI shows a pin to
+a token that no longer exists.
+
+**A candidate-query ERROR fails the claim; it does not degrade to the owner default.** "The database
+was unreachable for a moment" and "you have no pooled tokens" are different facts, and quietly
+treating the first as the second spends an account the user did not choose while raising nothing. A
+failed claim is retried; a silent mis-spend is not, because nobody learns it happened. This is the
+one place auto may refuse, and it is not a counterexample to D7: nothing was selected.
+
+**D15 — do NOT build a per-token openability probe.** The drafted eligibility gate asked whether a
+candidate can be opened. It is vacuous where it was specified: vault unlock is a per-**user** check
+already made upstream by the claim, so by the time the selector runs the owner's vault is unlocked by
+construction. There is no per-token signal short of attempting the decrypt, and attempting it for
+every candidate would decrypt secrets we are not going to spend. The residual — one individually
+undecryptable token — is caught at open time by D14 (§399), which is the right place for it.
+
+## 404. PRD #111 — one classifier for two callers, one policy from four knobs, and the two auth-surface decisions the pool forced
+
+**D21 — the eligibility gate has exactly one implementation, and the status is computed
+SERVER-SIDE.** The settings page renders each token's live eligibility and the ranker gates
+candidates on the same predicate. Written twice they drift, and the drift is invisible in the worst
+way: the page confidently tells a user a token is eligible while the selector silently skips it, with
+nothing going red. So `Classify` is the whole gate, the status ships as a string, and web and CLI
+render it verbatim — **a `100 - pct` or a `synced_at` comparison in the client is a bug by
+construction, not a style preference.** The residual is that two different SQL queries feed it (the
+per-user settings list, the ranking query), pinned by a live-DB **differential** asserting the two
+produce identical candidates *except* the in-flight count, which only the ranking query populates.
+That exception is itself a contract: `Classify` must ignore in-flight, or the differential would be
+comparing two things that are allowed to differ.
+
+**D6 — four operator knobs, assembled by a METHOD so there can only be one policy.** `MIN_HEADROOM`
+(15 points), `HEADROOM_TIE_PCT` (5), `INFLIGHT_PENALTY` (3 points per in-flight run) and
+`MAX_STALENESS` (3× the poll interval, D17 — so the selector and the shipped meter agree). Server env
+rather than per-user settings: one policy keeps the ranking testable and the UI simple, and per-user
+tuning is a future refinement, not a gap. Three details that a re-derivation lands elsewhere on:
+**0 is meaningful for all three integers** (no floor / exact-tie-only / no bias), so they must parse
+as non-negative rather than treating 0 as "unset" and substituting the default; a floor **above 100**
+is unsatisfiable and is clamped loudly, because otherwise every token classifies below-threshold and
+auto looks broken rather than mis-set; and a tie window above 100 is degenerate but coherent, so it
+is deliberately *not* clamped. Two literals mapping four fields each is D21's failure in a new
+costume — internally consistent on both sides, silently disagreeing.
+
+**D13 — the pool toggle is its own narrow route, not a field on the existing token PATCH.**
+`PATCH /me/secrets/anthropic_token/{id}/auto-eligible` under `RequireUser`: the one Bearer-reachable
+write in the secrets tree (§355). The obvious delivery — add the flag to the existing PATCH so the
+CLI can reach it — would have required moving that route out of the cookie-only group, making
+**rename, rotate and set-default Bearer-reachable as collateral damage**. The narrow route is the
+same class as the worker rebind: it mints nothing, reveals nothing, and only re-points spend among
+tokens the caller already holds.
+
+**D23 — `GET /me/rate-limits` moved cookie-only → `RequireUser`, on NON-ADDITIVITY, not on a
+sensitivity ranking.** It had to move because D13 gives the CLI a pool toggle while the endpoint
+reporting live eligibility stayed unreachable from it — so a scripted opt-in got no signal that the
+token can never be picked, reintroducing exactly the silent no-op the status vocabulary exists to
+kill. 🔴 **The argument that was REJECTED and must not be reinstated**: "rate-limit percentages are
+less sensitive than the labels and ids already exposed beside them" ranks *identifiers* against
+*behavioral telemetry* and concludes from the ranking. That is the "it's only metadata" move, and it
+would equally justify putting per-run cost on a shared board; the percentages are more sensitive **in
+kind** and less sensitive only in resolution. Two legs hold instead: (1) every inference this enables
+is already available at *finer* granularity through routes that are already `RequireUser` — per-run
+usage rides a run DTO carrying its own timestamps, which is a timestamped consumption series strictly
+finer than a 0-100 aggregate refreshed once a poll interval, and run creation is already
+`RequireUser`, so a stolen CLI token can already **spend** the victim's quota; (2) it is a GET of the
+caller's own row — no outbound call, no poke (so no amplification vector against Anthropic), it mints
+nothing, and it never reads admin-ness, so there is no escalation branch.
+
+**Carry the caveat, not just the conclusion: non-additivity is a property of the CURRENT route table,
+not of this endpoint.** If per-run usage or run creation ever return to cookie-only, this endpoint
+becomes the widest remaining activity channel and the decision must be revisited.
+
+**Implementation constraint: split the route group, never change the group's middleware.** The
+autopilot and judge PUTs share it and must stay cookie-only. The route-mount test pins the
+**limiter**, not the auth middleware, so it cannot catch a mistake here — the guard has to assert
+both that a Bearer request reaches the GET *and* that those two PUTs still 401.
