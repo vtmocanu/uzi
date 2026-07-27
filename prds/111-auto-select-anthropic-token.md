@@ -87,7 +87,7 @@ window is whichever is fuller, and 7-day is the hard cap.
 2. it has a gauge row with **non-NULL** `five_hour_pct` *and* `seven_day_pct` — both are schema-nullable (`00080`), and a reading that measured neither tells us nothing, so treat it as ineligible (D12);
 3. that row is fresh — `synced_at` within `UZI_AUTOSELECT_MAX_STALENESS` (default 2× the poll interval; a longer lag means steering on numbers Anthropic has since moved past). A token in the poller's 15-min refusal backoff (`usagepoller/engine.go`) goes stale here and drops out — see D11;
 4. `headroom(t) ≥ UZI_AUTOSELECT_MIN_HEADROOM` (default 15) — a single formulation, since `headroom` already binds on the fuller window;
-5. the token is openable now (owner's vault not locked — reuse `secretopen`'s dispatch, same as the poller).
+5. ~~the token is openable now (owner's vault not locked — reuse `secretopen`'s dispatch, same as the poller).~~ **Dropped — see D15.** The vault check is per-**user** and already happens upstream at `service.go:666`, so this gate is vacuous where it was specified; the per-token residual is caught at open time by D14 instead. Do not build a per-token openability probe.
 
 **Fallback, in order (D10).** If the eligible set is empty *only because every
 opted-in token is fresh and openable but below `MIN_HEADROOM`*, pick the
@@ -95,8 +95,15 @@ opted-in token is fresh and openable but below `MIN_HEADROOM`*, pick the
 consumed" still has a best answer and it beats ignoring the pool for the owner
 default, which may itself be the most-throttled token. Only if the pool is
 empty, entirely stale, or entirely unopenable does resolution fall to the
-**owner default** (an `auto` worker holds no active pin — D9). **Auto-selection
-never blocks or fails a run.**
+**owner default** (an `auto` worker holds no active pin — D9).
+
+~~**Auto-selection never blocks or fails a run.**~~ **That sentence was false as
+written and D14 is what makes it true** — measured 2026-07-27, before
+implementation: `recoverClaimAssembly` (`workersvc/service.go:728`) maps
+`errCredentialUnavailable` to `MarkRunFailedByID`, a **terminal** run failure. A
+selector that picks a token whose ciphertext will not decrypt therefore kills a
+run that the owner default would have completed. The guarantee holds only with
+D14's retry.
 
 **Selection among the eligible.** This is where D3's "within-threshold" lives,
 and it must **not** be written as a pairwise comparator. `if |a−b| < T then
@@ -137,11 +144,11 @@ spreading.
 
 | # | Milestone | Primary files | Depends on |
 |---|---|---|---|
-| **M1** | **Record the token per run.** `runs.anthropic_secret_id` (nullable, `ON DELETE SET NULL`) **+ `anthropic_secret_label`** snapshot. Recorded at the **assemble** points where the concrete id is known — the run lane resolves the default id *explicitly* (D8) so the recorded id equals the opened one, and the judge (`assembleJudgeClaim`) and chat lanes record theirs the same way. Expose in the run DTO; render in run view + CLI; join to `run_usage` for per-token cost. | `store/migrations/`, `workersvc/service.go` + `judge.go` + `chat.go`, `handler/runs.go`, `web/src` run view, `cmd/uzi/run.go` | — |
-| **M2** | **Opt-in pool.** `user_secrets.auto_eligible BOOLEAN NOT NULL DEFAULT false`; a per-token toggle on **Settings → Anthropic tokens** that also renders each opted-in token's **live auto-eligibility** (fresh / stale / refused / below-threshold — D11), so a token that can never be picked is visible, not a silent no-op; CLI `token` support; add the flag to `TokenRateLimitDTO`. | `store/migrations/`, `handler/secrets.go`, `web/src/pages/Settings.tsx`, `cmd/uzi/token.go`, `apitypes/ratelimit.go` | — |
+| **M1** | **Record the token per run.** `runs.anthropic_secret_id` (nullable, `ON DELETE SET NULL`) **+ `anthropic_secret_label`** snapshot, **plus M5's `anthropic_select_reason` + `anthropic_headroom_pct` in the same migration** (D19). Recorded at the **assemble** points where the concrete id is known — the run lane resolves the default id *explicitly* (D8) so the recorded id equals the opened one, and the judge (`assembleJudgeClaim`) and chat lanes record theirs the same way. Expose in the run DTO; render in run view + CLI; join to `run_usage` for per-token cost. | `store/migrations/`, `workersvc/service.go` + `judge.go` + `chat.go`, **`handler/workers.go`** (`runToDTO` lives there, NOT in `handler/runs.go`), `web/src` run view, `cmd/uzi/run.go`, `apitypes/wire_test.go` golden | — |
+| **M2** | **Opt-in pool.** `user_secrets.auto_eligible BOOLEAN NOT NULL DEFAULT false`; a per-token toggle on **Settings → Anthropic tokens** that also renders each opted-in token's **live auto-eligibility** (fresh / stale / **never polled** / below-threshold — D11 as amended by D16), so a token that can never be picked is visible, not a silent no-op; CLI support via a **new narrow route** (D13, *not* the existing PATCH); add the flag to `TokenRateLimitDTO`. **Ships `autoselect.Classify`** — the eligibility classifier is shared with M4's ranker and must not be implemented twice (D21), so the package is born here even though the PRD orders it under M4. | `store/migrations/`, new `api/internal/autoselect/`, `handler/secrets.go` + `handler/handler.go` (route), `web/src/pages/Settings.tsx`, `cmd/uzi/token.go`, `apitypes/ratelimit.go` | — |
 | **M3** | **Worker `auto` mode.** `workers.anthropic_bind_mode` enum `{default,pinned,auto}`, backfilled `pinned` where `anthropic_secret_id IS NOT NULL` else `default`; the worker picker on **Settings → Workers** gains an **auto** choice; CLI parity. | `store/migrations/`, `workersvc/service.go`, `web/src/pages/WorkersSettings.tsx`, `cmd/uzi/` | M2 |
 | **M4** | **The selector.** New `autoselect` package implementing the gate + `H*` anchor + within-`T` tie + soonest-reset + in-flight bias + fallback; wired into `claimSecretID` so `auto` mode calls it and every other mode is unchanged. | new `api/internal/autoselect/`, `workersvc/service.go`, `store/queries/` | M1, M2, M3 |
-| **M5** | **Observability.** Run view / DTO / CLI show the chosen token as "`<label>` — auto, N% headroom" and, on fallback, why (stale gauge / pool exhausted / vault locked). The admin per-user, per-token meter (PRD #104 M5) already exists; link the two. | `handler/runs.go`, `web/src`, `cmd/uzi/`, `workersvc/` | M1, M4 |
+| **M5** | **Observability.** Run view / DTO / CLI show the chosen token **and the mode that chose it** — `<label> — auto, N% headroom` vs `<label> — default` vs `<label> — pinned` (D20) — and, on fallback, why. Its columns land in M1's migration (D19), so M5 is render-only. The admin per-user, per-token meter (PRD #104 M5) already exists; link the two. | **`handler/workers.go`** (`runToDTO`), `web/src`, `cmd/uzi/`, `workersvc/` | M1, M4 |
 | **M6** | **Tests.** Store live-DB coverage for the new columns/queries; `autoselect` unit tests (gate, `H*` clustering, tie→expiry, the A/B/C=80/75/70 intransitivity guard, NULL pct/reset handling, in-flight bias, every fallback branch); an e2e phase asserting `auto` picks the emptiest seeded token **and** falls back to default when the poller is disabled; a **k8s validation** pass on dev-cluster (hosted workers share the `workers` table + claim path, and per CLAUDE.md k8s is the primary runtime). | `*_integration_test.go`, `autoselect/*_test.go`, `e2e/`, k8s | M1–M5 |
 | **M7** | **Docs + specs.** `docs/anthropic-token.md` gains the auto mode + the pool flag; `docs/cli.md` the new subcommands; `specs/ai.md` records D1–D3 and the ranking; ARCHITECTURE.md if the run-token record warrants a line. | `docs/`, `specs/ai.md`, `ARCHITECTURE.md` | M1–M6 |
 
@@ -225,6 +232,89 @@ already-applied head makes every upgraded instance refuse to boot.
   polls looks active while never being chosen. M2 therefore renders each token's
   live eligibility (fresh / stale / refused / below-threshold), and M6 checks
   whether OAuth setup-tokens can ever produce a fresh gauge at all (see R7).
+- **D19 — M5's two columns land in M1's migration.** `anthropic_select_reason`
+  and `anthropic_headroom_pct` on `runs`. M5 as drafted had nowhere to persist
+  "why it fell back", and M1 is already altering `runs`; folding them in costs
+  one migration instead of a fourth and leaves M5 render-only.
+- **D20 — The run view names the MODE, not just the token.** `<label> — auto,
+  62% headroom` vs `<label> — default` vs `<label> — pinned`. The label alone
+  cannot answer the user's actual question, because an auto pick and a default
+  fallback can name the same token; PRD #104's compat path also creates a row
+  labelled literally `default`, so the label is not even a reliable hint. (The
+  related worry that a default token might have *no* label is unfounded:
+  `user_secrets.label` has been `NOT NULL CHECK (char_length BETWEEN 1 AND 64)`
+  since `00077`.)
+- **D21 — One eligibility classifier, not two.** M2 renders each token's live
+  eligibility and M4 gates candidates on the same predicate. Two implementations
+  of one rule drift, and the drift is invisible: the Settings page would promise a
+  token is eligible while the selector skips it. So `autoselect.Classify` is
+  written once in M2, consumed by both, and the status string is computed
+  **server-side** — web and CLI render what the API says rather than re-deriving
+  it. The residual is that two different SQL queries feed it (M2's per-user list,
+  M4's ranking query), which is pinned by a live-DB differential test asserting
+  the two produce identical `Candidate` values **except** `InFlight`, which only
+  M4's query populates.
+- **D14 — On `auto`, an `errCredentialUnavailable` open retries once on the
+  non-auto binding.** Added 2026-07-27 from the architect's design pass; the lead
+  re-derived it. Without this, D7's "never fails a run" is simply untrue: a token
+  that passes the gauge gate but whose ciphertext will not decrypt (or which was
+  deleted between the ranking query and the open) reaches
+  `recoverClaimAssembly`, which fails the run terminally. Auto would then kill
+  runs that static binding completes — a regression introduced by the optimizer,
+  which is the one outcome D7 exists to forbid. So: on `auto` mode **and**
+  `errCredentialUnavailable`, retry once against what the worker would have used
+  without auto (the owner default, per D9), and record `reason=open_failed`.
+  Explicitly **not** for `errVaultLocked` — that path already requeues the run
+  (`service.go:730`), which is transient and correct; retrying it would convert a
+  wait into a spend on the wrong account.
+- **D15 — Eligibility drops "openable now" as a per-token gate; it is already
+  enforced per-user, upstream.** The PRD's gate #5 asks whether the token can be
+  opened. Measured: `Claim` returns idle when the owner's vault is locked
+  (`service.go:666`, an in-memory per-**user** check) and `ClaimRun` is scoped to
+  `wkr.UserID`, so by the time the selector runs, the owner's vault is unlocked
+  by construction. There is no per-token openability signal short of attempting
+  the decrypt, and attempting it for every candidate would decrypt secrets we are
+  not going to spend. The residual risk — one specific token being individually
+  undecryptable — is exactly what D14 catches at open time, which is the right
+  place for it. **Do not build a per-token openability probe.**
+- **D16 — The live per-token eligibility states are `fresh` / `stale` /
+  `never polled` / `below threshold`. `refused` is not one of them.** D11 promised
+  a `refused` state; nothing can serve it today. The poller's 15-minute refusal
+  backoff is an unexported in-process map (`usagepoller/engine.go`) with no
+  accessor, and `anthropic_rate_limits` has no column recording a failed poll
+  (measured: `user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
+  seven_day_pct, seven_day_resets_at, source, synced_at`). Rather than widen the
+  poller for state that dies on restart, or add a column, we split what the
+  LEFT JOIN already distinguishes: a token that **has never produced a reading**
+  renders `never polled`, one whose reading has aged out renders `stale`.
+  This keeps D11's actual safety property — a token that can never be picked is
+  visible rather than silently idle — and it serves R7's case better than
+  `refused` would have, since a credential the usage endpoint permanently refuses
+  never produces a row at all and now says so. What is lost is the *diagnosis* of
+  a token that polled before and is currently backing off; it reads `stale`.
+- **D17 — `MAX_STALENESS` defaults to 3× the poll interval so the selector and
+  the meter agree, and the meter is not touched.** The PRD drafted 2×;
+  `rateLimitStale` (`handler/ratelimits.go:150`) already ships 3× and its D3
+  documents that. Two definitions means the meter can call a token fresh while
+  the selector calls it stale, which is precisely the invisible no-op D11 exists
+  to prevent. Defaulting the new knob to 3× makes them agree **without changing
+  any existing behavior**. Residual, stated honestly: they agree by matching
+  defaults, not by sharing one definition, so an operator who overrides
+  `UZI_AUTOSELECT_MAX_STALENESS` re-opens the divergence. Unifying them means
+  changing what the shipped meter says, which is a user-visible change to
+  existing functionality and out of scope for this PRD.
+- **D18 — The in-flight bias counts every lane and every reason, and
+  `awaiting_approval` counts.** Three sub-decisions, together because they share
+  one rationale: the count models **concurrent spend against a credential**, and
+  nothing about how a run acquired that credential changes the quota it consumes.
+  So (a) it counts chat and judge runs too, which M1 makes possible for the first
+  time — this **supersedes R3's** stated limit, and M7 must correct R3 rather
+  than copy it; (b) it does not filter on the selection reason, since excluding
+  fallback-chosen runs would blind the bias to exactly the pile-up a fallback
+  creates; (c) `awaiting_approval` counts, because the worker holds the session
+  and resumes on the same token. (c) is the arguable one — an awaiting-approval
+  run is idle spend at that instant — and it is a deliberate conservative choice,
+  not an oversight.
 - **D13 — The `auto_eligible` toggle ships as its own narrow route, not on the
   existing token PATCH.** Added 2026-07-27, during implementation, from an
   auditor pre-flag; the lead re-derived it against the tree before settling it.
@@ -259,11 +349,15 @@ already-applied head makes every upgraded instance refuse to boot.
   M6 asserts it as a first-class case, not an accident.
 - **R3 — Staleness / herd.** Mitigated by the freshness gate (R2's mechanism)
   plus the in-flight bias. Neither is perfect against a burst; both are honest,
-  and the bias is only possible because M1 lands first. The bias also counts
+  and the bias is only possible because M1 lands first. ~~The bias also counts
   **run-lane** runs only — chat always spends the owner default (`chat.go:177`)
   and the judge lane its own binding, so a default token that is also a pool
   member carries concurrent spend the bias cannot see. An acknowledged limit,
-  not corrected here.
+  not corrected here.~~ **That limit was corrected — see D18.** It was a
+  consequence of having no per-run token record, and M1 removes exactly that:
+  once every lane records the token it used, counting chat and judge runs is
+  strictly more accurate than excluding them, so the bias counts all lanes. The
+  residual limit is now only the poll-interval lag itself.
 - **R4 — Resolution must stay in one place.** PRD #104's R4 warns that three
   copies of credential resolution drift and a wrong fallback spends the wrong
   account silently. M4 adds the selector *behind* `claimSecretID`, not beside it;
