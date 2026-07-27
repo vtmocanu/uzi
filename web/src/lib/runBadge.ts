@@ -190,8 +190,9 @@ export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | nul
  *   WorkerRunBadge.tsx <- workerRunBadge()  workerRuns.ts   not reached by this fix
  *   CIFixRunHeader.tsx <- fixVerdictChip()  fixVerdict.ts   not reached by this fix
  *
- * The three others need nothing TODAY, checked rather than assumed: their titles are a closed
- * verdict enum plus a count, a template over two numbers, and four literals. But they are
+ * The three others need nothing TODAY, checked rather than assumed: `judgeBadge` is a closed
+ * verdict lookup plus a count; `workerRunBadge` has TWO arms, a template over two numbers and
+ * the literal "Holds an active run"; `fixVerdictChip` is four literals. But they are
  * where the next untrusted interpolation would land without a strip, and composing here
  * cannot reach them — so this placement prevents drift between the two constructors it owns,
  * NOT across all five. (An earlier version of this comment claimed the opposite; the drift it

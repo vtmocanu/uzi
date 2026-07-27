@@ -122,8 +122,14 @@ export function HealthFlag({ run }: { run: Run }) {
       {stuck}
       {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
           attribute (runBadge's descriptor) and missed it here, where it renders as body
-          text — the mirror of 4a739bff, which fixed text and missed the attribute. Same
-          field, opposite channel, one commit apart. */}
+          text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
+          attribute for 4a739bff. Same field, opposite channel, one commit apart.
+          (This sentence named 4a739bff until D1: that is the commit which fixed the
+          ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
+          mirror. Second time those two were transposed — see the note in
+          WorkerUpgradeBadge.test.tsx — because they are one apart, both about
+          upgrade_detail, and differ only in channel, which is the distinction being
+          taught.) */}
       {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
     </span>
   );
