@@ -531,11 +531,36 @@ func flappingContainer(p *corev1.Pod, now time.Time) *corev1.ContainerStatus {
 			// future StartedAt gives a negative duration, and negative < flapWindow is
 			// TRUE, so a container reads as flapping on the strength of a clock
 			// disagreement. Measured: StartedAt at now+4h with 5 restarts reports stuck.
-			// The realistic bound is small — NTP skew shifts the window by the skew
-			// rather than pinning anything red, and it needs 3 lifetime restarts first —
-			// but the guard costs one comparison and it points the same way as the
-			// nil-Running skip above: a duration we cannot trust is not evidence of a
-			// restart loop.
+			//
+			// WHY THE GUARD IS WORTH IT — and it is NOT "the bound is small", which is
+			// what this comment used to say. One controller clock serves the WHOLE
+			// FLEET, so the pre-fix direction is a fleet-wide CORRELATED FALSE ALERT:
+			// every worker carrying 3+ lifetime restarts reddens at once because one
+			// clock slipped. That is the cry-wolf shape PRD #113 exists to prevent, and
+			// it is the same objection that ruled out the api-side heartbeat design.
+			// The post-fix direction is a per-container MISSED alert on a worker that
+			// was already broken and already unalerted — a degradation to pre-#145
+			// behaviour. Against #113's anti-cry-wolf priority the trade is not close.
+			//
+			// AND THE SKEW BOUND IS NOT ONLY BENIGN, which the old wording implied by
+			// saying skew "shifts the window rather than pinning anything red". Shifting
+			// a window also shifts things OUT of it. Measured, controller behind the
+			// kubelet by δ against a 40s flapper: δ=0 → up 40s, stuck; δ=30s → up 10s,
+			// stuck; δ=60s → up −20s, SETTLED; δ=5m → up −4m20s, SETTLED. The exclusion
+			// goes PERMANENT once δ exceeds the container's PER-INSTANCE uptime — 60s
+			// against a 40s flapper, not some huge number — because a flapper's instance
+			// uptime never grows, so past that point every tick is negative forever.
+			// Still the accepted direction (a missed alert), but it is a real hole and
+			// not merely a shifted threshold.
+			//
+			// It points the same way as the nil-Running skip above — a duration we
+			// cannot trust is not evidence of a restart loop — but note the two are NOT
+			// symmetric in consequence, only in mechanism. The nil skip has NO
+			// false-negative cost: a container with no current instance genuinely cannot
+			// be flapping, so nothing is missed. This one does, exactly as measured
+			// above. Read "points the same way" as a statement about the reasoning, not
+			// about the cost; taken literally it makes the nil skip look over-cautious
+			// or this one look free, and both readings are wrong.
 			up := now.Sub(cs.State.Running.StartedAt.Time)
 			if up >= 0 && up < flapWindow {
 				return cs

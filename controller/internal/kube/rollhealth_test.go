@@ -847,11 +847,25 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 // rule scans all containers, this loop reads that status on every tick of every pod in
 // the fleet.
 //
-// THE MUTATION THIS TEST EXISTS TO CATCH IS DELETING THE NIL CHECK, not changing the
-// count. With the check gone, an absent Running state reads as a zero StartedAt; the
-// obvious "hardening" of that (`if t.IsZero() { t = now }`) makes it "up 0 seconds",
-// which SATISFIES the recency conjunct — so the container flags forever, with no uptime
-// that could ever clear it because it will never run again.
+// TWO DIFFERENT EDITS BREAK THE GUARD, AND THEY FAIL DIFFERENTLY. An earlier version of
+// this header named the small one and then described the large one's symptom, which is
+// the mistake this whole branch exists to police, so read them apart:
+//
+//   - DELETING the nil check alone: `cs.State.Running.StartedAt` then dereferences a nil
+//     pointer and the package PANICS. Measured — zero assertions run. The guard is still
+//     pinned (the package fails), but loudly and by a crash, NOT by this test's
+//     assertion, and NOT by "an absent Running state reads as a zero time". Go does not
+//     do that.
+//   - RESTRUCTURING to tolerate nil and then defaulting the time — read StartedAt
+//     conditionally, then `if t.IsZero() { t = now }`, which looks like ordinary
+//     hardening — makes an absent instance "up 0 seconds", which SATISFIES the recency
+//     conjunct. That is the SILENT failure: the container flags forever, with no uptime
+//     that could ever clear it because it will never run again. THIS is the edit whose
+//     symptom this test asserts, and it is the one that would otherwise ship green.
+//
+// So the nil check is not load-bearing on its own — the shape of the code around it is.
+// A future reader who "simplifies" in two steps gets the panic on step one and the
+// silent flag on step two.
 //
 // RestartCount is 5 ON PURPOSE. With 0 the container fails the restart conjunct anyway
 // and the case passes identically whether or not the nil check exists — a fixture where
