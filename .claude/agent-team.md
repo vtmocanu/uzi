@@ -886,6 +886,66 @@ an assert-it-applied check, a positive control on every run, folds chosen to loo
 fixtures with distinct values per row, and a deferred-instruction backstop that fails the build
 for the instruction nobody has written yet.
 
+### A MUTATION RESULT IS MEANINGLESS FOUR DIFFERENT WAYS, and only one of them is the edit
+
+*Measured on PRD #111 (2026-07-27), all four on one branch, by three different agents including
+the ones whose job is to catch this.*
+
+`CLAUDE.md` already says to assert a mutation actually applied. That rule covers one of four
+failure modes, and the other three are invisible to it:
+
+1. **The edit did not apply.** A replacement string that does not match the file is a no-op. Hit
+   twice by the reviewer — once because `00089` puts five enum values on one line while the
+   pattern assumed one per line. Both times the run came back green and was scored SURVIVED.
+2. **The system did not observe it.** The coder's harness *did* diff the file, and one mutation
+   was still a no-op: the harness reused one Postgres container, `store.Migrate` is goose, and
+   the mutated migration was never re-applied — *"no migrations to run, current version 89"*.
+   **The file changed and the system under test did not.** For anything behind a version-keyed
+   cache (a migration runner, a package installer), "the file differs" is not "the mutation is
+   live".
+3. **The suite did not run.** The same harness never exported `UZI_TEST_DATABASE_URL`, so every
+   `*LiveDB` test skipped, `go test` exited 0, and that scored as survival — the positive-control
+   failure `CLAUDE.md` documents, occurring **inside the tool built to run the controls**. It
+   produced two false survivors, one of which was a perfectly good assertion nearly "fixed".
+4. **The build failed.** After (3) was fixed, mutations that change sqlc's inferred nullability
+   were found to have scored **RED** purely because a build failure also exits non-zero — a build
+   error wearing a failing mutation's clothes.
+
+**The asymmetry is the operational point.** A *reddening* mutation proves itself: the tree must
+have changed for the test to fail. A *surviving* one proves nothing until you have ruled out all
+four. So the verification effort is needed exactly where the result feels least surprising.
+A harness that reads only an exit code is measuring the wrong thing four different ways; require
+a `--- PASS`/`--- FAIL` line for the named test before believing any result.
+
+### A SOURCE-TEXT CONTROL IS SATISFIED BY DISABLED CODE — and the class is disabled code, not comments
+
+*Measured on PRD #111 (2026-07-27). Two instances, plus a third that looks identical and is
+correct, which is the half that makes this worth writing down.*
+
+A guard asserting a string is **present** in a file's raw text passes when the code it names is
+commented out, moved below a section marker, or otherwise present-but-inert:
+
+- `RunView.test.tsx` asserted `runViewSource` contains `<RunCredential run={run} />`. Deleting
+  the JSX reddened; wrapping it in `{/* … */}` left **42 passed, exit 0** while the chip never
+  rendered. `toContain` over raw file text does not know what a comment is.
+- `TestWorkerBindModeBackfillLiveDB` coupled to its migration by
+  `strings.Contains(migration, backfill)`. Deleting the statement reddened; **commenting it out
+  did not**, and nor would moving it below `-- +goose Down`. Either ships a migration whose
+  backfill never runs. Commenting out is the likelier mutation — it is what someone does when
+  "temporarily" disabling something.
+
+**Stripping comments closes one member, not the class.** After a three-regex comment strip landed,
+`{false && <RunCredential … />}` still passed — disabled code that is not a comment at all. The
+honest ceiling of any source-text presence guard is *"the text is present"*, never *"it runs"*;
+closing the rest needs a render or an execution, and where that is unavailable the residual should
+be **named as known** rather than left implied.
+
+**The inverse is correct and must not be "fixed".** `rateLimits.test.ts` asserts an **absence**
+over comment-stripped source (`not.toMatch(/100\s*-/)`). Commented-out code genuinely is not a
+second implementation of the gate, so ignoring it is right. **Presence and absence assertions have
+opposite relationships to comments** — a lead grouped all three as one class and would have sent
+someone to "fix" the one that was already correct.
+
 ## Standing rules — each exists because something went wrong once
 
 *Also migrated from the PRD #98 checkpoint. Each keeps its incident: a rule without its
