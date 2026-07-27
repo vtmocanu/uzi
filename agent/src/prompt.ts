@@ -218,33 +218,36 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 
 // ─── The clone's base commit (judge rec, run 51757591) ───────────────────────
 // The lead handed a subagent `git diff main...HEAD` as "the branch diff" and got a
-// multi-megabyte diff across ~100 unrelated commits; the subagent had to work the real
-// parent out for itself, and the lead then saved a cross-run MEMORY about it — the tell
-// that uzi should be stating the fact rather than each run rediscovering it.
+// multi-megabyte diff across ~100 unrelated commits. The worker has always known the real
+// answer; it just dropped it.
 //
-// The worker has always known the answer: git.ts resolves the base in the bare and checks
-// the branch out at it. But it is TWO facts on a resume, not one, and conflating them is
-// how a note meant to fix this would go wrong on exactly the runs that carry prior work:
+// THE DISTINCTION THAT SETTLES THIS IS REF NAME vs OID, not two-dot vs three-dot. Three
+// agents (this one included) asserted a two-vs-three-dot rule and each was wrong in some
+// reachable topology. What is actually true:
 //
-//   fresh branch  base == the default branch's tip
-//                 `git diff <base>..HEAD` IS the branch diff. One command, no ambiguity.
+//   * Against the fresh OID, three-dot IS the correct branch diff and two-dot is broken.
+//   * Against the clone's `main` REF, BOTH forms are wrong — because that ref is a FROZEN
+//     mirror. `ensureClone` refreshes the worker bare with
+//     `+refs/heads/*:refs/remotes/origin/*`, which updates the remote-tracking refs and
+//     never `refs/heads/*`, so the bare's own `refs/heads/main` is pinned at the moment the
+//     worker FIRST cloned the repo — and the runner clone inherits that as its local `main`.
 //
-//   resume        base == the branch's OWN previously-pushed tip (git.ts:312), so
-//                 `git diff <base>..HEAD` shows only what THIS run added, and the whole
-//                 branch is `git diff <default>...HEAD` — THREE dots, because the fork
-//                 point is behind both and merge-base is what finds it.
+// Measured on a bare whose origin gained 4 commits after the first clone:
 //
-// Measured on a purpose-built resume-shaped clone (prior pushed work on the branch, 5
-// newer commits on the default branch):
+//   bare refs/heads/main        7fc459f   <- frozen at first clone
+//   bare refs/remotes/o/main    0ccac2e   <- fresh; this is what git.ts resolves
+//   git diff <base>..HEAD       1 file    <- this run's work
+//   git diff main..HEAD         5 files   <- + 4 upstream commits this run never touched
+//   git diff main...HEAD        5 files   <- IDENTICAL. three dots does not save you here
 //
-//   git diff <base>..HEAD       -> this run's work alone                   (1 file)
-//   git diff <default>...HEAD   -> + the PRIOR run's commits               (2 files)
-//   git diff <default>..HEAD    -> + every default-branch commit as a DELETION (7 files)
+// And the direction is not predictable: the clone's `main` can sit EQUAL to the base (fresh
+// bare), BEHIND it (drifted bare, above), or AHEAD of it (a resume whose branch forked
+// before the mirror was taken). So the note must PREDICT NO SYMPTOM — an earlier version
+// said "reports every commit it gained as a deletion", which is wrong in the very topology
+// measured above, where they are additions.
 //
-// So the honest statement is NOT "three-dot is wrong" — three-dot against the default
-// branch is the correct BRANCH diff, and the brief that prompted this change had that
-// backwards. What is wrong is the TWO-dot form, always, and what is ambiguous is which of
-// the two diffs you meant. The note below names both and lets the lead pick.
+// The rule the note encodes: PRESCRIBE OIDs, NAME BRANCHES ONLY TO FORBID THEM, PREDICT
+// NOTHING.
 
 /** Bound + shape for a base commit before it is spoken in a prompt. The values are uzi's
  *  own `rev-parse` output, not repo text, so this is hygiene rather than containment — but
@@ -252,11 +255,11 @@ function priorWorkNote(prior: PriorWork | undefined): string {
  *  that it cannot carry a newline or markup. A hex object name cannot; anything else is
  *  dropped rather than rendered.
  *
- *  Worth being explicit about WHY there is nothing else to guard: only `baseSha` and the
- *  default tip are threaded here, never `baseRef`. On a fresh branch that ref is the
- *  UNTRUSTED repo's own default-branch NAME (git.ts:312), and naming it in a prompt would
- *  put repo-controlled text outside every fence — the exact residual promptSafeDir's
- *  comment says the charset clamp does not close. An OID cannot carry that. */
+ *  Worth being explicit about WHY there is nothing else to guard: only OIDs are threaded
+ *  here, never `baseRef`. On a fresh branch that ref is the UNTRUSTED repo's own
+ *  default-branch NAME (git.ts:312), and naming it in a prompt would put repo-controlled
+ *  text outside every fence — the exact residual promptSafeDir's comment says the charset
+ *  clamp does not close. An OID cannot carry that. */
 const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
 
 /**
@@ -264,26 +267,28 @@ const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
  * commands are therefore right. Plain and outside every untrusted fence: like priorWorkNote,
  * it is uzi's own statement of fact about the clone, not repo- or user-supplied text.
  *
- * Absent/malformed base ⇒ nothing is injected. Saying nothing leaves the lead exactly where
- * it is today; naming a commit that is not the parent would be worse than silence — which is
- * also why a resume with an UNRESOLVABLE default branch falls back to the narrower claim
- * ("what this run added") rather than asserting a branch diff it cannot name the base for.
+ * Absent/malformed base ⇒ nothing is injected. Saying nothing leaves the lead where it is
+ * today; naming a commit that is not the parent would be worse than silence — which is also
+ * why a resume with an UNRESOLVABLE default branch falls back to the narrower claim rather
+ * than asserting a branch diff it cannot name a base for.
  */
 export function baseCommitNote(baseCommit: string | undefined, defaultBranchCommit?: string): string {
   if (!baseCommit || !BASE_COMMIT_RE.test(baseCommit)) return "";
   const dflt = defaultBranchCommit && BASE_COMMIT_RE.test(defaultBranchCommit) ? defaultBranchCommit : undefined;
+  // Forbids the NAME without predicting what it would show, because that is genuinely
+  // unpredictable: this clone's `main` may sit equal to, behind, or ahead of your base.
   const shared = [
-    `Pass the explicit commit to any subagent you ask to review a diff. Do NOT write the`,
-    `diff against the default branch by name with two dots (\`main..HEAD\`): this clone's`,
-    `default branch was fetched fresh, so that form reports every commit it gained as a`,
-    `deletion.`,
+    `Use those commit ids literally. Do NOT write a diff against the default branch by`,
+    `NAME — not \`main..HEAD\`, not \`main...HEAD\` — and do not assume this clone's \`main\``,
+    `is current: it is a frozen mirror from when this repo was first cloned, so it may sit`,
+    `at, behind, or ahead of your base, and neither form tells you what this branch changed.`,
+    `Pass the explicit commit id to any subagent you ask to review a diff.`,
   ];
-  // Fresh: the seed IS the default tip, so there is exactly one diff and one command.
   if (!dflt || dflt === baseCommit) {
     return [
-      `Your branch was created at commit ${baseCommit}, the default branch's tip at clone`,
-      `time. To see exactly what this branch changed, use \`git diff ${baseCommit}..HEAD\``,
-      `(and \`git log ${baseCommit}..HEAD\`).`,
+      `Your branch was created at commit ${baseCommit}, which was the default branch's tip`,
+      `when this clone was made. To see exactly what this branch changed, use`,
+      `\`git diff ${baseCommit}..HEAD\` (and \`git log ${baseCommit}..HEAD\`).`,
       ...shared,
     ].join("\n");
   }
@@ -296,7 +301,7 @@ export function baseCommitNote(baseCommit: string | undefined, defaultBranchComm
     `different commands:`,
     `  - what THIS run has added:  \`git diff ${baseCommit}..HEAD\``,
     `  - the whole branch, including work earlier runs pushed:`,
-    `      \`git diff ${dflt}...HEAD\`  (THREE dots — the fork point is behind both)`,
+    `      \`git diff ${dflt}...HEAD\`  (THREE dots, against that commit id)`,
     ...shared,
   ].join("\n");
 }

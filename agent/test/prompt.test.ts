@@ -487,6 +487,9 @@ describe("plan prompts — prior-work note (issue #105)", () => {
 describe("plan/implement prompts — base-commit note (judge rec, run 51757591)", () => {
   const SHA = "0123456789abcdef0123456789abcdef01234567";
   const DFLT = "fedcba9876543210fedcba9876543210fedcba98";
+  /** A PRESCRIBED three-dot diff, i.e. one written against an object id. Distinct from the
+   *  forbidden `main...HEAD` the note names in order to rule it out. */
+  const THREE_DOT_CMD = /git diff [0-9a-f]{7,64}\.\.\.HEAD/;
   const base = { issueIid: 1, issueTitle: "t", issueDescription: "d", branch: "agent/issue-1", subagentNames: [] };
 
   it("injects nothing when the base commit is absent", () => {
@@ -501,8 +504,11 @@ describe("plan/implement prompts — base-commit note (judge rec, run 51757591)"
     const note = baseCommitNote(SHA, SHA);
     assert.ok(note.includes(`git diff ${SHA}..HEAD`), "must name the exact diff command, not a placeholder");
     assert.ok(note.includes(`git log ${SHA}..HEAD`));
-    assert.match(note, /the default branch's tip at clone/);
-    assert.ok(!note.includes("...HEAD"), "no three-dot form is needed when the base IS the default tip");
+    assert.match(note, /the default branch's tip\s+when this clone was made/);
+    // Checked against an OID specifically: the forbid-clause below mentions the literal
+    // `main...HEAD`, so a bare "...HEAD" substring test can no longer tell a PRESCRIBED
+    // three-dot command from a FORBIDDEN one.
+    assert.ok(!THREE_DOT_CMD.test(note), "no three-dot command is needed when the base IS the default tip");
   });
 
   it("RESUME: names BOTH diffs, and the branch diff with THREE dots", () => {
@@ -511,7 +517,7 @@ describe("plan/implement prompts — base-commit note (judge rec, run 51757591)"
     // calling that "the branch diff" is false on precisely the runs carrying prior work.
     const note = baseCommitNote(SHA, DFLT);
     assert.ok(note.includes(`git diff ${SHA}..HEAD`), "this run's work is still addressable");
-    assert.ok(note.includes(`git diff ${DFLT}...HEAD`), "the WHOLE branch is three-dot off the default tip");
+    assert.ok(note.includes(`git diff ${DFLT}...HEAD`), "the WHOLE branch is three-dot off the default OID");
     assert.match(note, /THIS run has added/);
     assert.match(note, /whole branch, including work earlier runs pushed/);
     assert.match(note, /THREE dots/);
@@ -523,16 +529,25 @@ describe("plan/implement prompts — base-commit note (judge rec, run 51757591)"
     // FRESH wording on a resume — that would assert "this is the branch diff" wrongly.
     const note = baseCommitNote(SHA, undefined);
     assert.ok(note.includes(`git diff ${SHA}..HEAD`));
-    assert.ok(!note.includes("...HEAD"), "nothing may be claimed about a fork point we could not name");
+    assert.ok(!THREE_DOT_CMD.test(note), "nothing may be claimed about a fork point we could not name");
   });
 
-  it("names the two-dot default-branch form as wrong, in every shape", () => {
+  it("forbids the default branch BY NAME in both forms, and predicts no symptom", () => {
+    // The distinction is ref NAME vs OID, not two-dot vs three-dot. The clone's `main` is a
+    // frozen mirror (the bare's refs/heads/* is never refreshed — ensureClone fetches
+    // +refs/heads/*:refs/remotes/origin/*), so it can sit at, behind, or AHEAD of the base.
+    // Measured on a drifted bare: `main..HEAD` and `main...HEAD` returned an IDENTICAL
+    // 5-file diff, 4 of them upstream commits the run never touched.
     for (const note of [baseCommitNote(SHA, SHA), baseCommitNote(SHA, DFLT)]) {
-      assert.ok(note.includes("main..HEAD"), "the two-dot form is the one that inverts the default branch");
-      // The note hard-wraps, so the assertion has to tolerate the break rather than
-      // pinning one line's worth of it.
-      assert.match(note, /reports every commit it gained as a\s+deletion/);
-      assert.match(note, /pass the explicit commit to any subagent/i);
+      assert.ok(note.includes("main..HEAD"), "the two-dot form must be forbidden by name");
+      assert.ok(note.includes("main...HEAD"), "…and so must three-dot: against the NAME, both are wrong");
+      assert.match(note, /frozen mirror/);
+      assert.match(note, /at, behind, or ahead/);
+      assert.match(note, /pass the explicit commit id to any subagent/i);
+      // PREDICT NOTHING. An earlier cut promised "reports every commit it gained as a
+      // deletion", which is false in the very topology above (they are additions there).
+      // A note that predicts a symptom teaches the lead to trust the wrong diagnostic.
+      assert.ok(!/deletion/i.test(note), "the note must not predict what the wrong form would show");
     }
   });
 
@@ -547,7 +562,7 @@ describe("plan/implement prompts — base-commit note (judge rec, run 51757591)"
     // A malformed DEFAULT tip degrades to the fresh wording rather than rendering garbage.
     const note = baseCommitNote(SHA, "refs/heads/main");
     assert.ok(!note.includes("refs/heads/main"));
-    assert.ok(!note.includes("...HEAD"));
+    assert.ok(!THREE_DOT_CMD.test(note));
   });
 
   it("rides all three planning turns, carrying both commits", () => {
