@@ -84,6 +84,36 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124 / item 7. The run title IS the forge issue title, writable by anyone who can
+// open an issue on the target repo. It was stripped on /judge and rendered raw on the pages
+// people actually live on, which is worse than uniformly unprotected: it makes the one
+// surface look authoritative while the others lie.
+//
+// The await anchors on the STATUS pill, not on the title — awaiting the cleaned title would
+// make a mutation red at a findByText timeout instead of at the assertion, which is the
+// blind-instrument trap this batch already hit twice.
+describe("RunsList — the run title carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of the forge-supplied title", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "r", issue_title: "Fix the \u202Eparser\u200B bug", status: "running" })],
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("running")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+  });
+});
+
 describe("RunsList — waiting for vault unlock (PRD #32)", () => {
   it("renders own queued runs as waiting for vault unlock while locked", async () => {
     vi.mocked(useAuth).mockReturnValue({

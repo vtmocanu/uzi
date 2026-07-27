@@ -229,10 +229,7 @@ export function RunView() {
               <span>/</span>
               <span className="text-muted">Run</span>
             </nav>
-            <div className="flex flex-wrap items-center gap-x-2">
-              <h1 className="truncate text-xl font-semibold tracking-tight">{run.issue_title}</h1>
-              {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
-            </div>
+            <RunHeading run={run} />
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
@@ -745,6 +742,26 @@ export function PlanPanel({
 // a run is past the gate (PRD #37 Decision 3b). For a repo-source run it says so
 // plainly, so a reader knows the internal review loop was repo-authored. Repo
 // names/descriptions render as plain JSX text, never <Markdown>.
+/**
+ * The run header's title line. Extracted and exported for the same reason PlanPanel,
+ * AgentRosterSummary and JudgePanel are: `RunView` itself needs routing, a live stream and
+ * a dozen API mocks to mount, so an assertion about the heading could not otherwise be
+ * written — and this line was the one #124 render site in the batch with no test at all
+ * (dropping its strip left all 42 cases green).
+ *
+ * `issue_title` is the FORGE issue title: writable by anyone who can open an issue on the
+ * target repo, so it is untrusted free text on the same footing as judge output. Display
+ * only — nothing here is posted back or used as a key.
+ */
+export function RunHeading({ run }: { run: Run }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-2">
+      <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
+      {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
+    </div>
+  );
+}
+
 export function AgentRosterSummary({ run }: { run: Run }) {
   const excluded = new Set(run.agent_exclusions ?? []);
   const roster = run.agent_source === "repo" ? (run.repo_agents ?? []) : (run.own_agents ?? []);

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary, JudgePanel, derivePlanRevision } from "./RunView";
+import { PlanPanel, AgentRosterSummary, JudgePanel, RunHeading, derivePlanRevision } from "./RunView";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -206,6 +206,21 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     expect(screen.getByText("coder")).toBeTruthy();
     expect(screen.getByText("tester")).toBeTruthy();
     expect(screen.getByText(/Excluded: reviewer/)).toBeTruthy();
+  });
+});
+
+// Issue #124 / item 7. The run page's own heading renders the forge issue title, and it
+// was the one render site in this batch that no test reached — dropping its strip left the
+// whole file green, which is why RunHeading is now extracted the way the panels beside it
+// already are.
+describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
+    const { container } = render(
+      <RunHeading run={run({ issue_title: "Fix the \u202Eparser\u200B bug", issue_iid: 7 })} />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+    expect(screen.getByText("#7")).toBeTruthy();
   });
 });
 
