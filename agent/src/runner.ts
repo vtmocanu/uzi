@@ -602,6 +602,19 @@ export class RunRunner {
    * decided and recorded the outcome — a `failed` report on top of it would clobber
    * a `cancelled`, and would overwrite the server-composed limit sentence with a
    * worker-composed one.
+   *
+   * ── Why the feed payload omits Decision 10's `attempt` ───────────────────────
+   * The worker CANNOT KNOW IT, and a guess would be wrong by construction. The park
+   * count is `runs.limit_wait_count`, which the SERVER increments inside
+   * SetRunLimitWait — strictly AFTER this message is emitted, and after the batcher
+   * that carries it has been closed. The claim payload does not deliver the previous
+   * value either (it carries `requeue_count`, a different counter for worker deaths).
+   * So the best a worker could emit is a stale N-1 that disagrees with the run row.
+   *
+   * Nothing is lost: `limit_wait_count` is on RunDTO and on the web `Run` type, so a
+   * renderer showing "attempt N" reads the authoritative value it already has,
+   * rather than a snapshot frozen into a feed row that never updates when the run
+   * parks again.
    */
   private async handleLimitReached(
     err: LimitReachedError,
@@ -620,13 +633,30 @@ export class RunRunner {
       rate_limit_type: err.rateLimitType,
       limit_resets_at: err.resetsAtMs,
     };
+    // The feed payload for the two structured kinds (PRD #35 Decision 10). Kept
+    // STRUCTURED rather than interpolated into a sentence because the renderer must
+    // map `rate_limit_type` through a known-value lookup with a neutral fallback: a
+    // feed payload is worker-authored and the server's enum allowlist does not reach
+    // it, and you cannot map a value that has been baked into prose without
+    // re-parsing the prose — which is worse than not structuring it at all.
+    //
+    // `resets_at` is an ISO string, matching every other timestamp the web renders
+    // and sidestepping the seconds-vs-milliseconds ambiguity that `resetsAt` itself
+    // carries. OMITTED ENTIRELY when the reset is unknown, never null, so "unknown"
+    // is one shape on the wire rather than two.
+    //
+    // `attempt` from Decision 10 is deliberately ABSENT — see the note in
+    // handleLimitReached's doc comment.
+    const feedPayload: Record<string, unknown> = {};
+    if (err.rateLimitType !== undefined) feedPayload["rate_limit_type"] = err.rateLimitType;
+    if (err.resetsAtMs !== undefined) feedPayload["resets_at"] = new Date(err.resetsAtMs).toISOString();
 
     if (!claim.wait_on_limit) {
       // Opted out: fail, but with the structured facts attached so the server can
       // say WHY instead of leaving today's bare "agent run failed:
       // error_during_execution".
       runLog.info("run hit a usage limit and is not opted in to waiting", { detail });
-      batcher.emit({ kind: "error", agent: "worker", payload: { text: `Anthropic usage limit reached (${detail})` } });
+      batcher.emit({ kind: "limit_hit", agent: "worker", payload: { ...feedPayload } });
       await batcher.close().catch(() => undefined);
       await reportState({ status: "failed", ...limitFields }).catch((e) =>
         runLog.error("could not report limit failure", { error: errMessage(e) }),
@@ -635,11 +665,7 @@ export class RunRunner {
     }
 
     runLog.info("run hit a usage limit; requesting a park", { detail });
-    batcher.emit({
-      kind: "status",
-      agent: "worker",
-      payload: { text: `Anthropic usage limit reached (${detail}) — pausing this run until the limit resets` },
-    });
+    batcher.emit({ kind: "limit_wait", agent: "worker", payload: { ...feedPayload } });
     await batcher.close().catch(() => undefined);
 
     let ack: StateAck;

@@ -52,7 +52,28 @@ export type MessageKind =
   | "plan_feedback"
   /** PRD #41: the lead is revising the plan for round N (payload `{ round: number }`);
    *  the UI derives its "revising" gate state from this. */
-  | "plan_revising";
+  | "plan_revising"
+  /** PRD #35 Decision 10: the run is being PARKED until the owner's Anthropic usage
+   *  window reopens. Payload `{ rate_limit_type?: string, resets_at?: string }` —
+   *  both OMITTED rather than null when unknown, so "unknown" has one shape.
+   *
+   *  Structured rather than a `status` line with the facts baked into prose, and the
+   *  reason is not tidiness: the renderer must map `rate_limit_type` through a
+   *  known-value lookup with a neutral fallback, because a feed payload is
+   *  WORKER-AUTHORED and the server's enum allowlist never reaches it. A value
+   *  interpolated into a sentence cannot be mapped without re-parsing the sentence,
+   *  and re-parsing worker text to decide how to render it is worse than the bare
+   *  string we had.
+   *
+   *  Decision 10 also lists an `attempt` key. It is deliberately NOT emitted — see
+   *  RunRunner.handleLimitReached; the worker cannot know it, and the run row's
+   *  authoritative `limit_wait_count` is already on the DTO. */
+  | "limit_wait"
+  /** PRD #35 Decision 8: the run hit a usage limit and is NOT waiting for it — an
+   *  opted-out run, or one whose park the server declined. Same payload as
+   *  `limit_wait`. The two are distinct kinds because they mean opposite things to a
+   *  reader: one says "this will resume", the other says "this is over". */
+  | "limit_hit";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text). */

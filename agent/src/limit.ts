@@ -191,6 +191,21 @@ export function classifyLimitFailure(
     return { resetsAtMs: futureReset, rateLimitType: latest?.rateLimitType };
   }
 
+  // ⚠ SPECIFIED BEHAVIOUR WITH A KNOWN RESIDUAL — NOT AN OVERSIGHT, DO NOT "FIX".
+  //
+  // The corroboration is a FUTURE RESET and nothing else. So a `rejected` observed
+  // early in a long turn, whose reset has not yet elapsed, will classify a death of
+  // an UNRELATED cause (say error_max_turns) as a limit. Decision 1 specifies
+  // staleness as the discriminator, and this implements exactly that.
+  //
+  // Narrowing it — excluding subtypes we believe unrelated — is policy the spec does
+  // not state, and it was deliberately not added on the implementer's own judgement.
+  // It was raised with the lead and the ruling was to keep it as written.
+  //
+  // Recorded this explicitly because the whole design principle of this module is
+  // that a change of reading is a FAILING TEST rather than a silent behaviour change.
+  // A future reader who "tidies" this into a subtype allowlist would be making
+  // precisely the silent change the principle exists to prevent.
   if (latest?.status === "rejected" && futureReset !== undefined) {
     return { resetsAtMs: futureReset, rateLimitType: latest.rateLimitType };
   }

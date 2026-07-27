@@ -1391,6 +1391,14 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
       assert.ok(parked, "the worker must have reported limit_wait");
       assert.strictEqual(parked.body.rate_limit_type, "five_hour");
       assert.strictEqual(typeof parked.body.limit_resets_at, "number");
+      // Decision 10's structured feed kind, not a status line with the facts baked
+      // into prose: M4 maps rate_limit_type through a known-value lookup, which is
+      // impossible against interpolated text.
+      const feed = api.messages(parked.runId).find((m) => m.kind === "limit_wait");
+      assert.ok(feed, "a structured limit_wait feed message must be emitted");
+      assert.strictEqual(feed.payload?.rate_limit_type, "five_hour");
+      assert.strictEqual(typeof feed.payload?.resets_at, "string", "resets_at is an ISO string");
+      assert.ok(!("attempt" in (feed.payload ?? {})), "attempt is server-owned and must not be guessed here");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -1456,6 +1464,12 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
       assert.strictEqual(failed.body.rate_limit_type, "five_hour");
       assert.strictEqual(typeof failed.body.limit_resets_at, "number");
       assert.strictEqual(failed.body.failure_reason, undefined, "the SERVER composes the reason, not the worker");
+      // The opted-out counterpart kind. Distinct from limit_wait because the two mean
+      // opposite things to a reader: one resumes, one is over.
+      const hit = api.messages(failed.runId).find((m) => m.kind === "limit_hit");
+      assert.ok(hit, "a structured limit_hit feed message must be emitted");
+      assert.strictEqual(hit.payload?.rate_limit_type, "five_hour");
+      assert.strictEqual(api.messages(failed.runId).some((m) => m.kind === "limit_wait"), false);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
