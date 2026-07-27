@@ -1860,6 +1860,11 @@ const realApi = {
   // optimistic update).
   setIssuePrdless: (repoId: string, iid: number, apply: boolean) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/prdless`, { apply }),
+  // Promote a non-PRD issue by adding the PRD label (PRD #102 M6, Decision 15).
+  // Forge-first and apply-only — there is no demote, so no boolean. The returned
+  // card is authoritative, like the prdless toggle above.
+  promoteIssue: (repoId: string, iid: number) =>
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/promote`),
   syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
   createIssue: (repoId: string, title: string, description: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues`, { title, description }),

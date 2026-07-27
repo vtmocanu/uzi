@@ -19,6 +19,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listRuns: vi.fn(),
       moveIssue: vi.fn(),
       reorderBoard: vi.fn(),
+      promoteIssue: vi.fn(),
     },
   };
 });
@@ -50,7 +51,16 @@ function aCard(over: Partial<Card> = {}): Card {
   } as Card;
 }
 
-function renderCard(over: Partial<Card> = {}, chips: string[] = [], maxChips?: number) {
+// renderCard renders one IssueCard. `props` overrides the M6 card-shape props
+// (PRD #102): the defaults describe an ordinary PRD card, which is what every
+// pre-M6 test in this file is about, so those tests keep asserting what they always
+// did while the non-PRD cases opt in explicitly.
+function renderCard(
+  over: Partial<Card> = {},
+  chips: string[] = [],
+  maxChips?: number,
+  props: { isPRD?: boolean; canPromote?: boolean; promoting?: boolean; onPromote?: () => void } = {},
+) {
   return render(
     <MemoryRouter>
       <IssueCard
@@ -73,6 +83,11 @@ function renderCard(over: Partial<Card> = {}, chips: string[] = [], maxChips?: n
         prdlessLabel="PRDLESS"
         prdlessBusy={false}
         onTogglePrdless={vi.fn()}
+        prdLabel="PRD"
+        isPRD={props.isPRD ?? true}
+        canPromote={props.canPromote ?? false}
+        promoting={props.promoting ?? false}
+        onPromote={props.onPromote ?? vi.fn()}
         onDragStart={vi.fn()}
         onDragEnd={vi.fn()}
         dimmed={false}
@@ -772,5 +787,199 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     renderBoard();
     await screen.findByText("Backlog");
     expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("manual");
+  });
+});
+
+// PRD #102 M6 — non-PRD issues on the board.
+//
+// Driven through the real Board rather than IssueCard, because everything here is
+// WIRING: which card set feeds the lanes, which feeds the freeze, and which
+// affordance a card gets. A lib-level test of the predicates passes while Board.tsx
+// hands the wrong array to either consumer — measured, not assumed: mutating
+// Board.tsx to freeze the RENDERED set left all 1316 tests green before this
+// describe existed.
+describe("Board — non-PRD issues (PRD #102 M6)", () => {
+  function installStorage(): Map<string, string> {
+    const m = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+        setItem: (k: string, v: string) => void m.set(k, String(v)),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: (i: number) => [...m.keys()][i] ?? null,
+        get length() {
+          return m.size;
+        },
+      } as Storage,
+    });
+    return m;
+  }
+
+  let store: Map<string, string>;
+
+  // PRD and non-PRD cards INTERLEAVED by iid in one lane. The interleaving is
+  // load-bearing for the freeze case: with the non-PRD cards grouped at one end, an
+  // implementation that appended them rather than keeping their positions passes.
+  const cards = () => [
+    aCard({ iid: 1, title: "issue one", column: "", labels: ["PRD"] }),
+    aCard({ iid: 2, title: "issue two", column: "", labels: ["bug"], has_prd_link: false }),
+    aCard({ iid: 3, title: "issue three", column: "", labels: ["PRD"] }),
+    aCard({ iid: 4, title: "issue four", column: "", labels: [] }),
+    aCard({ iid: 5, title: "issue five", column: "", labels: ["PRD"] }),
+    aCard({ iid: 6, title: "issue tracker", column: "", labels: ["uzi-self-improve"] }),
+  ];
+
+  const aBoard = (over: Partial<BoardData> = {}): BoardData => ({
+    repo_id: "repo-1",
+    path_with_namespace: "grp/proj",
+    web_url: "https://gitlab.example.com/grp/proj",
+    forge_type: "gitlab",
+    columns: [{ label_name: "Planned" }] as BoardData["columns"],
+    cards: cards(),
+    pipeline: null,
+    ...over,
+  });
+
+  beforeEach(() => {
+    store = installStorage();
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      prdLabel: "PRD",
+      autopilotLabel: "autopilot",
+      prdlessLabel: "PRDLESS",
+      prdlessEnabled: true,
+      theme: "ember",
+      themeOverride: null,
+      defaultTheme: "ember",
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.moveIssue.mockResolvedValue({ card: aCard({ iid: 1, column: "" }) });
+    mockApi.reorderBoard.mockImplementation(async () => ({ board: aBoard() }));
+    // The title matters: the assertions read card titles, and aCard's default title
+    // is not "issue two". A response that silently renames the card would pass a
+    // membership check on iids and fail the one that matters.
+    mockApi.promoteIssue.mockResolvedValue({
+      card: aCard({ iid: 2, title: "issue two", column: "", labels: ["PRD", "bug"], has_prd_link: false }),
+    });
+  });
+
+  const renderBoard = () =>
+    render(
+      <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+        <Routes>
+          <Route path="/repos/:id/board" element={<Board />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  const titles = () => screen.getAllByRole("link", { name: /^issue / }).map((a) => a.textContent);
+  const toggle = () => screen.getByLabelText(/Show other issues/);
+
+  it("shows exactly today's board with the toggle OFF", async () => {
+    // The criterion that protects every existing user: the additive fetch changes
+    // what is CACHED; this toggle decides what is RENDERED, and its default is off.
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
+  });
+
+  it("adds the open non-PRD issues with the toggle ON", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+    expect(titles()).toEqual(["issue one", "issue two", "issue three", "issue four", "issue five"]);
+  });
+
+  it("never shows the self-improve tracker, toggle on or off (Decision 13a)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(titles()).not.toContain("issue tracker");
+    fireEvent.click(toggle());
+    expect(titles()).not.toContain("issue tracker");
+  });
+
+  it("persists the toggle per repo", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+    expect(store.get("uzi.board.repo-1.showNonPRD")).toBe("true");
+  });
+
+  it("reads the persisted toggle back on load", async () => {
+    store.set("uzi.board.repo-1.showNonPRD", "true");
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(titles()).toContain("issue two");
+  });
+
+  // FREEZE-TEST 3 (task #13), at the wiring level. The lib test pins dropIntent's
+  // contract; this pins that Board.tsx actually hands it the payload set.
+  it("freezes the cards the viewer cannot see, in their existing relative order", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // Toggle OFF: the viewer sees 1, 3, 5 and moves 5 up one place.
+    expect(titles()).toEqual(["issue one", "issue three", "issue five"]);
+    fireEvent.click(screen.getByRole("button", { name: /Move issue #5 up in/ }));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+
+    const iids = mockApi.reorderBoard.mock.calls[0][1] as number[];
+    // The hidden non-PRD cards are IN the freeze — omit them and the server's
+    // ClearBoardOrderExcept NULLs their positions, dropping them to the bottom of the
+    // lane on this same person's other browser where the toggle is on.
+    expect(iids).toContain(2);
+    expect(iids).toContain(4);
+    // …and in the relative order they already had.
+    expect(iids.filter((i) => i === 2 || i === 4)).toEqual([2, 4]);
+    // The move really happened, so this is not passing by doing nothing.
+    expect(iids.indexOf(5)).toBeLessThan(iids.indexOf(3));
+  });
+
+  it("offers Promote instead of Start run on a non-PRD card (Decision 15)", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+    const lane = screen.getByText("Backlog").parentElement!.parentElement!;
+    // Three PRD cards offer Start run; the two non-PRD ones offer Promote instead.
+    expect(within(lane).getAllByRole("button", { name: /Start run/ })).toHaveLength(3);
+    expect(within(lane).getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(2);
+  });
+
+  it("does not offer the PRDLESS toggle on a non-PRD card (Decision 16)", async () => {
+    // prdlessEnabled is true in this describe, and card 2 has no PRD link — the exact
+    // shape that WOULD show the button on a PRD card. It grants nothing here, because
+    // run eligibility also requires the PRD label.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+    expect(screen.queryByRole("button", { name: /Mark PRDLESS/ })).toBeNull();
+  });
+
+  it("promotes forge-first and adopts the returned card", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(toggle());
+    fireEvent.click(screen.getAllByRole("button", { name: /Promote to PRD/ })[0]);
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 2));
+    // Wait on the PROMOTED card losing its button, not on "a Promote button exists":
+    // the other non-PRD card still has one, so the weaker wait resolves immediately
+    // and the assertion below then races the state update. Two remained before, one
+    // remains after.
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /Promote to PRD/ })).toHaveLength(1));
+    // The card is now an ordinary PRD card, so it survives the toggle going back off.
+    fireEvent.click(toggle());
+    expect(titles()).toContain("issue two");
   });
 });

@@ -1,4 +1,4 @@
-// Kanban board of PRD-labeled issues. Columns are GitLab labels; moves are
+// Kanban board of a repo's issues. Columns are GitLab labels; moves are
 // forge-first (the server writes the label, then returns the authoritative
 // card — a failed move snaps back because nothing moved optimistically).
 // Column identity follows multica's status-color language
@@ -31,6 +31,7 @@ import {
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
 import { boundedChips, chipLabels } from "../lib/labelChips";
+import { canPromote, isPRDCard, visibleCards } from "../lib/boardCards";
 import {
   dropIntent,
   insertionEdgeFor,
@@ -85,6 +86,7 @@ export function Board() {
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
   const [prdlessBusy, setPrdlessBusy] = useState<number | null>(null);
+  const [promoting, setPromoting] = useState<number | null>(null);
 
   // Hide-empty-columns toggle, persisted per repo. Initialised lazily from prefs;
   // re-read on repoId change because the route swaps :id without remounting the
@@ -99,6 +101,27 @@ export function Board() {
     setHideEmpty((v) => {
       const next = !v;
       prefs.set(hideEmptyKey, next);
+      return next;
+    });
+  };
+
+  // Show-non-PRD toggle (PRD #102 M6), per browser and per repo like hideEmpty and
+  // the sort mode. Default OFF, so a user who never touches it sees exactly the board
+  // they saw before M6 — the additive fetch changes what is CACHED, and this decides
+  // what is RENDERED.
+  //
+  // The useEffect re-read is not optional and is not defensive: the route swaps :id
+  // without remounting this component, so a lazy useState initialiser only ever runs
+  // for the first repo visited. That bug has been fixed twice in this file already.
+  const showNonPRDKey = `uzi.board.${repoId}.showNonPRD`;
+  const [showNonPRD, setShowNonPRD] = useState(() => prefs.get(showNonPRDKey, false));
+  useEffect(() => {
+    setShowNonPRD(prefs.get(`uzi.board.${repoId}.showNonPRD`, false));
+  }, [repoId]);
+  const toggleShowNonPRD = () => {
+    setShowNonPRD((v) => {
+      const next = !v;
+      prefs.set(showNonPRDKey, next);
       return next;
     });
   };
@@ -401,6 +424,23 @@ export function Board() {
     }
   };
 
+  // Promote (PRD #102 Decision 15): add the PRD label forge-first, then replace the
+  // one card with the authoritative response — the same no-optimistic-update shape as
+  // the PRDLESS toggle above. The promoted card keeps rendering whatever the toggle
+  // state is, because it is now a PRD card.
+  const promote = async (card: CardData) => {
+    if (promoting != null) return;
+    setPromoting(card.iid);
+    try {
+      const { card: updated } = await api.promoteIssue(repoId, card.iid);
+      setBoard((b) => (b ? { ...b, cards: b.cards.map((c) => (c.iid === updated.iid ? updated : c)) } : b));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not promote the issue");
+    } finally {
+      setPromoting(null);
+    }
+  };
+
   const columns = useMemo(() => {
     const cols: { key: string; label: string; droppable: boolean; accent: string }[] = [
       { key: OPEN_KEY, label: "Backlog", droppable: true, accent: "bg-faint" },
@@ -437,9 +477,17 @@ export function Board() {
   // rather than remembered.
   //
   //   payloadCards — drives the FREEZE. Never filtered.
-  //   renderCards  — drives the LANES. M6's non-PRD toggle filters HERE, one line.
+  //   renderCards  — drives the LANES. M6's non-PRD toggle filters HERE.
+  //
+  // M6 is the change that makes the split do work: until now the filter was the
+  // identity function and any implementation of the freeze passed. With a real
+  // card-level filter, using renderCards for the freeze would NULL the position of
+  // every card the viewer had hidden — which is what freeze-test 3 discriminates.
   const payloadCards = useMemo<CardData[]>(() => board?.cards ?? [], [board]);
-  const renderCards = payloadCards;
+  const renderCards = useMemo(
+    () => visibleCards(payloadCards, prdLabel, showNonPRD),
+    [payloadCards, prdLabel, showNonPRD],
+  );
 
   // columnKeys is the board's lane order for the freeze: the implicit Backlog column
   // first, then the configured ones. Closed is excluded — closed cards never enter the
@@ -601,6 +649,20 @@ export function Board() {
     dragIid != null,
   );
   const hiddenCount = columns.length - visible.length;
+  // How many of the rendered cards are the non-PRD ones the toggle brought in.
+  // Computed off renderCards, not payloadCards, so it counts what is on screen — the
+  // self-improve tracker is excluded from both.
+  const nonPRDCount = renderCards.filter((c) => !isPRDCard(c, prdLabel)).length;
+
+  // The board's own description, hoisted out of the JSX so the reason it changed can
+  // be written down. Its last sentence read "Only PRD-labeled issues appear here."
+  // until M6, and that is the one sentence a user actually reads about what this
+  // board contains — rendered product copy, invisible to any sweep of docs or code
+  // comments. It names the CONFIGURED label, since prd_label is renameable.
+  const boardDescription =
+    `Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; ` +
+    `you can still drag a card to change its label on the forge. ${prdLabel}-labeled issues always appear here; ` +
+    `turn on "Show other issues" to see the repo's other open issues alongside them.`;
 
   return (
     <div className="space-y-5">
@@ -620,7 +682,7 @@ export function Board() {
             )}
           </div>
         }
-        description={`Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here.`}
+        description={boardDescription}
         actions={
           <>
             {/* A real <label> around the repo's Select, so the control is named for a
@@ -638,6 +700,22 @@ export function Board() {
                   </option>
                 ))}
               </Select>
+            </label>
+            {/* Decision 12's toggle. "Show other issues" rather than "Show non-PRD
+                issues": prd_label is operator-configurable, so a literal would be wrong
+                on any instance that renamed it, and the phrasing that survives a rename
+                is the one about the repo rather than the label. The count is the same
+                affordance Hide empty uses — it says the toggle did something even when
+                the answer is "there are none". */}
+            <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
+              <input
+                type="checkbox"
+                checked={showNonPRD}
+                onChange={toggleShowNonPRD}
+                className="h-3.5 w-3.5 rounded border-edge accent-brand"
+              />
+              Show other issues
+              {showNonPRD && <span className="text-muted">({nonPRDCount} shown)</span>}
             </label>
             <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
               <input
@@ -849,6 +927,11 @@ export function Board() {
                     prdlessLabel={prdlessLabel}
                     prdlessBusy={prdlessBusy === card.iid}
                     onTogglePrdless={() => togglePrdless(card)}
+                    prdLabel={prdLabel}
+                    isPRD={isPRDCard(card, prdLabel)}
+                    canPromote={canPromote(card, prdLabel)}
+                    promoting={promoting === card.iid}
+                    onPromote={() => promote(card)}
                     onDragStart={(e) => {
                       e.dataTransfer.setData("text/plain", String(card.iid));
                       setDragIid(card.iid);
@@ -921,6 +1004,11 @@ export function IssueCard({
   prdlessLabel,
   prdlessBusy,
   onTogglePrdless,
+  prdLabel,
+  isPRD,
+  canPromote: promotable,
+  promoting,
+  onPromote,
   onDragStart,
   onDragEnd,
   dimmed,
@@ -967,6 +1055,16 @@ export function IssueCard({
   prdlessLabel: string;
   prdlessBusy: boolean;
   onTogglePrdless: () => void;
+  // PRD #102 M6. isPRD drives the treatment and the affordances; canPromote is the
+  // narrower question (open, not already PRD, not the self-improve tracker), so the
+  // two are separate props rather than one derived from the other on the card.
+  // prdLabel rides down for the button copy: the card names the CONFIGURED label,
+  // like the prdless button beside it, so an instance that renamed it reads right.
+  prdLabel: string;
+  isPRD: boolean;
+  canPromote: boolean;
+  promoting: boolean;
+  onPromote: () => void;
   onDragStart: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   dimmed: boolean;
@@ -1005,7 +1103,20 @@ export function IssueCard({
       onDragLeave={onCardDragLeave}
       onDrop={onCardDrop}
       className={cx(
-        "group rounded-lg border bg-raised/80 p-3 text-sm transition-colors",
+        "group rounded-lg border p-3 text-sm transition-colors",
+        // D17. Dashed rather than dimmed: opacity-40 already means "being dragged
+        // right now", and border-warn/60 ring-2 is `loud`, reserved for
+        // awaiting_approval. A permanently dim card reads as perpetually mid-drag,
+        // and ring treatment would put the least urgent card on the board at the top
+        // of the hierarchy.
+        //
+        // The dashed border alone does NOT carry it. Measured against the composited
+        // card background, --edge is 1.25:1 in ember and 1.21:1 in mission, against
+        // WCAG 1.4.11's 3:1 for a non-text indicator — and an ordinary card's border
+        // is ALREADY border-edge, so dashed-versus-solid at 1.2:1 would be the entire
+        // distinction. bg-transparent is the second, non-colour cue, which is exactly
+        // how the Closed LANE earns its separation from its bg-surface/60 neighbours.
+        isPRD ? "bg-raised/80" : "border-dashed bg-transparent",
         loud ? "border-warn/60 ring-2 ring-warn/40" : "border-edge",
         draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
         dimmed && "opacity-40",
@@ -1174,24 +1285,49 @@ export function IssueCard({
           {card.author && <span>{card.author}</span>}
         </div>
       )}
-      {!card.closed && (
+      {/* D15: Promote stands IN PLACE OF Start run, never beside it. A non-PRD card
+          cannot start a run (the Decision 14 gate refuses it server-side), so showing
+          a gated Start run here would be a disabled button whose tooltip explains a
+          rule the user has a one-click answer to. Promote IS that answer, and once
+          taken the card becomes ordinary and Start run appears. */}
+      {promotable ? (
         <div className="mt-2.5">
           <Button
-            variant={gate.enabled ? "primary" : "secondary"}
+            variant="secondary"
             size="sm"
-            disabled={!gate.enabled || starting}
-            title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
-            onClick={onStart}
+            disabled={promoting}
+            title={`Add the ${prdLabel} label so uzi can work this issue`}
+            onClick={onPromote}
             className="w-full"
           >
-            {starting ? "Starting…" : gate.enabled ? "Start run" : "Start run (gated)"}
+            {promoting ? "Promoting…" : `Promote to ${prdLabel}`}
           </Button>
         </div>
+      ) : (
+        !card.closed &&
+        isPRD && (
+          <div className="mt-2.5">
+            <Button
+              variant={gate.enabled ? "primary" : "secondary"}
+              size="sm"
+              disabled={!gate.enabled || starting}
+              title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
+              onClick={onStart}
+              className="w-full"
+            >
+              {starting ? "Starting…" : gate.enabled ? "Start run" : "Start run (gated)"}
+            </Button>
+          </div>
+        )
       )}
       {/* Show when applying is meaningful (no PRD link) or the label is already
           applied (so it can be removed); hide the no-op case — has a PRD link and
-          no label (S2). */}
-      {prdlessEnabled && !card.closed && (prdlessApplied || !card.has_prd_link) && (
+          no label (S2).
+
+          D16 adds isPRD: on a non-PRD card the PRDLESS label grants nothing, because
+          run eligibility now requires the PRD label as well. A button that looks like
+          it does something and does not is worse than no button. */}
+      {prdlessEnabled && isPRD && !card.closed && (prdlessApplied || !card.has_prd_link) && (
         <button
           type="button"
           draggable={false}

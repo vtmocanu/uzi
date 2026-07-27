@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
       setIssuePrdless: vi.fn(),
+      promoteIssue: vi.fn(),
     },
   };
 });
@@ -388,5 +389,74 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     fireEvent.click(screen.getByText("Mark PRDLESS"));
     // Once the label lands, the bypass enables Start.
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+  });
+});
+
+// PRD #102 M6. M4 removed the PRD chip from this page — correctly, since every
+// cached issue carried the label by construction and the chip carried no
+// information. M6 is what gives it information again: without an indicator here, a
+// non-PRD issue opened from the board is indistinguishable from a PRD one on the
+// page where a user decides what to do with it, and which offers the run controls
+// the server-side gate now refuses.
+describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
+  it("marks a non-PRD issue and offers Promote in place of Start run", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    expect(screen.getByText("not PRD")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Promote to PRD/ })).toBeTruthy();
+    // Hidden, not disabled: the server refuses the run and Promote is the one-click
+    // answer, so a gated button explaining a resolvable rule would be noise.
+    expect(screen.queryByRole("button", { name: /start run/i })).toBeNull();
+  });
+
+  it("shows neither on an ordinary PRD issue", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    expect(screen.queryByText("not PRD")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("does not offer the PRDLESS toggle on a non-PRD issue (Decision 16)", async () => {
+    // prdlessEnabled AND has_prd_link false — the exact shape that WOULD show the
+    // toggle on a PRD issue. It grants nothing here: run eligibility also requires
+    // the PRD label now.
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByText("Mark PRDLESS")).toBeNull();
+  });
+
+  it("promotes forge-first and adopts the returned labels", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["PRD", "bug"]) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    fireEvent.click(screen.getByRole("button", { name: /Promote to PRD/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+    // The page re-reads as an ordinary PRD issue: the marker goes, Start run appears.
+    await waitFor(() => expect(screen.queryByText("not PRD")).toBeNull());
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("does not offer Promote on the self-improve tracker (Decision 13a)", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi-self-improve"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    // Still MARKED as not-PRD (it is not uzi's board work), but not promotable — the
+    // server refuses it too, so an offered button would be a 422 waiting to happen.
+    expect(screen.getByText("not PRD")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
   });
 });

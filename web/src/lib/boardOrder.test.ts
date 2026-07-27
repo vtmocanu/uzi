@@ -9,6 +9,7 @@ import {
   SORT_MODES,
   type SortMode,
 } from "./boardOrder";
+import { visibleCards } from "./boardCards";
 import type { Card, LatestRun } from "./api";
 
 // Fixtures are built so that under EVERY mode the expected order differs from iid
@@ -377,6 +378,69 @@ describe("dropIntent", () => {
   it("returns null when the dragged card is gone from the payload or is closed", () => {
     expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 12345, destColumnKey: "", anchor: null })).toBeNull();
     expect(dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 99, destColumnKey: "", anchor: null })).toBeNull();
+  });
+});
+
+// FREEZE-TEST 3 (PRD #102, Decision 7b's third case; task #13).
+//
+// M5 could not express this. It needs a CARD-level render filter to discriminate,
+// and M5 had none — hideEmpty hides whole columns, so any implementation of the
+// freeze passes it vacuously. M6's non-PRD toggle is the first such filter, which is
+// why this test lands here rather than with the other two.
+//
+// The rule it protects: the freeze is computed from the PAYLOAD set, never from what
+// the viewer can see. Compute it from the rendered subset and ClearBoardOrderExcept
+// NULLs every card the viewer had hidden, dropping them to the bottom of their
+// column — on the same person's other browser, where the toggle happens to be on.
+describe("freeze-test 3: a freeze taken with cards hidden", () => {
+  const columnKeys = [""];
+  // One lane, PRD and non-PRD interleaved. The interleaving is the point: with the
+  // hidden cards grouped at one end, an implementation that appended them instead of
+  // preserving their positions would still pass.
+  const payloadCards = [
+    aCard({ iid: 10, column: "", labels: ["PRD"] }),
+    aCard({ iid: 20, column: "", labels: ["bug"] }),
+    aCard({ iid: 30, column: "", labels: ["PRD"] }),
+    aCard({ iid: 40, column: "", labels: [] }),
+    aCard({ iid: 50, column: "", labels: ["PRD"] }),
+  ];
+  const hidden = [20, 40];
+
+  it("leaves the hidden cards' relative order unchanged", () => {
+    // A viewer with the toggle OFF sees 10, 30, 50 and drags 50 to the top.
+    const seen = visibleCards(payloadCards, "PRD", false);
+    expect(seen.map((c) => c.iid)).toEqual([10, 30, 50]);
+
+    const out = dropIntent({
+      payloadCards, // UNFILTERED — this is the rule under test
+      columnKeys,
+      sortMode: "manual",
+      dragIid: 50,
+      destColumnKey: "",
+      anchor: { iid: 10, before: true },
+    })!;
+
+    // Every hidden card survives the freeze...
+    for (const iid of hidden) expect(out.iids).toContain(iid);
+    // ...and in the same relative order it had before, which is what the viewer with
+    // the toggle ON will see.
+    expect(out.iids.filter((iid) => hidden.includes(iid))).toEqual(hidden);
+    // The dragged card did move, so the fixture is not passing by doing nothing.
+    expect(out.iids[0]).toBe(50);
+  });
+
+  it("would lose them entirely if the freeze used the rendered set", () => {
+    // The positive control. Without it "the hidden cards are in the list" is a claim
+    // about a fixture, not about the implementation.
+    const broken = dropIntent({
+      payloadCards: visibleCards(payloadCards, "PRD", false),
+      columnKeys,
+      sortMode: "manual",
+      dragIid: 50,
+      destColumnKey: "",
+      anchor: { iid: 10, before: true },
+    })!;
+    for (const iid of hidden) expect(broken.iids).not.toContain(iid);
   });
 });
 

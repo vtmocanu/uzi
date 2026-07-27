@@ -1849,6 +1849,20 @@ export const mockApi = {
     }
     return delay({ card: { ...card } }, 320);
   },
+  // Promote (PRD #102 M6, Decision 15): add the configured PRD label, apply-only and
+  // idempotent. Refuses uzi's own self-improvement tracker the way the server does
+  // (Decision 13a), so the demo build cannot show a promote the real API would 422.
+  promoteIssue: async (repoId: string, iid: number) => {
+    const b = state.boards.get(repoId);
+    const card = b?.cards.find((c) => c.iid === iid);
+    if (!b || !card) throw new ApiError(404, "issue not found");
+    if (card.labels.includes("uzi-self-improve")) {
+      throw new ApiError(422, "this issue is uzi's own self-improvement tracker and cannot be promoted");
+    }
+    const label = appSettings.prd_label;
+    if (!card.labels.includes(label)) card.labels = [label, ...card.labels];
+    return delay({ card: { ...card } }, 320);
+  },
   getIssue: async (repoId: string, iid: number) => {
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === iid);

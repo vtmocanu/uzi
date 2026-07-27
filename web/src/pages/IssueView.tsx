@@ -6,6 +6,7 @@ import { startRunGate } from "../lib/runStream";
 import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { chipLabels } from "../lib/labelChips";
+import { canPromote, isPRDCard } from "../lib/boardCards";
 import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
 import { forgePlatform } from "../lib/forgeNoun";
@@ -45,6 +46,7 @@ export function IssueView() {
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
   const [prdlessBusy, setPrdlessBusy] = useState(false);
+  const [promoting, setPromoting] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -104,6 +106,34 @@ export function IssueView() {
       setError(err instanceof ApiError ? err.message : "Could not update the label");
     } finally {
       setPrdlessBusy(false);
+    }
+  };
+
+  // PRD #102 M6. The detail page needs its own answer to "is this uzi's work",
+  // computed from the SAME predicate the board card uses — two implementations is
+  // exactly how a card's affordances and its detail page's come to disagree.
+  //
+  // M4 removed the PRD chip from this page, correctly: every cached issue carried
+  // the label by construction, so the chip carried no information. M6 is what gives
+  // it information again, and without an indicator a non-PRD issue opened from the
+  // board is indistinguishable from a PRD one on the very page where a user decides
+  // what to do with it — and which offers the run controls the gate will refuse.
+  const isPRD = !!issue && isPRDCard(issue, prdLabel);
+  const promotable = !!issue && canPromote(issue, prdLabel);
+
+  // Promote (Decision 15), the same forge-first, adopt-the-response shape as the
+  // PRDLESS toggle above.
+  const promote = async () => {
+    if (!issue) return;
+    setError("");
+    setPromoting(true);
+    try {
+      const { card } = await api.promoteIssue(repoId, issue.iid);
+      setIssue({ ...issue, labels: card.labels });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not promote the issue");
+    } finally {
+      setPromoting(false);
     }
   };
 
@@ -189,6 +219,22 @@ export function IssueView() {
                     {autopilotLabel}
                   </Badge>
                 )}
+                {/* The non-PRD indicator (PRD #102 M6). Consistent with the card's
+                    dashed treatment in MEANING, not in mechanism: a border style is a
+                    card-scale cue and does not transfer to a full-width detail page, so
+                    it becomes an explicit badge here — which is also the only form that
+                    reaches a screen reader, since the card's border does not.
+
+                    Neutral tone, deliberately. This is not a warning: an issue that is
+                    not uzi's work is the ordinary state of most issues in a repo. */}
+                {!isPRD && (
+                  <Badge
+                    tone="neutral"
+                    title={`This issue does not carry the ${prdLabel} label, so uzi will not work it. Promote it to change that.`}
+                  >
+                    not {prdLabel}
+                  </Badge>
+                )}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
                 {!issue.has_prd_link &&
                   (prdlessEnabled && prdlessApplied ? (
@@ -217,7 +263,22 @@ export function IssueView() {
               {/* Show the toggle when applying is meaningful (no PRD link) or the
                   label is already applied (so it can be removed); hide the pure
                   no-op case — an issue that already has a PRD link and no label (S2). */}
-              {prdlessEnabled && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
+              {/* Promote (Decision 15) sits where the action for a non-PRD issue
+                  belongs: beside the PRDLESS toggle it replaces. */}
+              {promotable && (
+                <Button
+                  variant="secondary"
+                  disabled={promoting}
+                  title={`Add the ${prdLabel} label so uzi can work this issue`}
+                  onClick={promote}
+                >
+                  {promoting ? "…" : `Promote to ${prdLabel}`}
+                </Button>
+              )}
+              {/* isPRD is Decision 16, for the same reason it gates the card's button:
+                  run eligibility now requires the PRD label too, so on a non-PRD issue
+                  this grants nothing. */}
+              {prdlessEnabled && isPRD && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
                 <Button
                   variant={prdlessApplied ? "secondary" : "ghost"}
                   disabled={prdlessBusy}
@@ -257,7 +318,11 @@ export function IssueView() {
             )}
           </Card>
 
-          {!issue.closed && gate && (
+          {/* Hidden entirely on a non-PRD issue rather than shown gated: the server
+              refuses the run (Decision 14), and Promote above is the one-click answer,
+              so a disabled button explaining a rule the user can resolve in place would
+              be noise. */}
+          {!issue.closed && isPRD && gate && (
             <div>
               <Button
                 variant={gate.enabled ? "primary" : "ghost"}
