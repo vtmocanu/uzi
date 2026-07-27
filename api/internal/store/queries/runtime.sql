@@ -6,8 +6,23 @@
 -- (PRD #18), NULL when the caller made no choice. anthropic_secret_id is the
 -- optional mint-time token binding (PRD #104 M3); NULL means "my owner's default",
 -- which is what every worker minted before this was and stays.
-INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
-VALUES (@user_id, @name, @token_hash, @template_declared, @anthropic_secret_id)
+--
+-- 🔴 anthropic_bind_mode MUST BE NAMED HERE, and its absence was a silent
+-- regression. PRD #111 M3 made the MODE decide whether the id is read at all
+-- (workerSecretID gates on it first), and this INSERT set five columns without it —
+-- so the row took 00088's column default 'default' while carrying a real binding,
+-- and every worker minted through `POST /api/workers {"anthropic_token":"..."}`
+-- quietly spent the OWNER'S DEFAULT instead. PRD #104 M3's mint-time binding was
+-- dead, silently, in every channel — and M1 made it worse: the run records the
+-- credential actually opened, so the attribution feature CORROBORATED the wrong
+-- answer.
+--
+-- Written in the SAME statement as the id, for the reason SetWorkerAnthropicSecret
+-- gives: mode and id describe one decision, and a row where they disagree is one no
+-- resolution rule can rescue. The caller derives the pair (pinned when a label
+-- resolved, else default), exactly as PatchWorker does.
+INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
+VALUES (@user_id, @name, @token_hash, @template_declared, @anthropic_secret_id, @anthropic_bind_mode)
 RETURNING *;
 
 -- name: SetWorkerAnthropicSecret :one

@@ -108,22 +108,43 @@ var runInputKinds = map[string]bool{
 // workerDTO/runDTO/messageDTO moved to the stdlib-only apitypes leaf (PRD #64 M1);
 // the mappers below stay here as the store→DTO builders.
 
-// effectiveBindMode maps a worker's stored bind mode to the one a client should
-// render (PRD #111 M3, D9): 'pinned' with no credential id reports 'default'.
+// effectiveBindMode maps a worker's stored (mode, id) pair to the mode a client
+// should render (PRD #111 M3, D9). It is TOTAL IN BOTH DIRECTIONS, which is the
+// whole point: whatever the row holds, the answer it returns agrees with what
+// workerSecretID will actually resolve.
 //
-// The state is real and reachable, not defensive: 00078's FK nulls
-// workers.anthropic_secret_id when the credential is deleted and deliberately
-// leaves the mode alone (a coupling CHECK is impossible — see 00088), so every
-// worker pinned to a token their owner then deletes sits in it. Resolution already
-// treats that worker as default; reporting the raw column would have every client
-// draw a pin to a token that does not exist, and each of them would need this same
-// three-line rule to avoid it. Applying it once, server-side, is the same reasoning
-// as M2's auto_status: one implementation of a rule that two surfaces read.
+//   - 'pinned' with NO id reports 'default'. Real and reachable, not defensive:
+//     00078's FK nulls workers.anthropic_secret_id when the credential is deleted
+//     and deliberately leaves the mode alone (a coupling CHECK is impossible — see
+//     00088), so every worker pinned to a token their owner then deletes sits here.
+//   - a non-pinned mode WITH an id reports that mode, and the DTO mappers drop the
+//     id and label beside it. This direction was missing, and it was not
+//     hypothetical: the create path produced exactly this row until M3-BLOCK was
+//     fixed, so the API shipped `anthropic_bind_mode:"default"` next to a non-NULL
+//     id and label — and WorkersSettings renders "spends <label>" off the id branch,
+//     so the picker said pinned while the run record said default, about one worker.
+//
+// Reporting the raw column would put that same three-line rule in every client, and
+// each would have to get both directions right. Applying it once, server-side, is
+// the same reasoning as M2's auto_status: one implementation of a rule two surfaces
+// read. Being total means the DTO cannot EXPRESS a contradiction even if a future
+// writer produces one.
 func effectiveBindMode(mode string, secretID pgtype.UUID) string {
 	if mode == workersvc.BindModePinned && !secretID.Valid {
 		return workersvc.BindModeDefault
 	}
 	return mode
+}
+
+// bindingForMode is effectiveBindMode's other half: the id and label a client should
+// see, given the mode that will actually govern. A non-pinned worker shows neither,
+// because neither is read on its claim — emitting them invites exactly the
+// "picker says pinned, run record says default" split described above.
+func bindingForMode(mode string, secretID pgtype.UUID, label string) (*string, *string) {
+	if effectiveBindMode(mode, secretID) != workersvc.BindModePinned {
+		return nil, nil
+	}
+	return uuidPtrValue(secretID), textPtrValue(label != "", label)
 }
 
 // workerDTOFromWorker builds the DTO from a bare worker row plus its active (non-chat)
@@ -156,12 +177,13 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		Now:          now,
 		APIStartedAt: apiStartedAt,
 	}, workersvc.UpgradeParams{})
+	bindingID, bindingLabel := bindingForMode(w.AnthropicBindMode, w.AnthropicSecretID, secretLabel)
 	return apitypes.WorkerDTO{
 		UpgradeStatus:        upgradeStatus,
 		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget:        upgradeTarget,
-		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
-		AnthropicSecretLabel: textPtrValue(secretLabel != "", secretLabel),
+		AnthropicSecretID:    bindingID,
+		AnthropicSecretLabel: bindingLabel,
 		AnthropicBindMode:    effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
 		ID:                   w.ID.String(),
 		Name:                 w.Name,
@@ -193,6 +215,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		Now:          now,
 		APIStartedAt: apiStartedAt,
 	}, workersvc.UpgradeParams{})
+	rowBindingID, rowBindingLabel := bindingForMode(
+		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
 	return apitypes.WorkerDTO{
 		UpgradeStatus: upgradeStatus,
 		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
@@ -202,8 +226,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		UpgradeBlockingContainer: textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
 		UpgradeBlockingReason:    textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
 		UpgradeLastExitCode:      int32PtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
-		AnthropicSecretID:        uuidPtrValue(w.AnthropicSecretID),
-		AnthropicSecretLabel:     textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
+		AnthropicSecretID:        rowBindingID,
+		AnthropicSecretLabel:     rowBindingLabel,
 		AnthropicBindMode:        effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
 		ID:                       w.ID.String(),
 		Name:                     w.Name,

@@ -2251,6 +2251,18 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 	if err != nil {
 		return store.Worker{}, "", err
 	}
+	// The BIND MODE is derived from the same resolution that produced the id, and
+	// written in the same statement (PRD #111 M3). It is not optional: since M3 the
+	// mode is what decides whether the id is read at all, so a mint that set the id
+	// and let the mode take its column default produced a worker carrying a real
+	// binding that resolved the owner's DEFAULT — PRD #104 M3's mint-time binding,
+	// silently dead. Deriving it here rather than defaulting it in SQL is the same
+	// rule PatchWorker applies and the same one 00088's backfill applied to existing
+	// rows: a resolved label is `pinned`, its absence is `default`.
+	bindMode := BindModeDefault
+	if secretID.Valid {
+		bindMode = BindModePinned
+	}
 	// templateDeclared is the UI-chosen worker template (PRD #18), validated
 	// against the registry by the caller; empty → NULL (no choice made).
 	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{
@@ -2259,6 +2271,7 @@ func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, temp
 		TokenHash:         hash,
 		TemplateDeclared:  pgText(templateDeclared),
 		AnthropicSecretID: secretID,
+		AnthropicBindMode: bindMode,
 	})
 	if err != nil {
 		return store.Worker{}, "", err

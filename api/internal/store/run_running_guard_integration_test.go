@@ -53,6 +53,12 @@ func TestSetRunRunningAwaitingApprovalGuardLiveDB(t *testing.T) {
 	// test, and workers.token_hash is UNIQUE — a fixed literal would collide.
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: userID, Name: "laptop", TokenHash: append([]byte("f2guard-"), userID[:]...),
+		// 00088 made anthropic_bind_mode NOT NULL with a CHECK, and CreateWorker now
+		// names it (PRD #111 M3-BLOCK), so a direct-store call must say which mode it
+		// means — the zero value "" is a row the database cannot hold. Deliberately NOT
+		// defaulted in SQL: an empty mode silently becoming 'default' is exactly how the
+		// mint-time binding regression hid.
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)

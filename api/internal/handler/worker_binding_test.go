@@ -440,3 +440,58 @@ func TestEffectiveBindModeHidesAPhantomPin(t *testing.T) {
 		})
 	}
 }
+
+// TestBindingIsSuppressedOffPinned is M3-B: the DTO must not be able to EXPRESS a
+// contradiction. effectiveBindMode was total in only one direction — it mapped
+// pinned+NULL → default but left a non-pinned mode carrying an id alone, while the
+// mappers emitted that id and label beside it.
+//
+// Not hypothetical: the create path produced exactly that row until M3-BLOCK was
+// fixed, so the API shipped anthropic_bind_mode:"default" next to a non-NULL id and
+// label — and WorkersSettings renders "spends <label>" off the id branch. The picker
+// said pinned while the run record said default, about one worker.
+func TestBindingIsSuppressedOffPinned(t *testing.T) {
+	id := uuid.New()
+	bound := pgtype.UUID{Bytes: id, Valid: true}
+	for _, tc := range []struct {
+		name, mode string
+		secret     pgtype.UUID
+		wantID     bool
+	}{
+		{"pinned with an id shows it", workersvc.BindModePinned, bound, true},
+		{"pinned with no id shows nothing", workersvc.BindModePinned, pgtype.UUID{}, false},
+		// The two directions M3-B added. A non-pinned worker does not READ the id on
+		// its claim, so emitting it invites a client to render a binding that governs
+		// nothing.
+		{"default with a stale id hides it", workersvc.BindModeDefault, bound, false},
+		{"auto with a stale id hides it", workersvc.BindModeAuto, bound, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotID, gotLabel := bindingForMode(tc.mode, tc.secret, "console-key")
+			if (gotID != nil) != tc.wantID {
+				t.Fatalf("id = %v, want present=%v", gotID, tc.wantID)
+			}
+			// The label tracks the id exactly: a label with no id would be the same
+			// contradiction wearing the other field.
+			if (gotLabel != nil) != tc.wantID {
+				t.Fatalf("label = %v, want present=%v", gotLabel, tc.wantID)
+			}
+		})
+	}
+
+	// The whole-DTO statement: whatever the row holds, the mode a client reads and
+	// the binding it reads agree with each other.
+	for _, mode := range []string{workersvc.BindModeDefault, workersvc.BindModeAuto, workersvc.BindModePinned} {
+		dto := workerDTOFromWorker(store.Worker{
+			AnthropicBindMode: mode, AnthropicSecretID: bound,
+		}, 0, false, "console-key", "", time.Now(), time.Now())
+		if dto.AnthropicBindMode == workersvc.BindModePinned && dto.AnthropicSecretID == nil {
+			t.Errorf("mode %q: DTO says pinned with no credential", mode)
+		}
+		if dto.AnthropicBindMode != workersvc.BindModePinned && dto.AnthropicSecretID != nil {
+			t.Errorf("mode %q: DTO says %q while carrying a credential id — a client rendering "+
+				"off the id would say the worker is pinned while its claims spend something else",
+				mode, dto.AnthropicBindMode)
+		}
+	}
+}

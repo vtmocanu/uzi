@@ -83,6 +83,12 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "alpha", TokenHash: tokenHash(),
+		// 00088 made anthropic_bind_mode NOT NULL with a CHECK, and CreateWorker now
+		// names it (PRD #111 M3-BLOCK), so a direct-store call must say which mode it
+		// means — the zero value "" is a row the database cannot hold. Deliberately NOT
+		// defaulted in SQL: an empty mode silently becoming 'default' is exactly how the
+		// mint-time binding regression hid.
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
@@ -166,12 +172,14 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	if _, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "beta", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
+		AnthropicBindMode: "pinned",
 	}); err == nil {
 		t.Fatal("minting a worker already bound to another user's secret must be refused by the FK")
 	}
 	minted, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "gamma", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: ownerDefault, Valid: true},
+		AnthropicBindMode: "pinned",
 	})
 	if err != nil {
 		t.Fatalf("minting a worker bound to the owner's own secret: %v", err)

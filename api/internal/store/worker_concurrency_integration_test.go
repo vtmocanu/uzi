@@ -50,6 +50,7 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: userID, Name: "laptop", TokenHash: []byte{0xaa, 0xbb},
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
@@ -103,9 +104,9 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	for i, st := range []string{"claimed", "running", "awaiting_approval"} {
 		seedRun(int64(10+i), st, &wkr.ID)
 	}
-	seedRun(20, "queued", &wkr.ID)      // active_runs excludes queued
-	seedRun(21, "completed", &wkr.ID)   // and excludes terminal
-	seedRun(22, "running", nil)         // a run held by no worker must not inflate the count
+	seedRun(20, "queued", &wkr.ID)    // active_runs excludes queued
+	seedRun(21, "completed", &wkr.ID) // and excludes terminal
+	seedRun(22, "running", nil)       // a run held by no worker must not inflate the count
 
 	// seedChatRun inserts an ACTIVE chat run (kind='chat' ⇒ repo_id/issue_iid/branch
 	// all NULL per runs_kind_shape) held by holder. A chat is active for busy but is
@@ -123,6 +124,7 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	// case the naive "busy = active_runs > 0" derivation would get wrong).
 	wkr2, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: userID, Name: "chat-only", TokenHash: []byte{0xcc, 0xdd},
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker(wkr2): %v", err)

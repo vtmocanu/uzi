@@ -44,4 +44,11 @@ UPDATE workers SET anthropic_bind_mode = 'pinned' WHERE anthropic_secret_id IS N
 -- path, never used as a search predicate.
 
 -- +goose Down
+--
+-- LOSSY FOR 'auto', DELIBERATELY AND UNAVOIDABLY. Down drops the column and the Up
+-- re-derives it from anthropic_secret_id, so 'pinned' and 'default' round-trip
+-- exactly — but an 'auto' worker holds NO id by construction, so down-then-up
+-- returns it to 'default'. The id cannot express 'auto', so nothing here could
+-- preserve it; stated so an operator does not assume the cycle is lossless and
+-- discover a fleet of auto workers quietly back on the owner's default.
 ALTER TABLE workers DROP COLUMN anthropic_bind_mode;

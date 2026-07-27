@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -191,4 +192,95 @@ func TestSetWorkerAnthropicTokenDropsTheIDOffPinned(t *testing.T) {
 			t.Fatal("an illegal mode still reached the write")
 		}
 	})
+}
+
+// createStore records what CreateWorker writes. It also serves the label→id
+// resolution the mint path performs first.
+type createStore struct {
+	Store
+	labels map[string]uuid.UUID
+	arg    store.CreateWorkerParams
+	called bool
+}
+
+func (c *createStore) GetUserSecretIDByLabel(_ context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error) {
+	id, ok := c.labels[strings.ToLower(arg.Label)]
+	if !ok {
+		return uuid.UUID{}, pgx.ErrNoRows
+	}
+	return id, nil
+}
+
+func (c *createStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
+	c.called = true
+	c.arg = arg
+	return store.Worker{
+		ID: uuid.New(), UserID: arg.UserID, Name: arg.Name,
+		AnthropicSecretID: arg.AnthropicSecretID,
+		AnthropicBindMode: arg.AnthropicBindMode,
+	}, nil
+}
+
+// TestCreateWorkerWritesTheBindMode is M3-BLOCK's regression test, and the reason
+// it did not exist is the finding underneath the finding: CreateWorker had two test
+// call sites and BOTH passed "" for the label, so the mint-with-a-binding path — the
+// only one where the invariant lives — was never staged.
+//
+// The bug it pins: PRD #111 M3 made the MODE decide whether the id is read at all,
+// and CreateWorker's INSERT set the id without it. A worker minted through the
+// shipped `POST /api/workers {"anthropic_token":"console-key"}` therefore landed
+// (id=<secret>, mode="default") and its claims opened the OWNER'S DEFAULT. PRD #104
+// M3's mint-time binding was dead, silently, in every channel — and M1 made it worse
+// by recording the credential actually opened, so the attribution feature
+// corroborated the wrong answer.
+//
+// The assertion is end-to-end through resolution rather than on the params alone:
+// what matters is not that a column was written but that the worker RESOLVES to the
+// credential it was minted with.
+func TestCreateWorkerWritesTheBindMode(t *testing.T) {
+	consoleID := uuid.New()
+	st := &createStore{labels: map[string]uuid.UUID{"console-key": consoleID}}
+	svc := New(st, newBox(t), testParams())
+
+	wkr, _, err := svc.CreateWorker(context.Background(), uuid.New(), "alpha", "", "console-key")
+	if err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	if !st.called {
+		t.Fatal("no worker was written")
+	}
+	if st.arg.AnthropicBindMode != BindModePinned {
+		t.Fatalf("minted with a label but wrote mode %q, want pinned — the row carries a binding "+
+			"the mode says to ignore, so every claim spends the owner's default instead",
+			st.arg.AnthropicBindMode)
+	}
+	got := workerSecretID(wkr)
+	if got == nil {
+		t.Fatal("a worker minted WITH a binding resolves to the owner's default; " +
+			"PRD #104 M3's mint-time binding is dead")
+	}
+	if *got != consoleID {
+		t.Fatalf("resolved %v, want the minted credential %v", *got, consoleID)
+	}
+}
+
+// The unbound mint is the overwhelming majority and must land 'default' with a NULL
+// id — the state every worker had before any of this existed.
+func TestCreateWorkerWithoutALabelIsDefault(t *testing.T) {
+	st := &createStore{labels: map[string]uuid.UUID{}}
+	svc := New(st, newBox(t), testParams())
+
+	wkr, _, err := svc.CreateWorker(context.Background(), uuid.New(), "alpha", "", "")
+	if err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	if st.arg.AnthropicBindMode != BindModeDefault {
+		t.Fatalf("unbound mint wrote mode %q, want default", st.arg.AnthropicBindMode)
+	}
+	if st.arg.AnthropicSecretID.Valid {
+		t.Fatalf("unbound mint wrote a credential id: %+v", st.arg.AnthropicSecretID)
+	}
+	if got := workerSecretID(wkr); got != nil {
+		t.Fatalf("unbound worker resolved %v, want the owner's default", *got)
+	}
 }

@@ -63,6 +63,7 @@ func TestWorkerBindModeLiveDB(t *testing.T) {
 	}
 	wkr, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "alpha", TokenHash: tokenHash(),
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
@@ -189,12 +190,17 @@ func TestWorkerBindModeBackfillLiveDB(t *testing.T) {
 	bound, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "bound", TokenHash: tokenHash(),
 		AnthropicSecretID: pgtype.UUID{Bytes: secret.ID, Valid: true},
+		// DEFAULT deliberately, not pinned: this reconstructs the PRE-BACKFILL state —
+		// a row carrying a binding while the mode still holds the column default, which
+		// is exactly what 00088 found and what its UPDATE has to repair.
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("create bound worker: %v", err)
 	}
 	unbound, err := q.CreateWorker(ctx, store.CreateWorkerParams{
 		UserID: owner, Name: "unbound", TokenHash: tokenHash(),
+		AnthropicBindMode: "default",
 	})
 	if err != nil {
 		t.Fatalf("create unbound worker: %v", err)
@@ -216,8 +222,35 @@ func TestWorkerBindModeBackfillLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read 00088: %v", err)
 	}
-	if !strings.Contains(string(migration), backfill) {
-		t.Fatalf("00088 no longer contains its backfill statement:\n\t%s\n"+
+	// 🔴 THE CONTROL CATCHES DELETION AND HAS TO CATCH DISABLING, WHICH IS LIKELIER.
+	// A bare strings.Contains over the whole file is satisfied by a COMMENTED-OUT
+	// statement — measured: with the line prefixed `-- `, Contains still returns true —
+	// and equally by one moved below the `-- +goose Down` marker. In both, the
+	// migration ships with no working backfill, every worker that had a binding
+	// silently stops honouring its pin, and this test stays green. Commenting out is
+	// what someone does when "temporarily" disabling something, so it is at least as
+	// likely as deleting.
+	//
+	// So: split on the Down marker, read only the Up half, and require the statement
+	// on a line that is not itself a comment.
+	up, _, found := strings.Cut(string(migration), "-- +goose Down")
+	if !found {
+		t.Fatal("00088 has no `-- +goose Down` marker; cannot tell its Up half from its Down half")
+	}
+	var live bool
+	for _, line := range strings.Split(up, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		if strings.Contains(trimmed, backfill) {
+			live = true
+			break
+		}
+	}
+	if !live {
+		t.Fatalf("00088's Up half contains no LIVE backfill statement (commented out, moved below "+
+			"the Down marker, or deleted):\n\t%s\n"+
 			"Without it every worker that had a binding when the column was added silently "+
 			"stops honouring its pin and spends the owner's default instead.", backfill)
 	}

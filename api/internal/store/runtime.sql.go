@@ -745,8 +745,8 @@ func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerd
 
 const createWorker = `-- name: CreateWorker :one
 
-INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
@@ -756,6 +756,7 @@ type CreateWorkerParams struct {
 	TokenHash         []byte      `json:"token_hash"`
 	TemplateDeclared  pgtype.Text `json:"template_declared"`
 	AnthropicSecretID pgtype.UUID `json:"anthropic_secret_id"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 }
 
 // Workers -----------------------------------------------------------------
@@ -764,6 +765,21 @@ type CreateWorkerParams struct {
 // (PRD #18), NULL when the caller made no choice. anthropic_secret_id is the
 // optional mint-time token binding (PRD #104 M3); NULL means "my owner's default",
 // which is what every worker minted before this was and stays.
+//
+// 🔴 anthropic_bind_mode MUST BE NAMED HERE, and its absence was a silent
+// regression. PRD #111 M3 made the MODE decide whether the id is read at all
+// (workerSecretID gates on it first), and this INSERT set five columns without it —
+// so the row took 00088's column default 'default' while carrying a real binding,
+// and every worker minted through `POST /api/workers {"anthropic_token":"..."}`
+// quietly spent the OWNER'S DEFAULT instead. PRD #104 M3's mint-time binding was
+// dead, silently, in every channel — and M1 made it worse: the run records the
+// credential actually opened, so the attribution feature CORROBORATED the wrong
+// answer.
+//
+// Written in the SAME statement as the id, for the reason SetWorkerAnthropicSecret
+// gives: mode and id describe one decision, and a row where they disagree is one no
+// resolution rule can rescue. The caller derives the pair (pinned when a label
+// resolved, else default), exactly as PatchWorker does.
 func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createWorker,
 		arg.UserID,
@@ -771,6 +787,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		arg.TokenHash,
 		arg.TemplateDeclared,
 		arg.AnthropicSecretID,
+		arg.AnthropicBindMode,
 	)
 	var i Worker
 	err := row.Scan(
