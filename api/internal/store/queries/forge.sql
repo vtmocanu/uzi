@@ -193,8 +193,10 @@ SET title            = EXCLUDED.title,
 RETURNING *;
 
 -- name: ListIssuesByRepo :many
--- The board payload's issue half, and the ONLY caller is handler.buildBoard — so this
--- ORDER BY is the board's rendered order, and changing it changes nothing else.
+-- The board payload's issue half. In PRODUCTION the only caller is handler.buildBoard, so
+-- this ORDER BY is the board's rendered order and changing it changes nothing else. (There
+-- is a second caller in board_order_integration_test.go, which exists to pin this clause —
+-- the earlier flat "only caller" was true of production and wrong as stated.)
 --
 -- NULLS LAST is Postgres's default for ASC; it is written out because it is
 -- load-bearing rather than incidental (PRD #102 Decision 7b). A card nobody has
@@ -218,9 +220,21 @@ ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC;
 -- in submitted order. Board-global, so a card dragged between columns keeps a number
 -- that still means something in its destination.
 --
--- The ::bigint cast on the ordinal expression is load-bearing: sqlc's inference is
--- weaker on expressions than on columns, and an uncast expression here generates as
--- interface{} rather than a usable typed value.
+-- The ::bigint cast is EXPLICITNESS, NOT NECESSITY, and the distinction is recorded
+-- because the comment here used to assert the opposite. It claimed sqlc would generate
+-- the uncast expression as interface{} — measured false: dropping the cast and
+-- re-running sqlc v1.30.0 leaves SetBoardOrderPositionsParams byte-identical and the
+-- whole generated file differing only in the embedded SQL literal.
+--
+-- The structural reason CLAUDE.md's inference trap does not reach here: that trap is
+-- about a PROJECTION consumed as a Go value, and this is an :exec query with no
+-- RETURNING, so `pos` never crosses into Go at all — Postgres consumes it in
+-- SET board_position = v.pos. The cast is also semantically inert (WITH ORDINALITY
+-- yields bigint, bigint * int is bigint, and the column is bigint).
+--
+-- Kept anyway, because saying the width out loud next to an arithmetic expression is
+-- cheap and survives someone changing the multiplier. It is not load-bearing, and a
+-- comment that teaches a false rule about sqlc is worse than no comment.
 --
 -- THE UNKNOWN-IID RULE IS THIS JOIN, not a code path. An iid the client listed but
 -- the server no longer holds (evicted by DeleteIssuesNotIn between render and submit)

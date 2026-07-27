@@ -91,9 +91,11 @@ Both do exactly the same thing, so use whichever suits you.
 
 **With the keyboard.** Focus a card, or hover it, and use the small **up** and
 **down** buttons next to the issue number. Each press moves the card one place
-within its column, and the buttons are disabled at the top and bottom. They are
-reachable by tabbing, and each one is announced with the card and the direction
-("Move issue #42 down in Planned"), so this works without a mouse.
+within its column. The **up** button is disabled on the top card and **down** on
+the bottom one; a card that is alone in its column shows no buttons at all,
+since there is nowhere for it to go. They are reachable by tabbing, and each one
+is announced with the card and the direction ("Move issue #42 down in Planned"),
+so this works without a mouse.
 
 **By dragging.** Pick a card up and drop it where you want it. A line appears on
 the edge of the card you are hovering to show where it will land. Dropping onto
@@ -117,8 +119,10 @@ Two consequences worth knowing:
   order you had recorded before.
 - Issues that arrive after you last reordered appear at the **bottom** of their
   column rather than jumping to the top, in issue-number order among
-  themselves. Closing an issue clears its place, so an issue that reopens later
-  comes back at the bottom too.
+  themselves.
+- Closed issues drop out of the recorded order the next time you reorder
+  anything, so an issue that reopens after that comes back at the bottom of its
+  column. Reopened before then, it returns to the place it used to hold.
 
 ## Automatic moves
 

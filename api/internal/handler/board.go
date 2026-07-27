@@ -64,11 +64,12 @@ type cardDTO struct {
 	// NOT NULL), for the board's "Last updated" sort mode (PRD #102 M5).
 	//
 	// It must be set by BOTH card builders — assembleCards AND issueToCard. Missing
-	// it in issueToCard (the single-card path behind MoveIssue and SetIssuePrdless)
-	// is silent: the card comes back with the zero time, marshals as
-	// "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last updated mode
-	// while every other card is fine. The typechecker cannot see it; only a test that
-	// drags in that mode can.
+	// it in issueToCard (the single-card path, behind MoveIssue, SetIssuePrdless AND
+	// CreateIssue in handler/issues.go — three call sites, not the two this comment
+	// named until 2026-07-27) is silent: the card comes back with the zero time,
+	// marshals as "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last
+	// updated mode while every other card is fine. The typechecker cannot see it; only
+	// a test that drags in that mode can.
 	//
 	// board_position deliberately does NOT ride the card. The order is expressed by
 	// ListIssuesByRepo's ORDER BY, never as a number the client reasons about, which
@@ -890,6 +891,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 
 // issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
+// Three production callers: MoveIssue, SetIssuePrdless and CreateIssue (issues.go).
 func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
 	var labels []string
 	if err := json.Unmarshal(is.Labels, &labels); err != nil {

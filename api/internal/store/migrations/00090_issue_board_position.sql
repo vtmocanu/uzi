@@ -1,13 +1,17 @@
 -- +goose Up
 
--- Manual board ordering (PRD #102 M5, Decision 7/7b). The FIRST uzi-owned column on
--- `issues`, which is otherwise a pure forge cache — every other field is overwritten
--- from the forge on every sync. That inversion is the reason this migration needs a
--- comment at all: the invariant "every issue field is overwritten from the forge each
--- sync" stops being true here, and the thing that keeps this column safe is that
--- UpsertIssue's ON CONFLICT DO UPDATE names its columns explicitly rather than using
--- EXCLUDED.*, so board_position is excluded by omission. A future edit that adds it to
--- that SET list would silently reset every user's manual order once a minute.
+-- Manual board ordering (PRD #102 M5, Decision 7/7b). The first uzi-owned column on
+-- `issues`, which is otherwise a forge cache: every FORGE-DERIVED field (title, state,
+-- labels, web_url, author, has_prd_link, forge_updated_at) is overwritten on every
+-- sync. Stated that way deliberately — "every other field" was the earlier wording and
+-- is not true of `synced_at` (which comes from now()) nor of `id`/`repo_id` (never
+-- overwritten at all).
+--
+-- The thing that keeps this column safe is that UpsertIssue's ON CONFLICT DO UPDATE
+-- names its columns explicitly rather than using EXCLUDED.*, so board_position is
+-- excluded by omission. A future edit that adds it to that SET list would silently
+-- reset every user's manual order once a minute. Verified against the generated const,
+-- not just the .sql, and guarded by TestUpsertIssuePreservesBoardPositionLiveDB.
 --
 -- NULLABLE WITH NO DEFAULT, and that is the whole design rather than a shortcut.
 -- NULL means "never frozen, or synced since the last freeze", which is exactly the
