@@ -246,9 +246,16 @@ func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Lab
 func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error) {
 	opt := &gitlab.ListProjectIssuesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		// state=all is mandatory: the Closed column and de-label/close eviction
-		// both depend on seeing closed issues.
-		State: gitlab.Ptr("all"),
+		// state=all remains the DEFAULT (opts.State's zero value): the Closed column
+		// and de-label/close eviction both depend on seeing closed issues, so every
+		// pre-M6 caller must keep getting it.
+		//
+		// GitLab's REQUEST vocabulary is opened/closed/all, which happens to be
+		// identical to uzi's neutral vocabulary — so this driver needs no translation
+		// and the mapping below is a pass-through. That coincidence is exactly why a
+		// GitLab-shaped fake cannot catch a driver that fails to translate; see the
+		// Forgejo driver, where the vocabularies differ.
+		State: gitlab.Ptr(gitlabIssueStateParam(opts.State)),
 	}
 	if len(opts.Labels) > 0 {
 		labels := gitlab.LabelOptions(opts.Labels)
@@ -543,4 +550,20 @@ func toIssue(i *gitlab.Issue) Issue {
 		issue.UpdatedAt = *i.UpdatedAt
 	}
 	return issue
+}
+
+// gitlabIssueStateParam maps the neutral state onto GitLab's `state` query
+// parameter. The two vocabularies coincide (opened/closed/all), so this is a
+// pass-through with an explicit default — written out rather than inlined so the
+// Forgejo driver's genuine translation has a visible counterpart, and so an
+// unrecognised value can never reach the API as a silent filter.
+func gitlabIssueStateParam(s IssueState) string {
+	switch s {
+	case StateOpened:
+		return "opened"
+	case StateClosed:
+		return "closed"
+	default:
+		return "all"
+	}
 }

@@ -301,12 +301,20 @@ func (f *forgejo) ListIssues(ctx context.Context, projectID int64, opts ListIssu
 	}
 	opt := gitea.ListIssueOption{
 		ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage},
-		// state=all is mandatory (the Closed column + de-label/close eviction need
-		// closed issues). type=issues asks Forgejo to omit pull requests, but the
-		// client-side filter below is the actual guarantee (R4): a PR is modelled as
-		// an issue with a non-nil pull_request, and one leaking onto the board as a
-		// card is silent and embarrassing.
-		State: gitea.StateAll,
+		// state=all remains the DEFAULT (opts.State's zero value): the Closed column
+		// and de-label/close eviction need closed issues. type=issues asks Forgejo to
+		// omit pull requests, but the client-side filter below is the actual guarantee
+		// (R4): a PR is modelled as an issue with a non-nil pull_request, and one
+		// leaking onto the board as a card is silent and embarrassing.
+		//
+		// THE STATE VALUE MUST BE TRANSLATED, and this is the one place in M6 where a
+		// pass-through is wrong. Forgejo's REQUEST vocabulary is open/closed/all;
+		// uzi's neutral vocabulary is opened/closed/all. Passing the neutral "opened"
+		// straight through sends an invalid state and the filter silently does not
+		// apply. The reason nothing else in the codebase notices the difference is
+		// that forgejoIssueState already normalises the RESPONSE the other way, so the
+		// divergence is invisible everywhere except right here.
+		State: forgejoIssueStateParam(opts.State),
 		Type:  gitea.IssueTypeIssue,
 	}
 	if len(opts.Labels) > 0 {
@@ -692,6 +700,23 @@ func toForgejoIssue(i *gitea.Issue) Issue {
 		issue.Author = i.Poster.UserName
 	}
 	return issue
+}
+
+// forgejoIssueStateParam maps the NEUTRAL state onto Forgejo's request vocabulary.
+// This is the outbound counterpart of forgejoIssueState below, and the two are not
+// symmetric names by accident: Forgejo says "open" where uzi says "opened", so a
+// caller's neutral StateOpened must become gitea.StateOpen here or the filter is
+// silently ignored. Anything unrecognised falls back to StateAll, which is the
+// pre-M6 behaviour and the safe direction (over-fetch, never under-fetch).
+func forgejoIssueStateParam(s IssueState) gitea.StateType {
+	switch s {
+	case StateOpened:
+		return gitea.StateOpen
+	case StateClosed:
+		return gitea.StateClosed
+	default:
+		return gitea.StateAll
+	}
 }
 
 // forgejoIssueState maps Forgejo's issue state onto the neutral "opened"/"closed"
