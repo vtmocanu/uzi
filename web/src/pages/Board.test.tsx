@@ -61,7 +61,6 @@ function renderCard(over: Partial<Card> = {}, chips: string[] = [], maxChips?: n
         laneLabel="Backlog"
         canMoveUp={false}
         canMoveDown={false}
-        reordering={false}
         onMoveUp={vi.fn()}
         onMoveDown={vi.fn()}
         insertionEdge={null}
@@ -721,6 +720,51 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     const cls = moveBtn(1, "down").className;
     expect(cls).toContain("min-h-6");
     expect(cls).toContain("min-w-6");
+  });
+
+  // S8 (browser pass). Refusing the second gesture beats losing the first move, but
+  // silence was not the trade-off: every other rejection path on this board speaks.
+  it("says why a second reorder was refused instead of doing nothing visible", async () => {
+    let release: (v: { board: BoardData }) => void = () => {};
+    mockApi.reorderBoard.mockImplementation(
+      () => new Promise<{ board: BoardData }>((res) => { release = res; }),
+    );
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+
+    const card3 = screen.getByText("issue three").closest("div[draggable]") as HTMLElement;
+    fireEvent.drop(card3, { dataTransfer: { getData: () => "2" }, clientY: 0 });
+    await screen.findByText(/Still saving the previous move/);
+    expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1);
+    release({ board: aBoard() });
+  });
+
+  // S4 (browser pass). Closed cards keep a NULL position by design, so the payload
+  // returns them in the SQL fallback order and the lane jumped on the first drop from
+  // any non-iid mode — including a drop that moved nothing at all.
+  it("keeps the Closed lane in iid order whatever the board mode is", async () => {
+    const withClosed = () => [
+      ...cards(),
+      aCard({ iid: 15, title: "issue fifteen", column: "", closed: true, forge_updated_at: "2026-09-01T00:00:00Z" }),
+      aCard({ iid: 18, title: "issue eighteen", column: "", closed: true, forge_updated_at: "2026-08-01T00:00:00Z" }),
+    ];
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: withClosed() }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    const closedIids = () =>
+      within(laneFor("Closed"))
+        .getAllByRole("link", { name: /^issue / })
+        .map((a) => a.textContent);
+
+    // Under `updated`, 15 is newer than 18 — so a mode-sorted Closed lane would put 15
+    // first. It must stay in iid order either way.
+    // 15, 18, 99 — the base fixture already contributes a closed card at iid 99.
+    expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "updated" } });
+    expect(closedIids()).toEqual(["issue fifteen", "issue eighteen", "issue closed"]);
   });
 
   it("degrades a corrupt persisted mode to Manual instead of breaking the board", async () => {

@@ -138,11 +138,11 @@ export function Board() {
   // onDragOver — the HTML drag-and-drop model puts the drag data store in protected
   // mode for every event except dragstart and drop, so getData() there returns "".
   const [insertAt, setInsertAt] = useState<DropAnchor | null>(null);
-  // `reordering` drives the DISABLED state of the reorder buttons; reorderRef is what
-  // actually refuses a re-entrant drop. Two of them because a state read inside an
-  // event handler sees the value from that render, so two drops in one batch would
-  // both see `false` — a ref is updated synchronously and is the only thing that can
-  // reject the second.
+  // reorderRef is what REFUSES a re-entrant drop; `reordering` only tells the focus
+  // effect below when the operation settled. Two of them because a state read inside an
+  // event handler sees the value from that render, so two drops in one batch would both
+  // see `false` — a ref is updated synchronously and is the only thing that can reject
+  // the second. `reordering` no longer disables anything (see B1 below).
   const [reordering, setReordering] = useState(false);
   const reorderRef = useRef(false);
   // B1. `reordering` drives the buttons' `disabled`, and DISABLING A FOCUSED BUTTON
@@ -156,11 +156,18 @@ export function Board() {
   // becomes 38 tabs, one press, 38 tabs, one press. The buttons exist to satisfy
   // WCAG 2.1.1; this made them single-use, and fails 2.4.3 (Focus Order) as well.
   //
-  // Restoring focus rather than dropping `disabled`: the busy signal is worth keeping,
-  // and the ref guard above already makes a second press harmless, so `disabled` is now
-  // purely an affordance. React replaces the button element on re-render, so the
-  // restore matches on the accessible NAME, which is stable across a within-column move
-  // (same card, same direction, same lane).
+  // TWO SEPARATE FOCUS-LOSS PATHS, and the fix needs both halves:
+  //
+  //   1. DISABLING the focused button blurred it. Closed by not disabling at all —
+  //      reorderRef refuses re-entry synchronously, so `disabled` was only ever an
+  //      affordance here. Removing the cause beats compensating for it.
+  //   2. The board RE-RENDERS on setBoard and React replaces the button element, which
+  //      drops focus even with nothing disabled. That path is real and independent:
+  //      measured by the fallback test below, which reddens when this restore is removed
+  //      while no button is ever disabled.
+  //
+  // So the restore stays. It matches on the accessible NAME, which is stable across a
+  // within-column move (same card, same direction, same lane).
   const refocusName = useRef<string | null>(null);
   useEffect(() => {
     if (reordering || refocusName.current == null) return;
@@ -444,14 +451,25 @@ export function Board() {
 
   const cardsByColumn = useMemo(() => {
     const map = new Map<string, CardData[]>();
-    // Sorting ALL render cards (closed included) means the Closed lane follows the mode
-    // too, which is what a board-wide switcher implies.
     for (const c of sortCards(renderCards, sortMode)) {
       const key = columnKeyForCard(c);
       const arr = map.get(key) ?? [];
       arr.push(c);
       map.set(key, arr);
     }
+    // S4. THE CLOSED LANE IS ALWAYS iid ORDER, never the board's mode. Closed cards are
+    // excluded from the freeze by design (Decision 7b) and keep a NULL position, so the
+    // FIRST drop from any non-iid mode silently re-sorts the Closed lane underneath the
+    // user: the payload comes back ordered by the SQL fallback and the lane jumps.
+    //
+    // The browser pass showed it happening on a gesture that moved NOTHING — a card
+    // dropped back on itself, which is the natural "changed my mind" recovery — and the
+    // Closed lane still went 18 15 -> 15 18. A lane that reshuffles when the user
+    // deliberately cancelled is worse than one that ignores the sort control, and Closed
+    // is the one lane where the modes are least useful anyway (nothing there is running,
+    // and its cards are not draggable).
+    const closed = map.get(CLOSED_KEY);
+    if (closed) map.set(CLOSED_KEY, [...closed].sort((a, b) => a.iid - b.iid));
     return map;
   }, [renderCards, sortMode]);
 
@@ -493,7 +511,14 @@ export function Board() {
   const applyDrop = useCallback(
     async (dragIid: number, destKey: string, anchor: DropAnchor | null): Promise<boolean> => {
       if (destKey === CLOSED_KEY) return false; // Closed is not a drop target.
-      if (reorderRef.current) return false; // a reorder is already in flight
+      if (reorderRef.current) {
+        // S8. Refusing beats losing the move, but silence is not the trade-off — every
+        // other rejection here speaks (move() surfaces a forge error, a failed reorder
+        // sets "Could not save the new order"). On a slow link a user who drags twice
+        // would otherwise conclude the drag is broken.
+        setError("Still saving the previous move — try again in a moment.");
+        return false;
+      }
       const intent = dropIntent({
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
         columnKeys,
@@ -759,7 +784,6 @@ export function Board() {
                     // cards get neither.
                     canMoveUp={col.droppable && !card.closed && i > 0}
                     canMoveDown={col.droppable && !card.closed && i < cards.length - 1}
-                    reordering={reordering}
                     onMoveUp={() => moveCard(card, "up")}
                     onMoveDown={() => moveCard(card, "down")}
                     // Never an edge on the dragged card itself.
@@ -882,7 +906,6 @@ export function IssueCard({
   laneLabel,
   canMoveUp,
   canMoveDown,
-  reordering,
   onMoveUp,
   onMoveDown,
   insertionEdge,
@@ -918,9 +941,12 @@ export function IssueCard({
   laneLabel: string;
   canMoveUp: boolean;
   canMoveDown: boolean;
-  // A reorder is in flight anywhere on the board: disable every ↑/↓ so a second press
-  // cannot compute an order from a board the first press is about to replace.
-  reordering: boolean;
+  // NOTE: there is deliberately no `reordering` prop. It used to disable these buttons
+  // while a reorder was in flight, and DISABLING A FOCUSED BUTTON BLURS IT — that was
+  // B1, the focus falling to <body> and never coming back. Since #18 the re-entry guard
+  // is reorderRef, which refuses synchronously, so `disabled` was only ever an
+  // affordance here and dropping it removes the whole failure mode rather than
+  // compensating for it.
   onMoveUp: () => void;
   onMoveDown: () => void;
   // Which edge of this card the pointer is nearest during a drag, or null. Rendered as
@@ -1020,7 +1046,7 @@ export function IssueCard({
               <button
                 type="button"
                 draggable={false}
-                disabled={!canMoveUp || reordering}
+                disabled={!canMoveUp}
                 onClick={onMoveUp}
                 aria-label={`Move issue #${card.iid} up in ${laneLabel}`}
                 title={`Move issue #${card.iid} up in ${laneLabel}`}
@@ -1031,7 +1057,7 @@ export function IssueCard({
               <button
                 type="button"
                 draggable={false}
-                disabled={!canMoveDown || reordering}
+                disabled={!canMoveDown}
                 onClick={onMoveDown}
                 aria-label={`Move issue #${card.iid} down in ${laneLabel}`}
                 title={`Move issue #${card.iid} down in ${laneLabel}`}
