@@ -77,6 +77,11 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
       false,
       "the agent branch must NOT appear in the worker bare's heads (worker is bare-only)",
     );
+    // The base commit is REPORTED, not just used internally: the lead cannot otherwise
+    // know its branch's parent, and the clone's own default branch is not it (see the
+    // resume case below). Nothing has committed yet, so the checkout point IS HEAD.
+    assert.match(rc.baseCommit, /^[0-9a-f]{40}$/, "baseCommit must be a full resolved SHA");
+    assert.strictEqual(rc.baseCommit, gitIn(rc.path, ["rev-parse", "HEAD"]));
   });
 
   it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
@@ -124,6 +129,16 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     // Resumed off the fresh origin tip (A.txt present), NOT recreated off default.
     assert.strictEqual(fs.existsSync(path.join(second.path, "A.txt")), true);
     assert.strictEqual(gitIn(second.path, ["rev-parse", "HEAD"]), sha1);
+    // …and the reported base is the BRANCH's own tip, not the default branch's. This is
+    // the case the lead cannot infer: the clone still carries a local default branch,
+    // freshly fetched and pointing somewhere else entirely, so a diff written against it
+    // spans commits this branch never touched.
+    assert.strictEqual(second.baseCommit, sha1, "resume seeds off the branch's origin tip");
+    assert.notStrictEqual(
+      second.baseCommit,
+      gitIn(fx.originPath, ["rev-parse", "HEAD"]),
+      "…and that tip is NOT the default branch's, which is exactly why the base has to be reported",
+    );
   });
 
   // Issue #134 (the production half of #127). Any git that writes into a repo spawns a

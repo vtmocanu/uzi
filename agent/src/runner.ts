@@ -298,6 +298,9 @@ export class RunRunner {
         pipeline: claim.pipeline,
         worktreePath: runnerClone.path,
         branch: runnerClone.branch,
+        // The seed resolved this in the bare; forwarding it is what stops the lead from
+        // guessing the branch's parent (judge rec, run 51757591).
+        baseCommit: runnerClone.baseCommit,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,

@@ -216,6 +216,52 @@ function priorWorkNote(prior: PriorWork | undefined): string {
   ].join("\n");
 }
 
+// ─── The clone's base commit (judge rec, run 51757591) ───────────────────────
+// The lead handed a subagent `git diff main...HEAD` as "the branch diff" and got a
+// multi-megabyte diff across ~100 unrelated commits; the subagent had to work the real
+// parent out for itself, and the lead then saved a cross-run MEMORY about it — the tell
+// that uzi should be stating the fact rather than each run rediscovering it.
+//
+// The worker has always known the answer: git.ts resolves the base in the bare and checks
+// the branch out at it. Measured on a resume-shaped clone (prior pushed work on the branch,
+// 5 newer commits on the default branch):
+//
+//   git diff <base>..HEAD   -> this run's work alone            (1 file)
+//   git diff main...HEAD    -> + the PRIOR run's commits        (2 files; merge-base sits
+//                                                                behind the seeded base)
+//   git diff main..HEAD     -> + every default-branch commit as a DELETION (7 files)
+//
+// so neither default-branch form answers "what did this branch change"; only the explicit
+// base does.
+
+/** Bound + shape for a base commit before it is spoken in a prompt. The value is uzi's own
+ *  `rev-parse` output, not repo text, so this is hygiene rather than containment — but the
+ *  note sits OUTSIDE every fence, so the one thing that must hold unconditionally is that
+ *  it cannot carry a newline or markup. A hex object name cannot; anything else is dropped
+ *  rather than rendered. */
+const BASE_COMMIT_RE = /^[0-9a-f]{7,64}$/;
+
+/**
+ * The paragraph that tells the lead which commit its branch was cut from, and which diff
+ * commands are therefore right. Plain and outside every untrusted fence: like priorWorkNote,
+ * it is uzi's own statement of fact about the clone, not repo- or user-supplied text.
+ *
+ * Absent/malformed base ⇒ nothing is injected. Saying nothing leaves the lead exactly where
+ * it is today; naming a commit that is not the parent would be worse than silence.
+ */
+export function baseCommitNote(baseCommit: string | undefined): string {
+  if (!baseCommit || !BASE_COMMIT_RE.test(baseCommit)) return "";
+  return [
+    `Your branch was created at commit ${baseCommit}. To see exactly what this branch`,
+    `changed, use \`git diff ${baseCommit}..HEAD\` (and \`git log ${baseCommit}..HEAD\`), and`,
+    `pass that commit to any subagent you ask to review the diff.`,
+    `Do NOT diff against the default branch here: this clone's default branch was fetched`,
+    `fresh and is NOT this branch's parent, so \`main..HEAD\` reports every commit the`,
+    `default branch gained as a deletion, and \`main...HEAD\` folds in work that earlier`,
+    `runs already pushed to this branch.`,
+  ].join("\n");
+}
+
 // ─── Dependency provisioning notes (#157) ────────────────────────────────────
 // PRD #121 made the worker install the clone's JS dependencies before the agent's
 // first implement turn. Nothing TOLD the agent, so on run 51757591 it planned
@@ -378,6 +424,9 @@ export interface PlanPromptInput {
   /** Issue #105: set only when a dropped resume left the lead amnesiac ON a branch
    *  that already carries pushed work. */
   priorWork?: PriorWork;
+  /** The commit the runner clone cut this branch from (git.ts `RunnerClone.baseCommit`).
+   *  Absent ⇒ no note. See baseCommitNote. */
+  baseCommit?: string;
 }
 
 /**
@@ -389,9 +438,11 @@ export interface PlanPromptInput {
 export function buildPlanPrompt(input: PlanPromptInput): string {
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
+  const baseNote = baseCommitNote(input.baseCommit);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
+    ...(baseNote ? ["", baseNote] : []),
     "",
     UNTRUSTED_FRAME,
     "",
@@ -442,6 +493,12 @@ export interface ImplementPromptInput {
   /** #157 / audit 1: discovery hit a bound, so `deps` is a PREFIX. Carried so the note
    *  cannot read as exhaustive coverage of the repo's JS projects. */
   depsTruncated?: boolean;
+  /** The commit the runner clone cut this branch from. FIRST TURN ONLY, like `deps` —
+   *  later turns resume a session that already read it. Repeated here rather than left to
+   *  the plan turn on purpose: the observed defect was the lead DELEGATING a diff command,
+   *  which happens in this phase, and it is a different (unfenced, one-line) fact from the
+   *  #157 note, which is why both phases carry one. See baseCommitNote. */
+  baseCommit?: string;
 }
 
 /**
@@ -466,6 +523,10 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // Facts, first turn only. A failed dir reads as failed so the agent can act on it.
   const depsNote = input.first ? depsProvisionImplementNote(input.deps, input.depsTruncated) : "";
   if (depsNote) lines.push("", depsNote);
+  // The base commit, first turn only — this is the phase where the lead delegates a
+  // "review the diff" task to a subagent, which is where the wrong diff spec was observed.
+  const baseNote = input.first ? baseCommitNote(input.baseCommit) : "";
+  if (baseNote) lines.push("", baseNote);
   if (input.followUp) {
     lines.push(
       "",
@@ -552,6 +613,10 @@ export interface SelfImprovePlanPromptInput {
    *  that already carries pushed work — for the FIXED self_improve branch that is
    *  the previous cycles' commits. */
   priorWork?: PriorWork;
+  /** The commit the runner clone cut this branch from. Worth MORE here than on an issue
+   *  run: the self_improve branch is FIXED and long-lived, so its base is routinely a
+   *  previous cycle's tip rather than the default branch. See baseCommitNote. */
+  baseCommit?: string;
 }
 
 /**
@@ -574,11 +639,13 @@ export function buildSelfImprovePlanPrompt(input: SelfImprovePlanPromptInput): s
   // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   const priorNote = priorWorkNote(input.priorWork);
+  const baseNote = baseCommitNote(input.baseCommit);
   return [
     "You are running an AUTONOMOUS self-improvement task on uzi's own repository.",
     `You are on the fixed branch \`${input.branch}\`, which may already carry an open`,
     "merge request from a previous cycle — extend it rather than starting over.",
     ...(priorNote ? ["", priorNote] : []),
+    ...(baseNote ? ["", baseNote] : []),
     "",
     "Pick exactly ONE top improvement to make this cycle — a single bug fix, feature, or",
     "refactor that you can complete and verify in one merge request. Do NOT attempt a list.",
@@ -656,6 +723,8 @@ export interface CIFixPlanPromptInput {
   /** Issue #105: set only when a dropped resume left the lead amnesiac ON a branch
    *  that already carries pushed work. */
   priorWork?: PriorWork;
+  /** The commit the runner clone cut this branch from. See baseCommitNote. */
+  baseCommit?: string;
 }
 
 // CI job logs are the most attacker-influenceable text uzi ever feeds an agent:
@@ -688,10 +757,12 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   const openTag = `<job_log_${nonce}>`;
   const closeTag = `</job_log_${nonce}>`;
   const priorNote = priorWorkNote(input.priorWork);
+  const baseNote = baseCommitNote(input.baseCommit);
   const lines: string[] = [
     `A CI pipeline failed on ref \`${input.ref}\`. You are on branch \`${input.branch}\`.`,
     `Failing pipeline: ${input.pipelineWebURL}`,
     ...(priorNote ? ["", priorNote] : []),
+    ...(baseNote ? ["", baseNote] : []),
     "",
     ciLogFrame(openTag, closeTag),
     "",

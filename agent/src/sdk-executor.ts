@@ -425,6 +425,9 @@ export class SdkExecutor implements Executor {
           // Issue #105: only set when a dropped resume left this turn amnesiac on a
           // branch that already carries pushed work.
           priorWork: ctx.priorWork,
+          // Judge rec (run 51757591): the commit this branch was cut from, so the lead
+          // does not infer the parent from the clone's freshly-fetched default branch.
+          baseCommit: ctx.baseCommit,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -439,6 +442,9 @@ export class SdkExecutor implements Executor {
           memory: ctx.memory,
           // Issue #105: see above — the fixed self_improve branch's prior cycles.
           priorWork: ctx.priorWork,
+          // See above. The fixed self_improve branch is routinely seeded off a previous
+          // cycle's tip, so its base is the least guessable of the three kinds.
+          baseCommit: ctx.baseCommit,
         });
       } else {
         planPrompt = buildPlanPrompt({
@@ -452,6 +458,8 @@ export class SdkExecutor implements Executor {
           memory: ctx.memory,
           // Issue #105: see above — prior pushed work on this issue's branch.
           priorWork: ctx.priorWork,
+          // See above.
+          baseCommit: ctx.baseCommit,
         });
       }
       const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
@@ -606,6 +614,9 @@ export class SdkExecutor implements Executor {
           // gate round, so however many revisions happened, these are the final outcomes.
           deps: depsResults,
           depsTruncated,
+          // First turn only (buildImplementPrompt gates it): this is the phase where the
+          // lead hands a subagent a diff command, which is where the wrong one was seen.
+          baseCommit: ctx.baseCommit,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;

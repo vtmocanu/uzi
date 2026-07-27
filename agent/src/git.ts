@@ -143,6 +143,18 @@ export interface RunnerClone {
    *  branch's previous cycles, or a human's commits. Issue #105 uses it to warn the
    *  lead off redoing work it can no longer remember doing. */
   priorCommits: number;
+  /** The commit the branch was checked out AT — the fresh default-branch tip for a new
+   *  branch, the branch's own fresh origin tip on a resume. Full 40-char SHA (`rev-parse`
+   *  in the BARE, which is authoritative).
+   *
+   *  Load-bearing for the lead, which otherwise has to GUESS the branch's parent from the
+   *  clone's local default branch — and that ref is fetched fresh, so it is not the parent.
+   *  Measured on a resume-shaped clone (prior pushed work on the branch, 5 newer commits on
+   *  the default): `git diff <base>..HEAD` = this run's work alone; `main...HEAD` also folds
+   *  in the prior run's commits; `main..HEAD` additionally reports every default-branch
+   *  commit as a DELETION, which is the multi-megabyte diff a lead handed a subagent on run
+   *  51757591. prompt.ts turns this into the note that names the right command. */
+  baseCommit: string;
 }
 
 /**
@@ -327,7 +339,7 @@ export class GitCache {
       // likely SUCCEED QUIETLY rather than fail loudly.
       await this.disableAutoMaintenance(clonePath, /* asRunner */ true);
       await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
-      return { path: clonePath, branch, priorCommits };
+      return { path: clonePath, branch, priorCommits, baseCommit: baseSha };
     });
   }
 
