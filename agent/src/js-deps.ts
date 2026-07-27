@@ -190,6 +190,28 @@ const INSTALL_COMMANDS: Record<JsPackageManager, InstallSpec> = {
       "--config.manage-package-manager-versions=false",
     ],
   },
+  // THE SPLIT BELOW IS DELIBERATE: `--ignore-scripts` is ARGV, `YARN_IGNORE_PATH` is the
+  // env overlay, and the two are NOT interchangeable despite reading as siblings. Folding
+  // `--ignore-scripts` into the overlay beside its neighbour looks like tidying and would
+  // be a security regression on Berry. Both halves verified against Berry's source at
+  // `master`, 2026-07-27:
+  //
+  //   - Berry keeps an `IGNORED_ENV_VARIABLES` blocklist (`yarnpkg-core/sources/
+  //     Configuration.ts`), skipped for any setting whose source is `<environment>`.
+  //     `ignoreScripts` IS in it, carrying Berry's own comment that `YARN_IGNORE_SCRIPTS`
+  //     "should not shadow Yarn Modern's enableScripts setting when inherited from shared
+  //     CI environments". So as an env var it is silently discarded.
+  //   - `ignorePath` is NOT in that blocklist, which is why the env half of this
+  //     mitigation reaches Berry rather than being a yarn-1-only mechanism.
+  //
+  // The regression is worse than losing suppression, because of what the argv form buys
+  // us today: Berry's `install` command declares no `--ignore-scripts` option at all (its
+  // full `Option.*` list is json/immutable/immutable-cache/refresh-lockfile/check-cache/
+  // check-resolutions/inline-builds/mode plus the hidden yarn-1 aliases — `--frozen-lockfile`
+  // among them, so THAT one is accepted). A Berry install therefore fails on the
+  // unsupported flag and honest-skips, which is safe. Move the flag to the env and the
+  // command becomes one Berry ACCEPTS while ignoring the env var — turning a failing
+  // honest skip into a SUCCEEDING install that runs the repo's scripts.
   yarn: {
     command: "yarn",
     args: ["install", "--frozen-lockfile", "--ignore-scripts"],
