@@ -105,8 +105,9 @@ ORDER BY w.created_at ASC;
 -- overwritten to the current report on every register (the fresh-start signal). It is
 -- observability only — the server never enforces it.
 --
--- It also CLEARS THE INV-5 CEILING ANCHOR, and only when the version actually MOVES
--- (PRD #113 M4). The distinction is the invariant, not a refinement of it:
+-- It also CLEARS THE INV-5 CEILING ANCHOR AND THE ROLL-HEALTH DIAGNOSTIC BLOCK, and
+-- only when the version actually MOVES (PRD #113 M4; the diagnostics half is issue
+-- #145). The distinction is the invariant, not a refinement of it:
 --
 --   a register is evidence the POD CAME BACK.
 --   a version MOVE is evidence the ROLL COMPLETED.
@@ -116,6 +117,14 @@ ORDER BY w.created_at ASC;
 -- exactly where a stuck worker lives: a crash-looping agent re-registers on every
 -- start, so "clear on register" would let the worst-off worker in the fleet reset
 -- the ceiling several times a minute, forever.
+--
+-- THE DIAGNOSTICS RIDE THE SAME EVENT, and for the same reason (issue #145). They
+-- describe the pod of the roll that just ended, so a version move is exactly when
+-- they stop being true — and a register at an UNCHANGED version must not clear them,
+-- because a crash-looping agent re-registers on every start and would blank the row
+-- of the one worker whose diagnostics are worth reading, on a loop. The upsert in
+-- worker_roll_health.sql deliberately never clears them, so this is their only exit:
+-- keep the two ends of that rule in step if either moves.
 --
 -- It lives in THIS statement, in one round trip with the version write, so the two
 -- cannot be separated by a later refactor and cannot interleave with a concurrent
@@ -141,10 +150,26 @@ WITH prev AS (
     RETURNING *
 ), cleared AS (
     UPDATE worker_upgrade_reports r
-       SET upgrading_since = NULL, updated_at = now()
+       SET upgrading_since    = NULL,
+           blocking_container = NULL,
+           blocking_reason    = NULL,
+           restart_count      = 0,
+           last_exit_code     = NULL,
+           updated_at         = now()
       FROM prev
      WHERE r.worker_id = prev.id
-       AND r.upgrading_since IS NOT NULL
+       -- "There is something to clear", not "the anchor is set". The narrower guard
+       -- was equivalent only by an accident of the upsert: a report carrying
+       -- diagnostics is `rolling` or `stuck`, and a non-terminal report always stamps
+       -- the anchor, so diagnostics-without-anchor could not arise. That coupling is
+       -- not a property either statement states, and the moment a terminal report
+       -- carries a diagnostic the narrow guard skips the clear silently. Widened so
+       -- the clear does not depend on the other query's phase behaviour.
+       AND (r.upgrading_since IS NOT NULL
+            OR r.blocking_container IS NOT NULL
+            OR r.blocking_reason IS NOT NULL
+            OR r.restart_count <> 0
+            OR r.last_exit_code IS NOT NULL)
        -- COMPARE THE RELEASE, NOT THE STRING. Both sides are stripped of SemVer
        -- build metadata (everything from the first '+') before being compared,
        -- because the api's classifier and this clause must agree on what "the

@@ -49,10 +49,60 @@ ON CONFLICT (worker_id) DO UPDATE SET
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,
     pod_phase              = EXCLUDED.pod_phase,
-    blocking_container     = EXCLUDED.blocking_container,
-    blocking_reason        = EXCLUDED.blocking_reason,
-    restart_count          = EXCLUDED.restart_count,
-    last_exit_code         = EXCLUDED.last_exit_code,
+    -- ================= THE DIAGNOSTIC BLOCK: ALL FOUR, OR NONE =================
+    -- A REPORT MUST NOT BLANK FIELDS IT DID NOT MEASURE (issue #145).
+    --
+    -- deriveRollHealth returns `settled` the instant the pod's Ready condition is
+    -- True, BEFORE the blocking-container lookup — so a settled report carries the
+    -- ZERO of every field here (no container, no reason, restart_count 0, no exit
+    -- code) rather than an observation that they are absent. Written as bare
+    -- EXCLUDED.*, as these four arms used to be, that erased the real diagnostics: a
+    -- worker with 5 restarts and exit 1 persisted as pristine, at exactly the moment
+    -- somebody was reading the row to debug it. `phase` and `pod_phase` above are NOT
+    -- in this block because a settled report genuinely measures both.
+    --
+    -- THE FOUR MOVE TOGETHER, and that is why this is a CASE over the block rather
+    -- than a COALESCE per column. deriveRollHealth fills all four from ONE container
+    -- status, or leaves all four zero. Per-column preservation would pair a fresh
+    -- restart_count with a stale blocking_container and describe a row that was never
+    -- observed — most visibly on the pod-less ReplicaFailure branch, which reports a
+    -- reason with no container at all and must therefore clear the last pod's name.
+    -- The predicate is repeated verbatim in each arm and MUST STAY IDENTICAL: that
+    -- identity is the atomicity, so changing one arm alone silently ends it.
+    --
+    -- NO CLEAR HERE, for the same reason upgrading_since has none below: a clear the
+    -- controller can trigger by reporting hands the reset to the reporting party. The
+    -- ONLY clear is the worker's own authenticated re-registration moving
+    -- workers.version — RegisterWorker in runtime.sql, one statement, one round trip.
+    --
+    -- Preserving these under `settled` changes no CLASSIFICATION: they reach
+    -- ClassifyUpgrade only through stuckDetail (R1, phase=stuck) and rollingDetail
+    -- (R2, phase=rolling), and workerDTOFromRow surfaces them only when the status is
+    -- upgrade_failed. This is a data-integrity fix on a display-only table.
+    blocking_container     = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
+                                    OR EXCLUDED.blocking_reason IS NOT NULL
+                                    OR EXCLUDED.restart_count <> 0
+                                    OR EXCLUDED.last_exit_code IS NOT NULL
+                                  THEN EXCLUDED.blocking_container
+                                  ELSE worker_upgrade_reports.blocking_container END,
+    blocking_reason        = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
+                                    OR EXCLUDED.blocking_reason IS NOT NULL
+                                    OR EXCLUDED.restart_count <> 0
+                                    OR EXCLUDED.last_exit_code IS NOT NULL
+                                  THEN EXCLUDED.blocking_reason
+                                  ELSE worker_upgrade_reports.blocking_reason END,
+    restart_count          = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
+                                    OR EXCLUDED.blocking_reason IS NOT NULL
+                                    OR EXCLUDED.restart_count <> 0
+                                    OR EXCLUDED.last_exit_code IS NOT NULL
+                                  THEN EXCLUDED.restart_count
+                                  ELSE worker_upgrade_reports.restart_count END,
+    last_exit_code         = CASE WHEN EXCLUDED.blocking_container IS NOT NULL
+                                    OR EXCLUDED.blocking_reason IS NOT NULL
+                                    OR EXCLUDED.restart_count <> 0
+                                    OR EXCLUDED.last_exit_code IS NOT NULL
+                                  THEN EXCLUDED.last_exit_code
+                                  ELSE worker_upgrade_reports.last_exit_code END,
     controller_reported_at = EXCLUDED.controller_reported_at,
     observed_at            = EXCLUDED.observed_at,
     poll_interval_seconds  = EXCLUDED.poll_interval_seconds,

@@ -252,6 +252,205 @@ func TestWorkerRollHealthPersistenceLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #145 — A REPORT MUST NOT BLANK FIELDS IT DID NOT MEASURE.
+//
+// deriveRollHealth returns `settled` the instant the pod's Ready condition is True,
+// BEFORE the blocking-container lookup, so a settled report carries the zero value of
+// every diagnostic: blocking_container NULL, blocking_reason NULL, restart_count 0,
+// last_exit_code NULL. Written unconditionally into the ON CONFLICT arms, those zeros
+// erased the real observation — a worker with 5 restarts and exit 1 persisted as
+// pristine, at exactly the moment somebody was reading the row to debug it.
+//
+// The four columns are ONE measurement, which is why this test moves them as a block:
+// deriveRollHealth fills all four from a single container status, or leaves all four
+// zero. Keeping a stale blocking_container beside a fresh restart_count would describe
+// a row that was never observed, so per-column COALESCE is not the fix and the control
+// below (a report carrying only a reason) is what separates the two.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
+// e2e/run-store-it.sh.
+func TestRollReportDoesNotBlankUnmeasuredDiagnosticsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userID, fmt.Sprintf("diag-%s@e2e", userID))
+	workerID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO workers (id, user_id, name, token_hash, status, kind, version, hosted_size, template_declared)
+		 VALUES ($1, $2, $3, $4, 'offline', 'hosted', '0.11.0', 'm', 'base')`,
+		workerID, userID, "w-"+workerID.String()[:8], []byte(workerID.String()))
+
+	// diag is the diagnostic block as it sits in the row: a nil pointer is SQL NULL.
+	type diag struct {
+		container *string
+		reason    *string
+		restarts  int32
+		exitCode  *int32
+	}
+	readDiag := func(what string) diag {
+		var d diag
+		if err := pool.QueryRow(ctx,
+			`SELECT blocking_container, blocking_reason, restart_count, last_exit_code
+			   FROM worker_upgrade_reports WHERE worker_id = $1`, workerID).
+			Scan(&d.container, &d.reason, &d.restarts, &d.exitCode); err != nil {
+			t.Fatalf("read diagnostics (%s): %v", what, err)
+		}
+		return d
+	}
+	show := func(d diag) string {
+		s := func(p *string) string {
+			if p == nil {
+				return "NULL"
+			}
+			return *p
+		}
+		e := "NULL"
+		if d.exitCode != nil {
+			e = fmt.Sprintf("%d", *d.exitCode)
+		}
+		return fmt.Sprintf("container=%s reason=%s restarts=%d exit=%s", s(d.container), s(d.reason), d.restarts, e)
+	}
+	// report builds an upsert carrying an explicit diagnostic block, the shape the
+	// controller sends for a pod it could blame a container for.
+	report := func(phase string, at time.Time, container, reason string, restarts int32, exit *int32) store.UpsertWorkerRollHealthParams {
+		p := rollReport(workerID, phase, at)
+		p.BlockingContainer = pgtype.Text{String: container, Valid: container != ""}
+		p.BlockingReason = pgtype.Text{String: reason, Valid: reason != ""}
+		p.RestartCount = restarts
+		if exit != nil {
+			p.LastExitCode = pgtype.Int4{Int32: *exit, Valid: true}
+		}
+		return p
+	}
+
+	t0 := time.Now().UTC().Truncate(time.Second)
+	exit1 := int32(1)
+
+	// ---- The real observation lands. ----
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0, "agent", "CrashLoopBackOff", 5, &exit1)); err != nil {
+		t.Fatalf("upsert the stuck report: %v", err)
+	}
+	if got := readDiag("the stuck report"); got.container == nil || *got.container != "agent" ||
+		got.reason == nil || *got.reason != "CrashLoopBackOff" || got.restarts != 5 ||
+		got.exitCode == nil || *got.exitCode != 1 {
+		t.Fatalf("precondition: the stuck report did not persist its diagnostics; got %s", show(got))
+	}
+
+	// ---- THE BUG: a `settled` report carries zeros and must not write them. ----
+	//
+	// This is the exact param set the controller produces for a Ready pod — no
+	// container, no reason, restart_count 0, no exit code — because the settled arm
+	// returns before the blocking-container lookup runs.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("settled", t0.Add(time.Minute), "", "", 0, nil)); err != nil {
+		t.Fatalf("upsert the settled report: %v", err)
+	}
+	if got := readDiag("after the settled report"); got.container == nil || *got.container != "agent" ||
+		got.reason == nil || *got.reason != "CrashLoopBackOff" || got.restarts != 5 ||
+		got.exitCode == nil || *got.exitCode != 1 {
+		t.Errorf("a `settled` report blanked the diagnostics: %s. It measured NONE of these — the "+
+			"settled arm returns before the blocking-container lookup — so every value it carries is a "+
+			"zero, not an observation. Writing them makes a worker with 5 restarts and exit 1 read as "+
+			"pristine to whoever is debugging it, which is the state they are reading the row FOR.",
+			show(got))
+	}
+
+	// ---- CONTROL: a report that DID measure still overwrites, and downward. ----
+	//
+	// Without this the assertion above passes against an arm that never writes these
+	// columns at all. The restart count DROPS (5 -> 2), which is what a new pod for the
+	// same worker genuinely looks like; a GREATEST-style "keep the highest" preservation
+	// would survive every other check here and fail this one.
+	exit137 := int32(137)
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(2*time.Minute), "seed-nix", "ImagePullBackOff", 2, &exit137)); err != nil {
+		t.Fatalf("upsert the second stuck report: %v", err)
+	}
+	if got := readDiag("after a measuring report"); got.container == nil || *got.container != "seed-nix" ||
+		got.reason == nil || *got.reason != "ImagePullBackOff" || got.restarts != 2 ||
+		got.exitCode == nil || *got.exitCode != 137 {
+		t.Errorf("a report that DID measure failed to overwrite the previous diagnostics: %s. "+
+			"Preservation must be conditional on the report carrying nothing; a column that is never "+
+			"written is frozen, not preserved.", show(got))
+	}
+
+	// ---- ATOMICITY: the block moves together, so a partial report clears its siblings. ----
+	//
+	// The pod-less ReplicaFailure branch reports a REASON with no container, no restarts
+	// and no exit code (deriveRollHealth's `{Phase: stuck, BlockingReason: replicaFailure}`).
+	// That is a measurement, and it says "there is no pod" — so the previous pod's
+	// container name and exit code must go, or the row names a container that no longer
+	// exists beside a reason about a pod that never started. Per-column COALESCE keeps
+	// them and is why this is a CASE over the whole block.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(3*time.Minute), "", "FailedCreate", 0, nil)); err != nil {
+		t.Fatalf("upsert the pod-less report: %v", err)
+	}
+	if got := readDiag("after a pod-less report"); got.container != nil || got.reason == nil ||
+		*got.reason != "FailedCreate" || got.restarts != 0 || got.exitCode != nil {
+		t.Errorf("the pod-less ReplicaFailure report did not replace the whole diagnostic block: %s. "+
+			"All four columns come from ONE container status, so they must move together; a stale "+
+			"container name beside a fresh reason describes a row that was never observed.", show(got))
+	}
+
+	// ---- THE CLEAR, half one: a register at an UNCHANGED version keeps them. ----
+	//
+	// Same rule the INV-5 anchor holds: a register is evidence the pod came back, only a
+	// version MOVE is evidence the roll completed. A crash-looping agent re-registers on
+	// every start, so clearing on any register would wipe the diagnostics of exactly the
+	// worker whose diagnostics are worth reading, several times a minute.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: workerID, Version: pgtype.Text{String: "0.11.0", Valid: true},
+	}); err != nil {
+		t.Fatalf("register at the same version: %v", err)
+	}
+	if got := readDiag("after a register at the same version"); got.reason == nil || *got.reason != "FailedCreate" {
+		t.Errorf("registering at an UNCHANGED version cleared the diagnostics: %s. A crash-looping "+
+			"agent re-registers on every start, so this would blank the row of the worst-off worker in "+
+			"the fleet on a loop.", show(got))
+	}
+
+	// ---- THE CLEAR, half two: a version MOVE clears the whole block. ----
+	//
+	// The roll completed, so the diagnostics describe a pod that is gone. This is the
+	// ONLY legitimate clear — the worker's own authenticated re-registration — which is
+	// the same sentence the INV-5 anchor block states, now true of the diagnostics too.
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		ID: workerID, Version: pgtype.Text{String: "0.11.7", Valid: true},
+	}); err != nil {
+		t.Fatalf("register at a moved version: %v", err)
+	}
+	if got := readDiag("after a version move"); got.container != nil || got.reason != nil ||
+		got.restarts != 0 || got.exitCode != nil {
+		t.Errorf("a version move left the diagnostics behind: %s. They describe a pod that no longer "+
+			"exists; carrying them into the next release is how a fixed worker keeps looking broken.",
+			show(got))
+	}
+
+	// ---- And the clear is not a one-shot: the next incident records again. ----
+	//
+	// A guard that skipped rows with nothing to clear could, written carelessly, also
+	// skip rows that need clearing later. Re-arming here proves the column is still live
+	// after the clear.
+	if _, err := q.UpsertWorkerRollHealth(ctx, report("stuck", t0.Add(10*time.Minute), "agent", "CrashLoopBackOff", 3, &exit1)); err != nil {
+		t.Fatalf("re-arm after the clear: %v", err)
+	}
+	if got := readDiag("after re-arming"); got.container == nil || *got.container != "agent" || got.restarts != 3 {
+		t.Errorf("after the clear a new incident did not record: %s", show(got))
+	}
+}
+
 // Cross-tenancy. The roll-health table has no user_id, so the ONLY way to read a row is
 // through `workers` — which is what makes per-user scoping unavoidable rather than
 // remembered. Two users with distinct coordinates, because a single-user fixture passes
