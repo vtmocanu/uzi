@@ -40,6 +40,16 @@ type boardOrderFixture struct {
 	owner    store.User
 	stranger store.User
 	repoID   uuid.UUID
+	// strangerRepoID holds the SAME iids under a different user. It exists so the
+	// tenant predicate inside the freeze queries is observable: without it the
+	// fixture is single-repo, `repo_id = @repo_id` is satisfied by every row in the
+	// table, and deleting it changes nothing any assertion can see. The audit measured
+	// exactly that — both predicates mutated to a tautology, whole sweep still green.
+	//
+	// TestSetBoardOrderRejectsNonOwnerLiveDB does NOT cover this: it is rejected at
+	// repoForRequest and never reaches the query, so it pins the HANDLER's scoping and
+	// says nothing about the SQL's.
+	strangerRepoID uuid.UUID
 }
 
 func newBoardOrderFixture(ctx context.Context, t *testing.T, iids ...int64) boardOrderFixture {
@@ -81,21 +91,30 @@ func newBoardOrderFixture(ctx context.Context, t *testing.T, iids ...int64) boar
 	if err != nil {
 		t.Fatalf("seal token: %v", err)
 	}
-	connID := uuid.New()
 	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, f.owner.ID, f.owner.Email)
 	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, f.stranger.ID, f.stranger.Email)
-	mustExecT(ctx, t, pool,
-		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
-		 VALUES ($1, $2, 'gitlab', 'https://forge.example', 'bot', 1, $3)`, connID, f.owner.ID, sealed)
-	mustExecT(ctx, t, pool,
-		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
-		 VALUES ($1, $2, 1, 'g/bo', 'https://forge.example/g/bo', 'main', true)`, f.repoID, connID)
-	for _, iid := range iids {
+
+	// Both users get a repo holding the SAME iids. Colliding numbers are what make the
+	// probe sharp: forge_issue_iid is unique per repo, not globally, so an unscoped
+	// statement matches the other tenant's rows by construction rather than by luck.
+	seedRepo := func(userID uuid.UUID, projectID int, path, bot string) uuid.UUID {
+		connID, repoID := uuid.New(), uuid.New()
 		mustExecT(ctx, t, pool,
-			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-			 VALUES ($1, $2, 't', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
-			f.repoID, iid)
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.example', $3, $4, $5)`, connID, userID, bot, projectID, sealed)
+		mustExecT(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, $3, $4, 'https://forge.example/g/bo', 'main', true)`, repoID, connID, projectID, path)
+		for _, iid := range iids {
+			mustExecT(ctx, t, pool,
+				`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+				 VALUES ($1, $2, 't', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
+				repoID, iid)
+		}
+		return repoID
 	}
+	f.repoID = seedRepo(f.owner.ID, 1, "g/bo", "bot")
+	f.strangerRepoID = seedRepo(f.stranger.ID, 2, "g/bo-stranger", "bot2")
 	return f
 }
 
@@ -112,8 +131,12 @@ func (f boardOrderFixture) call(t *testing.T, user store.User, repoID uuid.UUID,
 }
 
 func (f boardOrderFixture) positions(ctx context.Context, t *testing.T) map[int64]pgtype.Int8 {
+	return f.positionsIn(ctx, t, f.repoID)
+}
+
+func (f boardOrderFixture) positionsIn(ctx context.Context, t *testing.T, repoID uuid.UUID) map[int64]pgtype.Int8 {
 	t.Helper()
-	rows, err := f.pool.Query(ctx, `SELECT forge_issue_iid, board_position FROM issues WHERE repo_id = $1`, f.repoID)
+	rows, err := f.pool.Query(ctx, `SELECT forge_issue_iid, board_position FROM issues WHERE repo_id = $1`, repoID)
 	if err != nil {
 		t.Fatalf("read positions: %v", err)
 	}
@@ -175,6 +198,16 @@ func TestSetBoardOrderAppliesSubmittedOrderLiveDB(t *testing.T) {
 			t.Errorf("issue %d board_position = %v, want %d", iid, pos[iid], want)
 		}
 	}
+
+	// THE TENANT BOUNDARY, at the layer that actually issues the statement. The
+	// stranger's repo holds the same iids and must be untouched. This is a different
+	// claim from the 404 test below, which never reaches the SQL at all.
+	other := f.positionsIn(ctx, t, f.strangerRepoID)
+	for _, iid := range []int64{10, 20, 30} {
+		if other[iid].Valid {
+			t.Errorf("TENANT LEAK: stranger's issue %d got board_position %d from another user's freeze", iid, other[iid].Int64)
+		}
+	}
 }
 
 // Acceptance criterion 1: the endpoint is owner-scoped through repoForRequest, and a
@@ -211,6 +244,11 @@ func TestSetBoardOrderEmptyListIsANoOpLiveDB(t *testing.T) {
 	if w := f.call(t, f.owner, f.repoID, `{"iids":[20,10]}`); w.Code != http.StatusOK {
 		t.Fatalf("seed call = %d, want 200", w.Code)
 	}
+	// Give the stranger's board a real order too, so an unscoped wipe shows up as
+	// CHANGED values rather than as the absence of new ones.
+	if w := f.call(t, f.stranger, f.strangerRepoID, `{"iids":[10,20]}`); w.Code != http.StatusOK {
+		t.Fatalf("stranger seed call = %d, want 200", w.Code)
+	}
 	if w := f.call(t, f.owner, f.repoID, `{"iids":[]}`); w.Code != http.StatusOK {
 		t.Fatalf("empty-list status = %d, want 200", w.Code)
 	}
@@ -218,6 +256,12 @@ func TestSetBoardOrderEmptyListIsANoOpLiveDB(t *testing.T) {
 	pos := f.positions(ctx, t)
 	if !pos[20].Valid || pos[20].Int64 != 1000 || !pos[10].Valid || pos[10].Int64 != 2000 {
 		t.Errorf("an empty submit changed the order: 20=%v 10=%v, want 1000/2000 — the len==0 guard is missing", pos[20], pos[10])
+	}
+	// The unscoped-ClearBoardOrderExcept blast radius, pinned: without the repo
+	// predicate an empty list would blank every board_position on the INSTANCE.
+	other := f.positionsIn(ctx, t, f.strangerRepoID)
+	if !other[10].Valid || other[10].Int64 != 1000 || !other[20].Valid || other[20].Int64 != 2000 {
+		t.Errorf("TENANT LEAK: stranger's order changed under another user's submit: 10=%v 20=%v, want 1000/2000", other[10], other[20])
 	}
 }
 
@@ -282,6 +326,28 @@ func TestSetBoardOrderRejectsOversizedListLiveDB(t *testing.T) {
 	}
 	if w := f.call(t, f.owner, f.repoID, string(body)); w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for %d iids", w.Code, len(iids))
+	}
+}
+
+// The cap must be consulted on the RAW body, before the dedupe. A list that is over the
+// cap only because it repeats one iid is the case that discriminates: checked after the
+// dedupe it collapses to a single legal iid and sails through, having already sized two
+// allocations off the decoded body. Measured on the audit's probe: a maximal 1 MiB body
+// is 524,283 iids and ~22 MiB of pre-allocation, on a route with no forge limiter.
+func TestSetBoardOrderCapsBeforeDedupeLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardOrderFixture(ctx, t, 10)
+
+	iids := make([]int64, maxBoardOrderIids+1)
+	for i := range iids {
+		iids[i] = 10 // every entry a duplicate: dedupes to ONE
+	}
+	body, err := json.Marshal(map[string]any{"iids": iids})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if w := f.call(t, f.owner, f.repoID, string(body)); w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 — the cap is being applied after the dedupe, so the allocation is sized off the raw body", w.Code)
 	}
 }
 

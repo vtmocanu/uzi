@@ -516,6 +516,10 @@ func run() error {
 	// comfortably exceed the poll cadence the server itself returns (12/min at 5s) so
 	// uzi login never trips its own limit — which the shared 10/min authLimiter would.
 	cliPollLimiter := mw.NewLimiter(cfg.CLIPollRateLimitMax, cfg.CLIPollRateLimitWindow, cfg.TrustedProxies)
+	// Dedicated per-user budget for the board reorder (PRD #102 M5). Deliberately NOT
+	// the forge budget: a reorder makes zero forge calls, and charging it there would
+	// let a burst of dragging starve the user's real forge operations.
+	boardOrderLimiter := mw.NewLimiter(cfg.BoardOrderRateLimitMax, cfg.BoardOrderRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	h.SetVersion(version)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
@@ -578,7 +582,7 @@ func run() error {
 	// the SAME api on a second port, not a second surface. Building Routes twice
 	// would be two independent middleware chains — and two rate limiters, so a
 	// per-IP budget would silently double.
-	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter)
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

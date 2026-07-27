@@ -28,10 +28,28 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; e2e/run-store-it.sh
 // provides one. `go test ./...` without it SKIPs.
 
-// boardOrderFixture stands up an isolated repo with `iids` open issues, and returns the
-// pool, the queries handle and the repo id. Fresh uuids per call keep re-runs against
+// boardOrderFixture stands up TWO isolated repos, each owned by a different user, each
+// holding the SAME `iids`. Returns the pool, the queries handle, the repo under test and
+// a second repo that no test ever addresses. Fresh uuids per call keep re-runs against
 // the same database from colliding on (repo_id, forge_issue_iid).
-func boardOrderFixture(ctx context.Context, t *testing.T, tag string, iids ...int64) (*pgxpool.Pool, *store.Queries, uuid.UUID) {
+//
+// THE SECOND REPO IS THE POINT, and it is not defensive padding. `repo_id = @repo_id` in
+// SetBoardOrderPositions and ClearBoardOrderExcept is the TENANT BOUNDARY:
+// forge_issue_iid is unique per repo and not globally, and repos -> forge_connections
+// -> user_id means cross-repo is cross-USER here. On a single-repo fixture that
+// predicate is satisfied by every row in the table, so deleting it changes nothing any
+// assertion can see. Measured by the wave-2 audit: mutating BOTH predicates to a
+// tautology in the generated forge.sql.go left the entire live sweep green at
+// RUN=204 PASS=204 FAIL=0 SKIP=0, all eleven board-order tests included.
+//
+// ClearBoardOrderExcept is the worse of the two under that mutation: without the repo
+// scope it NULLs every board on the instance except rows whose iid happens to appear in
+// the acting user's list.
+//
+// The colliding iids are what make the probe sharp: identical numbers in both repos
+// mean an unscoped statement matches the other tenant's rows by construction rather
+// than by luck.
+func boardOrderFixture(ctx context.Context, t *testing.T, tag string, iids ...int64) (*pgxpool.Pool, *store.Queries, uuid.UUID, uuid.UUID) {
 	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -46,25 +64,62 @@ func boardOrderFixture(ctx context.Context, t *testing.T, tag string, iids ...in
 	}
 	t.Cleanup(pool.Close)
 
-	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
-	mustExec(ctx, t, pool,
-		`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
-		userID, fmt.Sprintf("%s-%s@e2e", tag, userID))
-	mustExec(ctx, t, pool,
-		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
-		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`,
-		connID, userID, []byte{0x1})
-	mustExec(ctx, t, pool,
-		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, enabled)
-		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', true)`,
-		repoID, connID)
-	for _, iid := range iids {
+	seedRepo := func(who string, projectID int) uuid.UUID {
+		userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
 		mustExec(ctx, t, pool,
-			`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
-			 VALUES ($1, $2, 't', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
-			repoID, iid)
+			`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			userID, fmt.Sprintf("%s-%s-%s@e2e", tag, who, userID))
+		mustExec(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', $3, $4, $5)`,
+			connID, userID, "bot-"+who, projectID, []byte{0x1})
+		mustExec(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, enabled)
+			 VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', true)`,
+			repoID, connID, projectID, "g/r-"+who)
+		for _, iid := range iids {
+			mustExec(ctx, t, pool,
+				`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+				 VALUES ($1, $2, 't', 'opened', '["PRD"]'::jsonb, 'https://x', true, now(), now())`,
+				repoID, iid)
+		}
+		return repoID
 	}
-	return pool, store.New(pool), repoID
+	// Seed the neighbour FIRST and give it positions below, so it is never merely
+	// "still NULL like everything else" — a tenant leak has to overwrite real values.
+	otherRepoID := seedRepo("other", 2)
+	repoID := seedRepo("under-test", 1)
+	return pool, store.New(pool), repoID, otherRepoID
+}
+
+// assertNeighbourUntouched is the tenant-boundary assertion. The neighbour repo is
+// seeded with its own positions before the statement under test runs, so a leak shows
+// up as CHANGED values rather than as the absence of new ones.
+func assertNeighbourUntouched(ctx context.Context, t *testing.T, pool *pgxpool.Pool, otherRepoID uuid.UUID, want map[int64]int64) {
+	t.Helper()
+	got := positionsByIID(ctx, t, pool, otherRepoID)
+	for iid, w := range want {
+		p, ok := got[iid]
+		if !ok {
+			t.Fatalf("neighbour repo lost issue %d entirely", iid)
+		}
+		if !p.Valid || p.Int64 != w {
+			t.Errorf("TENANT LEAK: neighbour repo's issue %d board_position = %v, want %d — the repo_id predicate is not holding", iid, p, w)
+		}
+	}
+}
+
+// seedNeighbourPositions gives the untouched repo a known order of its own.
+func seedNeighbourPositions(ctx context.Context, t *testing.T, q *store.Queries, otherRepoID uuid.UUID, iids ...int64) map[int64]int64 {
+	t.Helper()
+	if err := q.SetBoardOrderPositions(ctx, store.SetBoardOrderPositionsParams{RepoID: otherRepoID, Iids: iids}); err != nil {
+		t.Fatalf("seed neighbour positions: %v", err)
+	}
+	want := make(map[int64]int64, len(iids))
+	for i, iid := range iids {
+		want[iid] = int64(i+1) * 1000
+	}
+	return want
 }
 
 // positionsByIID reads board_position for every issue in the repo. A NULL reads as
@@ -123,7 +178,8 @@ func wantNull(t *testing.T, got map[int64]pgtype.Int8, iid int64, why string) {
 // An iid the server does not hold is a per-iid no-op: no error, no effect on the rest.
 func TestSetBoardOrderPositionsLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, q, repoID := boardOrderFixture(ctx, t, "boardorder-set", 10, 20, 30)
+	pool, q, repoID, otherRepoID := boardOrderFixture(ctx, t, "boardorder-set", 10, 20, 30)
+	neighbour := seedNeighbourPositions(ctx, t, q, otherRepoID, 10, 20, 30)
 
 	// 999 is not in `issues`: it stands for a card evicted by DeleteIssuesNotIn between
 	// the client's render and its submit. It must not fail the freeze.
@@ -144,6 +200,9 @@ func TestSetBoardOrderPositionsLiveDB(t *testing.T) {
 	if len(got) != 3 {
 		t.Errorf("repo holds %d issues, want 3 — the unknown iid must not create a row", len(got))
 	}
+	// The neighbour holds the SAME iids. Without `repo_id = @repo_id` this write lands
+	// on its rows too, renumbering another user's board.
+	assertNeighbourUntouched(ctx, t, pool, otherRepoID, neighbour)
 }
 
 // S2. ClearBoardOrderExcept is what makes a closed card keep NULL and an omitted open
@@ -151,7 +210,8 @@ func TestSetBoardOrderPositionsLiveDB(t *testing.T) {
 // leave the listed ones alone.
 func TestClearBoardOrderExceptLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, q, repoID := boardOrderFixture(ctx, t, "boardorder-clear", 10, 20, 30)
+	pool, q, repoID, otherRepoID := boardOrderFixture(ctx, t, "boardorder-clear", 10, 20, 30)
+	neighbour := seedNeighbourPositions(ctx, t, q, otherRepoID, 10, 20, 30)
 
 	if err := q.SetBoardOrderPositions(ctx, store.SetBoardOrderPositionsParams{
 		RepoID: repoID, Iids: []int64{10, 20, 30},
@@ -169,6 +229,10 @@ func TestClearBoardOrderExceptLiveDB(t *testing.T) {
 	wantPos(t, got, 10, 1000)
 	wantPos(t, got, 30, 3000)
 	wantNull(t, got, 20, "omitted from the submitted list, so the freeze must clear it")
+	// The nastier half of the leak: unscoped, this statement NULLs every board on the
+	// instance except rows whose iid happens to appear in the acting user's list. The
+	// neighbour's 20 is exactly such a row.
+	assertNeighbourUntouched(ctx, t, pool, otherRepoID, neighbour)
 }
 
 // S2b. The `<> ALL('{}')` trap, pinned as behaviour rather than as a comment: an EMPTY
@@ -177,7 +241,8 @@ func TestClearBoardOrderExceptLiveDB(t *testing.T) {
 // that guard has something to protect against and so removing it is not silent.
 func TestClearBoardOrderExceptEmptyListWipesEverythingLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, q, repoID := boardOrderFixture(ctx, t, "boardorder-wipe", 10, 20)
+	pool, q, repoID, otherRepoID := boardOrderFixture(ctx, t, "boardorder-wipe", 10, 20)
+	neighbour := seedNeighbourPositions(ctx, t, q, otherRepoID, 10, 20)
 
 	if err := q.SetBoardOrderPositions(ctx, store.SetBoardOrderPositionsParams{
 		RepoID: repoID, Iids: []int64{10, 20},
@@ -193,6 +258,9 @@ func TestClearBoardOrderExceptEmptyListWipesEverythingLiveDB(t *testing.T) {
 	got := positionsByIID(ctx, t, pool, repoID)
 	wantNull(t, got, 10, "an empty iids array matches every row — this is the documented trap")
 	wantNull(t, got, 20, "an empty iids array matches every row — this is the documented trap")
+	// The wipe must stop at the tenant boundary even so: an empty list plus no repo
+	// scope would blank every board_position on the instance.
+	assertNeighbourUntouched(ctx, t, pool, otherRepoID, neighbour)
 }
 
 // S3. The ORDER BY, which is the entire basis for the web client's "Manual" mode being
@@ -204,7 +272,7 @@ func TestClearBoardOrderExceptEmptyListWipesEverythingLiveDB(t *testing.T) {
 // passes.
 func TestListIssuesByRepoBoardOrderLiveDB(t *testing.T) {
 	ctx := context.Background()
-	_, q, repoID := boardOrderFixture(ctx, t, "boardorder-list", 10, 20, 30, 40, 50)
+	_, q, repoID, _ := boardOrderFixture(ctx, t, "boardorder-list", 10, 20, 30, 40, 50)
 
 	// Positions deliberately invert iid order for the three that have one.
 	if err := q.SetBoardOrderPositions(ctx, store.SetBoardOrderPositionsParams{
@@ -250,7 +318,8 @@ func TestListIssuesByRepoBoardOrderLiveDB(t *testing.T) {
 // git diff shows the fold.
 func TestUpsertIssuePreservesBoardPositionLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, q, repoID := boardOrderFixture(ctx, t, "boardorder-upsert", 10, 20)
+	pool, q, repoID, otherRepoID := boardOrderFixture(ctx, t, "boardorder-upsert", 10, 20)
+	neighbour := seedNeighbourPositions(ctx, t, q, otherRepoID, 20, 10)
 
 	if err := q.SetBoardOrderPositions(ctx, store.SetBoardOrderPositionsParams{
 		RepoID: repoID, Iids: []int64{20, 10},
@@ -287,4 +356,7 @@ func TestUpsertIssuePreservesBoardPositionLiveDB(t *testing.T) {
 	got := positionsByIID(ctx, t, pool, repoID)
 	wantPos(t, got, 10, 2000)
 	wantPos(t, got, 20, 1000)
+	// UpsertIssue is itself repo-scoped by the ON CONFLICT target; the neighbour holds
+	// an issue with the same iid and must not be rewritten by this sync.
+	assertNeighbourUntouched(ctx, t, pool, otherRepoID, neighbour)
 }

@@ -286,7 +286,7 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 // Decision 8) — hosted provision and worker delete; cliPollLimiter is a dedicated
 // per-(path,IP) budget on POST /api/auth/cli/poll (PRD #64 M5), sized to exceed the
 // server-returned poll cadence so uzi login cannot trip its own rate limit.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter *mw.Limiter) http.Handler {
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -732,12 +732,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Manual card order (PRD #102 M5). The other whole-board replace, so it
 				// sits beside the columns route and is a PUT for the same reason.
 				//
-				// DELIBERATELY NOT on forgeLimiter.PerUserMiddleware, unlike every write
-				// route below it — this endpoint makes ZERO forge calls, it is a uzi-local
-				// write. Putting a drag on the per-user FORGE budget would let a burst of
-				// reordering starve the user's actual forge operations (move, sync, issue
-				// create), which is the thing that budget exists to protect.
-				r.Put("/{id}/board/order", h.SetBoardOrder)
+				// Its OWN limiter, not forgeLimiter and not none. Not the forge budget
+				// because this endpoint makes ZERO forge calls, and charging a drag there
+				// would let a burst of reordering starve the user's actual forge
+				// operations (move, sync, issue create) — the thing that budget protects.
+				// Not bare either: every request is a whole-board renumber in a
+				// transaction plus a full board rebuild, which makes it the most
+				// write-amplifying authenticated route on the board. "Give it its own" is
+				// the answer this codebase has already reached five times.
+				r.With(boardOrderLimiter.PerUserMiddleware).Put("/{id}/board/order", h.SetBoardOrder)
 				// The in-app issue view fetches the issue (with its description) live
 				// from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issues/{iid}", h.GetIssueDetail)

@@ -605,6 +605,22 @@ func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE CAP IS CHECKED ON THE RAW REQUEST, BEFORE THE DEDUPE, and the order is the
+	// whole point. Checking it after would size the two allocations below off the
+	// decoded body rather than off the cap: measured, a maximal 1 MiB body decodes to
+	// 524,283 iids that dedupe down to 1, having already cost ~22 MiB of
+	// pre-allocation — on a route that deliberately carries no forge limiter. Reject
+	// first, then allocate against a bounded length.
+	//
+	// Consequence, stated because it is a real behaviour choice: a body that is over
+	// the cap only because it repeats iids is now rejected rather than deduped down to
+	// something legal. No client produces one (the board sends each card once), and
+	// bounding the allocation is worth more than accepting a malformed body.
+	if len(req.IIDs) > maxBoardOrderIids {
+		httpx.Error(w, http.StatusBadRequest, "too many issues (max "+strconv.Itoa(maxBoardOrderIids)+")")
+		return
+	}
+
 	// Dedupe preserving first occurrence, the precedent ConfigureColumns sets for its
 	// column names. A duplicate iid is a client bug and must not 400 somebody's drag;
 	// left in, it would consume an ordinal and shift every card after it.
@@ -616,10 +632,6 @@ func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[iid] = struct{}{}
 		iids = append(iids, iid)
-	}
-	if len(iids) > maxBoardOrderIids {
-		httpx.Error(w, http.StatusBadRequest, "too many issues (max "+strconv.Itoa(maxBoardOrderIids)+")")
-		return
 	}
 
 	// THE EMPTY-LIST GUARD IS LOAD-BEARING, NOT DEFENSIVE TIDINESS. ClearBoardOrderExcept
