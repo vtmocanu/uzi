@@ -40,6 +40,18 @@ import (
 // the Slack line all render whatever string they are handed, and are required to
 // render an unrecognised one honestly rather than dropping it. One producer, one
 // home.
+//
+// 🔴 THE TRIGGER FOR REVISITING THAT, WRITTEN DOWN SO IT IS A DECIDABLE RULE RATHER
+// THAN A JUDGEMENT CALL: if a consumer ever needs to ENUMERATE this vocabulary, it
+// moves to its own package rather than being mirrored. `slacksvc` deliberately holds
+// no workersvc import (stated twice in slacksvc/gate.go), so the single consumer this
+// PRD schedules — M5's Slack line — is precisely the package that could not import
+// this home if it ever needed the set rather than the string. And the repo has
+// already paid that cost once for exactly this shape: slacksvc/health.go hand-mirrors
+// workersvc's reasonPersistFailing, pinned by a drift test whose failure message has
+// to tell you to update both. Mirroring is the outcome to avoid; a speculative
+// package for a single producer is worse than this comment; so the line is drawn at
+// enumeration.
 
 // RateLimitTypeUnknown is what every unrecognised report becomes. It is a real
 // member of the stored vocabulary (migration 00090's CHECK admits it), not a NULL:
@@ -110,9 +122,32 @@ func CoerceRateLimitType(reported *string) *string {
 // The park computation (PRD #35 M2, Decisions 4, 5, 6e and 8)
 // -------------------------------------------------------------------------
 
-// Jitter bounds for retry_not_before. One user's parked runs would otherwise all
-// carry the SAME reset — they died on the same window — and promote on the same
-// sweeper tick, so every one of them would claim, spend, and re-park together.
+// Jitter bounds for retry_not_before.
+//
+// 🔴 THIS IS LOAD-BEARING, NOT STAMPEDE-AVOIDANCE GARNISH (ADR-35 D4). It is the
+// ONLY mechanism that spreads a promoted wave across a user's credential pool. Do
+// not remove it as redundant with the sweeper tick — that reasoning is exactly
+// backwards, because PromoteLimitWaitRuns is a SINGLE UPDATE that releases every
+// eligible row in one tick. The tick does not stagger anything; it is what makes the
+// staggering necessary.
+//
+// How it composes with the in-flight bias, which is the part that is easy to miss:
+// the claim path is ClaimRun → assembleClaim → autoChoice → rank →
+// recordRunCredential, so a run that claimed earlier has already RECORDED its pick
+// before a later run ranks, and ListAutoSelectCandidates' load counter then sees it.
+// Jitter separates the promotions; claims serialize; each pick lands before the next
+// ranking reads it. The jitter and the counter are ONE mechanism, not two — which is
+// also why the counter must not be widened to count parked runs (see
+// deadCredentialReset's note below and ADR-35 D4).
+//
+// Accepted residual: two promotions closer together than one claim round-trip can
+// still converge on the same credential. That race predates this PRD — PRD #111
+// accepted it in the in-flight bias' own comment — and D4 makes it likelier by
+// correlating promotions. If it fires and the token has real headroom, both runs
+// simply run; only if the token is near-empty does the second re-park, costing one
+// unit of RUN_LIMIT_MAX_WAITS. IF IT EVER BITES, THE KNOB IS THIS RANGE, NOT THE
+// COUNTER. The signal is SweepResult.LimitPromoted > 1 on a single tick, which is
+// already reported and needs no new instrumentation.
 //
 // The floor is non-zero on purpose: it is also the clamp applied when the computed
 // stamp lands at or before `now`, so a park can never produce a stamp the very next

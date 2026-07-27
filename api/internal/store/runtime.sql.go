@@ -2691,6 +2691,15 @@ type PromoteLimitWaitRunsRow struct {
 // exactly this predicate, so the pass costs an index scan over a set that is empty
 // on a healthy instance rather than a seq scan of runs.
 //
+// 🔴 THIS IS A SINGLE UPDATE THAT RELEASES EVERY ELIGIBLE ROW IN ONE TICK. Nothing
+// here staggers a wave, so "the sweeper tick already spreads them out" is exactly
+// backwards — this statement is what makes the staggering necessary. The ONLY
+// mechanism spreading a promoted wave across a user's credential pool is the 60-180s
+// jitter baked into retry_not_before at PARK time (workersvc/limitwait.go's
+// limitParkJitter, ADR-35 D4). That is written here as well as there because this is
+// where someone reasons about promotion timing, and removing the jitter as
+// redundant-with-the-tick is the specific mistake available from this file.
+//
 // started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall (Decision 6d).
 // Without it, SweepRunningTimeout measures the resumed run against a started_at
 // from before a park that may have lasted days, and the run is failed on its first

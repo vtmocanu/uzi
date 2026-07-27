@@ -60,8 +60,7 @@ ALTER TABLE runs
 -- column's six members are closed at authoring — they are the whole
 -- SDKRateLimitInfo.rateLimitType union at the pinned @anthropic-ai/claude-agent-sdk
 -- (sdk.d.ts) — plus the server's own 'unknown' coercion. Nothing inside PRD #35 adds
--- a seventh. The only mover is an SDK pin bump, which is external, rare, and
--- accompanied by a failing test (below) rather than by silence.
+-- a seventh. The only mover is an SDK pin bump, which is external and rare.
 --
 -- WHY A CHECK AT ALL, given the column is display-only — and it is the same
 -- argument 00089 makes, which applies here MORE strongly than it did there. Nothing
@@ -77,13 +76,32 @@ ALTER TABLE runs
 -- a refactor that moves the coercion. An auditor demonstrated the exposure by
 -- storing 5009 bytes containing a control character straight into this column.
 --
--- HONEST COST, stated rather than buried: if an SDK bump adds a seventh member and
--- Go is taught it without this migration being amended, a park carrying that value
--- raises 23514 at runtime — a display nicety turning into a failed run. 00089
--- accepted exactly that risk and mitigated it the same way this does, with
--- TestRateLimitTypeVocabularyMatchesCheck, which PARSES THE LIST BELOW out of this
--- file and compares it to the Go allowlist. Drift therefore reddens at `go test`,
--- where a developer is, instead of at park time, where a user is.
+-- THE TWO DRIFT DIRECTIONS ARE NOT SYMMETRIC, AND ONLY ONE IS PINNED. Naming which
+-- is which is the whole justification for the CHECK, so read this before "closing
+-- the gap" in the unpinned direction.
+--
+--   Go taught, SQL forgotten  — FAILS HARD. A park carrying the new member raises
+--     23514 at runtime, turning a display nicety into a failed run on a user's work.
+--     PINNED: TestRateLimitTypeVocabularyMatchesCheck parses the list below out of
+--     this file and compares it to the Go allowlist, so this reddens at `go test`,
+--     where a developer is, instead of at park time, where a user is. 00089 accepted
+--     the identical risk and mitigated it with the identical instrument.
+--
+--   SDK bumped, Go forgotten  — FAILS SOFT, BY CONSTRUCTION. The new member arrives
+--     as an unrecognised string, CoerceRateLimitType maps it to 'unknown', it stores
+--     cleanly, and the only cost is display fidelity on one field. DELIBERATELY
+--     UNPINNED, and it is not merely an oversight to be corrected later: the SDK
+--     typings live in agent/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts,
+--     which is outside the api Go module and is not committed. A Go test reading them
+--     would be CACHE-INVISIBLE under CLAUDE.md's cross-module rule and would fail
+--     outright in the api CI job, where agent/node_modules does not exist. Measured:
+--     'seven_day_overage_included' appears in exactly ONE non-node_modules file in
+--     the tree, workersvc/limitwait.go. Nothing in this repo observes the SDK.
+--
+-- (An earlier draft of this paragraph promised "a failing test" on an SDK bump. That
+-- was false and is the exact shape of wrong doc this file is otherwise careful about:
+-- a promise of a guard that does not exist, sitting in the paragraph whose job is to
+-- justify the mitigation.)
 --
 -- NULL stays legal and is not an eighth value: every run predating this migration
 -- has one, as does every run that never parks, so a CHECK rejecting NULL would fail
@@ -142,10 +160,28 @@ CREATE INDEX idx_runs_limit_wait_retry
 --
 -- 🔴 THAT FAIL-LOUD PROPERTY IS ENTIRELY LOAD-BEARING ON GOOSE'S TRANSACTION
 -- WRAPPER, SO DO NOT ADD THE "NO TRANSACTION" ANNOTATION TO THIS FILE.
--- (Named without its leading plus-goose token on purpose: goose's parser treats ANY
--- comment line containing that token as an annotation, so merely NAMING it in prose
--- makes the whole file unparseable at boot — "not supported: invalid annotation",
--- with every migration after it unapplied. Measured here, on this comment.)
+--
+-- (Named without its leading plus-goose token on purpose. goose's parser fires on
+--   HasPrefix(TrimSpace(line), "--") && Contains(line, "<plus>goose")
+-- so the trigger is THE TOKEN ITSELF ON ANY COMMENT LINE — not the words "NO
+-- TRANSACTION", and not annotation-shaped prose. `-- see the plus-goose docs` bricks
+-- this file just as thoroughly. Writing the phrase in prose, as above, is safe BY
+-- CONSTRUCTION rather than by care, which is why it is the mitigation chosen here;
+-- but someone who only learns "avoid that phrase" still walks into it.
+--
+-- The failure is at API BOOT: "not supported: invalid annotation", with this and
+-- EVERY LATER migration unapplied. Measured here, on this very comment, by the live
+-- sweep — and nothing cheaper sees it. Note precisely why, because the obvious
+-- premise is wrong: sqlc DOES read this directory (sqlc.yaml's `schema:` points at
+-- it, and a deliberate syntax error here exits 1 with a line and column). It parses
+-- the SQL and is BLIND TO THE ANNOTATIONS, so a file with three plus-goose
+-- occurrences including the bricking one gives sqlc exit 0. sqlc validates the SQL;
+-- goose validates the annotations; neither validates the other's half.
+--
+-- CI catches a reintroduction — test:api-store-it runs a real postgres and any
+-- *LiveDB test calls store.Migrate. The blind spot is LOCAL: the ordinary pre-push
+-- gate runs with UZI_TEST_DATABASE_URL unset, so every live-DB test self-skips and
+-- cannot see a bricked migration. The window is one push.)
 -- Run in autocommit, the sequence below does not stop at the failing statement: the
 -- DROP INDEX commits, the narrowing ADD CONSTRAINT raises 23514 and is skipped, and
 -- every DROP COLUMN after it commits anyway. The instance is then left with `runs`

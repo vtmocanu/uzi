@@ -23,9 +23,21 @@ const wireContractFixture = "testdata/claim_skills_wire.json"
 // flag the fixture.
 //
 // The booleans are deliberately set NON-DEFAULT (true), exactly as AutoApprove
-// already was: a golden carrying every flag at its zero value would still pass
-// against a producer that dropped the field entirely, which is the one drift this
-// cross-language pin exists to catch.
+// already was.
+//
+// The reason is NOT the one this comment used to give — that "a golden carrying every
+// flag at its zero value would still pass against a producer that dropped the field
+// entirely". That is false, and measured false: TestClaimSkillsWireContract compares
+// json.MarshalIndent byte-for-byte against the file and NONE of these tags carries
+// omitempty, so a dropped field omits the KEY and the bytes differ whatever the value
+// was. Demonstrated by deleting `"wait_on_limit"` from the golden and watching the
+// test go red — a golden at false and a golden at true both catch it.
+//
+// The real reason, which is weaker but still sufficient: a non-default value is what
+// distinguishes "wired" from "present and always zero" for a future producer built
+// from the REAL claim path rather than from this hand-built fixture. A fixture full
+// of zero values agrees with a server that computes them all wrong in the same
+// direction.
 func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
