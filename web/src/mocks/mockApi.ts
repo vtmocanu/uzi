@@ -1091,6 +1091,18 @@ export const mockApi = {
     return delay({ user: { ...u } }, 200);
   },
 
+  // ── Usage-limit default (PRD #35 M3) ─────────────────────────────────────────
+  // 🔴 TOUCHES THE USER ROW ONLY. It must not walk `state.runs` "helpfully" applying
+  // the new default: the flag is copied onto a run at CREATION, so a sweep would
+  // silently undo every per-run override the user had made — including on the run
+  // they are looking at. The demo has to teach that these are two separate controls,
+  // because that is the thing about this feature people get wrong.
+  setWaitOnLimit: async (enabled: boolean) => {
+    const u = requireSession();
+    u.wait_on_limit = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server's audit H3).
   setJudgeEnabled: async (enabled: boolean, anthropicToken?: string | null) => {

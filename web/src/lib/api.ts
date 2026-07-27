@@ -24,6 +24,16 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
+  /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
+   *  inherits it, including the three kinds with no start affordance at all
+   *  (autopilot, ci_fix, self_improve), which is why the default exists rather than
+   *  a per-start prompt. Default false; toggled from their own Settings.
+   *
+   *  It is a DEFAULT, not a live switch: changing it never touches a run that
+   *  already exists. `Run.wait_on_limit` is the per-run value, set from this at
+   *  creation and overridable on the run view — so the two disagreeing is the normal
+   *  state of a user who overrode one run, not a sync bug to fix. */
+  wait_on_limit: boolean;
   // Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4),
   // independent of what their runs spend — the point of the feature. Both null ⇒
   // unbound ⇒ their default token. The label, never the value.
@@ -1722,6 +1732,24 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  /**
+   * PRD #35: flip the current user's DEFAULT for the usage-limit park. Returns the
+   * updated user.
+   *
+   * 🔴 IT DOES NOT REACH RUNS THAT ALREADY EXIST — not even queued ones, and not the
+   * one the user is looking at. The flag is copied onto each run at creation, so this
+   * changes what the NEXT run inherits and nothing else. The per-run control is
+   * setRunWaitOnLimit below; the two are separate endpoints because they answer
+   * different questions, and a single "sync everything" write would silently undo
+   * every per-run override the user had made.
+   *
+   * The reason this default is load-bearing rather than a convenience: autopilot,
+   * ci_fix and self_improve runs have NO start affordance at all, so for two of the
+   * three kinds that park, this setting is the only way the opt-in can ever be
+   * expressed.
+   */
+  setWaitOnLimit: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
   // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
   // the body carries no user id. Returns the updated user.
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):

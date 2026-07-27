@@ -50,3 +50,30 @@ describe("mockApi.setRunWaitOnLimit (PRD #35)", () => {
     await expect(mockApi.setRunWaitOnLimit("run-nope", true)).rejects.toMatchObject({ status: 404 });
   });
 });
+
+// PRD #35 M3: the per-user DEFAULT. Separate from the per-run toggle above, and the
+// separation is the thing being asserted.
+describe("mockApi.setWaitOnLimit — the user default (PRD #35)", () => {
+  it("flips the session user's default", async () => {
+    const { user } = await mockApi.setWaitOnLimit(true);
+    expect(user.wait_on_limit).toBe(true);
+    const off = await mockApi.setWaitOnLimit(false);
+    expect(off.user.wait_on_limit).toBe(false);
+  });
+
+  it("🔴 does NOT retro-apply to runs that already exist", async () => {
+    // The flag is copied onto a run at CREATION. A mock that swept state.runs would
+    // silently undo every per-run override — including on the run the user is
+    // looking at — and would teach the demo's users the opposite of how this works.
+    const before = await mockApi.getRun("run-limit-wait");
+    expect(before.run.wait_on_limit).toBe(true);
+
+    await mockApi.setWaitOnLimit(false);
+
+    const after = await mockApi.getRun("run-limit-wait");
+    expect(after.run.wait_on_limit).toBe(true);
+    expect(after.run.status).toBe("limit_wait");
+
+    await mockApi.setWaitOnLimit(true);
+  });
+});

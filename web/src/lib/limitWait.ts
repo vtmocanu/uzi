@@ -94,14 +94,24 @@ export function feedWindowLabel(type: unknown): string | null {
 /**
  * The `resets_at` off a run-message payload, as epoch milliseconds, or null.
  *
- * Untrusted like its `rate_limit_type` sibling, and shaped differently from every
- * other timestamp the web reads: the DTO's timestamps are ISO strings the server
- * wrote, but this one is whatever the worker put in the payload. The wire contract
- * (`protocol.ts`) carries the reset as an EPOCH NUMBER and normalizes seconds to
- * milliseconds with a `< 10^12` test, so a payload built from that field is a
- * number, while a payload built from an already-formatted value is a string. Accept
- * both rather than betting on which, and apply the same seconds threshold so a
- * seconds-valued number does not render as 1970.
+ * **The agreed shape is an ISO STRING**, and it is OMITTED rather than null when the
+ * reset is unknown, so "unknown" is one shape on the wire rather than two. The
+ * worker normalizes the SDK's own bare number (which carries a seconds-vs-
+ * milliseconds ambiguity) before it is emitted, so this never re-derives that.
+ *
+ * The numeric arm below is therefore NOT the contract — it is a guard, and the
+ * distinction matters to anyone tempted to delete it as dead code. This field is
+ * worker-authored and reaches the database through nothing but a NUL strip and a
+ * rune cap, so "the emitter promises an ISO string" is a statement about the worker
+ * we ship, not about the bytes that can arrive. A number that fell through would
+ * otherwise render as an authoritative-looking 1970, which is worse than no clause
+ * at all. Applying the same `< 10^12` threshold the worker uses costs four lines and
+ * removes that outcome.
+ *
+ * *(An earlier version of this comment asserted the wire carries a number and the
+ * string was the odd case. That was true of a draft of the contract and false of the
+ * one that shipped; it is corrected here rather than left to mislead the next reader
+ * into "fixing" the string arm.)*
  *
  * Returns null for anything else, INCLUDING a numerically valid but absurd instant
  * — the caller's sentence is written to stand without the clause, so a missing reset

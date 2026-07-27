@@ -843,24 +843,28 @@ function StandaloneResult({ result }: { result: RunMessage }) {
  *     even escaped: an unrecognised value drops the clause and the sentence still
  *     reads correctly;
  *   * `resets_at` is parsed to an instant and re-FORMATTED, so what renders is this
- *     build's own output, never the payload's bytes;
- *   * `attempt` renders only when it is a finite number.
+ *     build's own output, never the payload's bytes.
  *
  * That leaves no path from the payload to the DOM that carries a worker-chosen
- * string, which is a stronger property than escaping and is why it is worth the
- * three separate guards.
+ * string, which is a stronger property than escaping and is why both guards exist
+ * rather than a `dangerouslySetInnerHTML`-free assumption.
+ *
+ * 🔴 THE PAYLOAD HAS NO `attempt` KEY AND THIS ROW MUST NOT INVENT ONE. PRD #35's
+ * Decision 10 originally listed it; it was dropped because the count is incremented
+ * by the SERVER inside SetRunLimitWait, strictly after the worker emits this
+ * message, so anything a worker could put here is a stale N-1 that disagrees with
+ * the run row. The live count is `limit_wait_count` on the DTO and it renders in the
+ * run-view strip.
+ *
+ * Nor should this row read that DTO count: a feed row is a HISTORICAL record, so a
+ * run that parked three times would render three identical "attempt 3" rows. What
+ * distinguishes the rows is `resets_at`, which differs per park by construction — so
+ * no per-row information is lost by leaving the count out entirely.
  */
 function LimitRow({ payload, parked = false }: { payload?: Record<string, unknown>; parked?: boolean }) {
   const window = feedWindowLabel(payload?.["rate_limit_type"]);
   const resetsAt = parseFeedInstant(payload?.["resets_at"]);
-  const attempt = asNumber(payload?.["attempt"]);
-  const detail = [
-    window,
-    resetsAt != null ? `resets ${new Date(resetsAt).toLocaleString()}` : null,
-    // "attempt 2" only from the second park on: "attempt 1" is noise on the row that
-    // IS the first attempt, and a limit_hit never has a meaningful count.
-    parked && attempt != null && attempt > 1 ? `attempt ${attempt}` : null,
-  ]
+  const detail = [window, resetsAt != null ? `resets ${new Date(resetsAt).toLocaleString()}` : null]
     .filter((s): s is string => s != null)
     .join(" · ");
   return (

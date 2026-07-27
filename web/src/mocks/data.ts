@@ -54,6 +54,7 @@ export const mockAdmin: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  wait_on_limit: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
   created_at: daysAgo(41),
@@ -70,6 +71,11 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: true,
     judge_enabled: true,
+    // PRD #35: the demo's one opted-IN user, and it is the autopilot user on purpose.
+    // An autopilot run has no start affordance at all, so this default is the ONLY
+    // way its opt-in can ever be expressed — pairing the two is what makes the
+    // setting's reason for existing visible in the fixture rather than only in prose.
+    wait_on_limit: true,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: daysAgo(33),
@@ -83,6 +89,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: daysAgo(20),
@@ -96,6 +103,7 @@ export const mockUsers: User[] = [
     is_active: false,
     autopilot_enabled: false,
     judge_enabled: false,
+    wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: daysAgo(18),
@@ -111,6 +119,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: daysAgo(15),
@@ -124,6 +133,7 @@ export const mockUsers: User[] = [
     is_active: true,
     autopilot_enabled: false,
     judge_enabled: false,
+    wait_on_limit: false,
     judge_anthropic_secret_id: null,
     judge_anthropic_secret_label: null,
     created_at: daysAgo(25),
@@ -2170,20 +2180,28 @@ export const mockLimitWaitMessages: RunMessage[] = [
   lm("text", "lead", { text: "Reading the worker heartbeat path to scope the metrics endpoint." }, 138),
   lm("tool_use", "lead", { id: "lw-1", name: "Read", input: { file_path: "api/internal/handler/workers.go" } }, 138),
   lm("tool_result", "lead", { tool_use_id: "lw-1", content: "// Heartbeat records liveness for the claim path…" }, 137),
-  // The first park. resets_at is an EPOCH NUMBER here on purpose: that is the shape
-  // the wire contract carries, and a fixture that only ever used an ISO string would
-  // never exercise parseFeedInstant's numeric arm.
-  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: Math.floor((NOW + 41 * 60_000) / 1000), attempt: 1 }, 92),
+  // The first park. Two keys only — `rate_limit_type` and an ISO `resets_at` — which
+  // is the whole payload the worker emits. There is deliberately no `attempt`: the
+  // count is incremented server-side after this message is written, so a
+  // worker-supplied one would be a stale N-1. The run row's limit_wait_count is the
+  // live value and the run-view strip renders it.
+  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: minsAgo(51) }, 92),
   lm("status", null, { text: "resumed after the usage window reopened" }, 44),
   lm("text", "coder", { text: "Picking the metrics endpoint back up from the plan." }, 43),
   lm("tool_use", "coder", { id: "lw-2", name: "Edit", input: { file_path: "api/internal/handler/metrics.go" } }, 40),
   lm("tool_result", "coder", { tool_use_id: "lw-2", content: "ok" }, 40),
-  // The second park — the live one, and the reason the run row reads "attempt 2".
-  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: minsAhead(154), attempt: 2 }, 6),
+  // The second park — the live one, whose reset matches the run row's limit_resets_at.
+  // The two parks differ ONLY in resets_at, which is exactly what distinguishes the
+  // rows now that no count rides them: they must not read as duplicates.
+  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: minsAhead(154) }, 6),
   // A limit_hit from an opted-OUT run, replayed here so the danger-toned variant is
   // visible somewhere in mock mode. Its window name is one this build knows; the
   // untrusted-value path is covered by tests rather than by a hostile fixture.
   lm("limit_hit", "worker", { rate_limit_type: "seven_day_opus", resets_at: minsAhead(3_400) }, 5),
+  // A park with NO keys at all — the shape when the SDK frame carried neither field.
+  // Both are OMITTED rather than null, so this is what "unknown" actually looks like
+  // on the wire, and the row still has to say the one thing it is for.
+  lm("limit_wait", "worker", {}, 5),
 ];
 
 // ── Crew-roster demo runs (PRD #95 M2) ───────────────────────────────────────

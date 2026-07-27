@@ -132,13 +132,46 @@ describe("the parked-run fixture can actually discriminate (PRD #35)", () => {
     expect(kinds.has("limit_hit")).toBe(true);
   });
 
-  it("carries a NUMERIC resets_at somewhere, exercising the seconds/millis arm", () => {
-    // The wire carries the reset as an epoch number. A fixture that only ever used an
-    // ISO string would leave parseFeedInstant's numeric promotion untested by the one
-    // artefact a human actually looks at.
-    const numeric = mockLimitWaitMessages.filter(
-      (m) => typeof (m.payload as { resets_at?: unknown } | null)?.resets_at === "number",
+  it("🔴 models the SHIPPED payload: ISO resets_at, keys omitted, and NO attempt", () => {
+    // The fixture is the demo's stand-in for the wire, so a shape the worker cannot
+    // emit teaches the wrong thing to everyone who reads it — and would let a
+    // renderer that only handles that shape look correct in a browser pass.
+    //
+    // `attempt` was in PRD Decision 10 and was dropped: the count is incremented
+    // server-side AFTER this message is written, so any worker-supplied value is a
+    // stale N-1. Asserted as an ABSENCE because re-adding it is the tempting mistake.
+    for (const msg of mockLimitWaitMessages) {
+      if (msg.kind !== "limit_wait" && msg.kind !== "limit_hit") continue;
+      const payload = (msg.payload ?? {}) as Record<string, unknown>;
+      expect(Object.keys(payload).sort()).toEqual(
+        Object.keys(payload).filter((k) => k === "rate_limit_type" || k === "resets_at").sort(),
+      );
+      expect("attempt" in payload, `seq ${msg.seq} carries an attempt key the worker never sends`).toBe(false);
+      if ("resets_at" in payload) {
+        expect(typeof payload["resets_at"], `seq ${msg.seq}: resets_at must be an ISO string`).toBe("string");
+        expect(Number.isFinite(Date.parse(payload["resets_at"] as string))).toBe(true);
+      }
+    }
+  });
+
+  it("covers the OMITTED-key shape, which is how 'unknown' arrives", () => {
+    // Both keys are left out rather than sent as null, so "unknown" has exactly one
+    // shape. A fixture without this case never renders the bare row.
+    const bare = mockLimitWaitMessages.filter(
+      (m) => m.kind === "limit_wait" && Object.keys((m.payload ?? {}) as object).length === 0,
     );
-    expect(numeric.length).toBeGreaterThan(0);
+    expect(bare.length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes its two parks by resets_at, the only field that can", () => {
+    // With no count on the payload, resets_at is what stops two parks reading as
+    // duplicate rows. It differs per park by construction; the fixture must not
+    // accidentally reuse one value.
+    const resets = mockLimitWaitMessages
+      .filter((m) => m.kind === "limit_wait")
+      .map((m) => (m.payload as { resets_at?: string } | null)?.resets_at)
+      .filter((v): v is string => typeof v === "string");
+    expect(resets.length).toBeGreaterThan(1);
+    expect(new Set(resets).size).toBe(resets.length);
   });
 });

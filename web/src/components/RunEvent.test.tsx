@@ -882,11 +882,12 @@ describe("FinishTokens $0 cost (Decision 8)", () => {
 // case here names which of the two it is pinning.
 describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
   const RESETS = Date.UTC(2026, 6, 27, 21, 0, 0);
+  const ISO = new Date(RESETS).toISOString();
 
   it("renders a limit_wait row as a warn-toned PAUSE, never as breakage", () => {
     const { container } = render(
       <RunEventRow
-        msg={msg({ seq: 1, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: RESETS, attempt: 1 } })}
+        msg={msg({ seq: 1, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: ISO } })}
         live={false}
       />,
     );
@@ -901,7 +902,7 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
   it("renders a limit_hit row as a DANGER-toned death, with no 'paused' wording", () => {
     const { container } = render(
       <RunEventRow
-        msg={msg({ seq: 2, kind: "limit_hit", payload: { rate_limit_type: "seven_day_opus", resets_at: RESETS } })}
+        msg={msg({ seq: 2, kind: "limit_hit", payload: { rate_limit_type: "seven_day_opus", resets_at: ISO } })}
         live={false}
       />,
     );
@@ -932,7 +933,10 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
 
   it("drops a malformed resets_at rather than rendering a plausible-looking wrong date", () => {
     const { container } = render(
-      <RunEventRow msg={msg({ seq: 4, kind: "limit_wait", payload: { resets_at: "whenever", attempt: 3 } })} live={false} />,
+      <RunEventRow
+        msg={msg({ seq: 4, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: "whenever" } })}
+        live={false}
+      />,
     );
     // Not a bare `not.toContain("resets")` — the row's own sentence ends "…until it
     // resets", so that would pass for the wrong reason and fail for the right one.
@@ -940,13 +944,17 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     expect(container.textContent).not.toMatch(/resets \S/);
     expect(container.textContent).not.toContain("Invalid");
     expect(container.textContent).not.toContain("NaN");
-    // The attempt still renders — one unusable field must not blank the others.
-    expect(container.textContent).toContain("attempt 3");
+    // The window still renders — one unusable field must not blank the other.
+    expect(container.textContent).toContain("5-hour window");
   });
 
-  it("promotes an epoch-SECONDS resets_at instead of rendering 1970", () => {
-    // The wire contract carries the reset as an epoch number and normalizes seconds
-    // to milliseconds; a payload built off that field can be either.
+  it("guards against a NUMERIC resets_at, which the contract forbids and the field cannot", () => {
+    // The worker emits an ISO string. But this payload reaches the database through
+    // nothing but a NUL strip and a rune cap, so "the emitter promises a string" is a
+    // statement about the worker we ship, not about the bytes that can arrive. A
+    // seconds-valued number falling through would render an authoritative-looking
+    // 1970 — worse than no clause. This is a guard, not the contract, and the case
+    // exists so nobody deletes the arm as dead code.
     const { container } = render(
       <RunEventRow
         msg={msg({ seq: 5, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: RESETS / 1000 } })}
@@ -957,24 +965,32 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     expect(container.textContent).not.toContain("1970");
   });
 
-  it("hides 'attempt 1', which is noise on the row that IS the first attempt", () => {
-    const first = render(
-      <RunEventRow msg={msg({ seq: 6, kind: "limit_wait", payload: { attempt: 1 } })} live={false} />,
+  it("🔴 never renders an 'attempt' clause, even when a payload carries one", () => {
+    // The key was in PRD Decision 10 and was DROPPED: limit_wait_count is incremented
+    // by the server after this message is written, so any worker-supplied value is a
+    // stale N-1 that disagrees with the run row. The live count renders in the
+    // run-view strip, off the DTO.
+    //
+    // Asserted against a payload that HAS the key, because that is the only version
+    // of this test that fails against a renderer which quietly reads it again.
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 6, kind: "limit_wait", payload: { rate_limit_type: "five_hour", attempt: 7 } })} live={false} />,
     );
-    expect(first.container.textContent).not.toContain("attempt");
-    cleanup();
-    const second = render(
-      <RunEventRow msg={msg({ seq: 7, kind: "limit_wait", payload: { attempt: 2 } })} live={false} />,
-    );
-    expect(second.container.textContent).toContain("attempt 2");
+    expect(container.textContent).not.toContain("attempt");
+    expect(container.textContent).not.toContain("7");
+    expect(container.textContent).toContain("5-hour window");
   });
 
-  it("renders a bare payload without inventing detail", () => {
-    // An older worker, or a kind that carries no structure. The row still has to say
-    // the one thing it is for.
-    const { container } = render(<RunEventRow msg={msg({ seq: 8, kind: "limit_wait", payload: null })} live={false} />);
-    expect(container.textContent).toContain("Anthropic usage limit reached");
-    expect(container.textContent).not.toContain("(");
+  it("renders the OMITTED-key payload without inventing detail", () => {
+    // Both keys are left out rather than sent as null when the SDK frame carried
+    // neither, so this is what "unknown" actually looks like on the wire. The row
+    // still has to say the one thing it is for.
+    for (const payload of [{}, null]) {
+      cleanup();
+      const { container } = render(<RunEventRow msg={msg({ seq: 8, kind: "limit_wait", payload })} live={false} />);
+      expect(container.textContent).toContain("Anthropic usage limit reached");
+      expect(container.textContent).not.toContain("(");
+    }
   });
 
   it("no longer falls through to the 'unrenderable' arm", () => {
