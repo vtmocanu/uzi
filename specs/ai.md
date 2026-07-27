@@ -12395,6 +12395,7 @@ keeps the red `✗` and still auto-expands, because that one still wants attenti
   the alternative: tag the message at `agent/src/sdk-messages.ts` `mapUser` with an additive
   `denied: true` through the opaque `jsonb` payload. Deliberately NOT built now — it touches agent,
   protocol and web for a cosmetic change.
+
 ## 419. Issue #145 — pod `Ready` is not health, and the pod itself already carries the health signal
 
 **The decision, and it reverses a recommendation the repo owner wrote in a comment on the issue, on
@@ -12740,6 +12741,15 @@ beats a rule that relies on noticing.
 > instruction names only the weaker half. Recorded here because the paragraph above was the very
 > claim being written when it was falsified, which is this section's subject arriving one level up:
 > the rule-holder is not the person best placed to notice their own instance.
+>
+> **And the same shape has a third instance with NO human error in it at all, which is why it is the
+> strongest of the three.** Resolving this branch's `CHANGELOG.md` against a `main` that had cut two
+> releases in the interval, a three-way merge placed an `[Unreleased]` entry **inside a shipped
+> release** — because it matched on the `### Fixed` heading, a heading being what it matches on,
+> rather than on the release section the entry belongs to. Green, silent, and correct by its own
+> rules. **Git's unit of matching is not the author's unit of meaning.** In the other two instances
+> "be more careful" is at least available as a wrong answer; here it is not, which is what makes the
+> class worth naming rather than the incidents.
 
 **A published figure was wrong before it was re-derived, and the correction is the record.** The
 design said the rule fires on 33 of 41 `settled` ticks; replaying the identical 123 samples through
