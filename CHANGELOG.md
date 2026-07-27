@@ -57,6 +57,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Changed
 
+- **Anthropic token labels can no longer contain invisible formatting characters.** Zero-width
+  spaces and joiners, bidirectional overrides, the byte-order mark and the soft hyphen are now
+  rejected when a token is created or renamed, alongside the control characters that were
+  already rejected. The reason is what a label is for: it is the string you read to answer
+  "which account did this run bill?", and an invisible codepoint breaks exactly that — a
+  right-to-left override makes a label *read* as a different account, and a zero-width space
+  makes two genuinely different tokens draw identically in a browser while remaining distinct
+  rows. **The accepted cost, stated because it is a real one:** the zero-width joiner is itself
+  one of these characters, so multi-part emoji built from it (`👨‍👩‍👧`) can no longer be used in a
+  label; a single-codepoint emoji (`🔑`) is unaffected. Rejecting only the bidirectional
+  controls would have left the look-alike problem in place while appearing to fix it. Labels
+  saved before this landed are untouched (PRD #111 M2).
+
 - **`UZI_AGENT_VERSION` now carries a real build stamp instead of a frozen placeholder.** CI
   stamps the release into the agent image, and an unstamped image reports no version rather
   than the retired `0.1.0-m4` literal — so a hand-set value is no longer the only thing that

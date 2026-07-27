@@ -182,8 +182,20 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 }
 
 // The label reaches a terminal through cellText, like every other user-authored
-// cell: validateSecretLabel permits unicode.Cf (bidi overrides) and
-// uzicli.Printer.Table does not sanitize what it is handed.
+// cell, because uzicli.Printer.Table does not sanitize what it is handed.
+//
+// 🔴 THE FIXTURE BELOW IS DELIBERATELY UN-STORABLE THROUGH THE API. This comment
+// used to say "validateSecretLabel permits unicode.Cf", which was true when written
+// and stopped being true in this same milestone: the validator now rejects both
+// unicode.IsControl and unicode.Cf, so no handler will accept this label.
+//
+// The test still earns its keep, and the reasoning is recorded here so nobody has to
+// re-derive it before deleting it: the validator is a statement about what the
+// SERVER accepts, this is a statement about what the RENDERER does with what it is
+// given, and they sit on opposite sides of a trust boundary. A pre-M2 stored label,
+// a future write path that skips validation, or a row written directly to the
+// database all reach this code without passing that check. Keep the fixture hostile
+// and keep the cellText routing.
 func TestTokenListSanitizesLabel(t *testing.T) {
 	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
 		{ID: "s1", Kind: "anthropic_token", Label: "safe‮dnetsop\x1b[31m", CreatedAt: time.Unix(1784000000, 0)},

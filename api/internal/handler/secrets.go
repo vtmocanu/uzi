@@ -653,9 +653,40 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 }
 
 // validateSecretLabel trims and checks a token label (PRD #104 D7): non-empty, at
-// most maxLabelBytes, no control characters. Leading/trailing whitespace is trimmed
-// (so the stored value satisfies the migration's `label = btrim(label)` CHECK);
-// interior spaces are allowed (a label is a human name, not a token).
+// most maxLabelBytes, no control characters and no Unicode FORMAT characters.
+// Leading/trailing whitespace is trimmed (so the stored value satisfies the
+// migration's `label = btrim(label)` CHECK); interior spaces are allowed (a label
+// is a human name, not a token).
+//
+// 🔴 THE Cf HALF IS ABOUT WHAT A LABEL IS FOR, NOT ABOUT TERMINAL SAFETY.
+// Since PRD #111 a label is the string a user reads to answer "which account did
+// this run bill?" — so a label that can render as something it is not defeats the
+// feature it exists to serve. Two measured consequences, both closed here:
+//
+//   - U+202E (RIGHT-TO-LEFT OVERRIDE) and its neighbours visually REVERSE the text
+//     after them, so a label can be made to read as a different account entirely.
+//   - Zero-widths make two DISTINCT tokens render identically: `work` and
+//     `work`+U+200B are different rows that look the same in a browser, and 00077's
+//     unique index is on `lower(label)`, which does not fold them. So the
+//     collision the index exists to prevent stays possible while looking prevented.
+//
+// The predicate is the pair this repo has already settled on twice — sanitizeTTY
+// (cmd/uzi/run.go) and workersvc.hasUnsafeChar — rather than a third spelling of
+// almost the same rule.
+//
+// THE COST, DECIDED RATHER THAN DISCOVERED: U+200D (zero-width joiner) is itself a
+// format character, so EMOJI ZWJ SEQUENCES ARE NOT STORABLE — `family 👨‍👩‍👧 key` is
+// refused, and a single-codepoint emoji like `🔑 key` is fine. That is accepted on
+// purpose. A token label is an operational identifier used to answer a billing
+// question; the identical-rendering hazard applies to a zero-width JOINER exactly
+// as it does to a bidi override, and a partial reject-list (bidi controls only)
+// would leave the collision live while looking like it had solved something. The
+// error message says so, because a user hitting this deserves the reason and not a
+// mystery.
+//
+// Only NEW writes are validated. Labels stored before this landed are unaffected,
+// which is why the CLI still routes every label through cellText — see the tests
+// there for why that is defense in depth rather than redundancy.
 func validateSecretLabel(raw string) (string, error) {
 	label := strings.TrimSpace(raw)
 	if label == "" {
@@ -667,6 +698,12 @@ func validateSecretLabel(raw string) (string, error) {
 	for _, r := range label {
 		if r == unicode.ReplacementChar || unicode.IsControl(r) {
 			return "", errors.New("label must not contain control characters")
+		}
+		if unicode.In(r, unicode.Cf) {
+			return "", errors.New("label must not contain invisible formatting characters " +
+				"(zero-width spaces and joiners, bidirectional overrides, the byte-order mark): " +
+				"they let two different tokens look identical, or make a label read as a different " +
+				"account. This also rules out multi-part emoji such as 👨‍👩‍👧, which are joined by one")
 		}
 	}
 	return label, nil

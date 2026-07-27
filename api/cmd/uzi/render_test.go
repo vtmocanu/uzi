@@ -115,6 +115,23 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	// the escape would repaint the terminal, the override would visually reverse the
 	// label so it READS as a different account, and the newline would break the table
 	// rail. All three must be gone, and the printable text must survive.
+	//
+	// 🔴 THIS FIXTURE IS DELIBERATELY UN-STORABLE THROUGH THE API, AND THE TEST STILL
+	// EARNS ITS KEEP. Since PRD #111 M2, validateSecretLabel (handler/secrets.go)
+	// rejects both unicode.IsControl and unicode.Cf, so no label containing these bytes
+	// can be written through any handler today. Do NOT "tidy" this into a reachable
+	// fixture, and do NOT drop the cellText routing it pins:
+	//
+	//   - The two live on opposite sides of a trust boundary. The validator is what the
+	//     SERVER accepts; this is what the RENDERER does with whatever it is handed.
+	//     Depending on the far side of a boundary for local safety is exactly the
+	//     coupling that turns one regression into two.
+	//   - Three routes reach the renderer without passing that validator: a label
+	//     stored before M2 landed (existing rows are not re-validated), a future write
+	//     path that forgets the check, and a row written straight to the database.
+	//
+	// The `cellText` mutation control on this test is the live half — swapping it for
+	// sanitizeTTY or the raw string reddens the assertions below.
 	hostile := "safe‮dnetsop\x1b[31m\nnext-line"
 	out := render(&hostile)
 	for _, bad := range []string{"‮", "\x1b", "\n\nnext-line"} {
