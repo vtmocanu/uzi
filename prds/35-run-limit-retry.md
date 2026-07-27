@@ -125,7 +125,7 @@ this PRD supersedes that stance for sustained limits.
    slot for up to days and still get reaped: the server sweeper fails `running` runs
    past RUN_TIMEOUT=2h (`runtime.sql:789-801`) and five_hour/seven_day resets exceed
    that. `limit_wait` is:
-   - added to the status CHECK (`00020_workers_runs.sql:36-37` — still the inline
+   - added to the status CHECK (`00020_workers_runs.sql:37` — still the inline
      `00020` constraint; the 14 subsequent `ALTER TABLE runs` sites only touch
      `runs_kind_check` / `runs_kind_shape` (00053, 00058) and
      `runs_anthropic_select_reason_check` (00089), never the status CHECK);
@@ -179,7 +179,7 @@ this PRD supersedes that stance for sustained limits.
    endpoint (the `RunState` union at `agent/src/protocol.ts:15-19` gains the status;
    the `StateRequest` interface at `protocol.ts:666-710` gains the fields;
    `workersvc.SetState` dispatch `service.go:2104-2143` gains a case — the default arm
-   rejects unknown statuses today (`:2141`), so this is required wiring). The
+   rejects unknown statuses today (`:2142-2143`), so this is required wiring). The
    execution then ends and the slot frees (PRD #42 concurrency benefits).
    Server-side handling:
    - `rate_limit_type` is **allowlisted against the SDK union**
@@ -223,6 +223,67 @@ this PRD supersedes that stance for sustained limits.
      health_since = NULL`. `SetRunLimitWait` and the promotion query must decide
      whether they do too — a parked run is not unhealthy, so the current reading is
      yes for both, but it is a deliberate choice and belongs in the query comment.
+
+     **↳M0 — it is NOT a choice. Both queries MUST carry it, and Decision 3 above
+     holds the proof this bullet does not connect to.** `ListActiveRunsForHealth`
+     (`runtime.sql:1271-1276`) is a **positive** allowlist, which Decision 3 banks as
+     a free win (a parked run is invisible to the detector and can never read
+     "stalled"). It cuts the other way too, and nothing checked that direction:
+     **whatever flag was live at park time FREEZES for the whole park**, because
+     nothing will ever revisit the row to clear it. A run parked while flagged
+     `stalled` stays `stalled` for days. It is user-visible, not cosmetic —
+     `crewStateFor` (`api/cmd/uzi/tui_lanes.go:235-248`) reads `runHealth` through
+     `stalledHealth` after the terminal and gate checks, so a parked run falls
+     straight into `crewStalled`. That is **Success Criterion 2 failing through the
+     health column instead of the status column**, by a route this PRD never checks.
+     Both query comments must cite the detector's positive allowlist as the reason.
+     `health_notified_at` is not reset, per every other exit contract in the file.
+
+     **Do not "fix" it by adding `limit_wait` to `ListActiveRunsForHealth`.** The
+     detector's signals all describe a *running* agent, and making a park flaggable
+     re-introduces the false alarm Decision 3 depends on avoiding. Clearing at park
+     entry is the fix. The web mirror follows: `isHealthFlaggableStatus`
+     (`web/src/lib/runBadge.ts:138`) must not gain `limit_wait` either.
+
+   - ↳M0 **THE PARK ACKNOWLEDGEMENT CONTRACT — the worker cannot currently tell
+     whether its park was applied, and the failure mode is an unbounded disk leak on
+     the DESIGNED path.** `WorkerClient.reportState` returns `Promise<void>`
+     (`agent/src/client.ts:142`) and `isAlreadyTerminal` returns true for **any** 409
+     (`:250`), which `reportState` logs and returns as success. That is right for
+     every status shipped today, all of which are *terminal* reports where "the server
+     already moved on" genuinely is success. `limit_wait` is the first **non-terminal**
+     report whose consequence is that the worker **skips three filesystem removals**.
+
+     "Not parked" has five causes and **three of them are designed outcomes**: the
+     `running`-only source guard failing, `RUN_LIMIT_MAX_WAITS` exhausted, the
+     `RUN_LIMIT_MAX_PARK` clamp exceeded, `wait_on_limit=false` (coerced, Decision 5),
+     and the run already terminal (Decision 11's cancel). The middle three are the
+     designed terminal paths for a run that keeps hitting limits — the exact
+     population this PRD serves — so uncorrected, **every run that exhausts its retry
+     budget leaks the clone, the plugin dir and up to ~170 MB of run HOME**.
+
+     **Ruling**: `reportState` stops discarding the response body and returns
+     `{applied, status}`. No new endpoint and no new field are needed — both the 200
+     and the 409 paths already return `{"run": runToDTO(run)}`
+     (`handler/worker_protocol.go:483` and `:486`); the information is on the wire and
+     is being thrown away.
+
+     🔴 **The worker skips cleanup IF AND ONLY IF the returned status is
+     `"limit_wait"` — not `if (applied)`.** On the three designed paths above the
+     server *fails the run*, so `applied` is **true** and an `applied`-keyed branch
+     leaks on the most common cause of all. The status is the discriminator; `applied`
+     is diagnostics. A positive test on one literal is chosen over enumerating the
+     five causes because the default arm is then "clean up", so a future status, an
+     old server, a parse failure and an unforeseen cause all land on the safe side —
+     an enumeration goes stale, this cannot. On not-applied the worker cleans up
+     fully, logs at warn, and sends **no** further state report (the server already
+     owns the narrative; a `failed` report on top would clobber a `cancelled`).
+
+     Two comments go false and must be corrected in the commits that break them:
+     `client.ts:246-247` ("an idempotent success for any state report") and
+     `worker_protocol.go:480-482`. And `worker_protocol.go:472`'s 400 text —
+     `"state must be one of running, awaiting_approval, completed, failed"` — must
+     gain `limit_wait`.
 5. **Bounded, idempotent, source-guarded parks.** `runs.limit_wait_count` increments
    per park; `RUN_LIMIT_MAX_WAITS` (env, default 5) caps it — the N+1th limit
    failure fails the run ("usage-limit retry budget exhausted"). The
@@ -312,8 +373,27 @@ this PRD supersedes that stance for sustained limits.
      *before* approval (during planning or at the gate — only reachable via the
      planning turn itself dying on a limit) resumes into planning as today.
 
-     **↳M0 — `plan_md` is ALREADY on the claim payload** (`protocol.ts:451`, fed by
-     `service.go:1328` `PlanMd: textPtr(run.PlanMd)`), so the claim gains **two**
+     **↳M0 — `plan_approved` is a GATE-BYPASS PRIMITIVE; its invariant belongs in the
+     query comment where it is enforced.** The natural derivation reuses
+     `SetRunRunning`'s predicate (`runtime.sql:590-594`), whose own comment records an
+     accepted residual: a consumed round-1 input lets a stale round-2 pre-gate report
+     through. For `SetRunRunning` that residual hides a gate; for `plan_approved` it
+     tells the worker to skip Phase 1 and **implement an unreviewed `plan_md`** — same
+     residual, materially worse blast radius. It is sound today for a **structural**
+     reason, which is exactly why it must be written down rather than relied on: a park
+     is `running`-only (Decision 5), and a revise round sits at `awaiting_approval`
+     because `SetRunRunning` refuses that transition without a consumed `approve_plan`.
+     So the ordinary multi-round revise flow **cannot reach a park at all**, and the
+     only surviving residual is the stale pre-gate report the existing comment already
+     names. State the invariant — *no `awaiting_approval` report rewrites `plan_md`
+     after the consumed `approve_plan` that made `plan_approved` true* — plus that
+     two-clause argument, so the next reader sees the soundness is a property of the
+     query PAIR, not of the worker's loop. No tighter derivation is cheaply available:
+     `runs` carries no `plan_md_set_at` for `consumed_at` to be compared against.
+
+     **↳M0 — `plan_md` is ALREADY on the claim payload** (`workersvc/claim.go:38`, fed
+     unconditionally by `service.go:1328` and pinned by
+     `claim_wire_contract_test.go:38`), so the claim gains **two**
      fields (`wait_on_limit`, `plan_approved`), not three. Derive the human half in
      SQL as a projected column on `GetRunClaimContext` — **cast it**
      (`(EXISTS (…))::boolean`), because sqlc types a bare expression as `interface{}`
@@ -453,11 +533,27 @@ this PRD supersedes that stance for sustained limits.
    - `app_settings` is not used — it is admin/instance-wide only ("there is no
      user_settings table", `00044_slack.sql:5`); the caps are env config like the
      other run clocks.
-8. **Opt-out runs still get a better death.** Even with `wait_on_limit=false`, a
-   limit-classified failure reports
+8. **Opt-out runs still get a better death — and the SERVER composes the sentence
+   (↳M0).** Even with `wait_on_limit=false`, a limit-classified failure reports
    `failure_reason = "Anthropic usage limit (<type>) reached; resets at <ISO>"`
    (type from the allowlisted enum, no secrets involved) and emits a `limit_hit`
-   feed message — strictly better than today's `agent run failed:
+   feed message.
+
+   **↳M0 — if the WORKER composes that string, this PRD ships a Success Criterion its
+   own design violates.** A worker-composed reason receives only
+   `sanitizeFailureReason` (`service.go:3252` — `stripNUL` plus a rune cap), so
+   "a compromised worker cannot smuggle a non-enum `rate_limit_type` past the server"
+   is simply false on that path. Fix: the worker sends structured `rate_limit_type` +
+   `limit_resets_at` on the **`failed`** report too, and the server composes the
+   sentence from the allowlisted enum. One allowlist, both paths. Two constraints:
+   an unrecognised type coerces to `"unknown"` and absent fields leave today's
+   behaviour untouched (a terminal report is the one call a worker must not be able to
+   fail on a technicality — `service.go:2171-2174`'s stated principle, followed rather
+   than departed from); and the server replaces the worker's `failure_reason` text
+   only when the fields are present, so no other failure path is disturbed.
+   `rate_limit_type` needs no `stripNULParam` — the enum allowlist is strictly
+   stronger, since a non-member becomes the literal `"unknown"` and no
+   worker-controlled byte reaches the column — strictly better than today's `agent run failed:
    error_during_execution`. (Prior art exists for this half, in multica's
    `pkg/taskfailure` — see the Prior-art paragraph.)
 9. **Chat lane: message only, no auto-retry.** Chat already survives an erroring
@@ -489,7 +585,7 @@ this PRD supersedes that stance for sustained limits.
       package the CLI constructs directly (`api/cmd/uzi/commands_test.go:138`), so
       this is a three-consumer change, not two.
 
-    `RunStatus`, `RUN_STATUS_TONES` (warn), and the run view header get `limit_wait`
+    `RunStatus`, `RUN_STATUS_TONES` (warn) — **in `web/src/components/ui.tsx`, NOT `web/src/lib/`; the bare `ui.tsx` below reads as a sibling of `runBadge.ts` and is the one citation here that sends a reader to the wrong directory** — and the run view header get `limit_wait`
     with a countdown to `retry_not_before` and "attempt N/cap". Unknown-status
     fallback means a half-shipped web build degrades to a neutral pill, not a crash
     (`ui.tsx:206` opens the map; the fallback
@@ -497,10 +593,10 @@ this PRD supersedes that stance for sustained limits.
 11. **Cancel while parked works server-side (↳review MAJOR M1; ↳2026-07-27 — half of
     this decision was void, and was void at authoring).** A parked run keeps
     `worker_id` and its worker keeps heartbeating for other runs, so `hasLivePoller`
-    (`service.go:3020-3039`) would report a live poller and `SubmitInput` would
+    (`service.go:3023-3038`) would report a live poller and `SubmitInput` would
     enqueue a cancel that nothing consumes until resume. Fix: `hasLivePoller` treats
     `status='limit_wait'` like `'queued'` (no live steering by definition) — the
-    check at `:3023-3026` is **positive** (`if run.Status == "queued" || !run.WorkerID.Valid`),
+    check at `:3024-3026` is **positive** (`if run.Status == "queued" || !run.WorkerID.Valid`),
     so this wiring is genuinely required.
     **`CancelRunServerSide` needs no change.** `runtime.sql:679-690` guards
     `WHERE id = @id AND user_id = @user_id AND status NOT IN ('completed','failed','cancelled')`
@@ -545,7 +641,7 @@ this PRD supersedes that stance for sustained limits.
     pinning the allowlist against the SDK typings is the guard instead.
 
     **Read the status CHECK's constraint name off a live database rather than
-    assuming it.** `00020_workers_runs.sql:36-37` declares it inline with no name, so
+    assuming it.** the CHECK is on `00020_workers_runs.sql:37`, declared inline with no name, so
     Postgres auto-generated one; `runs_status_check` is the expected form, and a wrong
     `DROP CONSTRAINT` fails at boot rather than in a test. `\d runs` settles it.
 14. **Which run kinds park (↳2026-07-27 — NEW; RESOLVED at M0).** `runs_kind_check` is
@@ -656,6 +752,22 @@ this PRD supersedes that stance for sustained limits.
   (resets-at + attempt N/cap), runs list + board card badge **including
   `web/src/lib/runBadge.ts`** (Decision 10), `limit_wait`/`limit_hit` render cases in
   RunEvent/ActivityFeed; vitest coverage incl. escaped rendering.
+
+  **↳M0 constraints, both load-bearing.** (a) **The board-card work must be a
+  ZERO-LINE `web/src/pages/Board.tsx` delta.** PRD #102 (board v2) is rewriting that
+  file in a parallel worktree. It does not touch `runBadge.ts`, whose header states
+  why it exists: *"Kept out of Board.tsx so the mapping is unit-tested in isolation."*
+  `Board.tsx:606` calls `runBadge(run, Date.now())` and renders whatever comes back,
+  and `runBadge`'s `default:` arm (`runBadge.ts:261`) already renders an unknown
+  status as a neutral pill — so a proper `limit_wait` badge is a change to
+  `runStatusTone` (`:96`) and `runBadge`'s switch (`:231`), both inside
+  `runBadge.ts`, and the collision disappears instead of needing sequencing. A
+  `Board.tsx` edit is an escalation, not a merge problem. (b) **`LatestRun`
+  (`web/src/lib/api.ts:317`) gains nothing** — it is a deliberately narrow board
+  projection with no reset timestamps. The board card therefore shows a **static**
+  "limit wait" pill and the **countdown lives only on the run view**, which reads the
+  full `Run`. The two constraints compose: a board countdown would have forced a
+  `LatestRun` widening *and* a `Board.tsx` prop change.
 - [ ] **M-CLI — CLI + TUI** (↳2026-07-27 — new, and repo-mandated: "New uzi
   functionality ⇒ check whether `api/cmd/uzi/` needs a matching CLI change"):
   `terminalRunStatuses` (`api/cmd/uzi/run.go:48`) must not gain `limit_wait` (it is
@@ -790,3 +902,29 @@ this PRD supersedes that stance for sustained limits.
   api (M2 → M3 → M5-slack, serial within the lane because all three edit
   `workersvc/service.go` and regenerate the shared sqlc tree), web (M4), cli (M-CLI)
   — plus a docs/specs worker from the seam onward. M6 (e2e) is last and serial.
+- 2026-07-27 — **M0 rev 2**, folding in the priming-pass findings (each re-derived at
+  HEAD before acting). **Four rulings.** (a) The PRD #47 health exit contract on
+  `SetRunLimitWait` and the promotion query is **mandatory, not a deliberate choice**:
+  `ListActiveRunsForHealth`'s positive allowlist means a flag live at park time
+  freezes for the whole park, and `crewStateFor` renders it — Success Criterion 2
+  failing through the health column rather than the status column. (b) **The park
+  acknowledgement contract**: `reportState` returns `{applied, status}` instead of
+  `void`, and the worker skips cleanup **iff the returned status is `limit_wait`**,
+  never `iff applied` — on the three *designed* not-parked paths (budget exhausted,
+  clamp exceeded, opt-out coercion) the server fails the run and `applied` is true, so
+  an `applied`-keyed branch leaks ~170 MB on the most common cause. The escalation was
+  right that this is the normal path rather than the cancel race. (c) Decision 8's
+  opt-out sentence is **composed by the server** from the allowlisted enum, or the
+  no-smuggling Success Criterion is false on that path. (d) `plan_approved`'s
+  gate-bypass invariant goes in the query comment with its two-clause reachability
+  argument. **Constraints added**: M4's board work must be a zero-line `Board.tsx`
+  delta (PRD #102 is rewriting it; `runBadge.ts` is untouched by it and is where the
+  mapping belongs) and must not widen `LatestRun`, so the countdown is run-view only.
+  Migration `00090` confirmed free across all sibling worktrees, still to be
+  re-verified at the landing rebase. Six citation nits corrected, of which one
+  mattered: `RUN_STATUS_TONES` is in **`web/src/components/ui.tsx`**, and the PRD's
+  bare `ui.tsx` read as a sibling of `web/src/lib/runBadge.ts`.
+
+  **The milestone graph is unchanged** — none of the four rulings moves a file
+  between lanes; (b) lands in the agent lane and the seam, (a)/(c)/(d) in the api
+  lane, and the M4 constraints remove a collision rather than creating one.
