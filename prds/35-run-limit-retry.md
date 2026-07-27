@@ -139,6 +139,20 @@ this PRD supersedes that stance for sustained limits.
      `internal/workersvc/autostop.go:210` (`if run.Status != "running"`). The outcome
      is safe but the "already exclusive, pinned by test" claim must be
      **re-established** against a pass that did not exist when it was written.
+     **↳M0 — re-established at HEAD, and it holds.** `autostop.go:210` reads
+     `if run.Status != "running" { s.persistFail.evict(c.runID); return false }`. The
+     other passes were re-read too and each is exclusive by a *positive* status
+     allowlist or a kind scope — including the two register-time orphan queries
+     (`FailWorkerRunsOverCap`, `RequeueWorkerRuns`, `runtime.sql:847`/`:860`), which
+     are outside `Sweep` entirely and which this PRD never listed: a worker restarting
+     leaves a parked run alone. The full table is in the design brief so the coder does
+     not "fix" a filter that is already right. **The promotion pass goes after
+     `SweepStuckConfirmingProposals` and before `s.persistFail.prune(now)`**
+     (`service.go:3180`), counter `SweepResult.LimitPromoted`. Ordering is genuinely
+     free — every pass is disjoint from `limit_wait` as a source *and* from `queued` as
+     a target — so the reason is shape: `Sweep` is already "status transitions first,
+     then the prune → detector → auto-stop block", and promoting before the detector
+     makes a promoted run health-visible in the same tick rather than the next.
      Silver lining: that same line calls `s.persistFail.evict(c.runID)`, so the
      promotion pass needs no `evict` of its own (unlike the requeue sites at
      `service.go:3089` and `:3153`). `SweepIdleChatRuns` is kind-scoped and
@@ -190,7 +204,17 @@ this PRD supersedes that stance for sustained limits.
      **independent** reading of the same clock, which beats clamping an untrusted
      number. M2 must either cross-check the worker's `limit_resets_at` against the
      row for the run's credential (preferring the server's when they disagree) or
-     state why not. PRD #53 framed the split itself
+     state why not. **↳M0 — it cross-checks, and the dead credential's gauge row is
+     already in the `ListAutoSelectCandidates` result Decision 6e fetches, so there is
+     no extra query.** Map the allowlisted type to the column
+     (`five_hour` → `five_hour_resets_at`; the four `seven_day*` members →
+     `seven_day_resets_at`; `overage`/`unknown` → no cross-check) and take
+     **`max(worker reset, gauge reset)`** when the dead candidate is `Measured`. Both
+     are then statements about the *same* window, and promoting before the later of
+     them guarantees a re-park; the window mapping is what stops `max` over-delaying a
+     five-hour block by a seven-day rollover. This is accuracy, not security — the
+     security properties are unchanged and come from `RUN_LIMIT_MAX_PARK` and
+     Decision 5's accepted self-scoped-retry bound. PRD #53 framed the split itself
      (`prds/done/53-rate-limits.md:14-16`: *"PRD #35 (retry after limit) handles the
      recovery; this PRD handles the foresight"*) — the recovery half can now be built
      on real foresight data.
@@ -208,7 +232,32 @@ this PRD supersedes that stance for sustained limits.
    so without a source guard a worker could park an
    `awaiting_approval`/affinity-`queued` run, and a re-delivered state report would
    double-bump the counter — `running`-only makes re-delivery a 0-row no-op and
-   legit re-parks always come from `running`. Parking does **not** touch
+   legit re-parks always come from `running`.
+
+   **↳M0 — the source guard is only half of it: `SetRunRunning` can SILENTLY UN-PARK
+   a run, and the park is not durable without the mirror guard.** `SetRunRunning`'s
+   predicate is `status NOT IN ('completed','failed','cancelled')`
+   (`runtime.sql:589`), so a `running` heartbeat delivered *after* the park report —
+   the batcher retries, and reordering is possible — flips `limit_wait` back to
+   `running` with a `worker_id` whose execution has already ended. The run then sits
+   `running` until RUN_TIMEOUT fails it, and the park is lost with no signal anywhere.
+   `SetRunRunning` and (for symmetry) `SetRunAwaitingApproval` need
+   `AND status <> 'limit_wait'`. Resume is unaffected: the run is `claimed` when the
+   worker reports `running` on resume. The terminal setters stay unguarded — "terminal
+   always wins" is the existing invariant across the file, and the cancel path depends
+   on it.
+
+   **↳M0 — an opt-out run's `limit_wait` report is COERCED to failed server-side, not
+   refused.** Pushing `wait_on_limit` into the SQL predicate looks safer and is not: a
+   0-row result maps to `applied=false` → 409, and the worker **treats a 409 as
+   "already terminal" success** (`service.go:2100-2103`), so the report vanishes and
+   the run rots at `running` until RUN_TIMEOUT. The Go side reads `owned.WaitOnLimit`
+   and, when false, routes to `SetRunFailed` with the Decision 8 reason built
+   server-side from the allowlisted type and reset — the same branch point as the
+   `RUN_LIMIT_MAX_WAITS` cap check. The worker's own opt-out path (report `failed`
+   directly) stays the normal one; this is the guard behind it.
+
+   Parking does **not** touch
    `requeue_count` (mirrors the vault lock-race precedent, specs/ai.md §139): the
    counters stay semantically distinct — requeue_count = worker deaths,
    limit_wait_count = limit parks. Documented worst case (↳audit m-2): the caps
@@ -262,6 +311,24 @@ this PRD supersedes that stance for sustained limits.
      and enters the implement⇄review loop seeded with the delivered plan. A park
      *before* approval (during planning or at the gate — only reachable via the
      planning turn itself dying on a limit) resumes into planning as today.
+
+     **↳M0 — `plan_md` is ALREADY on the claim payload** (`protocol.ts:451`, fed by
+     `service.go:1328` `PlanMd: textPtr(run.PlanMd)`), so the claim gains **two**
+     fields (`wait_on_limit`, `plan_approved`), not three. Derive the human half in
+     SQL as a projected column on `GetRunClaimContext` — **cast it**
+     (`(EXISTS (…))::boolean`), because sqlc types a bare expression as `interface{}`
+     (CLAUDE.md, measured 2026-07-26) — and OR it with `run.AutoApprove` in Go.
+
+     **↳M0 — the skip must ALSO require a non-empty `plan_md`, and the PRD's rule does
+     not.** An autopilot run never reports `awaiting_approval`, so `runs.plan_md` is
+     NULL for it, while `plan_approved` is true by virtue of `auto_approve`. Skipping
+     Phase 1 on that combination enters the implement loop with no plan at all. The
+     worker's gate is `plan_approved && claim.plan_md non-empty && session resumable`:
+     the server states the fact, the worker decides what it can do with it. Residual,
+     accepted: an autopilot run re-plans on resume. Its resumed session still holds
+     the plan in the transcript and it cannot gate, so the cost is one turn.
+     Persisting `plan_md` for autopilot runs would remove even that, and is PRD #37's
+     scope, not this one's.
    - **(c) Affinity actually favors the prior worker.** Promotion resets
      `updated_at`, so `ClaimRun`'s affinity grace window **restarts** at promotion
      (`runtime.sql:464-472` — the predicate
@@ -295,12 +362,62 @@ this PRD supersedes that stance for sustained limits.
 
      The run already carries `anthropic_secret_id`, `anthropic_secret_label`,
      `anthropic_select_reason`, `anthropic_headroom_pct`
-     (`00086_run_anthropic_secret.sql:63-66`). Decide one of: **pin** the original
-     credential across the park (simplest, worst utilization); **re-select** freely
-     and accept the stale gate; or **re-select and recompute** `retry_not_before`
-     from the newly chosen credential's `anthropic_rate_limits` row — recommended,
-     and it composes with Decision 4's cross-check. A promotion that finds *any*
-     credential with headroom arguably should not wait at all.
+     (`00086_run_anthropic_secret.sql:63-66`).
+
+     **RESOLVED (M0, 2026-07-27): re-select freely at claim — PRD #111 is untouched —
+     and make the PARK-TIME stamp pool-aware instead.** The PRD's original
+     recommendation ("re-select and recompute") inverts the causality and is not
+     buildable: `retry_not_before` gates **promotion**, and re-selection happens at
+     **claim**, strictly downstream. There is no point at which the newly chosen
+     credential is known and the gate has not already fired.
+
+     So the computation moves to where the information exists. At park time,
+     `retry_not_before` stops meaning "the exhausted credential's reset" and becomes
+     *"the earliest moment this user could plausibly spend anything"*:
+
+     ```
+     base := crossCheckedReset(worker-reported reset, gauge row for the DEAD credential)
+     if alt, ok := autoselect.NextAvailable(cands, deadSecretID, policy, now); ok && alt < base {
+             base = alt
+     }
+     retry_not_before = clamp(base + jitter(60–180s))
+     ```
+
+     `NextAvailable` is a new **pure** function in `api/internal/autoselect` (the
+     package that already owns this vocabulary, D21's "one classifier"), over the rows
+     `ListAutoSelectCandidates` already returns. Excluding the dead credential: a
+     candidate that `Classify`s `eligible` contributes **now** (it is spendable
+     immediately); a `Measured` but below-threshold candidate contributes its
+     **binding-window** reset (`resetKey`'s rule, exported rather than duplicated);
+     everything unmeasurable contributes **nothing** — an unknown must neither pull
+     the floor to `now` nor push it out.
+
+     Why the other two lose: **pin** adds a fourth resolution mode ahead of
+     `claimSecretID` that outranks the claiming worker's configured
+     `anthropic_bind_mode` (a change to PRD #111's resolution path, which Out of Scope
+     protects) and delivers the worst outcome for exactly the multi-token users
+     PRD #111 exists for; **re-select and accept the stale gate** fails Success
+     Criterion 6 verbatim.
+
+     Also rejected, and worth recording because it is the obvious idea: having the
+     **promotion pass** ask "does this user have any credential with headroom" instead
+     of consulting a stamped clock. It turns the only single-statement pass in `Sweep`
+     into a per-user Go loop; it is **broken outright when the poller is disabled**
+     (`UZI_USAGE_POLL_INTERVAL=0`, which is what the e2e overlay sets — every candidate
+     classifies `stale`, so no parked run ever promotes); and the gauge lags the poll
+     interval, so a run that just died on a limit still reads as having headroom,
+     promotes, re-parks, and burns `limit_wait_count` to the cap in minutes.
+
+     The properties that make the ruling safe: a **single-token user** has one
+     candidate, it is the dead one, it is excluded, no leg contributes, and the stamp
+     is that credential's cross-checked reset — today's behaviour exactly. A
+     **poller-disabled deployment** classifies everything `stale`, no leg contributes,
+     and the stamp is the worker's reported reset — today's behaviour exactly. A run
+     whose `anthropic_secret_id` is NULL skips both legs (without the exclusion id,
+     leg 1 could fire on the dead credential's own stale reading). Stated residual: a
+     user with more pooled credentials than `RUN_LIMIT_MAX_WAITS` can burn the budget
+     cycling through them, and the run then fails "usage-limit retry budget exhausted",
+     which is honest.
 7. **Opt-in: per-run flag defaulted by a per-user setting.**
    - `users.wait_on_limit` boolean NOT NULL DEFAULT false; `PUT /api/me/wait-on-limit`
      + Settings toggle (exact clone of the autopilot-enabled plumbing,
@@ -309,7 +426,28 @@ this PRD supersedes that stance for sustained limits.
    - `runs.wait_on_limit` boolean NOT NULL DEFAULT false, stamped at creation:
      `CreateRun` body (today `{issue_iid}` only, `handler/workers.go:667-669`) gains
      optional `wait_on_limit`; absent ⇒ user default. Autopilot-created runs take
-     the user default. The start-run modal shows a pre-checked/unchecked box.
+     the user default.
+
+     **↳M0 — there are FOUR creation paths, not one, and a `DEFAULT false` column
+     with a partial set of writers silently opts users out.** They are `CreateRun`
+     (`runtime.sql:277`, manual *and* autopilot), `CreateCIFixRun` (`ci_fix.sql:3`),
+     `CreateSelfImproveRun` (`selfimprove.sql:3`), and `CreateJudgeRun`
+     (`judge.sql:6`, which stamps false — Decision 14). Resolve the effective flag in
+     the Go service layer and pass it explicitly on each; do not push the defaulting
+     into SQL, where a fifth path added later would silently miss it.
+
+     **↳M0 — the per-run surface is an OPEN QUESTION FOR THE USER, not a coder
+     decision.** This bullet said "the start-run modal shows a pre-checked box".
+     **There is no start-run modal**: `startRun` is a one-click button calling
+     `api.createRun(repoId, iid)` from `web/src/pages/Board.tsx:211-215` and
+     `web/src/pages/IssueView.tsx:70-75`. Introducing a modal changes existing
+     behaviour on every run a user starts. Recommendation put to the user: keep the
+     one-click start (inheriting the user default), ship the optional `wait_on_limit`
+     on `POST /api/runs` for the CLI and API, and satisfy "per run" with a **toggle on
+     the run view while the run is non-terminal** — which is strictly better, because
+     it also covers autopilot, `ci_fix` and `self_improve` runs that have no start
+     affordance and therefore cannot be served by a modal at all. Everything else in
+     the design is independent of the answer.
    - The flag rides the claim payload like `auto_approve` (top-level, re-read from
      the row on every claim) so a resumed run keeps its opt-in.
    - `app_settings` is not used — it is admin/instance-wide only ("there is no
@@ -383,25 +521,108 @@ this PRD supersedes that stance for sustained limits.
     gap other in-flight PRDs may claim. The old note that "PRD #50 has reserved
     `00057`" is **void** — 00057 was consumed by `00057_run_health.sql` (PRD #47).
     One migration: runs columns (`wait_on_limit`, `limit_resets_at`,
-    `retry_not_before`, `limit_wait_count`), users column (`wait_on_limit`), status
-    CHECK widened with `limit_wait`, plus a partial index
+    `retry_not_before`, `limit_wait_count`, **`rate_limit_type`**), users column
+    (`wait_on_limit`), status CHECK widened with `limit_wait`, plus a partial index
     `(retry_not_before) WHERE status = 'limit_wait'` for the promotion pass
-    (↳audit m-3 — cheap now, moot to retrofit). Verified 2026-07-27: none of the four
+    (↳audit m-3 — cheap now, moot to retrofit). Verified 2026-07-27: none of the five
     run columns, nor `users.wait_on_limit`, nor the index name exists today.
-14. **Which run kinds park (↳2026-07-27 — NEW, unresolved).** `runs_kind_check` is now
-    `('issue','ci_fix','chat','judge','self_improve')`
+
+    **↳M0 — the fifth column is new, and it is required, not tidiness.** This list
+    held four columns while Decision 4 had the worker report `rate_limit_type`,
+    Decision 10 rendered it, and M5's Slack line needed it:
+    `GetSlackRunContext` (`slack.sql:110-123`) is an **explicit column list selected
+    `FROM runs r`**, so "paused: usage limit (five_hour)" cannot be assembled from a
+    `run_messages` payload. Named `rate_limit_type` rather than
+    `limit_rate_limit_type` to match the SDK field, the wire field, the DTO field, the
+    feed payload key and the Slack render — a differently-named column buys prefix
+    grouping at the price of a rename at four boundaries.
+
+    **No CHECK on `rate_limit_type`.** The vocabulary is the SDK's six members plus
+    the server's `"unknown"` coercion and is **not ours to close** — an SDK pin bump
+    can add a member. `00086`'s own comment makes exactly this argument for
+    `anthropic_select_reason` ("a CHECK here would be rewritten before it ever guarded
+    anything"), and only `00089` closed it once the vocabulary had settled. A Go test
+    pinning the allowlist against the SDK typings is the guard instead.
+
+    **Read the status CHECK's constraint name off a live database rather than
+    assuming it.** `00020_workers_runs.sql:36-37` declares it inline with no name, so
+    Postgres auto-generated one; `runs_status_check` is the expected form, and a wrong
+    `DROP CONSTRAINT` fails at boot rather than in a test. `\d runs` settles it.
+14. **Which run kinds park (↳2026-07-27 — NEW; RESOLVED at M0).** `runs_kind_check` is
+    now `('issue','ci_fix','chat','judge','self_improve')`
     (`00053_chat_runs.sql:23`, `00058_run_judge_self_improve_kinds.sql:29`); this PRD
-    reasoned only about issue runs with a chat carve-out (Decision 9). `judge` and
-    `self_improve` runs also spend the owner's Anthropic token and can hit the same
-    limit, and `ClaimRun` (`runtime.sql:441-448`) already carries a judge-specific
-    exemption block. M1 must take a stance per kind rather than inheriting the issue
-    behaviour by default.
+    reasoned only about issue runs with a chat carve-out (Decision 9). The ruling is
+    exhaustive over all five, because `ci_fix` was left implicit too:
+
+    | kind | parks? | what happens instead |
+    |---|---|---|
+    | `issue` | **yes** | as designed |
+    | `ci_fix` | **yes** | see below |
+    | `self_improve` | **yes** | see below |
+    | `judge` | **no** | Decision 8's better death + a `limit_hit` feed message |
+    | `chat` | **no** | unchanged — Decision 9's feed-line upgrade only |
+
+    - **`ci_fix` parks.** It rides `RunRunner.execute` (`runner.ts:569`), the ordinary
+      claim lane, the ordinary executor and the ordinary plan gate — every mechanism
+      M1 and M2 touch. Excluding it would mean *writing a guard*, i.e. paying work to
+      not have the feature. Created by the poller with no user in the loop, so it
+      takes the owner's `users.wait_on_limit` default.
+    - **`self_improve` parks.** Same argument (`runner.ts:378`, `:577`), and it is the
+      run kind whose loss hurts most: long, repo-ful, `auto_approve`, expensive. The
+      counter-argument is that it holds `uq_runs_one_active_self_improve`
+      (`00058:54-56`, a negative guard) for the park window — but the engine's
+      documented behaviour on a blocked tick is *"a cycle is still in flight, skip the
+      tick"* (`self_improve.go:15-18`), which is precisely true of a parked run, and a
+      *failed* self_improve unblocks the index only by throwing the whole run away.
+      Cancel-while-parked (Decision 11) is the escape hatch. Note it routes to
+      `judgeSecretID`, never `autoChoice` (`service.go:1094-1100`), so Decision 6e's
+      pool legs are inert for it — no kind check needed, it falls out.
+    - **`judge` does NOT park**, on three grounds. (1) Structural, and decisive: it is
+      executed by `JudgeRunner.execute` (`agent/src/judge-runner.ts`, dispatched at
+      `worker.ts:164`) — a different file with its own error path and its own cleanup,
+      which never touches `runner.ts`'s `finally`. Parking it means duplicating
+      detection + park + carve-out into a second executor, roughly doubling M1's
+      surface for the cheapest run kind in the product. (2) Its value decays and it
+      cannot be re-enqueued: `maybeEnqueueJudge` fires once, on the *reviewed* run's
+      committed terminal transition (`judge_enqueue.go:33-42`), and that run never
+      transitions again — but equally, a judge parked for seven days reviews a run
+      nobody remembers, and losing a retrospective loses no user work. (3) It is
+      already free of side effects: `maybeEnqueueJudge`'s Gate 0 is a positive
+      allowlist and Gate 1 excludes `judge` outright, so `limit_wait` can never
+      recurse.
+
+      **What judge gets instead**: `judge-runner.ts:295` already reports `failed` with
+      a reason; M1 routes that reason through the same classifier, so an SDK limit
+      death yields `"Anthropic usage limit (five_hour) reached; resets at <ISO>"` plus
+      a `limit_hit` message rather than `agent run failed: error_during_execution`.
+      The classifier is a **pure function over SDK frames** in its own module,
+      imported by both executors and owned by neither. `SetRunLimitWait` additionally
+      carries `AND kind <> 'judge'` so the refusal is enforced server-side, not by
+      worker discipline.
+
+      Out of scope, named so it is not lost: re-enqueueing a judge that died on a
+      limit is PRD #46's enqueue policy, not this PRD's.
 
 ## Milestones
 
-- [ ] **M0 — Resolve the two open questions** (blocks M1): which credential a
+- [x] **M0 — Resolve the two open questions** (blocked M1): which credential a
   promoted run spends (Decision 6e), and whether `judge` / `self_improve` runs park
-  (Decision 14). Both are one-paragraph decisions recorded here; neither needs code.
+  (Decision 14). **Done 2026-07-27**; both rulings are folded into the decisions
+  above. The implementation brief — contracts, file map, migration column list,
+  sweeper placement, milestone dependency graph — is
+  `.claude/agent-team-tasks/prd-35-design.md`, and it records six findings that
+  change the milestones below (see the 2026-07-27 M0 Decision Log entry).
+
+- [ ] **M-SEAM — Freeze the wire contract before the parallel milestones** (new at
+  M0; blocks M1/M2/M3/M4/M-CLI). M1..M4 as written are **not** file-disjoint — all
+  four need the `RunState`/`StateRequest`/`ClaimPayload`/`RunDTO`/`RunStatus`
+  additions, and M2/M3/M5 all edit `workersvc/service.go` plus the sqlc-generated
+  tree. One mechanical, zero-behaviour commit lands the migration, the sqlc
+  regeneration, the two protocol.ts field groups, the mirrored Go structs, the five
+  DTO fields + `runToDTO`, the `RunStatus` union member, and the two envs. Every
+  member each downstream milestone reads is enumerated in the design brief; a field
+  missing from those lists means the seam is incomplete and is an escalation, not an
+  edit to a frozen file.
 - [ ] **M1 — Worker detection + park path**: rate-limit observer beside
   `mapSdkMessage` (captures latest `rate_limit_info`), classification per Decision 1
   precedence (terminal_reason primary; corroborated-rejected secondary), typed
@@ -520,3 +741,52 @@ this PRD supersedes that stance for sustained limits.
   health exit contract. ~25 further citations had drifted line numbers only and were
   refreshed in place. Decision 6a downgraded BLOCKING → MAJOR on the strength of
   issue #105's resume-dropped degradation.
+- 2026-07-27 — **M0 design gate closed** (architect). Full brief:
+  `.claude/agent-team-tasks/prd-35-design.md`.
+
+  **Decision 6e — re-select freely at claim; make the PARK-TIME stamp pool-aware.**
+  The PRD's own recommendation was unbuildable as written (`retry_not_before` gates
+  promotion, which is strictly upstream of the claim where re-selection happens), so
+  the computation moved to park time, where the user, the run and the candidate rows
+  are all in hand. `retry_not_before` now means "the earliest moment this user could
+  spend *anything*", via a new pure `autoselect.NextAvailable` over the existing
+  `ListAutoSelectCandidates` rows. Rejected: **pin** (adds a fourth resolution mode
+  ahead of `claimSecretID`, and is worst for the multi-token users PRD #111 exists
+  for); **accept the stale gate** (fails Success Criterion 6 verbatim); and
+  **headroom-checking in the promotion pass** (turns `Sweep`'s only single-statement
+  pass into a per-user loop, is broken outright with the poller disabled — the e2e
+  overlay's own configuration — and thrashes on gauge lag). Also rejected: gating the
+  pool legs on `runs.anthropic_select_reason`, which is more precise but promotes a
+  column `00086` documents as display-only into a load-bearing one to save at most one
+  re-park. Single-token users and poller-disabled deployments are bit-identical to
+  today by construction, which is the property the whole ruling was shaped around.
+
+  **Decision 14 — park = {issue, ci_fix, self_improve}; no park = {judge, chat}.**
+  `ci_fix` was implicit in the PRD and is now explicit. `judge` is refused on a
+  structural ground rather than a policy one — it runs in a different executor
+  (`judge-runner.ts`) that never touches `runner.ts`'s cleanup, so parking it would
+  roughly double M1 for the cheapest run kind — and gets Decision 8's better death
+  instead, enforced server-side by `AND kind <> 'judge'` on `SetRunLimitWait`.
+
+  **Six findings that change the work.** (1) The migration needs a **fifth** `runs`
+  column, `rate_limit_type` — M5's Slack line reads it off the run row via
+  `GetSlackRunContext`'s explicit column list and cannot get it from a feed payload.
+  (2) `SetRunRunning`'s `status NOT IN (terminal)` guard lets a late `running`
+  heartbeat **silently un-park** a run, which then rots until RUN_TIMEOUT; it and
+  `SetRunAwaitingApproval` need `AND status <> 'limit_wait'` (terminal setters stay
+  unguarded — "terminal always wins"). (3) There are **four** run-creation paths that
+  must stamp `wait_on_limit`, not the one the PRD names. (4) **There is no run-start
+  modal** — `startRun` is a one-click button in `Board.tsx:211` and
+  `IssueView.tsx:70`; Decision 7's checkbox has nowhere to live, and building a modal
+  changes existing UX, so the surface is an open question for the user (the
+  recommendation is a run-view toggle instead, which also covers autopilot, `ci_fix`
+  and `self_improve` runs that have no start affordance at all). (5) A `limit_wait`
+  report for an opt-out run must be **coerced to failed server-side**, not refused —
+  a 0-row refusal maps to 409, which the worker treats as success, losing the report.
+  (6) `plan_md` is **already** on `ClaimPayload` (`protocol.ts:451`), so the claim
+  gains two fields, not three.
+
+  **Parallelism**: 4 concurrent coders after a 1-coder M-SEAM commit — agent (M1),
+  api (M2 → M3 → M5-slack, serial within the lane because all three edit
+  `workersvc/service.go` and regenerate the shared sqlc tree), web (M4), cli (M-CLI)
+  — plus a docs/specs worker from the seam onward. M6 (e2e) is last and serial.
