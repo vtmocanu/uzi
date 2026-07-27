@@ -134,9 +134,12 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
     assert.strictEqual(fs.existsSync(path.join(second.path, "A.txt")), true);
     assert.strictEqual(gitIn(second.path, ["rev-parse", "HEAD"]), sha1);
     // …and the reported base is the BRANCH's own tip, not the default branch's. This is
-    // the case the lead cannot infer: the clone still carries a local default branch,
-    // freshly fetched and pointing somewhere else entirely, so a diff written against it
-    // spans commits this branch never touched.
+    // the case the lead cannot infer: the clone still carries a local default branch, and
+    // that ref is a FROZEN MIRROR of the default as it stood at first clone — so a diff
+    // written against it spans commits this branch never touched, in whichever direction
+    // the mirror has drifted. Note the assertion below compares against the ORIGIN's HEAD,
+    // outside the clone, which is the fresh value; the clone's own stale `main` is not
+    // what is being checked here.
     assert.strictEqual(second.baseCommit, sha1, "resume seeds off the branch's origin tip");
     const originDefault = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     assert.notStrictEqual(

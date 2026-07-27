@@ -1028,8 +1028,26 @@ func TestWorkerListSanitizesVersion(t *testing.T) {
 	// A version that is NOTHING but format characters compacts to "" and must still read
 	// as the placeholder, not as a blank cell — which is why the sanitize runs before the
 	// strOr fallback rather than after it.
-	if !strings.Contains(out, "-") {
-		t.Errorf("an all-format-character version should render \"-\", not an empty cell:\n%s", out)
+	//
+	// Asserted on beta's VERSION CELL, not on the whole output. `strings.Contains(out, "-")`
+	// looks like it guards this and cannot fail: upgradeCell returns "-" for an empty
+	// UpgradeStatus (worker.go), which BOTH fixture workers have, so the UPGRADE column
+	// satisfies it whatever VERSION renders. Measured — with the placeholder removed
+	// entirely, so an all-Cf version renders a blank cell, that assertion stayed green.
+	// Columns are ID NAME STATUS VERSION UPGRADE, so a blank VERSION collapses the row to
+	// four fields and the length check is what catches it.
+	var betaRow []string
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[1] == "beta" {
+			betaRow = f
+			break
+		}
+	}
+	if betaRow == nil {
+		t.Fatalf("no row for worker beta:\n%s", out)
+	}
+	if len(betaRow) != 5 || betaRow[3] != "-" {
+		t.Errorf("an all-format-character version must render \"-\" in the VERSION cell, got %q:\n%s", betaRow, out)
 	}
 }
 

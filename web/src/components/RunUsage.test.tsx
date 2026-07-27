@@ -293,12 +293,22 @@ describe("RunUsagePanel accessibility (item 8)", () => {
     for (const w of wrappers) {
       expect(w.getAttribute("role")).toBe("region");
       // A region role without an accessible name is not exposed as a landmark at all.
-      expect(w.getAttribute("aria-label")).toBeTruthy();
+      // …and the name must not repeat the role the AT announces immediately after it:
+      // "Per-phase usage table, scrollable" then the table role reads as
+      // "…table, scrollable … table, Per-phase usage". `scrollable` stays — that is the
+      // part with no other way to be announced, and the reason the region earns its place.
+      const label = w.getAttribute("aria-label") ?? "";
+      expect(label).toMatch(/scrollable$/);
+      expect(label).not.toMatch(/\btable\b/);
       // …and NO tabIndex, asserted rather than merely omitted. Chrome focuses overflowing
-      // scrollers natively (measured: Tab lands here, ArrowRight scrolls 0 -> 171), and it
+      // scrollers natively (measured: Tab lands here, ArrowRight scrolls 0 -> 299), and it
       // does so ONLY while they overflow — so an unconditional tab stop is dead weight at
-      // every desktop width. This assertion is what stops it being re-added as an
-      // "improvement"; the original finding came from a property read, not a keyboard test.
+      // every desktop width. This assertion stops it being re-added as an "improvement" on
+      // the strength of the property read that produced the original finding.
+      //
+      // It encodes a CHROME-SCOPED measurement, not a universal rule: see RunUsage.tsx for
+      // what a future engine measurement would have to show, and why the answer there would
+      // be a CONDITIONAL tabIndex rather than deleting this case.
       expect(w.hasAttribute("tabindex")).toBe(false);
     }
     // The two names must DIFFER: two adjacent scrollable data regions with one name is

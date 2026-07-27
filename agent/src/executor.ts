@@ -52,7 +52,8 @@ export interface RunContext {
   branch: string;
   /** The commit `branch` was cut from in the runner clone (git.ts `RunnerClone.baseCommit`).
    *  The executor states it in the lead's prompts so the lead does not have to infer the
-   *  branch's parent from the clone's default branch, which is fetched fresh and is not it.
+   *  branch's parent from the clone's default branch — which is a FROZEN MIRROR taken when
+   *  the worker first cloned the repo, and so may sit at, behind, or ahead of this commit.
    *  Optional: the M2 stub executor ignores it, like every field below `emit`. */
   baseCommit?: string;
   /** The default branch's tip (git.ts `RunnerClone.defaultBranchCommit`). Carried

@@ -481,9 +481,11 @@ describe("plan prompts — prior-work note (issue #105)", () => {
 // ── Base-commit note (judge rec, run 51757591) ───────────────────────────────
 //
 // The lead handed a subagent `git diff main...HEAD` and got a diff spanning ~100
-// unrelated commits, because the clone's default branch is fetched fresh and is not
-// the branch's parent. The worker already resolves the real parent; these pin that it
-// reaches the prompt, names the right command, and names the wrong ones as wrong.
+// unrelated commits, because the clone's default branch is a FROZEN MIRROR taken when the
+// worker first cloned the repo — not the branch's parent, and drifted from the real default
+// branch by an amount and in a direction nothing here can predict. The worker already
+// resolves the real parent; these pin that it reaches the prompt, prescribes the OIDs, and
+// forbids the ref NAME in both dot forms without predicting a symptom.
 describe("plan/implement prompts — base-commit note (judge rec, run 51757591)", () => {
   const SHA = "0123456789abcdef0123456789abcdef01234567";
   const DFLT = "fedcba9876543210fedcba9876543210fedcba98";

@@ -157,14 +157,26 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
             focusable. It carries role + a name and DELIBERATELY NO `tabIndex`.
             Driven for real in Chrome 150 at 375px: Tab from the summary already lands on
             this div (Chrome focuses overflowing scrollers natively, `tabIndex` -1, no
-            attribute) and ArrowRight scrolls it 0 -> 171 of max 299. So there is no 2.1.1
-            failure to fix — and Chrome makes it focusable ONLY while it actually overflows,
-            so an unconditional tabIndex={0} would plant a permanent empty tab stop at every
-            desktop width (1280px: scrollWidth == clientWidth == 950, Tab skips it). That is
-            a regression, not a fix. The real defect was the missing role/name: a keyboard
-            user landed on an unlabelled generic div with no announced purpose.
-            Safari/Firefox are UNTESTED here (agent-browser drives Chrome only). */}
-        <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-phase usage table, scrollable">
+            attribute) and ArrowRight scrolls it 0 -> 299. So on the MEASURED engine there is
+            no 2.1.1 failure to fix, and Chrome makes it focusable ONLY while it actually
+            overflows — an unconditional tabIndex={0} would plant a permanent empty tab stop
+            at every desktop width (1280px: scrollWidth == clientWidth == 950, Tab skips it).
+            The real defect was the missing role/name: a keyboard user landed on an
+            unlabelled generic div with no announced purpose.
+
+            THIS IS A SCOPED DECISION, NOT A UNIVERSAL ONE, and the test asserting the
+            attribute's ABSENCE encodes it — so read this before treating that assertion as
+            a rule. Keyboard-focusable scrollers are a recent Chrome behaviour and are not
+            universal; on an engine without it, a scroll region containing nothing focusable
+            IS keyboard-unreachable, which is the original 2.1.1 concern, and the standard
+            guidance adds tabindex="0" precisely because of that variance, accepting the
+            empty tab stop as the cheaper cost. Safari and Firefox are UNTESTED here
+            (agent-browser drives Chrome only). To revisit: measure Tab reaching the div and
+            an arrow key scrolling it on the engine in question, at a width where it
+            overflows AND one where it does not. If it is unreachable there, a CONDITIONAL
+            tabIndex (set only while scrollWidth > clientWidth) is the fix that satisfies
+            both engines — not an unconditional one, and not deleting this test. */}
+        <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-phase usage, scrollable">
           <table aria-label="Per-phase usage" className="w-full min-w-[560px] border-collapse text-xs">
             <thead>
               <tr>
@@ -210,7 +222,7 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
           {/* See the per-phase wrapper above. The names differ because two ADJACENT
               unlabelled data tables is precisely where a screen-reader user loses which
               one they are in. */}
-          <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-agent usage table, scrollable">
+          <div className="mt-2 overflow-x-auto" role="region" aria-label="Per-agent usage, scrollable">
             <table aria-label="Per-agent usage" className="w-full min-w-[600px] border-collapse text-xs">
               <thead>
                 <tr>

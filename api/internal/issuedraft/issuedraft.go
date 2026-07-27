@@ -262,10 +262,23 @@ func normalizeNewlines(s string) string {
 // written outside-in, so the natural place to "add one more pass" is the OUTSIDE — and that
 // is the wrong side. The invariant:
 //
-//	Any character-class normalization over an issue body — a Cf strip, a Unicode
-//	line-separator normalization, NFKC, anything that can turn a non-"\n" byte sequence
-//	into "\n" or delete bytes before a "/" — must run at or INSIDE normalizeNewlines's
-//	position. StripUnfencedSlashLines must be the LAST pass to see the text.
+//	No pass that can introduce a "\n", or delete bytes preceding a "/", may run AFTER
+//	StripUnfencedSlashLines. Any character-class normalization over an issue body — a Cf
+//	strip, a Unicode line-separator normalization, NFKC — must therefore run at or INSIDE
+//	normalizeNewlines's position.
+//
+// EXACTLY ONE PASS DOES RUN AFTER IT, and the rule above is not a description of the code
+// unless you know why that is safe: ScrubSecretShapes replaces with the non-empty,
+// non-slash literal "[redacted]" (:488), so a scrubbed span still leaves a token at the
+// line start and firstNonSpaceIsSlash answers false. Measured on the shipped package:
+//
+//	"glpat-AAAAAAAAAAAAAAAAAAAA/label ~backdoor\nplain text"
+//	  repl "[redacted]"  ->  "[redacted]/label ~backdoor\n…"   inert
+//	  repl ""            ->  "/label ~backdoor\n…"             LIVE
+//
+// Changing that replacement to "" arms this — a single line, no fences, the cheapest
+// possible arming. Note it is the INVERSE shape of the two triggers below: those
+// manufacture a line break, this one deletes bytes before a "/".
 //
 // Why: StripUnfencedSlashLines decides what is a quick-action line with
 // firstNonSpaceIsSlash, a BYTE scan skipping only ' ' and '\t', over strings.Split(body,
@@ -282,6 +295,12 @@ func normalizeNewlines(s string) string {
 // action, in a body this code writes to the user's forge. Nothing in the render path can
 // catch it, because the body is assembled here on the server (:122 and :157 fence
 // RationaleMd/SummaryMd into it).
+//
+// A bonus worth recording, running in the SAFE direction: SanitizeTitle defangs a leading
+// quick-action character with TrimLeft(s, " /"), a BYTE trim — so a title of
+// "<ZWSP>/label …" previously kept its "/" at index 1 and slipped past. With Cf stripped at
+// review ingest the string now reaches SanitizeTitle as "/label …" and IS defanged. Same
+// ordering principle, arriving as a fix rather than a hazard.
 //
 // Deliberately NOT done: adding U+2028/U+2029 to any strip predicate. "\n" is exempt by
 // design, so anyone who can place a U+2028 can place a "\n" and get the same rendering —

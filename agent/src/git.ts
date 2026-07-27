@@ -143,17 +143,24 @@ export interface RunnerClone {
    *  branch's previous cycles, or a human's commits. Issue #105 uses it to warn the
    *  lead off redoing work it can no longer remember doing. */
   priorCommits: number;
-  /** The commit the branch was checked out AT — the fresh default-branch tip for a new
-   *  branch, the branch's own fresh origin tip on a resume. Full 40-char SHA (`rev-parse`
-   *  in the BARE, which is authoritative).
+  /** The commit the branch was checked out AT, resolved off the FRESH remote-tracking ref
+   *  in the bare (`refs/remotes/origin/*`, which every fetch updates): the default branch's
+   *  current tip for a new branch, the branch's own current origin tip on a resume. Full
+   *  40-char SHA.
    *
    *  Load-bearing for the lead, which otherwise has to GUESS the branch's parent from the
-   *  clone's local default branch — and that ref is fetched fresh, so it is not the parent.
-   *  Measured on a resume-shaped clone (prior pushed work on the branch, 5 newer commits on
-   *  the default): `git diff <base>..HEAD` = this run's work alone; `main...HEAD` also folds
-   *  in the prior run's commits; `main..HEAD` additionally reports every default-branch
-   *  commit as a DELETION, which is the multi-megabyte diff a lead handed a subagent on run
-   *  51757591. prompt.ts turns this into the note that names the right command.
+   *  clone's local default branch. That ref is NOT a substitute, and not for the reason an
+   *  earlier version of this comment gave: the clone's `main` is a FROZEN MIRROR. `cloneBare`
+   *  rewrites the refspec to `+refs/heads/*:refs/remotes/origin/*`, so the bare's own
+   *  `refs/heads/*` never move after the first clone, and the runner clone inherits them as
+   *  its local `main` AND its `origin/main`.
+   *
+   *  The drift therefore has no predictable direction — the mirror can sit at, behind, or
+   *  ahead of this commit, one per topology — so neither `main..HEAD` nor `main...HEAD` is
+   *  reliable, and prompt.ts's note forbids the ref NAME in both dot forms while predicting
+   *  no symptom. (This comment used to assert `main..HEAD` reports the default branch's
+   *  commits as a DELETION. Measured on a drifted bare, they are ADDITIONS, and the two
+   *  dot forms return the same diff; see the block above baseCommitNote in prompt.ts.)
    *
    *  NOT the branch's fork point on a resume — see defaultBranchCommit, which is the
    *  distinction that makes the note correct on the runs that carry prior work. */
