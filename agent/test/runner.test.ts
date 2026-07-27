@@ -1404,6 +1404,35 @@ describe("RunRunner — usage-limit park (PRD #35)", () => {
     }
   });
 
+  // 🔴 THE SECURITY HALF OF THE CARVE-OUT, and until this test it had no artifact
+  // behind it. Measured by the M1 reviewer: extending `!parked` to also guard the
+  // secret eviction and the two gate-map deletes passed typecheck AND all 41 runner
+  // tests with exit 0. So an implementation leaving a parked run's decrypted forge
+  // PAT and Anthropic token registered in the logger — for the days a seven-day
+  // window lasts, on a worker that goes on to run other runs — was green everywhere.
+  //
+  // The carve-out is three FILESYSTEM removals. The eviction is not one of them: the
+  // secrets are re-delivered on the next claim, so holding them buys nothing and
+  // costs a widened exposure window on a machine that keeps working.
+  it("still evicts the run-scoped secrets from the logger when the run parks", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-secrets-"));
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 95);
+      const { logger, added, removed } = secretRecordingLogger();
+      const claim = gitlabClaim(95, { wait_on_limit: true });
+      await runnerWith(factory, gitlab, undefined, logger).execute(claim);
+      // Precondition: the park actually happened, or this asserts nothing.
+      assert.strictEqual(fs.existsSync(paths().runHome), true, "must have parked (else this test is vacuous)");
+      assert.ok(added.length > 0, "the run registered secrets");
+      for (const s of added) {
+        assert.ok(removed.includes(s), `secret registered at claim must be evicted on park: ${s}`);
+      }
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("cleans up fully when the park is refused with a 409 (the run was cancelled under it)", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-409-"));

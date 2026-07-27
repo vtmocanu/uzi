@@ -193,10 +193,19 @@ export function classifyLimitFailure(
 
   // ⚠ SPECIFIED BEHAVIOUR WITH A KNOWN RESIDUAL — NOT AN OVERSIGHT, DO NOT "FIX".
   //
-  // The corroboration is a FUTURE RESET and nothing else. So a `rejected` observed
-  // early in a long turn, whose reset has not yet elapsed, will classify a death of
-  // an UNRELATED cause (say error_max_turns) as a limit. Decision 1 specifies
-  // staleness as the discriminator, and this implements exactly that.
+  // The corroboration is a FUTURE RESET AND NOTHING ELSE. The death's subtype is not
+  // consulted at all. So:
+  //
+  //     rejected + PAST reset   + error_max_turns  ->  does NOT park
+  //     rejected + FUTURE reset + error_max_turns  ->  PARKS
+  //
+  // What prevents classification in the first line is the ELAPSED RESET, not the fact
+  // that the death was unrelated. It is worth being precise about which, because the
+  // residual is not a corner case: a five_hour window's reset is in the future for
+  // most of five hours, so ANY unrelated death observed after a `rejected` inside
+  // that window parks the run. Decision 1 specifies staleness as the discriminator
+  // and this implements exactly that; the PRD's own "an unrelated death must not
+  // park" phrasing is true only of the elapsed-reset subset.
   //
   // Narrowing it — excluding subtypes we believe unrelated — is policy the spec does
   // not state, and it was deliberately not added on the implementer's own judgement.

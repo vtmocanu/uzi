@@ -130,14 +130,36 @@ describe("classifyLimitFailure — a rejected event is secondary and needs corro
     assert.deepEqual(got, { resetsAtMs: IN_5H, rateLimitType: "five_hour" });
   });
 
-  // The case Decision 1 names explicitly. Without the corroboration clause, a
-  // `rejected` seen early in a long turn would park a run that died of something
-  // else entirely much later.
-  it("does NOT classify a stale rejected event followed by an unrelated death", () => {
+  // THE DISCRIMINATOR IS THE ELAPSED RESET, NOT THE UNRELATED DEATH. The two tests
+  // below differ ONLY in the reset and disagree in outcome, which is what pins that.
+  //
+  // This pair replaced a single test named "does NOT classify a stale rejected event
+  // followed by an unrelated death". That name attributed the non-classification to
+  // the death, and a reader trusting it would conclude an unrelated death is enough
+  // to prevent a park. It is not, as the second test shows.
+  it("does NOT classify when the rejected event's reset has already elapsed", () => {
     const obs = new RateLimitObserver();
     obs.observe(rateLimitEvent({ status: "rejected", resetsAt: AN_HOUR_AGO, rateLimitType: "five_hour" }));
     const got = classifyLimitFailure(errorResult({ subtype: "error_max_turns" }), obs.latest, NOW);
     assert.equal(got, undefined);
+  });
+
+  // ⚠ PINS THE ACCEPTED RESIDUAL, deliberately, so it cannot change silently.
+  //
+  // Same unrelated death, reset still in the future ⇒ the run PARKS. The subtype is
+  // never consulted. This is not a corner case: a five_hour window's reset is in the
+  // future for most of five hours, so any unrelated death observed after a `rejected`
+  // inside that window lands here.
+  //
+  // It was raised with the lead and the ruling was to keep Decision 1 as written —
+  // narrowing it to a subtype allowlist would be policy the spec does not state.
+  // Recorded as a passing test rather than a comment so that a future "tidy" is a
+  // failing test, which is this module's whole design principle.
+  it("DOES classify an unrelated death when the rejected event's reset is still in the future", () => {
+    const obs = new RateLimitObserver();
+    obs.observe(rateLimitEvent({ status: "rejected", resetsAt: IN_5H, rateLimitType: "five_hour" }));
+    const got = classifyLimitFailure(errorResult({ subtype: "error_max_turns" }), obs.latest, NOW);
+    assert.deepEqual(got, { resetsAtMs: IN_5H, rateLimitType: "five_hour" });
   });
 
   it("does not classify allowed or allowed_warning, however much headroom talk they carry", () => {

@@ -431,20 +431,36 @@ export class SdkExecutor implements Executor {
       let approvedPlan: string;
       // The agent selection the approve verdict carried (PRD #37).
       //
-      // ⚠ RESIDUAL ON THE PRE-APPROVED RESUME PATH, stated rather than hidden: the
-      // CLAIM DOES NOT CARRY THE PERSISTED SELECTION. The server stores what the
-      // human picked (runs.agent_source / agent_exclusions) but ClaimResponse has no
-      // field for it — `agent_selection` exists only on the OUTBOUND StateRequest an
-      // autopilot run uses to report the default it resolved for itself. So a resumed
-      // pre-approved run leaves this undefined and resolveAgentSelection applies its
-      // documented "absent" default (repo when a roster was detected, else own, no
-      // exclusions), exactly as an autopilot run does.
+      // ⚠ RESIDUAL ON THE PRE-APPROVED RESUME PATH — the OLDER-SERVER FALLBACK only.
+      // A current server delivers the persisted selection on the claim (PRD #35: it
+      // rides next to `plan_approved`, because both come from the same human verdict
+      // and propagating one without the other honours half a decision). This branch
+      // is what happens when it is absent: resolveAgentSelection applies its
+      // documented "absent" default — repo when a roster was detected, else own, no
+      // exclusions — exactly as an autopilot run does.
       //
-      // Consequence: a human who EXCLUDED a subagent may get it back after a park.
-      // That is a roster difference, not a guardrail bypass — every subagent is still
-      // drawn from the same vetted set and the Agent-guard hook still frozen to it.
-      // Closing it properly means adding the selection to the claim payload, which is
-      // a server-side change and belongs with the claim work, not here.
+      // WHAT THAT COSTS, stated fully because an earlier version of this comment
+      // understated it and got one claim wrong outright:
+      //
+      //  1. The larger effect is not exclusions, it is the SOURCE. A human who chose
+      //     `own` gets the `repo` roster after a park whenever the clone has agents.
+      //     Exclusions being dropped is the smaller, secondary case.
+      //  2. "Every subagent is still drawn from the same vetted set" — WHAT THIS
+      //     COMMENT USED TO SAY — IS FALSE. selectSubagents("repo", …) returns
+      //     subagentsFromTemplates(repoTemplates, …): the CLONED REPO's
+      //     `.claude/agents/` files, not the owner's admin-allocated templates. A
+      //     different set, not the same set differently filtered.
+      //  3. The skill-scoping regime changes with the source, per agents.ts's own
+      //     docstring: `own` keeps skills per-template (the allocations ARE the
+      //     admin's scoping surface there), while `repo` gives every subagent the
+      //     run's whole surviving skill set.
+      //
+      // The SECURITY claim does survive, and was checked rather than assumed: repo
+      // agents carry REPO_AGENT_DENIED_TOOLS, canonicalized against aliases so a
+      // `tools: [Task]` cannot slip through; sdk-executor re-enforces it; and the
+      // Agent-guard hook's allowSet is rebuilt from the RESOLVED selection. So this
+      // is a roster and scoping difference, not a guardrail bypass — but do not read
+      // "not a bypass" as "no difference", which is where the old wording led.
       let approvedSelection: AgentSelectionParse = { status: "absent" };
 
       if (preApproved) {
@@ -609,7 +625,10 @@ export class SdkExecutor implements Executor {
       // Agent-guard hook (its allowSet is frozen at construction — an excluded or
       // repo-sourced subagent must be denied), the lead system prompt (a repo-source
       // run adds the untrusted-review passage), and the subagent names fed to the
-      // implement prompt. Malformed selection resolves to `own`, never repo.
+      // implement prompt. Malformed selection resolves to `own`, never repo — true of
+      // an INVALID selection, and it does NOT generalise to "we never silently pick
+      // repo": an ABSENT selection resolves to repo when a roster was detected, which
+      // is exactly the older-server resume path described further up.
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
       const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
       if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });

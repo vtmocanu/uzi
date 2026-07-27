@@ -540,6 +540,20 @@ export class RunRunner {
       // gate-map deletes, and the secret eviction above — MUST still run on a park.
       // Guarding the whole block (or returning early) would leave a poller running
       // and a gate deadline registered for what may be days.
+      //
+      // ⚠ HOW EACH ONE FAILS IF YOU WIDEN `!parked` TO COVER IT, because they do not
+      // fail alike and only one of them fails legibly:
+      //   - the SECRET EVICTION fails SILENTLY. Measured by the M1 reviewer: guarding
+      //     it passed typecheck and every runner test with exit 0, leaving a parked
+      //     run's decrypted PAT and Anthropic token in the logger for the length of
+      //     the window. There is now a test for exactly that ("still evicts the
+      //     run-scoped secrets ... when the run parks"); it is the only thing
+      //     standing between that mistake and a green build.
+      //   - `steering.stop()` fails as a PROCESS HANG, not a red assertion: the
+      //     poller keeps the event loop alive and the test file never exits. Read
+      //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
+      //     for a timeout, so the tally will say everything passed while the exit
+      //     code says otherwise. A hang here is this bug until proven otherwise.
       if (worktreePath && !parked) {
         await this.git
           .removeRunnerClone(worktreePath)
