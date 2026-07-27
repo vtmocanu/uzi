@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
@@ -213,6 +214,59 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () =>
   });
 });
 
+/** The constant `core.hooksPath` git.ts pins; baked by both worker templates. */
+const HOOKS_DIR = "/usr/share/uzi-git-nohooks";
+
+/** The three facts about a path that decide the question below. Split out from the stat so
+ *  the baked shape can be asserted at all: an unprivileged test cannot chown to root, which
+ *  is the very property the verdict rests on. */
+interface HooksDirFacts {
+  uid: number;
+  /** Raw `stat` mode, type bits included — the verdict masks them off itself. */
+  mode: number;
+  isDir: boolean;
+}
+
+/** `undefined` when nothing is there. Absence is a legitimate answer, not an error. */
+function hooksDirFacts(p: string): HooksDirFacts | undefined {
+  try {
+    const st = fs.lstatSync(p);
+    return { uid: st.uid, mode: st.mode, isDir: st.isDirectory() };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Did something OTHER than the image create the hooks dir?
+ *
+ * The invariant is NOT "the path does not exist" — that reading is what made this case
+ * fail deterministically inside a worker container, where both templates bake the dir
+ * (`mkdir -p … && chmod 0555`, as root). The invariant is that no dir writable by the uid
+ * the worker and agent share sits on `core.hooksPath`, because a writable one is a place
+ * to plant a hook and that is the whole vector.
+ *
+ * So: absent ⇒ git.ts created nothing, fine. Present ⇒ it must be in the BAKED shape,
+ * root-owned with no write bit. That shape is unreachable at runtime here — an
+ * unprivileged process can neither chown to root nor create anything under /usr/share —
+ * so its presence is not evidence of a runtime mkdir. Anything else is: a dir this uid
+ * owns can be chmod'd back open whatever its current mode, and a root-owned dir carrying
+ * a write bit is already open.
+ *
+ * The mode half is not redundant with the uid half, and the reason is specific to this
+ * image: the worker baseline IS root and the entrypoint drops later (PRD #51 A1), so a
+ * runtime mkdir inside that window would be root-owned 0755 under the default umask. Only
+ * the `chmod 0555` distinguishes the baked stanza from it.
+ */
+function hooksDirVerdict(facts: HooksDirFacts | undefined): { ok: boolean; why: string } {
+  if (!facts) return { ok: true, why: `${HOOKS_DIR} is absent, so nothing created it` };
+  const mode = (facts.mode & 0o7777).toString(8).padStart(4, "0");
+  if (!facts.isDir) return { ok: false, why: `not a directory (mode 0${mode})` };
+  if (facts.uid !== 0) return { ok: false, why: `owned by uid ${facts.uid}, not root — a runtime mkdir` };
+  if (facts.mode & 0o222) return { ok: false, why: `mode 0${mode} carries a write bit; the baked dir is 0555` };
+  return { ok: true, why: `baked shape (root-owned, mode 0${mode})` };
+}
+
 describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
   const WORKER_VARS = ["UZI_WORKER_TOKEN", "UZI_WORKER_TOKEN_FILE", "UZI_API_URL"];
   beforeEach(() => {
@@ -267,16 +321,54 @@ describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
     const cfg = configPairs(gitEnv());
     assert.equal(cfg["safe.directory"], "*");
     // The empty hooks dir is BAKED into the image as root-owned 0555
-    // (agent/templates/base/Dockerfile) — the uzi uid (which the agent shares) cannot
-    // create a hook inside it. A runtime-created dir would be under the shared uid and
-    // agent-writable, which is the vector this closes. The filesystem perms can't be
-    // unit-tested portably (that's the Dockerfile stanza's job); here we pin that
-    // git.ts uses the constant baked path and does NOT create it at runtime.
+    // (agent/templates/base/Dockerfile, and jvm/Dockerfile separately — jvm is not
+    // `FROM base`). The uzi uid (which the agent shares) cannot create a hook inside it.
+    // A runtime-created dir would be under the shared uid and agent-writable, which is
+    // the vector this closes. Here we pin that git.ts uses the constant baked path…
     assert.equal(cfg["core.hooksPath"], "/usr/share/uzi-git-nohooks", "must be the baked constant path");
-    assert.ok(
-      !fs.existsSync("/usr/share/uzi-git-nohooks"),
-      "git.ts must NOT mkdir the hooks dir at runtime (it exists only in the image)",
-    );
+    // …and does not create it at runtime. This USED to assert plain absence, which is
+    // false INSIDE a worker container by construction — both templates bake the dir — so
+    // the case failed deterministically in the one environment that matters, every run
+    // re-triaged it as "1 red is benign", and a real regression could hide behind an
+    // accepted red. Absence is not the invariant; the invariant is that no AGENT-WRITABLE
+    // hooks dir sits on core.hooksPath. See hooksDirVerdict.
+    const verdict = hooksDirVerdict(hooksDirFacts(HOOKS_DIR));
+    assert.ok(verdict.ok, `git.ts must NOT mkdir the hooks dir at runtime: ${verdict.why}`);
+  });
+
+  // The control for the assertion above, and it is a control rather than a nicety: a
+  // predicate that answers "fine" to both states would be a test that cannot fail, which
+  // is strictly worse than the deterministic red it replaced. The runtime-created shape is
+  // reproduced for real (a temp dir this process owns, 0755); the baked shape has to be
+  // supplied as facts, because an unprivileged test cannot chown anything to root — which
+  // is the same fact the predicate rests on.
+  it("the hooks-dir predicate still REJECTS a runtime-created dir (positive control)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-hooks-"));
+    try {
+      const runtime = path.join(tmp, "uzi-git-nohooks");
+      fs.mkdirSync(runtime);
+      fs.chmodSync(runtime, 0o755); // explicit: the worker runs with umask 002 (main.ts)
+      const v = hooksDirVerdict(hooksDirFacts(runtime));
+      assert.equal(v.ok, false, `a dir in the runtime-created shape must FAIL, got: ${v.why}`);
+
+      // Absent ⇒ pass. git.ts created nothing, which is the whole invariant.
+      assert.equal(hooksDirVerdict(hooksDirFacts(path.join(tmp, "no-such-dir"))).ok, true);
+
+      // The baked shape ⇒ pass. Root-owned with no write bit is not reachable by the uid
+      // the worker and agent share, so its presence is not evidence of a runtime mkdir.
+      assert.equal(hooksDirVerdict({ uid: 0, mode: 0o040555, isDir: true }).ok, true);
+
+      // …and the two halves are independent. Root-owned but writable still fails (this is
+      // also what carries the control above if someone runs the suite AS root, where a
+      // runtime-created dir is root-owned too), and a non-root 0555 dir fails as well: an
+      // agent that owns a directory can chmod it back.
+      assert.equal(hooksDirVerdict({ uid: 0, mode: 0o040755, isDir: true }).ok, false);
+      assert.equal(hooksDirVerdict({ uid: 1000, mode: 0o040555, isDir: true }).ok, false);
+      // A non-directory on the path is not a hooks dir at all.
+      assert.equal(hooksDirVerdict({ uid: 0, mode: 0o100555, isDir: false }).ok, false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it("carries the scoped credential pair when a PAT is passed (and hooks stay neutralized)", () => {
