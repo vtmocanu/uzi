@@ -344,6 +344,13 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		{"create chat (mints a run)", http.MethodPost, "/api/chats"},
 		{"logout (must not bump token_version)", http.MethodPost, "/api/auth/logout"},
 		{"cli-token CRUD self-mint (Decision 16)", http.MethodPost, "/api/me/cli-tokens"},
+		// PRD #111 D23 SPLIT THE GROUP THESE TWO LIVE IN, and this is the half that
+		// catches a mistake there. GET /me/rate-limits moved out to RequireUser; these
+		// two consent switches stayed cookie-only, and they must NOT have travelled
+		// with it. route_limiter_mounts_test pins the LIMITER, not the auth
+		// middleware, so an implementation that widened all three passes it.
+		{"autopilot opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/autopilot"},
+		{"judge opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/judge"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)
@@ -351,6 +358,39 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 			t.Errorf("%s: %s %s over Bearer = %d, want 401 (cookie-only route rejects the bearer path)\nbody: %s",
 				tc.name, tc.method, tc.path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestCLIReachesRateLimitsOverBearerLiveDB is D23's other half: the GET actually
+// MOVED. Asserting only that the two PUTs still 401 would pass on a tree where
+// nothing changed at all.
+//
+// The rationale is non-additivity, not a sensitivity ranking (see handler.go): every
+// inference this enables is already available at finer granularity through routes
+// already reachable by this same token — GET /api/runs carries a timestamped
+// per-run cost series, and POST /repos/{id}/runs lets a stolen uzc_ SPEND the quota
+// outright. It is a GET of the caller's own row: no outbound call, no poke, no
+// IsAdmin branch.
+func TestCLIReachesRateLimitsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	rec := bearerReq(router, http.MethodGet, "/api/me/rate-limits", uzc)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/me/rate-limits over Bearer = %d, want 200 — D23 moved it to "+
+			"RequireUser so `uzi token list` can show live eligibility\nbody: %s", rec.Code, rec.Body.String())
+	}
+	// A token-less user's meters are an empty array, which is the shape the CLI
+	// decodes; asserting it here keeps the move from passing on an error envelope
+	// that happened to be 200.
+	if body := rec.Body.String(); !strings.Contains(body, `"tokens"`) {
+		t.Fatalf("response carries no tokens array: %s", body)
+	}
+	// And an UNAUTHENTICATED request is still refused — the move is cookie→bearer,
+	// not authenticated→public.
+	if rec := bearerReq(router, http.MethodGet, "/api/me/rate-limits", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/me/rate-limits = %d, want 401", rec.Code)
 	}
 }
 

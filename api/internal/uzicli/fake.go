@@ -62,6 +62,10 @@ type FakeClient struct {
 	LastPoolValue    bool
 	PoolSecret       apitypes.SecretDTO
 
+	// SelfMeters drives SelfRateLimits (PRD #111 D23): the caller's own per-token
+	// meters, each carrying the server-computed auto-selection status.
+	SelfMeters []apitypes.TokenRateLimitDTO
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets []apitypes.SecretDTO
 
@@ -211,6 +215,13 @@ func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible
 		return apitypes.SecretDTO{}, f.Err
 	}
 	return f.PoolSecret, nil
+}
+
+func (f *FakeClient) SelfRateLimits(context.Context) ([]apitypes.TokenRateLimitDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.SelfMeters, nil
 }
 
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {

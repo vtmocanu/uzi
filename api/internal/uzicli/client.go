@@ -72,6 +72,16 @@ type Client interface {
 	// caller's OWN tokens the pool may spend. An unknown label is a usage error
 	// resolved client-side (exit 3); an unknown id is a 404 (exit 4).
 	SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
+	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
+	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
+	//
+	// RequireUser since PRD #111 D23. Before that this was cookie-only, which left
+	// `uzi token pool <label> --on` a silent no-op from a script's point of view: it
+	// could opt a token in and had no way to learn the token could never be picked
+	// (no gauge reading, or one that aged out) — R7's hazard, reintroduced on the CLI
+	// half. The status string is computed server-side by autoselect.Classify and is
+	// RENDERED here, never re-derived (D21).
+	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
@@ -557,6 +567,16 @@ func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligib
 		return apitypes.SecretDTO{}, err
 	}
 	return env.Secret, nil
+}
+
+func (c *HTTPClient) SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error) {
+	var env struct {
+		Tokens []apitypes.TokenRateLimitDTO `json:"tokens"`
+	}
+	if err := c.get(ctx, "/api/me/rate-limits", &env); err != nil {
+		return nil, err
+	}
+	return env.Tokens, nil
 }
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {

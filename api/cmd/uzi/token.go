@@ -48,18 +48,34 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The live eligibility, keyed by secret id (PRD #111 D23). Best-effort:
+			// this read is a SECOND request and a failure of it must not fail the
+			// listing — a user asking which tokens they hold still gets the answer, with
+			// the eligibility column reading "?" rather than a lie. Before D23 this
+			// endpoint was cookie-only and the CLI could not read it at all, which left
+			// `uzi token pool x --on` unable to tell a caller that x can never be
+			// picked: R7's silent no-op, surviving on the CLI half.
+			eligibility := map[string]string{}
+			if meters, merr := c.SelfRateLimits(cmd.Context()); merr == nil {
+				for _, m := range meters {
+					eligibility[m.SecretID] = m.AutoStatus
+				}
+			}
+
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(secrets)
 			}
 			rows := make([][]string, 0, len(secrets))
 			for _, s := range secrets {
-				// POOL is the OPT-IN, not live eligibility. A pooled token can still be
-				// unpickable right now — its gauge may never have polled, or its reading
-				// may have aged out — and that live answer rides the rate-limit meters,
-				// which are a web surface today (GET /me/rate-limits is cookie-only).
-				// Naming the column POOL rather than ELIGIBLE keeps this from implying
-				// it knows more than it does.
+				// POOL is the OPT-IN; ELIGIBLE is the live answer, and they are different
+				// facts on purpose. A token can be opted in and still unpickable — its
+				// gauge may never have polled, or its reading may have aged out — which is
+				// exactly the state a user needs to see rather than infer.
+				//
+				// The status string is RENDERED, never re-derived (D21): it is
+				// autoselect.Classify's answer, the same function the selector gates on,
+				// so this column cannot promise something the selector will not do.
 				//
 				// The label goes through cellText: it is user-authored and
 				// uzicli.Printer.Table does not sanitize what it is handed. This comment
@@ -70,10 +86,11 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// and rows written before the validator landed are never re-validated.
 				rows = append(rows, []string{
 					s.ID, cellText(s.Label), boolStr(s.IsDefault), boolStr(s.AutoEligible),
+					eligibilityCell(s.AutoEligible, eligibility[s.ID]),
 					s.CreatedAt.Format("2006-01-02"),
 				})
 			}
-			return p.Table([]string{"ID", "LABEL", "DEFAULT", "POOL", "CREATED"}, rows)
+			return p.Table([]string{"ID", "LABEL", "DEFAULT", "POOL", "ELIGIBLE", "CREATED"}, rows)
 		},
 	}
 
@@ -162,6 +179,30 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(list, pool)
 	return cmd
+}
+
+// eligibilityCell renders one token's live auto-selection status for `uzi token
+// list` (PRD #111 D23).
+//
+// Three cases, and the distinctions are the point:
+//   - NOT pooled: "-", because the POOL column beside it already says so and
+//     repeating "not in pool" would be noise on every row a user has not opted in.
+//   - pooled with a status: the SERVER's word, rendered verbatim. The vocabulary is
+//     autoselect.Status and this function deliberately does not interpret it — a
+//     status this binary has never heard of prints as itself rather than being
+//     mapped to something wrong or dropped.
+//   - pooled with NO status: "?", meaning "the meters read failed or did not
+//     mention this token". NOT "-" and not blank: a pooled token whose eligibility
+//     is unknown must not look like one that is fine, which is the silent no-op the
+//     column exists to remove.
+func eligibilityCell(pooled bool, status string) string {
+	if !pooled {
+		return "-"
+	}
+	if status == "" {
+		return "?"
+	}
+	return status
 }
 
 // findSecretByLabel resolves a user-facing label to the token it names,

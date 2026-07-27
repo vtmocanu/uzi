@@ -274,9 +274,12 @@ as inert data.
   The pool is empty by default on purpose — a pool that helped itself to every
   credential would spend the one you reserved for something else. **Opting a token in
   does not guarantee it gets picked**: the selector also needs a fresh rate-limit
-  reading for it, and a token the usage poller has never reached stays unpickable
-  while looking active. That live per-token status is a web surface (Settings →
-  Anthropic tokens); the `POOL` column here is the opt-in, not the live answer.
+  reading for it. `uzi token list` shows that as two separate columns — `POOL` is
+  your opt-in, `ELIGIBLE` is whether the selector could pick it *right now*
+  (`eligible`, or `no_reading` / `stale` / `unmeasured` / `below_threshold` when it
+  could not; `-` when the token is not pooled, `?` when the reading could not be
+  fetched). Check `ELIGIBLE` after opting a token in: a token uzi has never managed
+  to poll stays unpickable while looking active.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

@@ -214,8 +214,8 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 			continue
 		}
 		cells := strings.Fields(row)
-		if len(cells) < 5 {
-			t.Errorf("row for %q has %d cells, want 5: %q", tc.label, len(cells), row)
+		if len(cells) < 6 {
+			t.Errorf("row for %q has %d cells, want 6: %q", tc.label, len(cells), row)
 			continue
 		}
 		if cells[2] != tc.wantDefault || cells[3] != tc.wantPool {
@@ -272,5 +272,72 @@ func TestTokenListSanitizesLabel(t *testing.T) {
 	}
 	if !strings.Contains(out, "safe") {
 		t.Errorf("sanitizing dropped the printable text too: %q", out)
+	}
+}
+
+// --- PRD #111 D23: the ELIGIBLE column ---------------------------------------
+
+// TestTokenListShowsLiveEligibility is the CLI half of D23. Before the auth move
+// `uzi token pool x --on` could opt a token in and give a script NO WAY to learn
+// that x can never be picked — R7's silent no-op surviving on the CLI side. The
+// column closes it, and this pins that it renders the SERVER's word per row.
+func TestTokenListShowsLiveEligibility(t *testing.T) {
+	fc := poolFake()
+	fc.SelfMeters = []apitypes.TokenRateLimitDTO{
+		{SecretID: "s2", Label: "console-key", AutoEligible: true, AutoStatus: "no_reading"},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "ELIGIBLE") {
+		t.Errorf("token list is missing the ELIGIBLE column: %q", out)
+	}
+	rowOf := func(label string) []string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, label) {
+				return strings.Fields(line)
+			}
+		}
+		t.Fatalf("no row for %q in:\n%s", label, out)
+		return nil
+	}
+	// The pooled token carries the server's status verbatim — this is the whole
+	// point of the column, and of D21: the string is autoselect.Classify's answer,
+	// not something the CLI re-derived from percentages it does not have.
+	if got := rowOf("console-key")[4]; got != "no_reading" {
+		t.Errorf("pooled token's ELIGIBLE = %q, want the server's no_reading — a pooled "+
+			"token that can never be picked must SAY so", got)
+	}
+	// An un-pooled token reads "-": the POOL column beside it already says it is out,
+	// and repeating "not in pool" would be noise on every row.
+	if got := rowOf("default")[4]; got != "-" {
+		t.Errorf("un-pooled token's ELIGIBLE = %q, want -", got)
+	}
+	// A pooled token the meters did not mention reads "?" — NOT "-" and not blank.
+	// "Unknown" and "fine" must not look the same, which is the failure the column
+	// exists to remove.
+	if got := rowOf("spare-key")[4]; got != "-" {
+		t.Errorf("un-pooled spare-key's ELIGIBLE = %q, want -", got)
+	}
+}
+
+// A failed meters read must not fail the listing: a user asking which tokens they
+// hold still gets the answer, with eligibility honestly unknown rather than absent.
+func TestTokenListSurvivesAMetersFailure(t *testing.T) {
+	fc := poolFake()
+	fc.SelfMeters = nil // no meters staged, and the fake returns no error either
+	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 — a secondary read must not fail the listing", code)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "console-key") {
+			if got := strings.Fields(line)[4]; got != "?" {
+				t.Errorf("pooled token with no meter reads %q, want ? — unknown must not "+
+					"look the same as eligible", got)
+			}
+		}
 	}
 }
