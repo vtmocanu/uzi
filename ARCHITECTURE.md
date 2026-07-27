@@ -429,12 +429,15 @@ above) throughout: it decrypts a user's Anthropic token and forge bot PAT and
 hands both to the worker **only inside a run's claim response**
 (`POST /api/worker/runs/claim`) — never persisted server-side in plaintext,
 never logged (the same redaction discipline as the forge integration). *Which*
-Anthropic credential is resolved per claim in one place
-(`workersvc.claimSecretID`): a `self_improve` run follows the owner's
-judge-lane binding, any other run-lane claim follows the claiming worker's
-**bind mode**, and the chat lane always resolves the owner's default. Because
-the token rides the claim rather than the worker, re-pointing a worker is
-complete server-side — no restart, no re-minted join token.
+Anthropic credential is resolved is a **per-claim** decision across four lanes,
+of which `workersvc.claimSecretID` decides two: a `self_improve` run follows
+the owner's judge-lane binding, and any other run-lane claim follows the
+claiming worker's **bind mode**. The other two never reach it — a judge run
+forks to `assembleJudgeClaim` *before* `claimSecretID` and follows the owner's
+judge binding, and the chat lane calls the opener directly with no override, so
+it always resolves the owner's default. Because the token rides the claim
+rather than the worker, re-pointing a worker is complete server-side — no
+restart, no re-minted join token.
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens by rate-limit headroom
@@ -442,10 +445,13 @@ Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 ranker is **pure**: the store query ends at `[]autoselect.Candidate` and
 everything after it is arithmetic over already-fetched rows with an injected
 clock, which is what keeps the ranking testable without a database. It sits
-*behind* `claimSecretID` rather than beside it, so `openAnthropic` and
-`assembleClaim` never learn that auto exists — PRD #104's R4 is that three
-copies of credential resolution drift and a wrong fallback spends the wrong
-account silently. Auto never fails a run: an empty, unmeasurable or
+*behind* `claimSecretID` rather than beside it, so **the ranker runs in exactly
+one place**: `assembleClaim` never ranks and `openAnthropic` never learns of it
+at all — PRD #104's R4 is that three copies of credential resolution drift and
+a wrong fallback spends the wrong account silently. `assembleClaim` *does* know
+the choice came from the selector, because D14's retry lives where the open
+happens: it re-resolves once on the non-auto binding when a selector-named
+credential will not decrypt. Auto never fails a run: an empty, unmeasurable or
 undecryptable pool falls back to the owner's default and records why.
 
 Every claim now also **records the credential it spent** on the run

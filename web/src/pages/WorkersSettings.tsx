@@ -80,10 +80,16 @@ export function WorkersSettings() {
   // quota of 2 produces), so deleting two identically-named workers would set the same
   // string, React would bail out, the effect would not re-fire, and the second
   // announcement would silently never take focus.
-  const [notice, setNotice] = useState<{ text: string } | null>(null);
+  //
+  // It also carries a TONE, because F18 made the two channels agree in WORDS and left
+  // them disagreeing in COLOUR: a green success banner reading "your token pool is
+  // empty, so its runs spend your default token" is the same category error one level
+  // down from the one F18 fixed, and this file's own comment argues that the visible
+  // and the announced must not disagree.
+  const [notice, setNotice] = useState<{ text: string; tone: "success" | "warning" } | null>(null);
   const noticeRef = useRef<HTMLDivElement>(null);
-  const announce = useCallback((text: string) => {
-    setNotice({ text });
+  const announce = useCallback((text: string, tone: "success" | "warning" = "success") => {
+    setNotice({ text, tone });
   }, []);
 
   const load = useCallback(async () => {
@@ -126,6 +132,10 @@ export function WorkersSettings() {
               : mode === "default"
               ? `${worker.name} now spends your default token, from its next claim.`
               : `${worker.name} now spends ${choice}, from its next claim.`,
+          // Amber for the empty-pool case only: nothing failed, but the worker is
+          // configured for something that will not happen, which is the one branch
+          // here that is not a plain success.
+          mode === "auto" && pooledCount === 0 ? "warning" : "success",
         );
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to change the worker's token");
@@ -134,11 +144,23 @@ export function WorkersSettings() {
       }
     },
     // announce is stable (a setState wrapper). pooledCount is NOT — it is derived from
-    // `tokens` on every render — and it MUST be in the deps: with `[]` the callback
-    // would capture the count from the render that created it, so a user who opted a
-    // token in and then switched a worker to auto would hear the empty-pool
-    // announcement anyway (web-ux F18). The cost is re-creating rebind when the token
-    // set changes, which is exactly when its behaviour changes.
+    // `tokens` on every render — and it MUST be in the deps.
+    //
+    // 🔴 THIS GUARDS A LIVE BUG ON THE ORDINARY PATH, not a future landmine, and the
+    // mechanism is subtler than "the token set changed mid-session". `tokens` starts
+    // as [] and is filled ASYNCHRONOUSLY by load(). So with `[]` deps, rebind is
+    // created on the FIRST render — when pooledCount is 0 — and never re-created. It
+    // holds 0 for the life of the mount, whatever the fetch returns.
+    //
+    // The reachable journey needs no refetch and no route change: open the page with a
+    // full pool, switch a worker to auto, hear "your token pool is empty". Measured —
+    // the test below reddens under `[]` with a token pooled at mount and no mid-mount
+    // change at all.
+    //
+    // Worth spelling out because a review concluded the opposite: it looked for a
+    // mid-mount token REFETCH, correctly found none (the tabs are separate routes, and
+    // the 10s poll re-reads workers only), and inferred the fix was merely defensive.
+    // The initial [] → fetched transition is the change, and it happens every time.
     [pooledCount],
   );
 
@@ -357,7 +379,7 @@ export function WorkersSettings() {
       {notice && (
         // tabIndex -1: focusable programmatically, never a tab stop of its own.
         <div ref={noticeRef} tabIndex={-1} className="outline-none">
-          <Alert tone="success" message={notice.text} />
+          <Alert tone={notice.tone} message={notice.text} />
         </div>
       )}
 

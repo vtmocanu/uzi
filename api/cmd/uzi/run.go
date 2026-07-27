@@ -562,6 +562,15 @@ func credentialCell(r apitypes.RunDTO) string {
 // headroom is rendered only where it exists. It is present on an auto pick and nil
 // everywhere else, including on D14's retry, where the measurement described the
 // credential that would NOT open.
+//
+// 🔴 A LATENT COUPLING WITH THE WEB, recorded because no test can currently see it.
+// This appends the suffix only under `auto` and `best_of_pool`; web's
+// lib/runCredential.ts appends it for ANY reason with a non-null headroom. The two
+// agree today by accident of the server rather than by construction — headroom is
+// written only on an auto pick, and D14 explicitly nulls it on the retry, so no
+// reachable state distinguishes them. The day something records a headroom on a
+// fallback, the CLI silently drops it and the web silently shows it. Whichever
+// surface changes first should make the other match.
 func selectReasonText(reason autoselect.Reason, headroom *int) string {
 	pct := ""
 	if headroom != nil {

@@ -237,13 +237,17 @@ describe("RunCredential chip structure (web-ux F19/F20/F21)", () => {
   // MODE, reading as a stutter or a bug. The roles are told apart typographically, so
   // the assertion is that the label sits in its own element carrying weight, not that
   // the text happens to differ.
-  it("sets the label apart from the mode typographically", () => {
+  it("sets the label apart from the mode by punctuation, not only by weight", () => {
     const { container } = render(<RunCredential run={cred({ label: "default", reason: "default" })} />);
     const weighted = container.querySelector("span.font-semibold");
-    expect(weighted, "the label needs its own weighted element, or the two 'default's are indistinguishable").not.toBeNull();
+    expect(weighted, "the label needs its own element").not.toBeNull();
     expect(weighted?.textContent).toBe("default");
-    // …and the mode is NOT inside it.
     expect(weighted?.textContent).not.toMatch(/—/);
+    // 🔴 THE QUOTES ARE THE ASSERTION. A weight step alone was MEASURED as
+    // imperceptible at 11px in muted grey — presence in the markup is not efficacy on
+    // screen, and this test existed while the chip still read `token default — default`
+    // indistinguishably. Quotes survive any size and any contrast.
+    expect(chipText(container)).toMatch(/token “default” — default/);
   });
 
   // F20. Measured at 375px: `token nearly-spent — default (auto: the chosen token

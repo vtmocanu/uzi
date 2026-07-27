@@ -2236,6 +2236,15 @@ export const mockLaneRuns: Run[] = [
   demoIssueRun({
     id: "run-stalled",
     issue_iid: 99,
+    // web-ux F23. `open_failed` had no mock run, so the LONGEST string in the
+    // vocabulary could only ever be seen as a rendering preview — and F20's overflow
+    // was findable exactly because a long string was on screen. This also fixes a
+    // second thing: a *running* run carrying NO credential is a shape no real instance
+    // produces, since a running run has by definition claimed one.
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "open_failed",
+    anthropic_headroom_pct: null,
     issue_title: "Busy crew, degraded: the stalled role sorts to the front",
     issue_description: "Demo run: same stream as run-busy with a looping health flag, so the active tester lane reads stalled and its role chip leads the rollup.",
     branch: "agent/issue-99",
@@ -2257,6 +2266,11 @@ export const mockCrewRuns: Run[] = [
   }),
   demoIssueRun({
     id: "run-degraded",
+    // The other half of F23: `pool_empty`, the second string with no mock run.
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "pool_empty",
+    anthropic_headroom_pct: null,
     issue_title: "Crew roster: worker went quiet (waiting on a worker)",
     status: "running",
     health: "waiting_worker",

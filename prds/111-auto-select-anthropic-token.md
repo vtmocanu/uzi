@@ -490,8 +490,14 @@ already-applied head makes every upgraded instance refuse to boot.
   residual limit is now only the poll-interval lag itself.
 - **R4 — Resolution must stay in one place.** PRD #104's R4 warns that three
   copies of credential resolution drift and a wrong fallback spends the wrong
-  account silently. M4 adds the selector *behind* `claimSecretID`, not beside it;
-  `openAnthropic` and `assembleClaim` are untouched.
+  account silently. M4 adds the selector *behind* `claimSecretID`, not beside it, so the
+  ranker runs in exactly ONE place. **Corrected 2026-07-27**: this said
+  "`openAnthropic` and `assembleClaim` are untouched", which was TRUE WHEN
+  DRAFTED and stopped being true inside this PRD. D14 was added mid-implementation
+  and its retry has to live where the open happens, so `assembleClaim` now branches
+  on `choice.autoPicked()` and writes `autoselect.ReasonOpenFailed`. `openAnthropic`
+  really is untouched. The claim R4 was defending survives in the narrower form —
+  `assembleClaim` never RANKS, and there is still one resolution site.
 - **R5 — CLI parity.** Per CLAUDE.md, a worker-binding or token change that only
   updates `web/` leaves the CLI stale. M2/M3/M5 each carry their `cmd/uzi`
   change in the same milestone.

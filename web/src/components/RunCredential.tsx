@@ -72,12 +72,17 @@ export function RunCredential({
           : hint
       }
     >
-      {/* web-ux F19. `token default — default` was the exact input D20 named as its
-          motivating case, and it rendered as the same word twice with nothing marking
-          which was which — it reads as a stutter or a bug. The LABEL is set in medium
-          weight, as WorkersSettings already does for a pinned worker, so the two roles
-          are told apart typographically rather than by position. */}
-      token <span className="font-semibold">{safe}</span>
+      {/* web-ux F19, second attempt, and the first one is why this is QUOTES rather
+          than weight. `token default — default` is the exact input D20 named as its
+          motivating case: the same word twice, first a NAME and then a MODE, with
+          nothing marking which is which. Bolding the label was measured at 3x zoom and
+          the one weight step (600 vs 500) at 11px in muted grey is not perceptible at
+          actual size — the markup changed and the meaning did not.
+          
+          Quotes do the work at any size and any contrast, and they are unambiguous
+          about WHICH token is a name. The weight stays because it costs nothing and
+          helps where it is visible. */}
+      token “<span className="font-semibold">{safe}</span>”
       {deleted && " (deleted)"}
       {mode && ` — ${mode}`}
       <span id={hintId} className="sr-only">

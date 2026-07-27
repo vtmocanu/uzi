@@ -752,17 +752,18 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
     expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
   });
 
-  // The DEPS leg, asserted directly. It is already caught — mutating `[pooledCount]`
-  // to `[]` reddens — but it reddens by TIMING OUT at ~5s on a pre-existing test whose
-  // name says nothing about pooled counts. A guard that works and cannot explain
-  // itself costs the next person the five minutes this test saves: opt a token in,
-  // switch to auto, and require the NON-empty announcement. Fails in milliseconds,
-  // names the cause.
+  // The DEPS leg, asserted directly, and the fixture is the ORDINARY path rather than
+  // an exotic one: a token is pooled at mount and nothing changes mid-mount.
   //
-  // The stale-closure shape is why this is not paranoia: with `[]` the callback
-  // captures pooledCount from the render that created it, so a user who pooled a token
-  // and THEN switched a worker to auto hears the empty-pool announcement anyway.
-  it("announces the pool once a token has been opted in mid-session", async () => {
+  // That is what makes the bug live rather than defensive. `tokens` starts [] and is
+  // filled asynchronously, so under `[]` deps rebind is created on the first render
+  // with pooledCount === 0 and keeps that value for the life of the mount. Open the
+  // page with a full pool, switch a worker to auto, hear "your token pool is empty".
+  //
+  // It was already caught before this test — by a 5s TIMEOUT on a pre-existing test
+  // whose name says nothing about pooled counts. A guard that works and cannot explain
+  // itself costs the next person the time this one saves.
+  it("announces a non-empty pool for a worker switched to auto after load", async () => {
     mockApi.listSecrets.mockResolvedValue({
       secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
     });
@@ -816,6 +817,32 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
     await waitFor(() => {
       expect(screen.getByText(/token pool is empty, so its runs spend your default token/i)).toBeTruthy();
     });
+    // 🔴 AND IT IS AMBER, NOT GREEN. F18 made the two channels agree in WORDS and left
+    // them disagreeing in COLOUR: the row span was text-warn while the announcement
+    // went through one unconditional success Alert, so a GREEN banner read "your token
+    // pool is empty, so its runs spend your default token". That is the same category
+    // error one level down from the one F18 fixed, and this file's own argument is
+    // that the visible and the announced must not disagree.
+    const banner = screen.getByText(/token pool is empty, so its runs spend your default token/i);
+    expect(banner.className, "a success-toned banner cannot carry a warning").toMatch(/text-warn\b/);
+    expect(banner.className).not.toMatch(/text-ok\b/);
+  });
+
+  // The other branches stay green: nothing went wrong, and making every announcement
+  // amber would cost the distinction this fix exists to create.
+  it("keeps an ordinary rebind announcement green", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker({ anthropic_bind_mode: "auto" }) });
+    renderPage();
+    await screen.findByText("laptop");
+    fireEvent.change(await screen.findByLabelText("Anthropic token for laptop"), {
+      target: { value: "\u0000auto" },
+    });
+    const banner = await screen.findByText(/now auto-selects from your token pool/i);
+    expect(banner.className).toMatch(/text-ok\b/);
   });
 });
 
