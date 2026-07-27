@@ -33,7 +33,7 @@ chromium	chromium	-
 fontconfig	-	-
 dejavu_fonts	-	-
 openssl.bin	openssl	openssl version
-file	file	file --version
+file.out	file	file --version
 perl	perl	perl -e exit
 coreutils	fmt	fmt --version
 kubernetes-helm	helm	helm version --short

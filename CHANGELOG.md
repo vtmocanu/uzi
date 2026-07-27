@@ -8,6 +8,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **`file` did not work in 0.11.11, despite that release announcing it.** The package was
+  declared as bare `file`, and devbox resolved that to the package's `dev` output -- headers
+  and libmagic, containing no `file` program at all. `devbox global install` reported success,
+  so the image shipped with `file` simply absent from the toolchain, exactly the silent
+  `command not found` the release was meant to remove. It is now declared `file.out`, the
+  output that carries the program, and verified from the realized profile rather than from a
+  shell that had the raw store path on its search path -- which is what made the original
+  check look green. This is the same trap `openssl.bin` documents; the earlier note reasoned
+  from a nixpkgs attribute that turns out not to govern what devbox installs, and that
+  reasoning is now corrected in place. Found by the new guard below, on its first real run.
+
 - **The worker image's toolchain guard had stopped covering the toolchain, and now cannot
   drift again.** The guard exists so a broken toolchain fails the image BUILD instead of
   shipping a silent `command not found` to every subagent at run time. It was a hardcoded
