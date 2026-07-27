@@ -172,6 +172,24 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+// Issue #124 / item 7: the recent-runs list renders the same forge-supplied issue title.
+describe("Dashboard — the recent-run title carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of the forge-supplied title", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ issue_title: "Fix the \u202Eparser\u200B bug" })] });
+    const { container } = renderDashboard();
+    // Same explicit first-load flush the neighbouring cases use, then anchor on a fixed
+    // stat-tile label rather than on the title: a lookup for the CLEANED title cannot match
+    // while the format character is present, so a mutation would red at the lookup instead
+    // of at the assertion below.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(screen.getByText("Active runs")).toBeTruthy();
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+  });
+});
+
 describe("Dashboard first-load / re-poll error split", () => {
   it("keeps skeletons (renders no tiles) when the first load fails", async () => {
     mockApi.listRuns.mockRejectedValueOnce(new Error("api down"));

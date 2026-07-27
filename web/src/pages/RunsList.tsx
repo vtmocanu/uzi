@@ -20,6 +20,7 @@ import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { JudgeRunBadge } from "../components/JudgeRunBadge";
+import { stripUnsafeChars } from "../lib/safeText";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -61,7 +62,10 @@ function RunRow({
         className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
       >
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-fg">{run.issue_title}</p>
+          {/* Issue #124: the run title is the forge ISSUE title — writable by anyone who
+              can open an issue on the target repo, so it is untrusted free text on the same
+              footing as judge output. Display-only here; the raw value stays the identity. */}
+          <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(run.issue_title)}</p>
           <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
             <span>
               {run.repo_path} #{run.issue_iid}
@@ -268,7 +272,14 @@ export function RunsList() {
                     className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2 text-sm"
                   >
                     <div>
-                      <span className="font-medium text-fg">{w.name}</span>
+                      {/* Issue #124, and this one is CROSS-PRINCIPAL: this list comes from
+                          `api.adminListWorkers()` -> ListAllWorkers, which embeds every
+                          user's worker row, so an admin reads names ANOTHER user chose.
+                          `handler/workers.go:388` only TrimSpaces and length-caps a name at
+                          creation -- no Cc/Cf strip -- so a bidi override in one user's
+                          worker name renders in the admin's fleet list beside a different
+                          user's `owner_email`. */}
+                      <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                       <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
                       {(w.template_reported || w.template_declared) && (
                         <span className="ml-2 text-xs text-faint">

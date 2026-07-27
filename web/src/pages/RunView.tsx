@@ -26,6 +26,7 @@ import {
   type TriageCounts,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { stripUnsafeChars } from "../lib/safeText";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
   formatElapsed,
@@ -96,7 +97,12 @@ function LiveElapsed({ since }: { since: string }) {
 // only, so health_reason is always present here (no gating needed). It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
 // re-render. Renders nothing for a healthy run or a non-flaggable status.
-function HealthFlag({ run }: { run: Run }) {
+/**
+ * The stuck/health pill. Exported for the same reason RunHeading and RunCompletedLine are:
+ * `RunView` needs routing, a live stream and a dozen API mocks to mount, and `health_reason`
+ * renders only in this branch — so without this the strip below could not be asserted.
+ */
+export function HealthFlag({ run }: { run: Run }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 30_000);
@@ -114,7 +120,17 @@ function HealthFlag({ run }: { run: Run }) {
     >
       ⚠ {healthFlagLabel(run.health)}
       {stuck}
-      {run.health_reason && <span className="font-normal"> — {run.health_reason}</span>}
+      {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
+          attribute (runBadge's descriptor) and missed it here, where it renders as body
+          text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
+          attribute for 4a739bff. Same field, opposite channel, one commit apart.
+          (This sentence named 4a739bff until D1: that is the commit which fixed the
+          ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
+          mirror. Second time those two were transposed — see the note in
+          WorkerUpgradeBadge.test.tsx — because they are one apart, both about
+          upgrade_detail, and differ only in channel, which is the distinction being
+          taught.) */}
+      {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
     </span>
   );
 }
@@ -228,10 +244,7 @@ export function RunView() {
               <span>/</span>
               <span className="text-muted">Run</span>
             </nav>
-            <div className="flex flex-wrap items-center gap-x-2">
-              <h1 className="truncate text-xl font-semibold tracking-tight">{run.issue_title}</h1>
-              {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
-            </div>
+            <RunHeading run={run} />
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
@@ -286,16 +299,7 @@ export function RunView() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-ok">Run completed</p>
-              <p className="mt-0.5 text-xs text-muted">
-                {duration && <>Ran for {duration}. </>}
-                {run.branch && (
-                  <>
-                    Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{run.branch}</code>
-                    {run.mr_iid != null &&
-                      ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
-                  </>
-                )}
-              </p>
+              <RunCompletedLine run={run} duration={duration} mrState={mrState} />
             </div>
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
@@ -333,11 +337,7 @@ export function RunView() {
               <p className={cx("text-sm font-semibold", stopped ? "text-fg" : "text-danger")}>
                 Run {stopped ? "stopped" : "failed"}
               </p>
-              {run.failure_reason && (
-                <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
-                  {run.failure_reason}
-                </p>
-              )}
+              <RunFailureReason run={run} stopped={stopped} />
               {duration && <p className="mt-0.5 text-xs text-muted">Ran for {duration}.</p>}
             </div>
             {/* The MR link is the run's whole output; surface it even on a failed or
@@ -744,6 +744,75 @@ export function PlanPanel({
 // a run is past the gate (PRD #37 Decision 3b). For a repo-source run it says so
 // plainly, so a reader knows the internal review loop was repo-authored. Repo
 // names/descriptions render as plain JSX text, never <Markdown>.
+/**
+ * The run header's title line. Extracted and exported for the same reason PlanPanel,
+ * AgentRosterSummary and JudgePanel are: `RunView` itself needs routing, a live stream and
+ * a dozen API mocks to mount, so an assertion about the heading could not otherwise be
+ * written — and this line was the one #124 render site in the batch with no test at all
+ * (dropping its strip left all 42 cases green).
+ *
+ * `issue_title` is the FORGE issue title: writable by anyone who can open an issue on the
+ * target repo, so it is untrusted free text on the same footing as judge output. Display
+ * only — nothing here is posted back or used as a key.
+ */
+/**
+ * The completed-run hero's detail line. Exported for the same reason RunHeading is: `RunView`
+ * needs routing, a live stream and a dozen API mocks to mount, so `run.branch` could not
+ * otherwise be asserted — and an unverified strip is what this batch keeps finding.
+ *
+ * `run.branch` is WORKER-supplied and ingest stores it as `stripNULParam(req.Branch)` — NUL
+ * only, no Cc/Cf — so it has the same profile as every other field this batch closed.
+ */
+/**
+ * The failed/stopped hero's reason line, extracted so it can be asserted at all — it renders
+ * in a different `RunView` branch from HealthFlag, so no single fixture reaches both.
+ *
+ * Issue #124, TEXT channel. `failure_reason` is worker-supplied, ingest is `stripNUL` +
+ * truncate (`sanitizeFailureReason`), and `service.go` writes `err.Error()` straight in — so
+ * a hostile repo can shape the error an agent fails with. This is the LARGER of the two
+ * surfaces that carry it: a paragraph of body text, versus a tooltip you have to hover.
+ */
+export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean }) {
+  if (!run.failure_reason) return null;
+  return (
+    <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
+      {stripUnsafeChars(run.failure_reason)}
+    </p>
+  );
+}
+
+export function RunCompletedLine({
+  run,
+  duration,
+  mrState,
+}: {
+  run: Run;
+  duration?: string | null;
+  mrState?: string | null;
+}) {
+  return (
+    <p className="mt-0.5 text-xs text-muted">
+      {duration && <>Ran for {duration}. </>}
+      {run.branch && (
+        <>
+          Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
+          {run.mr_iid != null &&
+            ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+        </>
+      )}
+    </p>
+  );
+}
+
+export function RunHeading({ run }: { run: Run }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-2">
+      <h1 className="truncate text-xl font-semibold tracking-tight">{stripUnsafeChars(run.issue_title)}</h1>
+      {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
+    </div>
+  );
+}
+
 export function AgentRosterSummary({ run }: { run: Run }) {
   const excluded = new Set(run.agent_exclusions ?? []);
   const roster = run.agent_source === "repo" ? (run.repo_agents ?? []) : (run.own_agents ?? []);
@@ -929,7 +998,15 @@ export function JudgePanel({ run }: { run: Run }) {
               judge incomplete
             </Badge>
           )}
-          {review?.judge_model && <span className="text-xs text-faint">via {review.judge_model}</span>}
+          {/* Issue #124: worker-reported, scrubbed at ingest by sanitizeSelfReported, so
+              rows written before that strip learned Cf still carry it. NOTE this is the
+              REVIEW DTO's judge_model (api.ts:1085), not the admin SETTING of the same name
+              (api.ts:428) — that one is edited in a controlled input and stripping it would
+              filter an admin's own keystrokes, the mistake the draft-seed ruling argued
+              against. */}
+          {review?.judge_model && (
+            <span className="text-xs text-faint">via {stripUnsafeChars(review.judge_model)}</span>
+          )}
         </div>
         {rerunButton}
       </div>
@@ -946,13 +1023,21 @@ export function JudgePanel({ run }: { run: Run }) {
         </p>
       ) : (
         <>
-          {/* summary_md and each rationale_md below are UNTRUSTED judge/worker output.
-              They are DELIBERATELY rendered as escaped plain text (React's default +
+          {/* summary_md, each target and each rationale_md below are UNTRUSTED judge/worker
+              output. They are DELIBERATELY rendered as escaped plain text (React's default +
               whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
               markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
-              (ScrubSecrets + control-strip) does NOT cover markdown/link injection. */}
+              (ScrubSecrets + control-strip) does NOT cover markdown/link injection.
+              Issue #124: escaping is not sufficient on its own either. TWO scrubbers run at
+              the review POST, not one — `sanitizeReviewText` (handler/judge_worker.go:381)
+              for summary/rationale, `sanitizeSelfReported` (handler/worker_protocol.go:44)
+              for `target` — and both were `IsControl`-only, so Cf bidi overrides were
+              persisted and reorder what a human reads. Both now strip Cf as well, but rows
+              written before that still render through here, which is why the renderer-side
+              strip is not redundant. See lib/safeText.ts for why it sits at the render site
+              and not at the API boundary (`target` is a coordinate the page posts back). */}
           {review.summary_md.trim() !== "" && (
-            <p className="whitespace-pre-wrap text-sm text-muted">{review.summary_md}</p>
+            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(review.summary_md)}</p>
           )}
 
           {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
@@ -976,7 +1061,9 @@ export function JudgePanel({ run }: { run: Run }) {
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge tone="info">{recommendationLabel(rec.category)}</Badge>
                       {rec.target.trim() !== "" && (
-                        <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{rec.target}</code>
+                        <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
+                          {stripUnsafeChars(rec.target)}
+                        </code>
                       )}
                       {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
                       <span className="ml-auto">
@@ -984,7 +1071,9 @@ export function JudgePanel({ run }: { run: Run }) {
                       </span>
                     </div>
                     {rec.rationale_md.trim() !== "" && (
-                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
+                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">
+                        {stripUnsafeChars(rec.rationale_md)}
+                      </p>
                     )}
                     {/* A settled disposition (done/dismissed) hides the create-issue
                         affordance (File / draft) but NOT an already-filed link: a rec that
@@ -1119,8 +1208,20 @@ function RecommendationFiler({
       const { draft } = await api.getIssueDraft(runId, rec.id);
       setDraft(draft);
       setRepoId(draft.default_repo_id);
-      setTitle(draft.title);
-      setDescription(draft.description);
+      // Issue #124 / LOW-1: sanitize what UZI supplies, leave what the USER types alone.
+      // These are controlled components, so the state IS what gets POSTed — filtering
+      // `value=` would silently rewrite the user's own typing. The SEED is uzi-supplied
+      // (a server draft templated from `rec.target` + `rationale_md`), so it is exactly
+      // the boundary that may be cleaned.
+      //
+      // The ingest strip means new rows can no longer carry Cf at all; this covers reviews
+      // stored BEFORE it, the same argument the renderer-side strip rests on. It is also
+      // on the SAFE side of the quick-action ordering trap: measured, a Cf strip applied
+      // BEFORE the server's StripUnfencedSlashLines makes `<ZWSP>/label ~backdoor` into a
+      // line the slash-pass then DROPS, whereas stripping AFTER that pass would turn an
+      // inert line into a live GitLab quick action.
+      setTitle(stripUnsafeChars(draft.title));
+      setDescription(stripUnsafeChars(draft.description));
     } catch (e) {
       setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
     } finally {

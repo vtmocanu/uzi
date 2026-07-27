@@ -14,6 +14,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // Stable per-row ids: the delete button is a focus target after a dismissed confirm,
 // and the warning is the confirm group's aria-description (PRD #58).
@@ -337,7 +338,11 @@ export function WorkersSettings() {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <span className="font-medium text-fg">{w.name}</span>
+                    {/* Own workers here, but stripped for the same reason and with the
+                        same helper as the admin fleet list (RunsList.tsx): the field is
+                        unstripped at ingest, and one page treating it as safe while the
+                        other does not is how the next reader picks the wrong precedent. */}
+                    <span className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
                     <span className="ml-2 align-middle">
                       <WorkerUpgradeBadge worker={w} />
                     </span>
@@ -347,7 +352,8 @@ export function WorkersSettings() {
                       ) : (
                         w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
                       )}
-                      {w.version && <span>· v{w.version}</span>}
+                      {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
+                      {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
                       {w.last_heartbeat_at && (
                         <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                       )}
@@ -433,7 +439,7 @@ export function WorkersSettings() {
                         restart, no re-minted join token. */}
                     {tokens.length > 1 && confirmingDelete !== w.id && (
                       <Select
-                        aria-label={`Anthropic token for ${w.name}`}
+                        aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
                         className="h-8 max-w-[11rem] text-xs"
                         value={w.anthropic_secret_label ?? ""}
                         disabled={tokenBusy === w.id}
@@ -484,7 +490,18 @@ export function WorkersSettings() {
                     ref={confirmRef}
                     tabIndex={-1}
                     role="group"
-                    aria-label={`Confirm deleting ${w.name}`}
+                    // Issue #124, and the one w.name site where the consequence is NOT
+                    // cosmetic: this is the accessible name of a DESTRUCTIVE confirmation and
+                    // the only thing a screen-reader user gets before choosing. A name
+                    // crafted so the announcement reads as a different worker turns a
+                    // self-inflicted typo risk into a wrong-target delete.
+                    //
+                    // The field is unstripped at ingest (handler/workers.go:388 trims and
+                    // length-caps, no Cc/Cf). Owner-set, so per-owner surfaces are
+                    // self-inflicted — but the ADMIN fleet list (RunsList.tsx) renders names
+                    // cross-user, which is why the strip is unconditional rather than argued
+                    // per surface.
+                    aria-label={`Confirm deleting ${stripUnsafeChars(w.name)}`}
                     // The label alone would DEFEAT this control for a screen reader.
                     // Focusing a named container announces its accessible NAME —
                     // "Confirm deleting base (M), group" — which sounds like a routine

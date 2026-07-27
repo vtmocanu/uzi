@@ -2,8 +2,9 @@
 // recommendation-category label map. Kept in a lib (not inline in RunView) so the
 // closed-enum → human-copy mapping is unit-tested and reused. None of these render
 // untrusted text — they map the closed verdict/category enums to fixed UI strings;
-// the untrusted free text (summary_md, rationale_md, target) is rendered separately
-// as escaped React text.
+// the untrusted free text (summary_md, rationale_md, target, judge_model) is rendered
+// separately as escaped React text, through lib/safeText's stripUnsafeChars — escaping
+// alone does not touch bidi overrides (issue #124).
 
 import type { RecommendationCategory, ReviewVerdict } from "./api";
 

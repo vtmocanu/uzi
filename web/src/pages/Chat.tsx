@@ -38,6 +38,7 @@ import {
   cx,
 } from "../components/ui";
 import { ChatIcon } from "../components/icons";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // WorkerOfflineBanner (Decision 15): honest liveness, derived from the existing
 // heartbeat-tracked worker list — never a silent forever-queue.
@@ -189,7 +190,7 @@ function ConversationRow({
   return (
     <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70">
       <Link to={`/chat/${chat.id}`} className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-fg">{conversationTitle(chat)}</p>
+        <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(conversationTitle(chat))}</p>
         <p className="mt-0.5 text-xs text-faint">Last activity {new Date(last).toLocaleString()}</p>
       </Link>
       <div className="flex items-center gap-2">
@@ -298,7 +299,11 @@ export function ChatConversation() {
     );
   }
 
-  const title = meta ? conversationTitle(meta) : (run?.issue_title?.trim() || "Untitled chat");
+  // Issue #124. BOTH branches are untrusted free text: the derived chat title is
+  // agent-written, and the fallback is the forge ISSUE title. One strip covers both. This
+  // site is the one the audit's enumeration missed — it looked for judge-DTO consumers, and
+  // a run title reaches a fourth page through this fallback.
+  const title = stripUnsafeChars(meta ? conversationTitle(meta) : (run?.issue_title?.trim() || "Untitled chat"));
 
   return (
     <div className="space-y-4">

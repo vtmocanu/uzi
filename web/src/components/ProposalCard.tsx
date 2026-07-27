@@ -2,6 +2,7 @@ import { useState } from "react";
 import { api, ApiError, isHttpsUrl, type CreatedIssue, type IssueProposal, type ProposalStatus } from "../lib/api";
 import { Badge, Button } from "./ui";
 import { ExternalLinkIcon, FileTextIcon } from "./icons";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // ProposalCard renders a chat agent's issue draft (PRD #39 Decision 8) as a
 // human-gated card. The load-bearing rule: title/description/labels come from the
@@ -60,16 +61,19 @@ export function ProposalCard({ chatId, proposal }: { chatId: string; proposal: I
 
       <div className="space-y-3 px-3 py-3">
         {/* Every field below is inert model text: rendered as escaped JSX, never
-            Markdown, so a link in the title/description is not clickable. */}
+            Markdown, so a link in the title/description is not clickable — and passed
+            through stripUnsafeChars first, because escaping does not touch a bidi
+            override (issue #124). Display only: confirm/dismiss post `proposal.id`,
+            never these strings, so the raw values still round-trip. */}
         <div className="space-y-1">
           {proposal.repo_path && (
-            <p className="font-mono text-[11px] text-faint">{proposal.repo_path}</p>
+            <p className="font-mono text-[11px] text-faint">{stripUnsafeChars(proposal.repo_path)}</p>
           )}
-          <p className="text-sm font-semibold text-fg">{proposal.title}</p>
+          <p className="text-sm font-semibold text-fg">{stripUnsafeChars(proposal.title)}</p>
         </div>
         {proposal.description && (
           <p className="whitespace-pre-wrap break-words text-sm text-muted">
-            {proposal.description}
+            {stripUnsafeChars(proposal.description)}
           </p>
         )}
         {proposal.labels.length > 0 && (
