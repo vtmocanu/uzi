@@ -10,8 +10,12 @@ import (
 // seeded set and its order were a silent contract: a reorder or a color change
 // would have shipped green and only shown up on the next repo somebody connected.
 //
-// These assert the DECISIONS, not the literal slice — which of them is being broken
-// is readable from the failure rather than from a diff of two slices.
+// The primary assertion IS a literal slice compare, and the header used to claim
+// otherwise ("assert the DECISIONS, not the literal slice"), which review m-6 caught as
+// an overclaim. What the extra assertions below actually buy is a readable FAILURE: the
+// slice compare says the order changed, and the named checks say WHICH decision the new
+// order breaks — Planned leading, Human Review following In Progress, the inherited
+// colour. That is worth having and is not the same as not pinning the literal.
 func TestDefaultColumnsSeedInFlowOrder(t *testing.T) {
 	names := make([]string, len(DefaultColumns))
 	for i, c := range DefaultColumns {

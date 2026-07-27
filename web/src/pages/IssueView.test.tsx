@@ -235,10 +235,98 @@ describe("IssueView label chips (PRD #102 M4)", () => {
     await screen.findByText("A small typo fix");
     expect(screen.getByText("bug")).toBeTruthy();
     expect(screen.queryByText("PRD")).toBeNull();
-    expect(screen.queryByText("autopilot")).toBeNull();
+    // autopilot is excluded from the CHIPS and always was. Since review M-1 it renders
+    // as a BADGE instead, which is a different element with a different meaning — so
+    // the assertion is that exactly one element carries the name and it is the badge,
+    // not that the name is absent. Asserting absence here would forbid the badge.
+    const autopilotEls = screen.getAllByText("autopilot");
+    expect(autopilotEls).toHaveLength(1);
+    expect(autopilotEls[0].getAttribute("title")).toMatch(/Autopilot/);
     // The issue's own column already names the header badge; a second copy of it as
     // a chip is the duplication Decision 6's column exclusion exists to prevent.
     expect(screen.getAllByText("In Progress")).toHaveLength(1);
+  });
+
+  // m-2. The strip on this page had NO test: folding stripUnsafeChars(l) to a raw {l}
+  // left nine tests green, because nothing here rendered a label carrying one.
+  it("strips format characters out of a chip (#124)", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
+    });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("security")).toBeTruthy();
+  });
+
+  // m-3. The ATTRIBUTE channel, on this surface too. container.textContent cannot see
+  // a title=, so the strip there was ungated on both pages at once.
+  it("strips the chip's title ATTRIBUTE, not only its text (#124)", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    const chip = screen.getByText("security");
+    expect(chip.getAttribute("title")).toBe("security");
+  });
+});
+
+// M-1. The autopilot label lost its only user-visible surface in web/ when M4 removed
+// it from the chip list. Removing it from the CHIPS was right — it is a workflow
+// marker, not content — but the consequence was that an issue armed for an unattended
+// run showed nothing at all until a run existed to carry RunView's badge.
+//
+// A badge is not a chip, so Decision 6 is untouched: the chip row still excludes the
+// label, and this says the distinct thing the chip never did.
+describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
+  it("shows an autopilot badge when the label is applied", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByTitle(/Autopilot/)).toBeTruthy();
+    expect(screen.getByText("autopilot")).toBeTruthy();
+  });
+
+  it("shows nothing when the label is absent", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"], has_prd_link: true }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByTitle(/Autopilot/)).toBeNull();
+  });
+
+  it("reads the CONFIGURED label name, never the literal 'autopilot'", async () => {
+    // The label is operator-configurable, like the other three. A hardcoded name would
+    // silently stop marking armed issues the moment an admin renames it.
+    vi.mocked(useAuth).mockReturnValue({
+      ...vi.mocked(useAuth)(),
+      autopilotLabel: "robot",
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "robot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("robot")).toBeTruthy();
+  });
+
+  it("does NOT put autopilot back in the chip row (Decision 6 stays intact)", async () => {
+    // The badge must not become a second route for a label the chip predicate excludes:
+    // exactly one element carries the name, and it is the badge.
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getAllByText("autopilot")).toHaveLength(1);
+    expect(screen.getByText("autopilot").getAttribute("title")).toMatch(/Autopilot/);
   });
 });
 

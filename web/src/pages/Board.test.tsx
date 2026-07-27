@@ -50,13 +50,14 @@ function aCard(over: Partial<Card> = {}): Card {
   } as Card;
 }
 
-function renderCard(over: Partial<Card> = {}, chips: string[] = []) {
+function renderCard(over: Partial<Card> = {}, chips: string[] = [], maxChips?: number) {
   return render(
     <MemoryRouter>
       <IssueCard
         card={aCard(over)}
         repoId="repo-1"
         chips={chips}
+        maxChips={maxChips}
         laneLabel="Backlog"
         canMoveUp={false}
         canMoveDown={false}
@@ -126,8 +127,61 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
 
   it("renders no chip row at all when nothing survives the filter", () => {
     // A card whose only labels are workflow markers must not grow an empty row.
-    const { container } = renderCard({ labels: ["PRD", "autopilot"] }, []);
-    expect(container.querySelectorAll("span[title]").length).toBe(0);
+    //
+    // Asserted on the ROW, not on the chips. The previous version of this test counted
+    // `span[title]` and was decoration: with an empty chip list no span renders whether
+    // the guard is there or not, so deleting the guard left an empty <div> behind and
+    // all eleven tests still passed (reviewer m-1). The row is queryable because it
+    // carries role="group" aria-label="Labels", which is also what makes the label set
+    // announceable rather than a bare div.
+    renderCard({ labels: ["PRD", "autopilot"] }, []);
+    expect(screen.queryByRole("group", { name: "Labels" })).toBeNull();
+  });
+
+  it("renders the row when there ARE chips — the control for the guard test above", () => {
+    // Without this pair, a guard hardcoded to `false` would satisfy the assertion above.
+    renderCard({}, ["bug"]);
+    expect(screen.getByRole("group", { name: "Labels" })).toBeTruthy();
+  });
+
+  it("still accounts for every label when the cap is 0 (Nit-1)", () => {
+    // boundedChips' contract is that the remainder is WITHHELD, not lost. Gating the
+    // row on shownChips would break exactly here: at a cap of 0 everything is overflow,
+    // so the row and its "+N" would both disappear and the labels would vanish with
+    // nothing saying so. The guard reads `chips.length`, so the row survives.
+    renderCard({}, ["a", "b"], 0);
+    const row = screen.getByRole("group", { name: "Labels" });
+    expect(row).toBeTruthy();
+    expect(screen.getByText("+2")).toBeTruthy();
+  });
+
+  it("makes the +N overflow focusable and announced, not hover-only (Nit-4)", () => {
+    // The withheld labels rode a `title` alone, which no keyboard or screen-reader user
+    // can reach — the same accessibility class as the drag gesture the ↑/↓ buttons
+    // exist for, so it gets the same answer.
+    renderCard({}, ["a", "b", "c", "d", "e", "f"]);
+    const more = screen.getByLabelText("2 more labels: e, f");
+    expect(more.getAttribute("tabindex")).toBe("0");
+    more.focus();
+    expect(document.activeElement).toBe(more);
+  });
+
+  it("strips the chip's title ATTRIBUTE, not only its text (#124, m-3)", () => {
+    // The assertion-channel trap: a whole-subtree container.textContent assertion CANNOT
+    // see an attribute value, so folding title={stripUnsafeChars(l)} to title={l} left
+    // twenty tests green. Attributes are only ever covered where someone wrote an
+    // explicit check.
+    renderCard({}, ["se\u202Ecurity"]);
+    const chip = screen.getByText("security");
+    expect(chip.getAttribute("title")).toBe("security");
+    expect(chip.getAttribute("title") ?? "").not.toMatch(/[\p{Cf}]/u);
+  });
+
+  it("strips the +N title attribute too", () => {
+    renderCard({}, ["a", "b", "c", "d", "e\u202E", "f"]);
+    const more = screen.getByText("+2");
+    expect(more.getAttribute("title") ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(more.getAttribute("aria-label") ?? "").not.toMatch(/[\p{Cf}]/u);
   });
 
   it("caps the visible chips and reports the rest as +N rather than dropping them", () => {

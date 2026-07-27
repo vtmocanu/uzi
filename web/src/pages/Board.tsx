@@ -811,6 +811,7 @@ export function IssueCard({
   repoId,
   projectWebUrl,
   chips,
+  maxChips,
   laneLabel,
   canMoveUp,
   canMoveDown,
@@ -842,6 +843,10 @@ export function IssueCard({
   // (columns + the configured workflow labels), and keeping it out of the card is
   // what lets this component mount in a test without an auth provider.
   chips: string[];
+  // Overrides MAX_CARD_CHIPS. Exists so the cap-0 edge — where every label is overflow
+  // and a shownChips-gated row would drop the "+N" along with them — is reachable from
+  // a test without changing the shipped cap.
+  maxChips?: number;
   // The card's lane name, for the reorder buttons' accessible names (PRD #102 M5).
   laneLabel: string;
   canMoveUp: boolean;
@@ -877,7 +882,7 @@ export function IssueCard({
   // Chips are bounded (PRD #102 M4): a lane is a fixed w-72, so an issue wearing a
   // dozen labels would push the card several rows taller than its neighbours and
   // bury the run badges. The remainder is not dropped — it rides the "+N" title.
-  const { shown: shownChips, overflow: chipOverflow, hidden: hiddenChips } = boundedChips(chips);
+  const { shown: shownChips, overflow: chipOverflow, hidden: hiddenChips } = boundedChips(chips, maxChips);
   // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
   // stays on the forge), so they are not draggable.
   const draggable = !card.closed;
@@ -1025,8 +1030,13 @@ export function IssueCard({
           card's loudest element after the title. Wrapping (not scrolling) keeps the
           lane's width fixed; per-chip truncation keeps one long label from doing the
           same job a hundred short ones would. */}
-      {shownChips.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+      {/* Gated on `chips`, NOT on `shownChips`. The distinction is not pedantry: at a
+          cap of 0 every label is overflow, so a shownChips guard would hide the row
+          AND the "+N" that is supposed to account for the hidden ones — the labels
+          would vanish with nothing saying so, contradicting boundedChips' own
+          contract that the remainder is withheld rather than lost. */}
+      {chips.length > 0 && (
+        <div role="group" aria-label="Labels" className="mt-1.5 flex flex-wrap items-center gap-1">
           {/* Issue #124: a label name is forge-supplied like the title, so it is
               stripped where it is DISPLAYED (text and the truncation tooltip) while
               the React key stays the raw string — identity is never built from the
@@ -1041,7 +1051,15 @@ export function IssueCard({
             </span>
           ))}
           {chipOverflow > 0 && (
-            <span className="text-[11px] text-faint" title={stripUnsafeChars(hiddenChips.join(", "))}>
+            <span
+              // Focusable and named, not hover-only. The withheld labels rode a `title`
+              // alone, which no keyboard or screen-reader user can reach — the same
+              // accessibility class as the drag gesture the ↑/↓ buttons exist for.
+              tabIndex={0}
+              aria-label={`${chipOverflow} more label${chipOverflow > 1 ? "s" : ""}: ${stripUnsafeChars(hiddenChips.join(", "))}`}
+              className="rounded text-[11px] text-faint"
+              title={stripUnsafeChars(hiddenChips.join(", "))}
+            >
               +{chipOverflow}
             </span>
           )}

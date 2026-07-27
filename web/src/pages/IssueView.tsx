@@ -165,6 +165,18 @@ export function IssueView() {
                     {stripUnsafeChars(l)}
                   </span>
                 ))}
+                {/* The autopilot label has had NO user-visible surface in web/ since M4
+                    removed it from the chip list (correctly — it is a workflow marker,
+                    not content). A BADGE is not a chip, so Decision 6 is untouched: the
+                    chip row still excludes it, and this says the distinct thing the chip
+                    never did, which is that the issue is armed for an unattended run.
+                    Mirrors RunView's autopilot badge so one fact reads one way. Without
+                    it, an armed issue shows nothing at all until a run exists. */}
+                {issue.labels.includes(autopilotLabel) && (
+                  <Badge tone="brand" title="Autopilot: a run starts automatically, with the plan auto-approved">
+                    {autopilotLabel}
+                  </Badge>
+                )}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
                 {!issue.has_prd_link &&
                   (prdlessEnabled && prdlessApplied ? (
