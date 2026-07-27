@@ -113,9 +113,15 @@ type RunDTO struct {
 	// of a historical run whose credential is gone — render the label, and treat the
 	// id as a link target only when present.
 	//
-	// The label is USER-SUPPLIED text (validateSecretLabel permits Unicode Cf,
-	// including bidi overrides), so any consumer writing it to a terminal must
-	// sanitize; the CLI routes it through cellText for exactly this.
+	// The label is USER-SUPPLIED text, so any consumer writing it to a terminal must
+	// sanitize; the CLI routes it through cellText and the web through
+	// lib/sanitizeLabel for exactly this.
+	//
+	// This used to say "validateSecretLabel permits Unicode Cf, including bidi
+	// overrides". PRD #111 M2 made that false: the validator now rejects Cf on write.
+	// The obligation is unchanged, because the validator governs writes and not
+	// history — labels stored before it landed are never re-validated, and nothing
+	// re-validates on read.
 	//
 	// This DTO is owner-or-admin scoped throughout (ListRuns owner-only,
 	// AdminListRuns admin-only, GetRun owner-or-admin), which is why the label rides

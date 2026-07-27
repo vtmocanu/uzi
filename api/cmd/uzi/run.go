@@ -490,12 +490,26 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	//
 	// Through cellText, NOT sanitizeTTY, and the difference is load-bearing here in a
 	// way it is not for the rows above. This is the first genuinely USER-AUTHORED
-	// string in this block: validateSecretLabel rejects control characters and U+FFFD
-	// but NOT unicode.Cf, so a bidi-override label is storable, and uzicli.Printer.Table
-	// does not sanitize what it is handed. cellText is the table-cell wrapper — it
-	// applies sanitizeTTY (which does strip Cf), folds newlines and tabs, and caps
-	// the length — so it is the only one of the two that keeps a hostile label from
-	// reordering or unaligning the rail it is printed in.
+	// string in this block, and uzicli.Printer.Table does not sanitize what it is
+	// handed. cellText is the table-cell wrapper: sanitizeTTY plus newline folding,
+	// tab folding and a length cap.
+	//
+	// 🔴 THE PREMISE THIS USED TO GIVE IS NOW FALSE, AND THE CONCLUSION STILL HOLDS —
+	// which is exactly why the premise is being corrected rather than deleted. It read
+	// "validateSecretLabel rejects control characters and U+FFFD but NOT unicode.Cf, so
+	// a bidi-override label is storable". Since PRD #111 M2 the validator DOES reject
+	// Cf, so a reader checking that premise would find it false and reasonably conclude
+	// that sanitizeTTY now suffices here.
+	//
+	// It does not, for two reasons that survive the validator:
+	//   - NEWLINE FOLDING. sanitizeTTY deliberately spares "\n"; a newline in a table
+	//     cell breaks the rail. Only cellText folds it. That is the difference the
+	//     mutation control in render_test.go pins, and the one an earlier version of
+	//     that control failed to test.
+	//   - The validator governs what the SERVER ACCEPTS ON WRITE. Rows stored before
+	//     it landed were never re-validated and nothing re-validates on read, so a
+	//     hostile label still reaches this line through history, through a future
+	//     write path that skips validation, and through a direct database write.
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", cellText(*r.AnthropicSecretLabel)})
 	}

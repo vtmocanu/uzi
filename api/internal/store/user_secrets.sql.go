@@ -682,7 +682,7 @@ func (q *Queries) RotateUserSecret(ctx context.Context, arg RotateUserSecretPara
 
 const setUserSecretAutoEligible = `-- name: SetUserSecretAutoEligible :one
 UPDATE user_secrets SET auto_eligible = $1, updated_at = now()
-WHERE id = $2 AND user_id = $3
+WHERE id = $2 AND user_id = $3 AND kind = $4
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
 
@@ -690,6 +690,7 @@ type SetUserSecretAutoEligibleParams struct {
 	AutoEligible bool      `json:"auto_eligible"`
 	ID           uuid.UUID `json:"id"`
 	UserID       uuid.UUID `json:"user_id"`
+	Kind         string    `json:"kind"`
 }
 
 type SetUserSecretAutoEligibleRow struct {
@@ -715,8 +716,21 @@ type SetUserSecretAutoEligibleRow struct {
 //
 // Idempotent: setting the value it already has affects one row and changes nothing
 // but updated_at, which is the right answer for a toggle a UI may re-send.
+//
+// The kind predicate is vacuous today (anthropic_token is user_secrets' only kind)
+// and is here for the day it is not: the ROUTE already asserts the kind in its path
+// (/anthropic_token/{id}), so a request naming a secret of some other kind is a
+// mismatch the handler should answer 404 to. Without this it would instead reach
+// 00087's CHECK and surface as a 500. That makes the CHECK argument stronger rather
+// than weaker — the constraint stays the backstop, and the handler stops depending
+// on it to produce a user-facing error.
 func (q *Queries) SetUserSecretAutoEligible(ctx context.Context, arg SetUserSecretAutoEligibleParams) (SetUserSecretAutoEligibleRow, error) {
-	row := q.db.QueryRow(ctx, setUserSecretAutoEligible, arg.AutoEligible, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, setUserSecretAutoEligible,
+		arg.AutoEligible,
+		arg.ID,
+		arg.UserID,
+		arg.Kind,
+	)
 	var i SetUserSecretAutoEligibleRow
 	err := row.Scan(
 		&i.ID,

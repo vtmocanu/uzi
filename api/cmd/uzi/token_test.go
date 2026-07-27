@@ -80,11 +80,24 @@ func TestTokenSubcommands(t *testing.T) {
 
 // --- PRD #111 M2: the auto-selection pool toggle ---------------------------
 
+// poolFake stages THREE tokens, and the third one is the point (B1).
+//
+// With only the first two — (default=true, pool=false) and (default=false, pool=true)
+// — the DEFAULT and POOL columns are exact inverses, so they render the same multiset
+// of strings in either direction. Measured: swapping boolStr(s.AutoEligible) for
+// boolStr(s.IsDefault), the plausible copy-paste in a row with two boolean columns,
+// left the entire `uzi token list` suite green including the column test. The failure
+// it hides is direct — the CLI names the wrong tokens as pooled and a user opts the
+// wrong credential in.
+//
+// The third token is false in BOTH columns, which breaks the symmetry: (true,false),
+// (false,true), (false,false) is not the same multiset as its transpose.
 func poolFake() *uzicli.FakeClient {
 	return &uzicli.FakeClient{
 		Secrets: []apitypes.SecretDTO{
 			{ID: "s1", Kind: "anthropic_token", Label: "default", IsDefault: true, AutoEligible: false, CreatedAt: time.Unix(1784000000, 0)},
 			{ID: "s2", Kind: "anthropic_token", Label: "console-key", IsDefault: false, AutoEligible: true, CreatedAt: time.Unix(1784000000, 0)},
+			{ID: "s3", Kind: "anthropic_token", Label: "spare-key", IsDefault: false, AutoEligible: false, CreatedAt: time.Unix(1784000000, 0)},
 		},
 		PoolSecret: apitypes.SecretDTO{ID: "s2", Kind: "anthropic_token", Label: "console-key", AutoEligible: true},
 	}
@@ -176,8 +189,41 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 	if !strings.Contains(out, "POOL") {
 		t.Errorf("token list is missing the POOL column: %q", out)
 	}
-	if !strings.Contains(out, "true") || !strings.Contains(out, "false") {
-		t.Errorf("token list should render both pool values: %q", out)
+	// POSITIONAL, not "the word true appears somewhere". Each row's POOL cell is
+	// asserted against that row's own AutoEligible, which is what a
+	// Contains-anywhere check cannot do and what lets the wrong column render
+	// undetected. Rows are ID / LABEL / DEFAULT / POOL / CREATED.
+	for _, tc := range []struct {
+		label       string
+		wantPool    string
+		wantDefault string
+	}{
+		{"default", "false", "true"},
+		{"console-key", "true", "false"},
+		{"spare-key", "false", "false"},
+	} {
+		var row string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, tc.label) {
+				row = line
+				break
+			}
+		}
+		if row == "" {
+			t.Errorf("no row for %q in:\n%s", tc.label, out)
+			continue
+		}
+		cells := strings.Fields(row)
+		if len(cells) < 5 {
+			t.Errorf("row for %q has %d cells, want 5: %q", tc.label, len(cells), row)
+			continue
+		}
+		if cells[2] != tc.wantDefault || cells[3] != tc.wantPool {
+			t.Errorf("row for %q rendered DEFAULT=%q POOL=%q, want DEFAULT=%q POOL=%q — "+
+				"the two columns are separate facts and rendering one in the other's place "+
+				"tells a user the wrong credential is pooled: %q",
+				tc.label, cells[2], cells[3], tc.wantDefault, tc.wantPool, row)
+		}
 	}
 }
 
@@ -197,14 +243,29 @@ func TestTokenListShowsPoolColumn(t *testing.T) {
 // database all reach this code without passing that check. Keep the fixture hostile
 // and keep the cellText routing.
 func TestTokenListSanitizesLabel(t *testing.T) {
+	// 🔴 THE FIXTURE NEEDS A NEWLINE AND A TAB, AND DID NOT HAVE THEM. Bidi and CSI
+	// are stripped by sanitizeTTY ALONE, so the original fixture passed under either
+	// helper and pinned nothing about which one is used — measured: cellText →
+	// sanitizeTTY passed, only cellText → raw failed.
+	//
+	// cellText's distinguishing behaviour is newline folding, tab folding and the
+	// length cap. A newline or tab in a table cell breaks the rail the column
+	// alignment depends on, which is the whole reason this goes through the cell
+	// wrapper rather than the text sanitizer.
+	//
+	// SECOND INSTANCE OF THIS SHAPE in one PRD (render_test.go was the first): a
+	// fixture on which the broken and the correct implementation AGREE, reading as
+	// proof of something it never tested. Worth expecting a third.
 	fc := &uzicli.FakeClient{Secrets: []apitypes.SecretDTO{
-		{ID: "s1", Kind: "anthropic_token", Label: "safe‮dnetsop\x1b[31m", CreatedAt: time.Unix(1784000000, 0)},
+		{ID: "s1", Kind: "anthropic_token", Label: "safe‮dnetsop\x1b[31m\nnext\tcell", CreatedAt: time.Unix(1784000000, 0)},
 	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "token", "list")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	for _, bad := range []string{"‮", "\x1b"} {
+	// The first two are the shared floor (either helper satisfies them); the last two
+	// are what tell cellText and sanitizeTTY apart.
+	for _, bad := range []string{"‮", "\x1b", "\nnext", "\tcell"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q: %q", bad, out)
 		}

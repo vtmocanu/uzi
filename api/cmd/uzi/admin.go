@@ -237,11 +237,23 @@ func vaultCell(locked bool) string {
 // tokenCell renders a token's label for the admin table, marking the default so an
 // operator can see at a glance which credential a user's unbound workers spend
 // against (#104 M5). The label is a name, never the credential.
+//
+// 🔴 THE ONLY PATH WHERE A CRAFTED LABEL REACHES SOMEONE OTHER THAN ITS AUTHOR, which
+// is why it goes through cellText even though every other admin cell is
+// server-controlled. Everywhere else a hostile label can only spoof its own owner's
+// terminal; here it renders in an ADMIN's, listing every user's credentials.
+//
+// PRD #111 M2's validateSecretLabel now rejects Cf on write, which narrows this
+// without closing it: rows written before that landed were never re-validated, and
+// nothing re-validates on read. The auditor enumerated every write path that sets
+// user_secrets.label — the two body-driven ones validate, and UpsertDefaultUserSecret
+// and the seed pass compiled-in constants — so HISTORY is precisely the remaining
+// route, and a render-site defense is what covers history and future drift alike.
 func tokenCell(label string, isDefault bool) string {
 	if isDefault {
-		return label + " (default)"
+		return cellText(label) + " (default)"
 	}
-	return label
+	return cellText(label)
 }
 
 // windowPct renders a rate-limit window's percentage, or "-" when the window is

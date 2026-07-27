@@ -57,9 +57,13 @@ type Client interface {
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
-	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}. It takes a
-	// LABEL, the name a human knows, resolved against the caller's own token list —
-	// the same shape SetWorkerToken uses, and for the same reason.
+	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.
+	//
+	// It takes an ID. The label→id resolution happens in the COMMAND, client-side —
+	// deliberately NOT the shape SetWorkerBindMode uses, which sends the label for the
+	// server to resolve. An earlier version of this comment claimed they were the
+	// same; see cmd/uzi/token.go for the two ways they differ (Go vs Postgres case
+	// folding, and a missing kind filter) and why this side is accepted for now.
 	//
 	// This is the ONE secrets write a CLI token can reach, and its own narrow route
 	// is why (D13). Every other secrets write is cookie-only, because minting or

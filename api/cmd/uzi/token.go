@@ -61,9 +61,13 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// Naming the column POOL rather than ELIGIBLE keeps this from implying
 				// it knows more than it does.
 				//
-				// The label goes through cellText: it is user-authored, validateSecretLabel
-				// permits unicode.Cf (bidi overrides), and uzicli.Printer.Table does not
-				// sanitize what it is handed.
+				// The label goes through cellText: it is user-authored and
+				// uzicli.Printer.Table does not sanitize what it is handed. This comment
+				// used to add "validateSecretLabel permits unicode.Cf", which PRD #111 M2
+				// made false — and which sat 124 lines from another comment in this same
+				// file that was corrected while this one was missed. The conclusion is
+				// unchanged: cellText folds newlines and tabs, which sanitizeTTY does not,
+				// and rows written before the validator landed are never re-validated.
 				rows = append(rows, []string{
 					s.ID, cellText(s.Label), boolStr(s.IsDefault), boolStr(s.AutoEligible),
 					s.CreatedAt.Format("2006-01-02"),
@@ -73,11 +77,30 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	// pool takes a LABEL, the name a human knows, and resolves it to an id against
-	// the caller's own token list — the same shape `uzi worker set-token` uses. The
-	// resolution is CLIENT-side and case-insensitive to match the unique index 00077
-	// put on (user_id, kind, lower(label)), so `Console` and `console` name the same
-	// token here exactly as they do everywhere else.
+	// pool takes a LABEL, the name a human knows, and resolves it to an id against the
+	// caller's own token list.
+	//
+	// 🔴 THIS IS NOT THE SAME SHAPE AS `uzi worker set-token`, and an earlier version
+	// of this comment said it was. set-token sends the LABEL and lets Postgres resolve
+	// it through the kind-filtered GetUserSecretIDByLabel, using SQL `lower()` — the
+	// same function 00077's unique index is built on. This resolves CLIENT-side with
+	// Go's strings.ToLower and sends an id.
+	//
+	// Two consequences, both accepted here and neither hypothetical:
+	//   - Go's and Postgres's case folding are not the same function. Measured:
+	//     strings.ToLower("İstanbul") == strings.ToLower("istanbul") in Go. Postgres
+	//     `lower('İstanbul')` under a UTF-8 collation is documented to yield a 9-char
+	//     string distinct to the index — so both labels can coexist as separate rows
+	//     while this command folds them together and pools whichever the list returns
+	//     first. Exotic, and self-evident in `uzi token list`, which shows both rows.
+	//   - findSecretByLabel has NO kind filter, while GetUserSecretIDByLabel does. It
+	//     is vacuous today (anthropic_token is the only kind) and would matter the
+	//     moment a second one lands.
+	//
+	// The reason it is client-side anyway: the toggle route is keyed on the secret id
+	// (D13's narrow route), and giving it a label-accepting variant would widen a
+	// credential-adjacent write surface to save one round trip. Routing this through
+	// the server later would fix both bullets at once and is the cleaner end state.
 	var on, off bool
 	pool := &cobra.Command{
 		Use:   "pool <label>",

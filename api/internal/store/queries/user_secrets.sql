@@ -276,8 +276,16 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 --
 -- Idempotent: setting the value it already has affects one row and changes nothing
 -- but updated_at, which is the right answer for a toggle a UI may re-send.
+--
+-- The kind predicate is vacuous today (anthropic_token is user_secrets' only kind)
+-- and is here for the day it is not: the ROUTE already asserts the kind in its path
+-- (/anthropic_token/{id}), so a request naming a secret of some other kind is a
+-- mismatch the handler should answer 404 to. Without this it would instead reach
+-- 00087's CHECK and surface as a 500. That makes the CHECK argument stronger rather
+-- than weaker — the constraint stays the backstop, and the handler stops depending
+-- on it to produce a user-facing error.
 UPDATE user_secrets SET auto_eligible = @auto_eligible, updated_at = now()
-WHERE id = @id AND user_id = @user_id
+WHERE id = @id AND user_id = @user_id AND kind = @kind
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: DeleteUserSecret :execrows

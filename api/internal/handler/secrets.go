@@ -558,7 +558,8 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 		}
 		found = true
 		row, serr := q.SetUserSecretAutoEligible(r.Context(), store.SetUserSecretAutoEligibleParams{
-			ID: secretID, UserID: user.ID, AutoEligible: *req.AutoEligible,
+			ID: secretID, UserID: user.ID, Kind: store.KindAnthropicToken,
+			AutoEligible: *req.AutoEligible,
 		})
 		if serr != nil {
 			return serr
