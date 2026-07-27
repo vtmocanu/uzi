@@ -605,6 +605,362 @@ func TestRestartThresholdArmFiresForARunningContainer(t *testing.T) {
 	}
 }
 
+// runningFor is running() with the TWO fields issue #145's rule actually reads chosen
+// per case instead of baked in: how long the CURRENT instance has been up, and whether
+// there is a last termination at all.
+//
+// running() cannot serve here and the difference is the whole point. It hardcodes
+// `StartedAt = testNow-1m`, so a "Ready + restarts" case built on it would read `stuck`
+// under both the shipped and the fixed derivation — by accident of that one minute
+// being inside flapWindow, not because the rule works. Every case below therefore
+// states its uptime and says why that number.
+//
+// lastTerm nil builds the shape MEASURED on a real crash-looping pod: a container
+// instance with restartCount 6 and `"lastState": {}`. It is not a defensive nil; it is
+// what killed a finishedAt-anchored design.
+func runningFor(p *corev1.Pod, container string, restarts int32, up time.Duration, lastTerm *corev1.ContainerStateTerminated, init bool) *corev1.Pod {
+	st := corev1.ContainerStatus{
+		Name:         container,
+		RestartCount: restarts,
+		State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(testNow.Add(-up))}},
+	}
+	if lastTerm != nil {
+		st.LastTerminationState.Terminated = lastTerm
+	}
+	if init {
+		p.Status.InitContainerStatuses = append(p.Status.InitContainerStatuses, st)
+	} else {
+		p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, st)
+	}
+	return p
+}
+
+// Issue #145 — A READY POD IS NOT SETTLED WHILE A CONTAINER IS FLAPPING.
+//
+// The worker container has no readiness probe, so `Ready` means the kubelet started the
+// process, not that the agent works. A container that starts, dies ~40s later and
+// repeats is Ready on 31% of ticks — MEASURED, 41 of 133 samples, and decaying from 100%
+// at 0 restarts to 10% at 6 as kubelet's backoff grows. The unguarded early return
+// reported `settled` on every one of those, so the badge alternated; and because
+// `settled` returns BEFORE the blocking-container lookup, the report carried zeroed
+// diagnostics over the real ones.
+//
+// Each case below is here because a WRONG implementation passes the others:
+//
+//  1. the defect itself.
+//  2. a count-only rule fails it — and so does a rule whose recency check sits inside
+//     the switch instead of at the entry. This is the most important case in the file.
+//  3. a recency-only rule fails it.
+//  4. the healthy roll; any rule that over-fires fails it.
+//  5. a finishedAt-anchored rule fails it — the shape measured on a real pod.
+func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
+	const want = "hash-new"
+	exit1 := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+
+	// --- 1. THE DEFECT. Ready, 5 restarts, this instance up 30s. ---
+	//
+	// 30s because that is the live shape: the sampled flapper ran `sleep 40; exit 1`, so
+	// a fresh instance sits ~30s into its life on the Ready ticks. Any value well inside
+	// flapWindow does; the point is that the container came up recently and has died
+	// repeatedly. (Not "Ready for most of each cycle" — measured, it is Ready on 31% of
+	// ticks overall and less as the backoff grows. The fixture is unaffected; only the
+	// justification was overstated.)
+	pod := ready(runningFor(workerPod("w1", want, 20*time.Minute), "worker", 5, 30*time.Second, exit1, false),
+		testNow.Add(-30*time.Second))
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+	if h.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. The pod is Ready, but its container has died 5 times and the "+
+			"current instance is 30s old — Ready means the kubelet started the process, not that the "+
+			"agent works, because the worker container has NO readiness probe.", h.Phase, protocol.PhaseStuck)
+	}
+	if h.BlockingContainer != "worker" || h.RestartCount != 5 {
+		t.Errorf("BlockingContainer = %q RestartCount = %d, want worker/5. The whole point of withholding "+
+			"`settled` is that the report then carries the diagnostics a settled report never collects.",
+			h.BlockingContainer, h.RestartCount)
+	}
+	if h.LastExitCode == nil || *h.LastExitCode != 1 {
+		t.Errorf("LastExitCode = %v, want 1 from LastTerminationState — the container is Running NOW and "+
+			"terminated before, which is exactly the crash-loop shape", h.LastExitCode)
+	}
+	// The reason comes from the last termination, because a Running container has no
+	// current-state reason. Without it stuckDetail renders "not ready" about a pod that
+	// IS ready.
+	if h.BlockingReason != "Error" {
+		t.Errorf("BlockingReason = %q, want %q from the last termination. Left empty, the api's "+
+			"stuckDetail substitutes \"not ready\", which is false of a Ready pod.", h.BlockingReason, "Error")
+	}
+
+	// --- 2. 🔴 THE ANTI-PERMANENT-RED CASE. Ready, 5 restarts, up 10m1s. ---
+	//
+	// A worker that restarted 5 times last week and has been up ever since is HEALTHY.
+	// RestartCount is the kubelet's lifetime counter and never decreases, so a rule
+	// built on the count alone pins this red forever — and since #151 removed the INV-5
+	// ceiling from R1, that `upgrade_failed` has no expiry at all.
+	//
+	// It is also the case that fails if the recency conjunct is moved INTO the switch
+	// rather than gating entry to the fall-through: this pod would then reach the arms,
+	// where its 4-hour age trips the reasonless `stuckAge` arm even if the restart arm
+	// is correctly gated. The guard must keep it out of the switch entirely.
+	//
+	// 10m1s, one second past flapWindow, because a boundary is where an off-by-one
+	// lives; the pod is 4h old to make it unmistakably a long-lived worker.
+	recovered := ready(runningFor(workerPod("w2", want, 4*time.Hour), "worker", 5, flapWindow+time.Second, exit1, false),
+		testNow.Add(-(flapWindow + time.Second)))
+	if h := deriveRollHealth([]corev1.Pod{*recovered}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. This worker restarted 5 times and has been up %v since — it is "+
+			"HEALTHY. The verdict must expire on continuous uptime, or a lifetime counter that never "+
+			"decreases pins a working worker red forever with no ceiling to end it.",
+			h.Phase, protocol.PhaseSettled, flapWindow+time.Second)
+	}
+
+	// --- 2b. THE OTHER SIDE OF THE SAME BOUNDARY. Ready, 5 restarts, up 9m59s. ---
+	//
+	// Case 2 ALONE IS VACUOUS and that is not a hypothetical: "up 10m1s -> settled"
+	// passes against an implementation whose guard never fires at all. Only the
+	// DISAGREEMENT between the pair is signal. One second on the other side of
+	// flapWindow, with every other input identical to case 2 — same restart count, same
+	// pod age — so the only thing that can explain a different verdict is the conjunct
+	// under test.
+	stillFlapping := ready(runningFor(workerPod("w2b", want, 4*time.Hour), "worker", 5, flapWindow-time.Second, exit1, false),
+		testNow.Add(-(flapWindow - time.Second)))
+	if h := deriveRollHealth([]corev1.Pod{*stillFlapping}, want, "", testNow); h.Phase == protocol.PhaseSettled {
+		t.Errorf("Phase = %q for a container up %v — one second INSIDE flapWindow, with the same 5 "+
+			"restarts and the same 4h pod age as the settled case above. If both sides of this boundary "+
+			"read the same, the recency conjunct is not being evaluated at all and case 2 proves nothing.",
+			h.Phase, flapWindow-time.Second)
+	}
+
+	// --- 2c. THE CONSTANT'S VALUE, pinned with LITERAL durations. ---
+	//
+	// Cases 2 and 2b express their uptime as `flapWindow ± time.Second`, so they pin the
+	// COMPARISON — that it is `<`, and where the off-by-one sits — but they cannot pin
+	// the NUMBER: retune flapWindow and both inputs move with it and both stay green.
+	// MEASURED: halving flapWindow from 10m to 5m left the entire kube suite passing.
+	//
+	// That matters here specifically because flapWindow is 10 minutes and stuckAge
+	// (a DIFFERENT quantity — pod age, not container uptime) is also 10 minutes, so a
+	// silent retune of one while reaching for the other is the live hazard.
+	//
+	// These two are literals and bracket the constant from both sides: 9m must be inside
+	// the window and 11m outside. Shrinking flapWindow reddens the first; widening it
+	// reddens the second. A deliberate retune therefore has to come here and say so,
+	// which is the point.
+	inside := ready(runningFor(workerPod("w2c", want, 4*time.Hour), "worker", 5, 9*time.Minute, exit1, false),
+		testNow.Add(-9*time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*inside}, want, "", testNow); h.Phase == protocol.PhaseSettled {
+		t.Errorf("a container up 9m with 5 restarts reads %q; 9 minutes must be INSIDE the flap window. "+
+			"If this fails alone, flapWindow has been shrunk below 9m — check whether that was deliberate "+
+			"and whether stuckAge was the constant actually meant.", h.Phase)
+	}
+	outside := ready(runningFor(workerPod("w2d", want, 4*time.Hour), "worker", 5, 11*time.Minute, exit1, false),
+		testNow.Add(-11*time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*outside}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("a container up 11m with 5 restarts reads %q, want %q; 11 minutes must be OUTSIDE the "+
+			"flap window, or the verdict stops expiring on continuous uptime.", h.Phase, protocol.PhaseSettled)
+	}
+
+	// --- 2e. NEGATIVE uptime (clock skew) is not evidence of a restart loop. ---
+	//
+	// StartedAt is stamped by the kubelet and compared against this controller's clock.
+	// Skew can put it in the FUTURE, and a negative duration is `< flapWindow`, so an
+	// unguarded comparison reads skew as flapping. Bounded in practice — the window
+	// shifts by the skew rather than pinning red, and 3 lifetime restarts are needed
+	// first — but a duration we cannot trust is not evidence, which is the same
+	// direction the nil-Running skip takes.
+	skewed := ready(runningFor(workerPod("w2e", want, 4*time.Hour), "worker", 5, -4*time.Hour, exit1, false),
+		testNow.Add(-time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*skewed}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("a container whose StartedAt is 4h in the FUTURE reads %q, want %q. A negative uptime is "+
+			"clock skew between the kubelet and this controller, and negative < flapWindow is true, so "+
+			"without the `up >= 0` guard a clock disagreement reads as a crash loop.",
+			h.Phase, protocol.PhaseSettled)
+	}
+
+	// --- 3. Ready, 2 restarts, up 5s. Recency without the count. ---
+	//
+	// One OOM or one node hiccup restarts a container recently. A recency-only rule
+	// calls that failure; the threshold of 3 is what makes this a non-event, and it is
+	// deliberately the same threshold the not-Ready path uses so the two paths cannot
+	// disagree about one pod.
+	blip := ready(runningFor(workerPod("w3", want, 20*time.Minute), "worker", stuckRestartThreshold-1, 5*time.Second, exit1, false),
+		testNow.Add(-5*time.Second))
+	if h := deriveRollHealth([]corev1.Pod{*blip}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. %d restarts is below the threshold of %d — a single benign restart "+
+			"must not read as a crash loop.", h.Phase, protocol.PhaseSettled, stuckRestartThreshold-1, stuckRestartThreshold)
+	}
+
+	// --- 4. THE HEALTHY ROLL. Ready, 0 restarts. Must not regress. ---
+	//
+	// This is every worker on every release. If it moves, the fix has turned the whole
+	// fleet's badge red — the cry-wolf failure the roll-health feature exists to prevent.
+	healthy := ready(runningFor(workerPod("w4", want, 3*time.Minute), "worker", 0, 90*time.Second, nil, false),
+		testNow.Add(-90*time.Second))
+	hh := deriveRollHealth([]corev1.Pod{*healthy}, want, "", testNow)
+	if hh.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q for a Ready pod that has never restarted", hh.Phase, protocol.PhaseSettled)
+	}
+	if hh.BlockingContainer != "" || hh.RestartCount != 0 || hh.LastExitCode != nil || hh.BlockingReason != "" {
+		t.Errorf("a healthy settled pod carries diagnostics %q/%q/%d/%v, want all empty — blaming a "+
+			"container on a healthy roll points an operator at innocent code",
+			hh.BlockingContainer, hh.BlockingReason, hh.RestartCount, hh.LastExitCode)
+	}
+	if !hh.PhaseSince.Equal(testNow.Add(-90 * time.Second)) {
+		t.Errorf("PhaseSince = %v, want the Ready transition — settled must still date from readiness",
+			hh.PhaseSince)
+	}
+
+	// --- 5. Ready, 5 restarts, up 30s, NO lastState at all. ---
+	//
+	// MEASURED, and it is why the anchor is state.running.startedAt: a real container
+	// instance carried restartCount 6 with `"lastState": {}` across its whole Ready
+	// window. An implementation anchoring recency on lastState.terminated.finishedAt is
+	// BLIND here and reports settled — the defect, unfixed, on the exact shape that
+	// motivated the design.
+	noLast := ready(runningFor(workerPod("w5", want, 20*time.Minute), "worker", 5, 30*time.Second, nil, false),
+		testNow.Add(-30*time.Second))
+	nh := deriveRollHealth([]corev1.Pod{*noLast}, want, "", testNow)
+	if nh.Phase != protocol.PhaseStuck {
+		t.Errorf("Phase = %q, want %q. This container has no lastState — measured on a real pod, not "+
+			"hypothesised — so a rule needing lastState.terminated.finishedAt cannot see it at all.",
+			nh.Phase, protocol.PhaseStuck)
+	}
+	if nh.BlockingContainer != "worker" || nh.RestartCount != 5 {
+		t.Errorf("BlockingContainer = %q RestartCount = %d, want worker/5 even with no lastState",
+			nh.BlockingContainer, nh.RestartCount)
+	}
+	if nh.LastExitCode != nil {
+		t.Errorf("LastExitCode = %v, want nil — k8s genuinely had no exit code here, and inventing one "+
+			"would be the same class of lie as blanking a measured one", nh.LastExitCode)
+	}
+	if nh.BlockingReason != "Restarting" {
+		t.Errorf("BlockingReason = %q, want %q — with no termination to quote, the fallback token must "+
+			"still be true of the pod, and \"not ready\" is not", nh.BlockingReason, "Restarting")
+	}
+}
+
+// 🔴 A NON-RUNNING CONTAINER WITH A HIGH RESTART COUNT MUST NOT FLAG. This is the
+// counterfactual for flappingContainer's `State.Running == nil` skip, and it is the
+// normal case on every worker pod rather than an edge.
+//
+// `seed-nix` is a PLAIN init container — no RestartPolicy, so not a native sidecar. It
+// runs once, exits, and stays Terminated for the pod's whole remaining life. Since the
+// rule scans all containers, this loop reads that status on every tick of every pod in
+// the fleet.
+//
+// TWO DIFFERENT EDITS BREAK THE GUARD, AND THEY FAIL DIFFERENTLY. An earlier version of
+// this header named the small one and then described the large one's symptom, which is
+// the mistake this whole branch exists to police, so read them apart:
+//
+//   - DELETING the nil check alone: `cs.State.Running.StartedAt` then dereferences a nil
+//     pointer and the package PANICS. Measured — zero assertions run. The guard is still
+//     pinned (the package fails), but loudly and by a crash, NOT by this test's
+//     assertion, and NOT by "an absent Running state reads as a zero time". Go does not
+//     do that.
+//   - RESTRUCTURING to tolerate nil and then defaulting the time — read StartedAt
+//     conditionally, then `if t.IsZero() { t = now }`, which looks like ordinary
+//     hardening — makes an absent instance "up 0 seconds", which SATISFIES the recency
+//     conjunct. That is the SILENT failure: the container flags forever, with no uptime
+//     that could ever clear it because it will never run again. THIS is the edit whose
+//     symptom this test asserts, and it is the one that would otherwise ship green.
+//
+// So the nil check is not load-bearing on its own — the shape of the code around it is.
+// A future reader who "simplifies" in two steps gets the panic on step one and the
+// silent flag on step two.
+//
+// RestartCount is 5 ON PURPOSE. With 0 the container fails the restart conjunct anyway
+// and the case passes identically whether or not the nil check exists — a fixture where
+// broken and correct agree, which proves nothing. 5 is what makes the guard falsifiable.
+//
+// ⚠ THIS PINS HALF OF WHAT THE TIDY WOULD BREAK. There is a sibling case with the same
+// symptom and a DIFFERENT cause: a container that IS Running but carries a ZERO
+// StartedAt also comes out settled today, because now.Sub(zero) is decades and the
+// comparison is `<`. So the nil case is excluded by the skip, and the zero case by the
+// arithmetic. `if t.IsZero() { t = now }` would flip BOTH into "up 0 seconds", and only
+// this fixture would redden. If you are here because that edit broke this test, check
+// the zero-StartedAt path too — nothing covers it.
+//
+// What this test does NOT establish: whether Kubernetes really persists an init
+// container's RestartCount after a retry finally succeeds. That needs a live pod and it
+// is not what is being pinned here — this is a hand-built ContainerStatus whose values
+// are chosen to make the mutation redden. The guard is correct regardless: a container
+// that is not running cannot be flapping.
+func TestNonRunningContainerWithRestartsDoesNotFlag(t *testing.T) {
+	const want = "hash-new"
+
+	// A healthy Ready pod whose init container finished long ago, after retries.
+	pod := ready(workerPod("w1", want, 3*time.Hour), testNow.Add(-3*time.Hour))
+	pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses, corev1.ContainerStatus{
+		Name:         "seed-nix",
+		RestartCount: 5,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 0, Reason: "Completed", FinishedAt: metav1.NewTime(testNow.Add(-3 * time.Hour)),
+		}},
+	})
+	// And the worker itself running happily since then, never restarted.
+	pod = runningFor(pod, "worker", 0, 3*time.Hour, nil, false)
+
+	h := deriveRollHealth([]corev1.Pod{*pod}, want, "", testNow)
+	if h.Phase != protocol.PhaseSettled {
+		t.Errorf("Phase = %q, want %q. seed-nix has 5 restarts and NO Running state — it exited hours "+
+			"ago and will never run again. \"Is it flapping right now\" is unanswerable for a container "+
+			"that is not running, so it must be skipped; scoring its absent StartedAt as \"up 0 seconds\" "+
+			"pins a healthy worker red permanently, with no uptime that could ever clear it.",
+			h.Phase, protocol.PhaseSettled)
+	}
+	if h.BlockingContainer != "" {
+		t.Errorf("BlockingContainer = %q, want empty — a settled pod must blame nobody", h.BlockingContainer)
+	}
+}
+
+// The flicker itself, which a single-tick assertion cannot see — the same discipline
+// TestRollHealthStaysRollingAcrossTicksWhileThePodIsNotReady applies to `rolling`.
+//
+// A crash-looping pod alternates Ready and not-Ready every few tens of seconds, and the
+// badge followed it: settled → stuck → settled → stuck. Asserting one Ready tick reads
+// `stuck` does not prove the flicker is gone; asserting it across the ALTERNATION does.
+// The verdict must hold `stuck` continuously, including on the Ready ticks in between.
+func TestFlappingPodDoesNotFlickerBackToSettledAcrossTicks(t *testing.T) {
+	const want = "hash-new"
+	exit1 := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}
+
+	// One cycle of the measured trajectory: Ready running, dead, backing off, Ready
+	// again on a fresh instance. Restart counts climb exactly as kubelet's do.
+	ticks := []struct {
+		at   time.Duration // before testNow
+		pod  func(at time.Duration) *corev1.Pod
+		what string
+	}{
+		{90 * time.Second, func(at time.Duration) *corev1.Pod {
+			return ready(runningFor(workerPod("w1", want, time.Hour), "worker", 3, 20*time.Second, exit1, false),
+				testNow.Add(-at))
+		}, "Ready, 3 restarts, instance 20s old"},
+		{60 * time.Second, func(time.Duration) *corev1.Pod {
+			p := workerPod("w1", want, time.Hour)
+			p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, corev1.ContainerStatus{
+				Name: "worker", RestartCount: 3,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}},
+			})
+			return p
+		}, "not Ready, terminated Error"},
+		{40 * time.Second, func(time.Duration) *corev1.Pod {
+			return waiting(workerPod("w1", want, time.Hour), "worker", "CrashLoopBackOff", 4, false)
+		}, "not Ready, CrashLoopBackOff"},
+		{10 * time.Second, func(at time.Duration) *corev1.Pod {
+			return ready(runningFor(workerPod("w1", want, time.Hour), "worker", 4, 5*time.Second, exit1, false),
+				testNow.Add(-at))
+		}, "Ready again, 4 restarts, instance 5s old"},
+	}
+
+	for _, tk := range ticks {
+		h := deriveRollHealth([]corev1.Pod{*tk.pod(tk.at)}, want, "", testNow)
+		if h.Phase != protocol.PhaseStuck {
+			t.Errorf("tick %q: Phase = %q, want %q. The badge alternating settled/stuck across this "+
+				"cycle IS the flicker in issue #145 — one tick reading correctly proves nothing about it.",
+				tk.what, h.Phase, protocol.PhaseStuck)
+		}
+	}
+}
+
 // A-1: a pod-list failure must NOT abort the reconcile cycle.
 //
 // MEASURED on dev-cluster: the deployed controller ServiceAccount answers `no` to
