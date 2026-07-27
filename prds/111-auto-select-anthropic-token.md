@@ -32,9 +32,15 @@ the chooser is missing.
 claim time in exactly one place — `claimSecretID` → `workerSecretID` in
 `api/internal/workersvc/service.go`, consumed by `assembleClaim` — and the result
 is used to open the token and then discarded. (**Line numbers deliberately
-removed 2026-07-27.** Every `service.go:NNN` this PRD originally carried was
-correct when written on 2026-07-22 and was ~190 lines stale by 2026-07-27 — the
-file grew on `main` and again under M1. Cite the symbol; it survives.) `run_usage` (PRD #40, migration
+removed 2026-07-27**, and the removal is now genuinely complete — the first pass
+at this claimed to be blanket while leaving four behind, which is a worse
+artifact than the stale numbers were, because a reader who trusts "they were
+removed" stops checking the ones that remain. The four `service.go` cites this
+PRD carried from 2026-07-22 were correct at its creation commit and ~190 lines
+stale five days later; three more added on 2026-07-27 were measured against
+`main` and were 8 lines out the moment M1 landed; and one
+`handler/ratelimits.go:150` was **never** correct at any commit — off by 3 the
+day it was written. Cite the symbol; it survives.) `run_usage` (PRD #40, migration
 `00062`) records what a run spent but not which credential spent it; with one
 token per user that was tautological, and PRD #104 explicitly left it as a known
 gap (its D3/R6). The moment a user holds two tokens — and certainly once uzi
@@ -89,7 +95,7 @@ window is whichever is fuller, and 7-day is the hard cap.
 2. it has a gauge row with **non-NULL** `five_hour_pct` *and* `seven_day_pct` — both are schema-nullable (`00080`), and a reading that measured neither tells us nothing, so treat it as ineligible (D12);
 3. that row is fresh — `synced_at` within `UZI_AUTOSELECT_MAX_STALENESS` (default ~~2×~~ **3×** the poll interval — see **D17**, which settled this so the selector and the shipped meter cannot disagree; a longer lag means steering on numbers Anthropic has since moved past). A token in the poller's 15-min refusal backoff (`usagepoller/engine.go`) goes stale here and drops out — see D11 as amended by **D16**;
 4. `headroom(t) ≥ UZI_AUTOSELECT_MIN_HEADROOM` (default 15) — a single formulation, since `headroom` already binds on the fuller window;
-5. ~~the token is openable now (owner's vault not locked — reuse `secretopen`'s dispatch, same as the poller).~~ **Dropped — see D15.** The vault check is per-**user** and already happens upstream at `service.go:666`, so this gate is vacuous where it was specified; the per-token residual is caught at open time by D14 instead. Do not build a per-token openability probe.
+5. ~~the token is openable now (owner's vault not locked — reuse `secretopen`'s dispatch, same as the poller).~~ **Dropped — see D15.** The vault check is per-**user** and already happens upstream in `Claim` (`s.vlt.Unlocked(wkr.UserID)`), so this gate is vacuous where it was specified; the per-token residual is caught at open time by D14 instead. Do not build a per-token openability probe.
 
 **Fallback, in order (D10).** If the eligible set is empty *only because every
 opted-in token is fresh and openable but below `MIN_HEADROOM`*, pick the
@@ -101,7 +107,7 @@ empty, entirely stale, or entirely unopenable does resolution fall to the
 
 ~~**Auto-selection never blocks or fails a run.**~~ **That sentence was false as
 written and D14 is what makes it true** — measured 2026-07-27, before
-implementation: `recoverClaimAssembly` (`workersvc/service.go:728`) maps
+implementation: `recoverClaimAssembly` (`workersvc/service.go`) maps
 `errCredentialUnavailable` to `MarkRunFailedByID`, a **terminal** run failure. A
 selector that picks a token whose ciphertext will not decrypt therefore kills a
 run that the owner default would have completed. The guarantee holds only with
@@ -118,7 +124,9 @@ top:
 ```
 H*   = max headroom over eligible
 tie  = { t in eligible : H* − headroom(t) ≤ UZI_AUTOSELECT_HEADROOM_TIE_PCT }   # default T = 5 points
-pick = the t in `tie` with the soonest reset, then the lowest secret id
+pick = the t in `tie` with the soonest reset OF ITS BINDING WINDOW (see D22 —
+       five_hour_resets_at when five_hour_pct >= seven_day_pct, else
+       seven_day_resets_at; NULL is +inf), then the lowest secret id
 ```
 
 `resets_at` is nullable (the poller writes NULL when Anthropic reports no reset,
@@ -335,12 +343,12 @@ already-applied head makes every upgraded instance refuse to boot.
   `errCredentialUnavailable`, retry once against what the worker would have used
   without auto (the owner default, per D9), and record `reason=open_failed`.
   Explicitly **not** for `errVaultLocked` — that path already requeues the run
-  (`service.go:730`), which is transient and correct; retrying it would convert a
+  (its `errVaultLocked` arm requeues), which is transient and correct; retrying it would convert a
   wait into a spend on the wrong account.
 - **D15 — Eligibility drops "openable now" as a per-token gate; it is already
   enforced per-user, upstream.** The PRD's gate #5 asks whether the token can be
   opened. Measured: `Claim` returns idle when the owner's vault is locked
-  (`service.go:666`, an in-memory per-**user** check) and `ClaimRun` is scoped to
+  (`s.vlt.Unlocked(wkr.UserID)` in `Claim`, an in-memory per-**user** check) and `ClaimRun` is scoped to
   `wkr.UserID`, so by the time the selector runs, the owner's vault is unlocked
   by construction. There is no per-token openability signal short of attempting
   the decrypt, and attempting it for every candidate would decrypt secrets we are
@@ -381,7 +389,7 @@ already-applied head makes every upgraded instance refuse to boot.
   a token that polled before and is currently backing off; it reads `stale`.
 - **D17 — `MAX_STALENESS` defaults to 3× the poll interval so the selector and
   the meter agree, and the meter is not touched.** The PRD drafted 2×;
-  `rateLimitStale` (`handler/ratelimits.go:150`) already ships 3× and its D3
+  `rateLimitStale` (`handler/ratelimits.go`) already ships 3× and its D3
   documents that. Two definitions means the meter can call a token fresh while
   the selector calls it stale, which is precisely the invisible no-op D11 exists
   to prevent. Defaulting the new knob to 3× makes them agree **without changing
@@ -437,7 +445,7 @@ already-applied head makes every upgraded instance refuse to boot.
 - **R3 — Staleness / herd.** Mitigated by the freshness gate (R2's mechanism)
   plus the in-flight bias. Neither is perfect against a burst; both are honest,
   and the bias is only possible because M1 lands first. ~~The bias also counts
-  **run-lane** runs only — chat always spends the owner default (`chat.go:177`)
+  **run-lane** runs only — chat always spends the owner default (`chat.go`, the nil override)
   and the judge lane its own binding, so a default token that is also a pool
   member carries concurrent spend the bias cannot see. An acknowledged limit,
   not corrected here.~~ **That limit was corrected — see D18.** It was a
