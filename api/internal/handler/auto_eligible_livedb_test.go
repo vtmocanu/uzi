@@ -228,8 +228,21 @@ func TestSelfRateLimitsAutoStatusLiveDB(t *testing.T) {
 		got[tk.SecretID] = tk.AutoStatus
 		pooled[tk.SecretID] = tk.AutoEligible
 	}
+	// Errorf, NOT Fatalf, and the difference is load-bearing rather than stylistic.
+	//
+	// This count is a PROXY: it prints the same "a token with no gauge row must still
+	// be listed" message whichever of the five vanished, so on its own it can
+	// misdirect. Worse, as a Fatalf it aborted before the table below — so the
+	// LEFT-JOIN mutation (`AND rl.synced_at IS NOT NULL`) reddened here and the one
+	// assertion that actually NAMES D16's property, `{"never polled", noGauge,
+	// StatusNoReading}`, never executed. The property was documented, not gated.
+	//
+	// Continuing is safe and is what makes the report specific: the map lookups below
+	// are nil-safe (a missing key yields ""), so the table then says
+	// `never polled: auto_status = "" want "no_reading"` and names the token that
+	// actually disappeared.
 	if len(got) != 5 {
-		t.Fatalf("got %d tokens, want 5 — a token with no gauge row must still be listed: %+v", len(got), got)
+		t.Errorf("got %d tokens, want 5 — a token with no gauge row must still be listed: %+v", len(got), got)
 	}
 	for _, tc := range []struct {
 		name   string
