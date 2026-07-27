@@ -93,6 +93,17 @@ duplicate `order`, or broken relative links — see `docs/README.md`. `ARCHITECT
 exists at root and is the cross-service map; keep it current when a change moves a
 boundary, and link the PRD/ADR rather than duplicating rationale. Design rationale
 lives in `prds/*.md` (Decision Logs; completed → `prds/done/`) and root
-`adr/NNNN-<slug>.md` numbered by PRD number. There is no `CHANGELOG.md`: releases are
-`v*` tags (CI publishes the images + Helm chart) — do not create one unless the user
-asks. New CLI-facing behavior may need a matching `docs/cli.md` + `api/cmd/uzi/` update.
+`adr/NNNN-<slug>.md` numbered by PRD number. **`CHANGELOG.md` EXISTS at the root and is actively maintained** — `[Unreleased]`
+collects everything since the last tag, and `.gitlab-ci.yml` **gates the release tag on
+it describing the release** (`chore/changelog-coverage-gate`, `c2847d82`), so an entry is
+not optional bookkeeping. *(Corrected 2026-07-27: this line read "There is no
+`CHANGELOG.md`: releases are `v*` tags — do not create one unless the user asks", which
+the judge flagged twice and which would have had a release run skip or contradict the
+`[Unreleased]` section. `.claude/agents/release.md` carried the same claim.)*
+
+**Its style is NOT the library's terse one-liner.** Entries here are a **bold lead
+sentence stating the user-visible outcome, followed by a paragraph** giving the mechanism,
+the trade-off, or the caveat a reader would otherwise rediscover — with the issue number
+in parentheses. Match the file, not the generic guidance: read the existing `[Unreleased]`
+entries before writing. Releases are `v*` tags (CI publishes the images + Helm chart) and
+the releaser folds `[Unreleased]` into the cut version. New CLI-facing behavior may need a matching `docs/cli.md` + `api/cmd/uzi/` update.

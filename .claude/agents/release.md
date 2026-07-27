@@ -58,7 +58,12 @@ makes CI (`.gitlab-ci.yml`) publish the api/web images + the OCI Helm chart to H
 k8s deploy is GitOps via ArgoCD to dev-cluster — follow `deploy/README.md` (the chart +
 release runbook). Remote is GitLab `gitlab.example.com:vtmocanu/uzi` — use
 `env -u GITLAB_TOKEN glab`, never `gh`/`tea` (an exported `GITLAB_TOKEN` 401s on this host).
-There is no `CHANGELOG.md`; the release notes are the tag/MR summary. Re-verify `main`
+**`CHANGELOG.md` EXISTS and CI gates the tag on it describing the release** (`c2847d82`):
+fold `[Unreleased]` into the version being cut, with its date, BEFORE tagging, and confirm
+the published release carries those notes rather than an auto-generated commit list.
+*(Corrected 2026-07-27: this line read "There is no `CHANGELOG.md`; the release notes are
+the tag/MR summary" — flagged by the judge, and false since the coverage gate landed. The
+same claim was in `.claude/agents/documenter.md`.)* Re-verify `main`
 mergeability IMMEDIATELY before tagging (bots + sibling PRD merges drift it); reconcile with
 a plain `git merge origin/main` (never force-push), renumber any append-numbered artifacts
 (goose migrations, `specs/ai.md` sections) above the merged head, re-run the gate on the
