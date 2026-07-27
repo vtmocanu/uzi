@@ -946,8 +946,22 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 //     safe-to-log metadata — a second claimCred-shaped thing to never log whole.
 //
 // M4's auto lane does not change this arithmetic, which was the reason the decision
-// waited: it arrives here with a label already in hand from the ranking query, so it
-// is the same shape as M3's pinned lane, not a third case.
+// waited: it is the same shape as M3's pinned lane, not a third case.
+//
+// 🔴 A CORRECTION TO HOW THAT WAS FIRST WRITTEN, because the clause argued against
+// its own conclusion. It read "it arrives here with a label already in hand from the
+// ranking query" — offered as the reason the second read is harmless, when that is
+// exactly what would make it redundant. The ranking query does select the label, and
+// autoselect.Outcome carried it as far as M5, where it was found to have no reader
+// and was DELETED rather than wired up.
+//
+// The positive reason the second read is right, which the original clause never gave:
+// this one is SAME-CALL. The label and the ciphertext come out of consecutive reads
+// of one row inside this function, so a rename between the ranking query and the open
+// cannot make the run name an account it did not bill. The ranking query's copy is
+// older and belongs to a different call. Spending same-call provenance to save a
+// primary-key lookup would invert D8 on precisely the lane where the SELECTOR, not
+// the user, chose the credential.
 func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (claimCred, error) {
 	var meta struct {
 		ID    uuid.UUID
@@ -1223,9 +1237,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
 		//     requeues the run, which is transient and correct, and retrying it would
 		//     convert a wait into a spend on the wrong account;
-		//   - exactly ONCE. The retry target is workerSecretID(wkr) — nil for an auto
-		//     worker — which can never satisfy autoPicked, so the structure of the code
-		//     forbids a second round rather than a counter doing it.
+		//   - exactly ONCE, and the code is safer than the first version of this comment.
+		//     That version argued from the ID: the retry target is workerSecretID(wkr),
+		//     nil for an auto worker, so it cannot satisfy autoPicked. True, but it rests
+		//     on the `auto ⇒ id IS NULL` invariant, which a future third writer of
+		//     workers.anthropic_secret_id could break without touching this line. The
+		//     STRONGER reason, and the one that holds regardless: the retry sets
+		//     reason=open_failed, so autoPicked fails on its REASON conjunct whatever the
+		//     id turns out to be. The structure forbids a second round; no counter, and
+		//     no dependency on an invariant enforced three files away.
 		if !choice.autoPicked() || !errors.Is(err, errCredentialUnavailable) {
 			return nil, err
 		}

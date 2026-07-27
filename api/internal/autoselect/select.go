@@ -102,11 +102,30 @@ func (r Reason) FellBackFromAuto() bool {
 // as "N% headroom", because that is the number the user's own meters show. Ranked
 // is the same value after the in-flight penalty — what actually decided the pick,
 // and diagnostics only. Rendering Ranked would show a percentage that appears
-// nowhere else in the product.
+// nowhere else in the product, and moves when somebody else's run starts. It has no
+// production reader and is kept because TestSelectGateReadsRawHeadroomNotRank asserts
+// on it: the gate/rank asymmetry is invisible without a way to see both numbers.
+//
+// 🔴 THERE IS DELIBERATELY NO Label, AND THE REASON IS NOT "NOTHING READ IT" (M5).
+// One was carried here through M4 — the ranking query selects s.label and the
+// Candidate carries it — and nothing outside tests ever read it, because the label
+// recorded on the run comes from openAnthropic's own owner-scoped metadata read.
+//
+// Using this one instead would have saved that read on the auto lane, which is how
+// the redundancy was first framed. It is the wrong trade, and by D8's own argument:
+// the ranking query's copy is read EARLIER and, more to the point, is not read by the
+// call that decrypts the credential. openAnthropic's copy is same-call — the label
+// and the ciphertext come out of consecutive reads of one row, so a rename between
+// ranking and open cannot make the run name an account it did not bill. Spending that
+// property to save a primary-key lookup would invert D8 on precisely the lane where
+// the SELECTOR, not the user, chose the credential — the lane where "which account
+// paid?" is least reconstructible from anything else.
+//
+// So the field is gone rather than wired up. A struct member that exists to be
+// plausible is worse than one that is absent.
 type Outcome struct {
 	Picked   bool
 	SecretID uuid.UUID
-	Label    string
 	Headroom int
 	Ranked   int
 	Reason   Reason
@@ -232,7 +251,6 @@ func Select(cands []Candidate, p Policy, now time.Time) Outcome {
 	return Outcome{
 		Picked:   true,
 		SecretID: pick.c.SecretID,
-		Label:    pick.c.Label,
 		Headroom: pick.e.Headroom,
 		Ranked:   pick.rank,
 		Reason:   reason,
