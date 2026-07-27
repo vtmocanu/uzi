@@ -8,6 +8,29 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Manual drag-to-reorder for board cards, a sort switcher, and a keyboard
+  equivalent.** Drag a card within its column to set the board's order by
+  hand, or use the new per-card up/down buttons for the same reorder without
+  a pointer: native HTML5 drag-and-drop has no keyboard path in any browser.
+  A five-mode switcher (Manual, Issue number, Recent run activity, Last
+  updated, Title) lets you view the board differently without discarding
+  the manual order underneath it; Manual is the default and reproduces
+  plain issue-number order on a board nobody has touched. A reorder is
+  durable per owner and follows you across devices (PRD #102 M5).
+
+- **Cards show their other GitLab labels as chips**, so `bug` or `security`
+  is visible without opening the issue. The PRD label, the PRDLESS escape
+  hatch, the autopilot label, and the card's own column label are excluded,
+  since none of those tell you anything the card doesn't already show some
+  other way. A card with many labels shows the first few plus a `+N` count
+  with the rest on hover (PRD #102 M4).
+
+- **A per-browser "Show other issues" toggle reveals a repo's open issues
+  that don't carry the PRD label**, off by default so a board nobody
+  touches looks exactly as it did before. Those cards render with a dashed
+  border and offer **Promote to PRD** in place of Start run, since they
+  can't start a run until they carry the label (PRD #102 M6).
+
 - **Workers can be set to pick their Anthropic token automatically.** Settings → Workers gains
   an **auto (from pool)** option beside the existing per-token choices, and `uzi worker
   set-token <id> --auto` does the same from the CLI. An auto worker chooses per claim from the
@@ -80,6 +103,23 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   (PRD #111 M1 + M5).
 
 ### Changed
+
+- **The board's implicit first column is now named Backlog, not Open.**
+  Display only: it's still the lane for issues carrying none of the
+  configured column labels (PRD #102 M1).
+
+- **Newly connected repos now seed Planned, In Progress, Human Review,
+  Later, with Planned first, replacing Upcoming.** Existing boards keep
+  their Upcoming column as-is; see
+  [docs/configuration.md](docs/configuration.md) for the manual rename
+  procedure (PRD #102 M2).
+
+- **Only PRD-labelled issues can start a run.** Start-run previously
+  accepted any issue with a PRD link or the PRDLESS escape hatch, so a
+  stranger's open issue that merely mentioned a `prds/*.md` path could
+  satisfy both and become runnable, by hand or from autopilot. The label
+  gate now runs first and applies uniformly to the manual handler, the
+  poller, and the CLI (PRD #102 M6).
 
 - **Anthropic token labels can no longer contain invisible formatting characters.** Zero-width
   spaces and joiners, bidirectional overrides, the byte-order mark and the soft hyphen are now
