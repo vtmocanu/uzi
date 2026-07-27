@@ -178,6 +178,42 @@ type Config struct {
 	// value below 1m is clamped up to 1m with a boot warning — the header-probe
 	// fallback spends the user's own tokens, so a tight interval is a footgun (D2).
 	UsagePollInterval time.Duration
+	// Auto-selection policy (PRD #111 D6): the knobs that decide which of a user's
+	// opted-in Anthropic credentials an `auto` worker's claim spends. Server env
+	// rather than per-user settings deliberately — one operator-set policy keeps the
+	// selector testable and the settings UI simple; per-user tuning is a future
+	// refinement, not a gap this leaves.
+	//
+	// All three integer knobs are PERCENTAGE POINTS, because the gauge they read is a
+	// SMALLINT 0..100. There are no fractions anywhere in this policy.
+	//
+	// AutoselectMinHeadroom is the floor below which a token is not picked by
+	// preference. Default 15. 0 is legitimate ("never mind the floor"); a value above
+	// 100 is not satisfiable by any reading, so it is clamped with a warning rather
+	// than left to silently disable auto-selection entirely.
+	AutoselectMinHeadroom int
+	// AutoselectHeadroomTiePct is M4's clustering tolerance T: tokens within this
+	// many points of the emptiest are treated as tied and broken by soonest reset.
+	// Default 5. 0 means "only an exact tie counts", which is a coherent policy.
+	AutoselectHeadroomTiePct int
+	// AutoselectMaxStaleness bounds how old a gauge reading may be and still steer a
+	// choice — steering on numbers Anthropic has since moved past is worse than not
+	// steering. Default 3× UsagePollInterval, which is NOT the 2× the PRD drafted:
+	// handler.rateLimitStale already ships 3× and renders the meter a user looks at,
+	// and two answers to "is this reading stale" in one product is a bug report
+	// waiting to happen (D17). They agree by matching DEFAULTS, not by sharing one
+	// definition, so an operator who overrides this re-opens the divergence.
+	//
+	// 0 means nothing is ever fresh. That is not a degenerate case to guard against:
+	// with the poller disabled (UZI_USAGE_POLL_INTERVAL=0, which the e2e overlay
+	// sets) the default computes to 0, every token classifies stale, and auto
+	// degrades to the worker's non-auto binding — the correct behaviour (R2).
+	AutoselectMaxStaleness time.Duration
+	// AutoselectInflightPenalty is M4's herd control: points subtracted from a
+	// token's ranking headroom per run currently spending it, so several claims
+	// inside one poll interval do not all pile onto the same emptiest credential.
+	// Default 3. 0 disables the bias, leaving pure headroom ranking.
+	AutoselectInflightPenalty int
 	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
 	// Default true; false makes users the free usage endpoint refuses show
 	// `unavailable` rather than spend a token. A security/spend control, so a
@@ -548,6 +584,31 @@ func Load() (Config, error) {
 			"clamped_to", time.Minute.String())
 		cfg.UsagePollInterval = time.Minute
 	}
+	// Auto-selection policy (PRD #111 D6). parseNonNegInt, not parseInt: 0 is
+	// meaningful for all three — no floor, exact-tie-only, no in-flight bias — and
+	// parseInt would silently substitute the default for it.
+	cfg.AutoselectMinHeadroom = parseNonNegInt("UZI_AUTOSELECT_MIN_HEADROOM", 15)
+	if cfg.AutoselectMinHeadroom > 100 {
+		// Not merely odd: headroom is min(100-five, 100-seven), so it can never
+		// exceed 100 and a floor above it classifies EVERY token below_threshold.
+		// Auto would then permanently fall back, looking exactly like a broken
+		// selector rather than a mis-set knob. Clamp loudly.
+		slog.Warn("UZI_AUTOSELECT_MIN_HEADROOM is above 100; clamping (headroom is a 0..100 percentage, so a higher floor is unsatisfiable and would make every token ineligible)",
+			"configured", cfg.AutoselectMinHeadroom, "clamped_to", 100)
+		cfg.AutoselectMinHeadroom = 100
+	}
+	// Deliberately NOT clamped: a tie window wider than 100 points is degenerate but
+	// coherent — every measurable token clusters and the pick falls through to
+	// soonest-reset then lowest id, which is still a total order and still
+	// deterministic. Nothing breaks, so there is nothing to warn about.
+	cfg.AutoselectHeadroomTiePct = parseNonNegInt("UZI_AUTOSELECT_HEADROOM_TIE_PCT", 5)
+	cfg.AutoselectInflightPenalty = parseNonNegInt("UZI_AUTOSELECT_INFLIGHT_PENALTY", 3)
+	// The default TRACKS the poll interval rather than being a constant, so the two
+	// stay related when an operator retunes polling. With polling disabled this is
+	// 0 — nothing is ever fresh — which is the correct answer for a gauge nothing
+	// updates, and matches what rateLimitStale already reports for the same case.
+	cfg.AutoselectMaxStaleness = parseNonNegDuration("UZI_AUTOSELECT_MAX_STALENESS", 3*cfg.UsagePollInterval)
+
 	usageProbe, err := parseBool("UZI_USAGE_PROBE", true)
 	if err != nil {
 		return Config{}, err

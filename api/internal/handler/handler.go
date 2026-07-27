@@ -350,6 +350,16 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListMySecrets)
+				// The auto-selection pool toggle (PRD #111 M2, D13). RequireUser, and
+				// it is the ONE write in this route tree that is — deliberately, and
+				// on the SAME reasoning as PATCH /workers/{id} below: it mints
+				// nothing, reveals nothing, and only re-points SPEND among tokens the
+				// caller already holds. It is a separate, narrow path precisely so
+				// that reasoning applies to it alone; folding the flag into the PATCH
+				// in the group below would have required moving that route here,
+				// making rename, rotate and set-default Bearer-reachable as
+				// collateral damage.
+				r.Patch("/anthropic_token/{id}/auto-eligible", h.PatchAnthropicTokenAutoEligible)
 			})
 			// Every WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
 			// rotating and deleting credentials is the CLI's exclusion zone — a

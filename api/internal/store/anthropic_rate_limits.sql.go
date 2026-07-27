@@ -86,12 +86,13 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 
 const listRateLimits = `-- name: ListRateLimits :many
 SELECT
-    u.id           AS user_id,
-    u.email        AS email,
-    u.display_name AS display_name,
-    s.id           AS user_secret_id,
-    s.label        AS label,
-    s.is_default   AS is_default,
+    u.id            AS user_id,
+    u.email         AS email,
+    u.display_name  AS display_name,
+    s.id            AS user_secret_id,
+    s.label         AS label,
+    s.is_default    AS is_default,
+    s.auto_eligible AS auto_eligible,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -111,6 +112,7 @@ type ListRateLimitsRow struct {
 	UserSecretID     pgtype.UUID        `json:"user_secret_id"`
 	Label            pgtype.Text        `json:"label"`
 	IsDefault        pgtype.Bool        `json:"is_default"`
+	AutoEligible     pgtype.Bool        `json:"auto_eligible"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -132,6 +134,13 @@ type ListRateLimitsRow struct {
 //
 // vault_locked is computed in-memory from the live vault, not stored, so it is not
 // selected here.
+//
+// auto_eligible (PRD #111 M2) is selected here for the same reason the per-user
+// query selects it, and it is NOT optional: both queries feed the one
+// TokenRateLimitDTO, so omitting it here would make the admin view report every
+// token as un-pooled — a confident, uniform, wrong answer, which is worse than the
+// field being absent. It is nullable through the LEFT JOIN (a token-less user's row
+// has no secret at all), and that row is skipped before the flag is read.
 func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimits)
 	if err != nil {
@@ -148,6 +157,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.UserSecretID,
 			&i.Label,
 			&i.IsDefault,
+			&i.AutoEligible,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -169,6 +179,7 @@ const listRateLimitsForUser = `-- name: ListRateLimitsForUser :many
 SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
+       s.auto_eligible AS auto_eligible,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -185,6 +196,7 @@ type ListRateLimitsForUserRow struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	Label            string             `json:"label"`
 	IsDefault        bool               `json:"is_default"`
+	AutoEligible     bool               `json:"auto_eligible"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -204,6 +216,14 @@ type ListRateLimitsForUserRow struct {
 //
 // Ordered default-first then by label, so the meter a user's unbound workers spend
 // against leads the list.
+//
+// auto_eligible (PRD #111 M2) joins the projection because this query, and only
+// this query, carries BOTH halves of a token's auto-selection story: the owner's
+// opt-in and the gauge reading that decides whether the selector could actually
+// pick it. The handler feeds the pair to autoselect.Classify and ships the answer
+// as a string, so the web never re-derives eligibility from pcts and timestamps
+// (D21). The LEFT JOIN above is what makes "never polled" expressible at all — an
+// INNER JOIN would drop exactly the token whose silent ineligibility R7 is about.
 func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) ([]ListRateLimitsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimitsForUser, userID)
 	if err != nil {
@@ -217,6 +237,7 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 			&i.UserSecretID,
 			&i.Label,
 			&i.IsDefault,
+			&i.AutoEligible,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,

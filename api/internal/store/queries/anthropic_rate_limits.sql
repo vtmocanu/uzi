@@ -61,9 +61,18 @@ ON CONFLICT (user_secret_id) DO UPDATE SET
 --
 -- Ordered default-first then by label, so the meter a user's unbound workers spend
 -- against leads the list.
+--
+-- auto_eligible (PRD #111 M2) joins the projection because this query, and only
+-- this query, carries BOTH halves of a token's auto-selection story: the owner's
+-- opt-in and the gauge reading that decides whether the selector could actually
+-- pick it. The handler feeds the pair to autoselect.Classify and ships the answer
+-- as a string, so the web never re-derives eligibility from pcts and timestamps
+-- (D21). The LEFT JOIN above is what makes "never polled" expressible at all — an
+-- INNER JOIN would drop exactly the token whose silent ineligibility R7 is about.
 SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
+       s.auto_eligible AS auto_eligible,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -89,13 +98,21 @@ ORDER BY s.is_default DESC, lower(s.label) ASC;
 --
 -- vault_locked is computed in-memory from the live vault, not stored, so it is not
 -- selected here.
+--
+-- auto_eligible (PRD #111 M2) is selected here for the same reason the per-user
+-- query selects it, and it is NOT optional: both queries feed the one
+-- TokenRateLimitDTO, so omitting it here would make the admin view report every
+-- token as un-pooled — a confident, uniform, wrong answer, which is worse than the
+-- field being absent. It is nullable through the LEFT JOIN (a token-less user's row
+-- has no secret at all), and that row is skipped before the flag is read.
 SELECT
-    u.id           AS user_id,
-    u.email        AS email,
-    u.display_name AS display_name,
-    s.id           AS user_secret_id,
-    s.label        AS label,
-    s.is_default   AS is_default,
+    u.id            AS user_id,
+    u.email         AS email,
+    u.display_name  AS display_name,
+    s.id            AS user_secret_id,
+    s.label         AS label,
+    s.is_default    AS is_default,
+    s.auto_eligible AS auto_eligible,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,

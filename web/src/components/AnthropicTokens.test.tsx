@@ -19,6 +19,10 @@ vi.mock("../lib/api", async (importActual) => {
       // The card fetches workers itself so a delete can NAME the affected ones
       // (D5). Defaulted per-test in beforeEach.
       listWorkers: vi.fn(),
+      // PRD #111 M2: the pool toggle, and the per-token live eligibility the card
+      // fetches so the chip sits beside the toggle rather than a card away.
+      setTokenAutoEligible: vi.fn(),
+      getMyRateLimits: vi.fn(),
     },
   };
 });
@@ -31,6 +35,8 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    // PRD #111 M2: the auto-selection pool opt-in, false unless a test says otherwise.
+    auto_eligible: false,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T00:00:00Z",
     ...over,
@@ -72,6 +78,8 @@ function renderList(secrets: SecretMeta[], reload = noop, judgeSecretId: string 
 beforeEach(() => {
   vi.spyOn(window, "confirm").mockReturnValue(true);
   mockApi.listWorkers.mockResolvedValue({ workers: [] });
+  mockApi.getMyRateLimits.mockResolvedValue({ tokens: [] });
+  mockApi.setTokenAutoEligible.mockResolvedValue({ secret: secret() });
 });
 
 afterEach(() => {
@@ -327,5 +335,76 @@ describe("AnthropicTokens", () => {
   it("keeps no second copy of an error for screen readers", () => {
     const { container } = renderList([secret()]);
     expect(container.querySelectorAll(".sr-only").length).toBe(0);
+  });
+
+  // ── PRD #111 M2: the auto-selection pool toggle ───────────────────────────
+
+  it("reflects the pool opt-in and toggles it both ways", async () => {
+    renderList([secret({ auto_eligible: false })]);
+    const box = screen.getByLabelText("Auto-select from this token") as HTMLInputElement;
+    expect(box.checked).toBe(false);
+
+    fireEvent.click(box);
+    await waitFor(() => expect(mockApi.setTokenAutoEligible).toHaveBeenCalledWith("sec-1", true));
+
+    cleanup();
+    renderList([secret({ auto_eligible: true })]);
+    const on = screen.getByLabelText("Auto-select from this token") as HTMLInputElement;
+    expect(on.checked).toBe(true);
+    fireEvent.click(on);
+    await waitFor(() => expect(mockApi.setTokenAutoEligible).toHaveBeenCalledWith("sec-1", false));
+  });
+
+  // The consequence has to be visible at the moment of the choice. Opting in a
+  // token whose gauge has never polled is a silent no-op — it looks active and can
+  // never be picked — so the chip lives beside the toggle rather than a card away.
+  it("shows the SERVER's eligibility beside the toggle for a pooled token", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        {
+          secret_id: "sec-1",
+          label: "default",
+          is_default: true,
+          auto_eligible: true,
+          auto_status: "no_reading",
+          limits: { status: "unavailable" },
+        },
+      ],
+    });
+    renderList([secret({ auto_eligible: true })]);
+    // "never polled" is autoStatusChip's rendering of no_reading — rendered, not
+    // re-derived: nothing in this component looks at `limits`.
+    expect(await screen.findByText("never polled")).toBeTruthy();
+  });
+
+  // An UN-pooled token gets no chip: the unchecked box beside it already says so,
+  // and a "not in pool" badge on every row a user has not opted into is noise.
+  it("shows no eligibility chip for an un-pooled token", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        {
+          secret_id: "sec-1",
+          label: "default",
+          is_default: true,
+          auto_eligible: false,
+          auto_status: "not_pooled",
+          limits: { status: "unavailable" },
+        },
+      ],
+    });
+    renderList([secret({ auto_eligible: false })]);
+    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
+    expect(screen.queryByText("not in pool")).toBeNull();
+  });
+
+  // A failed meters fetch must not break the toggle or blank the card: the chip is
+  // secondary information, and an error banner over it would be worse than its
+  // absence. Same stance as the workers fetch above it.
+  it("still renders the toggle when the eligibility fetch fails", async () => {
+    mockApi.getMyRateLimits.mockRejectedValue(new Error("network"));
+    renderList([secret({ auto_eligible: true })]);
+    expect(screen.getByLabelText("Auto-select from this token")).toBeTruthy();
+    await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
+    expect(screen.queryByText("never polled")).toBeNull();
   });
 });

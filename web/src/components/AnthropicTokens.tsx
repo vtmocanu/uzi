@@ -7,8 +7,9 @@
 // and not an edit-in-place field.
 
 import { useEffect, useState, type FormEvent } from "react";
-import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
+import { api, ApiError, type AutoStatus, type SecretMeta, type Worker } from "../lib/api";
 import { isVaultLocked } from "../lib/api";
+import { autoStatusChip } from "../lib/rateLimits";
 import { Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "./ui";
 
 const DOC_URL =
@@ -81,6 +82,7 @@ function TokenRow({
   soleToken,
   boundWorkers,
   judgeBound,
+  autoStatus,
   onChanged,
   onError,
   onNotice,
@@ -90,6 +92,10 @@ function TokenRow({
   soleToken: boolean;
   boundWorkers: string[];
   judgeBound: boolean;
+  // The SERVER's live eligibility answer for this token (PRD #111 M2), or
+  // undefined while the meters have not loaded (or failed to). Never re-derived
+  // here — see lib/rateLimits.ts for why that is a design rule and not a habit.
+  autoStatus: AutoStatus | undefined;
   onChanged: () => Promise<void>;
   onError: (m: string) => void;
   onNotice: (m: string) => void;
@@ -227,6 +233,42 @@ function TokenRow({
           </div>
         )}
       </div>
+      {/* Auto-selection pool (PRD #111 M2, D2). The toggle and the live status sit
+          together on purpose: opting a token in whose gauge has never polled is a
+          silent no-op — it looks active and can never be picked (R7) — so the
+          consequence has to be visible at the moment of the choice, not one card
+          down. The chip renders the SERVER's answer verbatim. */}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <label className="flex items-center gap-2 text-xs text-muted">
+          <input
+            type="checkbox"
+            className="h-3.5 w-3.5 accent-brand"
+            checked={secret.auto_eligible}
+            disabled={disabled}
+            onChange={(e) => {
+              const next = e.target.checked;
+              void run(
+                () => api.setTokenAutoEligible(secret.id, next),
+                next
+                  ? `“${secret.label}” is now in the auto-selection pool.`
+                  : `“${secret.label}” is no longer in the auto-selection pool.`,
+                next
+                  ? "Failed to add the token to the pool"
+                  : "Failed to remove the token from the pool",
+              );
+            }}
+          />
+          Auto-select from this token
+        </label>
+        {/* Shown only for a POOLED token. An un-pooled one is already described by
+            the unchecked box beside it, and a redundant "not in pool" chip would
+            just be noise on every row a user has not opted in. */}
+        {secret.auto_eligible && autoStatus && (
+          <Badge tone={autoStatusChip(autoStatus).tone} title={autoStatusChip(autoStatus).hint}>
+            {autoStatusChip(autoStatus).label}
+          </Badge>
+        )}
+      </div>
       <div className="mt-1 text-xs text-faint">
         updated {new Date(secret.updated_at).toLocaleString()}
       </div>
@@ -277,6 +319,29 @@ export function AnthropicTokens({
       })
       .catch(() => {
         if (!cancelled) setWorkers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [secrets]);
+
+  // Per-token live auto-selection eligibility (PRD #111 M2), fetched here for the
+  // same reason the workers are: the consequence of the toggle belongs beside the
+  // toggle, and no caller has this data. Re-fetched whenever `secrets` changes, so
+  // opting a token in updates its chip without a page reload. Failure is silent by
+  // design, exactly as above — the toggle still works and still says what it did;
+  // an error banner over a secondary fetch would be worse than a missing chip.
+  const [autoStatuses, setAutoStatuses] = useState<Record<string, AutoStatus>>({});
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getMyRateLimits()
+      .then(({ tokens }) => {
+        if (cancelled) return;
+        setAutoStatuses(Object.fromEntries(tokens.map((t) => [t.secret_id, t.auto_status])));
+      })
+      .catch(() => {
+        if (!cancelled) setAutoStatuses({});
       });
     return () => {
       cancelled = true;
@@ -372,6 +437,7 @@ export function AnthropicTokens({
                 .filter((w) => w.anthropic_secret_id === s.id)
                 .map((w) => w.name)}
               judgeBound={judgeSecretId === s.id}
+              autoStatus={autoStatuses[s.id]}
               onChanged={reload}
               onError={onError}
               onNotice={onNotice}

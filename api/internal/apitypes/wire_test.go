@@ -284,7 +284,11 @@ func TestSecretDTOTags(t *testing.T) {
 	// field — the pin is here so a future field addition that leaks the secret trips
 	// this test.
 	assertTags(t, "SecretDTO", SecretDTO{},
-		"id", "kind", "label", "is_default", "created_at", "updated_at")
+		"id", "kind", "label", "is_default",
+		// PRD #111 M2: the auto-selection pool opt-in. A flag the owner set, not a
+		// value — it names no credential and reveals nothing about one.
+		"auto_eligible",
+		"created_at", "updated_at")
 }
 
 func TestRepoDTOTags(t *testing.T) {
@@ -376,7 +380,12 @@ func TestRateLimitDTOTags(t *testing.T) {
 
 func TestTokenRateLimitDTOTags(t *testing.T) {
 	assertTags(t, "TokenRateLimitDTO", TokenRateLimitDTO{},
-		"secret_id", "label", "is_default", "limits")
+		"secret_id", "label", "is_default",
+		// PRD #111 M2: the pool opt-in and the SERVER-COMPUTED live eligibility.
+		// auto_status is on the wire as a string precisely so no client re-derives
+		// it from the windows below (D21).
+		"auto_eligible", "auto_status",
+		"limits")
 }
 
 func TestAdminRateLimitRowDTOTags(t *testing.T) {

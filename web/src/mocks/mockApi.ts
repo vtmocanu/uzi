@@ -1149,6 +1149,9 @@ export const mockApi = {
       kind: "anthropic_token",
       label: "default",
       is_default: true,
+      // A new token is never pooled (PRD #111 D2) — mirror the server default or
+      // the mock teaches the wrong lesson.
+      auto_eligible: false,
       created_at: now,
       updated_at: now,
     };
@@ -1177,6 +1180,7 @@ export const mockApi = {
       kind: "anthropic_token",
       label: trimmed,
       is_default: wantDefault,
+      auto_eligible: false,
       created_at: now,
       updated_at: now,
     };
@@ -1210,6 +1214,26 @@ export const mockApi = {
       row.is_default = true;
     }
     row.updated_at = new Date().toISOString();
+    return delay({ secret: { ...row } });
+  },
+  // The auto-selection pool toggle (PRD #111 M2). It also re-derives the token's
+  // live eligibility, because in the mock that is the only way the chip beside the
+  // toggle can move — and a toggle whose visible consequence never changes is the
+  // silent no-op the real feature exists to make visible.
+  setTokenAutoEligible: async (id: string, autoEligible: boolean) => {
+    const row = secrets.find((s) => s.id === id);
+    if (!row) throw new ApiError(404, "token not found");
+    row.auto_eligible = autoEligible;
+    row.updated_at = new Date().toISOString();
+    const meter = mockMyTokenRateLimits.find((t) => t.secret_id === id);
+    if (meter) {
+      meter.auto_eligible = autoEligible;
+      // The mock's fixtures all carry a fresh, roomy reading, so opting in reaches
+      // `eligible`. It does NOT re-implement the gate: the real status is computed
+      // server-side by autoselect.Classify and this is a two-value stand-in, which
+      // is why it lives here and not in lib/rateLimits.ts.
+      meter.auto_status = autoEligible ? "eligible" : "not_pooled";
+    }
     return delay({ secret: { ...row } });
   },
   deleteAnthropicTokenById: async (id: string) => {

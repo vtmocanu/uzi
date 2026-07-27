@@ -29,10 +29,27 @@ type RateLimitDTO struct {
 // replacing the single reading — a breaking response-shape change the web client,
 // the CLI, and the e2e assertions all move for in the same MR.
 type TokenRateLimitDTO struct {
-	SecretID  string       `json:"secret_id"`
-	Label     string       `json:"label"`
-	IsDefault bool         `json:"is_default"`
-	Limits    RateLimitDTO `json:"limits"`
+	SecretID  string `json:"secret_id"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"is_default"`
+	// Auto-selection (PRD #111 M2). AutoEligible is the owner's opt-in — the setting
+	// they toggled. AutoStatus is the LIVE answer: whether the selector could pick
+	// this token right now, and if not, why (`eligible` | `not_pooled` |
+	// `no_reading` | `unmeasured` | `stale` | `below_threshold`).
+	//
+	// 🔴 AutoStatus IS COMPUTED SERVER-SIDE AND MUST BE RENDERED, NEVER RE-DERIVED
+	// (D21). It comes from autoselect.Classify, the same single function the ranker
+	// gates candidates on, precisely so the settings page cannot promise a token is
+	// eligible that the selector silently skips. A client that reconstructs it from
+	// pct/synced_at reintroduces exactly the drift this field exists to remove, and
+	// nothing would fail when the two disagreed.
+	//
+	// The pair is not redundant: a token can be opted IN and still unpickable (its
+	// gauge never polled, or the reading aged out), which is R7's silent no-op and
+	// the reason the status is surfaced at all rather than left implicit.
+	AutoEligible bool         `json:"auto_eligible"`
+	AutoStatus   string       `json:"auto_status"`
+	Limits       RateLimitDTO `json:"limits"`
 }
 
 // AdminRateLimitRowDTO is one user's row on the admin view: identity + the live

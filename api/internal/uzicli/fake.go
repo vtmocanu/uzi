@@ -54,6 +54,14 @@ type FakeClient struct {
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
+	// SetTokenAutoEligible capture (PRD #111 M2): the secret id the command
+	// RESOLVED the label to, and the boolean it sent. The id is what proves the
+	// label→id resolution happened client-side against the caller's own list rather
+	// than the label being posted to the server.
+	LastPoolSecretID string
+	LastPoolValue    bool
+	PoolSecret       apitypes.SecretDTO
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets []apitypes.SecretDTO
 
@@ -190,6 +198,15 @@ func (f *FakeClient) ListSecrets(context.Context) ([]apitypes.SecretDTO, error) 
 		return nil, f.Err
 	}
 	return f.Secrets, nil
+}
+
+func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	f.LastPoolSecretID = id
+	f.LastPoolValue = eligible
+	if f.Err != nil {
+		return apitypes.SecretDTO{}, f.Err
+	}
+	return f.PoolSecret, nil
 }
 
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {

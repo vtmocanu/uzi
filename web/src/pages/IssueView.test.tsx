@@ -223,6 +223,7 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     id: "sec-1",
     label: "default",
     is_default: true,
+    auto_eligible: false,
     kind: "anthropic_token",
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",

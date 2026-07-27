@@ -12,6 +12,21 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **An opt-in pool for auto-selecting Anthropic tokens.** Settings → Anthropic tokens gains a
+  per-token "Auto-select from this token" toggle, and `uzi token pool <label> --on|--off` does
+  the same from the CLI. The pool is empty by default and opting a token in is deliberate: a
+  pool that helped itself to every credential would spend the one you reserved for something
+  else. Beside the toggle, each pooled token shows whether auto-selection could actually pick
+  it right now — `in pool`, or `never polled` / `stale reading` / `no usage data` / `low
+  headroom` when it could not. That is the point of the chip rather than decoration: a token
+  uzi has never managed to read a usage figure for can never be picked, and without the chip it
+  would sit there looking active. The status is computed server-side from the same rule the
+  selector uses, so the page cannot promise something the selector will not do. The selector
+  itself lands next (PRD #111 M2). New operator knobs `UZI_AUTOSELECT_MIN_HEADROOM`,
+  `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_MAX_STALENESS` and
+  `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
+  [docs/configuration.md](docs/configuration.md).
+
 - **Every run now names the Anthropic credential it spent.** The run view carries a `token
   <label>` chip and `uzi run get` an `ANTHROPIC_TOKEN` row, on all three lanes (issue/ci_fix,
   judge and chat). Until now a run recorded what it cost but not which account paid, which was

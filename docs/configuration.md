@@ -266,3 +266,22 @@ See [rate-limits.md](rate-limits.md) for what the meters show. The background po
 | `UZI_USAGE_POLL_INTERVAL` | `5m` | How often the poller ticks. `0` disables the engine entirely (existing rows are still served, always marked stale). A nonzero value below `1m` is clamped up to `1m` with a boot warning — the header-probe fallback spends a user's own Anthropic tokens, so a too-tight interval is a footgun, not a convenience. |
 | `UZI_USAGE_PROBE` | `true` | `false` disables the ~1-token header-probe fallback entirely; affected users (whose credential the free usage endpoint refuses) then show `unavailable` instead of a reading. See [rate-limits.md](rate-limits.md#the-probe-and-turning-it-off) for the token-cost accounting. |
 | `UZI_ANTHROPIC_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound request to Anthropic (usage endpoint and header probe), mirroring `FORGE_HTTP_TIMEOUT`'s and `UZI_OIDC_HTTP_TIMEOUT`'s posture. |
+
+## Auto-selecting an Anthropic token (PRD #111)
+
+A worker can pick its Anthropic credential automatically from the pool its owner
+opted in, preferring the account with the most rate-limit headroom. These knobs are
+the operator's policy for that choice — one policy for the instance, not a per-user
+setting. All three integer values are **percentage points**, because the gauge they
+read is a 0–100 percentage.
+
+Headroom means `min(100 − 5-hour %, 100 − 7-day %)`: the two windows are a
+conjunction, so a token at 10% of its 5-hour allowance and 98% of its 7-day one has
+2 points of usable capacity, not 46.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_AUTOSELECT_MIN_HEADROOM` | `15` | The floor below which a token is not picked by preference. `0` means no floor. A value above `100` is unsatisfiable (headroom never exceeds 100) and is clamped to `100` with a boot warning — left unclamped it would classify every token as below-threshold and auto-selection would look broken rather than mis-tuned. |
+| `UZI_AUTOSELECT_HEADROOM_TIE_PCT` | `5` | Tokens within this many points of the emptiest are treated as tied, and the tie is broken by whichever replenishes soonest. `0` means only an exact tie counts. |
+| `UZI_AUTOSELECT_MAX_STALENESS` | `3 × UZI_USAGE_POLL_INTERVAL` | How old a usage reading may be and still steer a choice — steering on numbers Anthropic has moved past is worse than not steering. The default **tracks** the poll interval and matches what the meters already call stale, so the two agree; overriding it re-opens that divergence. **With the poller disabled (`UZI_USAGE_POLL_INTERVAL=0`) this computes to `0`, nothing is ever fresh, and auto-selection degrades to the worker's ordinary binding** — the correct outcome for a gauge nothing updates. |
+| `UZI_AUTOSELECT_INFLIGHT_PENALTY` | `3` | Points subtracted from a token's ranking score per run currently spending it, so several claims inside one poll interval do not all pile onto the same emptiest credential. `0` disables the bias. |

@@ -55,6 +55,19 @@ type Client interface {
 	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
 	// entry's value appears nowhere — there is no reveal endpoint.
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
+	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
+	// the auto-selection pool (PRD #111 M2, D2): PATCH
+	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}. It takes a
+	// LABEL, the name a human knows, resolved against the caller's own token list —
+	// the same shape SetWorkerToken uses, and for the same reason.
+	//
+	// This is the ONE secrets write a CLI token can reach, and its own narrow route
+	// is why (D13). Every other secrets write is cookie-only, because minting or
+	// replacing a credential from a stolen uzc_ is the exposure PRD #104 D8 closes;
+	// this one mints nothing and reveals nothing, it only re-points which of the
+	// caller's OWN tokens the pool may spend. An unknown label is a usage error
+	// resolved client-side (exit 3); an unknown id is a 404 (exit 4).
+	SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
@@ -523,6 +536,19 @@ func (c *HTTPClient) ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, err
 		return nil, err
 	}
 	return env.Secrets, nil
+}
+
+func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
+	body := struct {
+		AutoEligible bool `json:"auto_eligible"`
+	}{AutoEligible: eligible}
+	var env struct {
+		Secret apitypes.SecretDTO `json:"secret"`
+	}
+	if err := c.patch(ctx, "/api/me/secrets/anthropic_token/"+url.PathEscape(id)+"/auto-eligible", body, &env); err != nil {
+		return apitypes.SecretDTO{}, err
+	}
+	return env.Secret, nil
 }
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {

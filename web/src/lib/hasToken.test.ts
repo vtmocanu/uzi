@@ -24,6 +24,8 @@ function secret(over: Partial<SecretMeta> = {}): SecretMeta {
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    // PRD #111 M2: the auto-selection pool opt-in, false unless a test says otherwise.
+    auto_eligible: false,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
     ...over,

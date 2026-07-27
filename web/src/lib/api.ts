@@ -44,6 +44,13 @@ export interface SecretMeta {
   kind: string;
   label: string;
   is_default: boolean;
+  /** PRD #111 M2: the owner's opt-in to the auto-selection pool — an `auto` worker
+   *  spends only tokens flagged here. Default false; opting in is deliberate.
+   *
+   *  This is the SETTING, not the live answer. Whether the selector could actually
+   *  pick the token right now also depends on its rate-limit reading, which arrives
+   *  as `auto_status` on TokenRateLimits and is computed server-side. */
+  auto_eligible: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -962,10 +969,33 @@ export type MyRateLimits =
 // TokenRateLimits is ONE token's meter (PRD #104 M5): the credential's label and
 // default flag — a name, never a value — plus the same status union PRD #53 froze.
 // secret_id keys the row for a rebind or a delete.
+/** AutoStatus is the server's answer to "could auto-selection pick this token right
+ *  now, and if not why" (PRD #111 M2). A CLOSED set, mirroring autoselect.Status.
+ *
+ *  🔴 RENDER IT; NEVER RE-DERIVE IT. It comes from autoselect.Classify, the same
+ *  single function the server's ranker gates candidates on, precisely so this page
+ *  cannot promise a token is eligible that the selector silently skips (D21).
+ *  Reconstructing it here from `limits` — a `100 - pct`, a synced_at comparison —
+ *  reintroduces exactly the drift the field exists to remove, and nothing would fail
+ *  when the two disagreed. */
+export type AutoStatus =
+  | "eligible"
+  | "not_pooled"
+  | "no_reading"
+  | "unmeasured"
+  | "stale"
+  | "below_threshold";
+
 export interface TokenRateLimits {
   secret_id: string;
   label: string;
   is_default: boolean;
+  /** The owner's pool opt-in, and the live eligibility it produces (PRD #111 M2).
+   *  Not redundant: a token can be opted IN and still unpickable — its gauge never
+   *  polled, or its reading aged out — which is the silent no-op the status exists
+   *  to surface. */
+  auto_eligible: boolean;
+  auto_status: AutoStatus;
   limits: MyRateLimits;
 }
 
@@ -1632,6 +1662,15 @@ const realApi = {
     id: string,
     body: { label?: string; default?: boolean; token?: string },
   ) => request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}`, body),
+  // The auto-selection pool toggle (PRD #111 M2, D13). Its OWN narrow route, not a
+  // field on the PATCH above: every other secrets write is cookie-only because a
+  // Bearer-reachable mint would let a stolen CLI token replace a user's credentials,
+  // and moving that PATCH to reach this toggle would have taken rename, rotate and
+  // set-default along with it.
+  setTokenAutoEligible: (id: string, autoEligible: boolean) =>
+    request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}/auto-eligible`, {
+      auto_eligible: autoEligible,
+    }),
   deleteAnthropicTokenById: (id: string) =>
     request<null>("DELETE", `/me/secrets/anthropic_token/${id}`),
   putAnthropicToken: (token: string) =>

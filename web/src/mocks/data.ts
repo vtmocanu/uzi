@@ -159,7 +159,16 @@ function okReading(
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 27, 2 * D + 4 * H);
 
 export const mockMyTokenRateLimits: TokenRateLimits[] = [
-  { secret_id: "sec-default", label: "default", is_default: true, limits: mockMyRateLimits },
+  {
+    secret_id: "sec-default",
+    label: "default",
+    is_default: true,
+    // Pooled and pickable, so the demo shows the PRD #111 chip in its healthy
+    // state next to a token that is NOT pooled — the contrast is the point.
+    auto_eligible: true,
+    auto_status: "eligible" as const,
+    limits: mockMyRateLimits,
+  },
   {
     // 34% / 22% — busier than the default but still both green under the #115
     // bands, so vlad reads "Live" on both tokens (mockup frame A) and is the
@@ -167,6 +176,8 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
     secret_id: "sec-console",
     label: "console-key",
     is_default: false,
+    auto_eligible: false,
+    auto_status: "not_pooled" as const,
     limits: okReading(34, 2 * H + 5 * MIN, 22, 3 * D + 2 * H, 3),
   },
 ];
@@ -176,7 +187,16 @@ export const mockMyTokenRateLimits: TokenRateLimits[] = [
 function tokenised(limits: MyRateLimits, label = "default"): TokenRateLimits[] {
   return limits.status === "no_token"
     ? [] // token-less is an EMPTY list since M5, not a status
-    : [{ secret_id: `sec-${label}`, label, is_default: true, limits }];
+    : [
+        {
+          secret_id: `sec-${label}`,
+          label,
+          is_default: true,
+          auto_eligible: false,
+          auto_status: "not_pooled" as const,
+          limits,
+        },
+      ];
 }
 
 // Per-persona readings so a demo login as a seeded non-admin reaches every own-
@@ -582,6 +602,7 @@ export const mockSecrets: SecretMeta[] = [
     kind: "anthropic_token",
     label: "default",
     is_default: true,
+    auto_eligible: false,
     created_at: daysAgo(30),
     updated_at: daysAgo(4),
   },
@@ -590,6 +611,9 @@ export const mockSecrets: SecretMeta[] = [
     kind: "anthropic_token",
     label: "console-key",
     is_default: false,
+    // Pooled, so the mock shows the PRD #111 toggle in its ON state and the
+    // eligibility chip beside it.
+    auto_eligible: true,
     created_at: daysAgo(9),
     updated_at: daysAgo(9),
   },

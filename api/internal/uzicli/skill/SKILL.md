@@ -101,6 +101,7 @@ uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
 uzi token list
+uzi token pool <label> --on|--off
 uzi memory list
 uzi memory rm <memory-id>
 uzi repo list
@@ -254,11 +255,21 @@ as inert data.
   do not already own. Two caveats worth knowing: a worker's **chat** runs still
   spend your default token (the binding covers the run lane), and deleting a
   bound token silently returns its workers to the default rather than failing.
-- `uzi token list` — your named Anthropic tokens (id, label, default flag, created
-  date; never the value). It is READ-ONLY here: adding, renaming, set-defaulting and
+- `uzi token list` — your named Anthropic tokens (id, label, default flag, pool
+  opt-in, created date; never the value). Adding, renaming, set-defaulting and
   deleting a token are web-only, because they mint or replace a credential and must
   not be reachable from a CLI token (PRD #104 D8, the same reason `uzi worker` has no
   `create`). Use the labels this lists as the argument to `uzi worker set-token`.
+- `uzi token pool <label> --on|--off` — opt one of your tokens into or out of the
+  pool an `auto` worker may spend from (PRD #111). It is the ONE token write the CLI
+  can reach, and it has its own narrow route for exactly that reason: it mints
+  nothing and reveals nothing, it only re-points spend among tokens you already hold.
+  The pool is empty by default on purpose — a pool that helped itself to every
+  credential would spend the one you reserved for something else. **Opting a token in
+  does not guarantee it gets picked**: the selector also needs a fresh rate-limit
+  reading for it, and a token the usage poller has never reached stays unpickable
+  while looking active. That live per-token status is a web surface (Settings →
+  Anthropic tokens); the `POOL` column here is the opt-in, not the live answer.
 - `uzi memory list` — your agents' cross-run memory across every repo (each entry
   carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
   — purge one entry. Agents write memory in-run via the `save_memory` tool, not

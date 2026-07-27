@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from "react";
 import { toneFor } from "../components/Meter";
-import type { AdminRateLimitUser, MyRateLimits, TokenRateLimits } from "./api";
+import type { AdminRateLimitUser, AutoStatus, MyRateLimits, TokenRateLimits } from "./api";
 import type { BadgeTone } from "../components/ui";
 
 // formatCountdown renders "resets in <this>" (Decision 7): "2d 4h", "1h 23m",
@@ -172,6 +172,81 @@ export function statusBadge(limits: MyRateLimits, vaultLocked: boolean): StatusB
       return { tone: "danger", label: `${which.join(" & ")} nearly out`, dot: true };
     }
   }
+}
+
+// ── Auto-selection eligibility (PRD #111 M2) ─────────────────────────────────
+//
+// 🔴 A MAP, NOT A COMPUTATION, AND THAT IS THE WHOLE DESIGN (D21). The server ships
+// the answer as a string because the eligibility gate has exactly ONE
+// implementation — autoselect.Classify in Go — which the ranker and this page both
+// consume. Anything here that reads `limits.five_hour.pct`, subtracts from 100, or
+// compares a synced_at is a second implementation of that gate, and the two would
+// drift into the worst possible failure: this card telling a user a token is
+// eligible while the selector silently skips it, with nothing failing anywhere.
+//
+// So the only thing below is label and colour.
+
+export interface AutoStatusChip {
+  tone: BadgeTone;
+  label: string;
+  /** The one-line "why", for the chip's title/tooltip. */
+  hint: string;
+}
+
+// AUTO_STATUS_CHIPS is EXHAUSTIVE over AutoStatus by type, so adding a status
+// server-side without a rendering here fails typecheck rather than painting a blank
+// chip. `not_pooled` is deliberately included and deliberately not rendered by the
+// settings row (the toggle beside it already says so) — but it still needs an entry,
+// because the admin view has no toggle to say it.
+const AUTO_STATUS_CHIPS: Record<AutoStatus, AutoStatusChip> = {
+  eligible: {
+    tone: "ok",
+    label: "in pool",
+    hint: "Auto-selection can pick this token: it is opted in, its usage reading is current, and it has headroom.",
+  },
+  not_pooled: {
+    tone: "neutral",
+    label: "not in pool",
+    hint: "Auto-selection never picks this token. Opt it in to let an auto worker spend it.",
+  },
+  no_reading: {
+    tone: "warning",
+    label: "never polled",
+    hint: "Opted in, but uzi has never read a usage figure for this token, so auto-selection cannot rank it — it will never be picked. A credential the usage endpoint refuses stays in this state.",
+  },
+  unmeasured: {
+    tone: "warning",
+    label: "no usage data",
+    hint: "Opted in and polled, but the reading carried no percentage for at least one window, so there is no headroom to rank on.",
+  },
+  stale: {
+    tone: "warning",
+    label: "stale reading",
+    hint: "Opted in, but the last usage reading is too old to steer a choice — auto-selection skips it until a fresh one lands. A token uzi is currently backing off from also reads this way.",
+  },
+  below_threshold: {
+    tone: "warning",
+    label: "low headroom",
+    hint: "Opted in and current, but below the headroom threshold, so auto-selection prefers other tokens. It is still picked if every pooled token is this low.",
+  },
+};
+
+// autoStatusChip renders the server's answer. It takes the string the API sent and
+// nothing else — no reading, no clock — which is what makes "the UI cannot disagree
+// with the selector" a property rather than a habit.
+//
+// An UNRECOGNISED value renders as an honest unknown rather than being dropped or
+// guessed at: the server is deployed separately, so a newer API can ship a status
+// this bundle has never heard of, and inventing a rendering for it would be the
+// exact lie this whole mechanism exists to prevent.
+export function autoStatusChip(status: AutoStatus | string): AutoStatusChip {
+  return (
+    AUTO_STATUS_CHIPS[status as AutoStatus] ?? {
+      tone: "neutral",
+      label: "unknown",
+      hint: `This uzi build does not recognise the eligibility state “${status}”. It is reported as-is rather than guessed at.`,
+    }
+  );
 }
 
 // useNow ticks a Date.now() clock so a rendered countdown re-derives between the

@@ -62,12 +62,17 @@ func scanSelfRateLimit(r store.ListRateLimitsForUserRow) func(dest ...any) error
 		*dest[0].(*uuid.UUID) = r.UserSecretID
 		*dest[1].(*string) = r.Label
 		*dest[2].(*bool) = r.IsDefault
-		*dest[3].(*pgtype.Int2) = r.FiveHourPct
-		*dest[4].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[5].(*pgtype.Int2) = r.SevenDayPct
-		*dest[6].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[7].(*pgtype.Text) = r.Source
-		*dest[8].(*pgtype.Timestamptz) = r.SyncedAt
+		// PRD #111 M2: auto_eligible is projected right after is_default, so the
+		// scan positions below all shift by one. Positional scanning is why this
+		// fake has to move in step with the query at all — a mismatch is a runtime
+		// interface-conversion panic, not a compile error.
+		*dest[3].(*bool) = r.AutoEligible
+		*dest[4].(*pgtype.Int2) = r.FiveHourPct
+		*dest[5].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[6].(*pgtype.Int2) = r.SevenDayPct
+		*dest[7].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[8].(*pgtype.Text) = r.Source
+		*dest[9].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -80,12 +85,13 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 		*dest[3].(*pgtype.UUID) = r.UserSecretID
 		*dest[4].(*pgtype.Text) = r.Label
 		*dest[5].(*pgtype.Bool) = r.IsDefault
-		*dest[6].(*pgtype.Int2) = r.FiveHourPct
-		*dest[7].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[8].(*pgtype.Int2) = r.SevenDayPct
-		*dest[9].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[10].(*pgtype.Text) = r.Source
-		*dest[11].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[6].(*pgtype.Bool) = r.AutoEligible // PRD #111 M2; shifts the rest by one
+		*dest[7].(*pgtype.Int2) = r.FiveHourPct
+		*dest[8].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[9].(*pgtype.Int2) = r.SevenDayPct
+		*dest[10].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[11].(*pgtype.Text) = r.Source
+		*dest[12].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -93,7 +99,7 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 func pgInt2(v int16) pgtype.Int2          { return pgtype.Int2{Int16: v, Valid: true} }
 func pgTs(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
 func pgTxt(s string) pgtype.Text          { return pgtype.Text{String: s, Valid: true} }
-func pgUUIDv(u uuid.UUID) pgtype.UUID      { return pgtype.UUID{Bytes: u, Valid: true} }
+func pgUUIDv(u uuid.UUID) pgtype.UUID     { return pgtype.UUID{Bytes: u, Valid: true} }
 func pgBool(b bool) pgtype.Bool           { return pgtype.Bool{Bool: b, Valid: true} }
 
 // okSelfRow is a token with a reading, for /me.

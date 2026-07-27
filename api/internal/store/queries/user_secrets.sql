@@ -43,7 +43,7 @@ VALUES (@user_id, @kind, @label,
         @want_default::boolean
             OR NOT EXISTS (SELECT 1 FROM user_secrets WHERE user_id = @user_id AND kind = @kind),
         @ciphertext, @sealed_with)
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: RotateUserSecret :one
 -- Replace one stored secret's value in place, keyed on its id (PRD #104 D10) and
@@ -53,7 +53,7 @@ RETURNING id, kind, label, is_default, created_at, updated_at;
 UPDATE user_secrets
 SET ciphertext = $3, sealed_with = $4, updated_at = now()
 WHERE id = $1 AND user_id = $2
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: UpsertDefaultUserSecret :one
 -- The kind-path compatibility alias (PRD #104 D14): PUT /api/me/secrets/{kind}
@@ -96,7 +96,7 @@ ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetUserSecretCiphertext :one
 -- Fetch the sealed ciphertext + how it was sealed, for decryption at agent-run
@@ -206,7 +206,13 @@ ORDER BY kind;
 -- indistinguishable rows), the label + is_default the UI renders, and the
 -- timestamps — never the ciphertext. Default first, then by label, so the credential
 -- a user's unbound workers spend against leads the list.
-SELECT id, kind, label, is_default, created_at, updated_at
+--
+-- auto_eligible (PRD #111 M2) rides along: it is the D2 opt-in, a flag the owner
+-- set, and belongs with the rest of a token's metadata. It is NOT the token's live
+-- eligibility — whether the selector could actually pick it right now additionally
+-- depends on its gauge reading, which this query deliberately does not join (see
+-- ListRateLimitsForUser, which does).
+SELECT id, kind, label, is_default, auto_eligible, created_at, updated_at
 FROM user_secrets
 WHERE user_id = @user_id AND kind = @kind
 ORDER BY is_default DESC, lower(label) ASC;
@@ -217,7 +223,7 @@ ORDER BY is_default DESC, lower(label) ASC;
 -- per-(user,kind) advisory lock the mutation takes first, it is what lets
 -- set-default's clear-then-set and delete-default's guard read a stable picture.
 -- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
-SELECT id, kind, label, is_default FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible FROM user_secrets
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
@@ -244,7 +250,7 @@ WHERE user_id = @user_id AND kind = @kind AND is_default;
 -- lock, so this cannot promote a foreign row.
 UPDATE user_secrets SET is_default = true, updated_at = now()
 WHERE id = @id AND user_id = @user_id
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: RenameUserSecret :one
 -- Rename ONE of the user's secrets (PRD #104 M2). Owner-scoped. A label colliding
@@ -254,7 +260,25 @@ RETURNING id, kind, label, is_default, created_at, updated_at;
 -- invariant (only the label index, which enforces itself).
 UPDATE user_secrets SET label = @label, updated_at = now()
 WHERE id = @id AND user_id = @user_id
-RETURNING id, kind, label, is_default, created_at, updated_at;
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
+
+-- name: SetUserSecretAutoEligible :one
+-- Opt ONE of the user's tokens into or out of the auto-selection pool (PRD #111 M2,
+-- D2). Owner-scoped in its own predicate, exactly as RenameUserSecret is, so a
+-- caller holding a foreign id writes nothing and reads nothing back — the handler's
+-- ownership check and this predicate are two independent layers, and the migration's
+-- kind CHECK is a third.
+--
+-- Returns the same metadata shape as RenameUserSecret / SetUserSecretDefault so all
+-- three feed one secretMeta builder; the shared shape is why the Go structs are
+-- convertible to each other at the call site, and why a column added to one must be
+-- added to all of them.
+--
+-- Idempotent: setting the value it already has affects one row and changes nothing
+-- but updated_at, which is the right answer for a toggle a UI may re-send.
+UPDATE user_secrets SET auto_eligible = @auto_eligible, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: DeleteUserSecret :execrows
 -- Delete ONE secret, keyed on its id (PRD #104 D10) and scoped to its owner. The

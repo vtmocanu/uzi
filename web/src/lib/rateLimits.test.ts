@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
 import {
+  autoStatusChip,
   formatAgo,
   formatCountdown,
   rowState,
@@ -9,7 +10,11 @@ import {
   worstWindow,
   type RowState,
 } from "./rateLimits";
-import type { AdminRateLimitUser, MyRateLimits } from "./api";
+import type { AdminRateLimitUser, AutoStatus, MyRateLimits } from "./api";
+// ?raw rather than node:fs — the web tsconfig carries no node types, and the same
+// choice is made for the same reason in workerSizes.test.ts and
+// WorkerUpgradeBadge.test.tsx.
+import rateLimitsSource from "./rateLimits.ts?raw";
 
 const NOW = Date.parse("2026-07-15T12:00:00Z");
 const NOW_SECS = Math.floor(NOW / 1000);
@@ -38,7 +43,18 @@ function row(id: string, name: string, limits: MyRateLimits, vault_locked = fals
     tokens:
       limits.status === "no_token"
         ? []
-        : [{ secret_id: `sec-${id}`, label: "default", is_default: true, limits }],
+        : [
+            {
+              secret_id: `sec-${id}`,
+              label: "default",
+              is_default: true,
+              // PRD #111 M2 rides every token row; these fixtures are about the
+              // rate-limit classification, so they stay un-pooled.
+              auto_eligible: false,
+              auto_status: "not_pooled" as const,
+              limits,
+            },
+          ],
   };
 }
 
@@ -140,5 +156,69 @@ describe("sortAdminRows", () => {
   it("tie-breaks two live-ok rows by 5h% desc", () => {
     const users = [row("a", "low", ok(10, 20)), row("b", "high", ok(35, 5))];
     expect(sortAdminRows(users).map((u) => u.name)).toEqual(["high", "low"]);
+  });
+});
+
+// ── autoStatusChip (PRD #111 M2, D21) ────────────────────────────────────────
+//
+// The point of these is NOT that the labels are pretty. It is that this module
+// maps a server-supplied string and derives nothing: the eligibility gate has one
+// implementation, in Go, and a second one here would drift into telling a user a
+// token is eligible while the selector skips it.
+describe("autoStatusChip", () => {
+  it("has a distinct rendering for every status the server can send", () => {
+    const statuses: AutoStatus[] = [
+      "eligible",
+      "not_pooled",
+      "no_reading",
+      "unmeasured",
+      "stale",
+      "below_threshold",
+    ];
+    const labels = statuses.map((s) => autoStatusChip(s).label);
+    // Distinct, because two statuses sharing a label makes them indistinguishable
+    // to the user they are shown to — which is the whole reason they are separate
+    // statuses rather than one "not eligible".
+    expect(new Set(labels).size).toBe(statuses.length);
+    for (const s of statuses) {
+      expect(autoStatusChip(s).hint.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("greens only 'eligible' and stays calm for 'not_pooled'", () => {
+    expect(autoStatusChip("eligible").tone).toBe("ok");
+    // not_pooled is a setting, not a problem: a user who has not opted a token in
+    // must not be shown a warning about it.
+    expect(autoStatusChip("not_pooled").tone).toBe("neutral");
+  });
+
+  // The three states that mean "opted in, and it will never be picked as things
+  // stand" all warn. That is R7's silent no-op made visible — the reason the
+  // status is surfaced at all.
+  it("warns on every opted-in-but-unpickable state", () => {
+    for (const s of ["no_reading", "unmeasured", "stale", "below_threshold"] as AutoStatus[]) {
+      expect(autoStatusChip(s).tone).toBe("warning");
+    }
+  });
+
+  // The server deploys separately, so a newer API can send a status this bundle
+  // has never heard of. Guessing a rendering for it would be exactly the lie the
+  // server-side classification exists to prevent.
+  it("reports an unrecognised status honestly instead of guessing", () => {
+    const chip = autoStatusChip("something_new_from_a_newer_api");
+    expect(chip.label).toBe("unknown");
+    expect(chip.hint).toContain("something_new_from_a_newer_api");
+  });
+
+  // The guard rail for the whole design: this module must contain no second
+  // implementation of the gate. A `100 -` or a synced_at comparison here IS that
+  // second implementation, and nothing else would fail when the two disagreed.
+  it("derives nothing — no headroom arithmetic, no staleness comparison", () => {
+    // Strip comments first: that module's own prose explains the rule by NAMING the
+    // forbidden shapes, so matching them uncommented would fail the test it documents.
+    const code = rateLimitsSource.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    expect(code).not.toMatch(/100\s*-/);
+    expect(code).not.toMatch(/synced_at/);
+    expect(code).not.toMatch(/auto_eligible/);
   });
 });
