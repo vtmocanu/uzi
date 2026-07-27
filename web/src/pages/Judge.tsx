@@ -37,6 +37,7 @@ import {
   seenInRunsLabel,
 } from "../lib/judgeBacklog";
 import { coordKey, recommendationLabel } from "../lib/judge";
+import { stripUnsafeChars } from "../lib/safeText";
 import { judgeBadge } from "../lib/judgeBadge";
 import { TriageSummary } from "./RunView";
 import { OccurrenceFileIssue } from "../components/OccurrenceFileIssue";
@@ -458,8 +459,10 @@ function isBucket(v: string | null): v is JudgeBacklogBucket {
 
 // GroupRow is one deduped (category, target) row: the category + target header, the "seen
 // in N runs" frequency chip, the rollup badge, the group actions, and the occurrence
-// expander. rationale_preview is UNTRUSTED judge text — rendered as escaped React text with
-// whitespace-pre-wrap, NEVER through a markdown renderer or dangerouslySetInnerHTML.
+// expander. rationale_preview and target are UNTRUSTED judge text — rendered as escaped React
+// text with whitespace-pre-wrap, NEVER through a markdown renderer or dangerouslySetInnerHTML,
+// and passed through stripUnsafeChars first (issue #124): escaping does not touch a bidi
+// override, and the api's review-ingest scrub drops Cc but not Cf.
 function GroupRow({
   group,
   selected,
@@ -485,21 +488,25 @@ function GroupRow({
           type="checkbox"
           checked={selected}
           onChange={onToggleSelect}
-          aria-label={`Select ${recommendationLabel(group.category)} ${group.target}`}
+          aria-label={`Select ${recommendationLabel(group.category)} ${stripUnsafeChars(group.target)}`}
           className="mt-1 h-4 w-4 shrink-0 accent-brand"
         />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <Badge tone="info">{recommendationLabel(group.category)}</Badge>
             {group.target.trim() !== "" && (
-              <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{group.target}</code>
+              <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
+                {stripUnsafeChars(group.target)}
+              </code>
             )}
             <span className="text-xs text-faint">{seenInRunsLabel(group.run_count)}</span>
             {group.bucket !== "todo" && <Badge tone={rollupTone(group.bucket)}>{rollupLabel(group.bucket)}</Badge>}
             {openCount > 0 && <span className="text-xs text-faint">{openCount} open</span>}
           </div>
           {group.rationale_preview.trim() !== "" && (
-            <p className="mt-1.5 line-clamp-3 whitespace-pre-wrap text-sm text-muted">{group.rationale_preview}</p>
+            <p className="mt-1.5 line-clamp-3 whitespace-pre-wrap text-sm text-muted">
+              {stripUnsafeChars(group.rationale_preview)}
+            </p>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
@@ -628,7 +635,7 @@ function OccurrenceRow({ occ, repos, onFiled }: { occ: JudgeOccurrence; repos: R
           to={`/runs/${occ.run_id}`}
           className="min-w-0 max-w-full truncate text-sm font-medium text-fg underline-offset-2 hover:underline"
         >
-          {occ.run_title || "Untitled run"}
+          {stripUnsafeChars(occ.run_title) || "Untitled run"}
         </Link>
         <OccurrenceVerdictBadge occ={occ} />
         <OccurrenceBucketChip occ={occ} />
@@ -946,7 +953,9 @@ function ZeroState({ judgeEnabled }: { judgeEnabled: boolean }) {
                 <Badge tone={rollupTone(g.bucket)}>{rollupLabel(g.bucket)}</Badge>
                 <span className="text-muted">{recommendationLabel(g.category)}</span>
                 {g.target.trim() !== "" && (
-                  <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{g.target}</code>
+                  <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
+                    {stripUnsafeChars(g.target)}
+                  </code>
                 )}
                 <span className="text-xs text-faint">{seenInRunsLabel(g.run_count)}</span>
               </li>

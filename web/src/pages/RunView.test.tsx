@@ -267,6 +267,42 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
+  // Issue #124. React escaping (pinned above) does not touch Unicode format characters,
+  // and the api's review-ingest scrub drops Cc only — Cc and Cf are disjoint — so a bidi
+  // override reaches the browser intact and the browser's bidi algorithm honours it. The
+  // rendered text is what a human READS, so that is what gets asserted.
+  it("strips bidi/zero-width characters out of judge free text before rendering (#124)", async () => {
+    const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE — reorders the line that follows it
+    const ZWSP = "\u200B"; // zero-width space — also defeats search over the rendered text
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        summary_md: `The review ${RLO}approved this change`,
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: `shell${ZWSP}check`,
+            rationale_md: `hit ${RLO}command not found`,
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+    await screen.findByText(/The review approved this change/);
+
+    // Nothing in the panel's rendered text carries a character from either category. This
+    // is asserted over the WHOLE subtree rather than per-field on purpose: a new judge
+    // field added to this panel without the strip fails here.
+    const rendered = container.textContent ?? "";
+    expect(rendered).not.toMatch(/[\p{Cf}]/u);
+    expect(rendered).toContain("The review approved this change");
+    expect(rendered).toContain("hit command not found");
+    // The target renders as the searchable string, not one with an invisible seam in it.
+    expect(screen.getByText("shellcheck")).toBeTruthy();
+  });
+
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: null });
     mockApi.rerunJudge.mockResolvedValue({ run: run({ id: "judge1", kind: "judge", status: "queued" }) });

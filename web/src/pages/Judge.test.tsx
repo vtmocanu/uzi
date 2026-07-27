@@ -119,6 +119,45 @@ describe("Judge — rationale_preview is escaped text, never HTML (PRD #98 audit
   });
 });
 
+// Issue #124: escaping (pinned directly above) leaves Unicode format characters alone, and
+// the browser's bidi algorithm honours them — so a recommendation target can visually name
+// a file it does not point at. The backlog is the surface where those targets are compared
+// side by side, which is exactly where a lying one does the most damage.
+describe("Judge — bidi/zero-width characters are stripped from backlog free text (#124)", () => {
+  it("renders no format character anywhere in the backlog, expander included", async () => {
+    const RLO = "\u202E";
+    const ZWSP = "\u200B";
+    mockApi.getJudgeBacklog.mockResolvedValue(
+      backlog({
+        groups: [
+          group({
+            target: `api/internal/${ZWSP}poller`,
+            rationale_preview: `The judge ${RLO}approved this`,
+            occurrences: [occ({ run_id: "run-1", rec_id: "rec-1", run_title: `A ${RLO}run` })],
+            open_count: 1,
+            run_count: 1,
+          }),
+        ],
+        triage: { total: 1, todo: 1, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      }),
+    );
+    const { container } = renderJudge();
+    await screen.findByText("The judge approved this");
+
+    // Expand the occurrences so run_title is on screen too — an un-expanded row would
+    // let a missed strip pass unnoticed.
+    fireEvent.click(screen.getByLabelText("Expand occurrences"));
+    await screen.findByText("A run");
+
+    const rendered = container.textContent ?? "";
+    expect(rendered).not.toMatch(/[\p{Cf}]/u);
+    // The target is the searchable string, and the checkbox label quotes it too, so the
+    // accessible name cannot disagree with what is on screen.
+    expect(screen.getByText("api/internal/poller")).toBeTruthy();
+    expect(screen.getByLabelText(/Select .* api\/internal\/poller/)).toBeTruthy();
+  });
+});
+
 describe("Judge — a dismiss RE-RENDERS the row from the response, never a client-side filter", () => {
   it("keeps the acted-on row (now Dismissed) and reports the response's Updated count", async () => {
     mockApi.getJudgeBacklog.mockResolvedValue(

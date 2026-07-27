@@ -26,6 +26,7 @@ import {
   type TriageCounts,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { stripUnsafeChars } from "../lib/safeText";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
   formatElapsed,
@@ -946,13 +947,17 @@ export function JudgePanel({ run }: { run: Run }) {
         </p>
       ) : (
         <>
-          {/* summary_md and each rationale_md below are UNTRUSTED judge/worker output.
-              They are DELIBERATELY rendered as escaped plain text (React's default +
+          {/* summary_md, each target and each rationale_md below are UNTRUSTED judge/worker
+              output. They are DELIBERATELY rendered as escaped plain text (React's default +
               whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
               markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
-              (ScrubSecrets + control-strip) does NOT cover markdown/link injection. */}
+              (ScrubSecrets + control-strip) does NOT cover markdown/link injection.
+              Issue #124: escaping is not sufficient on its own either — the ingest scrub
+              drops Cc and NOT Cf, so a bidi override survives it and reorders what a human
+              reads. stripUnsafeChars closes that at the render site; see lib/safeText.ts for
+              why it is here and not at the API boundary (`target` is a coordinate). */}
           {review.summary_md.trim() !== "" && (
-            <p className="whitespace-pre-wrap text-sm text-muted">{review.summary_md}</p>
+            <p className="whitespace-pre-wrap text-sm text-muted">{stripUnsafeChars(review.summary_md)}</p>
           )}
 
           {/* Triage bar (PRD #94): the server-bucketed per-review counts + a segmented
@@ -976,7 +981,9 @@ export function JudgePanel({ run }: { run: Run }) {
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge tone="info">{recommendationLabel(rec.category)}</Badge>
                       {rec.target.trim() !== "" && (
-                        <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{rec.target}</code>
+                        <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">
+                          {stripUnsafeChars(rec.target)}
+                        </code>
                       )}
                       {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
                       <span className="ml-auto">
@@ -984,7 +991,9 @@ export function JudgePanel({ run }: { run: Run }) {
                       </span>
                     </div>
                     {rec.rationale_md.trim() !== "" && (
-                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
+                      <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">
+                        {stripUnsafeChars(rec.rationale_md)}
+                      </p>
                     )}
                     {/* A settled disposition (done/dismissed) hides the create-issue
                         affordance (File / draft) but NOT an already-filed link: a rec that
