@@ -194,7 +194,7 @@ Three coherent parts (the same judge reviews flagged all three):
   the merge broke no part of the run lifecycle. Note also that e2e does **not** exercise the
   pre-scan's suppression path — the `jq: command not found` plant that would have was dropped
   by PRD #97 M4.
-- [ ] **M6 — Docs.** Update the relevant docs/specs (`specs/ai.md` design note per
+- [x] **M6 — Docs.** Update the relevant docs/specs (`specs/ai.md` design note per
   repo convention; `CLAUDE.md`/`ARCHITECTURE.md` if the run lifecycle description
   needs it).
 
