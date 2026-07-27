@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -634,6 +638,10 @@ func TestNormalizeRunEventTable(t *testing.T) {
 		{"known message passes through", apitypes.RunEventDTO{Type: "message", Seq: 1}, "message", ""},
 		{"known state keeps a known status", apitypes.RunEventDTO{Type: "state", Status: "running"}, "state", "running"},
 		{"terminal status is known", apitypes.RunEventDTO{Type: "state", Status: "cancelled"}, "state", "cancelled"},
+		// The end-to-end statement of the roster contract: a park frame must reach the
+		// consumer AS "limit_wait". Dropping it from knownRunStatuses turns this into
+		// RunStatusUnknown here rather than anywhere visible in the CLI's own code.
+		{"limit_wait survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "limit_wait"}, "state", "limit_wait"},
 		{"unknown status is made inert", apitypes.RunEventDTO{Type: "state", Status: "ascended"}, "state", RunStatusUnknown},
 		{"empty status on a state frame is inert too", apitypes.RunEventDTO{Type: "state"}, "state", RunStatusUnknown},
 		{"unknown type is made inert and loses its status", apitypes.RunEventDTO{Type: "teleport", Status: "running"}, RunEventTypeUnknown, ""},
@@ -665,10 +673,43 @@ func TestIsTerminalRunStatus(t *testing.T) {
 			t.Errorf("IsTerminalRunStatus(%q) = false, want true", s)
 		}
 	}
-	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", RunStatusUnknown, ""} {
+	// limit_wait sits in this list on purpose and is the one entry that is a
+	// REGRESSION GUARD rather than a restatement. A parked run resumes, so calling it
+	// terminal would stop `uzi run logs --follow` (run.go's own terminalRunStatuses),
+	// stop this stream's reconcile ticker, and make the TUI draw every lane `done` —
+	// three surfaces going quiet on a run that is about to start talking again.
+	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", RunStatusUnknown, ""} {
 		if IsTerminalRunStatus(s) {
 			t.Errorf("IsTerminalRunStatus(%q) = true, want false — treating a live run as terminal stops the reconcile that would have corrected it", s)
 		}
+	}
+}
+
+// TestKnownRunStatusesMatchTheDocumentedCount makes knownRunStatuses' own comment
+// enforceable. The comment states a count ("exactly these eight values") and declares
+// it part of the contract; until this test existed nothing checked it, so the map and
+// the sentence describing it could drift apart silently.
+//
+// WHAT THIS DOES NOT DO, stated because the assertion looks stronger than it is: it
+// compares the map against a literal in this file, not against runs_status_check. A
+// migration that widens the DB to a ninth status and forgets this map leaves both
+// green — and that omission is the expensive one, because NormalizeRunEvent then
+// rewrites the new status to RunStatusUnknown at the decode boundary and every CLI and
+// TUI consumer reads a live run as untrustworthy. uzicli is a leaf package (stdlib
+// plus a TOML decoder, Success Criterion 8) and cannot import the store to close that
+// gap. Widening the CHECK therefore remains a THREE-file edit: the migration, this
+// map, and the count in its comment.
+func TestKnownRunStatusesMatchTheDocumentedCount(t *testing.T) {
+	// Bump BOTH this number and knownRunStatuses' comment when the CHECK widens.
+	const documented = 8
+	if len(knownRunStatuses) != documented {
+		t.Errorf("len(knownRunStatuses) = %d, want %d — the map and the count its own comment states have drifted; one of the two was edited alone", len(knownRunStatuses), documented)
+	}
+	// The count alone cannot see a SWAP (drop one status, add another, len unchanged),
+	// and limit_wait is exactly the status a swap would drop, so it is pinned by name.
+	// Its absence is invisible in normal use: a parked run simply reads "unknown".
+	if _, ok := knownRunStatuses["limit_wait"]; !ok {
+		t.Error(`knownRunStatuses is missing "limit_wait" (PRD #35) — NormalizeRunEvent would rewrite every parked run to RunStatusUnknown at the decode boundary, so the CLI and TUI would show "unknown" for a run that is waiting out an Anthropic usage window`)
 	}
 }
 
@@ -744,4 +785,143 @@ func TestStreamRunCloseWhileConsumerIsNotReading(t *testing.T) {
 		t.Fatal("Close() on an undrained stream left the pump running: it is parked handing a frame to a consumer that will never read it. " +
 			"Every send must be cancellable, or a TUI leaks one goroutine and one socket per run view the user closes.")
 	}
+}
+
+// TestKnownRunStatusesMatchTheMigrationCheck closes the half the count assertion above
+// cannot see: it compares the map against runs_status_check ITSELF, parsed out of the
+// migration that last declares it.
+//
+// This is the expensive omission. NormalizeRunEvent rewrites any status outside
+// knownRunStatuses to RunStatusUnknown at the DECODE boundary, so a migration that
+// widens the CHECK without touching this file makes every run in the new status reach
+// the CLI and TUI as "unknown" — with the opposite meaning to the one intended, since
+// an unrecognised status is deliberately treated as "do not trust this to be active".
+// Nothing else would notice: the API accepts the value, the database stores it, and the
+// CLI silently downgrades it.
+//
+// It PARSES the migration rather than restating the list, which is the whole point —
+// a second hand-typed copy of the vocabulary is what it exists to prevent. Same shape
+// as workersvc's TestSelectReasonVocabularyMatchesCheck, and deliberately so.
+//
+// WHY THIS LIVES IN THE CLI LANE, since the obvious home looks like the store package:
+// knownRunStatuses is UNEXPORTED, so a test anywhere else would have to carry a third
+// hand-typed copy of the eight values to compare against — reintroducing exactly the
+// duplication being eliminated. Reading a file needs no import, so the leaf-package
+// convention (stdlib plus a TOML decoder) is not strained by this: os, path/filepath,
+// regexp and sort are all stdlib. The file is inside the module root, so the Go test
+// cache tracks it as an input and this adds no cache-invisibility hazard of the kind
+// CLAUDE.md documents for the repo-root fixtures/ directory.
+//
+// 🔴 THE RESIDUAL — one case, and it is narrower than "a rename breaks this". The scan
+// selects the last migration whose UP half names `runs_status_check`. Measured against
+// the three ways that name can move:
+//
+//	renamed in place (no migration names it)     -> FATAL, loudly: "reading the wrong thing"
+//	new migration DROPs it and ADDs a new name   -> caught: the DROP still names it, so
+//	                                                that file is chosen and its new CHECK parsed
+//	new migration widens WITHOUT ever naming it  -> SILENT PASS. This is the hole.
+//
+// Only the third is uncovered, and no amount of parsing here can see it: the scan has
+// no way to know a file it never selected is the one that matters. If the status domain
+// ever moves off this constraint (an enum type, a trigger, a differently-named CHECK
+// added without dropping the old one), update this scan in the same commit.
+//
+// 00020 declares the constraint inline and UNNAMED, which is why the name had to be read
+// off a live database in the first place — so 00020 is correctly never selected here.
+func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
+	// Same relative depth as internal/workersvc, whose auto_select_test.go established
+	// this path literal. Glob rather than a pinned filename because goose numbers are
+	// DRAFTS until merge (CLAUDE.md): 00090 is renamed to the next free number above
+	// the live head on the landing rebase, and a hardcoded name would break there.
+	paths, err := filepath.Glob(filepath.Join("..", "store", "migrations", "*.sql"))
+	if err != nil {
+		t.Fatalf("glob migrations: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("found no migrations to scan; the guard is reading the wrong directory and its silence proves nothing")
+	}
+	sort.Strings(paths)
+
+	// Take the LAST declaration, not the first: the domain is widened by successive
+	// migrations and only the most recent one describes the live constraint.
+	var chosen, upHalf string
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		// Cut BEFORE stripping comments — the goose marker is itself a comment line, so
+		// stripping first would merge the Down half into the Up half and union a
+		// NARROWER historical CHECK into the answer.
+		up, ok := gooseUpHalf(string(raw))
+		if !ok {
+			continue
+		}
+		if strings.Contains(stripSQLComments(up), "runs_status_check") {
+			chosen, upHalf = p, up
+		}
+	}
+	if chosen == "" {
+		t.Fatal("no migration's UP half names runs_status_check; the guard is reading the wrong thing (see the residual note above — a renamed constraint lands here)")
+	}
+
+	// The prose in these files names statuses freely, so a regex over raw text would
+	// happily collect them and agree with itself.
+	stmt := stripSQLComments(upHalf)
+	checks := regexp.MustCompile(`(?is)CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)`).FindAllStringSubmatch(stmt, -1)
+	if len(checks) != 1 {
+		t.Fatalf("found %d `CHECK (status IN (...))` statements in %s's UP half, want exactly 1; the file's shape changed and this parse can no longer be trusted", len(checks), chosen)
+	}
+
+	var fromSQL []string
+	for _, m := range regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(checks[0][1], -1) {
+		fromSQL = append(fromSQL, m[1])
+	}
+	if len(fromSQL) == 0 {
+		t.Fatalf("parsed no quoted values out of %s; the guard is reading the wrong thing", chosen)
+	}
+
+	var fromGo []string
+	for s := range knownRunStatuses {
+		fromGo = append(fromGo, s)
+	}
+	sort.Strings(fromSQL)
+	sort.Strings(fromGo)
+	if strings.Join(fromSQL, ",") != strings.Join(fromGo, ",") {
+		t.Fatalf("the run-status vocabulary has drifted.\n  Go:  %v\n  SQL: %v  (%s)\n"+
+			"A status the CHECK accepts and this map omits is rewritten to RunStatusUnknown at the decode "+
+			"boundary, so every CLI and TUI consumer reads a live run as untrustworthy — silently. "+
+			"Widening the CHECK is a three-file edit: the migration, knownRunStatuses, and the count in its comment.",
+			fromGo, fromSQL, chosen)
+	}
+}
+
+// gooseUpHalf returns the text between `-- +goose Up` and `-- +goose Down`, and whether
+// both markers were found. A migration missing either is skipped rather than guessed at.
+func gooseUpHalf(sql string) (string, bool) {
+	up := strings.Index(sql, "-- +goose Up")
+	if up < 0 {
+		return "", false
+	}
+	rest := sql[up:]
+	down := strings.Index(rest, "-- +goose Down")
+	if down < 0 {
+		return "", false
+	}
+	return rest[:down], true
+}
+
+// stripSQLComments drops whole-line `--` comments. Line-granular on purpose: these
+// migrations carry long prose blocks that name the very values being parsed, and a
+// trailing-comment-aware stripper would be more code for no gain here.
+func stripSQLComments(sql string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
