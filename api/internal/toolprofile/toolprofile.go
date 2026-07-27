@@ -155,7 +155,7 @@ var deniedExecutableSet = func() map[string]bool {
 // SCOPE, stated precisely because the obvious stronger claim is false. The denylist is
 // enforced on the TIER-1 path at three points — the admin allowlist write (via Denied),
 // and profile save + claim assembly (via Resolve → Allowed, which reads the denylist map
-// directly at :213). It is NOT consulted on the tier-2 path: a cloned repo's own
+// directly rather than going through Denied). It is NOT consulted on the tier-2 path: a cloned repo's own
 // devbox.json under repo_devbox_opt_in is filtered by SHAPE ONLY, so a repo that opts in
 // CAN install these. See the dated correction at agent/src/provision.ts (PRD #123 §6),
 // which retracted exactly this over-claim.

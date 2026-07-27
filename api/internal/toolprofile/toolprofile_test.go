@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -205,42 +204,48 @@ var knownInstallablePackages = map[string]bool{
 }
 
 // TestDeniedExecutablesDoNotShadowTheBakedToolchain is the data-driven half. Rather
-// than a list someone must think to update, it reads the packages actually baked into
-// every worker image and asserts none of them is suppressed.
+// than a list someone must think to update, it reads the tools actually baked into
+// every worker image and asserts none of them is suppressed. If the toolchain ever
+// bakes a tool whose name collides with a denied CLI, a genuine missing-tool finding
+// for it would be unreportable.
 //
-// Why this one bites when the pin above cannot: the baked manifest changes for its own
-// reasons — five packages were added to it the same day this test was written — so a
-// future collision arrives WITHOUT anyone editing this file, which is exactly the case
-// a hand-maintained list misses. If the toolchain ever bakes a tool whose name collides
-// with a denied CLI, a genuine missing-tool finding for it would be unreportable.
+// Reads toolchain-guard.tsv, NOT devbox.json, and that choice is the whole point. The
+// manifest lists PACKAGE names; suppression keys on EXECUTABLE names; and those two
+// diverge exactly where this package already knows they do. A first version compared
+// package names and therefore missed `kubernetes-helm` -> `helm` and
+// `python3Packages.pip` -> `pip` — reproducing, in the test meant to guard the
+// package/executable divergence, that very divergence. The TSV already carries the
+// mapping (column 2 is the binary the package puts on PATH), so using it makes the
+// check exact instead of coincidental.
 func TestDeniedExecutablesDoNotShadowTheBakedToolchain(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "agent", "devbox-global", "devbox.json"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "agent", "devbox-global", "toolchain-guard.tsv"))
 	if err != nil {
-		t.Fatalf("read baked toolchain manifest: %v", err)
+		t.Fatalf("read baked toolchain guard map: %v", err)
 	}
-	// devbox.json is HuJSON (it carries // comments), so pull the packages array by
-	// shape rather than unmarshalling.
-	m := regexp.MustCompile(`(?s)"packages"\s*:\s*\[(.*?)\]`).FindSubmatch(raw)
-	if m == nil {
-		t.Fatal("could not find the packages array in devbox.json — did its shape change?")
-	}
-	body := regexp.MustCompile(`//[^\n]*`).ReplaceAll(m[1], nil)
-	pkgs := regexp.MustCompile(`"([^"]+)"`).FindAllSubmatch(body, -1)
-	if len(pkgs) < 5 {
-		t.Fatalf("parsed only %d baked packages — the scan is probably broken, not the manifest", len(pkgs))
-	}
-	for _, p := range pkgs {
-		name := string(p[1])
-		// A baked package name may carry an output suffix (`openssl.bin`, `file.out`);
-		// the executable is what collides, so compare on the base attr too.
-		base := name
-		if i := strings.IndexByte(base, '.'); i > 0 {
-			base = base[:i]
+
+	checked := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		if deniedExecutableSet[name] || deniedExecutableSet[base] {
-			t.Errorf("baked toolchain package %q collides with a suppressed executable: "+
-				"a genuine missing-tool finding for it could never be reported", name)
+		cols := strings.Split(line, "\t")
+		if len(cols) < 2 {
+			continue
 		}
+		pkg, bin := strings.TrimSpace(cols[0]), strings.TrimSpace(cols[1])
+		if bin == "-" { // a package that legitimately ships no binary (fontconfig, fonts)
+			continue
+		}
+		checked++
+		if deniedExecutableSet[bin] {
+			t.Errorf("baked toolchain package %q ships %q, which is a suppressed executable: "+
+				"a genuine missing-tool finding for it could never be reported", pkg, bin)
+		}
+	}
+	// Floor: a broken parse (renamed file, changed separator) must not pass vacuously.
+	if checked < 8 {
+		t.Fatalf("only parsed %d baked binaries from toolchain-guard.tsv — the scan is probably broken, not the manifest", checked)
 	}
 }
 

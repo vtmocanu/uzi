@@ -102,6 +102,11 @@ var (
 // shellNames are the interpreters that REPORT a missing command; they are never the
 // missing command themselves, so the bash/zsh forms (`zsh: command not found: foo`)
 // would otherwise flag the shell prefix. Filtered out of the results.
+//
+// The path entries (`/bin/sh`, `/bin/bash`, `/usr/bin/env`) are now UNREACHABLE, since
+// normalizeCommandToken basenames before this map is consulted and the bare names below
+// already cover them. Kept rather than deleted: harmless, and removing them would make
+// this map silently wrong again if the basenaming were ever reverted.
 var shellNames = map[string]bool{
 	"bash": true, "zsh": true, "sh": true, "dash": true, "ash": true, "ksh": true,
 	"fish": true, "/bin/sh": true, "/bin/bash": true, "/usr/bin/env": true, "env": true,
@@ -156,6 +161,12 @@ func payloadText(p []byte) string {
 // `seen` map keyed on the raw token, so one run hitting both `jq: command not found`
 // and `exec: "/usr/bin/jq"` produced TWO candidates for one tool, consuming two of the
 // judgeMissCandidateCap slots.
+//
+// It also repairs a THIRD defect that predates the denylist work: executablesIn already
+// basenames (basenameToken), so the `green` index and the same-result veto have always
+// been keyed on basenames. A path-form candidate could therefore never match its own
+// green entry — `/usr/bin/helm` against `helm` — which meant suppressResolved could not
+// suppress it and observedGreenTools could not veto it. All three now agree.
 func normalizeCommandToken(cmd string) string {
 	trimmed := strings.Trim(strings.TrimSpace(cmd), `"'`)
 	if trimmed == "" {

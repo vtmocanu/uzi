@@ -24,7 +24,11 @@ describe("judge prompt covers every denylisted executable", () => {
     const start = goSrc.indexOf("var deniedPackageExecutables");
     assert.ok(start >= 0, "deniedPackageExecutables not found — did the map move or get renamed?");
     const block = goSrc.slice(start, goSrc.indexOf("\n}\n", start));
-    const groups = [...block.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]!);
+    // `:\s*\{` and not a bare `\{`: the first bare match starts at the map literal's OWN
+    // opening brace, so it spans `map[string][]string{ "glab": {"glab"` and pulls the KEY
+    // into the executable set. Invisible today only because the first entry's key equals
+    // its value; a reordered map would make the test demand a package name in the prompt.
+    const groups = [...block.matchAll(/:\s*\{([^}]*)\}/g)].map((m) => m[1]!);
     return [...new Set(groups.flatMap((g) => [...g.matchAll(/"([^"]+)"/g)].map((m) => m[1]!)))].sort();
   }
 
@@ -39,19 +43,49 @@ describe("judge prompt covers every denylisted executable", () => {
     return body.slice(0, end);
   }
 
-  it("names every executable the Go denylist map suppresses", () => {
+  /** The barred-CLI names the prompt actually lists, parsed as a SET.
+   *
+   *  🔴 NOT a substring test over the whole prompt. That was the first version and it
+   *  was partially vacuous: `gh` matches inside `"low|medium|high"`, `op` inside
+   *  `propose`, `tea` inside `instead` — so the GitHub CLI could be deleted from the
+   *  barred list and this test stayed green. Measured, not theorised. Compare sets. */
+  function promptExecutables(): string[] {
+    const prompt = judgePrompt();
+    const start = prompt.indexOf("NEVER use this category for these credential-bearing CLIs:");
+    assert.ok(start >= 0, "the barred-CLI paragraph is not in JUDGE_SYSTEM_PROMPT");
+    const end = prompt.indexOf("They are barred by policy", start);
+    assert.ok(end > start, "could not find the end of the barred-CLI list");
+    const list = prompt.slice(start + "NEVER use this category for these credential-bearing CLIs:".length, end);
+    // Strip TRAILING prose punctuation only — the list ends a sentence, so its last
+    // entry arrives as `vault.`. Trailing-only matters: `git-credential-gcloud.sh`
+    // carries an interior dot that must survive.
+    return [
+      ...new Set(
+        list
+          .split(/[\s,]+/)
+          .map((t) => t.trim().replace(/[.;:]+$/, ""))
+          .filter((t) => t !== ""),
+      ),
+    ].sort();
+  }
+
+  it("names exactly the executables the Go denylist map suppresses", () => {
     const execs = goExecutables();
     // Floor: stops the whole scan passing vacuously if the map is renamed, reformatted
     // into a shape the regex misses, or emptied. The same guard guardrails.test.ts uses.
     assert.ok(execs.length >= 20, `expected >= 20 denied executables, parsed ${execs.length} — did the map's shape change?`);
 
-    const prompt = judgePrompt();
-    const missing = execs.filter((e) => !prompt.includes(e));
+    const listed = promptExecutables();
+    assert.ok(listed.length >= 20, `parsed only ${listed.length} names out of the prompt's list — did its wording change?`);
+
+    // Equality, both directions. Missing means the model is not told a barred CLI is
+    // barred; extra means the prompt names something no longer denied.
     assert.deepStrictEqual(
-      missing,
-      [],
-      `JUDGE_SYSTEM_PROMPT does not name these denylisted executables, so the judge model is ` +
-        `not told they are barred and will keep recommending their installation: ${missing.join(", ")}`,
+      listed,
+      execs,
+      `JUDGE_SYSTEM_PROMPT's barred-CLI list has drifted from deniedPackageExecutables in ` +
+        `api/internal/toolprofile/toolprofile.go.\n  only in Go:     ${execs.filter((e) => !listed.includes(e)).join(", ") || "(none)"}` +
+        `\n  only in prompt: ${listed.filter((e) => !execs.includes(e)).join(", ") || "(none)"}`,
     );
   });
 });
