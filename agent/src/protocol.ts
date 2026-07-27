@@ -19,18 +19,20 @@ export type RunState =
   | "completed"
   | "failed";
 
-/**
- * The states a run never leaves.
- *
- * `limit_wait` is NOT one of them and must never be added (PRD #35): a parked run
- * resumes when the usage-limit window reopens. The warning is here because nothing
- * would catch the mistake — adding it is type-legal (it is a `RunState`), and this
- * Set currently has no consumer outside this file, so no test or typecheck fails.
- */
-export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
-  "completed",
-  "failed",
-]);
+// TERMINAL_STATES lived here and was DELETED (PRD #35). A repo-wide grep found
+// exactly one line — its own definition. No reader anywhere, not even in this file,
+// and `noUnusedLocals` could never flag it because it was exported.
+//
+// PRD #35 first added a warning comment telling a future editor not to put
+// `limit_wait` in the Set. That comment's own reasoning is the argument for this
+// deletion: adding a member was type-legal and nothing would have failed, so the Set
+// could not enforce anything. Leaving it would have left a no-op looking like a
+// guardrail, which is worse than either having it or not.
+//
+// The terminal/non-terminal distinction is enforced where it is actually read: the
+// `RunState` union above, the server's status CHECK, and `uzicli`'s own
+// terminalRunStatuses. If a consumer for a Set like this ever appears, add it back
+// with that consumer — not before.
 
 /** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal; PRD #41
  *  adds plan_feedback + plan_revising — the DB column carries no CHECK, so these need
