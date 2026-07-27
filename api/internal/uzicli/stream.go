@@ -53,11 +53,16 @@ var knownRunEventTypes = map[string]struct{}{
 // DECODE boundary, so a status the DB accepts and this map omits reaches every CLI and
 // TUI consumer as "unknown" — silently, and with the opposite meaning to the one
 // intended, since the comment below turns an unrecognised status into "do not trust
-// this to be active". No test catches the omission; the sentinel behaviour is pinned
-// but the roster is not.
+// this to be active".
 //
-// The count in the first sentence is part of the contract — if it disagrees with the
-// map, one of the two was edited alone.
+// The count in the first sentence is part of the contract, and it is now ENFORCED:
+// TestKnownRunStatusesMatchTheDocumentedCount fails if the map and the number above
+// disagree. That is a narrower guarantee than it looks, and the boundary is worth
+// stating so nobody over-trusts it — the assertion pins the map against this COMMENT,
+// not against the migration. Widening the DB CHECK to a ninth status without touching
+// this file still leaves both green, because no test in this leaf package can see
+// `api/internal/store/migrations/`. What it does catch is the likelier half of the
+// same mistake: editing one of the two here and forgetting the other.
 var knownRunStatuses = map[string]struct{}{
 	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
 	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.

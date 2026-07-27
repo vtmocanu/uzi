@@ -634,6 +634,10 @@ func TestNormalizeRunEventTable(t *testing.T) {
 		{"known message passes through", apitypes.RunEventDTO{Type: "message", Seq: 1}, "message", ""},
 		{"known state keeps a known status", apitypes.RunEventDTO{Type: "state", Status: "running"}, "state", "running"},
 		{"terminal status is known", apitypes.RunEventDTO{Type: "state", Status: "cancelled"}, "state", "cancelled"},
+		// The end-to-end statement of the roster contract: a park frame must reach the
+		// consumer AS "limit_wait". Dropping it from knownRunStatuses turns this into
+		// RunStatusUnknown here rather than anywhere visible in the CLI's own code.
+		{"limit_wait survives the decode boundary", apitypes.RunEventDTO{Type: "state", Status: "limit_wait"}, "state", "limit_wait"},
 		{"unknown status is made inert", apitypes.RunEventDTO{Type: "state", Status: "ascended"}, "state", RunStatusUnknown},
 		{"empty status on a state frame is inert too", apitypes.RunEventDTO{Type: "state"}, "state", RunStatusUnknown},
 		{"unknown type is made inert and loses its status", apitypes.RunEventDTO{Type: "teleport", Status: "running"}, RunEventTypeUnknown, ""},
@@ -665,10 +669,43 @@ func TestIsTerminalRunStatus(t *testing.T) {
 			t.Errorf("IsTerminalRunStatus(%q) = false, want true", s)
 		}
 	}
-	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", RunStatusUnknown, ""} {
+	// limit_wait sits in this list on purpose and is the one entry that is a
+	// REGRESSION GUARD rather than a restatement. A parked run resumes, so calling it
+	// terminal would stop `uzi run logs --follow` (run.go's own terminalRunStatuses),
+	// stop this stream's reconcile ticker, and make the TUI draw every lane `done` —
+	// three surfaces going quiet on a run that is about to start talking again.
+	for _, s := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait", RunStatusUnknown, ""} {
 		if IsTerminalRunStatus(s) {
 			t.Errorf("IsTerminalRunStatus(%q) = true, want false — treating a live run as terminal stops the reconcile that would have corrected it", s)
 		}
+	}
+}
+
+// TestKnownRunStatusesMatchTheDocumentedCount makes knownRunStatuses' own comment
+// enforceable. The comment states a count ("exactly these eight values") and declares
+// it part of the contract; until this test existed nothing checked it, so the map and
+// the sentence describing it could drift apart silently.
+//
+// WHAT THIS DOES NOT DO, stated because the assertion looks stronger than it is: it
+// compares the map against a literal in this file, not against runs_status_check. A
+// migration that widens the DB to a ninth status and forgets this map leaves both
+// green — and that omission is the expensive one, because NormalizeRunEvent then
+// rewrites the new status to RunStatusUnknown at the decode boundary and every CLI and
+// TUI consumer reads a live run as untrustworthy. uzicli is a leaf package (stdlib
+// plus a TOML decoder, Success Criterion 8) and cannot import the store to close that
+// gap. Widening the CHECK therefore remains a THREE-file edit: the migration, this
+// map, and the count in its comment.
+func TestKnownRunStatusesMatchTheDocumentedCount(t *testing.T) {
+	// Bump BOTH this number and knownRunStatuses' comment when the CHECK widens.
+	const documented = 8
+	if len(knownRunStatuses) != documented {
+		t.Errorf("len(knownRunStatuses) = %d, want %d — the map and the count its own comment states have drifted; one of the two was edited alone", len(knownRunStatuses), documented)
+	}
+	// The count alone cannot see a SWAP (drop one status, add another, len unchanged),
+	// and limit_wait is exactly the status a swap would drop, so it is pinned by name.
+	// Its absence is invisible in normal use: a parked run simply reads "unknown".
+	if _, ok := knownRunStatuses["limit_wait"]; !ok {
+		t.Error(`knownRunStatuses is missing "limit_wait" (PRD #35) — NormalizeRunEvent would rewrite every parked run to RunStatusUnknown at the decode boundary, so the CLI and TUI would show "unknown" for a run that is waiting out an Anthropic usage window`)
 	}
 }
 
