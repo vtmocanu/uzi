@@ -6,6 +6,8 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.11.12] - 2026-07-27
+
 ### Fixed
 
 - **`file` did not work in 0.11.11, despite that release announcing it.** The package was
