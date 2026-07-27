@@ -554,13 +554,13 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 
 **Phase 1 — rename + chips (independent; ships as one MR)**
 
-- [ ] **M1 — `Open` → `Backlog` in the web app**: column header, auto-move
+- [x] **M1 — `Open` → `Backlog` in the web app**: column header, auto-move
       toast text, and the issue detail page all read `Backlog`;
       `npm run typecheck` + `npm test` green. Sites:
       `web/src/pages/Board.tsx:6,55,299`, `web/src/pages/IssueView.tsx:17`,
       `web/src/lib/boardColumns.test.ts:5,10,23` (fixture + comments).
 
-- [ ] **M2 — `Planned` seeded first**: `forgesvc.DefaultColumns` reads
+- [x] **M2 — `Planned` seeded first**: `forgesvc.DefaultColumns` reads
       `{Planned, In Progress, Human Review, Later}`, `Planned` keeping the
       old `Upcoming` color (`#6699cc`); leading comment explains the new
       order per Decision 2; `go build ./...` + `go test ./...` green. A
@@ -568,7 +568,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       `Backlog | Planned | In Progress | Human Review | Later | Closed`
       and gets a `Planned` label on its GitLab project.
 
-- [ ] **M3 — Docs correct and migration documented**: `docs/board.md`
+- [x] **M3 — Docs correct and migration documented**: `docs/board.md`
       (`:17` implicit-column entry, `:19` seeded list, `:25` and `:58`
       backlog-bucket prose, `:57` restore-target list) and
       `docs/configuration.md:104` reflect the new names and order.
@@ -577,7 +577,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       the reverse order orphans the label and drops its cards into
       `Backlog`.
 
-- [ ] **M4 — Label chips on cards**: each card renders its non-workflow,
+- [x] **M4 — Label chips on cards**: each card renders its non-workflow,
       non-column labels as chips. The Decision 6 predicate is extracted to
       a pure, unit-tested helper in `web/src/lib/` (the `runBadge.ts` /
       `boardColumns.ts` discipline). Because the two callers exclude
@@ -594,7 +594,7 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
 
 **Phase 2 — sort modes + manual ordering**
 
-- [ ] **M5 — Sort modes and manual ordering within a column**: a nullable
+- [x] **M5 — Sort modes and manual ordering within a column**: a nullable
       ordering column on `issues` (migration number assigned at merge time,
       above the live head — currently `00085`), a reorder endpoint,
       drag-to-reorder in the board, and a board-wide sort-mode switcher.
