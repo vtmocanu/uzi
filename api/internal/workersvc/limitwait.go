@@ -1,5 +1,19 @@
 package workersvc
 
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+)
+
 // Anthropic usage-limit park (PRD #35): the server's half of the rate_limit_type
 // vocabulary.
 //
@@ -90,4 +104,399 @@ func CoerceRateLimitType(reported *string) *string {
 	}
 	unknown := RateLimitTypeUnknown
 	return &unknown
+}
+
+// -------------------------------------------------------------------------
+// The park computation (PRD #35 M2, Decisions 4, 5, 6e and 8)
+// -------------------------------------------------------------------------
+
+// Jitter bounds for retry_not_before. One user's parked runs would otherwise all
+// carry the SAME reset — they died on the same window — and promote on the same
+// sweeper tick, so every one of them would claim, spend, and re-park together.
+//
+// The floor is non-zero on purpose: it is also the clamp applied when the computed
+// stamp lands at or before `now`, so a park can never produce a stamp the very next
+// promotion pass already satisfies.
+const (
+	limitParkJitterMin = 60 * time.Second
+	limitParkJitterMax = 180 * time.Second
+)
+
+// limitParkFallback is the base used when NOTHING says when the window reopens:
+// the worker reported no usable reset, the gauge has none either (or the credential
+// is unknown), and no pooled alternative contributes. That case is real rather than
+// defensive — the classifier's PRIMARY signal is `terminal_reason`, which names the
+// cause outright and carries no reset of its own, so a limit death with no timestamp
+// is an ordinary outcome, not a malformed report.
+//
+// The value is bounded from both sides and neither bound is arbitrary. Too short and
+// a genuinely sustained limit burns all of RUN_LIMIT_MAX_WAITS in minutes and fails a
+// run that would have succeeded an hour later; too long and a run waits out a window
+// that reopened almost immediately. At 15 minutes the whole default budget spans
+// about 75 minutes of parking before the run fails honestly, which is a defensible
+// ceiling for the no-information case.
+//
+// Deliberately a CONSTANT and not an env knob: it is the answer to "we know nothing",
+// and an operator with something to say about their limits has RUN_LIMIT_MAX_WAITS
+// and RUN_LIMIT_MAX_PARK to say it with.
+const limitParkFallback = 15 * time.Minute
+
+// reportedResetBounds brackets a worker-reported limit_resets_at, which arrives as
+// epoch MILLISECONDS (the worker normalizes the SDK's unit-less number before
+// sending; see agent/src/limit.ts normalizeResetsAt).
+//
+// The range check is not hygiene, it is the thing that stops the park loop. An
+// out-of-range value — zero, negative, a seconds value mistaken for milliseconds, a
+// wrapped or overflowed epoch — converts to an instant in 1970 or in the year 50000.
+// The first gives retry_not_before <= now, so the very next promotion pass requeues
+// the run straight back into the exhausted window, it re-parks, and the cycle burns
+// RUN_LIMIT_MAX_WAITS in seconds. The second is caught by the RUN_LIMIT_MAX_PARK
+// ceiling, but only after it has been through time.UnixMilli, which is why both ends
+// are checked HERE, before conversion, rather than relying on the clamp downstream.
+//
+// The window is deliberately wide (2001-09-09 to 2100) rather than "near now": this
+// is a plausibility filter on the UNIT and the encoding, not a policy on how far out
+// a reset may be. That policy is RUN_LIMIT_MAX_PARK's, and keeping the two separate
+// is what lets the ceiling be an operator knob while this stays a constant.
+const (
+	reportedResetMinMs int64 = 1_000_000_000_000 // 2001-09-09; below this it is not milliseconds
+	reportedResetMaxMs int64 = 4_102_444_800_000 // 2100-01-01; above this it is not a real reset
+)
+
+// validReportedReset converts a worker-reported epoch-millisecond reset, or reports
+// that there is none to be had. Absent and implausible collapse to the same answer on
+// purpose: both mean "the worker told us nothing usable", and the caller's fallback
+// is identical for the two.
+func validReportedReset(ms *int64) (time.Time, bool) {
+	if ms == nil || *ms < reportedResetMinMs || *ms > reportedResetMaxMs {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(*ms).UTC(), true
+}
+
+// limitParkInput is everything the park decision reads. It is a struct rather than
+// twelve arguments because the decision is PURE and its test fixtures are built by
+// varying one field at a time.
+type limitParkInput struct {
+	// WaitOnLimit is the run's own opt-in, read from the row — never from the report.
+	WaitOnLimit bool
+	// LimitWaitCount is how many times this run has ALREADY parked.
+	LimitWaitCount int32
+	// DeadSecretID is the credential the run was spending, from runs.anthropic_secret_id.
+	// uuid.Nil for a run that predates PRD #111 or whose credential recording failed;
+	// NextAvailable refuses that case rather than letting the dead credential vote for
+	// its own replacement.
+	DeadSecretID uuid.UUID
+	// ReportedResetMs and ReportedType are the worker's UNTRUSTED report.
+	ReportedResetMs *int64
+	ReportedType    *string
+	// Candidates is this user's pool as ListAutoSelectCandidates returns it, including
+	// the dead credential (which carries the gauge row the Decision 4 cross-check
+	// reads). Empty is legal and means "no pool information".
+	Candidates []autoselect.Candidate
+	Policy     autoselect.Policy
+	MaxWaits   int
+	MaxPark    time.Duration
+	// Jitter is supplied by the caller so this function has no clock and no
+	// randomness of its own, which is what makes every case below assertable.
+	Jitter time.Duration
+	Now    time.Time
+}
+
+// limitParkDecision is the answer: park until RetryNotBefore, or fail with Reason.
+//
+// LimitResetsAt and RateLimitType are the SANITIZED report and are populated on BOTH
+// outcomes — the park stores them on the row, and the failure path uses them to
+// compose Reason. They are nil when the worker reported nothing usable.
+type limitParkDecision struct {
+	Park           bool
+	RetryNotBefore time.Time
+	LimitResetsAt  *time.Time
+	RateLimitType  *string
+	Reason         string
+}
+
+// decideLimitPark is the WHOLE park policy, and it is pure: no clock, no randomness,
+// no database. The caller fetches the candidates, reads the clock, rolls the jitter
+// and executes the resulting statement.
+//
+// # The three ways a park becomes a failure, and why none of them is a REFUSAL
+//
+// A refusal (0 rows) maps to 409, and the worker treats 409 as "the server already
+// moved on" and stops — so a refused report VANISHES: no failure reason, no feed
+// line, and the run rots at `running` until RUN_TIMEOUT. Every one of these three is
+// therefore a server-side FAIL with a composed reason, delivered as a 200 whose body
+// carries status "failed", which the worker can see and act on:
+//
+//   - the run opted out (WaitOnLimit false). The worker's own opt-out path is to
+//     report `failed` directly and is the normal one; this is the guard behind it,
+//     for a stale worker or a bug.
+//   - the retry budget is spent (LimitWaitCount >= MaxWaits). MaxWaits == 0 is the
+//     operator's "never park" switch and lands here on the first limit, which is
+//     exactly today's behaviour with a better reason.
+//   - the computed stamp is further out than MaxPark. Waiting is not free — a parked
+//     run holds its issue's one-active lock and its worker's disk — so past the
+//     ceiling, failing honestly beats holding both for weeks.
+//
+// # Where the base comes from, in order
+//
+//  1. the worker's reported reset, if it survives validReportedReset;
+//  2. cross-checked against the DEAD credential's own gauge row (Decision 4): when
+//     that candidate is Measured, take max(worker, gauge) for the window the
+//     rate_limit_type names. Both describe the SAME window, so promoting before the
+//     later of them guarantees a re-park. The window mapping is what stops `max` from
+//     over-delaying by days — a 5-hour limit is never compared against a 7-day
+//     rollover;
+//  3. lowered to autoselect.NextAvailable's floor when the user has a pooled
+//     alternative that is spendable sooner (Decision 6e);
+//  4. limitParkFallback when steps 1 and 2 produced nothing and step 3 did not fire.
+//
+// Then jitter is added and the result is floored at Now+Jitter, so a stamp that would
+// land in the past cannot spin the promotion pass.
+func decideLimitPark(in limitParkInput) limitParkDecision {
+	d := limitParkDecision{RateLimitType: CoerceRateLimitType(in.ReportedType)}
+	if reset, ok := validReportedReset(in.ReportedResetMs); ok {
+		d.LimitResetsAt = &reset
+	}
+
+	if !in.WaitOnLimit {
+		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt, "")
+		return d
+	}
+	if int(in.LimitWaitCount) >= in.MaxWaits {
+		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt,
+			fmt.Sprintf("usage-limit retry budget exhausted after %d attempt(s)", in.LimitWaitCount))
+		return d
+	}
+
+	base, haveBase := in.Now, false
+	if d.LimitResetsAt != nil {
+		base, haveBase = *d.LimitResetsAt, true
+	}
+	if gauge, ok := deadCredentialReset(in.Candidates, in.DeadSecretID, in.Policy, d.RateLimitType, in.Now); ok {
+		if !haveBase || gauge.After(base) {
+			base, haveBase = gauge, true
+		}
+	}
+	// Decision 6e. Only ever LOWERS the base — a pooled alternative cannot make the
+	// wait longer, and NextAvailable's own contract is a floor on "something is
+	// spendable", not a promise.
+	if alt, ok := autoselect.NextAvailable(in.Candidates, in.DeadSecretID, in.Policy, in.Now); ok {
+		if !haveBase || alt.Before(base) {
+			base, haveBase = alt, true
+		}
+	}
+	if !haveBase {
+		base = in.Now.Add(limitParkFallback)
+	}
+
+	retry := base.Add(in.Jitter)
+	// The floor. A reset already in the past is not an error to reject — it is a
+	// window that reopened while the report was in flight, and the right answer is
+	// "retry shortly", not "fail the run".
+	if floor := in.Now.Add(in.Jitter); !retry.After(floor) {
+		retry = floor
+	}
+	if retry.Sub(in.Now) > in.MaxPark {
+		d.Reason = limitFailureReason(d.RateLimitType, d.LimitResetsAt,
+			fmt.Sprintf("the window reopens further out than the %s maximum park", in.MaxPark))
+		return d
+	}
+
+	d.Park, d.RetryNotBefore = true, retry
+	return d
+}
+
+// deadCredentialReset is the Decision 4 cross-check: the DEAD credential's own gauge
+// reading of the window that rejected the run.
+//
+// It reads the row ListAutoSelectCandidates already returned, so there is no second
+// fetch. Only a MEASURED candidate contributes — Measured implies fresh and both
+// windows present, which is precisely the condition under which the gauge is worth
+// believing against the worker's report.
+//
+// The window mapping is the load-bearing half. seven_day_opus, seven_day_sonnet and
+// seven_day_overage_included are all seven-day windows under different names, so they
+// map to the same column. `overage` and `unknown` have NO gauge column at all
+// (anthropic_rate_limits stores the five-hour and seven-day windows only), and they
+// return false rather than falling back to some other window: cross-checking a
+// 5-hour reading against an overage rejection would produce a confidently wrong
+// answer, which is worse than no cross-check.
+func deadCredentialReset(cands []autoselect.Candidate, dead uuid.UUID, p autoselect.Policy, rateLimitType *string, now time.Time) (time.Time, bool) {
+	if dead == uuid.Nil || rateLimitType == nil {
+		return time.Time{}, false
+	}
+	for _, c := range cands {
+		if c.SecretID != dead {
+			continue
+		}
+		if !autoselect.Classify(c, p, now).Measured {
+			return time.Time{}, false
+		}
+		var col *time.Time
+		switch *rateLimitType {
+		case "five_hour":
+			col = c.FiveResetsAt
+		case "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included":
+			col = c.SevenResetsAt
+		default: // overage, unknown — no gauge column names this window
+			return time.Time{}, false
+		}
+		if col == nil {
+			return time.Time{}, false
+		}
+		return *col, true
+	}
+	return time.Time{}, false
+}
+
+// limitFailureReason composes Decision 8's sentence SERVER-SIDE, from the allowlisted
+// enum and the validated timestamp.
+//
+// 🔴 THE WORKER MUST NOT COMPOSE THIS. If it did, the enum would live worker-side and
+// receive only sanitizeFailureReason (stripNUL plus a rune cap), and the Success
+// Criterion "a compromised worker cannot smuggle a non-enum rate_limit_type past the
+// server" would be false on exactly the path that renders it to a human. One
+// allowlist, both the park path and the failed path.
+//
+// Each part is omitted rather than defaulted when it is unknown, so the sentence
+// never claims a fact the server does not have: no type means no parenthetical, no
+// reset means no "resets at" clause.
+func limitFailureReason(rateLimitType *string, resetsAt *time.Time, detail string) string {
+	s := "Anthropic usage limit"
+	if rateLimitType != nil {
+		s += " (" + *rateLimitType + ")"
+	}
+	s += " reached"
+	if resetsAt != nil {
+		s += "; resets at " + resetsAt.UTC().Format(time.RFC3339)
+	}
+	if detail != "" {
+		s += "; " + detail
+	}
+	return s
+}
+
+// limitParkJitter rolls one jitter value. The ONLY nondeterminism in the park path,
+// isolated to this call so decideLimitPark stays pure and every case in its test is
+// an exact-value assertion rather than a range check.
+//
+// math/rand rather than crypto/rand deliberately: this is stampede avoidance, not a
+// secret. An attacker who could predict it would learn when their own run resumes.
+func limitParkJitter() time.Duration {
+	return limitParkJitterMin + time.Duration(rand.Int63n(int64(limitParkJitterMax-limitParkJitterMin+1)))
+}
+
+// setLimitWait is SetState's `limit_wait` arm: the impure half of the park.
+//
+// It returns the row count SetState maps to `applied`, and it NEVER returns an
+// applied=false for a policy decision. That distinction is the whole reason this
+// function exists rather than the SQL being called inline:
+//
+//	0 rows  the SQL guard refused (not `running`, wrong worker, a judge run, or a
+//	        re-delivery). SetState maps that to 409, which the worker treats as
+//	        "the server already moved on" and stops. Correct for those causes: the
+//	        run really did move, and the worker's cleanup carve-out keys off the
+//	        RETURNED STATUS, so a 409 carrying anything other than "limit_wait"
+//	        makes it clean up rather than leak.
+//	1 row   either the park landed, or the run was FAILED here on purpose. Both are
+//	        200s carrying the resulting status, which is what lets the worker tell
+//	        "parked, keep the disk" from "failed, clean up" — the discrimination an
+//	        `applied`-keyed branch would get wrong on the three most common causes.
+//
+// 🔴 THE OPT-OUT COERCION IS THE POINT, NOT A NICETY. If a worker reports
+// limit_wait for a run with wait_on_limit=false (a stale worker, a bug), refusing it
+// would produce 0 rows → 409 → the worker treats it as success and exits, and the
+// park VANISHES: no failure reason, no feed line, and the run rots at `running`
+// until RUN_TIMEOUT fails it with something misleading. So the report is coerced to
+// a server-composed failure instead of refused. Same branch point as the budget cap.
+func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+	// The candidate pool is fetched ONLY when the run names the credential it was
+	// spending. Without that id there is nothing to exclude, and NextAvailable would
+	// have to be trusted not to let the dead credential vote for its own replacement
+	// — a query saved is beside the point; this is the correctness half.
+	var cands []autoselect.Candidate
+	dead := uuid.Nil
+	if run.AnthropicSecretID.Valid {
+		dead = uuid.UUID(run.AnthropicSecretID.Bytes)
+		rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
+		if err != nil {
+			return 0, fmt.Errorf("auto-select candidates: %w", err)
+		}
+		cands = make([]autoselect.Candidate, 0, len(rows))
+		for _, row := range rows {
+			cands = append(cands, autoselectrow.FromCandidateRow(row))
+		}
+	}
+
+	d := decideLimitPark(limitParkInput{
+		WaitOnLimit:     run.WaitOnLimit,
+		LimitWaitCount:  run.LimitWaitCount,
+		DeadSecretID:    dead,
+		ReportedResetMs: req.LimitResetsAt,
+		ReportedType:    req.RateLimitType,
+		Candidates:      cands,
+		Policy:          s.p.Autoselect,
+		MaxWaits:        s.p.RunLimitMaxWaits,
+		MaxPark:         s.p.RunLimitMaxPark,
+		Jitter:          limitParkJitter(),
+		Now:             s.now(),
+	})
+
+	if !d.Park {
+		return s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+			FailureReason: pgText(d.Reason),
+			SessionID:     sessionID,
+			ID:            run.ID,
+			WorkerID:      pgUUID(wkr.ID),
+		})
+	}
+	return s.q.SetRunLimitWait(ctx, store.SetRunLimitWaitParams{
+		ID:             run.ID,
+		WorkerID:       pgUUID(wkr.ID),
+		LimitResetsAt:  pgTimePtr(d.LimitResetsAt),
+		RateLimitType:  pgTextPtr(d.RateLimitType),
+		RetryNotBefore: pgTime(d.RetryNotBefore),
+		SessionID:      sessionID,
+	})
+}
+
+// limitAwareFailureReason is the `failed` arm's half of the same rule (§7.8): a
+// worker that opts out of parking reports `failed` directly and sends the structured
+// limit fields alongside, and the server composes the sentence from its own enum.
+//
+// Two constraints, both deliberate:
+//   - a terminal report is NEVER failed on a technicality. An unrecognised type
+//     coerces to "unknown"; an implausible timestamp is dropped. Neither rejects the
+//     report.
+//   - the replacement fires ONLY when the fields are present. Absent, this falls
+//     straight through to sanitizeFailureReason and no other failure path in the
+//     product changes behaviour.
+func limitAwareFailureReason(req StateRequest) pgtype.Text {
+	if req.RateLimitType == nil && req.LimitResetsAt == nil {
+		return sanitizeFailureReason(req.FailureReason)
+	}
+	var resetsAt *time.Time
+	if t, ok := validReportedReset(req.LimitResetsAt); ok {
+		resetsAt = &t
+	}
+	return pgText(limitFailureReason(CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
+}
+
+// pgTimePtr / pgTextPtr lift the park decision's optional fields into the pgtype
+// forms the generated params take. Nil becomes SQL NULL, which for
+// limit_resets_at and rate_limit_type is the honest answer ("the worker reported
+// nothing usable") rather than a placeholder.
+func pgTimePtr(t *time.Time) pgtype.Timestamptz {
+	if t == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *t, Valid: true}
+}
+
+func pgTextPtr(s *string) pgtype.Text {
+	if s == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *s, Valid: true}
 }

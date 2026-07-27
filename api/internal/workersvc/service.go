@@ -204,6 +204,13 @@ type Store interface {
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	// SetRunLimitWait parks a run until the owner's Anthropic usage window reopens
+	// (PRD #35); PromoteLimitWaitRuns is the sweeper pass that brings it back. The
+	// park's source guard is POSITIVE (status = 'running'), unlike every sibling
+	// above, so a re-delivered or out-of-order report is a 0-row no-op rather than a
+	// second park.
+	SetRunLimitWait(ctx context.Context, arg store.SetRunLimitWaitParams) (int64, error)
+	PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
 	CancelRunServerSide(ctx context.Context, arg store.CancelRunServerSideParams) (int64, error)
 	RejectRunServerSide(ctx context.Context, arg store.RejectRunServerSideParams) (int64, error)
@@ -401,6 +408,18 @@ type Params struct {
 	// disabled (R2) — degraded, never wrong, and never a spend against a credential
 	// nobody chose.
 	Autoselect autoselect.Policy
+
+	// Anthropic usage-limit park (PRD #35), mirrored from config. RunLimitMaxWaits
+	// caps parks PER RUN; RunLimitMaxPark caps how far out ONE park may reach.
+	//
+	// NOTE the zero values are the SAFE direction and are not a hole, but they are
+	// not the same kind of safe. RunLimitMaxWaits == 0 means "never park", so a
+	// Params literal that omits it behaves exactly as uzi did before this feature —
+	// the run fails on a limit, now with a better reason. RunLimitMaxPark == 0 makes
+	// every computed stamp exceed the ceiling and therefore also fails the run, so
+	// the two agree; the defaults live in config.go, where the envs are read.
+	RunLimitMaxWaits int
+	RunLimitMaxPark  time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -1327,6 +1346,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:     run.RequeueCount,
 		PlanMd:           textPtr(run.PlanMd),
 		AutoApprove:      run.AutoApprove,
+		// PRD #35. Re-read from the row on EVERY claim, like AutoApprove above: a
+		// park-resume-park cycle must keep asking the row rather than remembering what
+		// the first claim said, so a per-run toggle flipped mid-flight takes effect on
+		// the next resume.
+		WaitOnLimit: run.WaitOnLimit,
+		// plan_approved is derived HERE, not by the worker (Decision 6b). Its two halves
+		// are the human one — a consumed approve_plan input, projected by
+		// GetRunClaimContext, whose comment carries the gate-bypass invariant this
+		// relies on — and autopilot, which never had a gate to pass. A resumed run uses
+		// it to skip the Phase-1 planning turn and replay plan_md; without it the resume
+		// re-plans, re-parks at awaiting_approval in front of a human who already
+		// approved, and can fail with REASON_NO_PLAN when the resumed session declines
+		// to re-emit its plan.
+		PlanApproved: run.AutoApprove || rc.HumanPlanApproved,
 		Repo: ClaimRepo{
 			ID:            uuid.UUID(run.RepoID.Bytes).String(),
 			URL:           rc.RepoWebUrl,
@@ -2150,9 +2183,20 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
 			ID:          runID, WorkerID: pgUUID(wkr.ID),
 		})
+	case "limit_wait":
+		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: sanitizeFailureReason(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			// PRD #35 §7.8: when a `failed` report carries the structured limit fields,
+			// the SERVER composes the sentence from its own allowlisted enum and replaces
+			// whatever text the worker sent. That is the opt-out path (a run with
+			// wait_on_limit=false reports failed directly), and letting the worker compose
+			// it would put the enum on the untrusted side of the wire — the criterion "a
+			// compromised worker cannot smuggle a non-enum rate_limit_type past the
+			// server" would then be false on exactly the path a human reads. When the
+			// fields are absent this is nil and every other failure path is untouched.
+			FailureReason: limitAwareFailureReason(req),
+			SessionID:     sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
 		return store.Run{}, false, ErrInvalidState
@@ -3036,7 +3080,14 @@ func stopKindFor(kind string) string {
 // the run must be assigned to a worker whose heartbeat is fresh. A queued run
 // (no worker) or a stale/absent worker means no live poller.
 func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error) {
-	if run.Status == "queued" || !run.WorkerID.Valid {
+	// PRD #35: a PARKED run has no poller either, and this check is POSITIVE — which
+	// is why it is one of the two sites in the whole PRD that genuinely needed
+	// editing, while every negative guard elsewhere covered limit_wait for free.
+	// A parked run keeps its worker_id (affinity) and that worker keeps heartbeating
+	// for its OTHER runs, so both conditions above are false and the cancel would be
+	// enqueued for a poller that is not polling this run and never will again. It
+	// would then sit unconsumed until the promotion pass, i.e. potentially for days.
+	if run.Status == "queued" || run.Status == "limit_wait" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
@@ -3072,6 +3123,11 @@ type SweepResult struct {
 	// because their message writes are in a confirmed permanent-failure loop
 	// (PRD #108 M5). Normally 0 — the candidate set is usually empty.
 	AutoStopped int64
+	// LimitPromoted is the number of runs this pass brought back from limit_wait to
+	// queued because their retry_not_before elapsed (PRD #35). Normally 0: the
+	// partial index this reads covers only parked runs, a set that is empty on a
+	// healthy instance.
+	LimitPromoted int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -3192,6 +3248,30 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 			return res, fmt.Errorf("sweep stuck confirming proposals: %w", err)
 		}
 		res.ProposalsRecovered = int64(len(recovered))
+	}
+
+	// Usage-limit promotion (PRD #35 M2): limit_wait → queued once retry_not_before
+	// has elapsed. Placed here — after the status transitions, before the
+	// prune/detector/auto-stop observability block — because Sweep's shape is
+	// "transitions first, enforcement second", and because a run promoted before the
+	// detector runs is health-visible in THIS tick rather than the next. Ordering is
+	// otherwise free: every other pass is disjoint from limit_wait as a source and
+	// from queued as a target.
+	//
+	// No persistFail.evict here, unlike the stale-worker requeue above. autoStopWedgedRuns
+	// already evicts on `run.Status != "running"`, which a parked run satisfied for the
+	// whole park, so the streak is long gone by the time this fires.
+	promoted, err := s.q.PromoteLimitWaitRuns(ctx, pgTime(now))
+	if err != nil {
+		return res, fmt.Errorf("promote limit-wait runs: %w", err)
+	}
+	res.LimitPromoted = int64(len(promoted))
+	for _, r := range promoted {
+		// Same fan-out as every other sweep transition: the broadcaster tells live
+		// browsers, and notify moves the board card to In Progress for "queued" —
+		// identical to a requeue, which is exactly what a resume looks like from the
+		// board's point of view.
+		s.publishSwept(r.ID, r.Status)
 	}
 
 	// Bound the in-process persistence-failure tracker (PRD #108 M4). This is the

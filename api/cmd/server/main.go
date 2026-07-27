@@ -195,6 +195,10 @@ func run() error {
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
+		// PRD #35 usage-limit park. Both are server-side bounds on a WORKER-REPORTED
+		// event: the worker asks to park, the server decides for how long and how often.
+		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
+		RunLimitMaxPark:  cfg.RunLimitMaxPark,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /

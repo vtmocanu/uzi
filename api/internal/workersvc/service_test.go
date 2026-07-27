@@ -251,6 +251,18 @@ type fakeStore struct {
 	pendingProposalCount int64
 	createdProposal      *store.CreateIssueProposalParams
 	sweptStuckProposals  []uuid.UUID
+
+	// PRD #35 usage-limit park. setLimitWait captures the park params (which is where
+	// the computed retry_not_before is asserted); setLimitWaitRows models the SQL's
+	// POSITIVE source guard, so 0 means "the guard refused" and the service must map
+	// that to applied=false rather than to a park. promoteLimitWaitAt records every
+	// `now` the sweeper passed the promotion pass.
+	setLimitWait        *store.SetRunLimitWaitParams
+	setLimitWaitRows    int64
+	setLimitWaitErr     error
+	promotedLimitWait   []store.PromoteLimitWaitRunsRow
+	promoteLimitWaitErr error
+	promoteLimitWaitAt  []pgtype.Timestamptz
 }
 
 func (f *fakeStore) SweepStuckConfirmingProposals(context.Context, pgtype.Timestamptz) ([]uuid.UUID, error) {
@@ -464,6 +476,20 @@ func (f *fakeStore) SetRunCompleted(_ context.Context, arg store.SetRunCompleted
 func (f *fakeStore) SetRunFailed(_ context.Context, arg store.SetRunFailedParams) (int64, error) {
 	f.setFailed = &arg
 	return 1, nil
+}
+
+// PRD #35. setLimitWaitRows defaults to 0, which is the SQL guard refusing — so a
+// fixture that wants a park to land must say so, and one that says nothing gets the
+// no-op. That is the safe default for a fake whose real query carries a positive
+// source guard.
+func (f *fakeStore) SetRunLimitWait(_ context.Context, arg store.SetRunLimitWaitParams) (int64, error) {
+	f.setLimitWait = &arg
+	return f.setLimitWaitRows, f.setLimitWaitErr
+}
+
+func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error) {
+	f.promoteLimitWaitAt = append(f.promoteLimitWaitAt, now)
+	return f.promotedLimitWait, f.promoteLimitWaitErr
 }
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil
