@@ -1,7 +1,11 @@
 # PRD #121: Pre-provision cloned-repo JS deps before the agent works (+ pre-scan accuracy + gate honesty)
 
 **GitLab Issue**: [#121](https://gitlab.example.com/vtmocanu/uzi/-/issues/121)
-**Status**: **Implemented, awaiting the acceptance run (2026-07-27).** M1, M2, M3 and M6 are done and in MR !119. **M4 is SPLIT OUT** into its own increment (see its milestone entry). **M5 is the acceptance run and has NOT happened** — it needs the worker image built and deployed, and a green `./e2e/run-e2e.sh` does **not** substitute for it (the harness runs `UZI_E2E_EXECUTOR=stub`, so it executed zero lines of the agent-side change). This PRD therefore stays in `prds/` rather than moving to `prds/done/`: the repo's archive convention is that the acceptance run has been performed, and it has not.
+**Status**: **COMPLETE (2026-07-27).** M1, M2, M3 and M6 shipped in v0.11.9; **M5, the acceptance run, is satisfied** on run `71d83432` against a worker verified to be running this code (see its milestone entry for the measured evidence). **M4 is SPLIT OUT** into its own increment and is deliberately not delivered here.
+
+*It took two acceptance runs, and the first is the more instructive: every mechanism worked and the benefit was still lost, because nothing told the agent its dependencies already existed. Fixed by issue #157 and shipped in v0.11.11.*
+
+*The substantive output was never the feature. The PRD's Trust posture premise — that a frozen `--ignore-scripts` install runs no repo-authored code — was found **FALSE for yarn and pnpm**, measured, and that section is rewritten. `specs/human.md` carries the resulting constraint as user-ratified contract.*
 
 *The substantive output of implementation was not the feature. The PRD's Trust posture premise — that a frozen `--ignore-scripts` install runs no repo-authored code — was found **FALSE for yarn and pnpm**, measured, and that section is rewritten. `specs/human.md` now carries the resulting constraint as user-ratified contract.*
 
@@ -173,7 +177,7 @@ Three coherent parts (the same judge reviews flagged all three):
   thing M4 ships), and it yields zero gates from "I'll run the repo's test suites", passing
   **vacuously** — the precise failure M4 exists to prevent. Full design preserved for the
   follow-up increment.
-- [ ] **M5 — Verified on a real JS run.** A run touching `web/` completes with the
+- [x] **M5 — Verified on a real JS run.** A run touching `web/` completes with the
   agent never hitting `command not found` for a gate tool and never running a
   manual `npm ci`; the judge pre-scan no longer false-flags tsc/vitest. Capture
   the evidence (activity log / review).
@@ -192,6 +196,41 @@ Three coherent parts (the same judge reviews flagged all three):
   sitting next to a PRD whose headline criterion is about agent behaviour is precisely the
   artifact a later reader cites as proof — and it would be a false claim, from a genuinely
   green gate, with nothing in the gate's own output to reveal it.
+
+  **→ SATISFIED 2026-07-27, on run `71d83432` (issue #116), against a worker verified to be
+  running this code.** Both criteria measured on the complete 887-message trace:
+
+  | criterion | result |
+  |---|---|
+  | zero agent-initiated `npm ci` | **0** install commands, whole run |
+  | zero gate-tool `command not found` | **0** real failures |
+  | provisioning fired | `seq 3` kick-off → `seq 67` *"installed JS dependencies in agent, web"* |
+
+  The agent ran roughly 45 gate invocations across **both** provisioned workspaces (`npm test`,
+  `npm run typecheck`, `npx vitest`, `npm run build` in `web/`; `npm test`, `npm run typecheck`,
+  `node --test` in `agent/`) without a missing tool and without preceding any of them with an
+  install. Issue #116 was chosen over a web-only PRD precisely so both workspaces would be
+  exercised.
+
+  **The deploy chain was verified link by link rather than assumed**: tag `v0.11.11` → commit
+  `4ab9d58d` → worker reporting `0.11.11+g4ab9d58d`, with the #157 merge confirmed an ancestor
+  of the tagged tree.
+
+  **This took two runs, and the first one is the more instructive.** On v0.11.9 the install
+  worked perfectly — both workspaces provisioned before the agent's first tool call, zero
+  gate-tool `command not found` — and the agent ran `npm ci` twice anyway, because **nothing
+  told it the deps existed**. Its plan said *"npm ci (fresh worktree has empty node_modules)"*,
+  which was true when written: the plan turn precedes the join. Since `npm ci` deletes
+  `node_modules` first, it destroyed the provisioned tree and rebuilt it, so the feature's
+  entire wall-clock benefit was lost while every mechanism in it worked. Issue #157 fixed the
+  missing half by telling the agent, and this run's plan never mentions an install.
+
+  **One methodology note, because an instrument lied during the analysis.** An interim pass
+  flagged `eslint: not found` and it was uzi's own fixture text at
+  `judge_prescan_test.go:164` — the agent was *reading* the PRD #121 pre-scan tests. A regex
+  over message payloads cannot distinguish a shell error from source quoting one. The verdict
+  above counts only `tool_result` entries with `is_error: true`, which cannot match source
+  text. **A weaker instrument would have failed this milestone on a false positive.**
 
   What e2e *did* prove is worth stating so the run is not dismissed either: the judge funnel
   is still full-wire green with the widened `ListToolTraceForRun` inside `judgeSignal`, and

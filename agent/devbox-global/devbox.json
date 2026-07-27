@@ -94,14 +94,38 @@
   // shell breakage appears after this rolls, `coreutils` is the first suspect and the
   // cheapest of the three to drop — `fmt` is the least valuable of them.
   //
-  // Verified at the pinned rev before adding (x86_64-linux eval + a live arm64-linux
-  // `devbox install` inside the built agent image, 2026-07-27):
-  //   * meta.outputsToInstall is ["out","man"] / ["out","man"] / ["out"] — all three carry
-  //     `out`, so they do NOT hit the openssl split-output trap above and stay bare attrs.
-  //   * each ships its binary: bin/file, bin/perl, bin/fmt. Exercised from the resulting
-  //     profile: `file --version` → file-5.48, `perl -e` runs, `fmt -w 20` rewraps.
-  //   * all three narinfos are HTTP 200 on cache.nixos.org, so CI's amd64-only kaniko
-  //     build substitutes them rather than compiling.
+  // `file` MUST be `file.out`, for the same reason openssl must be `openssl.bin` — and this
+  // one was learned the expensive way, so read it before adding any multi-output package.
+  //
+  // CORRECTION (2026-07-27, same day): this block previously read "meta.outputsToInstall is
+  // ["out","man"] / ["out","man"] / ["out"] — all three carry `out`, so they do NOT hit the
+  // openssl split-output trap above and stay bare attrs." The premise is true and the
+  // CONCLUSION IS FALSE. `meta.outputsToInstall` is a nixpkgs attribute; it is NOT what
+  // devbox's resolver uses. Measured: with a bare `file`, `devbox global install` exits 0
+  // and the realized profile manifest carries `file-5.48-DEV` — the headers/libmagic
+  // output, which contains no `bin/file` at all. The profile therefore has no `file`, and
+  // `command -v file` 127s in the image.
+  //
+  // 0.11.11 SHIPPED `file` BROKEN because of this. Two things hid it: `devbox global
+  // install` reports success, and a project-scope `devbox install` + `devbox run` (how it
+  // was first "verified") puts the raw /nix/store path on PATH, so `file` resolved there
+  // while being absent from the profile the image actually uses. The tell was visible and
+  // missed — the other four resolved under `.devbox/nix/profile/default/bin` and `file`
+  // resolved under `/nix/store/...`. Verify a package against the PROFILE
+  // (`readlink -f .devbox/nix/profile/default` then `ls bin/`), never against `command -v`
+  // inside `devbox run`.
+  //
+  // Caught by the build guard's first real run (agent/devbox-global/assert-toolchain.sh),
+  // which is the entire argument for that guard existing.
+  //
+  // Verified at the pinned rev (x86_64-linux eval + live arm64-linux `devbox global
+  // install` into the profile, 2026-07-27):
+  //   * `file.out`, `perl`, `coreutils`, `kubernetes-helm` and `kubeconform` all land
+  //     bin/file, bin/perl, bin/fmt, bin/helm and bin/kubeconform IN THE PROFILE.
+  //   * exercised from that profile: `file --version` → file-5.48, `perl -e` runs,
+  //     `fmt -w 20` rewraps, `helm version --short` → v4.2.3, `kubeconform -v` → v0.7.0.
+  //   * all narinfos are HTTP 200 on cache.nixos.org, so CI's amd64-only kaniko build
+  //     substitutes them rather than compiling.
   //
   // NOTE (as load-bearing as the openssl one): write them BARE, never `file@latest`. A
   // plain `devbox add file perl coreutils` resolves through devbox-search, which pins each
@@ -163,7 +187,7 @@
     "fontconfig",
     "dejavu_fonts",
     "openssl.bin",
-    "file",
+    "file.out",
     "perl",
     "coreutils",
     "kubernetes-helm",

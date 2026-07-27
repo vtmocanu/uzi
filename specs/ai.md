@@ -12336,6 +12336,471 @@ Two things worth keeping:
   register as `--ignore-scripts` in §398 — say what was measured, and say what rests on an
   assumption.
 
+## 418. PRD #116 — a THIRD result state, "blocked", decided at render time and nowhere else
+
+A PreToolUse denial is the guardrail working as designed, and the agent recovers from it, so painting
+it red made healthy runs look broken. The live case (#115): the lead's `Explore` spawn was denied, it
+used `researcher` instead, the run finished fine — and the feed showed a red "✗ error". So
+`tool_result` now has three presentation states, not two: an exported pure
+`classifyResultState(isError, text): "ok" | "error" | "blocked"` in `web/src/components/RunEvent.tsx`.
+A denial renders a neutral chip with a warn-tinted `⊘` glyph and starts **collapsed**; a genuine error
+keeps the red `✗` and still auto-expands, because that one still wants attention.
+
+- **What it keys off, and why the anchor is per LINE.** All 15 deny reasons in
+  `agent/src/guardrails.ts` carry the phrase `"denied by guardrail"`. The web requires that phrase to
+  START one of the text's lines, after leading whitespace and an optional `<tool_use_error>` open tag.
+  Neither of the two obvious tests is right. `startsWith` over the whole text fails an SDK wrapper and
+  a denial that is one of several content blocks `resultToText` joins with `\n` — and note it must be
+  the PHRASE it anchors on, not "phrase + colon", because the two `?? "denied by guardrail"` fallbacks
+  have no colon to anchor on. But a plain `.includes` — which is what this shipped
+  as first, and what the PRD recommends — over-matches in a way this very change made likelier: a
+  genuinely FAILING command whose output quotes the phrase would render calm and collapsed, and the
+  concrete case is our own gate, since a red `cd agent && npm test` prints `node --test` titles like
+  ``ok 14 - the ".git access" deny reason starts with "denied by guardrail"``. That is the PRD's own
+  "under-alarming a real problem" risk arriving for real, so the anchor moved to the line, which
+  satisfies every real shape while a mid-line mention stays red. `web/` and `agent/` are separate
+  npm packages, so the phrase cannot be imported; the coupling is pinned from the **agent** side by
+  `agent/test/guardrails.test.ts`, both behaviourally (all 15 deny paths driven through the public
+  API — the constants are module-private — asserting 15 *distinct* reasons, so the table cannot be
+  fifteen copies of one path) and structurally (a source scan of the `REASON_*` literals, so a FUTURE
+  16th reason added without the phrase fails too, which the behavioural half can never cover). Both
+  agent-side assertions are `startsWith`, stricter than what the web needs on purpose: the web
+  tolerates a wrapper it does not control, the agent promises text it does.
+
+- **`is_error` stays TRUE. This is presentation-only.** The persisted `run_messages` frame stays
+  honest to exactly what the SDK emitted — and historical frames cannot be rewritten anyway. **The
+  guarantee that nothing downstream shifts comes from the frame being UNCHANGED, not from nobody
+  reading it, and the difference matters.** It is tempting to record that a `tool_result` block's
+  `is_error` is read only by the renderer — the PRD says so, inheriting a pre-#121 survey — and it is
+  false: `api/internal/workersvc/judge.go`'s `toolResultOutcome` parses that exact field, feeding
+  `observedGreenTools`, which is what suppresses a missing-tool finding when the run demonstrably ran
+  the tool. (`isErrorResult` in `agent/src/sdk-messages.ts` genuinely does only inspect the terminal
+  `type:"result"` frame — that part of the survey holds; it is the "and nothing else" that does not.)
+  Recorded because that sentence is precisely what would license the tempting simplification of
+  flipping a denial to non-error at the source — after which a guardrail-denied Bash result would
+  count as green evidence that its command ran, silently suppressing the missing-tool flag PRD #121
+  exists to raise. Detection being render-time is also what gives historical runs
+  the calm chip for free: no persisted marker, no migration, and `ChatMessages` inherits it because it
+  renders through the same row.
+
+- **The honest limit, and how close it actually is.** The phrase coupling is real: if the pinned
+  claude-agent-sdk moved the PreToolUse-deny path onto its `<tool_use_error>` wrapper AND changed the
+  text, every blocked chip would silently revert to red with no test failing on the web side — and
+  nobody would notice, because the run still works. **The nearer miss is not the wrapper, though, and
+  it is one line of SDK code wide.** That same pinned binary builds a PREFIXED form of the very same
+  denial — `` `${hookName} hook error: ${reason}` `` — and yields it immediately BEFORE the raw-reason
+  one; the bare reason reaches the `tool_result` only because the consumer keeps the last yield.
+  Reorder those two, or drop the second, and every denial arrives mid-line. A line anchor is *more*
+  exposed to that than `.includes` was, which is why the hook-error preamble is stripped alongside the
+  wrapper — cheap mitigations, chosen with eyes open, not a close. It is also a stronger argument for
+  the structured marker below than the wrapper risk is. The durable fix, if it ever regresses, is the structured marker the PRD documents as
+  the alternative: tag the message at `agent/src/sdk-messages.ts` `mapUser` with an additive
+  `denied: true` through the opaque `jsonb` payload. Deliberately NOT built now — it touches agent,
+  protocol and web for a cosmetic change.
+
+## 419. Issue #145 — pod `Ready` is not health, and the pod itself already carries the health signal
+
+**The decision, and it reverses a recommendation the repo owner wrote in a comment on the issue, on
+measurement.** A Ready pod is **not settled** while one of its containers is **flapping**: at least
+`stuckRestartThreshold` (3) restarts **and** the current instance up less than `flapWindow`
+(10 minutes). The worker's own heartbeat is **NOT** usable for this. The owner's comment recommended
+heartbeat correlation ("pod Ready + worker `offline` after `RegisterConvergenceGrace`"); the
+measurement said it does not fire; the owner adopted the controller-side rule instead. **The binding
+decision is the owner's and the evidence that moved it is the team's**, which is why the refutation
+was posted as a comment on #145 rather than left on the branch — a decision record that contradicts a
+public recommendation must be reachable from where the recommendation lives.
+
+The rule reads pod status only, which `deriveRollHealth` already receives in full: no signature
+change, no `DesiredWorker` field, no `PollResponse` change, no wire golden moved, no SQL, no
+migration.
+
+### Why the heartbeat rule was rejected — two independent reasons, and one of them has a bound
+
+- **MEASURED: 0 fires in 123 samples** of real kubelet state from a container that becomes Ready and
+  then crash-loops. Dropping the grace conjunct takes it 0 → 1, so the grace is not what kills it.
+- **The two signals are anti-correlated.** No readiness probe on the worker container ⟹ `Ready` means
+  the container is Running ⟹ the node process is alive (`entrypoint.sh` `exec`s to it) ⟹ it beat
+  within its 15s interval ⟹ not `offline`. The heartbeat only goes stale during the
+  `CrashLoopBackOff` backoff, when the pod is **not** Ready and the existing arms already fire. The
+  repo asserted the same thing from the other end, unread, in `RegisterWorker`'s own comment about a
+  crash-looping agent re-registering on every start.
+- **⚠ "By construction" is NOT unconditional and the first version of the banner said it was.** The
+  chain depends on the worker registering inside the 45s stale window — measured at 1.9s and 1.809s
+  on two pods across two ReplicaSets, bounded at ~32s by `UZI_DOCKER_READY_TIMEOUT`, which is
+  env-tunable and **pinned by nothing**. Raise it past 45s and the anti-correlation weakens and this
+  advice expires. The heartbeat half of the measurement is also a **MODEL** — the sampled pod was a
+  busybox flapper, not the agent — parameterised by measured numbers and deliberately generous to the
+  rule under test. It still fired zero times.
+- **`PhaseSince` resets on every restart, and this reason holds unconditionally.** It is the Ready
+  condition's `LastTransitionTime` (`readyCondition`, assigned on the settled path). Measured across
+  **every pod on the cluster carrying both a restart and a Ready condition** — a whole-cluster
+  snapshot, 135 pods scanned, four specimens. The values are inline because the capture was
+  session-local and this file is not:
+
+  ```
+  kube-system/kube-controller-manager-…-lkzzq      1 restart     Ready = finishedAt + 23s
+  kube-system/kube-controller-manager-…-vvmxm      1 restart     Ready = finishedAt + 13s
+  prod-apps/legacy-web-app-…      115 restarts  Ready = finishedAt +  2s
+  cloud-provider-system/guest-cluster-…     1 restart     Ready = finishedAt +  1s
+  ```
+
+  In all four the transition sits 1 to 23 seconds after `lastState.terminated.finishedAt` and never
+  near `pod.startTime`. **The 115-restart row is decisive:** pod `startTime` 2026-02-12, Ready
+  transition 2026-07-26 — five months later, two seconds after the last termination. So on a flapping
+  pod `now - PhaseSince` is bounded by the container's alive time, and "after
+  `RegisterConvergenceGrace` has elapsed" is never true.
+- **Unplanned cross-path corroboration, and it is the strongest single observation in the run.** The
+  database's `worker_upgrade_reports.phase_since` for the measured worker reads `11:07:11+00`,
+  **identical to the `Ready` condition timestamp read directly off the pod through the apiserver**.
+  Two observers on entirely separate paths — the kubelet's own condition, and the controller's
+  derivation of it POSTed through the wire contract and persisted — agreeing to the second. It
+  confirms both that `PhaseSince` really is the Ready transition and that the register-gap
+  measurement was anchored on the right field.
+
+**The measurement the issue demanded as a precondition** was the 45s-vs-5m interaction, so a
+legitimate roll could not read as failure: pod Ready → worker registered is ~2s, bounded ~32s. The
+reasoning originally offered for *skipping* that measurement — "the pod is not Ready during that
+window" — was **wrong in detail and right in conclusion**: the pod is not Ready for the *preceding*
+~2 minutes of init containers, and the post-Ready gap is the ~2s above. Worth keeping as an instance
+of a correct conclusion reached through a false mechanism, which is the class this branch kept
+producing.
+
+### Why not the api side — two reasons beyond the 0/123
+
+1. **It cannot be built in the controller at all.** `PollResponse.DesiredWorker` carries id,
+   template, size, docker, generation and join token — no status, no `last_heartbeat_at` — and
+   `protocol.go` states the controller may not touch a worker's online/offline status. Heartbeat
+   correlation there means putting api liveness on the poll wire and reading it back.
+2. **Placed in the api, it introduces a fleet-wide PERMANENT cry-wolf path.** `registerWithRetry`
+   catches every error and retries forever with no give-up path, and `MarkStaleWorkersOffline` is
+   `WHERE status = 'online'`, so a worker that never reached `online` stays `offline` indefinitely. A
+   worker whose registration is *rejected* stays alive, Ready and permanently `offline` while the
+   controller's signal stays fresh over a separate path. The causes are non-transient and fleet-wide
+   (`UZI_SECRET_KEY` rotation, join-token change, NetworkPolicy or DNS), so every hosted worker would
+   badge `upgrade_failed` at once, for an auth incident. A live specimen sat in exactly that state:
+
+   ```
+   worker d26fb0f9   status=offline   version=''   last_heartbeat_at=NULL
+   created 2026-07-26 20:10, still in that state at 2026-07-27 12:20 — 16 hours
+   ```
+
+   **The 16 hours is the load-bearing part, and the mechanism goes with it:** because
+   `MarkStaleWorkersOffline` is `WHERE status = 'online'`, that row has **never once reached
+   `'online'`**, so nothing in the sweeper can ever touch it. It is not a worker that went offline; it
+   is a worker the offline path cannot reach. **So the issue's "no permanent-red failure mode" claim
+   is true of its mechanism and false as a safety property.**
+
+### The guard is at the ENTRY, and that placement is the commit's most important property
+
+`flappingContainer` gates entry into the fall-through; it is not an arm inside the switch and not a
+check bolted onto `case health.RestartCount >= stuckRestartThreshold`. That arm reads the kubelet's
+**lifetime** counter, so gating there would let a Ready pod with 3 accumulated restarts and days of
+uptime report `stuck` — and since #151 removed the INV-5 ceiling from R1 (§402), that red never
+expires. With the guard at the entry a healthy worker with 5 lifetime restarts never reaches the
+switch at all.
+
+**The assertion that separates the two placements was measured VACUOUS on its own.** `Ready + 5
+restarts + up 10m1s → settled` passes against a build whose guard never fires — with
+`flappingContainer` stubbed to nil it does not appear in the failure list at all. Its complement
+(`up 9m59s → NOT settled`, every other input identical) fails there. **The pair's disagreement is the
+signal; either alone is satisfiable by a build that ignores the conjunct.** The same shape applies to
+the constant itself: expressing the boundary as `flapWindow ± time.Second` pins the comparison but
+not the NUMBER — halving the constant left the whole suite green — so literal 9m and 11m cases
+bracket it.
+
+**The mutation matrix gives those gaps their real cost, and it is the argument for why the guards
+needed their own fixtures rather than riding on the trajectory tests.** Before the pins landed the
+suite tolerated **any `flapWindow` above 30 seconds** — 31 seconds, one hour, one year, all green —
+and the lower bound came from one fixture's literal 30s uptime rather than from any assertion about
+the value. Driven end to end, with the suite green, those wrong constants would have shown a user:
+
+- `flapWindow = 24h`: a worker with 5 restarts, currently up 11 minutes, badges `Upgrade failed`. A
+  false red expiring only after a day of continuous uptime.
+- the defensive `if t.IsZero() { t = now }` tidy on the nil-`Running` skip: a **healthy** worker whose
+  `seed-nix` retried 5× and then **succeeded**, agent clean for two hours, badges
+  `Upgrade failed — seed-nix: Completed (5 restarts, last exit 0)`. **The real 133-tick trajectory is
+  bit-identical under this fold**, so no test watching the crash loop could ever have seen it.
+
+That last one is the sharpest result in the whole run: a trajectory test over real samples is not
+coverage of a guard whose whole job is a case the trajectory does not contain.
+
+- **`flapWindow` is its own constant, equal to `stuckAge` by coincidence of value and not of
+  meaning.** `stuckAge` bounds how long a *reasonless pod* may sit before it is called stuck; this
+  bounds how recently a *container* must have restarted for a live restart loop to still count as
+  one. It is deliberately not part of the `ControllerStuckAge` relationship — nothing api-side
+  mirrors it, and nothing should. **That absence is a consequence of #151, not a property of the
+  constant:** if R1 were ever ceiling-gated again, `flapWindow` would join that relationship and need
+  the same clamp. It is also the SOLE expiry of the alert it produces.
+- **`up >= 0` rejects negative uptime**, which is what clock skew between the stamping kubelet and
+  the controller produces; negative < `flapWindow` is true, so an unguarded comparison reads a clock
+  disagreement as a restart loop. The justification is not "the bound is small": one controller clock
+  serves the whole fleet, so the pre-fix direction is a **correlated fleet-wide false alert** — the
+  same anti-cry-wolf objection that ruled out the api-side design — while the post-fix direction is a
+  per-container missed alert on a worker already broken and already unalerted. **And the skew bound
+  is not only benign**, which the first wording implied: shifting a window also shifts things OUT of
+  it. Measured against a 40s flapper, the exclusion goes **permanent** once skew exceeds the
+  container's per-instance uptime — 60s, not some large number — because a flapper's instance uptime
+  never grows.
+- **Ruling 3(b): the controller supplies `"Restarting"` when even the last termination has no
+  reason**, confined to this arm. A Ready-but-flapping pod has no current-state reason, and the api's
+  `stuckDetail` would otherwise substitute "not ready" about a pod that is Ready. It is a
+  controller-authored token in a field that elsewhere carries kubelet's own words, which is why it is
+  not widened; it is safe against the switch because neither it nor a last-termination reason is in
+  `blockingReasons`, so the verdict still comes from the restart arm.
+- **Owner's ruling: scan ALL containers, with the consequence stated in the option chosen** — a
+  flapping `dind` sidecar answers for the worker. Scanning only `worker` leaves a pod wedged by a
+  flapping sidecar reporting `settled`, which is the same class of bug #145 reports, and if every
+  worker really is broken then badging every worker is true. `seed-nix` is a plain init container, so
+  a `State.Running == nil` container is present on every healthy worker pod for its whole
+  post-startup life: the nil skip is exercised fleet-wide on every tick, not as an edge case.
+- **Permanence is bounded to genuine crash-loops, and the two halves of that claim have different
+  warrants.** `RestartCount` is monotonic per pod, so the recency conjunct is the only thing that
+  ever clears. **MEASURED:** the pod's inventory is `worker`, `seed-nix`, `dind`, `dind-init`, and
+  there are no liveness or readiness probes anywhere under `controller/` — only two dind
+  `StartupProbe`s, and a StartupProbe failure kills rather than flaps. **REASONED, NOT MEASURED:**
+  that nothing exits on a sub-10-minute cadence. That is an inference from those containers' design
+  intent — nobody watched them over time — and it is the load-bearing half. A future report of a
+  periodically exiting sidecar invalidates it rather than surprising it.
+- **🔴 THE SLOW CRASH LOOP IS INVISIBLE, AT EVERY SHA, AND IT IS A WORSE WORKER THAN THE ONE #145
+  REPORTED.** Measured end to end: a worker with 20 restarts, currently up 11 minutes, on roughly a
+  15-minute death cycle renders `up to date` with no attention strip — before this fix and after it.
+  **This is the design's stated limit, not a defect**, and the owner confirmed it is recorded as a
+  known bound rather than filed as an issue. The reason it cannot simply be fixed is that the recency
+  conjunct is **simultaneously** what stops a healthy worker being pinned permanently red and what
+  makes a slow loop invisible: at a fixed window you cannot keep one without the other. Whoever next
+  touches `flapWindow` is trading directly between these two, and should know that is the trade.
+
+### The data-integrity half: a report must not blank fields it did not measure
+
+The four diagnostic columns move as a GROUP under `CASE WHEN EXCLUDED.phase IN ('rolling','stuck')`.
+**The PHASE is the discriminator because the phase is what decides whether the lookup ran:** a
+`rolling`/`stuck` report carrying zeros looked and found nothing to blame, which is an observation; a
+`settled` report never looked. The predicate is repeated verbatim in each arm and that identity *is*
+the atomicity. The ReplicaFailure branch is the grouping's strongest argument rather than an
+exception to it: it sets a reason ALONE, with no container, no count and no exit code.
+
+**The clear rides the version move.** `RegisterWorker`'s existing `cleared` CTE had its guard widened
+from `upgrading_since IS NOT NULL` to "the anchor is set OR any of the four diagnostics is present",
+and the four columns joined the same `SET` — **one statement, one guard, sharing the anchor's single
+version-move predicate, NOT a predicate of their own.** A wider guard is a bigger blast radius than a
+separate predicate, not a smaller one, which is why the live-DB test *constructs* a NULL-anchor row
+carrying diagnostics rather than waiting for one to become reachable. **Measured on real Postgres: a
+real release move is required** — `0.11.0→0.11.0` clears nothing, `0.11.0→0.11.0+gabc` (build
+metadata only) clears nothing, `0.11.0→0.11.9` clears — **so the crash-loop re-register loop cannot
+blank the row, and the issue's own mechanism cannot be turned against its fix.** INV-5 is not
+weakened: every row the widened guard newly matches has `upgrading_since IS NULL` by construction, so
+`SET upgrading_since = NULL` is a no-op on exactly those rows, proven structurally and measured.
+
+**Two rejected shapes, each with the measurement that rejected it:**
+
+- **Per-column `COALESCE`, rejected twice over.** `restart_count` is `integer NOT NULL DEFAULT 0`
+  taken as `@restart_count` rather than `sqlc.narg`, so `EXCLUDED.restart_count` is never NULL and a
+  `COALESCE` arm on it is a **silent no-op** — the three nullable siblings would look fixed while the
+  field in the issue's own headline ("5 restarts AND exit 1") stayed wiped. Per-column preservation
+  also mixes fields from different reports into one row.
+- **Payload-conditional preservation ("preserve when the report carries nothing") shipped, was
+  measured to leak, and was reverted.** The all-zero `rolling` report is the ORDINARY case — the
+  Recreate gap, the stale-pod-only branch and a healthy pod that is simply not Ready yet all return
+  it. Measured through the real classifier: `detail="CrashLoopBackOff"` with preservation against
+  `detail="Pending"` without.
+- **The leak instance the commit message under-describes.** The **reasonless `stuck` age arm**
+  (Pending/FailedScheduling, no container statuses) also emits an all-zero block, and because that
+  path IS `upgrade_failed`, `workerDTOFromRow`'s gate **opens** — so all three gated
+  `upgrade_blocking_*` fields leaked too, and the full attention strip rendered a previous pod's
+  container, reason and exit code **for a worker whose actual problem was that it never got
+  scheduled**. A confidently wrong diagnosis routing an operator to `kubectl logs` on an innocent
+  container. The commit message describes only the rolling/tooltip instance, and its sentence that
+  the detail string "is NOT gated the way the three `blocking_*` DTO fields are" is true and
+  **incomplete**.
+
+Reachability worth keeping, because it decides what a leak costs: `upgrade_detail` is rendered with
+**no** status gate (the badge sets `title` from it for every status with a presentation entry,
+`upgrading` included, so a leak surfaces as a tooltip); the three `upgrade_blocking_*` DTO fields ARE
+gated on `upgrade_failed`; `likelyCause` is fed from the gated fields and was therefore never
+exposed; and **`restart_count` has no gated DTO field at all**, so the ungated `upgrade_detail`
+string is that column's only route to a human.
+
+**A requirement the team carried for hours, retired by measurement.** Commit 1's comment predicted
+that "commit 2 is what makes any of this displayable; the detail string it feeds must then not
+present a pinned older observation as a current one." The commit 2 that landed does the opposite: R1
+gates `upgrade_failed` on `stuck`, the predicate writes EXCLUDED for every `rolling`/`stuck` report
+so a `stuck` row's block is always its own measurement, a preserved block exists only on a `settled`
+row, and `settled` yields at most `upgrading` via R3. **No phase can open the gate with a preserved
+block, and commit 2 made preserved blocks LESS reachable, not more.** Commit 1's remaining value is
+DB-level data integrity — the row keeps the incident for whoever reads the table, which is exactly
+what the issue complained about. Only the near-term rendering payoff was overstated.
+
+**And commit 1 alone is invisible to a user — measured through the chain, not argued.** Two ticks on
+one worker row (stuck with 5 restarts and exit 1, then recovered): the database **keeps** the
+diagnostics, which is commit 1 working, while the browser receives `up_to_date`,
+`upgrade_detail=null` and all three `upgrade_blocking_*` null, because they are gated on
+`upgrade_failed`. The wipe fix is realized to a human only through a later `stuck` tick. Commit 1's
+own message predicted this; it is now measured end to end rather than reasoned.
+
+### The headline criterion is MEASURED END TO END, and the flicker is gone at the BADGE
+
+This is the only measurement of the thing the issue actually complained about, and the distinction
+between phase and badge is the point: the complaint was a **user-visible** flicker. The whole chain
+was driven with **shipped code at every stage** — `deriveRollHealth` → the real `reconcile.Loop`
+report mapper (so the wire bytes are what the controller would POST) → `handler.ControllerStatus` →
+`UpsertWorkerRollHealth` against a **live Postgres** → `ListWorkersByUser` → `workerDTOFromRow` →
+`ClassifyUpgradeWithTarget` → the badge components under jsdom, over 133 real
+`kubectl get pod -o json` samples of the crash-looping pod, each sample's own capture time as `now`.
+
+```
+tree                        up_to_date  upgrading  upgrade_failed  badge transitions
+pre-fix (commit 1 only)         41          5            87              12
+with commit 2                   18          5           110               4
+```
+
+Rendered strip on a real tick: `Upgrade failed / worker: CrashLoopBackOff (6 restarts, last exit 1)`.
+**Positive control:** the identical probe against the pre-fix parent, where all 15 hostile fixtures
+report `settled` with zeroed diagnostics — so the green is a real result rather than an instrument
+that cannot fire.
+
+**What the instrument could NOT show, recorded because a validation's bounds are part of its
+result.** No live cluster and no live agent: the trajectory is a busybox flapper's real kubelet
+state, and the agent was never the subject. One pod and one worker, so nothing here measures a fleet
+or concurrent rolls. HTTP routing and auth were bypassed — `RequireController`, the chi routes and
+the browser fetch are untested. **jsdom proves the string is in the DOM, not that a human can read
+it**: no layout, no contrast, no screen reader. And the CLI is untested end to end.
+
+> **One claim about the CLI does not reproduce and is corrected here rather than repeated.** It was
+> relayed that `api/cmd/uzi/worker.go` prints `upgrade_detail` into a terminal, so #159's mis-named
+> container reaches operators that way. It does not: `uzi worker list`'s table renders
+> `upgradeCell(w)`, which switches on `UpgradeStatus` alone and never touches the detail string. The
+> substance survives by a different route — the same command under `--json` serializes the whole
+> `WorkerDTO`, detail included, and that is the form built for agents to parse. Wrong mechanism,
+> right conclusion, which is this branch's own recurring shape arriving one more time.
+
+**A denominator difference that is NOT a conflict — recorded so nobody "reconciles" it later.** The
+design and the public comment compute over a **123-sample** subset; the end-to-end validation
+computes over **133**; the directory holds 134 files, one caught mid-write and empty. **All of them
+agree the Ready/running sample count is 41**, which is the numerator every rate depends on, so no
+published figure moves. Different totals over the same meaningful subset.
+
+**The durable half of the method is the provenance table, and it was earned rather than reasoned.**
+The architect recorded, per observation, whether it is **retained, expired, or re-observable — with
+the command to re-take each**. That practice exists because one of its own measurements **expired
+mid-review**: the pod it was taken from rolled away before anyone captured it, briefly making a
+figure published as measured unre-derivable. It was re-taken on the replacement pod, which is why the
+register gap is two samples across two ReplicaSets rather than one. **Carry the commands, not the
+files:** session scratchpads do not survive and `.claude/agent-team-tasks/` is gitignored, so any
+evidence that matters has to live inline in this file — which is why the specimen values above are
+transcribed here rather than cited.
+
+### The readiness probe, declined with a technical argument beside the security one
+
+The worker is outbound-only and `entrypoint.sh` `exec`s straight to the agent, so a probe means an
+inbound listener and a trust boundary `CLAUDE.md` says not to weaken. The measurement strengthens the
+refusal rather than softening it: a probe reports "alive", which the pod already reports, and it does
+not report "keeps dying", which the pod **also** already reports via `restartCount` and the current
+instance's uptime. **The signal was never missing; the derivation discarded it.** Only the
+alive-but-silent case would need one, an `exec` probe would suffice there, and it deserves its own
+issue.
+
+### The process finding, which is the same defect family the issue is about
+
+**Every commit-borne defect on this branch was of one family: a comment asserting a mechanism the
+code or the data does not have.** Issue #145 exists *because* of exactly that class — a
+`RegisterConvergenceGrace` comment claimed a mechanism R3's `isBehind()` guard denied it — so the
+branch reproduced its own subject matter while fixing it. Several instances were authored by the
+commit correcting the previous one; several named a **mutation that was not the one actually run**
+(a nil-check deletion described as reading a zero time, measured to PANIC — the silent symptom needs
+the larger restructure-then-default edit); and two were the **lead's**, which is worth recording
+because nobody reviews the lead's messages.
+
+**Do not carry the count.** It was reported as five, then seven, then ten, growing every time a new
+reader looked — the instability is the finding, and any figure written here would be one more claim
+outliving its evidence.
+
+**The load-bearing lesson, in the coder's words: on this branch, self-review caught zero of them.**
+Every instance was caught by a reader who was not the author, and the last several only because
+validators went back to the **raw sample files** and re-ran the mutations rather than trusting
+anyone's summary. `.claude/agent-team.md` already predicts this — the rule-holder is not the person
+best placed to notice their own instance — and the `prdpath.go` precedent had both halves in one
+file, one commit, one author. **The fix is not care, it is a second reader.** The strongest single
+instrument was a live assertion contradicting a comment: `TestWorkerRollHealthPersistenceLiveDB`'s
+`Fatalf` proves a report DOES reach the anchor, so if the comment claiming otherwise were true the
+test could not pass.
+
+**Adjacent, and it is the load-bearing form rather than the anecdote.** A concurrent-write overlap
+between two writers (a lead sequencing error) cost nothing — **not because anyone noticed in time,
+but because staging by path is unconditional**: the coder never had a code path that could stage
+another agent's file. Same shape as `CLAUDE.md`'s "name throwaways outside the `uzi-` namespace"
+being the strong rule and "be careful with globs" the weak one. A rule that removes the failure mode
+beats a rule that relies on noticing.
+
+> **⚠ AND THAT PROTECTION STOPS AT `git add` — MEASURED ON THIS BRANCH, BY THE COMMIT THAT WROTE THE
+> PARAGRAPH ABOVE.** `git add specs/ai.md` stages one path, but a bare `git commit` afterwards
+> commits **the whole index**, including whatever another agent staged in the interval. That is
+> exactly what happened here: a concurrent writer staged 135 files while this section was being
+> edited, and the follow-up commit swept all of them into a commit whose own message said "one
+> markdown file, zero code". Recovered with `git reset --soft HEAD~1` — which restores the index
+> untouched, so the other agent's staged work was handed back exactly as found — and re-committed as
+> `git commit -- specs/ai.md`, the pathspec form, which commits only that path whatever else is
+> staged. **So the durable rule is `git commit -- <path>`, not `git add <path>`**; the standing
+> instruction names only the weaker half. Recorded here because the paragraph above was the very
+> claim being written when it was falsified, which is this section's subject arriving one level up:
+> the rule-holder is not the person best placed to notice their own instance.
+>
+> **And the same shape has a third instance with NO human error in it at all, which is why it is the
+> strongest of the three.** Resolving this branch's `CHANGELOG.md` against a `main` that had cut two
+> releases in the interval, a three-way merge placed an `[Unreleased]` entry **inside a shipped
+> release** — because it matched on the `### Fixed` heading, a heading being what it matches on,
+> rather than on the release section the entry belongs to. Green, silent, and correct by its own
+> rules. **Git's unit of matching is not the author's unit of meaning.** In the other two instances
+> "be more careful" is at least available as a wrong answer; here it is not, which is what makes the
+> class worth naming rather than the incidents.
+
+**A published figure was wrong before it was re-derived, and the correction is the record.** The
+design said the rule fires on 33 of 41 `settled` ticks; replaying the identical 123 samples through
+the *shipped* code gives **23**. The 33 came from a probe counter **two design generations behind**,
+carrying neither the restart-count conjunct nor the current recency anchor — dropping only the
+conjunct gives 41 or 37, so both were needed to reproduce it. It had already reached the public issue
+comment and was corrected there in place with the reason stated rather than silently edited.
+Downstream figures were unaffected and independently re-derived. Of the 23, 19 carry a real `Error`
+reason and exit code and 4 carry `"Restarting"`, so ruling 3(b) is load-bearing on roughly a sixth of
+the ticks this rule produces rather than decorative.
+
+**The double-zero test signature (`RUN=0 PASS=0 FAIL=0`) had several distinct causes here, and they
+are indistinguishable without reading the log:** a grep pattern shaped for the wrong invocation
+(`go test` prints `--- PASS` only under `-v`); the throwaway Postgres not coming up inside the
+script's window under Docker load; and reading the log before the run finished. Each looks exactly
+like a suite that executed nothing. Read the file; never conclude from the tally.
+
+### Filed rather than folded
+
+**Issue #159, and it got substantially worse as validation went on** — on the flapping path the
+verdict and the subject are computed from two different containers by construction:
+`flappingContainer` decides *whether*, and the `blockingContainer` → `mostRestartedContainer`
+fall-through decides *who*. It runs both ways, so neither container is the guaranteed subject: a
+flapping `worker` beside a longer-worn `dind` names the dind, and a flapping dind beside a worn
+worker names the worker, with the wrong container's exit code reported because `lastTermination`
+reads the subject's.
+
+**The realistic case is the one that reads worst, and it is reachable on any docker-tier worker.** A
+flapping `worker` beside a `seed-nix` that retried 6× and then **Completed** renders
+`Upgrade failed — seed-nix: Completed (6 restarts, last exit 0)`: an init container that *succeeded*,
+named under a failure heading, with exit code 0, while the agent crash-loops. A reader is told the
+thing that worked is the thing that failed. The wrong name also reaches `likelyCause` and the
+copy-`kubectl` affordance, both of which key off it.
+
+**This is not a regression** — before this branch all of those pods reported `settled` silently, so
+it trades silence for a confident wrong pointer. **Filed rather than folded** because the
+133-sample measurement was single-container and is therefore SILENT on this path rather than
+supportive of it, and because the one-line fix leaves the real trajectory **unchanged** (same
+18/5/110 split, same 4 transitions) and the suite green **with and without it**. Every current
+fixture is single-container, so the two selections coincide and a fixture where they agree proves
+nothing; the discriminating fixture is a two-container pod where the flapping container is *not* the
+most-restarted one. A change to what the report names must not ride on a measurement that could not
+observe it.
+
+**Not run, deliberately, with reasons:** `./e2e/run-e2e.sh`, because it is a docker-compose harness
+and the phase half is controller-side and k8s-only, so it cannot reach `deriveRollHealth`; and the
+live-DB sweep on the phase commit, because nothing in it edits a query. In both cases a green would
+have been evidence for a change the run never executed.
+
 # PRD-less — Issue #124: untrusted display text, sanitized at both ends
 
 Serves no PRD; filed and fixed as a standalone security issue. Recorded because it sets

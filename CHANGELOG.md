@@ -6,6 +6,111 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **A guardrail denial no longer reads as a failure in the run activity feed.** When a
+  PreToolUse guardrail denies a call — a `git push`, an env or `/proc` read, an unassembled
+  subagent — the agent recovers and the run carries on, but the feed painted the result with
+  the same red "✗ error" badge as a genuine tool crash, so a healthy run looked broken to
+  anyone watching. Such results now render a third, calm state: a neutral "⊘ blocked" chip
+  (only the glyph is warn-tinted, because a full warn chip would collide with the
+  "plan awaiting approval" and slow-duration tints) that stays collapsed rather than
+  auto-expanding, since a handled and recovered-from denial does not want attention. A real
+  failure is untouched — still red, still auto-expanded. The chat surface inherits it, as it
+  renders through the same row. Detection is render-time, keyed off the `"denied by guardrail"`
+  phrase all 15 deny reasons carry, so historical runs get the calm chip too with no persisted
+  marker and no migration; `is_error` is deliberately left true on the stored frame, which keeps
+  the record honest to what the SDK emitted and is what leaves every downstream reader — the
+  judge's missing-tool prescan among them — seeing exactly what it saw before. The phrase must
+  START a line of the result, not merely appear in it: matching anywhere would have meant a
+  genuinely failing command whose output quotes the phrase rendering calm and collapsed, and this
+  change created that case itself, since a red `npm test` in the agent prints test titles carrying
+  the phrase. The coupling to the phrase is real and is pinned from the agent side, since the two
+  are separate npm packages: `agent/test/guardrails.test.ts` now drives all 15 deny paths through
+  the public API and also scans the reason declarations in source, so a future 16th reason added
+  without the phrase — or written in a form the scan cannot read — fails there rather than
+  silently turning its chip red again (issue #116).
+
+### Fixed
+
+- **A crash-looping hosted worker's diagnostics no longer vanish the moment its pod
+  reports Ready.** A `settled` roll report overwrote `blocking_container`,
+  `blocking_reason`, `restart_count` and `last_exit_code` with empties whether or not it
+  had looked at them, so a worker with five restarts and exit 1 could read as pristine
+  in the database at exactly the moment someone was reading the row to debug it. The
+  four columns now move together and are only replaced by a report whose phase
+  (`rolling`/`stuck`) means the controller actually measured them; the worker's own
+  authenticated version move still clears them (issue #145).
+
+- **The Workers page badge no longer flickers `upgrade failed` → nothing →
+  `upgrade failed` while a container crash-loops.** The worker container has no
+  readiness probe, so `Ready == True` means only that the process started, not that the
+  agent works — a Ready-but-flapping container was being reported `settled`. A Ready pod
+  is now withheld from `settled` while any container has 3+ restarts and its current
+  instance has been up less than 10 minutes, and self-clears once the container stays
+  up. A negative container uptime (clock skew between kubelet and controller) no longer
+  reads as flapping either (issue #145).
+  See [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+- **The run-view usage tables' left-aligned cells (the Agent, Phase and Model columns)
+  are legible again instead of uniformly dimmed.** Two Tailwind classes of equal
+  specificity were both emitted on the same cell, and stylesheet order picked the
+  muted one every time (issue #152).
+
+- **The run-view usage tables are usable with a screen reader.** Column headers now
+  carry `scope="col"`, each table has its own accessible name, and the decorative
+  disclosure triangles next to each `<details>` no longer get announced as a second,
+  contradictory reading of the same expand/collapse state.
+
+### Security
+
+- **Unicode "format" characters — bidi overrides like U+202E, zero-width
+  spaces/joiners, the BOM — in untrusted text can no longer make it render in an
+  order its bytes don't have (Trojan Source, CVE-2021-42574).** Stripped at
+  render — in visible text and in attributes like tooltips and accessible names —
+  everywhere judge output, run titles, forge- or agent-supplied issue, proposal and
+  memory text, the worker fleet page, and a filed-issue draft seeded from judge text
+  reach the UI; stripped at review ingest so a hostile character can no longer be
+  stored in the first place; and stripped from the CLI's worker table. A worker's own
+  name is covered too — the one case where the reader isn't the field's own owner: it
+  could otherwise render, crafted, in an admin's fleet list next to a different user's
+  email. Coverage is per-surface, not blanket: `agent_label` is a separate, still-open
+  gap tracked as issue #164 (issue #124).
+
+## [0.11.12] - 2026-07-27
+
+### Fixed
+
+- **`file` did not work in 0.11.11, despite that release announcing it.** The package was
+  declared as bare `file`, and devbox resolved that to the package's `dev` output -- headers
+  and libmagic, containing no `file` program at all. `devbox global install` reported success,
+  so the image shipped with `file` simply absent from the toolchain, exactly the silent
+  `command not found` the release was meant to remove. It is now declared `file.out`, the
+  output that carries the program, and verified from the realized profile rather than from a
+  shell that had the raw store path on its search path -- which is what made the original
+  check look green. This is the same trap `openssl.bin` documents; the earlier note reasoned
+  from a nixpkgs attribute that turns out not to govern what devbox installs, and that
+  reasoning is now corrected in place. Found by the new guard below, on its first real run.
+
+- **The worker image's toolchain guard had stopped covering the toolchain, and now cannot
+  drift again.** The guard exists so a broken toolchain fails the image BUILD instead of
+  shipping a silent `command not found` to every subagent at run time. It was a hardcoded
+  line naming five binaries, and it never grew as the manifest did: `chromium`,
+  `fontconfig` and `dejavu_fonts` arrived, then `file`, `perl`, `coreutils`,
+  `kubernetes-helm` and `kubeconform` in 0.11.11, none of them guarded. By that release it
+  was verifying 5 of 13 packages while reporting success, so a green `publish:agent` said
+  nothing about whether `helm` resolved. Worse than an uncovered package is a green light
+  nobody re-derives. The guard now checks its own coverage: it reads what `devbox global
+  install` actually installed and fails the build if any package lacks a row in
+  `agent/devbox-global/toolchain-guard.tsv`, so adding a package without guarding it is no
+  longer possible. Each row also runs its tool rather than only resolving it, because a nix
+  package can land its libraries and manual pages while its CLI never appears -- the
+  `openssl.bin` bug this guard missed the first time. Packages that legitimately ship no
+  binary are declared as such rather than guessed: `fontconfig` sounds like it provides
+  `fc-cache` and does not.
+
+## [0.11.11] - 2026-07-27
+
 ### Added
 
 - **Five more tools every run can reach: `file`, `perl`, `fmt`, `helm` and `kubeconform`.**
@@ -40,30 +145,31 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
-- **The run-view usage tables' left-aligned cells (the Agent, Phase and Model columns)
-  are legible again instead of uniformly dimmed.** Two Tailwind classes of equal
-  specificity were both emitted on the same cell, and stylesheet order picked the
-  muted one every time (issue #152).
+- **The agent no longer reinstalls dependencies the worker has already provisioned.**
+  0.11.9 added JS dependency provisioning before the agent's first turn, and it works: the
+  first real run after it shipped installed both workspaces before the agent's first tool
+  call, and hit zero `command not found` for a gate tool where earlier runs hit them
+  routinely. But nothing told the agent any of that, so it planned an `npm ci` at plan time
+  (when the background install genuinely has not finished yet) and then ran it. Since
+  `npm ci` deletes `node_modules` before installing, that destroyed the provisioned tree and
+  rebuilt it, costing exactly the time the feature exists to save. The agent is now told:
+  the plan prompts state the mechanism without promising it will succeed, since the install
+  can fail; the implement prompt carries the actual per directory results, reporting a
+  failed directory as failed so the agent can react rather than trusting a claim that is
+  false for that run. It also now says when discovery hit its directory bound, so a bounded
+  scan cannot read as full coverage (issue #157).
 
-- **The run-view usage tables are usable with a screen reader.** Column headers now
-  carry `scope="col"`, each table has its own accessible name, and the decorative
-  disclosure triangles next to each `<details>` no longer get announced as a second,
-  contradictory reading of the same expand/collapse state.
-
-### Security
-
-- **Unicode "format" characters — bidi overrides like U+202E, zero-width
-  spaces/joiners, the BOM — in untrusted text can no longer make it render in an
-  order its bytes don't have (Trojan Source, CVE-2021-42574).** Stripped at
-  render — in visible text and in attributes like tooltips and accessible names —
-  everywhere judge output, run titles, forge- or agent-supplied issue, proposal and
-  memory text, the worker fleet page, and a filed-issue draft seeded from judge text
-  reach the UI; stripped at review ingest so a hostile character can no longer be
-  stored in the first place; and stripped from the CLI's worker table. A worker's own
-  name is covered too — the one case where the reader isn't the field's own owner: it
-  could otherwise render, crafted, in an admin's fleet list next to a different user's
-  email. Coverage is per-surface, not blanket: `agent_label` is a separate, still-open
-  gap tracked as issue #164 (issue #124).
+- **Repo supplied directory names reaching the agent's prompt are contained.** Those names
+  come from reading an untrusted cloned repo, and they land outside the fences that mark
+  quoted content as data, which is the one position where instruction shaped text is what
+  those fences exist to stop. A repo could commit a directory whose name reads as an
+  instruction. Names are now filtered to a conservative character set, length bounded, and
+  placed inside a nonce fence whose tag a repo cannot forge, since the tag is drawn at
+  random during the run while the name was committed to git before the run existed. A name
+  the filter had to alter is flagged as not being a usable path, with a pointer to locate
+  the real directory, so honest names like `my project` or `café` do not silently become
+  paths that cannot be found. This reduces the surface rather than closing it: the fence
+  relabels the text as data, it does not remove it from the model's context (issue #157).
 
 ## [0.11.10] - 2026-07-27
 

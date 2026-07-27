@@ -192,10 +192,134 @@ ON CONFLICT (worker_id) DO UPDATE SET
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,
     pod_phase              = EXCLUDED.pod_phase,
-    blocking_container     = EXCLUDED.blocking_container,
-    blocking_reason        = EXCLUDED.blocking_reason,
-    restart_count          = EXCLUDED.restart_count,
-    last_exit_code         = EXCLUDED.last_exit_code,
+    -- ================= THE DIAGNOSTIC BLOCK: ALL FOUR, OR NONE =================
+    -- A REPORT MUST NOT BLANK FIELDS IT DID NOT MEASURE (issue #145).
+    --
+    -- THE PHASE IS THE DISCRIMINATOR, because the phase is what decides whether the
+    -- controller ran the measurement at all. deriveRollHealth returns ` + "`" + `settled` + "`" + ` the
+    -- instant the pod's Ready condition is True, BEFORE the blocking-container lookup,
+    -- so a settled report carries the ZERO of every field here (no container, no
+    -- reason, restart_count 0, no exit code) — it never looked. Every ` + "`" + `rolling` + "`" + ` or
+    -- ` + "`" + `stuck` + "`" + ` report DID look, so whatever it carries, zeros included, is an
+    -- observation and must land. Written as bare EXCLUDED.*, as these four arms used
+    -- to be, the settled zeros erased the real diagnostics: a worker with 5 restarts
+    -- and exit 1 persisted as pristine, at exactly the moment somebody was reading the
+    -- row to debug it. ` + "`" + `phase` + "`" + ` and ` + "`" + `pod_phase` + "`" + ` above are NOT in this block, and the
+    -- reason is GENERAL rather than settled-specific: every branch of deriveRollHealth
+    -- measures both. A branch that has a current pod stamps pod_phase from it BEFORE
+    -- the settled early return; the three branches that leave it empty (pod-less with
+    -- ReplicaFailure, the pod-less Recreate gap, stale-pod-only) do so because there is
+    -- NO current pod, which makes empty the observation rather than the absence of one
+    -- — the same standing a diagnostic-free ` + "`" + `rolling` + "`" + ` report has below. So the headline
+    -- holds for pod_phase too; it simply never needs an exception.
+    --
+    -- "THE REPORT CARRIES NOTHING" IS THE WRONG PREDICATE, and it is the tempting one
+    -- — it needs no knowledge of the controller and it fixes the headline symptom.
+    -- It conflates "never looked" with "looked and found nothing to blame", and only
+    -- the phase separates those. Two deriveRollHealth branches return ` + "`" + `rolling` + "`" + ` with
+    -- no diagnostics at all (the pod-less Recreate gap, and the stale-pod-only
+    -- branch); preserving there would carry the PREVIOUS roll's reason into a healthy
+    -- mid-Recreate tick, and rollingDetail (upgrade.go) reads BlockingReason FIRST, so
+    -- R2's upgrade_detail would read "CrashLoopBackOff" for a worker that is fine.
+    -- That string is NOT gated the way the three blocking_* DTO fields are — it is the
+    -- badge's own title attribute (WorkerUpgradeBadge.tsx) — so it renders.
+    --
+    -- THE FOUR MOVE TOGETHER, which is why this is a CASE over the block rather than a
+    -- COALESCE per column. Each report's diagnostics come from ONE source — usually a
+    -- single ContainerStatus (blockingContainer, or the mostRestartedContainer
+    -- fallback, whose provenance is likewise one status), and on the pod-less
+    -- ReplicaFailure branch a DEPLOYMENT CONDITION, which sets the reason ALONE with no
+    -- container, no restart count and no exit code. That third case is not an exception
+    -- to the grouping; it is its strongest argument. Per-column preservation would pair
+    -- a fresh restart_count with a stale blocking_container and describe a row that was
+    -- never observed — most visibly there, where the previous pod's name would survive
+    -- beside a reason about a pod that never started. (An earlier version of this
+    -- comment said all four always come from one container status "or are all zero",
+    -- which is a false dichotomy: that branch is neither.) The
+    -- predicate is repeated verbatim in each arm and MUST STAY IDENTICAL: that
+    -- identity is the atomicity, so changing one arm alone silently ends it. It is
+    -- deliberately the same ` + "`" + `IN ('rolling', 'stuck')` + "`" + ` set the anchor arm below uses.
+    --
+    -- A uniform COALESCE would ALSO have been a silent no-op on restart_count, which
+    -- is ` + "`" + `integer NOT NULL DEFAULT 0` + "`" + ` (migration 00083) and arrives as @restart_count,
+    -- not sqlc.narg — so EXCLUDED.restart_count is never NULL and half the issue's own
+    -- symptom ("5 restarts AND exit 1") would have survived the fix.
+    --
+    -- THIS IS DATA INTEGRITY, NOT A CONTROL AGAINST A LYING CONTROLLER, and the
+    -- distinction belongs in the file whose header enumerates three real security
+    -- properties. The wipe lever is unchanged and intentionally so: a controller that
+    -- reports ` + "`" + `stuck` + "`" + ` or ` + "`" + `rolling` + "`" + ` with empty diagnostics still writes zeros here,
+    -- because those phases assert that the lookup ran. What is fixed is an HONEST
+    -- controller destroying its own earlier measurement.
+    --
+    -- NO CLEAR ARM HERE — and the analogy to upgrading_since below holds for only ONE
+    -- half of what that phrase usually means, so read the halves apart. An earlier
+    -- version of this comment asserted both of the anchor, and the second half was
+    -- false of these four the moment the predicate above became phase-conditional:
+    --
+    --   * SHARED with upgrading_since: nothing in this statement empties these columns
+    --     INDEPENDENTLY of what the report carries. A ` + "`" + `settled` + "`" + ` report cannot reset
+    --     them, which is the forgeability the anchor's own block describes.
+    --   * NOT SHARED: the anchor is WRITE-ONCE from a report — a non-terminal report may
+    --     stamp it while it is NULL (the INSERT arm above, and the COALESCE below) and
+    --     may never move or clear it afterwards. These four are REWRITTEN by every
+    --     non-terminal report, zeros included, per the bound above. So the contrast is
+    --     repeat-writability and emptying, not reachability, and "only a re-registration
+    --     can empty this" is true of the anchor and FALSE of the diagnostics.
+    --
+    --     (This line used to say the anchor is "unreachable from a report at all",
+    --     which this file contradicts twice — the INSERT's CASE stamps it from a
+    --     report's own phase and observed_at, and the anchor block below says so in
+    --     prose: "non-terminal phase, no anchor yet -> stamp it". The ceiling's ARMING
+    --     is exactly that stamp, so a reader who believed the absolute would hunt for
+    --     the arming elsewhere, or read the COALESCE as an inconsistency to tidy away.)
+    --
+    -- So what RegisterWorker's version-move clear provides is not exclusivity. It is
+    -- the only thing that empties the block WITHOUT a report, which is exactly what a
+    -- completed roll needs: afterwards the diagnostics describe a pod that is gone, and
+    -- no further report for it may ever arrive.
+    --
+    -- CHANGES NO RENDERED OUTPUT TODAY, so do not look for a UI difference to verify
+    -- it — the live-DB test is the evidence. The preserved values are reachable only on
+    -- a ` + "`" + `settled` + "`" + ` row: workerDTOFromRow nulls the three upgrade_blocking_* DTO fields
+    -- unless the status is upgrade_failed (which requires phase=stuck), and R1/R2's
+    -- detail strings require phase stuck/rolling, where EXCLUDED wins anyway.
+    --
+    -- Do NOT read that gate as covering this block, though — it covers three of these
+    -- four columns and there is no fourth field to gate. ` + "`" + `restart_count` + "`" + ` has NO DTO
+    -- field of its own (no UpgradeRestartCount beside the three upgrade_blocking_*),
+    -- so its ONLY route to a human is the UNGATED upgrade_detail string, via
+    -- stuckDetail's "(N restarts, last exit M)".
+    --
+    -- AND A PRESERVED BLOCK IS NOT REACHABLE BY ANY RENDER PATH — this line used to
+    -- predict the opposite, and the prediction was falsified by the commit it named.
+    -- It said "commit 2 is what makes any of this displayable; the detail string it
+    -- feeds must then not present a pinned older observation as a current one." What
+    -- landed routes a Ready-but-flapping pod to ` + "`" + `stuck` + "`" + `, which OVERWRITES. Structurally:
+    -- the upgrade_failed gate is R1 (hosted && fresh && phase == stuck); this predicate
+    -- writes EXCLUDED for every rolling/stuck report, so a stuck row's block is always
+    -- that report's own measurement; a preserved block therefore exists only on a
+    -- ` + "`" + `settled` + "`" + ` row, and ` + "`" + `settled` + "`" + ` yields at most ` + "`" + `upgrading` + "`" + ` via R3. No phase can open
+    -- the gate with a preserved block, and commit 2 made preserved blocks LESS
+    -- reachable rather than more.
+    --
+    -- So what is this preservation FOR, now that the UI payoff it predicted is gone?
+    -- DB-level data integrity, which is what the issue actually complained about: the
+    -- row keeps the incident for whoever reads the table — psql, a future query, an
+    -- operator exporting it — instead of a crash-looping worker "persisting as
+    -- pristine". Only the near-term rendering claim was overstated.
+    blocking_container     = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
+                                  THEN EXCLUDED.blocking_container
+                                  ELSE worker_upgrade_reports.blocking_container END,
+    blocking_reason        = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
+                                  THEN EXCLUDED.blocking_reason
+                                  ELSE worker_upgrade_reports.blocking_reason END,
+    restart_count          = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
+                                  THEN EXCLUDED.restart_count
+                                  ELSE worker_upgrade_reports.restart_count END,
+    last_exit_code         = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
+                                  THEN EXCLUDED.last_exit_code
+                                  ELSE worker_upgrade_reports.last_exit_code END,
     controller_reported_at = EXCLUDED.controller_reported_at,
     observed_at            = EXCLUDED.observed_at,
     poll_interval_seconds  = EXCLUDED.poll_interval_seconds,
