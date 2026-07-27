@@ -122,9 +122,16 @@ ORDER BY w.created_at ASC;
 -- describe the pod of the roll that just ended, so a version move is exactly when
 -- they stop being true — and a register at an UNCHANGED version must not clear them,
 -- because a crash-looping agent re-registers on every start and would blank the row
--- of the one worker whose diagnostics are worth reading, on a loop. The upsert in
--- worker_roll_health.sql deliberately never clears them, so this is their only exit:
--- keep the two ends of that rule in step if either moves.
+-- of the one worker whose diagnostics are worth reading, on a loop.
+--
+-- THIS IS NOT THEIR ONLY EXIT, and an earlier version of this comment said it was.
+-- The upsert has no clear ARM, but every non-terminal report WRITES those columns,
+-- zeros included — a `rolling` or `stuck` report that carries nothing empties them,
+-- and that is correct there, because those phases assert the controller ran the
+-- lookup. What this clear uniquely provides is emptying the block WITHOUT a report,
+-- which is what a completed roll needs: afterwards the diagnostics describe a pod
+-- that is gone and no further report for it may ever arrive. Keep the two ends of
+-- that rule in step if either moves.
 --
 -- It lives in THIS statement, in one round trip with the version write, so the two
 -- cannot be separated by a later refactor and cannot interleave with a concurrent
