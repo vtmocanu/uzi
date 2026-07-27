@@ -81,9 +81,10 @@ RUN set -o pipefail \
     && rm -rf "${TARBALL}" checksums.txt devbox-extract
 
 # --- PRD #83 M1 (Q2): go + python default toolchain via devbox-global — MIRRORED FROM base
-# The same committed pinned global manifest (agent/devbox-global/devbox.json:
-# go + python3 + pip) realized into the baked /nix at build time via `devbox global
-# install`, so every run has go/python/pip instantly. jvm is NOT `FROM base`, so it carries
+# The same committed pinned global manifest (agent/devbox-global/devbox.json -- read it
+# for the package set; do not trust a list quoted here) realized into the baked /nix at
+# build time via `devbox global install`, so every run has the toolchain instantly.
+# jvm is NOT `FROM base`, so it carries
 # its own copy of this stanza + the ENV PATH addition — keep in LOCKSTEP with base. Exact
 # `devbox global` invocation + resulting PATH/devbox.lock are tester-confirmed on the live
 # build (Dockerfile header convention). See templates/base for the full rationale.
@@ -109,7 +110,7 @@ RUN PROFILE="$(readlink -f /home/worker/.local/share/devbox/global/default/.devb
     && readlink -f /opt/uzi-toolchain > /etc/uzi-toolchain-profile \
     && chown -R worker:runner /nix/var/nix/gcroots \
     && chown -h worker:runner /nix/var/nix/gcroots/uzi-toolchain
-# Put the STABLE toolchain bin on the image PATH so go/python3/gcc/pip resolve for BOTH the
+# Put the STABLE toolchain bin on the image PATH so the baked toolchain resolves for BOTH the
 # worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the image
 # PATH). Points at /opt/uzi-toolchain/bin — the immutable handle above — NOT the mutable
 # `.devbox/.../default/bin` symlink. A per-run `devbox shellenv` still PREPENDS run tools,
@@ -118,8 +119,17 @@ ENV PATH="/opt/uzi-toolchain/bin:${PATH}"
 # PRD #92 M1 fail-closed guard (the "UNVERIFIED" stanza never had one): a broken toolchain
 # fails the BUILD here (resolving against /opt/uzi-toolchain/bin) instead of shipping a
 # silent 127 to every subagent at run time. MIRRORED from base.
-RUN command -v python3 && command -v go && command -v gcc && command -v pip && command -v openssl \
-    && go version && python3 --version && gcc --version && pip --version && openssl version
+#
+# DRIFT-PROOF SINCE 0.11.11. This was a hardcoded `command -v python3 && ... && openssl`
+# line, and it never grew as devbox.json did: chromium/fontconfig/dejavu_fonts (PRD #87)
+# and then file/perl/coreutils/kubernetes-helm/kubeconform were all baked WITHOUT guard
+# coverage, so the guard passed on 5 of 13 packages while `publish:agent` reported green.
+# The guard now cross-checks its own coverage against what devbox actually installed, so
+# adding a package to devbox.json without a row in toolchain-guard.tsv FAILS THE BUILD.
+COPY agent/devbox-global/toolchain-guard.tsv /tmp/toolchain-guard.tsv
+COPY agent/devbox-global/assert-toolchain.sh /tmp/assert-toolchain.sh
+RUN bash /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv \
+    && rm -f /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

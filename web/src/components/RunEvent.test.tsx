@@ -6,6 +6,7 @@ import {
   CommandBlock,
   RunEventRow,
   buildToolIndex,
+  classifyResultState,
   describeError,
   describeStatus,
   formatDuration,
@@ -468,6 +469,226 @@ describe("result chips (PRD #38 Decision 13)", () => {
     const pre = container.querySelector("pre");
     expect(pre?.textContent?.startsWith("[image omitted]")).toBe(true);
     expect(pre?.textContent).toContain("after image");
+  });
+});
+
+describe("guardrail-deny 'blocked' chip (PRD #116)", () => {
+  // The live #115 reason: the lead tried to spawn the SDK built-in `Explore`
+  // subagent and the subagent guard denied it (REASON_UNKNOWN_SUBAGENT).
+  const DENY = "denied by guardrail: only the run's assembled subagents may be invoked";
+
+  // The two shapes that made a whole-text `.includes` unsafe. Both are the output of
+  // a command that GENUINELY failed (is_error true) and merely QUOTES the phrase
+  // mid-line — exactly the "under-alarming a real problem" risk PRD #116 named.
+  // `node --test` echoes every test title, so a red `npm test` in agent/ prints the
+  // phrase back at us; likewise any failing command that greps guardrails.ts.
+  const FAILING_TEST_LOG = [
+    "TAP version 13",
+    "# Subtest: deny reasons carry the user-facing phrase (PRD #116)",
+    'ok 14 - the ".git access" deny reason starts with "denied by guardrail"',
+    "not ok 15 - covers all 15 deny reasons, and each case reaches a DISTINCT one",
+    "# fail 1",
+  ].join("\n");
+  const GREP_OUTPUT = [
+    'agent/src/guardrails.ts:92:const REASON_PUSH = "denied by guardrail: git push is not permitted";',
+    'agent/src/guardrails.ts:93:const REASON_REMOTE = "denied by guardrail: git remote mutation is not permitted";',
+  ].join("\n");
+
+  const renderResult = (payload: Record<string, unknown>) =>
+    render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Agent", input: { subagent_type: "Explore", description: "map the feed" } } })}
+        result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", ...payload } })}
+        live={false}
+      />,
+    );
+
+  it("classifies the three states, anchoring the phrase to the START of a line", () => {
+    expect(classifyResultState(false, "all good")).toBe("ok");
+    expect(classifyResultState(true, "boom\nstack")).toBe("error");
+    expect(classifyResultState(true, DENY)).toBe("blocked");
+    // Colon-less fallback (guardrails.ts:539/:786) — there is no colon to anchor on,
+    // which is why this is not an exact-match or "phrase + colon" test.
+    expect(classifyResultState(true, "denied by guardrail")).toBe("blocked");
+    // A <tool_use_error> SDK wrapper: the open tag is stripped before the anchor test.
+    expect(classifyResultState(true, "<tool_use_error>denied by guardrail: x</tool_use_error>")).toBe(
+      "blocked",
+    );
+    // The SDK builds a `<hook> hook error: <reason>` form of the same denial and
+    // yields it just BEFORE the raw-reason one; the bare reason wins only because the
+    // consumer keeps the last yield. One reordering away, so the preamble is stripped.
+    expect(classifyResultState(true, `PreToolUse:Bash hook error: ${DENY}`)).toBe("blocked");
+    // The strip is narrow — it needs the literal "hook error: ", which no incidental
+    // mention of the phrase carries. A bare "error: " preamble is NOT a denial.
+    expect(classifyResultState(true, `error: ${DENY}`)).toBe("error");
+    // Per LINE, not per whole text: resultToText joins content blocks with "\n", so
+    // the denial can land anywhere in that join, and may be indented.
+    expect(classifyResultState(true, `ran the tool\n${DENY}`)).toBe("blocked");
+    expect(classifyResultState(true, `${DENY}\nthe agent recovered`)).toBe("blocked");
+    expect(classifyResultState(true, `   ${DENY}`)).toBe("blocked");
+    // …but a MID-line mention in a genuinely failing command's output must NOT
+    // disarm the red chip.
+    expect(classifyResultState(true, FAILING_TEST_LOG)).toBe("error");
+    expect(classifyResultState(true, GREP_OUTPUT)).toBe("error");
+    expect(classifyResultState(true, `note: ${DENY}`)).toBe("error");
+    // Gated on is_error: a SUCCESSFUL result that merely quotes the phrase is not
+    // reclassified.
+    expect(classifyResultState(false, DENY)).toBe("ok");
+  });
+
+  it("labels a guardrail denial 'blocked', never 'error'", () => {
+    const { getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    expect(chip.textContent).toContain("blocked");
+    expect(chip.textContent).not.toContain("error");
+    expect(chip.textContent).toContain("⊘");
+  });
+
+  it("starts COLLAPSED (unlike a genuine error) and expands on click", () => {
+    const { container, getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(true);
+    fireEvent.click(chip);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    expect(pre?.hasAttribute("hidden")).toBe(false);
+    // …and it re-labels for the open state, like any normal collapsible result.
+    expect(chip.getAttribute("aria-label")).toBe("Hide Agent blocked output");
+  });
+
+  it("uses a NON-danger tone: neutral chip + body, warn only on the ⊘ glyph", () => {
+    const { container, getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    const pre = container.querySelector("pre");
+    // Nothing in the row carries a danger colour (border-/bg-/text-danger).
+    for (const el of Array.from(container.querySelectorAll("*"))) {
+      expect(el.className.toString()).not.toMatch(/(border|bg|text)-danger/);
+    }
+    // The chip reuses the neutral success frame verbatim…
+    expect(chip.className).toContain("border-edge bg-raised/50 text-muted hover:border-edge-strong");
+    expect(pre?.className).toContain("border-edge bg-ink");
+    // …and only the glyph is warn-tinted (Decision 4: no full warn chip). Assert the
+    // glyph EXISTS first, so a regression that drops it reports that rather than
+    // "the given combination of arguments (undefined and string) is invalid".
+    const glyph = Array.from(chip.querySelectorAll("span")).find((s) => s.textContent === "⊘");
+    expect(glyph, "expected a ⊘ glyph span inside the blocked chip").toBeTruthy();
+    expect(glyph!.className).toContain("text-warn");
+    // /-warn/ and not just "text-warn": a regression to a fully warn-tinted chip
+    // (border-warn/40 bg-warn/10) is exactly what Decision 4 forbids, and a
+    // "text-warn" token check would sail straight past bg-warn/10. The glyph is a
+    // CHILD span, so its own warn tint does not reach this className.
+    expect(chip.className).not.toMatch(/-warn/);
+  });
+
+  it("keeps the ⊘ glyph NON-bold (bold closes its counter at 11px)", () => {
+    const { getByRole } = renderResult({ content: DENY, is_error: true });
+    const chip = getByRole("button", { name: /show Agent blocked output/i });
+    const glyph = Array.from(chip.querySelectorAll("span")).find((s) => s.textContent === "⊘");
+    expect(glyph, "expected a ⊘ glyph span inside the blocked chip").toBeTruthy();
+    expect(glyph!.className).toBe("text-warn text-[13px] leading-none");
+  });
+
+  it("preserves the raw deny reason verbatim in the body", () => {
+    const { container } = renderResult({ content: DENY, is_error: true });
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent).toBe(DENY);
+    expect(pre?.getAttribute("aria-label")).toBe("Tool blocked output");
+  });
+
+  // Every shape a REAL denial ships in must stay blocked. The array cases go through
+  // resultToText, which joins text blocks with "\n" — so they also pin that the match
+  // is per line rather than "the text starts with the phrase".
+  const BLOCKED_SHAPES: Array<{ name: string; content: unknown }> = [
+    { name: "the plain reason", content: DENY },
+    { name: "the colon-less fallback", content: "denied by guardrail" },
+    {
+      name: "a <tool_use_error> wrapper",
+      content: "<tool_use_error>denied by guardrail: reading /proc is not permitted</tool_use_error>",
+    },
+    {
+      name: "the LAST of several content blocks",
+      content: [
+        { type: "text", text: "Attempted 2 tool calls." },
+        { type: "text", text: "The second was refused:" },
+        { type: "text", text: DENY },
+      ],
+    },
+    {
+      name: "the FIRST of several content blocks",
+      content: [
+        { type: "text", text: DENY },
+        { type: "text", text: "The agent retried with an assembled subagent." },
+      ],
+    },
+    { name: "an indented reason line", content: `Tool call refused.\n    ${DENY}` },
+  ];
+
+  for (const { name, content } of BLOCKED_SHAPES) {
+    it(`stays blocked for ${name}`, () => {
+      const { getByRole, unmount } = renderResult({ content, is_error: true });
+      const chip = getByRole("button", { name: /show Agent blocked output/i });
+      expect(chip.textContent).toContain("blocked");
+      expect(chip.textContent).not.toContain("error");
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      expect(chip.className).not.toMatch(/-danger/);
+      unmount();
+    });
+  }
+
+  // The other direction, which is the half with no coverage before: a command that
+  // genuinely FAILED and merely quotes the phrase mid-line must keep the red chip.
+  for (const { name, content } of [
+    { name: "a failing `npm test` log echoing a test title", content: FAILING_TEST_LOG },
+    { name: "a failing command's grep of guardrails.ts", content: GREP_OUTPUT },
+  ]) {
+    it(`stays a RED error for ${name}`, () => {
+      const { container, getByRole, unmount } = renderResult({ content, is_error: true });
+      // Auto-expanded ⇒ the a11y label is the "Hide …" form.
+      const chip = getByRole("button", { name: /hide Agent error output/i });
+      expect(chip.textContent).toContain("error");
+      expect(chip.textContent).toContain("✗");
+      expect(chip.textContent).not.toContain("blocked");
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+      expect(chip.className).toContain("border-danger/40 bg-danger/10 text-danger");
+      expect(container.querySelector("pre")?.hasAttribute("hidden")).toBe(false);
+      unmount();
+    });
+  }
+
+  it("leaves a NON-guardrail error unchanged: red ✗ error, auto-expanded", () => {
+    const { container, getByRole } = renderResult({ content: "boom\nstack", is_error: true });
+    const chip = getByRole("button", { name: /hide Agent error output/i });
+    expect(chip.textContent).toContain("error");
+    expect(chip.textContent).toContain("✗");
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    expect(chip.className).toContain("border-danger/40 bg-danger/10 text-danger");
+    // Byte-for-byte on the glyph too: moving `font-bold` into the per-state
+    // glyphClass (so only ⊘ could drop it) must leave ✗ emitting what it always did.
+    const glyph = Array.from(chip.querySelectorAll("span")).find((s) => s.textContent === "✗");
+    expect(glyph, "expected a ✗ glyph span inside the error chip").toBeTruthy();
+    expect(glyph!.className).toBe("font-bold text-danger");
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(false);
+    expect(pre?.className).toContain("border-danger/40 bg-danger/[0.08]");
+    expect(pre?.getAttribute("aria-label")).toBe("Tool error output");
+  });
+
+  it("leaves a SUCCESS chip unchanged: bold ✓ on the neutral frame", () => {
+    const { getByRole } = renderResult({ content: "line one\nline two" });
+    const chip = getByRole("button", { name: /show 2 lines of Agent output/i });
+    const glyph = Array.from(chip.querySelectorAll("span")).find((s) => s.textContent === "✓");
+    expect(glyph, "expected a ✓ glyph span inside the ok chip").toBeTruthy();
+    expect(glyph!.className).toBe("font-bold text-ok");
+    expect(chip.className).toContain("border-edge bg-raised/50 text-muted hover:border-edge-strong");
+  });
+
+  it("does not reclassify a SUCCESS result that merely mentions the phrase", () => {
+    const { getByRole } = renderResult({ content: `note: ${DENY}` });
+    const chip = getByRole("button", { name: /show 1 line of Agent output/i });
+    expect(chip.textContent).toContain("1 line");
+    expect(chip.textContent).toContain("✓");
+    expect(chip.textContent).not.toContain("blocked");
   });
 });
 
