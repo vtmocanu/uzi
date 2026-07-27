@@ -146,9 +146,25 @@ ON CONFLICT (worker_id) DO UPDATE SET
     -- four columns and there is no fourth field to gate. `restart_count` has NO DTO
     -- field of its own (no UpgradeRestartCount beside the three upgrade_blocking_*),
     -- so its ONLY route to a human is the UNGATED upgrade_detail string, via
-    -- stuckDetail's "(N restarts, last exit M)". Commit 2 is what makes any of this
-    -- displayable; the detail string it feeds must then not present a pinned older
-    -- observation as a current one.
+    -- stuckDetail's "(N restarts, last exit M)".
+    --
+    -- AND A PRESERVED BLOCK IS NOT REACHABLE BY ANY RENDER PATH — this line used to
+    -- predict the opposite, and the prediction was falsified by the commit it named.
+    -- It said "commit 2 is what makes any of this displayable; the detail string it
+    -- feeds must then not present a pinned older observation as a current one." What
+    -- landed routes a Ready-but-flapping pod to `stuck`, which OVERWRITES. Structurally:
+    -- the upgrade_failed gate is R1 (hosted && fresh && phase == stuck); this predicate
+    -- writes EXCLUDED for every rolling/stuck report, so a stuck row's block is always
+    -- that report's own measurement; a preserved block therefore exists only on a
+    -- `settled` row, and `settled` yields at most `upgrading` via R3. No phase can open
+    -- the gate with a preserved block, and commit 2 made preserved blocks LESS
+    -- reachable rather than more.
+    --
+    -- So what is this preservation FOR, now that the UI payoff it predicted is gone?
+    -- DB-level data integrity, which is what the issue actually complained about: the
+    -- row keeps the incident for whoever reads the table — psql, a future query, an
+    -- operator exporting it — instead of a crash-looping worker "persisting as
+    -- pristine". Only the near-term rendering claim was overstated.
     blocking_container     = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.blocking_container
                                   ELSE worker_upgrade_reports.blocking_container END,

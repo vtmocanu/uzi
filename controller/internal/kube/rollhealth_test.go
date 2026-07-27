@@ -725,6 +725,52 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 			h.Phase, flapWindow-time.Second)
 	}
 
+	// --- 2c. THE CONSTANT'S VALUE, pinned with LITERAL durations. ---
+	//
+	// Cases 2 and 2b express their uptime as `flapWindow ± time.Second`, so they pin the
+	// COMPARISON — that it is `<`, and where the off-by-one sits — but they cannot pin
+	// the NUMBER: retune flapWindow and both inputs move with it and both stay green.
+	// MEASURED: halving flapWindow from 10m to 5m left the entire kube suite passing.
+	//
+	// That matters here specifically because flapWindow is 10 minutes and stuckAge
+	// (a DIFFERENT quantity — pod age, not container uptime) is also 10 minutes, so a
+	// silent retune of one while reaching for the other is the live hazard.
+	//
+	// These two are literals and bracket the constant from both sides: 9m must be inside
+	// the window and 11m outside. Shrinking flapWindow reddens the first; widening it
+	// reddens the second. A deliberate retune therefore has to come here and say so,
+	// which is the point.
+	inside := ready(runningFor(workerPod("w2c", want, 4*time.Hour), "worker", 5, 9*time.Minute, exit1, false),
+		testNow.Add(-9*time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*inside}, want, "", testNow); h.Phase == protocol.PhaseSettled {
+		t.Errorf("a container up 9m with 5 restarts reads %q; 9 minutes must be INSIDE the flap window. "+
+			"If this fails alone, flapWindow has been shrunk below 9m — check whether that was deliberate "+
+			"and whether stuckAge was the constant actually meant.", h.Phase)
+	}
+	outside := ready(runningFor(workerPod("w2d", want, 4*time.Hour), "worker", 5, 11*time.Minute, exit1, false),
+		testNow.Add(-11*time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*outside}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("a container up 11m with 5 restarts reads %q, want %q; 11 minutes must be OUTSIDE the "+
+			"flap window, or the verdict stops expiring on continuous uptime.", h.Phase, protocol.PhaseSettled)
+	}
+
+	// --- 2e. NEGATIVE uptime (clock skew) is not evidence of a restart loop. ---
+	//
+	// StartedAt is stamped by the kubelet and compared against this controller's clock.
+	// Skew can put it in the FUTURE, and a negative duration is `< flapWindow`, so an
+	// unguarded comparison reads skew as flapping. Bounded in practice — the window
+	// shifts by the skew rather than pinning red, and 3 lifetime restarts are needed
+	// first — but a duration we cannot trust is not evidence, which is the same
+	// direction the nil-Running skip takes.
+	skewed := ready(runningFor(workerPod("w2e", want, 4*time.Hour), "worker", 5, -4*time.Hour, exit1, false),
+		testNow.Add(-time.Minute))
+	if h := deriveRollHealth([]corev1.Pod{*skewed}, want, "", testNow); h.Phase != protocol.PhaseSettled {
+		t.Errorf("a container whose StartedAt is 4h in the FUTURE reads %q, want %q. A negative uptime is "+
+			"clock skew between the kubelet and this controller, and negative < flapWindow is true, so "+
+			"without the `up >= 0` guard a clock disagreement reads as a crash loop.",
+			h.Phase, protocol.PhaseSettled)
+	}
+
 	// --- 3. Ready, 2 restarts, up 5s. Recency without the count. ---
 	//
 	// One OOM or one node hiccup restarts a container recently. A recency-only rule
@@ -805,6 +851,14 @@ func TestReadyPodIsNotSettledWhileAContainerIsFlapping(t *testing.T) {
 // RestartCount is 5 ON PURPOSE. With 0 the container fails the restart conjunct anyway
 // and the case passes identically whether or not the nil check exists — a fixture where
 // broken and correct agree, which proves nothing. 5 is what makes the guard falsifiable.
+//
+// ⚠ THIS PINS HALF OF WHAT THE TIDY WOULD BREAK. There is a sibling case with the same
+// symptom and a DIFFERENT cause: a container that IS Running but carries a ZERO
+// StartedAt also comes out settled today, because now.Sub(zero) is decades and the
+// comparison is `<`. So the nil case is excluded by the skip, and the zero case by the
+// arithmetic. `if t.IsZero() { t = now }` would flip BOTH into "up 0 seconds", and only
+// this fixture would redden. If you are here because that edit broke this test, check
+// the zero-StartedAt path too — nothing covers it.
 //
 // What this test does NOT establish: whether Kubernetes really persists an init
 // container's RestartCount after a retry finally succeeds. That needs a live pod and it

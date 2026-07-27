@@ -434,9 +434,21 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // correct on its own terms and costs nothing if the state turns out to be unreachable.
 //
 // SCANS ALL CONTAINERS, NOT JUST THE WORKER — a deliberate, user-accepted behaviour
-// change, stated out loud because nobody asked for it. A flapping dind sidecar reports
-// the worker as failed, naming dind. Honest (docker runs really are broken) and it
-// matches how blockingContainer and mostRestartedContainer already treat the pod, but it
+// change, stated out loud because nobody asked for it. A flapping dind sidecar will
+// withhold `settled` for the WHOLE POD, so the worker reports failed on its account.
+//
+// ⚠ THE CONTAINER NAMED IS NOT NECESSARILY THIS ONE. This function decides the VERDICT;
+// the name, restart count and exit code in the report still come from the
+// mostRestartedContainer fall-through below, which picks whichever container has the
+// highest LIFETIME count. Those disagree whenever a quiet container out-restarts the
+// flapping one — measured: dind flapping (4 restarts, up 2m) beside a stable worker (7
+// lifetime restarts, up 72h) reports stuck, correctly, but names `worker` with 7
+// restarts. The init-first ordering here does not carry through either, for the same
+// reason. That is a known divergence tracked separately; do not read this function's
+// choice as the one an operator sees.
+//
+// Honest (docker runs really are broken) and it matches how blockingContainer and
+// mostRestartedContainer already treat the pod, but it
 // is wider than "the agent keeps dying", and the dind sidecars are `RestartPolicy:
 // Always` native sidecars whose RestartCount accumulates across the pod's life exactly
 // like the worker's. So a fleet-wide sidecar image or config change can satisfy this
@@ -460,7 +472,18 @@ func flappingContainer(p *corev1.Pod, now time.Time) *corev1.ContainerStatus {
 			if cs.State.Running == nil {
 				continue
 			}
-			if now.Sub(cs.State.Running.StartedAt.Time) < flapWindow {
+			// `up >= 0` rejects a NEGATIVE uptime, which is what clock skew between the
+			// kubelet that stamped StartedAt and this controller produces. Without it a
+			// future StartedAt gives a negative duration, and negative < flapWindow is
+			// TRUE, so a container reads as flapping on the strength of a clock
+			// disagreement. Measured: StartedAt at now+4h with 5 restarts reports stuck.
+			// The realistic bound is small — NTP skew shifts the window by the skew
+			// rather than pinning anything red, and it needs 3 lifetime restarts first —
+			// but the guard costs one comparison and it points the same way as the
+			// nil-Running skip above: a duration we cannot trust is not evidence of a
+			// restart loop.
+			up := now.Sub(cs.State.Running.StartedAt.Time)
+			if up >= 0 && up < flapWindow {
 				return cs
 			}
 		}
