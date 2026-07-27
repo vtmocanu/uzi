@@ -30,9 +30,9 @@ func (q *Queries) CountActiveSelfImproveRuns(ctx context.Context) (int64, error)
 const createSelfImproveRun = `-- name: CreateSelfImproveRun :one
 
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit
 ) VALUES (
-    $1, $2::uuid, 'self_improve', $3, $4, $5, true
+    $1, $2::uuid, 'self_improve', $3, $4, $5, true, $6
 )
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type
 `
@@ -43,6 +43,7 @@ type CreateSelfImproveRunParams struct {
 	IssueIid         pgtype.Int8 `json:"issue_iid"`
 	IssueTitle       string      `json:"issue_title"`
 	IssueDescription string      `json:"issue_description"`
+	WaitOnLimit      bool        `json:"wait_on_limit"`
 }
 
 // Self-improvement engine (PRD #46 Decisions 9-11, M5) ------------------------
@@ -67,6 +68,13 @@ type CreateSelfImproveRunParams struct {
 // here. The uq_runs_one_active_self_improve partial index admits at most one
 // non-terminal self_improve instance-wide (23505 → ErrActiveSelfImproveExists), so
 // Boot re-runs and any future replica never double-create onto the fixed branch.
+// wait_on_limit (PRD #35) comes from the OWNER's default: like ci_fix, this run is
+// created by an engine tick with no user in the loop. It parks (Decision 14) — it is
+// long, repo-ful, auto_approve and expensive, exactly the run whose loss to a
+// five-hour window hurts most. A parked one keeps holding
+// uq_runs_one_active_self_improve, which is correct: the engine's documented
+// behaviour on a blocked tick is "a cycle is still in flight, skip", and that is
+// precisely true of a parked run. Cancel-while-parked is the escape hatch.
 func (q *Queries) CreateSelfImproveRun(ctx context.Context, arg CreateSelfImproveRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createSelfImproveRun,
 		arg.UserID,
@@ -74,6 +82,7 @@ func (q *Queries) CreateSelfImproveRun(ctx context.Context, arg CreateSelfImprov
 		arg.IssueIid,
 		arg.IssueTitle,
 		arg.IssueDescription,
+		arg.WaitOnLimit,
 	)
 	var i Run
 	err := row.Scan(

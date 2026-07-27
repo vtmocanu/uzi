@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -764,4 +765,214 @@ func TestClaimCarriesWaitOnLimitAndPlanApproved(t *testing.T) {
 				name, payload.WaitOnLimit, tc.waitOnLimit)
 		}
 	}
+}
+
+// TestClaimCarriesThePersistedAgentSelection is the resume half of Decision 6b's
+// verdict propagation. plan_approved and the selection come from ONE human gate
+// verdict; shipping the first without the second hands a user back a subagent they
+// deliberately excluded, with no signal.
+//
+// The nil case is not a detail — it is what keeps every gate-less run working. A run
+// that never reached a gate has agent_source NULL, and the worker's absent-default
+// (repo when a roster was detected, else own) is the correct answer for it. Returning
+// an empty selection instead would pin those runs to whatever source this code
+// guessed and override a roster the worker legitimately detected.
+func TestClaimCarriesThePersistedAgentSelection(t *testing.T) {
+	t.Run("a persisted selection is replayed verbatim", func(t *testing.T) {
+		f := newAutoFixture(t)
+		f.fs.claimRun.AgentSource = pgtype.Text{String: AgentSourceRepo, Valid: true}
+		f.fs.claimRun.AgentExclusions = []byte(`["reviewer","tester"]`)
+
+		sel := f.claim(t).AgentSelection
+		if sel == nil {
+			t.Fatal("the claim dropped a persisted selection. A resumed run then falls " +
+				"through to the worker's absent-default and silently regains every excluded " +
+				"subagent — half of a human verdict honoured, which is worse than none " +
+				"because the user gets no signal")
+		}
+		if sel.Source != AgentSourceRepo {
+			t.Fatalf("source = %q, want %q", sel.Source, AgentSourceRepo)
+		}
+		if len(sel.Exclusions) != 2 || sel.Exclusions[0] != "reviewer" || sel.Exclusions[1] != "tester" {
+			t.Fatalf("exclusions = %v, want [reviewer tester] — the exclusions ARE the "+
+				"half of the verdict that goes missing", sel.Exclusions)
+		}
+	})
+
+	t.Run("no persisted selection stays absent", func(t *testing.T) {
+		f := newAutoFixture(t) // claimRun leaves AgentSource invalid
+		if sel := f.claim(t).AgentSelection; sel != nil {
+			t.Fatalf("a run that never reached a gate carried %+v; it must stay absent so "+
+				"the worker's own default (repo when a roster was detected, else own) still "+
+				"applies — otherwise every gate-less run is pinned to a source this code "+
+				"guessed", sel)
+		}
+	})
+
+	t.Run("a chosen source with nothing excluded serializes as an empty list", func(t *testing.T) {
+		f := newAutoFixture(t)
+		f.fs.claimRun.AgentSource = pgtype.Text{String: AgentSourceOwn, Valid: true}
+		f.fs.claimRun.AgentExclusions = nil
+
+		sel := f.claim(t).AgentSelection
+		if sel == nil || sel.Source != AgentSourceOwn {
+			t.Fatalf("selection = %+v, want source own", sel)
+		}
+		if sel.Exclusions == nil {
+			t.Fatal("exclusions is nil, which marshals to JSON null; the wire contract is a " +
+				"list, and \"source chosen, nothing excluded\" is a real value that must " +
+				"serialize as []")
+		}
+		if len(sel.Exclusions) != 0 {
+			t.Fatalf("exclusions = %v, want empty", sel.Exclusions)
+		}
+	})
+
+	t.Run("malformed jsonb degrades to absent rather than failing the claim", func(t *testing.T) {
+		f := newAutoFixture(t)
+		f.fs.claimRun.AgentSource = pgtype.Text{String: AgentSourceRepo, Valid: true}
+		f.fs.claimRun.AgentExclusions = []byte(`{"not":"a list"}`)
+
+		if sel := f.claim(t).AgentSelection; sel != nil {
+			t.Fatalf("decoded %+v out of malformed jsonb", sel)
+		}
+		// The claim itself must still succeed: the column is data a previous write left
+		// behind, not an invariant of this request, and erroring here would strand a run
+		// no operator can unstick.
+	})
+}
+
+// --- wait_on_limit at creation, per path ----------------------------------------
+
+// 🔴 THIS TEST IS THE ONLY GUARD, AND THE COMPILER IS NOT ONE. sqlc emits a PARAMS
+// STRUCT, so a creation path that never mentions WaitOnLimit compiles cleanly and
+// yields the zero value — every run from it silently opted OUT, with the user's own
+// Settings toggle apparently doing nothing. Measured while wiring this: adding the
+// column and regenerating left `go build ./...` fully green with all three call
+// sites unstamped. So each path is asserted individually rather than by one
+// representative case; that is the whole point of the loop being unrolled.
+//
+// The design brief names four creation paths. Three take the owner's default, and
+// judge is the fourth: it must NOT be stamped, because a judge run never parks
+// (Decision 14) and the column's DEFAULT false is that mechanism.
+func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
+	optedIn := store.User{ID: uuid.New(), WaitOnLimit: true}
+
+	t.Run("CreateRun inherits the owner default", func(t *testing.T) {
+		fs := &fakeStore{
+			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			createRunResult: store.Run{ID: uuid.New()},
+			userByID:        optedIn,
+		}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, nil); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if !fs.createRunParams.WaitOnLimit {
+			t.Fatal("a run created for an opted-in owner was stamped wait_on_limit=false. " +
+				"The user's Settings toggle then does nothing and nothing goes red — a " +
+				"params struct that omits the field compiles fine")
+		}
+	})
+
+	t.Run("CreateRun honours an explicit false over an opted-in default", func(t *testing.T) {
+		no := false
+		fs := &fakeStore{
+			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			createRunResult: store.Run{ID: uuid.New()},
+			userByID:        optedIn,
+		}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &no); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if fs.createRunParams.WaitOnLimit {
+			t.Fatal("an explicit false was ignored in favour of the owner default; the " +
+				"pointer exists precisely so 'said false' outranks 'said nothing'")
+		}
+	})
+
+	t.Run("CreateRun honours an explicit true over an opted-out default", func(t *testing.T) {
+		yes := true
+		fs := &fakeStore{
+			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			createRunResult: store.Run{ID: uuid.New()},
+			userByID:        store.User{ID: optedIn.ID}, // default false
+		}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false, &yes); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if !fs.createRunParams.WaitOnLimit {
+			t.Fatal("an explicit true was ignored")
+		}
+	})
+
+	t.Run("CreateAutopilotRun inherits the owner default", func(t *testing.T) {
+		// The path the dropped start-run modal could never have reached: no human is in
+		// the loop, so the default is the ONLY thing that can opt it in.
+		fs := &fakeStore{
+			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			createRunResult: store.Run{ID: uuid.New()},
+			userByID:        optedIn,
+		}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateAutopilotRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", false); err != nil {
+			t.Fatalf("CreateAutopilotRun: %v", err)
+		}
+		if !fs.createRunParams.WaitOnLimit {
+			t.Fatal("an autopilot run for an opted-in owner was stamped false")
+		}
+	})
+
+	t.Run("a torn user read resolves false rather than failing the creation", func(t *testing.T) {
+		fs := &fakeStore{
+			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			createRunResult: store.Run{ID: uuid.New()},
+			userByIDErr:     errors.New("boom"),
+		}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", false, nil); err != nil {
+			t.Fatalf("a preference lookup failure must not fail the creation: %v", err)
+		}
+		if fs.createRunParams.WaitOnLimit {
+			t.Fatal("a failed lookup resolved TRUE; false is today's behaviour and the safe " +
+				"direction")
+		}
+	})
+}
+
+// The two poller/engine-created kinds. Both park (Decision 14) and neither has a
+// human in the loop, so the owner's default is the only thing that can opt them in —
+// and these are exactly the runs the dropped start-run modal could never have
+// reached, which is the coverage argument that carried the run-view toggle.
+func TestPollerCreatedRunsInheritTheOwnerWaitOnLimitDefault(t *testing.T) {
+	owner := uuid.New()
+	optedIn := store.User{ID: owner, WaitOnLimit: true}
+
+	t.Run("ci_fix", func(t *testing.T) {
+		fs := &fakeStore{ciFixRunResult: store.Run{ID: uuid.New(), Kind: RunKindCIFix}, userByID: optedIn}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateCIFixRun(context.Background(), owner, uuid.New(), "main", "t", "d", sampleSnapshot()); err != nil {
+			t.Fatalf("CreateCIFixRun: %v", err)
+		}
+		if fs.ciFixRunParams == nil || !fs.ciFixRunParams.WaitOnLimit {
+			t.Fatal("a ci_fix run for an opted-in owner was stamped false. It rides the same " +
+				"runner, executor and plan gate as an issue run and costs the same, so " +
+				"excluding it would have meant paying for a guard to NOT have the feature")
+		}
+	})
+
+	t.Run("self_improve", func(t *testing.T) {
+		fs := &fakeStore{userByID: optedIn}
+		svc := New(fs, newBox(t), testParams())
+		if _, err := svc.CreateSelfImproveRun(context.Background(), owner, uuid.New(), 7, "t", "d"); err != nil {
+			t.Fatalf("CreateSelfImproveRun: %v", err)
+		}
+		if fs.selfImproveParams == nil || !fs.selfImproveParams.WaitOnLimit {
+			t.Fatal("a self_improve run for an opted-in owner was stamped false. It is long, " +
+				"repo-ful, auto_approve and expensive — the run whose loss to a five-hour " +
+				"window hurts most")
+		}
+	})
 }

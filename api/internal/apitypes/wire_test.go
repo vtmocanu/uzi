@@ -47,6 +47,9 @@ func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
 		"autopilot_enabled", "judge_enabled",
+		// PRD #35 Decision 7: the per-user DEFAULT for the usage-limit park. A default,
+		// not a policy — every run carries its own, stamped at creation.
+		"wait_on_limit",
 		// PRD #104 M4: which credential this user's retrospectives spend. Both null
 		// ⇒ their default. The label, never the token value.
 		"judge_anthropic_secret_id", "judge_anthropic_secret_label",

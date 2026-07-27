@@ -535,3 +535,32 @@ func pgTextPtr(s *string) pgtype.Text {
 	}
 	return pgtype.Text{String: *s, Valid: true}
 }
+
+// resolveWaitOnLimit answers "does THIS new run park on a usage limit" (PRD #35
+// Decision 7): the caller's explicit choice when it made one, else the owner's
+// users.wait_on_limit default.
+//
+// It lives in the SERVICE layer rather than as a SQL DEFAULT because the defaulting
+// has to be visible at every creation site. A DEFAULT clause would make a creation
+// path added later silently opt its users out with nothing going red — and note that
+// Go does NOT save you here either: sqlc's params are a struct literal, so an
+// unstamped call site compiles and yields false. Measured while wiring this: adding
+// the column and regenerating left `go build ./...` green with all three call sites
+// unstamped. The real guard is a per-path test, and there is one.
+//
+// A FAILED USER LOOKUP RESOLVES TO false, NOT AN ERROR, and the direction matters:
+// false is today's behaviour exactly (the run fails on a limit, now with a better
+// reason), whereas failing the creation would turn a preference lookup into a run
+// that never exists. A user row is also always present here — every creation path
+// has already proven ownership of a repo or an issue by this point — so this is the
+// fallback for a torn read, not a routine branch.
+func (s *Service) resolveWaitOnLimit(ctx context.Context, userID uuid.UUID, requested *bool) bool {
+	if requested != nil {
+		return *requested
+	}
+	u, err := s.q.GetUserByID(ctx, userID)
+	if err != nil {
+		return false
+	}
+	return u.WaitOnLimit
+}

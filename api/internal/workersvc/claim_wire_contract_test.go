@@ -56,7 +56,11 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		PlanMd:           strptr("# Plan\n"),
 		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
 		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
-		PlanApproved:     true, // PRD #35 Decision 6b: lets a resume skip the plan gate
+		PlanApproved:     true,
+		// PRD #35: the persisted selection rides the claim so a resumed, already-approved
+		// run keeps the exclusions the same human verdict carried. NON-EMPTY on purpose —
+		// an empty exclusions list here would agree with a producer that dropped them.
+		AgentSelection: &AgentSelection{Source: "repo", Exclusions: []string{"reviewer"}}, // PRD #35 Decision 6b: lets a resume skip the plan gate
 		Repo: ClaimRepo{
 			ID:            "22222222-2222-2222-2222-222222222222",
 			URL:           "https://gitlab.example.com/g/p",

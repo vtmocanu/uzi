@@ -1360,6 +1360,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// approved, and can fail with REASON_NO_PLAN when the resumed session declines
 		// to re-emit its plan.
 		PlanApproved: run.AutoApprove || rc.HumanPlanApproved,
+		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
+		// verdict, and propagating the approval without the exclusions is what silently
+		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
+		AgentSelection: persistedSelection(run),
 		Repo: ClaimRepo{
 			ID:            uuid.UUID(run.RepoID.Bytes).String(),
 			URL:           rc.RepoWebUrl,
@@ -2684,8 +2688,12 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // Decision 3): the handler sets it from the fresh forge snapshot's labels + the
 // prdless settings, and it exempts this run from the HasPrdLink gate. The
 // one-non-terminal-run-per-issue index rejects a duplicate active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD)
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
+	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
+	// because "the caller said false" and "the caller said nothing" are different
+	// requests, and collapsing them would make every API client that omits the field
+	// override the user's own Settings choice with false.
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD, waitOnLimit)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -2700,10 +2708,12 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 // invariant that an autopilot run and a manual run are born through the same path is
 // enforced structurally, not by two implementations that could drift.
 func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD)
+	// nil: an autopilot run has no human in the loop to express a per-run choice, so
+	// it takes the owner's default (PRD #35 Decision 7 / design brief 7.3).
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD, nil)
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool, waitOnLimit *bool) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -2752,6 +2762,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		IssueDescription: description,
 		OriginColumn:     s.originColumn(ctx, repoID, issue),
 		AutoApprove:      autoApprove,
+		// PRD #35 Decision 7. Stamped at creation from the owner's default (or the
+		// caller's explicit choice), never read from users at park time: a run must
+		// keep the behaviour it was created with, so flipping the default later cannot
+		// retroactively change a run already in flight.
+		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, waitOnLimit),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

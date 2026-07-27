@@ -286,8 +286,21 @@ WHERE status = 'online'
 -- the worker reads it to resolve the plan gate without a human.
 -- repo_id is nullable since PRD #39 (chat runs carry none); the ::uuid cast keeps
 -- this INSERT param a non-null uuid.UUID — an issue run always targets a repo.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
+--
+-- wait_on_limit is the PRD #35 opt-in, resolved in the SERVICE layer as
+-- COALESCE(explicit request, the owner's users.wait_on_limit default) and passed in
+-- explicitly, rather than defaulted in SQL. Naming the column here is what makes an
+-- unstamped creation path visible in a diff of THIS file.
+--
+-- 🔴 IT IS NOT VISIBLE TO THE COMPILER, THOUGH, AND ASSUMING OTHERWISE IS THE TRAP.
+-- sqlc generates a PARAMS STRUCT, and a Go struct literal that omits a field
+-- compiles happily and yields the zero value — which for a bool is false, i.e. every
+-- run from that path silently opted OUT. Measured while writing this: adding the
+-- column and regenerating left `go build ./...` fully green with all three call
+-- sites unstamped. So the guard here is a TEST that creates a run for an opted-in
+-- owner and asserts the flag arrives, per creation path — not the type system.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1514,3 +1527,28 @@ WHERE id = @id AND status = @status;
 -- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
 -- for a queued run already past its threshold, so it is off the hot path.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: SetRunWaitOnLimit :execrows
+-- Flip ONE run's usage-limit opt-in after the fact (PRD #35 Decision 7, the per-run
+-- surface the user ruled for on 2026-07-27 in place of a start-run modal).
+--
+-- Owner-scoped: a run is toggled by the person whose credentials it spends, and the
+-- predicate is the write's own authorization rather than a fact maintained
+-- elsewhere. A foreign run returns 0 rows, which the handler maps to 404 — never
+-- 403, which would confirm the run exists.
+--
+-- The status guard is CancelRunServerSide's, deliberately reused verbatim: negative,
+-- so it covers limit_wait for free and needs no edit for any future non-terminal
+-- status. A terminal run is a no-op rather than an error — the toggle changes FUTURE
+-- limit behaviour, and a finished run has none.
+--
+-- 🔴 IT DOES NOT TOUCH status, AND MUST NOT. Flipping the flag OFF on a parked run
+-- does not un-park it: Decision 11's cancel is that control, and silently failing a
+-- user's run because they changed a preference would destroy work they never asked
+-- to lose. Flipping it ON while parked is likewise inert — the run is already
+-- parked. The flag is read at the NEXT limit event and at the next claim (the worker
+-- re-reads it from the row every time), which is what makes a mid-flight change take
+-- effect without this statement needing to reach into the state machine.
+UPDATE runs SET wait_on_limit = @wait_on_limit, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');

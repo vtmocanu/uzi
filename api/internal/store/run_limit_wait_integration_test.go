@@ -449,3 +449,128 @@ func TestGetRunClaimContextHumanPlanApprovedLiveDB(t *testing.T) {
 			"already approved, and can fail with REASON_NO_PLAN")
 	}
 }
+
+// TestSetRunWaitOnLimitLiveDB pins the per-run toggle's SQL semantics (PRD #35
+// Decision 7, the surface the user chose over a start-run modal).
+//
+// 🔴 THE STATUS ASSERTIONS ARE THE POINT, NOT THE FLAG ONES. The toggle changes
+// FUTURE limit behaviour only, so flipping it off on a PARKED run must not un-park
+// or cancel it: Decision 11's cancel is that control, and silently failing someone's
+// run because they changed a preference would destroy work they never asked to lose.
+// A statement that touched status would pass every flag assertion here.
+func TestSetRunWaitOnLimitLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, otherID, connID, repoID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, u := range []uuid.UUID{userID, otherID} {
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			u, fmt.Sprintf("wol-%s@e2e", u))
+	}
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+
+	var iid int64 = 5000
+	newRun := func(t *testing.T, status string, wait bool) uuid.UUID {
+		t.Helper()
+		iid++
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, wait_on_limit)
+			 VALUES ($1, $2, $3, $4, 't', 'd', $5, $6)`, id, userID, repoID, iid, status, wait)
+		return id
+	}
+	read := func(t *testing.T, id uuid.UUID) (string, bool) {
+		t.Helper()
+		var status string
+		var wait bool
+		if err := pool.QueryRow(ctx, `SELECT status, wait_on_limit FROM runs WHERE id = $1`, id).
+			Scan(&status, &wait); err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		return status, wait
+	}
+	set := func(t *testing.T, id, owner uuid.UUID, enabled bool) int64 {
+		t.Helper()
+		rows, err := q.SetRunWaitOnLimit(ctx, store.SetRunWaitOnLimitParams{
+			ID: id, UserID: owner, WaitOnLimit: enabled,
+		})
+		if err != nil {
+			t.Fatalf("SetRunWaitOnLimit: %v", err)
+		}
+		return rows
+	}
+
+	t.Run("flips a non-terminal run and touches nothing else", func(t *testing.T) {
+		for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "limit_wait"} {
+			id := newRun(t, status, false)
+			if rows := set(t, id, userID, true); rows != 1 {
+				t.Fatalf("%s: rows = %d, want 1 — the guard is CancelRunServerSide's negative "+
+					"predicate, which covers every non-terminal status including limit_wait", status, rows)
+			}
+			gotStatus, gotWait := read(t, id)
+			if !gotWait {
+				t.Fatalf("%s: wait_on_limit did not flip", status)
+			}
+			if gotStatus != status {
+				t.Fatalf("%s: status became %q. The toggle governs FUTURE limit behaviour and "+
+					"must never move the state machine", status, gotStatus)
+			}
+		}
+	})
+
+	t.Run("turning it OFF on a parked run leaves it parked", func(t *testing.T) {
+		id := newRun(t, "limit_wait", true)
+		if rows := set(t, id, userID, false); rows != 1 {
+			t.Fatalf("rows = %d, want 1", rows)
+		}
+		status, wait := read(t, id)
+		if wait {
+			t.Fatal("the flag did not clear")
+		}
+		if status != "limit_wait" {
+			t.Fatalf("status = %q, want limit_wait still. Un-parking here would fail or "+
+				"resume a run because the user changed a PREFERENCE — Decision 11's cancel "+
+				"is the control for stopping a parked run, and it is a different request", status)
+		}
+	})
+
+	t.Run("a terminal run is a no-op", func(t *testing.T) {
+		for _, status := range []string{"completed", "failed", "cancelled"} {
+			id := newRun(t, status, false)
+			if rows := set(t, id, userID, true); rows != 0 {
+				t.Fatalf("%s: rows = %d, want 0", status, rows)
+			}
+			if _, wait := read(t, id); wait {
+				t.Fatalf("%s: the flag moved on a terminal run", status)
+			}
+		}
+	})
+
+	t.Run("a foreign run is untouched", func(t *testing.T) {
+		id := newRun(t, "running", false)
+		if rows := set(t, id, otherID, true); rows != 0 {
+			t.Fatalf("rows = %d, want 0 — ownership is this statement's OWN predicate, not a "+
+				"fact maintained by the caller", rows)
+		}
+		if _, wait := read(t, id); wait {
+			t.Fatal("a non-owner flipped someone else's run")
+		}
+	})
+}
