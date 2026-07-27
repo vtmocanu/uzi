@@ -165,13 +165,27 @@ That deleted the `uzi-workers` ServiceAccount and its pull-secret `InfisicalSecr
 **SEPARATE AND NOT A UGREP DEFECT — braces. The escape you add to make them literal is what turns them into a quantifier.** Filed apart from the paragraph above on purpose: BSD grep behaves identically, so folding it in would misattribute a portable POSIX behaviour to ugrep and weaken the divergence above, which is real. Measured 2026-07-27 (ugrep 7.5.0 in BRE, and `command grep`, BSD 2.6.0):
 
 ```
-grep     -c 'tabIndex={0}'    -> 1   correct — bare { is LITERAL in BRE
-grep  -F -c 'tabIndex={0}'    -> 1   identical; -F changes nothing here
-grep  -E -c 'tabIndex={0}'    -> 2   ERE: interval, "= zero times" also matches bare `tabIndex`
-grep     -c 'tabIndex=\{0\}'  -> 2   <- THE TRAP: escaping IS the POSIX interval syntax
+grep     -c 'tabIndex={0}'    correct — bare { is LITERAL in BRE
+grep  -F -c 'tabIndex={0}'    identical; -F changes nothing here
+grep  -E -c 'tabIndex={0}'    ERE: interval
+grep     -c 'tabIndex=\{0\}'  <- THE TRAP: escaping IS the POSIX interval syntax
 ```
 
-The fourth line is the one to remember: it is a trap in the shape of a precaution. A careful person escaping the braces to be safe converts a literal into "zero of the preceding character".
+**The mechanism, which matters far more than any count: `x{0}` means "the preceding `x`, zero times", so the pattern SILENTLY WIDENS TO ITS OWN PREFIX — but ONLY in ERE/PCRE.** Two corrections, both measured on this host (ugrep 7.5.0) against a four-line fixture, because the paragraph is about not trusting counts you did not derive:
+
+```
+                          matches
+grep    'tabIndex={0}'    line 1 only          <- BRE: the braces are LITERAL
+grep -E 'tabIndex={0}'    lines 1, 2, 4        <- ERE: degrades to `tabIndex`
+grep -P 'tabIndex={0}'    lines 1, 2, 4        <- same
+      (fixture: `tabIndex={0}` / `tabIndex` / `tabInde` / `tabIndexZZZ`)
+```
+
+**Plain `grep` is NOT affected**: POSIX BRE spells the interval `\{0\}`, so a bare `{0}` is an ordinary character and the naive pattern behaves as a literal. The trap needs `-E` or `-P`. And the prefix is **`tabIndex`, not `tabInde`** — `{0}` quantifies the character immediately before it, which is `=`, not the `x`. Note line 3 (`tabInde`) does NOT match in any mode, which is the direct disproof of the shorter prefix.
+
+So the widened pattern matches every line containing `tabIndex` — a comment, a variable name, a doc sentence. So the inflation is **not "+1"**: it is exactly however many other lines carry the prefix, which is **zero on a clean fixture and non-zero the moment a comment mentions the symbol**. That is why two agents measuring this got `3→4` and `1→2` on their own fixtures and neither was wrong. A reader who learns "a brace adds one" mispredicts on both; a reader who learns "the interval makes the last character optional, so the pattern degrades to a prefix" predicts both.
+
+It is a trap in the shape of a precaution: the escape a careful person adds to make the braces literal is the thing that breaks it.
 
 *(Two earlier versions of this paragraph were wrong, both written by the lead from a single observation. The first claimed a bare `{0}` miscounts under plain `grep` — it does not; a reviewer filed that after an off-by-one expectation (`^2$` against a true count of 3) and retracted it once measured. The second generalised to "any unescaped metacharacter in an intended literal", which a tester refuted as mode-dependent: in BRE `a.b` and `c*d` over-match but `e+f` does not, because `+` is literal there. The habit both failures share is going from one measurement to a stated mechanism without re-measuring.)*
 
