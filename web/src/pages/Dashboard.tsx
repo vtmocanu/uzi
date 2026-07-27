@@ -63,7 +63,7 @@ function Step({
         {done ? <CheckIcon /> : index}
       </span>
       <div className="min-w-0 flex-1">
-        <p className={cx("text-sm font-medium", done ? "text-muted line-through decoration-edge-strong" : "text-fg")}>
+        <p className={cx("text-sm font-medium", done ? "text-muted line-through" : "text-fg")}>
           {title}
         </p>
         {!done && <p className="text-xs text-faint">{hint}</p>}
