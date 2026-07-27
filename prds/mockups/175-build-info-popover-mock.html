@@ -1,0 +1,1165 @@
+<title>uzi build info — surface variants</title>
+
+<style>
+  /* ---------------------------------------------------------------
+     Page tokens. Cool industrial neutrals, slightly slate-biased so
+     they sit next to uzi's own palette; ember orange is the single
+     accent, desaturated on the light ground so it doesn't glare.
+     --------------------------------------------------------------- */
+  :root {
+    --ground: #f4f5f7;
+    --surface: #ffffff;
+    --sunk: #eceef1;
+    --ink: #12151c;
+    --muted: #5c6472;
+    --faint: #858d9c;
+    --hair: #dcdfe5;
+    --hair-strong: #c3c8d2;
+    --accent: #c2661a;
+    --accent-soft: #f6ede3;
+    --good: #1d7a52;
+    --warn: #8a6516;
+    --shadow: 0 1px 2px rgb(18 21 28 / 0.06), 0 8px 24px rgb(18 21 28 / 0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0d0f14;
+      --surface: #141821;
+      --sunk: #0a0c11;
+      --ink: #e6e9ef;
+      --muted: #8b94a5;
+      --faint: #6b7385;
+      --hair: #242a36;
+      --hair-strong: #333b4a;
+      --accent: #fb923c;
+      --accent-soft: #2a1d10;
+      --good: #34d399;
+      --warn: #fbbf24;
+      --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.3);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0d0f14;
+    --surface: #141821;
+    --sunk: #0a0c11;
+    --ink: #e6e9ef;
+    --muted: #8b94a5;
+    --faint: #6b7385;
+    --hair: #242a36;
+    --hair-strong: #333b4a;
+    --accent: #fb923c;
+    --accent-soft: #2a1d10;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.3);
+  }
+
+  :root[data-theme="light"] {
+    --ground: #f4f5f7;
+    --surface: #ffffff;
+    --sunk: #eceef1;
+    --ink: #12151c;
+    --muted: #5c6472;
+    --faint: #858d9c;
+    --hair: #dcdfe5;
+    --hair-strong: #c3c8d2;
+    --accent: #c2661a;
+    --accent-soft: #f6ede3;
+    --good: #1d7a52;
+    --warn: #8a6516;
+    --shadow: 0 1px 2px rgb(18 21 28 / 0.06), 0 8px 24px rgb(18 21 28 / 0.05);
+  }
+
+  /* Mono is the display face here on purpose: every value on this page
+     is a stamped coordinate — a version, a SHA, a date. Same stack uzi
+     itself ships as --font-mono, so the mocks are literally correct. */
+  :root {
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: 56px 0 32px;
+    border-bottom: 1px solid var(--hair);
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(26px, 4.4vw, 40px);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  .standfirst {
+    max-width: 62ch;
+    color: var(--muted);
+    font-size: 16px;
+    margin: 0;
+  }
+
+  /* ---------- the data strip ---------- */
+
+  .strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 1px;
+    background: var(--hair);
+    border: 1px solid var(--hair);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 40px 0 0;
+  }
+
+  .strip-cell {
+    background: var(--surface);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .strip-key {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+
+  .strip-val {
+    font-family: var(--mono);
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .strip-note {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  .strip-note b {
+    font-weight: 600;
+    color: var(--good);
+  }
+
+  .strip-note i {
+    font-style: normal;
+    font-weight: 600;
+    color: var(--warn);
+  }
+
+  /* ---------- controls ---------- */
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin: 28px 0 0;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .seg {
+    display: inline-flex;
+    border: 1px solid var(--hair-strong);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .seg button {
+    appearance: none;
+    border: 0;
+    background: var(--surface);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 7px 15px;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+
+  .seg button + button { border-left: 1px solid var(--hair-strong); }
+  .seg button:hover { color: var(--ink); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
+  :root[data-theme="dark"] .seg button[aria-pressed="true"],
+  .seg button[aria-pressed="true"] { color: #fff; }
+
+  .seg button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  /* ---------- plates ---------- */
+
+  .plate {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+    gap: 40px;
+    align-items: start;
+    padding: 48px 0;
+    border-bottom: 1px solid var(--hair);
+  }
+
+  @media (max-width: 860px) {
+    .plate { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  }
+
+  .plate-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 0 0 6px;
+  }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 21px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+
+  .tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 3px;
+    border: 1px solid currentColor;
+    color: var(--faint);
+  }
+
+  .tag.pick { color: var(--accent); background: var(--accent-soft); }
+
+  .plate-body p {
+    margin: 0 0 14px;
+    color: var(--muted);
+    font-size: 14px;
+    max-width: 60ch;
+  }
+
+  .plate-body p:last-child { margin-bottom: 0; }
+
+  .plate-body strong { color: var(--ink); font-weight: 600; }
+
+  .spec {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border-top: 1px solid var(--hair);
+    margin-top: 18px;
+  }
+
+  .spec-row {
+    display: grid;
+    grid-template-columns: 74px minmax(0, 1fr);
+    gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--hair);
+    font-size: 13px;
+    align-items: start;
+  }
+
+  .spec-row dt {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--faint);
+    padding-top: 3px;
+  }
+
+  .spec-row dd { margin: 0; color: var(--muted); }
+
+  .spec-row dd code {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--sunk);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .cost { font-weight: 600; }
+  .cost.low { color: var(--good); }
+  .cost.mid { color: var(--warn); }
+  .cost.high { color: var(--accent); }
+
+  /* =================================================================
+     MOCK CHROME — uzi's real tokens. Deliberately fixed dark in both
+     page themes: uzi ships two dark themes (ember, mission) and no
+     light one, so inverting these would be a lie about the product.
+     ================================================================= */
+
+  .mock {
+    --u-bg: 8 10 15;
+    --u-surface: 15 18 26;
+    --u-raised: 23 27 38;
+    --u-edge: 39 45 60;
+    --u-fg: 228 232 240;
+    --u-muted: 148 158 176;
+    --u-faint: 122 133 154;
+    --u-brand: 251 146 60;
+    --u-ok: 52 211 153;
+
+    font-family: var(--sans);
+    background: rgb(var(--u-bg));
+    border: 1px solid rgb(var(--u-edge));
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    color: rgb(var(--u-fg));
+  }
+
+  [data-uzi="mission"] .mock {
+    --u-bg: 5 8 15;
+    --u-surface: 11 17 32;
+    --u-raised: 16 26 48;
+    --u-edge: 28 42 69;
+    --u-fg: 241 245 249;
+    --u-muted: 148 163 184;
+    --u-faint: 116 132 155;
+    --u-brand: 34 211 238;
+  }
+
+  .rail {
+    width: 232px;
+    background: rgb(var(--u-surface));
+    border-right: 1px solid rgb(var(--u-edge));
+    display: flex;
+    flex-direction: column;
+    min-height: 396px;
+  }
+
+  .rail-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 12px;
+    border-bottom: 1px solid rgb(var(--u-edge));
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .rail-dot {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: rgb(var(--u-brand));
+    flex: none;
+  }
+
+  .rail-nav { flex: 1; padding: 10px 8px; display: flex; flex-direction: column; gap: 1px; }
+
+  .rail-group {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgb(var(--u-faint));
+    padding: 12px 8px 5px;
+  }
+
+  .rail-group:first-child { padding-top: 4px; }
+
+  .rail-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: rgb(var(--u-muted));
+  }
+
+  .rail-item.on { background: rgb(var(--u-raised)); color: rgb(var(--u-fg)); }
+  .rail-item svg { flex: none; opacity: 0.75; }
+
+  .rail-foot { border-top: 1px solid rgb(var(--u-edge)); }
+
+  .rail-user {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 12px;
+  }
+
+  .avatar {
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    background: rgb(var(--u-raised));
+    color: rgb(var(--u-muted));
+    display: grid;
+    place-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    flex: none;
+  }
+
+  .rail-user-name { font-size: 12px; font-weight: 500; line-height: 1.3; }
+  .rail-user-role { font-size: 11px; color: rgb(var(--u-faint)); line-height: 1.3; }
+
+  /* the version node — the thing all four variants argue about */
+  .vnode {
+    border-top: 1px solid rgb(var(--u-edge));
+    padding: 6px 12px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: rgb(var(--u-faint));
+    font-variant-numeric: tabular-nums;
+  }
+
+  .vnode-2 { line-height: 1.5; }
+  .vnode-2 .age { color: rgb(var(--u-muted)); }
+
+  /* ---------- variant A: popover ---------- */
+
+  .pop-host { position: relative; }
+
+  .pop-trigger {
+    appearance: none;
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-top: 1px solid rgb(var(--u-edge));
+    padding: 6px 12px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: rgb(var(--u-faint));
+    cursor: pointer;
+    transition: color 120ms ease, background 120ms ease;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pop-trigger:hover { color: rgb(var(--u-fg)); background: rgb(var(--u-raised)); }
+
+  .pop-trigger:focus-visible {
+    outline: 2px solid rgb(var(--u-brand));
+    outline-offset: -2px;
+    color: rgb(var(--u-fg));
+  }
+
+  .pop {
+    position: absolute;
+    left: 10px;
+    bottom: calc(100% + 8px);
+    width: 226px;
+    background: rgb(var(--u-raised));
+    border: 1px solid rgb(var(--u-edge));
+    border-radius: 8px;
+    padding: 11px 12px;
+    box-shadow: 0 12px 32px rgb(0 0 0 / 0.55);
+    opacity: 0;
+    transform: translateY(4px);
+    pointer-events: none;
+    transition: opacity 130ms ease, transform 130ms ease;
+    z-index: 5;
+  }
+
+  .pop-host:hover .pop,
+  .pop-host:focus-within .pop {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pop { transition: none; transform: none; }
+    .pop-host:hover .pop, .pop-host:focus-within .pop { transform: none; }
+    .seg button { transition: none; }
+    .pop-trigger { transition: none; }
+  }
+
+  .pop-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: rgb(var(--u-fg));
+    letter-spacing: -0.01em;
+    margin-bottom: 2px;
+  }
+
+  .pop-sub {
+    font-size: 11px;
+    color: rgb(var(--u-faint));
+    margin-bottom: 9px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid rgb(var(--u-edge));
+  }
+
+  .kv {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 10px;
+    font-size: 11px;
+    align-items: baseline;
+  }
+
+  .kv dt { color: rgb(var(--u-faint)); margin: 0; }
+
+  .kv dd {
+    margin: 0;
+    font-family: var(--mono);
+    color: rgb(var(--u-fg));
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  .hint {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--faint);
+    font-style: italic;
+  }
+
+  /* ---------- variant C: about page ---------- */
+
+  .app { display: flex; }
+
+  .canvas {
+    flex: 1;
+    min-width: 0;
+    padding: 20px 22px;
+    background: rgb(var(--u-bg));
+  }
+
+  .page-title {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0 0 3px;
+  }
+
+  .page-sub { font-size: 12px; color: rgb(var(--u-faint)); margin: 0 0 18px; }
+
+  .card {
+    background: rgb(var(--u-surface));
+    border: 1px solid rgb(var(--u-edge));
+    border-radius: 9px;
+    padding: 15px 16px;
+    margin-bottom: 12px;
+  }
+
+  .card-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgb(var(--u-faint));
+    margin-bottom: 11px;
+  }
+
+  .age-hero {
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+    flex-wrap: wrap;
+  }
+
+  .age-num {
+    font-family: var(--mono);
+    font-size: 34px;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+    line-height: 1;
+    color: rgb(var(--u-brand));
+    font-variant-numeric: tabular-nums;
+  }
+
+  .age-unit { font-size: 13px; color: rgb(var(--u-muted)); }
+
+  .coords {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+    gap: 13px 18px;
+  }
+
+  .coord-k {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: rgb(var(--u-faint));
+    margin-bottom: 3px;
+  }
+
+  .coord-v {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: rgb(var(--u-fg));
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+  }
+
+  .linkrow { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .chip {
+    font-size: 11px;
+    color: rgb(var(--u-muted));
+    border: 1px solid rgb(var(--u-edge));
+    background: rgb(var(--u-raised));
+    border-radius: 999px;
+    padding: 4px 10px;
+    text-decoration: none;
+  }
+
+  /* ---------- variant D: stat tiles ---------- */
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+    gap: 9px;
+  }
+
+  .tile {
+    background: rgb(var(--u-surface));
+    border: 1px solid rgb(var(--u-edge));
+    border-radius: 9px;
+    padding: 12px 13px;
+  }
+
+  .tile.new { border-color: rgb(var(--u-brand) / 0.55); }
+
+  .tile-l {
+    font-size: 11px;
+    color: rgb(var(--u-faint));
+    margin-bottom: 5px;
+  }
+
+  .tile-v {
+    font-family: var(--mono);
+    font-size: 23px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tile.new .tile-v { color: rgb(var(--u-brand)); }
+  .tile-h { font-size: 10px; color: rgb(var(--u-faint)); margin-top: 5px; }
+
+  /* ---------- terminal ---------- */
+
+  .term {
+    background: rgb(var(--u-bg));
+    border: 1px solid rgb(var(--u-edge));
+    border-radius: 9px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+
+  .term-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 11px;
+    border-bottom: 1px solid rgb(var(--u-edge));
+    background: rgb(var(--u-surface));
+  }
+
+  .term-bar span {
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
+    background: rgb(var(--u-edge));
+  }
+
+  .term-body {
+    padding: 13px 14px;
+    overflow-x: auto;
+  }
+
+  .term pre {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.65;
+    color: rgb(var(--u-fg));
+    white-space: pre;
+  }
+
+  .term .c { color: rgb(var(--u-brand)); }
+  .term .d { color: rgb(var(--u-faint)); }
+  .term .s { color: rgb(var(--u-ok)); }
+
+  /* ---------- closing ---------- */
+
+  .closer { padding: 48px 0 0; }
+
+  .closer h2 { margin-bottom: 14px; }
+
+  .closer ol {
+    margin: 0;
+    padding-left: 20px;
+    max-width: 66ch;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  .closer li { margin-bottom: 9px; }
+  .closer li strong { color: var(--ink); font-weight: 600; }
+
+  .closer code {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--sunk);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .mockwrap { display: flex; }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">uzi · design options</p>
+    <h1>Where the factory's build info lives</h1>
+    <p class="standfirst">
+      Four places to surface how old uzi is and what exactly is running, mocked in uzi's own chrome.
+      All four read one endpoint — the existing <code style="font-family:var(--mono);font-size:0.9em">GET /api/version</code>, widened from a single string to a build-info object.
+    </p>
+  </header>
+
+  <section class="strip" aria-label="The four fields and where each comes from">
+    <div class="strip-cell">
+      <span class="strip-key">Founded</span>
+      <span class="strip-val">3 Jul 2026</span>
+      <span class="strip-note"><b>Free.</b> A Go const. It is never going to change.</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-key">Age</span>
+      <span class="strip-val">24 days</span>
+      <span class="strip-note"><b>Free.</b> Computed in the browser from Founded, so it stays right between releases.</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-key">Commits</span>
+      <span class="strip-val">2,060</span>
+      <span class="strip-note"><i>Costs a CI step.</i> Needs full git history — the image jobs clone shallow today.</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-key">Build</span>
+      <span class="strip-val">7bb0757</span>
+      <span class="strip-note"><i>Costs a build arg.</i> Same ldflags block that already stamps the version.</span>
+    </div>
+  </section>
+
+  <div class="controls">
+    <span>Preview theme</span>
+    <div class="seg" role="group" aria-label="uzi theme">
+      <button type="button" data-set="ember" aria-pressed="true">Ember</button>
+      <button type="button" data-set="mission" aria-pressed="false">Mission</button>
+    </div>
+    <span style="color:var(--faint)">— uzi's two shipped themes. Neither is light, so the mocks stay dark in both page themes.</span>
+  </div>
+
+  <div id="stage" data-uzi="ember">
+
+    <!-- ============ A ============ -->
+    <section class="plate">
+      <div class="mockwrap">
+        <div class="mock">
+          <div class="rail">
+            <div class="rail-brand"><span class="rail-dot"></span> uzi</div>
+            <nav class="rail-nav">
+              <div class="rail-group">Factory</div>
+              <div class="rail-item on">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                Dashboard
+              </div>
+              <div class="rail-item">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Runs
+              </div>
+              <div class="rail-item">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
+                Workers
+              </div>
+              <div class="rail-group">Help</div>
+              <div class="rail-item">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                Docs
+              </div>
+            </nav>
+            <div class="rail-foot">
+              <div class="rail-user">
+                <span class="avatar">V</span>
+                <span>
+                  <span class="rail-user-name">Vlad Mocanu</span>
+                  <span class="rail-user-role">Administrator</span>
+                </span>
+              </div>
+              <div class="pop-host">
+                <button type="button" class="pop-trigger" aria-describedby="pop-a">v0.11.12</button>
+                <div class="pop" id="pop-a" role="tooltip">
+                  <div class="pop-title">uzi v0.11.12</div>
+                  <div class="pop-sub">24 days old · 2,060 commits</div>
+                  <dl class="kv">
+                    <dt>Founded</dt><dd>3 Jul 2026</dd>
+                    <dt>Built</dt><dd>27 Jul 2026</dd>
+                    <dt>Commit</dt><dd>7bb0757</dd>
+                    <dt>Chart</dt><dd>0.11.12</dd>
+                  </dl>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="plate-body">
+        <div class="plate-head">
+          <h2>Badge popover</h2>
+          <span class="tag pick">recommended</span>
+        </div>
+        <p>
+          The footer badge stops being a <code>div</code> and becomes a button. Hover or focus it and the
+          full build coordinate set opens above. <strong>Try it in the mock</strong> — hover the version, or tab to it.
+        </p>
+        <p>
+          Everything stays where people already look for the version, and nothing new competes for
+          rail height or nav space.
+        </p>
+        <dl class="spec">
+          <div class="spec-row"><dt>Lives in</dt><dd><code>AppShell.tsx:496</code></dd></div>
+          <div class="spec-row"><dt>Cost</dt><dd><span class="cost low">Low</span> — one component, no route, no nav entry</dd></div>
+          <div class="spec-row"><dt>Collapsed</dt><dd>Works — the rail keeps the badge, popover anchors right</dd></div>
+          <div class="spec-row"><dt>Against</dt><dd>Found only by hovering. Wrong choice for anything you want people to notice.</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ============ B ============ -->
+    <section class="plate">
+      <div class="mockwrap">
+        <div class="mock">
+          <div class="rail" style="min-height:300px">
+            <div class="rail-brand"><span class="rail-dot"></span> uzi</div>
+            <nav class="rail-nav">
+              <div class="rail-group">Factory</div>
+              <div class="rail-item on">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                Dashboard
+              </div>
+              <div class="rail-item">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Runs
+              </div>
+            </nav>
+            <div class="rail-foot">
+              <div class="rail-user">
+                <span class="avatar">V</span>
+                <span>
+                  <span class="rail-user-name">Vlad Mocanu</span>
+                  <span class="rail-user-role">Administrator</span>
+                </span>
+              </div>
+              <div class="vnode vnode-2">
+                v0.11.12<br />
+                <span class="age">24 days · 2,060 commits</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="plate-body">
+        <div class="plate-head">
+          <h2>Two-line footer</h2>
+          <span class="tag">smallest diff</span>
+        </div>
+        <p>
+          Same node, one extra line, no interaction at all. The age is simply always on screen.
+        </p>
+        <p>
+          This is the cheapest thing that could work, and the only variant with no affordance to
+          discover — which is either its virtue or its ceiling, depending on whether you ever
+          want the SHA.
+        </p>
+        <dl class="spec">
+          <div class="spec-row"><dt>Lives in</dt><dd><code>AppShell.tsx:496</code></dd></div>
+          <div class="spec-row"><dt>Cost</dt><dd><span class="cost low">Lowest</span> — a few lines of JSX</dd></div>
+          <div class="spec-row"><dt>Collapsed</dt><dd>Does not fit — falls back to the version alone</dd></div>
+          <div class="spec-row"><dt>Against</dt><dd>Permanently spends rail height, and has no room for the build SHA or date</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ============ C ============ -->
+    <section class="plate">
+      <div class="mockwrap">
+        <div class="mock">
+          <div class="app">
+            <div class="rail" style="width:150px;min-height:404px">
+              <div class="rail-brand" style="font-size:13px"><span class="rail-dot"></span> uzi</div>
+              <nav class="rail-nav">
+                <div class="rail-group">Factory</div>
+                <div class="rail-item">Dashboard</div>
+                <div class="rail-item">Runs</div>
+                <div class="rail-group">Help</div>
+                <div class="rail-item">Docs</div>
+                <div class="rail-item on">About</div>
+              </nav>
+            </div>
+            <div class="canvas">
+              <h3 class="page-title">About this instance</h3>
+              <p class="page-sub">What is running here, and since when.</p>
+
+              <div class="card">
+                <div class="card-label">Factory age</div>
+                <div class="age-hero">
+                  <span class="age-num">24</span>
+                  <span class="age-unit">days since first commit, 3 Jul 2026</span>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card-label">Build coordinates</div>
+                <div class="coords">
+                  <div>
+                    <div class="coord-k">Version</div>
+                    <div class="coord-v">0.11.12</div>
+                  </div>
+                  <div>
+                    <div class="coord-k">Commit</div>
+                    <div class="coord-v">7bb0757</div>
+                  </div>
+                  <div>
+                    <div class="coord-k">Commits</div>
+                    <div class="coord-v">2,060</div>
+                  </div>
+                  <div>
+                    <div class="coord-k">Built</div>
+                    <div class="coord-v">27 Jul 2026</div>
+                  </div>
+                  <div>
+                    <div class="coord-k">Chart</div>
+                    <div class="coord-v">0.11.12</div>
+                  </div>
+                  <div>
+                    <div class="coord-k">Uptime</div>
+                    <div class="coord-v">6d 04h</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card" style="margin-bottom:0">
+                <div class="card-label">Elsewhere</div>
+                <div class="linkrow">
+                  <a class="chip" href="#c">Changelog</a>
+                  <a class="chip" href="#c">Docs</a>
+                  <a class="chip" href="#c">Source</a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="plate-body">
+        <div class="plate-head">
+          <h2>About page</h2>
+          <span class="tag">most room</span>
+        </div>
+        <p>
+          A real route under Help, next to Docs. The only variant with space for uptime, the chart
+          coordinate, and links out to the changelog.
+        </p>
+        <p>
+          Worth it if this is ever going to answer <strong>"what exactly is deployed on dev-cluster
+          right now"</strong> for someone debugging. Not worth it if it is only ever the age.
+        </p>
+        <dl class="spec">
+          <div class="spec-row"><dt>Lives in</dt><dd>New <code>/about</code> route + nav entry</dd></div>
+          <div class="spec-row"><dt>Cost</dt><dd><span class="cost mid">Medium</span> — page, route, nav, tests</dd></div>
+          <div class="spec-row"><dt>Collapsed</dt><dd>Unaffected</dd></div>
+          <div class="spec-row"><dt>Against</dt><dd>A page nobody visits twice. Pairs well with A rather than replacing it.</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ============ D ============ -->
+    <section class="plate">
+      <div class="mockwrap">
+        <div class="mock">
+          <div style="padding:18px 18px 20px">
+            <h3 class="page-title">Dashboard</h3>
+            <p class="page-sub">Everything the factory is doing right now.</p>
+            <div class="tiles">
+              <div class="tile">
+                <div class="tile-l">Active runs</div>
+                <div class="tile-v">3</div>
+                <div class="tile-h">2 awaiting approval</div>
+              </div>
+              <div class="tile">
+                <div class="tile-l">Workers</div>
+                <div class="tile-v">2</div>
+                <div class="tile-h">1 online</div>
+              </div>
+              <div class="tile">
+                <div class="tile-l">Boards</div>
+                <div class="tile-v">1</div>
+                <div class="tile-h">enabled repos</div>
+              </div>
+              <div class="tile new">
+                <div class="tile-l">Factory age</div>
+                <div class="tile-v">24d</div>
+                <div class="tile-h">since 3 Jul 2026</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="plate-body">
+        <div class="plate-head">
+          <h2>Dashboard tile</h2>
+          <span class="tag">most visible</span>
+        </div>
+        <p>
+          A fifth <code>StatTile</code> in the row that already exists. Four lines of code, and the
+          highest-traffic surface in the app.
+        </p>
+        <p>
+          The catch is what it sits next to. Active runs, workers and boards are numbers you
+          <strong>act on</strong>; factory age is a number you enjoy. Putting them in one row quietly
+          says they are the same kind of thing.
+        </p>
+        <dl class="spec">
+          <div class="spec-row"><dt>Lives in</dt><dd><code>Dashboard.tsx:181</code></dd></div>
+          <div class="spec-row"><dt>Cost</dt><dd><span class="cost low">Lowest</span> — one <code>StatTile</code></dd></div>
+          <div class="spec-row"><dt>Collapsed</dt><dd>Unaffected</dd></div>
+          <div class="spec-row"><dt>Against</dt><dd>Dilutes an operational row with a vanity metric. Every other tile links somewhere; this one has nowhere to go.</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <!-- ============ CLI ============ -->
+    <section class="plate">
+      <div class="mockwrap" style="flex-direction:column;gap:12px;width:100%">
+        <div class="term">
+          <div class="term-bar"><span></span><span></span><span></span></div>
+          <div class="term-body">
+<pre><span class="d">$</span> <span class="c">uzi</span> version
+uzi        <span class="s">v0.11.12</span>  <span class="d">(cli)</span>
+server     <span class="s">v0.11.12</span>  <span class="d">https://uzi.example.com</span>
+age        24 days   <span class="d">founded 3 Jul 2026</span>
+commits    2060
+build      7bb0757   <span class="d">27 Jul 2026 21:12 UTC</span></pre>
+          </div>
+        </div>
+        <div class="term">
+          <div class="term-bar"><span></span><span></span><span></span></div>
+          <div class="term-body">
+<pre><span class="d">$</span> <span class="c">uzi</span> version <span class="c">--json</span>
+{
+  <span class="s">"version"</span>: <span class="s">"0.11.12"</span>,
+  <span class="s">"server"</span>: {
+    <span class="s">"version"</span>: <span class="s">"0.11.12"</span>,
+    <span class="s">"founded"</span>: <span class="s">"2026-07-03"</span>,
+    <span class="s">"commits"</span>: 2060,
+    <span class="s">"commit"</span>: <span class="s">"7bb07572…"</span>,
+    <span class="s">"built_at"</span>: <span class="s">"2026-07-27T21:12:38Z"</span>,
+    <span class="s">"uptime_seconds"</span>: 534721
+  }
+}</pre>
+          </div>
+        </div>
+      </div>
+      <div class="plate-body">
+        <div class="plate-head">
+          <h2>CLI parity</h2>
+          <span class="tag">not optional</span>
+        </div>
+        <p>
+          Not a variant — this ships alongside whichever one you pick. CLAUDE.md's rule is that new
+          functionality gets checked against <code>api/cmd/uzi/</code>.
+        </p>
+        <p>
+          <code>uzi version</code> today prints <strong>only the CLI's own ldflags stamp</strong> and never
+          contacts the server (<code>api/cmd/uzi/version.go</code>). It also already supports
+          <code>--json</code>, so the top-level <code>version</code> key stays exactly as it is — agents
+          parse it today, and the Homebrew formula asserts on the human output. The server's coordinates
+          nest underneath.
+        </p>
+        <p>
+          <strong>Widening the response is the actual change.</strong> Every variant above is just a
+          different rendering of the same extra fields, which is why picking one is cheap and
+          changing your mind later is cheaper.
+        </p>
+      </div>
+    </section>
+
+  </div>
+
+  <section class="closer">
+    <h2>What I would do</h2>
+    <ol>
+      <li>Widen <code>GET /api/version</code> to a build-info object. Keep <code>version</code> as-is so nothing breaks.</li>
+      <li>Hardcode <strong>founded</strong> as a Go const and compute <strong>age</strong> client-side. Neither needs a release to stay correct.</li>
+      <li>Stamp <strong>commit</strong> and <strong>built_at</strong> through the ldflags block already in <code>api/Dockerfile</code> — two build args on a line that exists. <strong>commits</strong> is the odd one out: kaniko's build context is <code>api/</code>, so there is no <code>.git</code> to count. Ride the <code>publish:assert-changelog</code> job, which already runs at full depth on tags and is already a <code>needs:</code> of the publish jobs, and hand the number over as a dotenv artifact.</li>
+      <li>Ship <strong>A</strong> first. It is the smallest honest surface, and it does not spend rail height or dashboard attention. Add <strong>C</strong> later if instance debugging ever needs a page.</li>
+    </ol>
+  </section>
+
+</div>
+
+<script>
+  const stage = document.getElementById("stage");
+  document.querySelectorAll(".seg button").forEach((b) => {
+    b.addEventListener("click", () => {
+      stage.dataset.uzi = b.dataset.set;
+      document.querySelectorAll(".seg button").forEach((o) => {
+        o.setAttribute("aria-pressed", String(o === b));
+      });
+    });
+  });
+</script>
