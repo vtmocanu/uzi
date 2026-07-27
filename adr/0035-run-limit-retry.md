@@ -143,6 +143,81 @@ This is **accuracy, not security**. The security properties come from elsewhere 
 are unchanged: `RUN_LIMIT_MAX_PARK` clamps an inflated reset, and a deflated one costs
 the attacker's own user at most `RUN_LIMIT_MAX_WAITS` self-scoped retries.
 
+### D4 — A promotion wave is spread by TIME, never by the load counter; the jitter is the mechanism, not a garnish
+
+D2 manufactures something that did not exist before it: **a correlated wave.** N runs
+parked against the same exhausted credential all become promotable at roughly the same
+reset. Without D2 they would simply have failed, N times, independently.
+
+`PromoteLimitWaitRuns` is a **single UPDATE that promotes every row whose clock has
+passed**, so one sweeper tick releases the entire wave at once. The 60-180s jitter on
+`retry_not_before` is therefore the only thing that separates them. **It is
+load-bearing and must not be "simplified" away** on the theory that the sweeper tick
+already spreads runs out — it does the exact opposite.
+
+**How the spread actually works, and why it needs no new mechanism.** Claim ordering
+is: `ClaimRun` (status → `claimed`) → `assembleClaim` → `claimSecretID` → `autoChoice`
+→ `ListAutoSelectCandidates` → pick → `recordRunCredential` (stamps
+`anthropic_secret_id`). So a run that claimed *earlier* has already **recorded** its
+pick by the time a later run ranks, and the existing in-flight counter sees it and
+penalizes that token. Jitter separates the promotions; claims then serialize; each
+pick is recorded before the next ranking reads it. **The jitter and the counter are
+one mechanism, not two.**
+
+#### 🔴 Widening the load counter to include parked runs CANNOT work, and this is why
+
+It is the obvious fix and it will be proposed again, so the refutation is recorded
+rather than the conclusion:
+
+**`runs.anthropic_secret_id` on a parked run names the credential the run
+SPENT, not the one it is about to spend.** The park does not clear it, promotion does
+not clear it, and only the *next* claim's `recordRunCredential` overwrites it. So
+every parked run in the wave is recorded against **X — the exhausted credential** —
+and counting them would pile phantom load onto the one token that is already excluded
+for being empty. It adds **exactly zero** asymmetry between the candidates Y and Z
+that the wave is actually going to converge on.
+
+The general form, which is the part worth keeping: **the in-flight bias works because
+it is per-token asymmetric.** A run that has not yet chosen a credential contributes
+no asymmetry, and a load term applied equally to every candidate cannot change a
+ranking. **Parked load is structurally unrankable.** No widening of that counter — by
+`retry_not_before`, by status, by anything — can spread a wave, because the
+information it would need (which token each parked run is *going* to pick) does not
+exist until the run picks it.
+
+The counter's exclusion of `limit_wait` is therefore not a gap that D2 opened. It is
+**correct, and correct for D2's own reason**: a counted run is one that has chosen.
+
+#### Rejected alternatives
+
+- **Stagger the claim rather than the promotion.** This duplicates the jitter one
+  layer down: a claim follows its promotion within one worker poll interval, so
+  jittered promotion already *is* a staggered claim. Implementing it separately needs
+  either a second not-before column or an in-process timer, and both are more
+  machinery for the same effect.
+- **`LIMIT` the promotion batch per tick** (considered here, not raised by the review;
+  recorded because it is the next idea anyone has). It bounds the wave regardless of
+  jitter collisions and costs one clause — and it converts a **rare** ranking collision
+  into a **guaranteed** delay for the tail of every wave, since the sweeper tick can be
+  minutes and the (N−K)th run then waits extra ticks. Bad trade against a race that
+  self-corrects in one re-park.
+
+#### Accepted residual, stated honestly
+
+Two promotions closer together than one claim round-trip can still rank identically
+and converge on the same token. **That race is not new** — it exists today for any two
+concurrent claims, and PRD #111 accepted it in the in-flight bias' own comment
+(*"several claims inside one interval read the SAME headroom and would pile onto the
+same emptiest token"*). D2 makes it **more likely** by correlating the promotions, and
+the jitter is what bounds it.
+
+The cost is small and self-correcting: if the token they converge on has real
+headroom, both runs simply run and nothing bad happened; only if it is near-empty does
+the second re-park, costing one unit of `RUN_LIMIT_MAX_WAITS`. **If this ever bites,
+the knob is the jitter RANGE, not the counter.** The observable signal is
+`SweepResult.LimitPromoted > 1` on a single tick — already reported, so no new
+instrumentation is needed to see it.
+
 ## Consequences
 
 **The two no-regression properties are structural, not tested-in.** They are why this

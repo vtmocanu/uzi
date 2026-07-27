@@ -169,7 +169,19 @@ this PRD supersedes that stance for sustained limits.
    - **already** invisible to the PRD #47 health detector — no edit, and it can
      therefore never read "stalled" (↳2026-07-27: `ListActiveRunsForHealth`,
      `runtime.sql:1286`, uses a **positive** allowlist
-     `status IN ('queued','running','awaiting_approval')`);
+     `status IN ('queued','running','awaiting_approval')`).
+
+     **↳M0 — that set has THREE hand-written mirrors, not one, and this inventory
+     listed none of them.** All three are positive allowlists, so all three exclude a
+     parked run for free and **none needs an edit** — but M5 and M4 work from this
+     list, so an unlisted mirror gets either rediscovered as a "gap" or "fixed" into a
+     real bug. They are: `web/src/lib/runBadge.ts:138` `isHealthFlaggableStatus` (the
+     web badge gate), `api/internal/slacksvc/health.go:51` `isHealthFlaggableStatus`
+     (the Slack root's ⚠ variant, a hand-written twin of the SQL set), and the SQL
+     itself. **Do not add `limit_wait` to any of them**: the detector's signals
+     (stalled / looping / slow) all describe a *running* agent, and a parked run's flag
+     is cleared at park entry by the exit contract below, so there is nothing for a
+     flaggable park to show but a false alarm;
    - still needing the **reconciler** mapping `limit_wait → In Progress with
      act:true` (`runlifecycle/lifecycle.go:161-172`; ↳review N3 — an act:false
      default would leave a pending move marker unhealed and trip the 30m give-up
@@ -197,6 +209,30 @@ this PRD supersedes that stance for sustained limits.
      seven_day window) the run **fails** with a clear reason instead of parking.
      The clamp is server-side because a compromised worker must not park a run for
      years.
+
+     **↳M0 — the jitter is the MECHANISM, not a garnish, and it must not be
+     "simplified" away.** Decision 6e makes promotion pool-aware, which manufactures a
+     correlated **wave**: N runs parked against one exhausted credential all become
+     promotable at the same reset, and `PromoteLimitWaitRuns` is a single UPDATE that
+     releases every eligible row in one tick — so the sweeper does the opposite of
+     spreading them. The jitter is the only thing that separates them, and it works
+     **with** PRD #111's in-flight counter rather than instead of it: jitter separates
+     the promotions, claims then serialize, and each run's pick is *recorded*
+     (`recordRunCredential`) before the next run's ranking query reads it, so the
+     existing counter sees it.
+
+     **Widening that counter to include parked runs cannot help, and the reason is
+     worth knowing because it is the obvious fix**: a parked run's
+     `anthropic_secret_id` names the credential it *spent*, not the one it is about to
+     spend (nothing clears it until the next claim overwrites it). Counting parked runs
+     therefore piles phantom load onto the already-excluded exhausted token and adds
+     **zero** asymmetry between the candidates the wave will actually converge on. The
+     counter's `limit_wait` exclusion is correct, and correct for Decision 6e's own
+     reason: a counted run is one that has chosen. Full argument, the accepted residual
+     (two promotions closer than one claim round-trip can still collide — a race that
+     predates this PRD and that PRD #111 accepted explicitly) and the rejected
+     alternatives are in **ADR-35 D4**. If it ever bites, the knob is the jitter
+     RANGE, not the counter; the signal is `SweepResult.LimitPromoted > 1` on one tick.
    - ↳2026-07-27 **the "worker-reported is the only source" premise is obsolete.**
      PRD #53/#104 shipped `anthropic_rate_limits`, keyed on `user_secret_id` with
      `five_hour_resets_at` / `seven_day_resets_at` (`00080_rate_limits_per_token.sql:40-52`),
@@ -819,9 +855,16 @@ this PRD supersedes that stance for sustained limits.
   exactly that way today) and `GetSlackRunContext` (`:265`) selects the reset
   timestamp for the "paused: usage limit (five_hour); resumes ~<t>" line —
   `EscapeMrkdwn` applied per-field even though the type is allowlisted upstream;
-  `docs/` page section + `docs/configuration.md` for the new envs **and the parked
-  disk cost** (Decision 6a); `specs/ai.md` design record; `specs/human.md` addition
-  proposed to the user.
+  `docs/` page section + `docs/configuration.md` **and `.env.example`** for the new
+  envs (↳M0 — `.env.example` was owned by no milestone and is assigned here; every
+  comparable run knob appears in both files: `RUN_TIMEOUT:221`,
+  `RUN_IDLE_TIMEOUT:223`, `RUN_MAX_REQUEUES:231`, `WORKER_AFFINITY_GRACE:243`) **and
+  the parked disk cost** (Decision 6a); `specs/ai.md` design record; `specs/human.md`
+  addition proposed to the user.
+
+  **↳M0 — M5 must NOT "fix" `api/internal/slacksvc/health.go:51`.** Its
+  `isHealthFlaggableStatus` is a positive allowlist that already excludes a parked run
+  correctly; it is now listed in Decision 3's inventory as already-satisfied.
 - [ ] **M6 — E2E**: stub-executor scenarios — opt-in park → sweeper promotes (short
   test clock) → resume **skips the gate** and completes; opt-out fails with
   explanatory reason; cancel-while-parked cancels immediately; full-stack smoke.
@@ -966,6 +1009,41 @@ this PRD supersedes that stance for sustained limits.
   **The milestone graph is unchanged** — none of the four rulings moves a file
   between lanes; (b) lands in the agent lane and the seam, (a)/(c)/(d) in the api
   lane, and the M4 constraints remove a collision rather than creating one.
+- 2026-07-27 — **M0 rev 3**, from the M-SEAM review. **Ruling: the promotion-wave
+  stampede is real, but the proposed fix cannot work and the existing design already
+  contains the mechanism.** Decision 6e makes promotion pool-aware, which manufactures
+  a correlated wave that did not exist before it — N runs parked on one exhausted
+  credential all become promotable at the same reset, and `PromoteLimitWaitRuns`
+  releases every eligible row in one UPDATE. The review proposed widening
+  `ListAutoSelectCandidates`' in-flight counter to include parked runs. **It cannot
+  spread anything**: a parked run's `anthropic_secret_id` names the credential it
+  *spent*, not the one it is about to spend, so counting parked runs piles phantom load
+  onto the already-excluded exhausted token and adds zero asymmetry between the
+  candidates the wave converges on. The general form, which is the durable part: the
+  in-flight bias works because it is **per-token asymmetric**, a run that has not yet
+  chosen contributes no asymmetry, and a load term applied equally to every candidate
+  cannot change a ranking — **parked load is structurally unrankable**. So the counter's
+  `limit_wait` exclusion is not a gap Decision 6e opened; it is correct for Decision
+  6e's own reason (a counted run is one that has chosen). What *does* spread the wave is
+  time: the jitter separates the promotions, claims serialize, and each pick is recorded
+  before the next ranking reads it — **the jitter and the counter are one mechanism, not
+  two**, which reclassifies the jitter from mitigation to load-bearing. Also rejected:
+  staggering the claim (duplicates the jitter one layer down) and `LIMIT`ing the
+  promotion batch (converts a rare collision into a guaranteed delay for every wave's
+  tail). Accepted residual: two promotions closer than one claim round-trip can still
+  converge — a race that **predates this PRD**, which PRD #111 accepted explicitly, made
+  likelier by the correlation and bounded by the jitter; if it bites, the knob is the
+  jitter RANGE and the signal is `SweepResult.LimitPromoted > 1` on one tick. Recorded as
+  **ADR-35 D4**, since it is a consequence of D2 rather than of a milestone.
+
+  **Two inventory corrections in the same pass.** Decision 3's already-satisfied list
+  named the health detector's SQL allowlist but **none of its two hand-written
+  mirrors** — `web/src/lib/runBadge.ts:138` and `api/internal/slacksvc/health.go:51`,
+  both positive allowlists, both already correct, both now listed so M4 and M5 neither
+  rediscover them as gaps nor "fix" them into bugs. And `.env.example` was owned by no
+  milestone; assigned to **M5**, since every comparable run knob appears in both it and
+  `docs/configuration.md`.
+
 - 2026-07-27 — **Both M0 open questions ruled BY THE USER**; both went the way the
   architect recommended.
 
