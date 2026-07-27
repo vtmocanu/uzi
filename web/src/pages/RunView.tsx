@@ -284,16 +284,7 @@ export function RunView() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-ok">Run completed</p>
-              <p className="mt-0.5 text-xs text-muted">
-                {duration && <>Ran for {duration}. </>}
-                {run.branch && (
-                  <>
-                    Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{run.branch}</code>
-                    {run.mr_iid != null &&
-                      ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
-                  </>
-                )}
-              </p>
+              <RunCompletedLine run={run} duration={duration} mrState={mrState} />
             </div>
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
@@ -753,6 +744,37 @@ export function PlanPanel({
  * target repo, so it is untrusted free text on the same footing as judge output. Display
  * only — nothing here is posted back or used as a key.
  */
+/**
+ * The completed-run hero's detail line. Exported for the same reason RunHeading is: `RunView`
+ * needs routing, a live stream and a dozen API mocks to mount, so `run.branch` could not
+ * otherwise be asserted — and an unverified strip is what this batch keeps finding.
+ *
+ * `run.branch` is WORKER-supplied and ingest stores it as `stripNULParam(req.Branch)` — NUL
+ * only, no Cc/Cf — so it has the same profile as every other field this batch closed.
+ */
+export function RunCompletedLine({
+  run,
+  duration,
+  mrState,
+}: {
+  run: Run;
+  duration?: string | null;
+  mrState?: string | null;
+}) {
+  return (
+    <p className="mt-0.5 text-xs text-muted">
+      {duration && <>Ran for {duration}. </>}
+      {run.branch && (
+        <>
+          Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{stripUnsafeChars(run.branch)}</code>
+          {run.mr_iid != null &&
+            ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+        </>
+      )}
+    </p>
+  );
+}
+
 export function RunHeading({ run }: { run: Run }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2">

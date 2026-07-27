@@ -490,6 +490,17 @@ export function WorkersSettings() {
                     ref={confirmRef}
                     tabIndex={-1}
                     role="group"
+                    // Issue #124, and the one w.name site where the consequence is NOT
+                    // cosmetic: this is the accessible name of a DESTRUCTIVE confirmation and
+                    // the only thing a screen-reader user gets before choosing. A name
+                    // crafted so the announcement reads as a different worker turns a
+                    // self-inflicted typo risk into a wrong-target delete.
+                    //
+                    // The field is unstripped at ingest (handler/workers.go:388 trims and
+                    // length-caps, no Cc/Cf). Owner-set, so per-owner surfaces are
+                    // self-inflicted — but the ADMIN fleet list (RunsList.tsx) renders names
+                    // cross-user, which is why the strip is unconditional rather than argued
+                    // per surface.
                     aria-label={`Confirm deleting ${stripUnsafeChars(w.name)}`}
                     // The label alone would DEFEAT this control for a screen reader.
                     // Focusing a named container announces its accessible NAME —

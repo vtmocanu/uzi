@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary, JudgePanel, RunHeading, derivePlanRevision } from "./RunView";
+import { PlanPanel, AgentRosterSummary, JudgePanel, RunHeading, RunCompletedLine, derivePlanRevision } from "./RunView";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -213,6 +213,21 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
 // was the one render site in this batch that no test reached — dropping its strip left the
 // whole file green, which is why RunHeading is now extracted the way the panels beside it
 // already are.
+// Issue #124: `run.branch` is WORKER-supplied and ingest stores it as
+// `stripNULParam(req.Branch)` — NUL only, no Cc/Cf. Extracted to be assertable at all;
+// before that, dropping the strip left the whole file green.
+describe("RunCompletedLine — the worker-supplied branch carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of run.branch", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-\u202E7\u200B", mr_iid: null })} duration="2m" />,
+    );
+    // Anchored on the duration, which the mutation cannot move.
+    expect(container.textContent).toContain("Ran for 2m");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("agent/issue-7")).toBeTruthy();
+  });
+});
+
 describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
     const { container } = render(

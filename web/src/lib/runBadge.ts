@@ -5,6 +5,7 @@
 
 import { isTerminalRun, type LatestRun, type RunHealth, type StopKind } from "./api";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
+import { stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -169,8 +170,34 @@ export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | nul
     label: `⚠ ${label}${elapsed}`,
     tone: "warning",
     pulse: true,
-    title: run.health_reason ?? undefined,
+    title: badgeTitle(run.health_reason),
   };
+}
+
+/**
+ * Issue #124 for the badge TOOLTIP. `RunBadge.title` is rendered as a `title` attribute at
+ * five sites (Board, RunHealthBadge, JudgeRunBadge, WorkerRunBadge, CIFixRunHeader), and an
+ * attribute is a sink `container.textContent` cannot see — so every #124 test in the repo is
+ * structurally blind to it, exactly like the upgrade-badge tooltip was.
+ *
+ * Stripped HERE, where the descriptor is composed, rather than at the five renderers: this
+ * function's output is display-only by construction (a badge descriptor, never posted back,
+ * never a key), so it is still a display transform and not a boundary one — and one place
+ * cannot drift out of step with four others.
+ *
+ * Covers BOTH title sources, which is why the fix does not depend on settling their
+ * provenance separately:
+ *   - `failure_reason` is worker-supplied and ingest does not strip it
+ *     (workersvc `sanitizeFailureReason` is stripNUL + truncate). `service.go` writes
+ *     `err.Error()` straight in, and a hostile repo can shape the error an agent fails
+ *     with — attacker-influenceable, owner-only audience.
+ *   - `health_reason` is server-composed as far as was traced, and NOT exhaustively so.
+ *     The CLI already routes it through `sanitizeTTY` (cmd/uzi/run.go), so the web was the
+ *     inconsistent side of a decision the CLI had already made.
+ */
+function badgeTitle(reason: string | null | undefined): string | undefined {
+  const clean = reason ? stripUnsafeChars(reason) : "";
+  return clean === "" ? undefined : clean;
 }
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
@@ -202,7 +229,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         label: "failed",
         tone: "danger",
         pulse: false,
-        title: run.failure_reason ?? undefined,
+        title: badgeTitle(run.failure_reason),
       };
     case "completed":
       // A completed run with an MR becomes a link chip (ok-accented), carrying the

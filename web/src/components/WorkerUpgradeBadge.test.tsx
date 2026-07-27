@@ -98,6 +98,18 @@ describe("WorkerUpgradeBadge — upgrade_detail carries no format characters (#1
     expect(container.textContent).toContain("running 0.11.0, target 0.11.7");
   });
 
+  it("strips the divergent upgrade_target in the fleet panel's sentence", () => {
+    // Same value `upgrade_detail` composes six lines away, which 4a739bff already strips.
+    const { container } = render(
+      <FleetUpgradePanel
+        workers={[aWorker({ kind: "hosted", upgrade_target: "0.11\u202E.7\u200B", upgrade_status: "outdated" })]}
+        cpVersion="0.11.9"
+      />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toContain("v0.11.7");
+  });
+
   it("strips it in the badge's title ATTRIBUTE too, which textContent cannot see", () => {
     // The attribute is a sink a rendered-text sweep misses by construction, and it carries
     // the same field. Asserted on the attribute directly for that reason — the assertion

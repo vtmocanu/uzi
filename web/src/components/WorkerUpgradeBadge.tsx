@@ -333,7 +333,12 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
     // so the divergence is stated rather than judged.
     if (w.kind === "hosted" && w.upgrade_target && cpVersion && w.upgrade_target !== cpVersion) {
       divergentCount++;
-      divergentTargets.add(w.upgrade_target);
+      // Issue #124. Weaker provenance than the rest of the batch — `classifyWithTarget`
+      // sets this from uzi's own CPVersion or the CONTROLLER's reported tag, not from a
+      // worker — so this is for the ASYMMETRY as much as the tier: `upgrade_detail`
+      // composes the same value into its own sentence six lines away and IS stripped.
+      // Same value, two treatments, is what makes the next reader guess.
+      divergentTargets.add(stripUnsafeChars(w.upgrade_target));
     }
   }
   return { counts, attention, divergentCount, divergentTargets: [...divergentTargets] };

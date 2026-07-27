@@ -373,3 +373,35 @@ describe("activeRunInHistory (issue-view start-run gate)", () => {
     expect(activeRunInHistory([])).toBe(false);
   });
 });
+
+// Issue #124 for the badge TOOLTIP. `RunBadge.title` is rendered as a `title` ATTRIBUTE at
+// five sites, and an attribute is a sink `container.textContent` cannot see — so every #124
+// render test in this repo is structurally blind to it. Asserted on the descriptor, which is
+// where the fix lives and where one assertion covers all five renderers.
+describe("runBadge title — format characters (#124)", () => {
+  /** `RunBadge` is a union and the `mr` variant carries no title, so narrow rather than
+   *  cast — a cast here would hide a real regression if `failed` ever stopped being a badge. */
+  const titleOf = (reason: string | null): string | undefined => {
+    const b = runBadge({ status: "failed", failure_reason: reason } as never, Date.now());
+    if (b.kind !== "badge") throw new Error(`expected a badge for a failed run, got ${b.kind}`);
+    return b.title;
+  };
+
+  it("strips them from failure_reason, which is worker-supplied and unstripped at ingest", () => {
+    const title = titleOf("the repo \u202Eapproved\u200B this");
+    expect(title ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(title).toBe("the repo approved this");
+  });
+
+  it("leaves an ordinary reason byte-identical", () => {
+    const reason = "exit status 1: go test ./... failed";
+    expect(titleOf(reason)).toBe(reason);
+  });
+
+  it("keeps an absent reason absent rather than turning it into an empty tooltip", () => {
+    // `title=""` renders a real (empty) tooltip box in some engines, so a reason that is
+    // nothing but format characters must collapse to undefined, not to "".
+    expect(titleOf(null)).toBeUndefined();
+    expect(titleOf("\u202E\u200B")).toBeUndefined();
+  });
+});
