@@ -29,6 +29,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -307,6 +309,12 @@ type Store interface {
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetUserSecretMetaByID(ctx context.Context, arg store.GetUserSecretMetaByIDParams) (store.GetUserSecretMetaByIDRow, error)
 	SetRunAnthropicSecret(ctx context.Context, arg store.SetRunAnthropicSecretParams) (int64, error)
+	// Auto-selection (PRD #111 M4): every anthropic_token the user holds, with its
+	// gauge reading and in-flight run count. NOT pre-filtered on auto_eligible — the
+	// eligibility gate lives entirely in autoselect.Classify (D21), and the ranker
+	// needs the unfiltered set to tell "you pooled nothing" from "you pooled tokens
+	// that are all stale".
+	ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID) ([]store.ListAutoSelectCandidatesRow, error)
 	// Worker → token binding (PRD #104 M3): label resolution for the mint-time and
 	// CLI-facing forms, and the id-keyed rebind itself.
 	GetUserSecretIDByLabel(ctx context.Context, arg store.GetUserSecretIDByLabelParams) (uuid.UUID, error)
@@ -377,6 +385,22 @@ type Params struct {
 	// OFF. That is the fail-safe direction and it is why the default lives in
 	// config.go (where the env is read) rather than in New.
 	AutoStopEnabled bool
+
+	// Autoselect is the operator-set auto-selection policy (PRD #111 D6/M4), built
+	// by config.Config.AutoselectPolicy — the SAME constructor handler.autoStatus
+	// reads. That sharing is the point and not a convenience: the settings page and
+	// the selector classify the same token against the same thresholds, so they
+	// cannot disagree about whether it is eligible. Two Params-side literals mapping
+	// the four knobs independently would each be internally consistent and would drift
+	// with nothing going red (D21).
+	//
+	// The ZERO VALUE is a coherent, deliberate policy rather than a hole: MaxStaleness
+	// 0 means nothing is ever fresh, so every token classifies stale, Select returns
+	// pool_stale and every auto worker resolves its non-auto binding. A Params literal
+	// that forgets this field therefore behaves exactly like a factory with the poller
+	// disabled (R2) — degraded, never wrong, and never a spend against a credential
+	// nobody chose.
+	Autoselect autoselect.Policy
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -795,26 +819,75 @@ type claimCred struct {
 // a default fallback can name the same token, and PRD #104's compatibility path
 // creates a row labelled literally "default", so the label alone answers nothing).
 //
-// M1 can only ever distinguish these two, because auto does not exist yet: a
-// resolved binding (a worker's, or the judge lane's) is "pinned", the absence of one
-// is "default". PRD #111 M4 adds "auto", "best_of_pool", "pool_empty", "pool_stale"
-// and "open_failed" to this vocabulary; the column carries no CHECK until then
-// (see migration 00086 for why).
+// These three are the static half of a CLOSED vocabulary; autoselect owns the other
+// five (auto, best_of_pool, pool_empty, pool_stale, open_failed). Migration 00089's
+// CHECK is the union, and TestSelectReasonVocabularyMatchesCheck parses that CHECK to
+// keep the two halves and the constraint in step: a ninth value added in Go and
+// forgotten in SQL is a constraint violation at claim time, which is a FAILED RUN.
 const (
 	selectReasonDefault = "default"
 	selectReasonPinned  = "pinned"
+	// selectReasonJudge is the judge lane's own value, and it is not decoration.
+	// Recording "pinned" here would tell a user their WORKER was bound to this
+	// credential when in fact their own judge binding chose it (D4) — a different
+	// setting, on a different page, that they would then go and not find. D20 makes
+	// the run view name the mode, so a wrong mode is a user-facing wrong answer.
+	selectReasonJudge = "judge"
 )
 
-// selectReasonFor names the mode that produced a claim's secretID override, in M1's
-// two-value vocabulary. It takes the OVERRIDE rather than the resolved credential on
+// staticSelectReasons is the non-auto half of the vocabulary, for the guard that
+// compares Go against migration 00089's CHECK. A fresh slice, for AllReasons's
+// reason.
+func staticSelectReasons() []string {
+	return []string{selectReasonDefault, selectReasonPinned, selectReasonJudge}
+}
+
+// secretChoice is WHICH credential a claim should spend and WHY: the override
+// openAnthropic takes (nil ⇒ the owner's default), the reason to record, and the
+// measured headroom when a reading produced the choice.
+//
+// It replaced a bare *uuid.UUID because M4 made the answer two-dimensional. An auto
+// pick and a default fallback can name the SAME token, so an id alone can no longer
+// say what happened — and the fallback reasons (pool_empty, pool_stale) are carried
+// by a choice whose id is nil, i.e. by exactly the value that used to mean "nothing
+// to say".
+//
+// headroom is a pointer because NULL is a real answer: only an auto pick has a
+// measured headroom, and 0 is a legal one (a fully-consumed token picked
+// best-of-pool), so a zero value cannot stand in for absence.
+type secretChoice struct {
+	secretID *uuid.UUID
+	reason   string
+	headroom *int16
+}
+
+// autoPicked reports whether the SELECTOR named this credential, as opposed to a
+// binding or a fallback. It is the precise gate on D14's retry: only a credential
+// auto chose gets a second attempt on the owner default, because only auto has an
+// alternative the user did not ask for. A pinned worker or a judge binding that will
+// not open must still fail terminally — the user named that credential, and silently
+// billing a different one is the R4 failure this PRD is otherwise built to avoid.
+func (c secretChoice) autoPicked() bool {
+	return c.secretID != nil &&
+		(c.reason == string(autoselect.ReasonAuto) || c.reason == string(autoselect.ReasonBestOfPool))
+}
+
+// staticChoice names the mode that produced a claim's secretID override for the two
+// non-auto resolutions. It takes the OVERRIDE rather than the resolved credential on
 // purpose: after resolution both cases are just an id, and "the owner's default" and
 // "a binding that happens to name the default token" are different facts that a user
 // reading the run view needs told apart.
-func selectReasonFor(secretID *uuid.UUID) string {
+//
+// bound is the reason to use when the override is set — selectReasonPinned for a
+// worker binding, selectReasonJudge for the judge lane. An UNSET override is
+// selectReasonDefault either way, and that asymmetry is correct: a judge lane with no
+// binding really did spend the owner's default, and saying "judge" would claim a
+// binding chose it.
+func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 	if secretID == nil {
-		return selectReasonDefault
+		return secretChoice{reason: selectReasonDefault}
 	}
-	return selectReasonPinned
+	return secretChoice{secretID: secretID, reason: bound}
 }
 
 // openAnthropic resolves AND opens the Anthropic credential for one run — the one
@@ -864,6 +937,28 @@ func selectReasonFor(secretID *uuid.UUID) string {
 // decoration: they run BEFORE the open, so an unscoped by-id lookup would put another
 // user's label in hand at exactly the point M1 records it — a claim that then fails
 // on the open, having already leaked what it was going to record.
+//
+// TWO ROUND TRIPS PER CLAIM, AND THAT IS SETTLED, NOT PENDING (PRD #111 A7, decided
+// in M4). The obvious tightening is to project `label` from secretopen's ciphertext
+// query so one read serves both, which would also make the label provably come from
+// the row that was decrypted — D8's own argument, one level down. Declined, for two
+// reasons that are worth writing down because the idea recurs:
+//
+//   - The provenance gain is nil, unlike D8's. D8 closed a real gap: the default was
+//     resolved INSIDE the ciphertext query and no id ever escaped, so there was
+//     nothing to record. Here both reads name the SAME id under the same predicate
+//     on a primary key, so they cannot return different rows. All the projection
+//     would buy is a label read microseconds later — and the label is a point-in-time
+//     SNAPSHOT that a later rename deliberately does not update anyway (00086).
+//   - The cost lands on the wrong package. secretopen is shared with the rate-limit
+//     poller; widening its return type would ripple into usagepoller's TokenOpener
+//     seam for the claim lane's convenience, and it would make a function that
+//     currently returns only secret bytes return a struct mixing plaintext with
+//     safe-to-log metadata — a second claimCred-shaped thing to never log whole.
+//
+// M4's auto lane does not change this arithmetic, which was the reason the decision
+// waited: it arrives here with a label already in hand from the ranking query, so it
+// is the same shape as M3's pinned lane, not a third case.
 func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID *uuid.UUID) (claimCred, error) {
 	var meta struct {
 		ID    uuid.UUID
@@ -926,15 +1021,24 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 // case that is NOT an error: it means the run vanished under us (its forge
 // connection cascade-deleted the repo → run), which every other claim-path reader
 // treats as errRunVanished and drops.
-func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, reason string) error {
+func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred claimCred, choice secretChoice) error {
+	// The headroom recorded is the RAW headroom of the pick — what the user's own
+	// meters show — never the in-flight-penalised rank, which is an internal ordering
+	// key that appears nowhere else in the product. NULL for every non-auto lane,
+	// because there is no reading behind those choices; NULL also on D14's retry,
+	// where the credential actually spent is the fallback and the measured headroom
+	// described the one that would not open.
+	headroom := pgtype.Int2{}
+	if choice.headroom != nil {
+		headroom = pgtype.Int2{Int16: *choice.headroom, Valid: true}
+	}
 	n, err := s.q.SetRunAnthropicSecret(ctx, store.SetRunAnthropicSecretParams{
 		AnthropicSecretID:     pgUUID(cred.ID),
 		AnthropicSecretLabel:  pgText(cred.Label),
-		AnthropicSelectReason: pgText(reason),
-		// NULL until M4 has a measured headroom to record; M5 renders it.
-		AnthropicHeadroomPct: pgtype.Int2{},
-		ID:                   run.ID,
-		UserID:               run.UserID,
+		AnthropicSelectReason: pgText(choice.reason),
+		AnthropicHeadroomPct:  headroom,
+		ID:                    run.ID,
+		UserID:                run.UserID,
 	})
 	if err != nil {
 		return fmt.Errorf("record run anthropic credential: %w", err)
@@ -983,11 +1087,65 @@ func ValidBindMode(mode string) bool {
 //     MODE decides.
 //
 // Judge runs never reach here; they fork to assembleJudgeClaim earlier.
-func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (*uuid.UUID, error) {
+func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (secretChoice, error) {
 	if run.Kind == RunKindSelfImprove {
-		return s.judgeSecretID(ctx, run.UserID)
+		id, err := s.judgeSecretID(ctx, run.UserID)
+		if err != nil {
+			return secretChoice{}, err
+		}
+		return staticChoice(id, selectReasonJudge), nil
 	}
-	return workerSecretID(wkr), nil
+	if wkr.AnthropicBindMode == BindModeAuto {
+		return s.autoChoice(ctx, wkr, run.UserID)
+	}
+	return staticChoice(workerSecretID(wkr), selectReasonPinned), nil
+}
+
+// autoChoice runs the selector for an `auto` worker (PRD #111 M4).
+//
+// It is BEHIND claimSecretID, never beside it. PRD #104's R4 is that three copies of
+// credential resolution drift and a wrong fallback spends the wrong account silently;
+// keeping the selector under the one function that answers "which credential" means
+// openAnthropic and assembleClaim never learn that auto exists.
+//
+// The three impure steps live here and nowhere else: the query, the clock, and the
+// policy. autoselect.Select is pure, which is what lets the whole ranking be tested
+// against hand-written fixtures with no database.
+//
+// A query error FAILS the claim rather than degrading to the owner default, and that
+// is deliberate in the same way judgeSecretID's is: "the database was unreachable for
+// a moment" and "you have no pooled tokens" are different facts, and quietly treating
+// the first as the second spends an account the user did not choose while raising
+// nothing. The run is retried; a silent mis-spend is not retried, because nobody
+// learns it happened.
+//
+// A fallback (pool_empty / pool_stale) resolves workerSecretID(wkr), which for an
+// auto worker is nil ⇒ the owner's default (D9). It is written as the CALL rather
+// than as a literal nil so the rule stated in workerSecretID stays the single source
+// of what "this worker's non-auto binding" means — the current answer happens to be
+// nil for every auto worker, and the rule is what survives the next mode.
+func (s *Service) autoChoice(ctx context.Context, wkr store.Worker, userID uuid.UUID) (secretChoice, error) {
+	rows, err := s.q.ListAutoSelectCandidates(ctx, userID)
+	if err != nil {
+		return secretChoice{}, fmt.Errorf("auto-select candidates: %w", err)
+	}
+	cands := make([]autoselect.Candidate, 0, len(rows))
+	for _, row := range rows {
+		cands = append(cands, autoselectrow.FromCandidateRow(row))
+	}
+	out := autoselect.Select(cands, s.p.Autoselect, s.now())
+	if !out.Picked {
+		// D7: auto never fails a run. An empty or unmeasurable pool resolves the
+		// worker's non-auto behaviour and records WHY, so "auto was on and I still got
+		// the default" is a fact the run view states rather than one a user infers.
+		return secretChoice{secretID: workerSecretID(wkr), reason: string(out.Reason)}, nil
+	}
+	id := out.SecretID
+	// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
+	// so the value is in range by construction and the narrowing cannot truncate.
+	// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
+	h := int16(out.Headroom)
+	return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
 }
 
 // workerSecretID is a worker's Anthropic binding as openAnthropic's override: nil
@@ -1056,18 +1214,42 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
 	// rebind take effect on the worker's next claim with no restart and no re-minted
 	// join token — the token has never ridden the worker, only each claim response.
-	secretID, err := s.claimSecretID(ctx, wkr, run)
+	choice, err := s.claimSecretID(ctx, wkr, run)
 	if err != nil {
 		return nil, err
 	}
-	cred, err := s.openAnthropic(ctx, run.UserID, secretID)
+	cred, err := s.openAnthropic(ctx, run.UserID, choice.secretID)
 	if err != nil {
-		return nil, err
+		// 🔴 D14. Without this arm, D7's "auto never fails a run" is simply untrue.
+		// recoverClaimAssembly maps errCredentialUnavailable to MarkRunFailedByID — a
+		// TERMINAL failure — so a token that passes the gauge gate and then will not
+		// decrypt (a rotated UZI_SECRET_KEY, a corrupt row, a token deleted between the
+		// ranking query and the open) kills a run the owner default would have
+		// completed. That is the optimizer newly failing runs that static binding
+		// finished, which is the one outcome D7 exists to forbid.
+		//
+		// Scoped as tightly as it can be, on three axes:
+		//   - only a credential the SELECTOR named (choice.autoPicked) — a pinned or
+		//     judge binding that will not open still fails, because the user named it;
+		//   - only errCredentialUnavailable. NOT errVaultLocked: that path already
+		//     requeues the run, which is transient and correct, and retrying it would
+		//     convert a wait into a spend on the wrong account;
+		//   - exactly ONCE. The retry target is workerSecretID(wkr) — nil for an auto
+		//     worker — which can never satisfy autoPicked, so the structure of the code
+		//     forbids a second round rather than a counter doing it.
+		if !choice.autoPicked() || !errors.Is(err, errCredentialUnavailable) {
+			return nil, err
+		}
+		choice = secretChoice{secretID: workerSecretID(wkr), reason: string(autoselect.ReasonOpenFailed)}
+		cred, err = s.openAnthropic(ctx, run.UserID, choice.secretID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Record it before anything else can fail (PRD #111 M1): the credential HAS been
 	// opened at this point, so from the run's perspective it is already the account
 	// this claim commits to, whether or not the rest of assembly succeeds.
-	if err := s.recordRunCredential(ctx, run, cred, selectReasonFor(secretID)); err != nil {
+	if err := s.recordRunCredential(ctx, run, cred, choice); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

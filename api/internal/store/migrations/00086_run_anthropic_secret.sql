@@ -16,16 +16,21 @@
 -- ALTER instead of a fourth migration whose number would have to be re-derived at
 -- landing. M1 writes reason ('default' | 'pinned' — the mode that named the
 -- credential, which is all that is knowable before auto exists) and leaves
--- headroom NULL; M4 adds 'auto', 'best_of_pool', 'pool_empty', 'pool_stale' and
--- 'open_failed' and is the first writer of headroom.
+-- headroom NULL; M4 adds 'auto', 'best_of_pool', 'pool_empty', 'pool_stale',
+-- 'open_failed' AND 'judge' (the judge lane borrowed 'pinned' while the vocabulary
+-- held two values; M4 gave it its own, because D20 makes the run view name the MODE
+-- and "pinned" sends a user looking for a worker binding that does not exist), and
+-- is the first writer of headroom. *(This paragraph named five M4 values until M4
+-- landed six; corrected in the same commit as 00089.)*
 --
 -- Deliberately NO CHECK on anthropic_select_reason, unlike runs.stop_kind
--- (00050/00082). The vocabulary is NOT closed at M1 — M4 adds five values inside
--- this same PRD — so a CHECK here would be rewritten before it ever guarded
--- anything, which is exactly the churn 00082 had to pay. The column is
--- display-only: nothing in the state machine, the claim path or any sweep gate
--- reads it. Once M4 has settled the vocabulary a CHECK is worth adding, and that
--- is the right migration to add it in.
+-- (00050/00082). The vocabulary is NOT closed at M1 — M4 adds values inside this
+-- same PRD — so a CHECK here would be rewritten before it ever guarded anything,
+-- which is exactly the churn 00082 had to pay. The column is display-only: nothing
+-- in the state machine, the claim path or any sweep gate reads it. Once M4 has
+-- settled the vocabulary a CHECK is worth adding, and that is the right migration to
+-- add it in. **It did: 00089_run_select_reason_check.sql**, which closes the column
+-- to the eight values and is kept in step with Go by a test that parses it.
 --
 -- WHY THE LABEL IS SNAPSHOTTED RATHER THAN JOINED. The FK below nulls the id when
 -- the token is deleted, and a rename rewrites user_secrets.label in place. A join

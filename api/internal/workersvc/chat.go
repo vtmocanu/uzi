@@ -183,7 +183,12 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// the RECORD is not redundant: it is what lets M4's in-flight bias see chat spend
 	// against a credential at all (D18), and what makes a chat run's cost attributable
 	// alongside every other lane's.
-	if err := s.recordRunCredential(ctx, run, cred, selectReasonFor(nil)); err != nil {
+	// The nil override is passed through staticChoice rather than hand-writing the
+	// reason, so chat cannot drift from the one function that maps overrides to
+	// reasons. Its second argument is unreachable here by construction (a nil override
+	// is `default` whatever it says), and it is spelled selectReasonDefault rather than
+	// a placeholder so a reader does not have to check.
+	if err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault)); err != nil {
 		return nil, err
 	}
 	anthropic := cred.Token

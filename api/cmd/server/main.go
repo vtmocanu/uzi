@@ -190,6 +190,11 @@ func run() error {
 		WorkerChatTurnTimeout:       cfg.WorkerChatTurnTimeout,
 		ProposalConfirmStuckTimeout: cfg.ProposalConfirmStuckTimeout,
 		AutoStopEnabled:             cfg.AutoStopEnabled,
+		// The SAME constructor the settings page reads (PRD #111 D21) — not a second
+		// literal mapping the four UZI_AUTOSELECT_* knobs. Two mappings would each be
+		// internally consistent while the meter and the selector disagreed about the
+		// same token, with nothing going red.
+		Autoselect: cfg.AutoselectPolicy(),
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /

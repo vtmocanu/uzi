@@ -313,8 +313,15 @@ func TestJudgeClaimRecordsItsBinding(t *testing.T) {
 		t.Fatalf("judge run recorded (%v,%q), want (%v,\"review-key\")",
 			uuid.UUID(rec.AnthropicSecretID.Bytes), rec.AnthropicSecretLabel.String, judgeID)
 	}
-	if rec.AnthropicSelectReason.String != selectReasonPinned {
-		t.Fatalf("judge reason = %q, want %q (the binding named it)", rec.AnthropicSelectReason.String, selectReasonPinned)
+	// `judge`, not `pinned`. This assertion said `pinned` through M1, when the
+	// vocabulary held two values and the judge binding had to borrow one; M4 closed the
+	// set and gave the lane its own. It matters because D20 makes the run view name the
+	// MODE: "pinned" tells a user their WORKER is bound to review-key, so they go
+	// looking at Settings → Workers, where no such binding exists — the choice was made
+	// by their judge setting, on a different page.
+	if rec.AnthropicSelectReason.String != selectReasonJudge {
+		t.Fatalf("judge reason = %q, want %q (the JUDGE binding named it, not a worker's)",
+			rec.AnthropicSelectReason.String, selectReasonJudge)
 	}
 	if rec.ID != runID {
 		t.Fatalf("judge recorded against run %v, want %v", rec.ID, runID)

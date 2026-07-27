@@ -73,6 +73,13 @@ type fakeStore struct {
 	recordedCreds  []store.SetRunAnthropicSecretParams
 	recordCredErr  error
 	recordCredRows *int64
+	// autoCandidates is what M4's ranking query returns (PRD #111 M4) and
+	// autoCandidatesErr fails it. autoCandidateLookups records the user ids asked
+	// for — which is what proves the selector never ranks another tenant's tokens,
+	// and that a NON-auto worker never runs the query at all.
+	autoCandidates       []store.ListAutoSelectCandidatesRow
+	autoCandidatesErr    error
+	autoCandidateLookups []uuid.UUID
 	// judgeSecret is the user's judge-lane binding (PRD #104 M4); the zero value is
 	// "unbound", which is every user's state until they choose otherwise, so existing
 	// judge fixtures keep resolving the default with no change.
@@ -383,6 +390,14 @@ func (f *fakeStore) GetUserSecretMetaByID(_ context.Context, arg store.GetUserSe
 		label = "token-" + arg.ID.String()[:8]
 	}
 	return store.GetUserSecretMetaByIDRow{ID: arg.ID, Label: label}, nil
+}
+
+func (f *fakeStore) ListAutoSelectCandidates(_ context.Context, userID uuid.UUID) ([]store.ListAutoSelectCandidatesRow, error) {
+	f.autoCandidateLookups = append(f.autoCandidateLookups, userID)
+	if f.autoCandidatesErr != nil {
+		return nil, f.autoCandidatesErr
+	}
+	return f.autoCandidates, nil
 }
 
 func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnthropicSecretParams) (int64, error) {
