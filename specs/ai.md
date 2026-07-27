@@ -12944,6 +12944,17 @@ five. The three most important omissions are the ones D20's own rationale is abo
 while the vocabulary held two values, and `pinned` sends a user to Settings → Workers looking for a
 binding that does not exist. It is also not a fallback, so "and, on fallback, why" does not cover it.
 
+**The em dash in every rendering above stays — the user's decision [user 2026-07-27], and it is NOT a
+general licence.** The house style avoids em dashes in user-facing content, and the question was
+raised rather than assumed. It was settled on one fact about *this* file: the CLI already ships four
+pre-existing em dashes in user-facing output, so changing this one line would make it inconsistent
+with its neighbours, which is worse for a reader than the style rule is good. That reasoning is local
+and it does not travel. **A brand-new user-facing string has no neighbours to be consistent with, so
+it takes the house style — a comma, a colon or a second sentence.** Recorded here rather than in
+`specs/human.md` deliberately: the ruling holds on a property of the current copy, not of the
+product, and a rebuild that renders no em dashes anywhere would satisfy the contract and make it
+moot. Freezing it into the contract file would turn a copy-consistency judgement into a requirement.
+
 **Three homes, three guards, and they are three MECHANISMS rather than restatements.** The set lives
 in `autoselect.Reason` (Go), migration `00089`'s CHECK (SQL) and a `SelectReason` union (TS).
 Go↔SQL is a test that parses the CHECK; SQL↔TS is a web test that parses the same migration;
