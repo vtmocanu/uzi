@@ -1192,3 +1192,24 @@ compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general o
   **one writer at a time, and stage by path** — and the failure mode of dropping either is the
   same: a commit whose contents nobody chose. Here it also silently invalidated a measurement,
   because the deferred edit landed on the green path *after* the e2e number was taken.
+- **`git add <path>` PROTECTS WHAT YOU STAGE. IT DOES NOT PROTECT WHAT YOU COMMIT — a bare
+  `git commit` commits the ENTIRE INDEX, including whatever another agent staged in the interval.
+  Use `git commit -- <path>`.** The rule above covers `add`; nothing covered `commit`, and the gap
+  is not theoretical — it fired **twice on issue #145's branch alone**, in opposite directions:
+  - the spec-keeper ran a correct `git add specs/ai.md`, then a bare `git commit`, and swept **135
+    files another agent had staged in the interval** into a commit whose own message read "one
+    markdown file, zero code, zero queries";
+  - the other direction is worse, because it looks like success: the agent whose files were taken
+    ran its own `git commit` and got **`nothing to commit, working tree clean`** — which reads as
+    *already done*, not as *someone else committed my work*. A green, quiet answer to the wrong
+    question.
+
+  Recovery is `git reset --soft HEAD~1`, which leaves the index untouched so the other agent's
+  staged work is handed back exactly as found, then `git commit -- <path>`.
+
+  **And record why the safe case was safe, because it is the load-bearing half.** The agent that
+  avoided this got the good outcome by **verifying its index immediately before committing** —
+  which is *noticing*, and `CLAUDE.md` is explicit that a rule relying on noticing loses to one
+  that removes the failure mode (its own example: naming throwaway containers outside the `uzi-`
+  namespace is the strong rule, "be careful with globs" the weak one). `git commit -- <path>` is
+  the strong form here. Treat "I checked first" as a report of good luck, not of process.

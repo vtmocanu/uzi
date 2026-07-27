@@ -33,6 +33,25 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
+- **A crash-looping hosted worker's diagnostics no longer vanish the moment its pod
+  reports Ready.** A `settled` roll report overwrote `blocking_container`,
+  `blocking_reason`, `restart_count` and `last_exit_code` with empties whether or not it
+  had looked at them, so a worker with five restarts and exit 1 could read as pristine
+  in the database at exactly the moment someone was reading the row to debug it. The
+  four columns now move together and are only replaced by a report whose phase
+  (`rolling`/`stuck`) means the controller actually measured them; the worker's own
+  authenticated version move still clears them (issue #145).
+
+- **The Workers page badge no longer flickers `upgrade failed` → nothing →
+  `upgrade failed` while a container crash-loops.** The worker container has no
+  readiness probe, so `Ready == True` means only that the process started, not that the
+  agent works — a Ready-but-flapping container was being reported `settled`. A Ready pod
+  is now withheld from `settled` while any container has 3+ restarts and its current
+  instance has been up less than 10 minutes, and self-clears once the container stays
+  up. A negative container uptime (clock skew between kubelet and controller) no longer
+  reads as flapping either (issue #145).
+  See [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
 - **The judge no longer recommends installing a tool that policy permanently forbids.**
   A credential-bearing CLI such as `glab`, `gh`, `aws` or `az` is barred outright, even
   against an explicit admin allowlist, because a logged-in one reachable from the agent's
