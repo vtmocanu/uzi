@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Worker } from "../lib/api";
+import { stripUnsafeChars } from "../lib/safeText";
 
 /**
  * Per-worker upgrade badge and the Fleet upgrade summary (PRD #113 M5).
@@ -57,7 +58,12 @@ export function WorkerUpgradeBadge({ worker }: { worker: Worker }) {
       className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs ${TONE_CLASS[p.tone]}`}
       // The detail is the sentence the api derived ("running 0.11.0, target 0.11.7"), so
       // the badge and its explanation cannot disagree — the api computed both.
-      title={worker.upgrade_detail ?? undefined}
+      //
+      // Issue #124: stripped HERE TOO, not only where the same field renders as text 175
+      // lines down. An ATTRIBUTE is a sink a per-render-site sweep misses by construction —
+      // `container.textContent` cannot see it, so no test asserting over rendered text can
+      // either. A tooltip is drawn by the browser and honours bidi exactly like body text.
+      title={worker.upgrade_detail ? stripUnsafeChars(worker.upgrade_detail) : undefined}
     >
       {p.label}
     </span>
@@ -225,7 +231,15 @@ export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
       </div>
       {/* The api's own sentence, as TEXT — the same string the badge carries as a title,
           rendered where a keyboard and a screen reader can both reach it. */}
-      {worker.upgrade_detail && <div className="mt-1 text-fg">{worker.upgrade_detail}</div>}
+      {/* Issue #124, and this shape is strictly worse than a bare field: the api composes
+          the untrusted span INSIDE a sentence uzi wrote (upgrade.go:143 "running %s, target
+          %s"; :462 "%s: %s" from blocking_container/blocking_reason). A bidi override there
+          does not merely garble the attacker's own value — it reorders uzi's words around
+          it, so the sentence can read as its own opposite while every byte uzi contributed
+          is intact. Ingest strips Cf now; this covers rows written before that. */}
+      {worker.upgrade_detail && (
+        <div className="mt-1 text-fg">{stripUnsafeChars(worker.upgrade_detail)}</div>
+      )}
       {cause && <div className="mt-1 text-faint">{cause}</div>}
       {failed && (
         <div className="mt-2">
@@ -319,7 +333,13 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
     // so the divergence is stated rather than judged.
     if (w.kind === "hosted" && w.upgrade_target && cpVersion && w.upgrade_target !== cpVersion) {
       divergentCount++;
-      divergentTargets.add(w.upgrade_target);
+      // Issue #124. Weaker provenance than the rest of the batch — `classifyWithTarget`
+      // sets this from uzi's own CPVersion or the CONTROLLER's reported tag, not from a
+      // worker — so this is for the ASYMMETRY as much as the tier: `upgrade_detail`
+      // composes the same value into its own sentence and IS stripped, at :66 (the badge's
+      // title attribute) and :241 (the detail panel's text) in this file.
+      // Same value, two treatments, is what makes the next reader guess.
+      divergentTargets.add(stripUnsafeChars(w.upgrade_target));
     }
   }
   return { counts, attention, divergentCount, divergentTargets: [...divergentTargets] };

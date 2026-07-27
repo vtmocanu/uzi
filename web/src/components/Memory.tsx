@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type Memory } from "../lib/api";
 import { Alert, Button, Card, EmptyState, SectionTitle } from "./ui";
 import { ThoughtIcon } from "./icons";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // Group the flat, newest-first list into per-repo buckets while preserving order:
 // the first time a repo_name is seen fixes its position, so the most-recently
@@ -127,9 +128,10 @@ function MemoryRow({ memory, onDelete }: { memory: Memory; onDelete: () => void 
     <li className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0 space-y-1.5">
-          <div className="font-medium text-fg">{memory.title}</div>
+          {/* Issue #124: agent-written cross-run memory, same untrusted class. */}
+          <div className="font-medium text-fg">{stripUnsafeChars(memory.title)}</div>
           <pre className="whitespace-pre-wrap break-words font-mono text-xs text-muted">
-            {memory.body}
+            {stripUnsafeChars(memory.body)}
           </pre>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
             <span>saved {new Date(memory.created_at).toLocaleString()}</span>

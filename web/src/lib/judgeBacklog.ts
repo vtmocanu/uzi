@@ -2,7 +2,8 @@
 // rollup labels, and the zero-state verdict tally are unit-tested without the DOM. None
 // of these render untrusted text — they map closed enums (buckets, verdicts) to fixed UI
 // copy; the untrusted free text (rationale_preview, target, run_title) is rendered
-// separately as escaped React text on the page.
+// separately as escaped React text on the page, through lib/safeText's stripUnsafeChars —
+// escaping alone does not touch bidi overrides (issue #124).
 
 import type {
   BadgeTone,

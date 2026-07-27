@@ -11,6 +11,7 @@ import { forgePlatform } from "../lib/forgeNoun";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import { useAuth } from "../auth/AuthContext";
+import { stripUnsafeChars } from "../lib/safeText";
 
 // columnLabel names the column the issue sits in, for the header chip.
 function columnLabel(issue: IssueDetail): string {
@@ -131,7 +132,8 @@ export function IssueView() {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="truncate text-2xl font-semibold">{issue.title}</h1>
+                {/* Issue #124: forge-supplied, untrusted (see Board). */}
+                <h1 className="truncate text-2xl font-semibold">{stripUnsafeChars(issue.title)}</h1>
                 <span className="text-sm text-faint">#{issue.iid}</span>
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
@@ -202,7 +204,12 @@ export function IssueView() {
             </h2>
             {issue.description.trim() ? (
               <div className="docs-prose max-w-none">
-                <Markdown content={issue.description} />
+                {/* Issue #124 names issue DESCRIPTIONS alongside titles, and Markdown does
+                    not close this: that pipeline is hardened against raw HTML and dangerous
+                    URL schemes, neither of which is a bidi override. Stripping before the
+                    renderer cannot inject markdown structure — it only deletes characters
+                    that carry no markdown meaning. */}
+                <Markdown content={stripUnsafeChars(issue.description)} />
               </div>
             ) : (
               <p className="text-sm text-faint">This issue has no description.</p>

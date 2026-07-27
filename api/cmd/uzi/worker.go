@@ -37,7 +37,31 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
-				rows = append(rows, []string{w.ID, w.Name, w.Status, strOr(w.Version, "-"), upgradeCell(w)})
+				// Issue #124: `version` is WORKER SELF-REPORTED, and Printer.Table Fprintln's
+				// cells through a tabwriter with no scrub of its own (uzicli/output.go) — so
+				// this was the one free-text sink in the CLI not routed through sanitizeTTY,
+				// while every other one is. Pre-item-6 the exposure was Cf-only, since the Cc
+				// half was already stripped at ingest; ingest now strips both, and this covers
+				// rows written before that. compactText is the shape the neighbouring table
+				// cells already use.
+				// Sanitize BEFORE the placeholder, not after: a version that is nothing but
+				// format characters compacts to "" and must still read as "-", not as a blank
+				// cell. (A judge could not do this, but a hostile worker holding a valid join
+				// token could, and that is whose string this is.)
+				//
+				// `w.Name` in the same row is deliberately NOT compacted, and the difference is
+				// worth a word because nothing in the code shows it: this command lists only
+				// the CALLER's own workers, and a name is set by its owner (handler/workers.go),
+				// so the author and the only reader are the same person. `Version` is different
+				// in both respects — the WORKER self-reports it, and the web's admin fleet list
+				// renders names cross-user, which is why that surface strips the name and this
+				// one does not. If `uzi worker list` ever grows an admin/all-users mode, the
+				// name becomes cross-principal here too and needs compactText.
+				version := compactText(strOr(w.Version, ""))
+				if version == "" {
+					version = "-"
+				}
+				rows = append(rows, []string{w.ID, w.Name, w.Status, version, upgradeCell(w)})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
 			// auto-stopped run is "check the worker's version" — v0.10.1+ isolates a

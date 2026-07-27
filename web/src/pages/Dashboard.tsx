@@ -18,6 +18,7 @@ import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
+import { stripUnsafeChars } from "../lib/safeText";
 
 interface Overview {
   runs: RunListItem[];
@@ -307,7 +308,8 @@ export function Dashboard() {
                   className="flex items-center gap-3 py-2.5 transition-colors hover:bg-raised/40"
                 >
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-fg">{r.issue_title}</p>
+                    {/* Issue #124: forge-supplied issue title, untrusted (see RunsList). */}
+                    <p className="truncate text-sm font-medium text-fg">{stripUnsafeChars(r.issue_title)}</p>
                     <p className="text-xs text-faint">
                       {r.repo_path} #{r.issue_iid}
                       {r.mr_iid != null && (

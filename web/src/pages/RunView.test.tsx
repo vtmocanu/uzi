@@ -1,7 +1,16 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary, JudgePanel, derivePlanRevision } from "./RunView";
+import {
+  PlanPanel,
+  AgentRosterSummary,
+  JudgePanel,
+  RunHeading,
+  RunCompletedLine,
+  RunFailureReason,
+  HealthFlag,
+  derivePlanRevision,
+} from "./RunView";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -209,6 +218,80 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+// Issue #124 / item 7. The run page's own heading renders the forge issue title, and it
+// was the one render site in this batch that no test reached — dropping its strip left the
+// whole file green, which is why RunHeading is now extracted the way the panels beside it
+// already are.
+// Issue #124, the TEXT channel for the two fields 96ed275a fixed on the ATTRIBUTE channel.
+// Both are asserted SEPARATELY and each is mutated on its own, because they render in
+// DIFFERENT branches of RunView and no single fixture reaches both — a case planting a Cf in
+// `failure_reason` passes with `health_reason` still raw, which is exactly the shape that let
+// three earlier defects through. Each fixture gives its field a real non-empty value rather
+// than relying on a default, since `RunView.test.tsx` setting both to `null` is why nothing
+// caught these.
+describe("RunFailureReason — the worker-supplied failure reason (#124, text channel)", () => {
+  it("strips bidi/zero-width characters out of the rendered reason", () => {
+    const { container } = render(
+      <RunFailureReason run={run({ failure_reason: "the repo \u202Eapproved\u200B this" })} />,
+    );
+    // The rendered TEXT is the assertion — a `title` check here would be measuring what
+    // 96ed275a already fixed, on a surface that carries no title at all.
+    //
+    // The POSITIVE assertion below is load-bearing, not belt-and-braces. Both renders sit
+    // behind a truthiness guard, so a fixture that regressed to `null` would mount nothing
+    // and leave `not.toMatch` matching an empty string — green, and proving nothing. Same
+    // shape as this batch's first finding: `!fs.existsSync(...)` passing because the thing
+    // it tested for was absent. Measured: nulling this fixture reds with
+    // `expected '' to be 'the repo approved this'`.
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toBe("the repo approved this");
+  });
+
+  it("renders nothing when there is no reason", () => {
+    const { container } = render(<RunFailureReason run={run({ failure_reason: null })} />);
+    expect(container.textContent).toBe("");
+  });
+});
+
+describe("HealthFlag — the health reason (#124, text channel)", () => {
+  it("strips bidi/zero-width characters out of the rendered reason", () => {
+    const { container } = render(
+      <HealthFlag run={run({ status: "running", health: "stalled", health_reason: "no output for \u202E20m\u200B" })} />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    // Sharper here than in the sibling case: the pill DOES mount without a reason (it
+    // renders `⚠ stalled`), so `not.toMatch` passes on a null fixture and only this line
+    // catches it. Measured: `expected '⚠ stalled' to contain 'no output for 20m'`.
+    expect(container.textContent).toContain("no output for 20m");
+  });
+});
+
+// Issue #124: `run.branch` is WORKER-supplied and ingest stores it as
+// `stripNULParam(req.Branch)` — NUL only, no Cc/Cf. Extracted to be assertable at all;
+// before that, dropping the strip left the whole file green.
+describe("RunCompletedLine — the worker-supplied branch carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of run.branch", () => {
+    const { container } = render(
+      <RunCompletedLine run={run({ branch: "agent/issue-\u202E7\u200B", mr_iid: null })} duration="2m" />,
+    );
+    // Anchored on the duration, which the mutation cannot move.
+    expect(container.textContent).toContain("Ran for 2m");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("agent/issue-7")).toBeTruthy();
+  });
+});
+
+describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
+    const { container } = render(
+      <RunHeading run={run({ issue_title: "Fix the \u202Eparser\u200B bug", issue_iid: 7 })} />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("Fix the parser bug")).toBeTruthy();
+    expect(screen.getByText("#7")).toBeTruthy();
+  });
+});
+
 describe("JudgePanel (PRD #46 M4)", () => {
   function review(over: Partial<RunReview> = {}): RunReview {
     return {
@@ -265,6 +348,57 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(await screen.findByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
     // The markup did not become a real element.
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  // Issue #124. React escaping (pinned above) does not touch Unicode format characters,
+  // and the api's review-ingest scrub dropped Cc only — Cc and Cf are disjoint — so a bidi
+  // override reached the browser intact and the browser's bidi algorithm honours it. Ingest
+  // strips Cf now; rows stored before that still arrive carrying it. The rendered text is
+  // what a human READS, so that is what gets asserted.
+  it("strips bidi/zero-width characters out of judge free text before rendering (#124)", async () => {
+    const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE — reorders the line that follows it
+    const ZWSP = "\u200B"; // zero-width space — also defeats search over the rendered text
+    // EVERY judge-derived free-text field in this fixture carries a hostile character, and
+    // that is the point rather than thoroughness. The whole-subtree assertion below can only
+    // see a field the FIXTURE makes hostile — so while `judge_model` sat here as the clean
+    // literal "haiku", the case passed with that field unstripped and the comment's promise
+    // ("a new judge field added to this panel without the strip fails here") was false. It
+    // survived four #124 commits in that blind spot. A field added to the DTO must be added
+    // here too, or this case silently stops covering it.
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        summary_md: `The review ${RLO}approved this change`,
+        judge_model: `hai${RLO}ku`,
+        recommendations: [
+          {
+            id: "rc1",
+            category: "install_worker_tool",
+            target: `shell${ZWSP}check`,
+            rationale_md: `hit ${RLO}command not found`,
+            confidence: "high",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+    // The await must resolve whether or not the strip works. Awaiting the CLEANED text
+    // here would make a mutation red at a 5s findByText timeout instead of at the
+    // assertion below — a red that looks like proof and measures something else. The
+    // verdict chip is a closed enum, so it is on screen in both states.
+    await screen.findByText("Issues found");
+
+    // Nothing in the panel's rendered text carries a character from either category,
+    // asserted over the WHOLE subtree. The guarantee is exactly as wide as the fixture is
+    // hostile — see the note above; it is not "any new field is covered automatically".
+    // Asserted FIRST, so it is what a mutation reds on.
+    const rendered = container.textContent ?? "";
+    expect(rendered).not.toMatch(/[\p{Cf}]/u);
+    expect(rendered).toContain("The review approved this change");
+    expect(rendered).toContain("hit command not found");
+    // The target renders as the searchable string, not one with an invisible seam in it.
+    expect(screen.getByText("shellcheck")).toBeTruthy();
+    expect(rendered).toContain("via haiku");
   });
 
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
@@ -347,6 +481,36 @@ describe("JudgePanel (PRD #46 M4)", () => {
       ...over,
     };
   }
+
+  // Issue #124 / LOW-1. The draft is templated server-side from `rec.target` +
+  // `rationale_md`, so a review stored BEFORE the ingest strip can still seed a bidi
+  // override into it — and this body is written to the user's forge. The strip belongs at
+  // the SEED, not on `value=`: these are controlled components, so the state IS the POST
+  // body, and filtering the value would silently rewrite what the user typed.
+  it("strips format characters from the SEEDED draft, before the user can edit it (#124)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({
+      draft: draftFixture({
+        title: "Improve the \u202Ereviewer",
+        description: "## What the judge found\n\n\u200Bmalicious\u202E line",
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    fireEvent.click(await screen.findByText("File issue"));
+    await screen.findByText("Draft issue");
+
+    // Read the CONTROL VALUES, not the rendered text: these are what a Create click posts.
+    const title = screen.getByDisplayValue(/Improve the/) as HTMLInputElement;
+    const body = screen.getByDisplayValue(/What the judge found/) as HTMLTextAreaElement;
+    expect(title.value).not.toMatch(/[\p{Cf}]/u);
+    expect(body.value).not.toMatch(/[\p{Cf}]/u);
+    expect(title.value).toBe("Improve the reviewer");
+    // …and the markdown structure is intact: the strip spares \n, so the fenced template
+    // the server built is still a template and not one run-on line.
+    expect(body.value).toContain("## What the judge found");
+    expect(body.value).toContain("\n");
+  });
 
   it("opens the draft with templated fields on File issue click (state B)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });

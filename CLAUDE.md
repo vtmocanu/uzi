@@ -72,6 +72,17 @@ Migrations are goose SQL files embedded via `go:embed` and run at API boot; ther
 
 **`PASS=0` has a SECOND cause, and it is your grep, not the suite.** `go test` prints `--- PASS` lines only under `-v`. Without it a perfectly good run emits nothing for a `grep -c '^--- PASS'` to count, so the tally reads `RUN=0 PASS=0 SKIP=0` with `EXIT=0` — the signature above, from a run in which every assertion executed. Measured 2026-07-25: the same command with `-v` reported `RUN=128 PASS=128 FAIL=0 SKIP=0` against `0/0/0` without it. The package-time tell is what separates them (11.3s, not 0.6s), and it is the reason to read the time rather than trust the count. **Before concluding a sweep ran nothing, confirm `-v` is in the command you ran.** The paragraph above documents only the first cause, and a reader who trusts it goes off to debug a healthy suite.
 
+**And a THIRD cause, which presents as a DEFICIT rather than a zero: `grep -c '^--- PASS'` and `grep -c '=== RUN'` count different populations.** **Go INDENTS subtest `--- PASS` lines but does NOT indent subtest `=== RUN` lines** — measured on one live sweep log: 21 subtest `=== RUN` lines, **0** indented; 21 subtest `--- PASS` lines, **all** indented. So a `^`-anchored PASS grep sees only top-level tests while any `=== RUN` grep, anchored or not, sees everything:
+
+```
+grep -c '=== RUN'      184      grep -c '^=== RUN'      184   <- anchor changes NOTHING here
+grep -c -- '--- PASS'  184      grep -c '^--- PASS'     163   <- and everything here
+```
+
+Read across the two forms and you get 184 against 163, which looks exactly like **21 tests that failed to report** and is nothing of the kind. **The figures are one sample of a suite that grows every week — the SHAPE is the finding, not the pair.** Pick one population and count both sides in it: an unanchored `--- PASS` grep with an unfiltered `=== RUN` grep is the consistent pair.
+
+*(This paragraph originally also claimed `RUN(top-level)=163`, on the reasoning "`t.Run` subtests are indented". **That figure does not exist and cannot be obtained** — the indentation claim is true of the `--- PASS/FAIL/SKIP` family and false of `=== RUN`, so the second pair was a symmetry the lead inferred rather than measured, in a paragraph about not trusting counts you did not derive. Caught by a tester who ran all four greps against its own log.)* **What actually matters is unchanged and is not a tally at all:** `FAIL` and `SKIP` must be zero *at every indent level*, which no top-level-only grep can tell you.
+
 **COMPARING VERSIONS? `golang.org/x/mod/semver` NEEDS A LEADING `v` AND EVERY VERSION THIS PROJECT SHIPS IS BARE — the naive compare fails SILENTLY and fails OPEN.** Not PRD-specific; any future version comparison here hits it. The bare form is deliberate on both sides: `api/Dockerfile` stamps `-X main.version=${UZI_VERSION#v}` and `deploy/chart/Chart.yaml` carries `version`/`appVersion` without the `v` (Model B). Measured 2026-07-26 on those literal shipped strings:
 
 ```
@@ -105,6 +116,10 @@ npx vitest run src/pages/Foo.test.tsx      # single file
 npm run build                              # runs check-docs + tsc --noEmit + vite build
 ```
 
+**A NON-MOCK `vite dev` OR `vite preview` OF THIS REPO TALKS TO YOUR LIVE STACK.** `web/vite.config.ts` sets `server.proxy` for `/api` → `http://127.0.0.1:8080`, and there is no `preview` override, so **`vite preview` inherits it** — the same proxy the dev loop wants is a live wire to `uzi-web-1` and the real database behind it. Measured 2026-07-27 while browser-verifying #124: the first page load of a preview build fired `GET /api/auth/me` at the real stack and got a 401 carrying nginx headers and the production CSP. **The inheritance is by construction, not by coincidence** — verified in the shipped resolver at the version this repo runs (vite 6.4.3): `resolvePreviewOptions` returns `proxy: preview?.proxy ?? server.proxy`. And `web/package.json` ships `"preview": "vite preview"`, so the hazard is one `npm run preview` away rather than an obscure invocation. That particular page load was harmless because it only issued GETs — **a page that POSTs on mount would have written to real uzi.** (Stated narrowly on purpose: "the whole app only GETs on mount" is NOT established, and a grep cannot establish it, since it cannot separate a call made on mount from a handler merely defined in an effect body.) Same class as the "never run a bare `docker compose up` for smoke purposes" rule above, arriving through a config file nobody reads instead of through an env var.
+
+Mitigations, in order of preference: run with `VITE_UZI_MOCK=1`, which replaces `api` wholesale so the app makes **no** network calls at all; or, when you specifically need the shipped `realApi` path (browser-level response interception is the only honest way to test a client-side transform — a mock fixture exercises `mockApi`, which is the code you are not shipping), **register every interception route BEFORE the first `open`**. Two things that bite there: route precedence is not last-registered-wins, so `unroute` a broad pattern rather than layering a narrow one over it; and stub `/api/repos`, `/api/forge/connections` and `/api/runs` as well as the endpoint under test, or their 401s trip the global logout redirect and bounce you to `/login` before the surface renders.
+
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
@@ -113,6 +128,14 @@ npm run typecheck
 npm test                                   # node --test via tsx
 node --import tsx --test test/worker.test.ts   # single file
 ```
+
+**`cd agent && npm ci` BREAKS THE MACHINE'S `agent-browser` FOR EVERY OTHER SESSION, and deleting the worktree afterwards is what makes it permanent.** `agent/package.json` pins `agent-browser` (`0.32.3`) as a dependency, and that npm package's `postinstall` **rewrites `/opt/homebrew/bin/agent-browser`** to point inside whatever `node_modules` just installed it — clobbering the brew formula's symlink (`0.31.1` here, a different version). Install into a throwaway worktree, remove the worktree, and the CLI is off `PATH` host-wide with a dangling link. Observed twice on 2026-07-27, hours apart, from ordinary validator gate runs — this is not someone being careless, it is the documented gate step doing it.
+
+**Do not remove the failure by remembering to avoid `npm ci` — remove it by not installing at all.** A validator that needs the deps in a throwaway worktree can **symlink `node_modules` from the long-lived worktree** instead of installing: no install step, so no `postinstall`, so no clobber — and it is faster than `npm ci` besides. That is the change that ends the recurrence; everything below is triage.
+
+**The tell is SILENT, which is why nobody catches it in time.** A clobbered link still resolves while the throwaway worktree exists, so `agent-browser --version` answers happily — with the npm version (`0.32.3`), not brew's (`0.31.1`), which is the only visible difference. Anyone asking "is `agent-browser` fine?" gets yes. The check that discriminates is `ls -l /opt/homebrew/bin/agent-browser`: read whether the target is under `/opt/homebrew/Cellar` or under somebody's `node_modules`. The breakage becomes host-wide `command not found` the moment that worktree is deleted, which is typically minutes later and by a different session.
+
+**Repairing it takes a specific sequence, and the two obvious commands each fail on their own** (measured 2026-07-27, three repairs in one afternoon): `brew link --overwrite` alone answers *"Already linked"* and refuses, because brew's bookkeeping still thinks it owns the link. `brew unlink && brew link` then removes **0 symlinks** — brew no longer recognises the npm-written link as its own — and the plain `link` refuses because a file is in the way. What works is **`brew unlink agent-browser` followed by `brew link --overwrite agent-browser`**: the unlink clears the bookkeeping, the `--overwrite` replaces the foreign symlink. And the repair does not *hold* — the next `npm ci` in `agent/` undoes it. If you only need to drive a browser, call the Cellar binary directly and skip the whole cycle: `/opt/homebrew/Cellar/agent-browser/<version>/libexec/bin/agent-browser`, which no npm postinstall touches.
 
 **`node --test` prints `ℹ fail 0` while tests are failing, when they fail by TIMEOUT.** Measured twice independently (PRD #121): three tests timed out at 15s, surfaced under `✖ failing tests:`, and were not counted in the `fail` tally; `$?` was 1 throughout, so the exit code is the field that told the truth and the tally is the one that lied. This is the **mirror image** of the `PASS=0` trap in the api section above: there, a tally shaped for the wrong invocation (no `-v`) reads zero from a **healthy** run; here, the right invocation reads zero from a **broken** run — same lesson, opposite direction. Read the exit code and the named failing tests, never a bare tally.
 
@@ -138,6 +161,37 @@ That deleted the `uzi-workers` ServiceAccount and its pull-secret `InfisicalSecr
 **Corollary, and it is the same mistake one level up:** `helm template … | grep -c 'kind: ServiceAccount'` is NOT evidence an object exists. Two sessions concluded the chart rendered the SA from exactly that grep. Count objects by parsing (`yaml.safe_load_all`), and when a grep and a parser disagree, the parser is right.
 
 **`grep` ON THIS HOST IS `ugrep`, AND `[^-]` DOES NOT BEHAVE.** Measured 2026-07-27: `printf 'abcs---\n' | grep -cE '[^-]---$'` returns **0** while `'[a-z]---$'` returns **1** — so a guard written with a negated bracket expression passes on the very render it exists to reject. Check with `grep --version` before trusting a negated class, and prefer `awk` for anything load-bearing.
+
+**The escape hatch is `-P`, not just `awk`:** `grep -cP '[^-]---$'` on that same input returns **1**, the right answer. So the defect is in ugrep's **POSIX modes specifically** (plain/`-E`), which is a sharper and more useful statement than "ugrep is broken".
+
+**SEPARATE AND NOT A UGREP DEFECT — braces. The escape you add to make them literal is what turns them into a quantifier.** Filed apart from the paragraph above on purpose: BSD grep behaves identically, so folding it in would misattribute a portable POSIX behaviour to ugrep and weaken the divergence above, which is real. Measured 2026-07-27 (ugrep 7.5.0 in BRE, and `command grep`, BSD 2.6.0):
+
+```
+grep     -c 'tabIndex={0}'    correct — bare { is LITERAL in BRE
+grep  -F -c 'tabIndex={0}'    identical; -F changes nothing here
+grep  -E -c 'tabIndex={0}'    ERE: interval
+grep     -c 'tabIndex=\{0\}'  <- THE TRAP: escaping IS the POSIX interval syntax
+```
+
+**The mechanism, which matters far more than any count: `x{0}` means "the preceding `x`, zero times", so the pattern SILENTLY WIDENS TO ITS OWN PREFIX — but ONLY in ERE/PCRE.** Two corrections, both measured on this host (ugrep 7.5.0) against a four-line fixture, because the paragraph is about not trusting counts you did not derive:
+
+```
+                          matches
+grep    'tabIndex={0}'    line 1 only          <- BRE: the braces are LITERAL
+grep -E 'tabIndex={0}'    lines 1, 2, 4        <- ERE: degrades to `tabIndex`
+grep -P 'tabIndex={0}'    lines 1, 2, 4        <- same
+      (fixture: `tabIndex={0}` / `tabIndex` / `tabInde` / `tabIndexZZZ`)
+```
+
+**Plain `grep` is NOT affected**: POSIX BRE spells the interval `\{0\}`, so a bare `{0}` is an ordinary character and the naive pattern behaves as a literal. The trap needs `-E` or `-P`. And the prefix is **`tabIndex`, not `tabInde`** — `{0}` quantifies the character immediately before it, which is `=`, not the `x`. Note line 3 (`tabInde`) does NOT match in any mode, which is the direct disproof of the shorter prefix.
+
+So the widened pattern matches every line containing `tabIndex` — a comment, a variable name, a doc sentence. So the inflation is **not "+1"**: it is exactly however many other lines carry the prefix, which is **zero on a clean fixture and non-zero the moment a comment mentions the symbol**. That is why two agents measuring this got `3→4` and `1→2` on their own fixtures and neither was wrong. A reader who learns "a brace adds one" mispredicts on both; a reader who learns "the interval makes the last character optional, so the pattern degrades to a prefix" predicts both.
+
+It is a trap in the shape of a precaution: the escape a careful person adds to make the braces literal is the thing that breaks it.
+
+*(Two earlier versions of this paragraph were wrong, both written by the lead from a single observation. The first claimed a bare `{0}` miscounts under plain `grep` — it does not; a reviewer filed that after an off-by-one expectation (`^2$` against a true count of 3) and retracted it once measured. The second generalised to "any unescaped metacharacter in an intended literal", which a tester refuted as mode-dependent: in BRE `a.b` and `c*d` over-match but `e+f` does not, because `+` is literal there. The habit both failures share is going from one measurement to a stated mechanism without re-measuring.)*
+
+**The rule that survives every case above, needs no taxonomy, and does not depend on which grep is installed: use `-F` when you mean a literal.** And **verify restores with `git status`/`git diff`, not with a grep count** — not because grep miscounts, but because a literal count only tells you something if you already know how many occurrences ought to exist. The VCS does not require you to know that, which is exactly why it is the right instrument for "is the tree back where it was".
 
 ## Architecture
 

@@ -52,6 +52,31 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   reads as flapping either (issue #145).
   See [docs/worker-upgrades.md](docs/worker-upgrades.md).
 
+- **The run-view usage tables' left-aligned cells (the Agent, Phase and Model columns)
+  are legible again instead of uniformly dimmed.** Two Tailwind classes of equal
+  specificity were both emitted on the same cell, and stylesheet order picked the
+  muted one every time (issue #152).
+
+- **The run-view usage tables are usable with a screen reader.** Column headers now
+  carry `scope="col"`, each table has its own accessible name, and the decorative
+  disclosure triangles next to each `<details>` no longer get announced as a second,
+  contradictory reading of the same expand/collapse state.
+
+### Security
+
+- **Unicode "format" characters — bidi overrides like U+202E, zero-width
+  spaces/joiners, the BOM — in untrusted text can no longer make it render in an
+  order its bytes don't have (Trojan Source, CVE-2021-42574).** Stripped at
+  render — in visible text and in attributes like tooltips and accessible names —
+  everywhere judge output, run titles, forge- or agent-supplied issue, proposal and
+  memory text, the worker fleet page, and a filed-issue draft seeded from judge text
+  reach the UI; stripped at review ingest so a hostile character can no longer be
+  stored in the first place; and stripped from the CLI's worker table. A worker's own
+  name is covered too — the one case where the reader isn't the field's own owner: it
+  could otherwise render, crafted, in an admin's fleet list next to a different user's
+  email. Coverage is per-surface, not blanket: `agent_label` is a separate, still-open
+  gap tracked as issue #164 (issue #124).
+
 ## [0.11.12] - 2026-07-27
 
 ### Fixed
