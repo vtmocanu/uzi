@@ -77,8 +77,11 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `default (auto: no fresh usage readings)` — and links to Settings → Anthropic tokens, which
   is where that particular problem gets fixed. Those runs are the only ones that carry a
   warning colour: nothing failed, but your pool did no work, which is usually a setting you
-  can change. `uzi worker list` also gains a **TOKEN** column, so the three-way choice the CLI
-  could already *set* is finally one it can *show* (PRD #111 M1 + M5).
+  can change. A run that spent the least-consumed token of a pool where **every** token was
+  nearly exhausted is called out separately, in blue rather than amber — it worked, but your
+  pool is nearly out — and links to the same page. `uzi worker list` also gains a **TOKEN**
+  column, so the three-way choice the CLI could already *set* is finally one it can *show*
+  (PRD #111 M1 + M5).
 
 - **A Model column in the run view's per-agent usage table.** The usage panel named the run's
   model only once, in the top strip — the main thread's. A run is multi-model (a subagent can

@@ -752,6 +752,42 @@ describe("WorkersSettings auto-mode over an empty pool (web-ux F18)", () => {
     expect(screen.queryByText(/is empty — its runs spend/i)).toBeNull();
   });
 
+  // The DEPS leg, asserted directly. It is already caught — mutating `[pooledCount]`
+  // to `[]` reddens — but it reddens by TIMING OUT at ~5s on a pre-existing test whose
+  // name says nothing about pooled counts. A guard that works and cannot explain
+  // itself costs the next person the five minutes this test saves: opt a token in,
+  // switch to auto, and require the NON-empty announcement. Fails in milliseconds,
+  // names the cause.
+  //
+  // The stale-closure shape is why this is not paranoia: with `[]` the callback
+  // captures pooledCount from the render that created it, so a user who pooled a token
+  // and THEN switched a worker to auto hears the empty-pool announcement anyway.
+  it("announces the pool once a token has been opted in mid-session", async () => {
+    mockApi.listSecrets.mockResolvedValue({
+      secrets: [twoUnpooled[0], aSecret({ id: "sec-spare", label: "spare-key", auto_eligible: true })],
+    });
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ anthropic_bind_mode: "default" })] });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker({ anthropic_bind_mode: "auto" }) });
+    renderPage();
+    await screen.findByText("laptop");
+    fireEvent.change(await screen.findByLabelText("Anthropic token for laptop"), {
+      target: { value: "\u0000auto" },
+    });
+    // Waits for WHICHEVER announcement lands, then asserts which one it was. That is
+    // what makes it fail in milliseconds: under the stale-closure mutation the wrong
+    // announcement appears just as fast as the right one, so there is nothing to time
+    // out on. Waiting only for the CORRECT string would burn the full waitFor timeout
+    // before saying anything, which is the 5s non-explanation this test replaces.
+    await screen.findByText(/from its next claim|token pool is empty/i);
+    expect(
+      screen.queryByText(/token pool is empty/i),
+      "pooledCount is missing from rebind's useCallback deps: the callback captured the " +
+        "count from the render that created it, so opting a token in mid-session does not " +
+        "reach the announcement",
+    ).toBeNull();
+    expect(screen.getByText(/now auto-selects from your token pool/i)).toBeTruthy();
+  });
+
   // A non-auto worker must be untouched by any of this: the empty pool is irrelevant
   // to a worker that was never going to consult it.
   it("leaves a default-mode worker's summary alone", async () => {

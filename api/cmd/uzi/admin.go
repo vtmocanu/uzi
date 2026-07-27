@@ -99,6 +99,16 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				//
 				// The render site is the trust boundary and does not depend on the
 				// validator holding; hardening the validator is a separate change.
+				//
+				// 🔴 "THE CROSS-TENANT ONE" ABOVE MEANS "of the two worker-name cells",
+				// NOT "of this file". `uzi admin cli-tokens` below renders `t.Name` raw
+				// into the same kind of cross-tenant admin table, and CLI-token names get
+				// only strings.TrimSpace — no control-character check either. It is left
+				// deliberately: it is PRD #64's surface, this change does not make it
+				// worse, and render-site fixes here are scoped to the surfaces this PRD
+				// touches. It goes up as a follow-up with the worker-name validator.
+				// Named here so the next reader sees a signpost rather than two
+				// sanitized cells and a file that looks finished.
 				rows = append(rows, []string{w.ID, w.OwnerEmail, cellText(w.Name), w.Status})
 			}
 			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS"}, rows)
