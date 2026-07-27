@@ -106,8 +106,10 @@ const (
 	// flapWindow is how long a container's CURRENT instance must have been up before it
 	// stops counting as flapping (issue #145). It is kubelet's own backoff-forget
 	// interval: stay up this long and the CrashLoopBackOff is forgotten, which is the
-	// same fact stuckAge's comment and rollhealth_test.go's `running()` helper already
-	// assert from the other side.
+	// same fact the blockingContainer-fallback comment below and rollhealth_test.go's
+	// `running()` helper already assert from the other side. (NOT stuckAge's comment,
+	// which an earlier version of this line cited — that one covers the reason arm's
+	// 37s timing and when doBackOff starts, and never mentions the reset.)
 	//
 	// EQUAL TO stuckAge BY COINCIDENCE OF VALUE, NOT OF MEANING, which is why it is its
 	// own constant rather than a reuse. stuckAge bounds how long a REASONLESS pod may sit
@@ -115,10 +117,24 @@ const (
 	// for a live restart loop to still count as one. Changing one must not silently
 	// change the other.
 	//
-	// It is also deliberately NOT part of the ControllerStuckAge relationship: the api
-	// mirrors stuckAge in its own constant and TestMaxUpgradingWindowExceedsControllerStuckAge
-	// asserts a clamp between them. NOTHING api-side mirrors flapWindow, and nothing
-	// should — the verdict it gates is derived and reported here, not recomputed there.
+	// It is also deliberately NOT part of the ControllerStuckAge relationship: that pair
+	// exists because MaxUpgradingWindow gates R2 and must outlast the controller's
+	// `rolling`, so the api mirrors stuckAge in its own constant and
+	// TestMaxUpgradingWindowExceedsControllerStuckAge asserts a clamp between them. This
+	// constant gates a `stuck` verdict, which feeds R1 — a different rule with no window
+	// to order against. NOTHING api-side mirrors flapWindow, and nothing should.
+	//
+	// The absence of that coupling is a CONSEQUENCE OF #151, not a property of this
+	// constant: if R1 were ever ceiling-gated again, flapWindow would join the
+	// relationship and would need the same kind of clamp.
+	//
+	// 🔴 READ THIS BEFORE SHORTENING IT. Because #151 removed the INV-5 ceiling from R1,
+	// an `upgrade_failed` produced by this arm has NO expiry of its own — flapWindow
+	// elapsing on continuous uptime is the SOLE thing that ends it. Every other stuck
+	// arm's alert clears when the pod state changes; this one clears only when the
+	// container has been up this long. Shorten it and the alert clears sooner on a
+	// worker that is still dying; lengthen it and a recovered worker stays red longer.
+	// Neither is obviously wrong, but the choice is the alert's entire lifetime.
 	flapWindow = 10 * time.Minute
 )
 
@@ -443,9 +459,17 @@ func blockingContainer(p *corev1.Pod) *corev1.ContainerStatus {
 // highest LIFETIME count. Those disagree whenever a quiet container out-restarts the
 // flapping one — measured: dind flapping (4 restarts, up 2m) beside a stable worker (7
 // lifetime restarts, up 72h) reports stuck, correctly, but names `worker` with 7
-// restarts. The init-first ordering here does not carry through either, for the same
-// reason. That is a known divergence tracked separately; do not read this function's
-// choice as the one an operator sees.
+// restarts, and stuckDetail then renders a reason and exit code from a termination hours
+// old, on a currently-healthy container, with no timestamp. The init-first ordering here
+// does not carry through either, for the same reason. Do not read this function's choice
+// as the one an operator sees: the verdict and the subject are computed from two
+// different containers by construction.
+//
+// TRACKED AS ISSUE #159, deliberately not fixed here — it changes rendered output on a
+// path no measurement covers, so it wants its own fixture and its own measurement. Note
+// what such a fixture needs: TWO containers where the flapping one is NOT the
+// most-restarted one. A two-container fixture where the two agree passes against the
+// unfixed code.
 //
 // Honest (docker runs really are broken) and it matches how blockingContainer and
 // mostRestartedContainer already treat the pod, but it
