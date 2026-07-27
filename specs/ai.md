@@ -1023,7 +1023,7 @@ Serves human: "agents only ever create MRs, never write to main — primary dire
 
 Layered so no single layer is load-bearing, and none trusts the model:
 1. **GitLab role**: the bot is Developer and `main` is protected (documented project
-   config; **now continuously verified by PRD #5's privcheck** — see §95–§97, which
+   config; **now continuously verified by PRD #5's privcheck** — see §405–§407, which
    turns this layer from documented-and-hoped into checked-at-save-and-periodically).
 2. **Worker-owned network git** (§45): the agent literally has no push credential, so
    protected-branch writes are impossible regardless of what the model attempts —
@@ -2317,6 +2317,25 @@ Serves human Feature #19; minimal new surface.
 
 ---
 
+> **Numbering note (issue #156, resolved 2026-07-27) — §93-§100 were landed THREE times, and
+> the next two blocks are the renumbered survivors.** Three PRDs (#19 above, #5 and #17/#16
+> below) each ran in parallel off the same base and each opened with the same sentence,
+> "Section numbers continue past PRD #24's #92" — so all three minted 93-100 independently and
+> nothing caught it at merge. Twenty-two sections shared eight numbers.
+>
+> Resolved by keeping the **earliest** block (PRD #19, §93-§100) at its original numbers and
+> renumbering the two later blocks above the then-head of 402: **PRD #5 → §403-§408**,
+> **PRD #17/#16 → §409-§416**. Earliest-wins was chosen because it keeps the most existing
+> cross-references valid by default (7 of the 13 pointed at PRD #19's block), so fewer
+> references had to be repointed by hand and fewer chances to repoint one wrongly.
+>
+> **Physical order is unchanged** — only the numbers moved — so the file now reads
+> 92, 93-100, 403-408, 409-416, 101, … That discontinuity is the cost, and it is deliberate:
+> renumbering in place would have shifted every section above 100 and invalidated hundreds of
+> references to fix thirteen. Two consequences worth knowing: PRD #17/#16's block used to flow
+> into §101-§104 (the rest of the skills work) and no longer does, and the two later blocks'
+> "continue past #92" sentences were corrected here because this change made them false.
+
 # PRD #5 — Access Control & PAT Least-Privilege Hardening
 
 Serves human Feature #5 (registration domain allowlist + registration toggle + PAT
@@ -2324,10 +2343,11 @@ least-privilege verification; user chose this scope — option A — precisely s
 parallel to PRD #4's M3–M7 with no file overlap). Two thin, same-theme workstreams:
 tighten who registers, and verify the bot PAT can do no more than open MRs — making
 PRD #4's "GitLab-side bot = Developer + protected main" guardrail (§50) *checked*
-instead of hoped. Section numbers continue past PRD #24's #92. Realizes
+instead of hoped. Sections are **§403-§408**; they were authored as 93-98 "continuing past
+PRD #24's #92" and renumbered by issue #156 — see the numbering note above. Realizes
 `prds/5-access-control-pat-hardening.md`.
 
-## 93. Registration controls (server)
+## 403. Registration controls (server)
 
 Serves human: "allow registration only from configurable email domains"; "enable/disable registration".
 
@@ -2363,7 +2383,7 @@ Serves human: "allow registration only from configurable email domains"; "enable
   behind the **auth rate limiter** like register/login. Its shape is a security
   boundary: only operator-set, user-visible policy — nothing else, ever.
 
-## 94. Registration UX (web)
+## 404. Registration UX (web)
 
 Serves human Feature #5 (registration controls, user-facing).
 
@@ -2373,7 +2393,7 @@ Serves human Feature #5 (registration controls, user-facing).
   pre-validation. The **server stays authoritative** (client checks are UX only); a
   server rejection renders its message inline.
 
-## 95. PAT least-privilege verification — forge interface + rules
+## 405. PAT least-privilege verification — forge interface + rules
 
 Serves human: "can uzi verify the glpat does not have more permissions than needed
 for an MR — per repo, at save, and afterwards?" (plan.md line 48); primary directive
@@ -2408,7 +2428,7 @@ for an MR — per repo, at save, and afterwards?" (plan.md line 48); primary dir
   save-block** — older-instance tolerance; the only allowlisted forge
   (gitlab.example.com) is ≥15.5.
 
-## 96. privcheck package: enforcement, persistence, periodic sweep
+## 406. privcheck package: enforcement, persistence, periodic sweep
 
 Serves human Feature #5 ("at save, and afterwards").
 
@@ -2445,7 +2465,7 @@ Serves human Feature #5 ("at save, and afterwards").
   **`NULL` status = never checked**, rendered as an explicit "unchecked" badge, never
   as ✓; the boot sweep back-fills it right after deploy.
 
-## 97. Web privilege surfacing
+## 407. Web privilege surfacing
 
 Serves human Feature #5 (drift becomes visible without anyone asking).
 
@@ -2457,7 +2477,7 @@ Serves human Feature #5 (drift becomes visible without anyone asking).
   with a link to `docs/gitlab-bot-setup.md`. Admin fleet-wide privilege dashboard is
   out of scope.
 
-## 98. Configuration additions (env, extends §13/§25)
+## 408. Configuration additions (env, extends §13/§25)
 
 | Var | Default | Notes |
 |---|---|---|
@@ -2476,12 +2496,15 @@ seven subagents, the worker found no `lead` row, left `baseOptions.model` unset,
 and the SDK silently fell back to the account default (observed: `claude-sonnet-5`)
 — invisible and unconfigurable. This PRD ships `lead` as the **eighth** builtin on
 `opus`, makes it editable/resettable like the others, and adds a per-user
-default-model knob that overrides it for a user's own runs. Section numbers
-continue past PRD #24's #92; the decisions below realize the PRD's Design Decisions
+default-model knob that overrides it for a user's own runs. Sections are **§409-§416**;
+they were authored as 93-100 "continuing past PRD #24's #92" and renumbered by issue #156
+(see the numbering note above) — §409-§414 are this PRD, §415-§416 begin PRD #16's skills
+work and used to run straight into §101-§104, which they no longer do.
+The decisions below realize the PRD's Design Decisions
 (`prds/17-lead-template-and-model-selection.md`), whose per-decision attributions
 carry provenance. Builds on PRD #3 (agent templates) and PRD #4 (runtime/claim).
 
-## 93. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
+## 409. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
 
 Serves human: "lead ships as a builtin with a real orchestrator prompt on opus";
 "builtins are the single source, `.claude/agents/` is the dev team's" (user,
@@ -2525,7 +2548,7 @@ Serves human: "lead ships as a builtin with a real orchestrator prompt on opus";
   The reconciler's query dependency is narrowed to a `builtinReconcilerQueries`
   interface so the collision path is unit-testable without a live DB.
 
-## 94. Lead prompt body augments, never replaces, the guardrails
+## 410. Lead prompt body augments, never replaces, the guardrails
 
 Serves human Feature #17 + the primary directive (`main` is never touched).
 
@@ -2536,7 +2559,7 @@ Serves human Feature #17 + the primary directive (`main` is never touched).
   cannot weaken guardrails** (asserted by existing + new tests). The four independent
   guardrail layers (§45, §50) are untouched.
 
-## 95. Shared model validator homed in `agenttmpl` (single rule source)
+## 411. Shared model validator homed in `agenttmpl` (single rule source)
 
 Serves human: "model choices offered as aliases + a custom escape hatch" (user);
 best-practice (two surfaces must not drift). AI-decided homing.
@@ -2547,7 +2570,7 @@ best-practice (two surfaces must not drift). AI-decided homing.
   thin-wrap it without an import cycle (the handler maps its result to
   `pgtype.Text` + an HTTP error); the builtin validity tests call it directly. The
   prior template-model check (allowed interior spaces, no length cap) is replaced by
-  it. The web `ModelSelect` mirror (§96) is a **client hint only** — the server rule
+  it. The web `ModelSelect` mirror (§412) is a **client hint only** — the server rule
   is authoritative.
 - **Decision-4 rules**: blank / whitespace-only ⇒ `("", nil)` = inherit (the caller
   stores NULL); a non-blank value must be a **single token** — trimmed, no interior
@@ -2556,7 +2579,7 @@ best-practice (two surfaces must not drift). AI-decided homing.
   accepted here and only surfaces as a run-time SDK error (the API cannot enumerate
   valid IDs without calling Anthropic).
 
-## 96. Shared `ModelSelect` control (web)
+## 412. Shared `ModelSelect` control (web)
 
 Serves human: aliases + custom escape hatch (user). AI-decided component shape.
 
@@ -2576,7 +2599,7 @@ Serves human: aliases + custom escape hatch (user). AI-decided component shape.
   "the main agent thread that plans and delegates") so it reads differently from
   invokable subagents; otherwise it edits and resets like any other builtin.
 
-## 97. Per-user default worker model (api + web)
+## 413. Per-user default worker model (api + web)
 
 Serves human: "per-user default worker model" (user, 2026-07-05 — the default follows
 per-user run ownership, not a global setting).
@@ -2591,12 +2614,12 @@ per-user run ownership, not a global setting).
   targeted lookup, **not** a JOIN widening of the claim-context query).
 - **API `GET` / `PUT /api/me/settings`**, session-authenticated (PRD #1 cookie +
   CSRF), **own-user only** — no admin path to another user's value. `PUT` validates
-  through `ValidateModel` (§95) and stores `""` as NULL.
+  through `ValidateModel` (§411) and stores `""` as NULL.
 - **Web**: a "Worker model" section on `Settings.tsx` under the Anthropic-token block,
   using `ModelSelect`, explaining precedence (the per-user default overrides the lead
   template's model; empty = inherit the lead template's model, opus by default).
 
-## 98. Claim plumbing + model precedence (api + agent)
+## 414. Claim plumbing + model precedence (api + agent)
 
 Serves human: "the run owner's default model wins over the lead template model"
 (Decision 6, review finding + user, 2026-07-05).
@@ -2635,7 +2658,7 @@ existing builtin routed to the main thread). Full rationale in
 `prds/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
 cross-service map in ARCHITECTURE.md "Agent skills".
 
-## 99. Skill scopes + storage schema (`skills`, `agent_skill_allocations`)
+## 415. Skill scopes + storage schema (`skills`, `agent_skill_allocations`)
 
 Serves human: "skills at global scope and per-user scope; allocate global or user
 skills to each agent"; "repos may carry skills the worker detects".
@@ -2670,7 +2693,7 @@ skills to each agent"; "repos may carry skills the worker detects".
 - **`repos.repo_skills_enabled BOOLEAN NOT NULL DEFAULT false`** added in the same
   migration — the per-repo opt-in flag for repo-borne skills (§105).
 
-## 100. Builtin skills: `skilltmpl` reconciler, no `.claude/skills/` mirror
+## 416. Builtin skills: `skilltmpl` reconciler, no `.claude/skills/` mirror
 
 Serves human: "builtin skills ship with uzi, editable and resettable like builtin
 agent templates".
@@ -4226,7 +4249,7 @@ Serves human: repo-carried toolchains, safely.
 Serves human plan.md 44 (global/user agents), extended from skills to the templates.
 
 - **`agent_templates` grows `scope` (builtin|global|user) + `user_id`** (`00048`),
-  mirroring skills §99: backfill `scope='builtin' where is_builtin`; drop the flat
+  mirroring skills §415: backfill `scope='builtin' where is_builtin`; drop the flat
   `UNIQUE(name)`; add the two partial uniques (`uq_agent_templates_shared_name (name)
   WHERE scope<>'user'`, `uq_agent_templates_user_name (user_id,name) WHERE scope='user'`).
 - **`is_builtin` KEPT as a compat column** (Decision 9): rather than churn every
@@ -4699,8 +4722,8 @@ and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
   the cap is advertised at registration for observability but never enforced server-side.
   The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
   block PRD #39's chat lane and encode scaling policy in the schema).
-- **§878's "one run at a time" becomes "bounded by the cap, default 1"** once PRD #42
-  lands; §669's one-*worker*-per-user invariant is untouched.
+- **§43's "one run at a time" becomes "bounded by the cap, default 1"** once PRD #42
+  lands; §35's one-*worker*-per-user invariant is untouched.
 - **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
   PAT exposure during push windows; Bash cross-run worktree writes — details in the ADR);
   the real fix is the k8s uid-split/container-per-run era (§168), where each
@@ -5024,7 +5047,7 @@ PRD carries the complete set (1–15) and the review corrections.
   the cap is advertised at registration for observability but never enforced server-side.
   The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
   have blocked PRD #39's chat lane and encoded scaling policy in the schema).
-- **§877-878's "one run at a time" prose is now "bounded by the cap, default 1"**; §669's
+- **§43's "one run at a time" prose is now "bounded by the cap, default 1"**; §35's
   one-*worker*-per-user invariant is untouched — a different guarantee this PRD does not
   touch.
 - **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
@@ -5176,7 +5199,7 @@ and the M0 verdict that gates them.
 ## 193. Builtin propagation — insert-only seed, reset clobbers customizations, documented recipe over auto-migration
 
 - **Editing `builtins/lead.md` reaches new databases only** (↳review M-3): boot seeding is insert-only
-  (`ReconcileBuiltinTemplates`, `ON CONFLICT (name) … DO NOTHING`, §93; scope-aware
+  (`ReconcileBuiltinTemplates`, `ON CONFLICT (name) … DO NOTHING`, §409; scope-aware
   `WHERE scope <> 'user'` since §158). The sole upgrade path for existing deployments is
   `ResetAgentTemplate`, which re-applies the embedded builtin **verbatim, discarding any admin
   customization** of that template — and the population most likely to reset (admins who customized
