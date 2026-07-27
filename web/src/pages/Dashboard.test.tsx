@@ -209,9 +209,10 @@ describe("Dashboard first-load / re-poll error split", () => {
 });
 
 describe("Dashboard onboarding checklist (PRD #60)", () => {
-  it("strikes a done step with currentColor — no decoration-* color class", async () => {
+  it("keeps no decoration-* class on a done step, so the strike falls back to currentColor", async () => {
     // One online worker (step 4 done) and no token/forge/repos (steps 1-3 open), so
-    // the checklist card renders at all (it hides once every step is done).
+    // the checklist card renders at all (it hides once every step is done). The worker
+    // restates the beforeEach default on purpose — it is the step this test asserts on.
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
     renderDashboard();
     await act(async () => {
@@ -221,9 +222,11 @@ describe("Dashboard onboarding checklist (PRD #60)", () => {
     const done = screen.getByText("Bring a worker online");
     const classes = done.className.split(/\s+/).filter(Boolean);
     expect(classes).toContain("line-through");
-    // The regression guard: a decoration COLOR must never come back (PRD #60 — the
-    // old one was a border token at ~1.9:1 against the card, so the line was all but
-    // invisible). With no text-decoration-color the line inherits the muted text.
+    // The regression guard, deliberately wider than the defect: no decoration-* utility
+    // at all. A decoration COLOR is what caused PRD #60 (a border token at ~1.9:1 against
+    // the card, so the line was all but invisible); with none set, the line inherits the
+    // muted text color. jsdom cannot observe the computed color, so the class list is the
+    // proxy — a thickness or style utility would trip this too, which is the intent.
     expect(classes.filter((c) => c.startsWith("decoration-"))).toEqual([]);
 
     // Sanity: an open step is not struck at all.
