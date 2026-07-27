@@ -75,7 +75,7 @@ func TestDecideLimitParkFallsBackWhenNothingKnowsTheReset(t *testing.T) {
 	if !d.Park {
 		t.Fatalf("a limit death with no reported reset must still park, got %q", d.Reason)
 	}
-	want := parkNow.Add(limitParkFallback + 90*time.Second)
+	want := parkNow.Add(limitParkFallbackBase + 90*time.Second) // priorParks 0 ⇒ the 15m base
 	if !d.RetryNotBefore.Equal(want) {
 		t.Fatalf("retry_not_before = %v, want %v (fallback + jitter)", d.RetryNotBefore, want)
 	}
@@ -110,7 +110,7 @@ func TestDecideLimitParkRejectsImplausibleResets(t *testing.T) {
 		if d.LimitResetsAt != nil {
 			t.Fatalf("%s: limit_resets_at = %v, want NULL", name, d.LimitResetsAt)
 		}
-		want := parkNow.Add(limitParkFallback + 90*time.Second)
+		want := parkNow.Add(limitParkFallbackBase + 90*time.Second) // priorParks 0 ⇒ the 15m base
 		if !d.RetryNotBefore.Equal(want) {
 			t.Fatalf("%s: retry_not_before = %v, want the fallback %v. A stamp at or before "+
 				"`now` is the park LOOP: the next promotion pass requeues the run into the "+
@@ -1009,5 +1009,92 @@ func TestWaitOnLimitSurvivesAResume(t *testing.T) {
 	if got := f.claim(t).WaitOnLimit; got {
 		t.Fatal("a run toggled OFF between claims still claimed as opted-in; the flag is " +
 			"re-read from the row precisely so a mid-flight change takes effect")
+	}
+}
+
+// 🔴 TestLimitParkFallbackIsExponential pins PRD Decision 4's schedule, and the
+// FIRST-PARK case is the one that matters most.
+//
+// runs.limit_wait_count is incremented by SetRunLimitWait in the same statement as
+// the transition, so the value this code sees is the count BEFORE the park — 0 on the
+// first one. Decision 4 writes the exponent as 2^(n−1) for a 1-based attempt number;
+// applied literally to that 0-based field it yields 2^(-1), i.e. a 7.5-minute first
+// park. Both readings agree the first park waits 15 minutes, and that agreement is
+// what this asserts.
+func TestLimitParkFallbackIsExponential(t *testing.T) {
+	for priorParks, want := range map[int32]time.Duration{
+		0: 15 * time.Minute,
+		1: 30 * time.Minute,
+		2: 1 * time.Hour,
+		3: 2 * time.Hour,
+		4: 4 * time.Hour,
+	} {
+		if got := limitParkFallbackFor(priorParks); got != want {
+			t.Fatalf("priorParks=%d: %v, want %v", priorParks, got, want)
+		}
+	}
+
+	// The cap does not bind at the default budget — the fifth park is exactly 4h — so
+	// it exists to guard an operator who RAISES RUN_LIMIT_MAX_WAITS.
+	for _, priorParks := range []int32{5, 6, 19, 20, 21, 64, 1 << 20} {
+		got := limitParkFallbackFor(priorParks)
+		if got != limitParkFallbackCap {
+			t.Fatalf("priorParks=%d: %v, want the %v cap", priorParks, got, limitParkFallbackCap)
+		}
+		// The overflow guard, which is the reason the shift is bounded rather than left
+		// to wrap: time.Duration is an int64 of NANOSECONDS, and an unguarded
+		// 15m << 64 is NEGATIVE — a stamp in the past, i.e. the park loop this whole
+		// computation exists to avoid. A large count is operator-reachable through
+		// RUN_LIMIT_MAX_WAITS, so this is not hypothetical.
+		if got <= 0 {
+			t.Fatalf("priorParks=%d produced a non-positive duration %v", priorParks, got)
+		}
+	}
+
+	// Negative is not reachable through the column (int NOT NULL DEFAULT 0), but the
+	// function is total and a shift by a negative count panics in Go.
+	if got := limitParkFallbackFor(-1); got != limitParkFallbackBase {
+		t.Fatalf("negative priorParks: %v, want the base %v", got, limitParkFallbackBase)
+	}
+}
+
+// TestDecideLimitParkFallbackGrowsWithThePriorParkCount is the same schedule asserted
+// through the real decision, since that is where the 0-based field is actually read.
+//
+// The flat constant this replaced was a REGRESSION rather than a neutral choice: at
+// RUN_LIMIT_MAX_WAITS=5 a flat 15m exhausts the whole budget in ~75 minutes, so a run
+// that hit a FIVE-HOUR window — this PRD's headline case — died inside the first 75
+// minutes. An exponential schedule's error is recoverable when pessimistic (the first
+// resume just succeeds) and the flat one's is fatal when optimistic.
+func TestDecideLimitParkFallbackGrowsWithThePriorParkCount(t *testing.T) {
+	var prev time.Duration
+	for _, priorParks := range []int32{0, 1, 2, 3, 4} {
+		in := parkIn()
+		in.ReportedResetMs = nil // nothing knows the reset ⇒ the fallback path
+		in.LimitWaitCount = priorParks
+		d := decideLimitPark(in)
+		if !d.Park {
+			t.Fatalf("priorParks=%d: refused to park (%q)", priorParks, d.Reason)
+		}
+		want := parkNow.Add(limitParkFallbackFor(priorParks) + 90*time.Second)
+		if !d.RetryNotBefore.Equal(want) {
+			t.Fatalf("priorParks=%d: retry_not_before = %v, want %v", priorParks, d.RetryNotBefore, want)
+		}
+		if wait := d.RetryNotBefore.Sub(parkNow); priorParks > 0 && wait <= prev {
+			t.Fatalf("priorParks=%d waited %v, which is not longer than the previous %v — a "+
+				"schedule that does not grow is the flat constant this replaced", priorParks, wait, prev)
+		}
+		prev = d.RetryNotBefore.Sub(parkNow)
+	}
+
+	// The whole default budget now spans ~7h45m of parking rather than ~75 minutes,
+	// which is what makes a five-hour window survivable with no readable reset.
+	var total time.Duration
+	for n := int32(0); n < 5; n++ {
+		total += limitParkFallbackFor(n)
+	}
+	if total < 5*time.Hour {
+		t.Fatalf("the default budget spans %v of parking, which does not outlast a "+
+			"five-hour window — the headline case this PRD exists for", total)
 	}
 }

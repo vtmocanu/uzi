@@ -157,24 +157,75 @@ const (
 	limitParkJitterMax = 180 * time.Second
 )
 
-// limitParkFallback is the base used when NOTHING says when the window reopens:
+// The EXPONENTIAL fallback schedule used when NOTHING says when the window reopens:
 // the worker reported no usable reset, the gauge has none either (or the credential
-// is unknown), and no pooled alternative contributes. That case is real rather than
-// defensive — the classifier's PRIMARY signal is `terminal_reason`, which names the
-// cause outright and carries no reset of its own, so a limit death with no timestamp
-// is an ordinary outcome, not a malformed report.
+// is unknown), and no pooled alternative contributes.
 //
-// The value is bounded from both sides and neither bound is arbitrary. Too short and
-// a genuinely sustained limit burns all of RUN_LIMIT_MAX_WAITS in minutes and fails a
-// run that would have succeeded an hour later; too long and a run waits out a window
-// that reopened almost immediately. At 15 minutes the whole default budget spans
-// about 75 minutes of parking before the run fails honestly, which is a defensible
-// ceiling for the no-information case.
+// WHY A FALLBACK EXISTS AT ALL. The classifier's PRIMARY signal is `terminal_reason`,
+// which names the cause outright and carries NO timestamp of its own — so "a limit
+// death with no reset" is an ordinary outcome rather than a malformed report, and
+// something has to be the base. It is also not a rare corner: on any deployment with
+// UZI_USAGE_POLL_INTERVAL=0 nothing refreshes synced_at, so every candidate
+// classifies stale, `Measured` is false, and the worker report, the gauge cross-check
+// and the pool leg ALL go silent together — this becomes that deployment's usual
+// path. (The e2e overlay sets exactly that, so M6 exercises this branch by
+// construction.)
 //
-// Deliberately a CONSTANT and not an env knob: it is the answer to "we know nothing",
-// and an operator with something to say about their limits has RUN_LIMIT_MAX_WAITS
-// and RUN_LIMIT_MAX_PARK to say it with.
-const limitParkFallback = 15 * time.Minute
+// 🔴 WHY EXPONENTIAL AND NOT FLAT, WHICH IS THE WHOLE POINT: the error of a doubling
+// schedule is RECOVERABLE IN ONE DIRECTION AND FATAL IN THE OTHER, and it errs on the
+// recoverable side. If the window actually reopened early, the first resume succeeds
+// and the schedule never advances — the pessimism costs nothing. If the window is
+// genuinely long, the schedule buys the hours. A FLAT CONSTANT INVERTS EXACTLY THAT:
+// free when the guess was pessimistic, fatal when optimistic. Concretely, a flat 15m
+// at RUN_LIMIT_MAX_WAITS=5 exhausts the entire budget in ~75 minutes, so a run that
+// hit a FIVE-HOUR window — this PRD's headline case — dies inside the first 75
+// minutes, which is the exact failure the feature exists to prevent.
+//
+// The base and the cap are a CONSTANT and not env knobs: this is the answer to "we
+// know nothing", and an operator with something to say about their limits has
+// RUN_LIMIT_MAX_WAITS and RUN_LIMIT_MAX_PARK to say it with.
+const (
+	limitParkFallbackBase = 15 * time.Minute
+	// The cap does NOT bind at the default budget — the fifth park is exactly 4h — so
+	// it constrains nothing today and exists to guard an operator who raises
+	// RUN_LIMIT_MAX_WAITS.
+	limitParkFallbackCap = 4 * time.Hour
+	// limitParkFallbackMaxShift bounds the doubling so it can never overflow
+	// time.Duration (an int64 of NANOSECONDS). 15m << 20 is roughly a decade and still
+	// fits; the cap is reached at shift 4, so every value at or above this bound is
+	// capped anyway and the guard costs nothing. Without it a large priorParks — which
+	// is operator-reachable through RUN_LIMIT_MAX_WAITS — shifts past 63 bits and
+	// yields a NEGATIVE duration, i.e. a stamp in the past and a park loop.
+	limitParkFallbackMaxShift = 20
+)
+
+// limitParkFallbackFor returns the fallback wait for a park, given how many times
+// this run has ALREADY parked.
+//
+// 🔴 THE ARGUMENT IS THE PRIOR COUNT, WHICH IS 0 ON THE FIRST PARK, AND THAT IS WHY
+// THIS IS A SHIFT BY priorParks RATHER THAN THE PRD'S LITERAL `2^(n−1)`.
+// runs.limit_wait_count is incremented by SetRunLimitWait in the same statement as
+// the transition, so the value this code sees is the count BEFORE the park — the
+// budget guard reads `LimitWaitCount >= MaxWaits` for the same reason. Decision 4's
+// exponent is written for a 1-based attempt number; applying it literally to a
+// 0-based field yields 2^(-1) and a 7.5-minute first park. Both readings agree that
+// the FIRST park waits 15 minutes, which is the invariant to check a change against.
+//
+//	priorParks:  0     1     2    3    4    5+
+//	wait:       15m   30m   1h   2h   4h   4h (capped)
+func limitParkFallbackFor(priorParks int32) time.Duration {
+	if priorParks <= 0 {
+		return limitParkFallbackBase
+	}
+	if priorParks >= limitParkFallbackMaxShift {
+		return limitParkFallbackCap
+	}
+	d := limitParkFallbackBase << uint(priorParks)
+	if d > limitParkFallbackCap {
+		return limitParkFallbackCap
+	}
+	return d
+}
 
 // reportedResetBounds brackets a worker-reported limit_resets_at, which arrives as
 // epoch MILLISECONDS (the worker normalizes the SDK's unit-less number before
@@ -284,7 +335,8 @@ type limitParkDecision struct {
 //     rollover;
 //  3. lowered to autoselect.NextAvailable's floor when the user has a pooled
 //     alternative that is spendable sooner (Decision 6e);
-//  4. limitParkFallback when steps 1 and 2 produced nothing and step 3 did not fire.
+//  4. the EXPONENTIAL fallback (limitParkFallbackFor) when steps 1 and 2 produced
+//     nothing and step 3 did not fire — 15m doubling per prior park, capped at 4h.
 //
 // Then jitter is added and the result is floored at Now+Jitter, so a stamp that would
 // land in the past cannot spin the promotion pass.
@@ -322,7 +374,7 @@ func decideLimitPark(in limitParkInput) limitParkDecision {
 		}
 	}
 	if !haveBase {
-		base = in.Now.Add(limitParkFallback)
+		base = in.Now.Add(limitParkFallbackFor(in.LimitWaitCount))
 	}
 
 	retry := base.Add(in.Jitter)
