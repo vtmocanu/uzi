@@ -12818,10 +12818,10 @@ was static and manual while the per-token rate-limit gauge (#53/#104 M5) went un
 recorded what it *cost* but never which credential *paid*.
 
 ⚠️ **PROVENANCE: D1, D2 and D3 below are USER-STATED, settled with the user before drafting, and so
-is the originating ask they serve.** They are recorded here because `specs/human.md` has no Feature
-#111 section yet — an edit to that file needs user approval and one is pending. Until it lands, this
-section is the only record of three items that belong in the contract, and a reader must not take
-them for AI choices. Everything from the ranking paragraph down, and all of §421-§428, is AI design.
+is the originating ask they serve.** The contract now carries them — `specs/human.md`, Feature #111,
+approved 2026-07-27 — so this section is an ELABORATION of those items, not their record, and the
+elaboration is replaceable while they are not. A reader must not take them for AI choices.
+Everything from the ranking paragraph down, and all of §421-§428, is AI design.
 
 - **D1 — a per-worker THIRD bind mode**, not a per-user global toggle. A worker is `default`,
   `pinned:<token>` or `auto`, so a user can auto-balance most workers while keeping the
