@@ -1770,12 +1770,29 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
 
     // Turn 1 is the plan turn: mechanism only, and it cannot know the outcome.
     assert.match(turns[0]!.promptText!, /do NOT put a manual/);
-    assert.ok(!/ALREADY INSTALLED/.test(turns[0]!.promptText!), "the plan turn is built before the join, so it has no facts to give");
+    assert.ok(!/deps_dirs_/.test(turns[0]!.promptText!), "the plan turn is built before the join, so it has no facts to give");
     // Turn 2 is the first implement turn: the real per-dir outcome, failure included.
-    assert.match(turns[1]!.promptText!, /ALREADY INSTALLED in: web/);
-    assert.match(turns[1]!.promptText!, /did NOT succeed in: agent/);
+    assert.match(turns[1]!.promptText!, /installed:\n1\. web/);
+    assert.match(turns[1]!.promptText!, /failed:\n2\. agent/);
     // Turn 3 is a later implement turn on a resumed session — it must not repeat.
-    assert.ok(!/ALREADY INSTALLED/.test(turns[2]!.promptText!));
+    assert.ok(!/deps_dirs_/.test(turns[2]!.promptText!));
+  });
+
+  it("tells the agent when discovery was TRUNCATED, so the list cannot read as exhaustive (#157 audit)", async () => {
+    // joinDepsInstall used to return only `results`, dropping `truncated` on the floor —
+    // so a repo past MAX_PROJECT_DIRS got a note that read as full coverage, recreating
+    // the unexplainable `command not found` this change exists to remove.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => ({
+      results: [{ dir: "web", manager: "npm", ok: true, detail: "ok" }],
+      truncated: true,
+    });
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.match(turns[1]!.promptText!, /NOT the complete set of JS projects/);
   });
 
   it("the facts are still correct after a plan REVISION (#157)", async () => {
@@ -1797,8 +1814,8 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     assert.strictEqual(turns.length, 3, "expected plan, revision, then one implement turn");
     // The REVISION turn is still a planning turn, riding a resumed session that already
     // carries the mechanism note — so it must not be handed facts it cannot have yet.
-    assert.ok(!/ALREADY INSTALLED/.test(turns[1]!.promptText!), "the revision turn runs before the join");
-    assert.match(turns[2]!.promptText!, /ALREADY INSTALLED in: web/, "the implement turn after a revision must still get the facts");
+    assert.ok(!/deps_dirs_/.test(turns[1]!.promptText!), "the revision turn runs before the join");
+    assert.match(turns[2]!.promptText!, /1\. web/, "the implement turn after a revision must still get the facts");
   });
 
   it("is best-effort: a failed install does NOT fail the run, and the skip is reported honestly", async () => {

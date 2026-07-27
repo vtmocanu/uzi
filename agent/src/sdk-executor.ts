@@ -46,7 +46,7 @@ import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { assistantModelOf, assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
-import { errMessage } from "./util.js";
+import { clampToDirCharset, errMessage } from "./util.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
 // (PRD §Configuration); converted to ms at the timer.
@@ -274,6 +274,10 @@ export class SdkExecutor implements Executor {
     // one. The precedent for opening that door cheaply is `toolEnv`, which rides
     // ExecutorResult for exactly this kind of executor-computed state (runner.ts).
     let depsResults: JsDepsResult[] = [];
+    // Audit 1: carried alongside the results, because a bounded scan that reads as full
+    // coverage is exactly the unexplainable `command not found` this PRD removes — and
+    // the prompt's consumer is the agent that will actually run the gates.
+    let depsTruncated = false;
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
@@ -535,7 +539,7 @@ export class SdkExecutor implements Executor {
       // `requires: "node_modules"` pre-flight passes, the check runs against a corrupt
       // tree, and it FAILS — accusing good code of failing, which is the one thing
       // self-improve.ts's status mapping exists to prevent.
-      depsResults = await this.joinDepsInstall(ctx, depsInstall);
+      ({ results: depsResults, truncated: depsTruncated } = await this.joinDepsInstall(ctx, depsInstall));
 
       // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
       // The plan turn ran with the OWN subagents; the approved selection now decides
@@ -601,6 +605,7 @@ export class SdkExecutor implements Executor {
           // could not have. Correct on the revise path too: the join runs after the LAST
           // gate round, so however many revisions happened, these are the final outcomes.
           deps: depsResults,
+          depsTruncated,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
@@ -702,11 +707,11 @@ export class SdkExecutor implements Executor {
    * throws: the promise carries its own catch, and a provisioning result — however bad —
    * is information for the user, not a run failure.
    */
-  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsInstall>): Promise<JsDepsResult[]> {
+  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsInstall>): Promise<JsDepsInstall> {
     const { results, truncated } = await depsInstall;
     if (results.length === 0) {
       ctx.emit({ kind: "status", agent: "worker", payload: { text: "no JS dependencies to install (no lockfile found)" } });
-      return results;
+      return { results, truncated };
     }
     // One line, naming every dir and — for anything that did not install — why. A
     // silent skip here resurfaces later as an inexplicable `vitest: not found`.
@@ -720,7 +725,7 @@ export class SdkExecutor implements Executor {
     if (truncated) parts.push("discovery hit its directory bound — some project dirs were not installed");
     ctx.emit({ kind: "status", agent: "worker", payload: { text: parts.join(" — ") } });
     this.log.info("JS dependency provisioning", { run_id: ctx.runId, results, truncated });
-    return results;
+    return { results, truncated };
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
@@ -973,6 +978,9 @@ export function resolveLeadModel(configModel?: string, templateModel?: string): 
  * charset is clamped to what a real project dir needs and the length is bounded.
  */
 function safeDirLabel(dir: string): string {
-  const cleaned = dir.replace(/[^A-Za-z0-9._/@-]/g, "?");
-  return cleaned.length > 120 ? `${cleaned.slice(0, 120)}…` : cleaned;
+  // 120 chars: this is a rendered feed line, where a long-but-real directory name is
+  // more useful than a short one, and React escapes the output — the clamp here is
+  // cosmetic plus defence in depth. The PROMPT clamp is load-bearing and uses a
+  // tighter bound; both share the charset deliberately (clampToDirCharset).
+  return clampToDirCharset(dir, 120);
 }
