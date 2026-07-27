@@ -1,7 +1,12 @@
 # PRD #111: Auto-select the Anthropic token per run by rate-limit headroom, and record which token each run used
 
 **GitLab Issue**: [#111](https://gitlab.example.com/vtmocanu/uzi/-/issues/111)
-**Status**: **COMPLETE, with one success criterion UNMET** (created 2026-07-22; implemented 2026-07-27 on `feature/prd-111-auto-select-token`) — see "Status at PR time" at the foot of this file.
+**Status**: **DONE — merged 2026-07-27 (MR !139), with one success criterion UNMET** (created
+2026-07-22; implemented 2026-07-27 on `feature/prd-111-auto-select-token`). The unmet criterion is
+the dev-cluster k8s validation, deferred by user decision and tracked as **issue #168** — see
+"Status at PR time" at the foot of this file for why the compose e2e does not substitute for it.
+Other follow-ups from this PRD: **#169** (user-authored names in admin terminals), **#170**
+(`check-styles`), **#171** (the live-DB harness's Postgres wait).
 **Priority**: Medium
 **Related**: [#104](https://gitlab.example.com/vtmocanu/uzi/-/issues/104) (named tokens — this builds directly on its per-token rate-limit gauge and its single credential-resolution seam), [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53) (rate limits — the gauge this PRD reads to choose), [#40](https://gitlab.example.com/vtmocanu/uzi/-/issues/40) (token usage reporting — the per-run token record this PRD adds is the attribution join #40 could not make)
 
