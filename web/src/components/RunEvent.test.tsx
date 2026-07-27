@@ -514,6 +514,13 @@ describe("guardrail-deny 'blocked' chip (PRD #116)", () => {
     expect(classifyResultState(true, "<tool_use_error>denied by guardrail: x</tool_use_error>")).toBe(
       "blocked",
     );
+    // The SDK builds a `<hook> hook error: <reason>` form of the same denial and
+    // yields it just BEFORE the raw-reason one; the bare reason wins only because the
+    // consumer keeps the last yield. One reordering away, so the preamble is stripped.
+    expect(classifyResultState(true, `PreToolUse:Bash hook error: ${DENY}`)).toBe("blocked");
+    // The strip is narrow — it needs the literal "hook error: ", which no incidental
+    // mention of the phrase carries. A bare "error: " preamble is NOT a denial.
+    expect(classifyResultState(true, `error: ${DENY}`)).toBe("error");
     // Per LINE, not per whole text: resultToText joins content blocks with "\n", so
     // the denial can land anywhere in that join, and may be indented.
     expect(classifyResultState(true, `ran the tool\n${DENY}`)).toBe("blocked");

@@ -329,6 +329,10 @@ const GUARDRAIL_DENY_MARK = "denied by guardrail";
 // tag is stripped before the anchor test so a wrapped denial still reads as one.
 const TOOL_USE_ERROR_OPEN = "<tool_use_error>";
 
+// …and it builds a `PreToolUse:Bash hook error: <reason>` form of the same denial
+// (see classifyResultState). Stripped up to and including this preamble.
+const HOOK_ERROR_PREAMBLE = "hook error: ";
+
 export type ResultState = "ok" | "error" | "blocked";
 
 // classifyResultState maps a tool_result to its presentation state (PRD #116).
@@ -346,6 +350,13 @@ export type ResultState = "ok" | "error" | "blocked";
 //     a test title quoting the phrase, is a real problem and must stay "✗ error"
 //     (under-alarming it is the risk PRD #116 called out).
 //
+// The one prefix stripped beyond the wrapper is a hook-error preamble. The pinned SDK
+// builds `${hookName} hook error: ${reason}` for the SAME denial and yields it just
+// BEFORE the raw-reason result; the bare reason only wins because the consumer keeps
+// the last yield. That is one reordering away from every denial arriving prefixed, so
+// the preamble is stripped too — narrowly (it must end in "hook error: "), which no
+// incidental mention of the phrase carries.
+//
 // "blocked" is gated on is_error: a successful result quoting the phrase is untouched.
 // The state is purely presentational — `is_error` stays true on the persisted frame,
 // so nothing downstream shifts. That guarantee comes from the frame being UNCHANGED,
@@ -358,6 +369,8 @@ export function classifyResultState(isError: boolean, text: string): ResultState
   for (const line of text.split("\n")) {
     let s = line.trimStart();
     if (s.startsWith(TOOL_USE_ERROR_OPEN)) s = s.slice(TOOL_USE_ERROR_OPEN.length).trimStart();
+    const preamble = s.indexOf(HOOK_ERROR_PREAMBLE);
+    if (preamble !== -1) s = s.slice(preamble + HOOK_ERROR_PREAMBLE.length).trimStart();
     if (s.startsWith(GUARDRAIL_DENY_MARK)) return "blocked";
   }
   return "error";

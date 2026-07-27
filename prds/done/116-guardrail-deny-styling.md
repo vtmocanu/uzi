@@ -1,6 +1,8 @@
 # PRD #116 — Distinguish handled guardrail denials from errors in the activity feed
 
 **Issue**: [#116](https://gitlab.example.com/vtmocanu/uzi/-/issues/116) · **Label**: PRD · **Priority**: Low
+**Status**: **DONE** — M1–M3 complete on branch `agent/issue-116`. Closed 2026-07-27. See
+"As built" below for the five departures from this document.
 
 ## Problem
 
@@ -182,7 +184,8 @@ Each was verified before changing course.
    otherwise a silent hole).
 4. **`web/src/components/ChatMessages.test.tsx` did not exist** — it was created
    rather than extended. (The mock line references in M2 are also transposed:
-   `mockDoneMessages` is at `data.ts:1776`, the `fm()` helper at `:1848`.)
+   `mockDoneMessages` is the fixture to extend, not the `fm()` helper — that one
+   belongs to `mockFailedMessages`.)
 5. **The `⊘` glyph is not `font-bold`** (Decision 4 pins the tone, not the weight). A
    browser pass measured that at 11px with weight 700 the glyph's counter closes and
    it rasterises as an amber blob — confusable with the feed's existing status dots.
@@ -207,6 +210,11 @@ row is terse ("ok", "error", "3 lines"); it is a copy call for a human, not a de
   guardrail")` (chosen — survives a leading/trailing wrapper); (b) the
   `guardrails.test.ts` phrase-contract test (M2) guards the agent side. If it ever
   does regress, the structured-marker alternative (Decision 1) is the durable fix.
+  **(a) is superseded — see "As built" #1: the match anchors the phrase to the start
+  of a line, because the over-match dismissed below turned out to be reachable. And
+  the wrapper is not the nearest SDK risk: the same binary builds a
+  `<hook> hook error: <reason>` form of the denial and yields it just before the raw
+  one, so that preamble is stripped too.)**
 - **Phrase coupling.** If a reason constant ever dropped the phrase, that denial
   reverts to "error". Held by the non-optional 15-constant `guardrails.test.ts`
   assertion in M2; the phrase is itself a stable user-facing contract.

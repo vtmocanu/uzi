@@ -12347,9 +12347,10 @@ keeps the red `✗` and still auto-expands, because that one still wants attenti
 - **What it keys off, and why the anchor is per LINE.** All 15 deny reasons in
   `agent/src/guardrails.ts` carry the phrase `"denied by guardrail"`. The web requires that phrase to
   START one of the text's lines, after leading whitespace and an optional `<tool_use_error>` open tag.
-  Neither of the two obvious tests is right. Exact `startsWith` over the whole text fails the two
-  colon-less `?? "denied by guardrail"` fallbacks, an SDK wrapper, and a denial that is one of several
-  content blocks `resultToText` joins with `\n`. But a plain `.includes` — which is what this shipped
+  Neither of the two obvious tests is right. `startsWith` over the whole text fails an SDK wrapper and
+  a denial that is one of several content blocks `resultToText` joins with `\n` — and note it must be
+  the PHRASE it anchors on, not "phrase + colon", because the two `?? "denied by guardrail"` fallbacks
+  have no colon to anchor on. But a plain `.includes` — which is what this shipped
   as first, and what the PRD recommends — over-matches in a way this very change made likelier: a
   genuinely FAILING command whose output quotes the phrase would render calm and collapsed, and the
   concrete case is our own gate, since a red `cd agent && npm test` prints `node --test` titles like
@@ -12380,11 +12381,17 @@ keeps the red `✗` and still auto-expands, because that one still wants attenti
   the calm chip for free: no persisted marker, no migration, and `ChatMessages` inherits it because it
   renders through the same row.
 
-- **The honest limit.** The phrase coupling is real. If the pinned claude-agent-sdk moved the
-  PreToolUse-deny path onto its `<tool_use_error>` wrapper AND changed the text, every blocked chip
-  would silently revert to red with no test failing on the web side — and nobody would notice, because
-  the run still works. Stripping the wrapper before the anchor test, plus the agent-side phrase test,
-  are the cheap mitigations chosen, not a close. The durable fix, if it ever regresses, is the structured marker the PRD documents as
+- **The honest limit, and how close it actually is.** The phrase coupling is real: if the pinned
+  claude-agent-sdk moved the PreToolUse-deny path onto its `<tool_use_error>` wrapper AND changed the
+  text, every blocked chip would silently revert to red with no test failing on the web side — and
+  nobody would notice, because the run still works. **The nearer miss is not the wrapper, though, and
+  it is one line of SDK code wide.** That same pinned binary builds a PREFIXED form of the very same
+  denial — `` `${hookName} hook error: ${reason}` `` — and yields it immediately BEFORE the raw-reason
+  one; the bare reason reaches the `tool_result` only because the consumer keeps the last yield.
+  Reorder those two, or drop the second, and every denial arrives mid-line. A line anchor is *more*
+  exposed to that than `.includes` was, which is why the hook-error preamble is stripped alongside the
+  wrapper — cheap mitigations, chosen with eyes open, not a close. It is also a stronger argument for
+  the structured marker below than the wrapper risk is. The durable fix, if it ever regresses, is the structured marker the PRD documents as
   the alternative: tag the message at `agent/src/sdk-messages.ts` `mapUser` with an additive
   `denied: true` through the opaque `jsonb` payload. Deliberately NOT built now — it touches agent,
   protocol and web for a cosmetic change.
