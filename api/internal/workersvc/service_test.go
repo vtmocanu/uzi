@@ -16,8 +16,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// prdLabels is the cached labels jsonb of an ordinary board issue: one carrying the
+// configured PRD label, plus any extras a case needs.
+//
+// Before PRD #102 M6 these fixtures could leave labels unset, because the sync
+// filter guaranteed every cached issue carried the PRD label and nothing read it
+// on the run path. Decision 14's gate makes it load-bearing: a fixture WITHOUT the
+// label now means "an issue that is not uzi's" and is rejected before any other
+// gate is reached, which is what the six tests updated alongside this helper were
+// silently asserting the opposite of.
+func prdLabels(extra ...string) []byte {
+	b, _ := json.Marshal(append([]string{settings.DefaultPRDLabel}, extra...))
+	return b
+}
 
 // fakeStore embeds the Store interface so unimplemented methods panic if a test
 // path reaches them unexpectedly; the tests override only what they exercise.
@@ -1765,7 +1780,7 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 
 	// No PRD link, no bypass → rejected.
-	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
+	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: false}}
 	svc := New(fsNoLink, newBox(t), testParams())
 	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false); err != ErrNoPRDLink {
 		t.Fatalf("err = %v, want ErrNoPRDLink", err)
@@ -1773,7 +1788,7 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 
 	// Happy path → title snapshotted from the cached issue, description from arg.
 	fs := &fakeStore{
-		issueByID:       store.Issue{Title: "Real Title", HasPrdLink: true},
+		issueByID:       store.Issue{Title: "Real Title", Labels: prdLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fs, newBox(t), testParams())
@@ -1795,7 +1810,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 
 	// Same PRD-link gate as the manual path (no bypass).
-	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
+	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: false}}
 	svc := New(fsNoLink, newBox(t), testParams())
 	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", false); err != ErrNoPRDLink {
 		t.Fatalf("err = %v, want ErrNoPRDLink (autopilot must enforce the same gate)", err)
@@ -1803,7 +1818,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 
 	// Happy path → auto_approve set, description snapshotted.
 	fs := &fakeStore{
-		issueByID:       store.Issue{Title: "Real Title", HasPrdLink: true},
+		issueByID:       store.Issue{Title: "Real Title", Labels: prdLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fs, newBox(t), testParams())
@@ -1822,7 +1837,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 
 	// A manual run leaves auto_approve false.
 	fsManual := &fakeStore{
-		issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+		issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
@@ -1857,7 +1872,7 @@ func TestCreateRunPRDLESSGateMatrix(t *testing.T) {
 		for _, path := range []string{"manual", "autopilot"} {
 			t.Run(path+"/"+tc.name, func(t *testing.T) {
 				fs := &fakeStore{
-					issueByID:       store.Issue{Title: "T", HasPrdLink: tc.hasPRDLink},
+					issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: tc.hasPRDLink},
 					createRunResult: store.Run{ID: uuid.New()},
 				}
 				svc := New(fs, newBox(t), testParams())
@@ -1950,7 +1965,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	big := strings.Repeat("x", MaxIssueDescriptionBytes+1)
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
-	fs := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
+	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true}}
 	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, false); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
@@ -1958,14 +1973,14 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 		t.Fatal("an oversize description must be rejected before CreateRun")
 	}
 
-	fsAuto := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
+	fsAuto := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true}}
 	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big, false); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateAutopilotRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
-	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
+	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
 	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, false); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
@@ -1974,7 +1989,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{
-		issueByID:    store.Issue{Title: "T", HasPrdLink: true},
+		issueByID:    store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
