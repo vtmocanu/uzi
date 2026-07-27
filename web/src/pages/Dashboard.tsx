@@ -156,7 +156,26 @@ export function Dashboard() {
 
   if (!user) return null;
 
+  // PRD #35 (web-ux F2): "active" is still every non-terminal run — the TILE's count is
+  // right, and a parked run genuinely is in flight. What was wrong is the HINT, which
+  // said "agents at work" over a set that can contain runs where no agent is working
+  // and none will for hours.
+  //
+  // Split rather than excluded, deliberately: dropping parked runs from the count would
+  // make them vanish from the one surface that says how much is in flight, which is the
+  // opposite failure. `!isTerminalRun` as a proxy for "actively working" is the actual
+  // defect, and it is only visible now because limit_wait is the first non-terminal
+  // status that lasts hours by design.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
+  const waiting = active.filter((r) => r.status === "limit_wait");
+  const working = active.length - waiting.length;
+  // "8 at work · 1 waiting" only when there is something to disambiguate; a factory
+  // with nothing parked keeps exactly the copy it had.
+  const activeHint = !active.length
+    ? "nothing in flight"
+    : waiting.length
+      ? `${working} at work · ${waiting.length} waiting on a usage limit`
+      : "agents at work";
   const recent = data?.runs.slice(0, 5) ?? [];
   const steps = data
     ? [data.hasToken, data.hasForge, data.reposEnabled > 0, data.workersOnline > 0]
@@ -181,7 +200,7 @@ export function Dashboard() {
           <StatTile
             label="Active runs"
             value={active.length}
-            hint={active.length ? "agents at work" : "nothing in flight"}
+            hint={activeHint}
             to="/runs"
           />
           <StatTile

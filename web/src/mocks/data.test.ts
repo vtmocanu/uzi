@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mockMyTokenRateLimits, mockSecrets } from "./data";
+import { mockBoards, mockLimitWaitMessages, mockMyTokenRateLimits, mockRuns, mockSecrets } from "./data";
 
 // The demo build is a shipped artifact, and these two fixtures describe the SAME
 // tokens to two different parts of one settings row: the toggle comes from
@@ -59,5 +59,138 @@ describe("mock token fixtures agree with each other (PRD #111, web-ux F1)", () =
       `the demo shows only ${[...statuses].join(", ")} — the states that matter ` +
         `(never polled, stale, no usage data, low headroom) cannot be seen without a live poller`,
     ).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// PRD #35. The parked fixture is the ONLY way the run view's countdown, the board's
+// warn pill, and the two new feed rows are reachable in mock mode — and mock mode is
+// how this feature gets browser-validated at all, because a non-mock `vite dev` /
+// `vite preview` of this repo proxies /api at whatever real stack is running.
+//
+// So the fixture is a test artefact, and these pin the properties that make it able
+// to catch anything. Every one of them is satisfiable by a fixture that looks fine.
+describe("the parked-run fixture can actually discriminate (PRD #35)", () => {
+  const parked = mockRuns.find((r) => r.id === "run-limit-wait");
+  const due = mockRuns.find((r) => r.id === "run-limit-wait-due");
+
+  it("exists alongside a second, DEGRADED parked fixture", () => {
+    // Two, not one. The second exists because the first cannot reach the degraded
+    // countdown states — expired stamp, multi-day window, suppressed attempt — and
+    // the browser validator had to override Date.now() inside the page to see them.
+    // A state reachable only by patching the clock regresses silently.
+    expect(parked, "no run-limit-wait fixture — nothing in mock mode renders a park").toBeDefined();
+    expect(due, "no run-limit-wait-due fixture — the expired-countdown branch is unreachable").toBeDefined();
+    expect(mockRuns.filter((r) => r.status === "limit_wait")).toHaveLength(2);
+  });
+
+  it("🔴 the second fixture reaches the branches the first cannot", () => {
+    // Each assertion here is one branch that would otherwise need a patched clock.
+    // retry_not_before in the PAST -> "Resuming shortly" instead of a countdown.
+    expect(Date.parse(due!.retry_not_before!)).toBeLessThan(Date.now());
+    // A multi-day window -> formatCountdown's "Nd Nh" arm and the long-horizon reset.
+    expect(due!.rate_limit_type).toBe("seven_day");
+    expect(Date.parse(due!.limit_resets_at!) - Date.now()).toBeGreaterThan(4 * 86_400_000);
+    // count == 1 -> the SUPPRESSED attempt clause, the opposite of the first fixture.
+    expect(due!.limit_wait_count).toBe(1);
+    // Still the pool-aware ordering, and by days rather than an hour.
+    expect(Date.parse(due!.retry_not_before!)).toBeLessThan(Date.parse(due!.limit_resets_at!));
+  });
+
+  it("🔴 stamps retry_not_before EARLIER than limit_resets_at", () => {
+    // Not a fudge and not an offset. The stamp is pool-aware: an owner whose second
+    // credential still has headroom is promoted before the dead credential's window
+    // rolls over, so earlier is the NORMAL case. A fixture with the two equal — or
+    // with the reset first — lets a countdown wired to the wrong field look correct
+    // in every browser pass anyone will ever do.
+    const retry = Date.parse(parked!.retry_not_before!);
+    const resets = Date.parse(parked!.limit_resets_at!);
+    expect(Number.isFinite(retry) && Number.isFinite(resets)).toBe(true);
+    expect(retry).toBeLessThan(resets);
+  });
+
+  it("puts both instants in the FUTURE, so the countdown is the state on screen", () => {
+    // Everything else in data.ts is minsAgo. A park seeded in the past renders
+    // "Resuming shortly" — a real state, but not the one anyone opens this to see.
+    expect(Date.parse(parked!.retry_not_before!)).toBeGreaterThan(Date.now());
+    expect(Date.parse(parked!.limit_resets_at!)).toBeGreaterThan(Date.now());
+  });
+
+  it("🔴 carries health 'ok', never a stale flag", () => {
+    // The server CLEARS health on park entry, because its health detector's allowlist
+    // never revisits a parked run and a flag live at park time would freeze for the
+    // whole park. A fixture carrying "stalled" here would reproduce that bug in the
+    // demo and look entirely plausible while doing it.
+    expect(parked!.health).toBe("ok");
+    expect(parked!.health_reason).toBeNull();
+    expect(parked!.health_since).toBeNull();
+  });
+
+  it("has parked more than once, so the 'attempt N' clause is exercised", () => {
+    // attempt 1 is deliberately suppressed as noise, so a count of 1 would leave that
+    // branch invisible in the demo.
+    expect(parked!.limit_wait_count).toBeGreaterThan(1);
+  });
+
+  it("is opted in and names a window this build knows", () => {
+    expect(parked!.wait_on_limit).toBe(true);
+    expect(parked!.rate_limit_type).toBe("five_hour");
+  });
+
+  it("has a board card, so the warn pill is reachable without opening the run", () => {
+    const card = mockBoards["repo-uzi"]?.cards.find((c) => c.latest_run?.id === "run-limit-wait");
+    expect(card, "the parked run has no card — runBadge's limit_wait arm renders nowhere").toBeDefined();
+    expect(card!.latest_run!.status).toBe("limit_wait");
+  });
+
+  it("carries BOTH new message kinds in its stream", () => {
+    // They render differently (warn vs. danger) and one run can only have parked, so
+    // the limit_hit is a replayed death from an opted-out run — present precisely so
+    // the danger variant is visible somewhere in the demo.
+    const kinds = new Set(mockLimitWaitMessages.map((m) => m.kind));
+    expect(kinds.has("limit_wait")).toBe(true);
+    expect(kinds.has("limit_hit")).toBe(true);
+  });
+
+  it("🔴 models the SHIPPED payload: ISO resets_at, keys omitted, and NO attempt", () => {
+    // The fixture is the demo's stand-in for the wire, so a shape the worker cannot
+    // emit teaches the wrong thing to everyone who reads it — and would let a
+    // renderer that only handles that shape look correct in a browser pass.
+    //
+    // `attempt` was in PRD Decision 10 and was dropped: the count is incremented
+    // server-side AFTER this message is written, so any worker-supplied value is a
+    // stale N-1. Asserted as an ABSENCE because re-adding it is the tempting mistake.
+    for (const msg of mockLimitWaitMessages) {
+      if (msg.kind !== "limit_wait" && msg.kind !== "limit_hit") continue;
+      const payload = (msg.payload ?? {}) as Record<string, unknown>;
+      expect(Object.keys(payload).sort()).toEqual(
+        Object.keys(payload).filter((k) => k === "rate_limit_type" || k === "resets_at").sort(),
+      );
+      expect("attempt" in payload, `seq ${msg.seq} carries an attempt key the worker never sends`).toBe(false);
+      if ("resets_at" in payload) {
+        expect(typeof payload["resets_at"], `seq ${msg.seq}: resets_at must be an ISO string`).toBe("string");
+        expect(Number.isFinite(Date.parse(payload["resets_at"] as string))).toBe(true);
+      }
+    }
+  });
+
+  it("covers the OMITTED-key shape, which is how 'unknown' arrives", () => {
+    // Both keys are left out rather than sent as null, so "unknown" has exactly one
+    // shape. A fixture without this case never renders the bare row.
+    const bare = mockLimitWaitMessages.filter(
+      (m) => m.kind === "limit_wait" && Object.keys((m.payload ?? {}) as object).length === 0,
+    );
+    expect(bare.length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes its two parks by resets_at, the only field that can", () => {
+    // With no count on the payload, resets_at is what stops two parks reading as
+    // duplicate rows. It differs per park by construction; the fixture must not
+    // accidentally reuse one value.
+    const resets = mockLimitWaitMessages
+      .filter((m) => m.kind === "limit_wait")
+      .map((m) => (m.payload as { resets_at?: string } | null)?.resets_at)
+      .filter((v): v is string => typeof v === "string");
+    expect(resets.length).toBeGreaterThan(1);
+    expect(new Set(resets).size).toBe(resets.length);
   });
 });

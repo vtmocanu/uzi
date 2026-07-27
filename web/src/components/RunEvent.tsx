@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
+import { feedWindowLabel, parseFeedInstant } from "../lib/limitWait";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { Markdown } from "./Markdown";
 import { cx } from "./ui";
@@ -18,6 +19,7 @@ import {
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
 // SDK mapping) plus the runner's own worker emissions:
 //   text | thinking | tool_use | tool_result | status | error | plan
+//   | limit_wait | limit_hit (PRD #35)
 // Anything else falls through to a muted unknown-kind line (RunMessage.kind is a
 // free string; the raw frame is always available in the worker's debug log).
 //
@@ -827,6 +829,73 @@ function StandaloneResult({ result }: { result: RunMessage }) {
   );
 }
 
+/**
+ * PRD #35: the `limit_wait` (parked) and `limit_hit` (died on a limit) feed rows.
+ *
+ * 🔴 EVERY FIELD READ HERE IS WORKER-AUTHORED AND THE SERVER'S ALLOWLIST DOES NOT
+ * REACH IT. `run_messages` payloads are worker JSON; the only server-side processing
+ * is a NUL strip and a rune cap. The `rate_limit_type` allowlist people reach for
+ * when reviewing this guards a DIFFERENT field with the same name — the run ROW's
+ * column — on a different write path. So:
+ *
+ *   * the window name goes through `feedWindowLabel`, a closed lookup that yields
+ *     null for anything outside the SDK vocabulary. The input is never echoed, not
+ *     even escaped: an unrecognised value drops the clause and the sentence still
+ *     reads correctly;
+ *   * `resets_at` is parsed to an instant and re-FORMATTED, so what renders is this
+ *     build's own output, never the payload's bytes.
+ *
+ * That leaves no path from the payload to the DOM that carries a worker-chosen
+ * string, which is a stronger property than escaping and is why both guards exist
+ * rather than a `dangerouslySetInnerHTML`-free assumption.
+ *
+ * 🔴 THE PAYLOAD HAS NO `attempt` KEY AND THIS ROW MUST NOT INVENT ONE. PRD #35's
+ * Decision 10 originally listed it; it was dropped because the count is incremented
+ * by the SERVER inside SetRunLimitWait, strictly after the worker emits this
+ * message, so anything a worker could put here is a stale N-1 that disagrees with
+ * the run row. The live count is `limit_wait_count` on the DTO and it renders in the
+ * run-view strip.
+ *
+ * Nor should this row read that DTO count: a feed row is a HISTORICAL record, so a
+ * run that parked three times would render three identical "attempt 3" rows. What
+ * distinguishes the rows is `resets_at`, which differs per park by construction — so
+ * no per-row information is lost by leaving the count out entirely.
+ */
+function LimitRow({ payload, parked = false }: { payload?: Record<string, unknown>; parked?: boolean }) {
+  const window = feedWindowLabel(payload?.["rate_limit_type"]);
+  const resetsAt = parseFeedInstant(payload?.["resets_at"]);
+  const detail = [window, resetsAt != null ? `resets ${new Date(resetsAt).toLocaleString()}` : null]
+    .filter((s): s is string => s != null)
+    .join(" · ");
+  return (
+    <div
+      className={cx(
+        "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs",
+        parked ? "border-warn/40 bg-warn/10 text-warn" : "border-danger/40 bg-danger/10 text-danger",
+      )}
+    >
+      <span aria-hidden="true">{parked ? "⏸" : "✗"}</span>
+      {/* web-ux F3: both predicates are POSITIVE, and the death row's is not optional.
+          It used to read "Anthropic usage limit reached" against the park's "…reached
+          — paused until it resets", making the death text a strict PREFIX of the
+          park's: the terminal outcome was carried by a MISSING clause, plus colour,
+          plus a glyph that is aria-hidden. Sighted colourblind users were fine (⏸ vs
+          ✗ carries it in grayscale); a screen-reader user got the more severe of the
+          two events as the LESS marked one, which is exactly backwards.
+
+          "the run failed here" rather than "waiting is off for this run": today the
+          only emitter of limit_hit is runner.ts's opted-out branch, so the cause would
+          be accurate — but judge-runner.ts reports the same structured facts on its
+          own failure path and gaining a feed line there is a one-line change. The
+          outcome is true for every emitter; the cause is true for the current one. */}
+      {parked
+        ? "Anthropic usage limit reached — paused until it resets"
+        : "Anthropic usage limit reached — the run failed here"}
+      {detail && <span className="font-normal opacity-90">({detail})</span>}
+    </div>
+  );
+}
+
 // RunEventRow renders one message. Memoized (props: msg is immutable per seq;
 // result flips undefined→object once when a tool call completes; live flips once
 // when the run leaves running) so an append never re-renders settled rows.
@@ -904,6 +973,17 @@ export const RunEventRow = memo(function RunEventRow({
         </div>
       );
     }
+    // PRD #35: the run hit an Anthropic usage limit and PARKED. Warn-toned, not
+    // danger — nothing failed, and the run resumes on its own. The row is the
+    // moment-of-park record; the live countdown lives in the run-view header, which
+    // reads the run row rather than this payload.
+    case "limit_wait":
+      return <LimitRow parked payload={rec} />;
+    // PRD #35: the run hit a usage limit and did NOT park — the owner opted out, or
+    // it is a kind that never parks (a judge run). This is a terminal outcome, so it
+    // is the one of the pair that reads as breakage.
+    case "limit_hit":
+      return <LimitRow payload={rec} />;
     default: {
       const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
       return (
