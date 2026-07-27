@@ -283,15 +283,24 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   // Issue #124. React escaping (pinned above) does not touch Unicode format characters,
-  // and the api's review-ingest scrub drops Cc only — Cc and Cf are disjoint — so a bidi
-  // override reaches the browser intact and the browser's bidi algorithm honours it. The
-  // rendered text is what a human READS, so that is what gets asserted.
+  // and the api's review-ingest scrub dropped Cc only — Cc and Cf are disjoint — so a bidi
+  // override reached the browser intact and the browser's bidi algorithm honours it. Ingest
+  // strips Cf now; rows stored before that still arrive carrying it. The rendered text is
+  // what a human READS, so that is what gets asserted.
   it("strips bidi/zero-width characters out of judge free text before rendering (#124)", async () => {
     const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE — reorders the line that follows it
     const ZWSP = "\u200B"; // zero-width space — also defeats search over the rendered text
+    // EVERY judge-derived free-text field in this fixture carries a hostile character, and
+    // that is the point rather than thoroughness. The whole-subtree assertion below can only
+    // see a field the FIXTURE makes hostile — so while `judge_model` sat here as the clean
+    // literal "haiku", the case passed with that field unstripped and the comment's promise
+    // ("a new judge field added to this panel without the strip fails here") was false. It
+    // survived four #124 commits in that blind spot. A field added to the DTO must be added
+    // here too, or this case silently stops covering it.
     mockApi.getRunReview.mockResolvedValue({
       review: review({
         summary_md: `The review ${RLO}approved this change`,
+        judge_model: `hai${RLO}ku`,
         recommendations: [
           {
             id: "rc1",
@@ -311,16 +320,17 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // verdict chip is a closed enum, so it is on screen in both states.
     await screen.findByText("Issues found");
 
-    // Nothing in the panel's rendered text carries a character from either category. This
-    // is asserted over the WHOLE subtree rather than per-field on purpose: a new judge
-    // field added to this panel without the strip fails here. Asserted FIRST, so it is
-    // what a mutation reds on.
+    // Nothing in the panel's rendered text carries a character from either category,
+    // asserted over the WHOLE subtree. The guarantee is exactly as wide as the fixture is
+    // hostile — see the note above; it is not "any new field is covered automatically".
+    // Asserted FIRST, so it is what a mutation reds on.
     const rendered = container.textContent ?? "";
     expect(rendered).not.toMatch(/[\p{Cf}]/u);
     expect(rendered).toContain("The review approved this change");
     expect(rendered).toContain("hit command not found");
     // The target renders as the searchable string, not one with an invisible seam in it.
     expect(screen.getByText("shellcheck")).toBeTruthy();
+    expect(rendered).toContain("via haiku");
   });
 
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {

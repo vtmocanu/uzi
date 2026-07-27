@@ -462,7 +462,8 @@ function isBucket(v: string | null): v is JudgeBacklogBucket {
 // expander. rationale_preview and target are UNTRUSTED judge text — rendered as escaped React
 // text with whitespace-pre-wrap, NEVER through a markdown renderer or dangerouslySetInnerHTML,
 // and passed through stripUnsafeChars first (issue #124): escaping does not touch a bidi
-// override, and the api's review-ingest scrub drops Cc but not Cf.
+// override, and the api's review-ingest scrub dropped Cc but not Cf until it learned both —
+// which leaves every row stored before that fix still carrying them.
 function GroupRow({
   group,
   selected,

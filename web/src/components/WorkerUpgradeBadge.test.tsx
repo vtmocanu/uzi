@@ -80,6 +80,25 @@ describe("WorkerUpgradeBadge", () => {
   });
 });
 
+// Issue #124, item 7 addendum. This field is a strictly stronger primitive than a bare
+// untrusted string: the api composes the worker's value INSIDE a sentence uzi wrote
+// (upgrade.go:143 `"running %s, target %s"`), so a bidi override reorders UZI'S words
+// around it — the sentence can read as its own opposite while every byte uzi contributed
+// is intact. Ingest strips Cf now; this covers rows stored before that.
+describe("WorkerUpgradeBadge — upgrade_detail carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of the composed sentence", () => {
+    // WorkerUpgradeDetail, not the badge: the badge renders the closed-enum status, the
+    // detail panel renders the composed sentence.
+    const { container } = render(
+      <WorkerUpgradeDetail
+        worker={aWorker({ upgrade_status: "outdated", upgrade_detail: "running 0.11.0\u202E, target 0.11.7\u200B" })}
+      />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toContain("running 0.11.0, target 0.11.7");
+  });
+});
+
 describe("the attention set (Decision 1)", () => {
   it("counts failed and behind, never upgrading", () => {
     expect(needsAttention(aWorker({ upgrade_status: "upgrade_failed" }))).toBe(true);

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Worker } from "../lib/api";
+import { stripUnsafeChars } from "../lib/safeText";
 
 /**
  * Per-worker upgrade badge and the Fleet upgrade summary (PRD #113 M5).
@@ -225,7 +226,15 @@ export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
       </div>
       {/* The api's own sentence, as TEXT — the same string the badge carries as a title,
           rendered where a keyboard and a screen reader can both reach it. */}
-      {worker.upgrade_detail && <div className="mt-1 text-fg">{worker.upgrade_detail}</div>}
+      {/* Issue #124, and this shape is strictly worse than a bare field: the api composes
+          the untrusted span INSIDE a sentence uzi wrote (upgrade.go:143 "running %s, target
+          %s"; :462 "%s: %s" from blocking_container/blocking_reason). A bidi override there
+          does not merely garble the attacker's own value — it reorders uzi's words around
+          it, so the sentence can read as its own opposite while every byte uzi contributed
+          is intact. Ingest strips Cf now; this covers rows written before that. */}
+      {worker.upgrade_detail && (
+        <div className="mt-1 text-fg">{stripUnsafeChars(worker.upgrade_detail)}</div>
+      )}
       {cause && <div className="mt-1 text-faint">{cause}</div>}
       {failed && (
         <div className="mt-2">

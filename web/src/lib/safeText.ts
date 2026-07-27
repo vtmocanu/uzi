@@ -31,11 +31,12 @@
 // asserting nothing that survives is Cc or Cf, and an astral-plane passthrough that catches
 // an over-broad predicate.
 //
-// WHY THE WEB SIDE AT ALL: the two review-POST ingest scrubbers are `IsControl`-only —
-// `sanitizeReviewText` (handler/judge_worker.go:381) for summary/rationale, and
-// `sanitizeSelfReported` (handler/worker_protocol.go:44) for `target`. Cc and Cf are
-// disjoint, so every character named above survived ingest and was persisted. Closing that
-// at the source does not make this redundant: rows written before it still render here.
+// WHY THE WEB SIDE AT ALL: the two review-POST ingest scrubbers — `sanitizeReviewText`
+// (handler/judge_worker.go) for summary/rationale, `sanitizeSelfReported`
+// (handler/worker_protocol.go) for `target` and `judge_model` — WERE `IsControl`-only, and
+// Cc and Cf are disjoint, so every character named above survived ingest and was persisted.
+// They strip Cf now too. That does not make this redundant: rows written BEFORE that still
+// render here, and no ingest fix can reach them.
 //
 // NOT applied at the API boundary, deliberately. `target` is a COORDINATE: the page matches
 // dispositions and filed issues by (category, target) and posts that pair back. Normalizing
@@ -62,9 +63,12 @@
  *     is `false`.)
  *   * Without `g` only the first offender goes: `"a<RLO>b<ZWSP>c"`. That reads as a working
  *     fix in any test that plants exactly one, which is why there is a case for it below.
- *   * `\p{C}` would be over-broad — it includes `Cn` (unassigned), so a code point assigned
- *     after the engine's Unicode table would be stripped out of legitimate text. Measured
- *     on `a\u{E0002}b`: this form keeps it, `\p{C}` yields `"ab"`.
+ *   * `\p{C}` would be over-broad — it is `Cc|Cf|Cn|Co|Cs`, so it also swallows PRIVATE-USE
+ *     (`Co`) and unassigned (`Cn`) code points: legitimate text merely unknown to this
+ *     engine's Unicode table. `Co` is the load-bearing half of the corpus, because Unicode
+ *     will never assign the private-use area, so that fixture cannot rot the way a
+ *     currently-unassigned code point can. Measured on `a\uE000b`: this form keeps it,
+ *     `\p{C}` yields `"ab"`.
  */
 const UNSAFE_CHAR = /(?![\n\t])[\p{Cc}\p{Cf}]/gu;
 

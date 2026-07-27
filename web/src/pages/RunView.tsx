@@ -947,7 +947,15 @@ export function JudgePanel({ run }: { run: Run }) {
               judge incomplete
             </Badge>
           )}
-          {review?.judge_model && <span className="text-xs text-faint">via {review.judge_model}</span>}
+          {/* Issue #124: worker-reported, scrubbed at ingest by sanitizeSelfReported, so
+              rows written before that strip learned Cf still carry it. NOTE this is the
+              REVIEW DTO's judge_model (api.ts:1085), not the admin SETTING of the same name
+              (api.ts:428) — that one is edited in a controlled input and stripping it would
+              filter an admin's own keystrokes, the mistake the draft-seed ruling argued
+              against. */}
+          {review?.judge_model && (
+            <span className="text-xs text-faint">via {stripUnsafeChars(review.judge_model)}</span>
+          )}
         </div>
         {rerunButton}
       </div>

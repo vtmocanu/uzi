@@ -284,20 +284,22 @@ describe("RunUsagePanel accessibility (item 8)", () => {
     return render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
   }
 
-  it("makes both scroll regions keyboard-reachable (WCAG 2.1.1)", () => {
+  it("names both scroll regions, and adds NO tab stop (WCAG 2.1.1 is already satisfied)", () => {
     const { container } = panel();
     const wrappers = [...container.querySelectorAll("div.overflow-x-auto")];
     // Both breakdown tables, not one: the per-agent table overflows harder than the
     // per-phase one (600 vs 560 minimum width against a 301px viewport).
     expect(wrappers.length).toBe(2);
     for (const w of wrappers) {
-      // Without tabindex a scrollable region holding nothing focusable cannot be reached
-      // OR scrolled by keyboard — and the clipped content is numbers cut mid-value, so it
-      // reads as a wrong figure rather than as "there is more here".
-      expect(w.getAttribute("tabindex")).toBe("0");
       expect(w.getAttribute("role")).toBe("region");
       // A region role without an accessible name is not exposed as a landmark at all.
       expect(w.getAttribute("aria-label")).toBeTruthy();
+      // …and NO tabIndex, asserted rather than merely omitted. Chrome focuses overflowing
+      // scrollers natively (measured: Tab lands here, ArrowRight scrolls 0 -> 171), and it
+      // does so ONLY while they overflow — so an unconditional tab stop is dead weight at
+      // every desktop width. This assertion is what stops it being re-added as an
+      // "improvement"; the original finding came from a property read, not a keyboard test.
+      expect(w.hasAttribute("tabindex")).toBe(false);
     }
     // The two names must DIFFER: two adjacent scrollable data regions with one name is
     // the case a screen-reader user cannot navigate between.

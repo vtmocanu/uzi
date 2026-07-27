@@ -105,6 +105,22 @@ function renderPage() {
   );
 }
 
+// Issue #124, item 7 addendum: the worker's self-reported version, same trust class and
+// same ingest scrubber as `target`.
+describe("WorkersSettings — the reported version carries no format characters (#124)", () => {
+  it("strips bidi/zero-width characters out of the version string", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ id: "w-1", name: "laptop", version: "0.11\u202E.0\u200B" })],
+    });
+    const { container } = renderPage();
+    // Anchored on the worker NAME, which the mutation cannot move — awaiting the cleaned
+    // version would red at the lookup instead of at the assertion.
+    await waitFor(() => expect(screen.getByText("laptop")).toBeTruthy());
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(container.textContent).toContain("v0.11.0");
+  });
+});
+
 describe("WorkersSettings resource gauges (PRD #49)", () => {
   it("renders per-worker CPU + memory gauges, a no-limit absolute readout, and the process-source label", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: fleet });
