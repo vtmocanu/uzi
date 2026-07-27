@@ -195,6 +195,50 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
     assert.equal(r.detail, "command not available in the worker");
   });
 
+  it("maps the wall-clock cap to skipped, not failed (#153)", async () => {
+    // A check killed by the cap produced no verdict, so it is never evidence of a
+    // failure. This regressed silently under execFile: the cap surfaced as `e.killed`,
+    // which is NOT set on the spawn path, so a timed-out check reported "failed".
+    const started = Date.now();
+    const r = await defaultCheckRunner(checkEnv, 150)(check({ command: "sh", args: ["-c", "sleep 30"] }), worktree);
+    assert.equal(r.status, "skipped", "a check that ran out of wall clock must never be reported as a failure");
+    assert.equal(r.detail, "timed out");
+    // The cap must actually fire; if the kill did not land this would run the full 30s.
+    assert.ok(Date.now() - started < 5000, "the wall-clock cap did not kill the check");
+  });
+
+  it("the wall-clock kill reaps the check's GRANDCHILDREN, not just its direct child (#153)", async () => {
+    // A test suite backgrounds helpers (a dev server, a docker container, a watcher). A
+    // plain `child.kill()` signals only the direct child and orphans those; the fix
+    // spawns the check `detached` — making it a process-GROUP leader — and reaps the
+    // GROUP. This is the half of #153 that IS observable without a uid split, and it is
+    // what stops a timed-out check leaving work behind on the worker.
+    const marker = join(worktree, `grandchild-${Date.now()}`);
+    const r = await defaultCheckRunner(checkEnv, 200)(
+      // Backgrounds a grandchild that will write a marker shortly AFTER the cap fires,
+      // then blocks. `nohup` does not setsid, so the grandchild stays in the group — a
+      // group kill reaches it, a direct-child kill does not.
+      check({ command: "sh", args: ["-c", `nohup sh -c 'sleep 1; echo alive > ${marker}' >/dev/null 2>&1 & sleep 30`] }),
+      worktree,
+    );
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "timed out");
+    await new Promise((res) => setTimeout(res, 1800));
+    assert.ok(
+      !existsSync(marker),
+      "a backgrounded grandchild outlived the wall-clock kill: the check was not reaped as a process group, so a timed-out suite leaves processes running on the worker",
+    );
+  });
+
+  it("maps a kill by any other signal to skipped (an OOM kill is not a test failure)", async () => {
+    const r = await defaultCheckRunner(checkEnv, 5000)(
+      check({ command: "sh", args: ["-c", "kill -TERM $$; sleep 5"] }),
+      worktree,
+    );
+    assert.equal(r.status, "skipped");
+    assert.match(r.detail, /^killed \(SIG/);
+  });
+
   it("captures ONLY the exit status — command output never reaches the result", async () => {
     const secret = "sk-ant-api03-NEVER-IN-THE-MR";
     const r = await defaultCheckRunner(checkEnv, 5000)(
