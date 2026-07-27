@@ -29,10 +29,25 @@ export type RunState =
 // could not enforce anything. Leaving it would have left a no-op looking like a
 // guardrail, which is worse than either having it or not.
 //
-// The terminal/non-terminal distinction is enforced where it is actually read: the
-// `RunState` union above, the server's status CHECK, and `uzicli`'s own
-// terminalRunStatuses. If a consumer for a Set like this ever appears, add it back
-// with that consumer — not before.
+// WHERE THE DISTINCTION IS ACTUALLY ENFORCED — corrected, because the first version
+// of this note named three places and two of them do not enforce terminality at all:
+// the `RunState` union above is the reportable DOMAIN (all five statuses a worker may
+// send, terminal or not), and the server's status CHECK is likewise a domain
+// constraint over all eight. Neither says anything about which are terminal.
+//
+// The one that matters, and that the first version omitted, is
+// **`TERMINAL_RUN_STATUSES` in `home-reclaim.ts`** — same package, the only live
+// terminal set in the agent, and the one whose modification breaks PRD #35. Adding
+// `limit_wait` there makes the stranded-HOME sweep delete a PARKED run's SDK
+// transcript, which is the ~170 MB the whole resume depends on. The warning this
+// deleted Set used to carry now lives there, where it has teeth: unlike here, that
+// change has a destructive consequence AND a test that catches it.
+//
+// `uzicli`'s `terminalRunStatuses` is genuinely a terminal set, but it lives in
+// another service and gates whether `uzi run logs --follow` stops polling.
+//
+// If a consumer for a Set like this ever appears here, add it back with that
+// consumer — not before.
 
 /** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal; PRD #41
  *  adds plan_feedback + plan_revising — the DB column carries no CHECK, so these need
@@ -718,7 +733,14 @@ export function resolveAgentSelection(
   }
 }
 
-/** Body of POST /runs/:id/state. Fields are set per target status. */
+/** Body of POST /runs/:id/state. Fields are set per target status.
+ *
+ *  NOTE FOR ANYONE GREPPING THIS FILE: `plan_md` is declared on FOUR separate
+ *  interfaces here (this one, `ClaimResponse`, `WorkerRunDetail`, `JudgeTraceTarget`).
+ *  A bare grep for the symbol returns four hits with no indication of which owns
+ *  which line, and that ambiguity has already produced one wrong citation acted on by
+ *  three people — `protocol.ts:451` was read as the claim payload when it is
+ *  `WorkerRunDetail`. Scope to the enclosing interface before concluding anything. */
 export interface StateRequest {
   status: RunState;
   /** awaiting_approval carries the captured plan. */

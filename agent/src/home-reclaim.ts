@@ -54,9 +54,28 @@ import { RUN_ID_RE } from "./util.js";
  * is over", and a future reader must not upgrade that to "nothing is writing".
  */
 
-/** Run statuses a run never leaves (`runs.status` CHECK, migration `00020`:
- *  queued/claimed/running/awaiting_approval/completed/failed/cancelled). A run in
- *  one of these will never resume, so its HOME cannot be wanted again. */
+/**
+ * Run statuses a run never leaves. A run in one of these will never resume, so its
+ * HOME cannot be wanted again.
+ *
+ * The `runs.status` CHECK now holds EIGHT values — queued / claimed / running /
+ * awaiting_approval / limit_wait / completed / failed / cancelled — after migration
+ * `00090` widened migration `00020`'s original seven with `limit_wait` (PRD #35).
+ *
+ * 🔴 `limit_wait` IS NOT TERMINAL AND MUST NEVER BE ADDED TO THIS SET. Read the
+ * DEFAULT_RECLAIM_MIN_AGE_MS comment below before touching it: a parked run's HOME
+ * is past `minAgeMs` for essentially its whole park (the age filter is 3h, a park
+ * runs to RUN_LIMIT_MAX_PARK, default 8d), so it becomes a candidate on EVERY sweep
+ * and survives only because the API answers `limit_wait` and `limit_wait` is absent
+ * here. Adding it deletes the ~170 MB SDK transcript the entire resume depends on.
+ *
+ * This is the SECOND of two independent protections for a parked HOME. The first is
+ * the runner's cleanup carve-out, which skips the teardown deletion; this one skips
+ * the sweep deletion hours later. Losing EITHER loses the transcript, and the
+ * failure presents as "the resume started a fresh session" long after the fact, with
+ * nothing pointing back here — which is why the guard is asserted in
+ * home-reclaim.test.ts rather than left to this comment.
+ */
 export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
 
 /**
