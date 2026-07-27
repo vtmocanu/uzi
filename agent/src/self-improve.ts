@@ -10,9 +10,9 @@
 // file — the same-OS-user residual this used to carry is closed for the local (A1)
 // path. The primary directive is untouched — the bot still never merges to main.
 
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { runnerCommand } from "./runner-uid.js";
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 import { buildCheckEnv } from "./sdk-env.js";
 
 // Re-exported so the existing importers (runner.ts, the tests) keep one obvious home for
@@ -146,10 +146,12 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 // executor should not import a run-kind-specific module to get one. Its security rationale
 // moved with it; read that comment before touching anything that feeds a check subprocess.
 
-// defaultCheckRunner runs a check via execFile under the SCRUBBED env (buildCheckEnv)
-// with a wall-clock cap. It captures only the exit status, never the (potentially
-// secret-bearing) command output — the run-message redactor does not cover a
-// third-party test's stdout, so none of it reaches the MR.
+// defaultCheckRunner runs a check via `spawn` under the SCRUBBED env (buildCheckEnv)
+// with a wall-clock cap that can actually enforce itself under the runner-uid split
+// (#153 — see the load-bearing note at the spawn site). It captures only the exit status,
+// never the (potentially secret-bearing) command output: the output is not read at all
+// (`stdio: "ignore"`), because the run-message redactor does not cover a third-party
+// test's stdout, so none of it can reach the MR.
 //
 // The status mapping is deliberately conservative: a check only reports "failed"
 // when it actually RAN and genuinely failed. Everything that means "this check could
@@ -160,6 +162,7 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 //   - exit 127 (command/binary not found by the    → skipped
 //     shell or the npm script, e.g. vitest/tsc)
 //   - killed by the wall-clock cap                 → skipped
+//   - killed by any other signal (e.g. OOM)        → skipped
 //   - any other non-zero exit                      → failed   [a real failure]
 export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 * 1000): CheckRunner {
   return (check, worktreePath) => {
@@ -177,6 +180,27 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
             : `prerequisite missing: ${check.requires}`,
       });
     }
+    // #154: a SURVIVING `node_modules` is not the same as an installed one. The
+    // existence check above passes for a tree the installer failed to build, and the
+    // check then runs against stale deps and reports a real-looking failure — the exact
+    // outcome the status mapping below exists to prevent.
+    //
+    // Measured, and this is the shape the fix is keyed to: with `package.json` declaring
+    // a dependency the lockfile does not carry, `npm ci` REFUSES (EUSAGE, "can only
+    // install packages when your package.json and package-lock.json … are in sync"),
+    // exits 1, and leaves the previous `node_modules` intact — with the newly-declared
+    // dependency absent from it. So the tell is not the directory, it is the gap between
+    // what the manifest declares and what the tree contains.
+    if (check.requires === "node_modules") {
+      const missing = missingDeclaredDeps(cwd);
+      if (missing.length > 0) {
+        return Promise.resolve({
+          name: check.name,
+          status: "skipped" as const,
+          detail: `dependencies out of date in the worker (missing: ${missing.slice(0, 3).join(", ")})`,
+        });
+      }
+    }
     // PRD #51 M4: the check runs agent-authored test code (go test / vitest / tsc) — an
     // untrusted surface — so under the `runner` uid (setpriv wrapper); single-uid (#58)
     // runs it directly. ENOENT/127 still classify as "skipped" (the wrapper preserves the
@@ -184,38 +208,104 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
     // wrapper is absent).
     const wc = runnerCommand(check.command, check.args);
     return new Promise<CheckResult>((resolve) => {
-      execFile(
-        wc.command,
-        wc.args,
-        { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 },
-        (error) => {
-          if (!error) {
-            resolve({ name: check.name, status: "passed", detail: "exit 0" });
-            return;
-          }
-          // execFile's error carries `code` as the ENOENT-style string on a spawn
-          // failure, or the numeric exit status when the command ran and exited
-          // non-zero — so it is genuinely `string | number` here.
-          const e = error as Error & { code?: string | number; killed?: boolean };
-          if (e.code === "ENOENT") {
-            resolve({ name: check.name, status: "skipped", detail: "command not available in the worker" });
-            return;
-          }
-          if (e.killed) {
-            resolve({ name: check.name, status: "skipped", detail: "timed out" });
-            return;
-          }
-          // 127 is "command not found" from the shell or an npm script whose binary is
-          // absent — never a real test failure, so it is a skip, not a failure.
-          if (e.code === 127) {
-            resolve({ name: check.name, status: "skipped", detail: "command/binary not available (exit 127)" });
-            return;
-          }
-          resolve({ name: check.name, status: "failed", detail: typeof e.code === "number" ? `exit ${e.code}` : "failed" });
-        },
-      );
+      let timedOut = false;
+      let settled = false;
+      // THE `spawn` + `detached: true` + `killRunnerGroup` TRIO IS LOAD-BEARING (#153).
+      // Reverting to `execFile` with its `timeout` option looks like a simplification and
+      // silently reintroduces a measured defect: execFile's timeout kills from the WORKER
+      // uid, which is EPERM against a process running as `runner`, so under the PRD #51
+      // split the wall-clock cap could not kill anything. Measured on this exact shape —
+      // worker execFile'ing `setpriv --reuid runner … sleep 120` with a 2s cap called back
+      // at 2008ms carrying `code: "EPERM"` while the runner's `sleep 120` was still alive
+      // 6s later; the same-uid control killed correctly. A check could outlive its cap and
+      // orphan.
+      //   - `detached: true` makes the child a process-GROUP leader, which is the shape
+      //     `killRunnerGroup` documents and what lets the kill reach any grandchild the
+      //     test spawned. `execFile` does not even forward `detached` (it copies a fixed
+      //     option subset to spawn), so the flag would be dropped without a word.
+      //   - `killRunnerGroup` reuids via setpriv under the split and signals directly on a
+      //     #58 single-uid start, so both modes can actually reap. A plain `child.kill()`
+      //     cannot.
+      // `stdio: "ignore"` keeps the no-output-capture property STRUCTURAL rather than
+      // disciplinary — stronger than execFile's buffer-then-discard, and it also retires a
+      // `maxBuffer` that would have killed a merely-verbose passing suite.
+      const child = spawn(wc.command, wc.args, { cwd, env, detached: true, stdio: "ignore" });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killRunnerGroup(child.pid);
+      }, timeoutMs);
+      // The live child keeps the loop alive on its own; an un-unref'd timer would hold it
+      // for the FULL cap even after a fast check finished.
+      timer.unref();
+      const done = (result: CheckResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+
+      child.on("error", (err) => {
+        // The check never started, so it has no verdict — "skipped" either way. (Under
+        // execFile a non-ENOENT spawn failure used to land in the final branch and be
+        // reported as "failed", which is the accusation this mapping exists to avoid.)
+        const code = (err as NodeJS.ErrnoException).code;
+        done({
+          name: check.name,
+          status: "skipped",
+          detail: code === "ENOENT" ? "command not available in the worker" : "could not start the check",
+        });
+      });
+      child.on("close", (code, signalName) => {
+        // A check killed by the cap has no verdict. Under execFile this arrived as
+        // `e.killed`, which is NOT set on this path — so before #153 a timed-out check
+        // reported "failed", exactly the false accusation the mapping forbids.
+        if (timedOut) return done({ name: check.name, status: "skipped", detail: "timed out" });
+        if (code === 0) return done({ name: check.name, status: "passed", detail: "exit 0" });
+        // 127 is "command not found" from the shell or an npm script whose binary is
+        // absent — never a real test failure, so it is a skip, not a failure.
+        if (code === 127) return done({ name: check.name, status: "skipped", detail: "command/binary not available (exit 127)" });
+        // Killed by a signal we did not send (an OOM kill, an operator SIGTERM): the
+        // check produced no verdict, so it is not evidence of a failure either.
+        if (code === null) return done({ name: check.name, status: "skipped", detail: `killed (${signalName})` });
+        done({ name: check.name, status: "failed", detail: `exit ${code}` });
+      });
     });
   };
+}
+
+/**
+ * The dependencies `<cwd>/package.json` DECLARES that are absent from its
+ * `node_modules` (#154). Empty ⇒ nothing contradicts "the deps are installed".
+ *
+ * DERIVED FROM WHAT THE PROJECT DECLARES, never a flat requirement, and that is the
+ * load-bearing part rather than a nicety: `npm ci` on a ZERO-DEPENDENCY project exits 0
+ * and creates no `node_modules` at all (measured), so any unconditional requirement would
+ * turn a genuine success into a reported failure — the same lie as passing a stale tree,
+ * pointing the other way. A project that declares nothing yields `[]` here and its check
+ * runs, exactly as before.
+ *
+ * Deliberately conservative about what counts as declared:
+ *   - `dependencies` + `devDependencies` only. `optionalDependencies` may legitimately be
+ *     absent (that is what optional means — a platform-mismatched binary is not installed
+ *     and nothing is wrong), and `peerDependencies` may be intentionally unmet.
+ *   - An unreadable or malformed package.json yields `[]`. We cannot tell, and unknown
+ *     must never be reported as a failure.
+ * Presence is a shallow existence check per package (`node_modules/<name>`, scope-aware),
+ * not a version match: the goal is to catch a tree the installer did not build, not to
+ * re-implement `npm ci`'s own reconciliation.
+ */
+export function missingDeclaredDeps(cwd: string): string[] {
+  let declared: string[];
+  try {
+    const parsed = JSON.parse(readFileSync(`${cwd}/package.json`, "utf8")) as {
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
+    declared = [...Object.keys(parsed.dependencies ?? {}), ...Object.keys(parsed.devDependencies ?? {})];
+  } catch {
+    return [];
+  }
+  return declared.filter((name) => !existsSync(`${cwd}/node_modules/${name}`));
 }
 
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:
