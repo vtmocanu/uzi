@@ -61,10 +61,17 @@ Three coherent parts (the same judge reviews flagged all three):
    scrubbed env, best-effort → honest skip on failure). Two upgrades:
    - **Generalize dir discovery**: instead of hardcoded `web/agent`, find dirs
      with a `package.json` + a lockfile (excluding `node_modules`, bounded
-     depth/count), and pick the installer per lockfile: `package-lock.json →
-     npm ci`, `pnpm-lock.yaml → pnpm i --frozen-lockfile`, `yarn.lock → yarn
-     --frozen-lockfile`, `bun.lockb → bun install`; a root `workspaces` monorepo
+     depth/count), and pick the installer per lockfile; a root `workspaces` monorepo
      resolves to a single root install.
+
+     *The four command strings drafted here (`pnpm i --frozen-lockfile`, `yarn
+     --frozen-lockfile`, `bun install`, …) are **superseded** and were removed
+     2026-07-27 rather than corrected. Not one of the three non-npm strings matched what
+     shipped, and a fact-check found that only the bun one had been caught. Quoting
+     command strings in a design document means maintaining a second copy of
+     `INSTALL_COMMANDS` that nothing tests — **`agent/src/js-deps.ts` is the source of
+     truth**, and the Trust posture table above carries the security-relevant flags with
+     the reason each is there.*
    - **Overlap the latency**: kick the install off **concurrently with the plan
      turn + approval wait** (which includes human latency), so deps are ready by
      the time the agent implements — near-zero added wall-clock, and nothing is
@@ -97,7 +104,11 @@ Three coherent parts (the same judge reviews flagged all three):
 - [x] **M1 — Generalized dependency discovery + install (extract from
   `prepareCheckDeps`).** A package-manager-aware, lockfile-driven installer that
   discovers JS project dirs in a clone (bounded), runs the **frozen `--ignore-scripts`
-  install** (unchanged from `prepareCheckDeps` — a pure relocation, no flag change)
+  install** (*as drafted this said "unchanged from `prepareCheckDeps` — a pure relocation,
+  no flag change". **That stopped being true during implementation** and the Decision Log
+  records why: yarn gained `YARN_IGNORE_PATH=1`, pnpm gained `--ignore-pnpmfile` and
+  `--config.manage-package-manager-versions=false`, and bun gained `--frozen-lockfile`.
+  The relocation was pure until the security correction; it is not now.*)
   under the runner uid + scrubbed env, and returns per-dir install/skip results. Unit
   tests over fixture clones (npm/pnpm/yarn/bun, monorepo workspaces, no-lockfile,
   install-failure → honest skip).
@@ -270,8 +281,18 @@ Two limits, stated because their absence is what made the old text dangerous:
    gap); **corepack shims** (present in the image but not enabled — `corepack enable` would
    make `packageManager` drive a download-and-execute for yarn *and* npm); **a real Berry as
    the `yarn` on PATH** (`YARN_IGNORE_PATH` is a yarn-1 mechanism and Berry's behaviour is
-   untested, though Berry's rejection of `--frozen-lockfile` makes an honest failure the
-   likely outcome); and **lockfile-embedded specifiers** (`git:`, `file:`, `link:`,
+   untested. *Corrected 2026-07-27: this previously said "Berry's rejection of
+   `--frozen-lockfile` makes an honest failure the likely outcome". **Berry ACCEPTS
+   `--frozen-lockfile`** as a hidden deprecated alias for `--immutable` — in
+   `plugin-essentials`' `install.ts` it is declared `Option.Boolean('--frozen-lockfile',
+   {hidden: true})` and passed to `reportOptionDeprecations` with a callback setting
+   `immutable`, carrying **no `error` key**, so unlike `--production` it does not abort and
+   the install proceeds. Using a false rejection to bound a SECURITY residual is the worst
+   place to have got this wrong. Note also that Berry defines its own `ignorePath` boolean
+   consumed at `checkYarnPath`, whose env form is `YARN_IGNORE_PATH` — so the mitigation
+   plausibly carries onto Berry as well. That is a source read, not an execution; the
+   "untested" caveat stands, now without the false reasoning.*); and
+   **lockfile-embedded specifiers** (`git:`, `file:`, `link:`,
    arbitrary `resolved` URLs) plus `.npmrc` registry redirection.
 
    **`--ignore-scripts` bounds what runs at install time, not what the install PLACES on
@@ -299,10 +320,19 @@ Two limits, stated because their absence is what made the old text dangerous:
 
 ## Risks & Mitigations
 
-- **Untrusted install code.** Mitigated by `--ignore-scripts` (no repo-authored script
-  runs) plus the existing runner-uid + scrubbed-env sandbox — the same boundary that
-  already runs the repo's tests. **Caveat:** on a `#58` single-uid start there is no
-  runner-uid split (`self-improve.ts:154-157`), so isolation is weaker there; since k8s
+- **Untrusted install code.** *(Corrected 2026-07-27. This bullet previously read
+  "Mitigated by `--ignore-scripts` (no repo-authored script runs)" — the exact claim the
+  Trust posture section above rewrites as FALSE, left standing in the same file by the
+  author of that rewrite. It is the third copy of this claim found on this branch, after
+  the module header and the Decision Log entry, and the one nobody chased. **A retraction
+  propagates only as far as the people holding copies, and grepping for the retracted
+  SENTENCE is what leaves the copy that paraphrases it.**)*
+  Mitigated by the **per-manager mitigations in the Trust posture table above** —
+  `--ignore-scripts` alone does not hold this line for yarn or pnpm — plus the existing
+  runner-uid + scrubbed-env sandbox, the same boundary that already runs the repo's tests.
+  **Caveat:** on a `#58` single-uid start there is no
+  runner-uid split (`self-improve.ts`, the single-uid branch of the check-env comment
+  block), so isolation is weaker there; since k8s
   is now the primary runtime (CLAUDE.md), verify the k8s worker posture
   (`docs/proc-hardening.md`) rather than assuming the split holds everywhere.
 - **Install latency on every JS run.** Mitigated by overlapping with the plan +
@@ -347,9 +377,13 @@ Two limits, stated because their absence is what made the old text dangerous:
   and repo test execution (the trust boundary this PRD reuses).
 - **PRD #46 Decision 4** — the deterministic command-not-found pre-scan
   (`scanCommandNotFound`) M3 refines.
-- **`self-improve.ts` `prepareCheckDeps`** — the existing install routine M1
-  extracts and generalizes; **`runner.ts:388`** — its current (post-agent) call
-  site.
+- **`self-improve.ts` `prepareCheckDeps`** — the install routine M1 extracted and
+  generalized. *Past tense as of 2026-07-27: the function no longer exists — M2 deleted it
+  rather than leaving a shim, because two install paths for one job is the drift this PRD
+  removes. Its post-agent call site in `runner.ts` now calls `installJsDeps`. This entry
+  said "the **existing** install routine" and "its **current** call site" until the
+  fact-check caught it: a present-tense claim about deleted code is a wrong doc, not a
+  typo, by the rule this branch adopted.*
 
 ## Decision Log
 
