@@ -138,7 +138,13 @@ export function Board() {
   // onDragOver — the HTML drag-and-drop model puts the drag data store in protected
   // mode for every event except dragstart and drop, so getData() there returns "".
   const [insertAt, setInsertAt] = useState<DropAnchor | null>(null);
+  // `reordering` drives the DISABLED state of the reorder buttons; reorderRef is what
+  // actually refuses a re-entrant drop. Two of them because a state read inside an
+  // event handler sees the value from that render, so two drops in one batch would
+  // both see `false` — a ref is updated synchronously and is the only thing that can
+  // reject the second.
   const [reordering, setReordering] = useState(false);
+  const reorderRef = useRef(false);
 
   // Start-run preconditions, refreshed alongside the board: whether the user has a
   // worker and an Anthropic token. Whether an issue already has an active run now
@@ -435,9 +441,24 @@ export function Board() {
   // prevent: on an untouched board every position is NULL, so one written position
   // sorts ahead of every NULL under NULLS LAST and a card dragged to the BOTTOM of its
   // column renders at the TOP.
+  //
+  // RETURNS whether the board actually moved. Callers that ANNOUNCE the outcome must
+  // gate on it: swallowing the rejection into setError and resolving normally made
+  // moveCard's toast fire on failure, so the board rendered "Could not save the new
+  // order" and "#1 moved down in Backlog" at the same time. That is worst on the
+  // keyboard path, where the toast IS the feedback and the user cannot see that the
+  // card did not move. Same reason move() already returns Promise<boolean>.
+  //
+  // Re-entrant calls are REFUSED, not queued. reorderRef (not the `reordering` state)
+  // is the guard, because two drops inside one React batch would both read the same
+  // pre-update state value. Without it a second drop computes its order from the same
+  // pre-first-drop payloadCards and silently discards the first — Decision 7b's
+  // accepted last-writer-wins is about CROSS-TAB concurrency resolved by the 10s
+  // refetch, not two drags in one tab in one second.
   const applyDrop = useCallback(
-    async (dragIid: number, destKey: string, anchor: DropAnchor | null) => {
-      if (destKey === CLOSED_KEY) return; // Closed is not a drop target.
+    async (dragIid: number, destKey: string, anchor: DropAnchor | null): Promise<boolean> => {
+      if (destKey === CLOSED_KEY) return false; // Closed is not a drop target.
+      if (reorderRef.current) return false; // a reorder is already in flight
       const intent = dropIntent({
         payloadCards, // UNFILTERED — the payload-set rule (Decision 7b)
         columnKeys,
@@ -446,20 +467,24 @@ export function Board() {
         destColumnKey: destKey,
         anchor,
       });
-      if (!intent) return;
+      if (!intent) return false;
+      reorderRef.current = true;
       setReordering(true);
       try {
         if (intent.columnChanged && !(await move(destKey, dragIid))) {
-          return; // move() surfaced the error and left the card where it was
+          return false; // move() surfaced the error and left the card where it was
         }
         const { board: fresh } = await api.reorderBoard(repoId, intent.iids);
         // No optimistic reorder: the card does not visually move until the server's
         // authoritative board replaces this one, matching move()'s snap-back contract.
         setBoard(fresh);
         setSortMode("manual");
+        return true;
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Could not save the new order");
+        return false;
       } finally {
+        reorderRef.current = false;
         setReordering(false);
       }
     },
@@ -478,8 +503,12 @@ export function Board() {
       const lane = cardsByColumn.get(columnKeyForCard(card)) ?? [];
       const anchor = neighbourAnchor(lane, card.iid, direction);
       if (!anchor) return; // already at that end
-      await applyDrop(card.iid, columnKeyForCard(card), anchor);
-      pushToast(`#${card.iid} moved ${direction} in ${columnLabel(card)}`);
+      // ONLY on success. This is the announcement channel for users who cannot see the
+      // board, so a toast that fires regardless is not a cosmetic slip — it is the
+      // feedback saying the opposite of what happened.
+      if (await applyDrop(card.iid, columnKeyForCard(card), anchor)) {
+        pushToast(`#${card.iid} moved ${direction} in ${columnLabel(card)}`);
+      }
     },
     [cardsByColumn, applyDrop, pushToast],
   );

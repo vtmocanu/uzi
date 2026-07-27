@@ -301,6 +301,12 @@ var wantRouteMounts = []routeMount{
 	// whole board in a transaction and rebuilds the board on every request, so bare
 	// was the wrong answer too — and "give it its own" is what this codebase has
 	// already decided five times over.
+	//
+	// An earlier version of this comment justified it with "every other board WRITE
+	// route carries limForge". That is false in both directions and was struck: the row
+	// directly above is PUT board/columns with noLimiter, and ConfigureColumns DOES make
+	// forge calls (ForgeForConnection then EnsureLabels). The decision stands on its own
+	// merits above; it never needed that claim.
 	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},

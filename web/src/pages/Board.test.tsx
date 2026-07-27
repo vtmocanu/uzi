@@ -587,6 +587,74 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     expect(mockApi.moveIssue).not.toHaveBeenCalled();
   });
 
+  // M5-1. The keyboard path exists for users who cannot see the board, so its toast is
+  // not decoration — it IS the feedback. Announcing success on a failed reorder tells
+  // exactly the wrong thing to exactly the people who cannot check.
+  it("does NOT announce success when the reorder failed", async () => {
+    mockApi.reorderBoard.mockRejectedValue(new Error("boom"));
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    // The error surfaces...
+    await screen.findByText("Could not save the new order");
+    // ...and the success announcement must not.
+    expect(screen.queryByText(/#1 moved down/)).toBeNull();
+  });
+
+  it("DOES announce success when the reorder succeeded — the control", async () => {
+    // Without this pair, deleting the toast entirely would satisfy the assertion above.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await screen.findByText(/#1 moved down in Backlog/);
+  });
+
+  it("does not announce a move when there was nothing to move", async () => {
+    // dropIntent returns null when the card is gone from the payload — evicted between
+    // render and press. A toast here claims a move that never happened.
+    mockApi.getBoard.mockResolvedValue({ board: aBoard({ cards: [] }) });
+    renderBoard();
+    await screen.findByText("Backlog");
+    expect(screen.queryByRole("button", { name: /Move issue/ })).toBeNull();
+  });
+
+  // M5-2. The buttons were guarded on `reordering` and the drop handlers were not,
+  // leaving the hole in the path that is far easier to trigger twice in a second.
+  it("refuses a second reorder while one is in flight, from EITHER path", async () => {
+    let release: (v: { board: BoardData }) => void = () => {};
+    mockApi.reorderBoard.mockImplementation(
+      () => new Promise<{ board: BoardData }>((res) => { release = res; }),
+    );
+    renderBoard();
+    await screen.findByText("Backlog");
+
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+
+    // A DROP while the first is still in flight. Both orders would otherwise be
+    // computed from the same pre-first-drop payload, so the second silently discards
+    // the first.
+    const card3 = screen.getByText("issue three").closest("div[draggable]") as HTMLElement;
+    fireEvent.drop(card3, { dataTransfer: { getData: () => "2" }, clientY: 0 });
+    fireEvent.drop(laneFor("Planned"), { dataTransfer: { getData: () => "2" } });
+    expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1);
+
+    release({ board: aBoard() });
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+  });
+
+  it("accepts a reorder again once the first has settled", async () => {
+    // The guard must RELEASE. A latch that never clears would satisfy the test above
+    // and break the feature after one drag.
+    renderBoard();
+    await screen.findByText("Backlog");
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(2));
+  });
+
   it("degrades a corrupt persisted mode to Manual instead of breaking the board", async () => {
     store.set("uzi.board.repo-1.sortMode", '"not-a-mode"');
     renderBoard();

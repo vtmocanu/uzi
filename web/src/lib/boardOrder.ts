@@ -156,9 +156,16 @@ export function boardOrderAfterDrop(
   // column. It happens to look right only when the card was already last, which is
   // exactly the fixture someone would reach for. Measured while writing the unit test:
   // dragging the FIRST card of a lane onto itself returned [10, 30, …] for an input of
-  // [30, 10, …]. The UI never renders an insertion edge on the dragged card, so this
-  // arm is defence rather than a live path — but "the caller cannot produce it" is not
-  // a reason for the helper to answer wrongly when it does.
+  // [30, 10, …].
+  //
+  // THIS ARM IS LOAD-BEARING AND FULLY REACHABLE. An earlier version of this comment
+  // called it "defence rather than a live path" on the grounds that the UI never draws
+  // an insertion edge on the dragged card. The edge is only the INDICATOR: onCardDrop
+  // is attached to every card with no self-check, and onCardDragOver calls
+  // preventDefault() BEFORE its dragIid === card.iid early return, so the browser
+  // permits a drop on the dragged card itself. Measured (review M5-3): dragStart card 1
+  // then drop on card 1 submits [1,2,3,4,9] with this arm and [2,3,4,1,9] without it.
+  // "Defence, not a live path" is the sentence that gets an arm deleted in six months.
   const selfDrop = dragged != null && anchor != null && anchor.iid === dragIid;
   if (dragged && !selfDrop) {
     const from = buckets.get(columnKeyOf(dragged));
@@ -173,6 +180,15 @@ export function boardOrderAfterDrop(
     }
     // Looked up after the removal, so the indices below are the post-removal ones and
     // `before` needs no adjustment for a within-column move.
+    //
+    // An anchor whose iid is NOT in the destination bucket falls through to
+    // `at = dest.length`, appending to the bottom. That is the same shape the selfDrop
+    // arm above exists to remove, and it is deliberately kept here because the cases
+    // differ: a self-drop expresses "no movement", so relocating the card is wrong,
+    // whereas a stale anchor expresses "put it near a card that is no longer there",
+    // for which the end of the destination column is the only defensible answer. It IS
+    // reachable — the 10s poll can replace `board` between render and drop (review
+    // M5-6) — so it is asserted rather than assumed.
     let at = dest.length;
     if (anchor) {
       const ai = dest.findIndex((c) => c.iid === anchor.iid);

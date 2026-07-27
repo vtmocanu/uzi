@@ -1799,6 +1799,16 @@ export const mockApi = {
       for (const iid of iids) {
         const card = byIID.get(iid);
         // (2) unknown iid: skip. (Also skips a duplicate, matching the server's dedupe.)
+        //
+        // KNOWN DIVERGENCE, recorded rather than left to be discovered (review M5-7):
+        // this also skips a CLOSED card, and SetBoardOrderPositions does not — the
+        // server would happily rank one it was handed. Unreachable from the product,
+        // because dropIntent filters closed cards out before the request is built, so
+        // neither side ever sees one. Kept on the mock side because it is the safer
+        // half of the divergence and because the demo board contains closed cards: a
+        // hand-built mock-mode request that ranked one would render it in the Closed
+        // lane at a rank, which is exactly the state Decision 7b forbids. If the server
+        // ever gains its own filter, delete this clause rather than adding a second.
         if (!card || card.closed || seen.has(iid)) continue;
         seen.add(iid);
         ordered.push(card);
