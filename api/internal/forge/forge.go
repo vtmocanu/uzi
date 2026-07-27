@@ -285,8 +285,13 @@ type Job struct {
 //
 // The neutral spelling is GitLab's, not Forgejo's, for the historical reason that
 // GitLab was the only driver when the cache's state='opened' filter was written.
-// Forgejo says "open"; forgejoIssueState maps that inbound. See StateAll's note on
-// why the OUTBOUND direction needs its own translation.
+// Forgejo says "open"; forgejoIssueState maps that INBOUND, and
+// forgejoIssueStateParam maps it OUTBOUND — that function's comment is where the
+// asymmetry is explained, and it is the one that matters, since an untranslated
+// neutral value is not rejected on the Forgejo lane, it is silently ignored.
+//
+// (This used to point at StateAll's note for the outbound explanation. StateAll's
+// note says nothing about it — it documents the zero value.)
 type IssueState string
 
 const (

@@ -9,7 +9,7 @@ audience: user
 Each enabled repo gets a board in the sidebar: a kanban view of its GitLab
 issues, kept in sync with the forge in both directions. By default it shows
 the repo's `PRD`-labeled issues, the ones uzi works; **Show other issues**
-brings in the repo's other open issues alongside them. Cards also carry
+brings in the repo's other issues alongside them. Cards also carry
 their latest agent run, so the board doubles as a run tracker: it moves
 issues automatically as a run progresses and refreshes itself, without a
 manual reload.
@@ -232,7 +232,7 @@ displays in its highest-positioned column until the next move normalizes it.
 
 ### Show other issues
 
-**Show other issues** adds the repo's other **open** issues to the board, so
+**Show other issues** adds the repo's other issues to the board, so
 you can triage the whole backlog in one place instead of switching to GitLab
 to see what else is filed. It is off by default, it is remembered per board
 and per browser, and it changes only what you see: nobody else's board moves,
@@ -249,7 +249,9 @@ they behave differently in two ways:
   There is no un-promote in uzi; remove the label in GitLab if you change your
   mind.
 
-Closed issues without the `PRD` label never appear at all, and uzi's own
+Issues without the `PRD` label are only ever synced while they are **open**, so
+they never reach the **Closed** column: one that closes on the forge keeps
+looking open until the reconcile pass removes it, as described above. uzi's own
 self-improvement tracking issue is always hidden.
 
 A run that finishes a PRD is asked to move the file to `prds/done/` in its own

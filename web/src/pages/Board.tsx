@@ -1188,12 +1188,25 @@ export function IssueCard({
         // `loud` (the warn ring, reserved for awaiting_approval) nor opacity-40
         // (being dragged right now).
         //
-        // Second cue, and the one that does the work when a card has both: the BUTTON
-        // below reads "Promote to PRD" where a PRD card reads "Start run". The
-        // exception is a non-PRD card that has CLOSED on the forge and not yet been
-        // evicted — promotable false, isPRD false, so no button at all. At 1.39:1 that
-        // card carried no cue whatsoever; at 5.16:1 the border carries it alone. The
-        // eviction window itself is documented in docs/board.md.
+        // Second cue: the BUTTON below reads "Promote to PRD" where a PRD card reads
+        // "Start run". It is present on every non-PRD card the sync can produce,
+        // INCLUDING one that has closed on the forge and not yet been evicted.
+        //
+        // An earlier version of this comment claimed that window renders no button at
+        // all — promotable false, isPRD false. That was WRONG, and measured wrong:
+        // canPromote({labels:["bug"], closed:false}) is true. During the window the row
+        // is never re-upserted (the PRD fetch is label-filtered, the additive fetch is
+        // StateOpened, so neither returns a closed non-PRD issue), so issues.state
+        // stays 'opened', cardDTO.Closed derives false, and the card renders Promote
+        // exactly as it did before it closed. docs/board.md had this right all along —
+        // and the false sentence closed by citing docs/board.md as corroboration,
+        // which is what let it survive three readers.
+        //
+        // The state it described is real but is NOT reachable through the sync: it
+        // needs closed=true AND isPRD=false, i.e. a row cached while closed (only the
+        // state=all PRD fetch writes those) that later stops matching prd_label — an
+        // operator rename while closed PRD cards are cached. Untested, and left
+        // untested deliberately rather than asserted.
         isPRD ? "bg-raised/80" : "border-dashed bg-transparent",
         // One border-color class per branch, never two: Tailwind utilities of equal
         // specificity resolve by the order they appear in the generated STYLESHEET,

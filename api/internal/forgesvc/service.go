@@ -452,6 +452,20 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 //     the caller keeps the mark it already had. Advancing to openMax instead
 //     would be unsound for exactly the reason above, openMax being free to exceed
 //     tA.
+//
+// THE SECOND CASE HAS A STANDING COST, and it is worth knowing rather than fixing.
+// A repo with open issues but NO PRD issues has prdMax zero on every pass, so its
+// mark never advances at all and every IncrementalSync re-reads from the same
+// bound — now paying TWO unbounded fetches per poll rather than one. Correctness is
+// unaffected (the upserts are idempotent and the window only ever re-covers ground
+// already covered), and the pre-M6 code had the identical no-advance behaviour on
+// the PRD fetch; M6 doubles the traffic it costs.
+//
+// Not fixed here because every fix is worse: advancing on openMax alone is the
+// unsound case above, and a per-path mark is a wider change to the poller's state
+// than this milestone should carry. It is the same unboundedness the PRD's "M6
+// scale" open question names, and it wants the same answer — a cap or a per-repo
+// opt-in — not a change to this function.
 func advanceHWM(prdMax, openMax time.Time) time.Time {
 	if prdMax.IsZero() || openMax.IsZero() {
 		return prdMax

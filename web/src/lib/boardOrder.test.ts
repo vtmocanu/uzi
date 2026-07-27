@@ -348,12 +348,22 @@ describe("dropIntent", () => {
     expect(out.iids).toHaveLength(3);
   });
 
-  it("covers the UNFILTERED payload, not the subset a viewer can see", () => {
-    // The payload-set rule. A caller that hands dropIntent a filtered list would
-    // produce a shorter iids array; ClearBoardOrderExcept then NULLs everything
-    // missing, relocating those cards to the bottom of their column on the same
-    // user's other browser. Simulated here by comparing against what a "rendered"
-    // subset would have produced.
+  it("returns every card it was GIVEN, so a filtered input yields a shorter order", () => {
+    // RENAMED from "covers the UNFILTERED payload, not the subset a viewer can see",
+    // which oversold it. dropIntent has no filter of its own and cannot: it orders
+    // whatever array it is handed. So this pins its INPUT-OUTPUT relation — the same
+    // set out as in — and nothing about which array the caller chooses.
+    //
+    // The `partial` half is a fixture check, not a behavioural one: the test removed
+    // 20 from the input, so 20 being absent from the output is arithmetic. It stays
+    // because it makes the relation legible in both directions, but nobody should
+    // read it as the payload-set gate.
+    //
+    // THE ACTUAL GATE IS ELSEWHERE, in two places, because dropIntent's contract and
+    // Board.tsx's choice of argument are different things and only the second can
+    // regress: "freeze-test 3" below (contract) and Board.test.tsx's
+    // "freezes the cards the viewer cannot see" (wiring). Mutating Board.tsx to pass
+    // the rendered set left all 1316 tests green while this one passed.
     const rendered = payloadCards.filter((c) => c.iid !== 20);
     const full = dropIntent({ payloadCards, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!;
     const partial = dropIntent({ payloadCards: rendered, columnKeys, sortMode: "manual", dragIid: 30, destColumnKey: "", anchor: null })!;

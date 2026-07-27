@@ -335,3 +335,48 @@ func TestWithoutLabelMatchesExactly(t *testing.T) {
 		t.Fatalf("withoutLabel kept %v, want [2 3 4]", got)
 	}
 }
+
+// TestAClosedNonPRDIssueIsNeitherRefreshedNorKept pins the window docs/board.md
+// documents and the Board.tsx comment describes — and it exists because that comment
+// described it WRONGLY for a while, claiming the card renders no button.
+//
+// The mechanism, which is what makes the claim checkable: once a non-PRD issue
+// closes, NEITHER fetch returns it. The PRD fetch is label-filtered and it carries
+// no PRD label; the additive fetch is StateOpened and it is no longer open. So the
+// cached row is never re-upserted — its state stays 'opened', which is why the card
+// keeps rendering as an open, promotable card rather than sliding into Closed — and
+// it is absent from the union keep-set, so the next FullSync evicts it.
+//
+// Both halves are asserted, because either alone tells a misleading story: "not
+// upserted" without "evicted" reads as a leak, and "evicted" without "not upserted"
+// reads as an orderly close.
+func TestAClosedNonPRDIssueIsNeitherRefreshedNorKept(t *testing.T) {
+	st := &fakeStore{}
+	svc := newTestService(st)
+
+	// The forge's state AFTER the issue closed: the PRD fetch still returns the PRD
+	// issue, and the open fetch no longer returns issue 2.
+	f := &fakeForge{
+		issues:     []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+		openIssues: []forge.Issue{labelled(1, time.Unix(100, 0), prdLabel)},
+	}
+
+	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+
+	// Never re-upserted: nothing wrote issue 2, so its cached state is untouched and
+	// still says 'opened'. That staleness is the documented window, not a bug.
+	if got := upsertedIIDs(st); slices.Contains(got, int64(2)) {
+		t.Fatalf("upserted %v — a closed non-PRD issue must not be re-upserted; neither fetch can return it", got)
+	}
+
+	// And evicted: absent from the union keep-set, so the reconcile removes it.
+	keep := keepSet(t, st)
+	if slices.Contains(keep, int64(2)) {
+		t.Fatalf("keep-set %v still holds the closed non-PRD issue; the window must END at the reconcile", keep)
+	}
+	if !slices.Contains(keep, int64(1)) {
+		t.Fatalf("keep-set %v dropped the PRD issue, which is a different bug entirely", keep)
+	}
+}

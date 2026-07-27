@@ -96,9 +96,25 @@ describe("canPromote", () => {
     expect(canPromote(card([SELF_IMPROVE_LABEL]), "PRD")).toBe(false);
   });
 
+  it("STILL offers it on a card whose forge issue closed but has not been evicted", () => {
+    // The window docs/board.md documents. During it the row is never re-upserted —
+    // the PRD fetch is label-filtered and the additive fetch is StateOpened, so
+    // neither returns a closed non-PRD issue — so issues.state stays 'opened' and
+    // cardDTO.Closed derives FALSE. The card therefore looks and behaves exactly as
+    // it did before it closed, Promote included.
+    //
+    // This test exists because a code comment asserted the opposite (no button at
+    // all) and survived three readers, partly by citing docs/board.md as
+    // corroboration while contradicting it.
+    expect(canPromote(card(["bug"], false), "PRD")).toBe(true);
+  });
+
   it("does not offer it on a closed card", () => {
-    // Closed non-PRD cards never enter the cache at all (the additive fetch is
-    // open-only), so this is belt: a card that closes between polls still lingers.
+    // Reachable only when a row was cached WHILE closed — which the state=all PRD
+    // fetch does — and then stopped matching prd_label, i.e. an operator rename while
+    // closed PRD cards are cached. Not reachable through the sync alone, and stated
+    // that narrowly on purpose: the comment that used to claim this was the ordinary
+    // post-close window was wrong.
     expect(canPromote(card(["bug"], true), "PRD")).toBe(false);
   });
 });
