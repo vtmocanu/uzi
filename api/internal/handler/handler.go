@@ -243,6 +243,7 @@ func toDTO(u store.User) apitypes.UserDTO {
 		IsAdmin:          u.IsAdmin,
 		IsActive:         u.IsActive,
 		AutopilotEnabled: u.AutopilotEnabled,
+		WaitOnLimit:      u.WaitOnLimit,
 		JudgeEnabled:     u.JudgeEnabled,
 		CreatedAt:        u.CreatedAt.Time,
 		// The judge binding's id; the LABEL is filled in only by the routes that
@@ -466,6 +467,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens judging their finished runs. Session-scoped identity
 			// (never the body), like autopilot.
 			r.Put("/me/judge", h.SetJudgeEnabled)
+			// Current-user usage-limit park default (PRD #35 Decision 7): whether a NEW
+			// run parks rather than fails when this user's Anthropic window is exhausted.
+			// Cookie-only with its two neighbours, and for the same reason: it is consent
+			// to uzi holding an issue lock and a worker's disk for up to RUN_LIMIT_MAX_PARK
+			// on the caller's behalf, which a stolen CLI token must not be able to switch on.
+			r.Put("/me/wait-on-limit", h.SetUserWaitOnLimit)
 		})
 
 		// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
@@ -827,6 +834,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// mirroring ConfirmProposal — not the RequireUser read group the draft GET
 				// sits in. Owner-or-admin to see the recommendation, caller-owns-repo to write.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
+				// Per-run usage-limit opt-in (PRD #35 Decision 7, the surface the user chose
+				// over a start-run modal). Cookie-only, matching /me/wait-on-limit: the same
+				// consent, at a finer grain. Owner-scoped in SQL, spends nothing, mints
+				// nothing, and never touches the run's status.
+				r.Put("/{id}/wait-on-limit", h.SetRunWaitOnLimit)
 			})
 		})
 

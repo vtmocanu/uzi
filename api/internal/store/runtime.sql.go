@@ -517,8 +517,8 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
-VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7)
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit)
+VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7, $8)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type
 `
 
@@ -530,6 +530,7 @@ type CreateRunParams struct {
 	IssueDescription string      `json:"issue_description"`
 	OriginColumn     pgtype.Text `json:"origin_column"`
 	AutoApprove      bool        `json:"auto_approve"`
+	WaitOnLimit      bool        `json:"wait_on_limit"`
 }
 
 // Runs ---------------------------------------------------------------------
@@ -544,6 +545,19 @@ type CreateRunParams struct {
 // the worker reads it to resolve the plan gate without a human.
 // repo_id is nullable since PRD #39 (chat runs carry none); the ::uuid cast keeps
 // this INSERT param a non-null uuid.UUID — an issue run always targets a repo.
+//
+// wait_on_limit is the PRD #35 opt-in, resolved in the SERVICE layer as
+// COALESCE(explicit request, the owner's users.wait_on_limit default) and passed in
+// explicitly, rather than defaulted in SQL. Naming the column here is what makes an
+// unstamped creation path visible in a diff of THIS file.
+//
+// 🔴 IT IS NOT VISIBLE TO THE COMPILER, THOUGH, AND ASSUMING OTHERWISE IS THE TRAP.
+// sqlc generates a PARAMS STRUCT, and a Go struct literal that omits a field
+// compiles happily and yields the zero value — which for a bool is false, i.e. every
+// run from that path silently opted OUT. Measured while writing this: adding the
+// column and regenerating left `go build ./...` fully green with all three call
+// sites unstamped. So the guard here is a TEST that creates a run for an opted-in
+// owner and asserts the flag arrives, per creation path — not the type system.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.UserID,
@@ -553,6 +567,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.IssueDescription,
 		arg.OriginColumn,
 		arg.AutoApprove,
+		arg.WaitOnLimit,
 	)
 	var i Run
 	err := row.Scan(
@@ -855,6 +870,23 @@ UPDATE runs SET status = 'failed',
     updated_at         = now()
 WHERE id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- limit_wait excluded EXPLICITLY (PRD #35) — the third statement in this file to
+  -- need it, for the same reason as SetRunRunning and SetRunAwaitingApproval above:
+  -- the negative predicate on the line above ADMITS a parked run. Auto-stopping one
+  -- would be wrong on the merits, not merely unreachable: its message writes are not
+  -- in a permanent-failure loop, they have simply STOPPED, because the worker went
+  -- away by design and the server owns the resume.
+  --
+  -- The reason to spend a clause on an unreachable case is that the invariant is
+  -- currently stated in a DIFFERENT PACKAGE from the one that enforces it.
+  -- workersvc/autostop.go's ` + "`" + `if run.Status != "running"` + "`" + ` is the only thing excluding
+  -- a park today, and that line's own comment justifies itself entirely in terms of
+  -- ` + "`" + `queued` + "`" + ` and PRD #108's requeue streak — parking is not mentioned there, because
+  -- it did not exist when it was written. Someone relaxing that Go line later (to
+  -- cover awaiting_approval, say) would make parked runs auto-stoppable with no SQL
+  -- backstop and no failing test. This is that backstop, written where the guard is
+  -- ENFORCED rather than where it is currently derived.
+  AND status <> 'limit_wait'
 `
 
 type FailRunAutoStopParams struct {
@@ -1163,7 +1195,11 @@ SELECT rp.web_url             AS repo_web_url,
        c.forge_type,
        c.base_url,
        c.bot_username,
-       c.token_ciphertext
+       c.token_ciphertext,
+       (EXISTS (SELECT 1 FROM run_user_inputs i
+                WHERE i.run_id = r.id
+                  AND i.kind = 'approve_plan'
+                  AND i.consumed_at IS NOT NULL))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
@@ -1180,11 +1216,45 @@ type GetRunClaimContextRow struct {
 	BaseUrl           string      `json:"base_url"`
 	BotUsername       string      `json:"bot_username"`
 	TokenCiphertext   []byte      `json:"token_ciphertext"`
+	HumanPlanApproved bool        `json:"human_plan_approved"`
 }
 
 // The repo + connection facts the claim payload needs, alongside the run. The
 // bot PAT (token_ciphertext) is decrypted by the service, never selected in the
 // clear from the DB.
+//
+// human_plan_approved is the HUMAN half of the claim payload's plan_approved
+// (PRD #35 Decision 6b); the service ORs it with the run's auto_approve. A resumed
+// run whose plan a human already approved must skip the Phase-1 planning turn and
+// the gate, replaying plan_md instead — otherwise a park-and-resume re-plans,
+// re-parks at awaiting_approval in front of a human who already approved, and can
+// fail with REASON_NO_PLAN when the resumed session declines to re-emit its plan.
+//
+// ::boolean is not decoration: sqlc's inference is weaker on EXPRESSIONS than on
+// columns, and an uncast EXISTS(...) types as interface{}, which is unusable as a
+// Go bool (measured on PRD #113 M5's `IS NOT NULL` projection).
+//
+// 🔴 THE INVARIANT THIS RELIES ON, WRITTEN HERE BECAUSE THIS IS WHERE IT IS READ.
+// The predicate is SetRunRunning's, whose own comment records an accepted residual:
+// a consumed round-1 approve_plan lets a stale round-2 pre-gate report through. For
+// SetRunRunning that residual hides a gate. Here it would tell the worker to skip
+// Phase 1 and IMPLEMENT AN UNREVIEWED plan_md — the same residual with a materially
+// worse blast radius, which is why it is spelled out rather than inherited.
+//
+// It is sound today, and the reason is structural rather than lucky, so it is a
+// property of the QUERY PAIR and not of the worker's loop:
+//   - a park is running-only (SetRunLimitWait's positive source guard), and
+//   - a revise round sits at awaiting_approval, which SetRunRunning refuses to
+//     leave for 'running' unless a consumed approve_plan exists.
+//
+// So the ordinary multi-round revise flow cannot reach a park at all. The one
+// surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
+// already names: if that admits a run to 'running' and it then parks, the resume
+// skips the gate on an unreviewed plan_md. Required invariant, stated so a future
+// change can be checked against it: NO awaiting_approval REPORT REWRITES plan_md
+// AFTER THE CONSUMED approve_plan THAT MADE human_plan_approved TRUE. A tighter
+// derivation is not cheaply available — runs carries no plan_md_set_at to compare
+// consumed_at against, and inventing one is out of this PRD's scope.
 func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetRunClaimContextRow, error) {
 	row := q.db.QueryRow(ctx, getRunClaimContext, runID)
 	var i GetRunClaimContextRow
@@ -1198,6 +1268,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.BaseUrl,
 		&i.BotUsername,
 		&i.TokenCiphertext,
+		&i.HumanPlanApproved,
 	)
 	return i, err
 }
@@ -2614,6 +2685,84 @@ func (q *Queries) MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Tim
 	return result.RowsAffected(), nil
 }
 
+const promoteLimitWaitRuns = `-- name: PromoteLimitWaitRuns :many
+UPDATE runs SET
+    status     = 'queued',
+    started_at = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE status = 'limit_wait' AND retry_not_before <= $1
+RETURNING id, user_id, status
+`
+
+type PromoteLimitWaitRunsRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// The sweeper's promotion pass (PRD #35 M2): limit_wait → queued once the clock
+// passes retry_not_before. Backed by idx_runs_limit_wait_retry, a partial index on
+// exactly this predicate, so the pass costs an index scan over a set that is empty
+// on a healthy instance rather than a seq scan of runs.
+//
+// 🔴 THIS IS A SINGLE UPDATE THAT RELEASES EVERY ELIGIBLE ROW IN ONE TICK. Nothing
+// here staggers a wave, so "the sweeper tick already spreads them out" is exactly
+// backwards — this statement is what makes the staggering necessary. The ONLY
+// mechanism spreading a promoted wave across a user's credential pool is the 60-180s
+// jitter baked into retry_not_before at PARK time (workersvc/limitwait.go's
+// limitParkJitter, ADR-35 D4). That is written here as well as there because this is
+// where someone reasons about promotion timing, and removing the jitter as
+// redundant-with-the-tick is the specific mistake available from this file.
+//
+// started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall (Decision 6d).
+// Without it, SweepRunningTimeout measures the resumed run against a started_at
+// from before a park that may have lasted days, and the run is failed on its first
+// tick back — the feature would deliver a run that resumes and immediately dies.
+//
+// requeue_count is deliberately NOT bumped (Decision 5): it counts worker deaths
+// and this is not one. limit_wait_count already recorded the park, and letting a
+// park consume re-queue budget would fail a run for a reason that never happened.
+//
+// session_id, last_seq and worker_id are untouched, exactly as in every other
+// requeue query here: the session is what makes the resume a resume rather than a
+// restart, and worker_id is affinity, so the same disk reclaims the run and its
+// clone if that worker is still alive.
+//
+// limit_resets_at / retry_not_before / rate_limit_type are LEFT IN PLACE as
+// history — the run view renders "attempt N, last paused on <window>" from them
+// after the resume. A stale retry_not_before cannot re-fire this statement because
+// the status predicate has already moved.
+//
+// Health reset for the same reason SetRunLimitWait carries one, from the other
+// side: the detector's allowlist DOES include 'queued', so it re-evaluates the
+// queued signal from this transition's fresh updated_at rather than inheriting
+// anything.
+//
+// RETURNING id, user_id, status matches every other sweep transition in this file,
+// so the caller can publish each promotion through the broadcaster/notifier
+// fan-out; a promotion to 'queued' moves the board card to In Progress exactly like
+// a requeue.
+func (q *Queries) PromoteLimitWaitRuns(ctx context.Context, now pgtype.Timestamptz) ([]PromoteLimitWaitRunsRow, error) {
+	rows, err := q.db.Query(ctx, promoteLimitWaitRuns, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PromoteLimitWaitRunsRow{}
+	for rows.Next() {
+		var i PromoteLimitWaitRunsRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordRunColumnMove = `-- name: RecordRunColumnMove :execrows
 UPDATE runs SET board_column = $1, move_pending_since = NULL, updated_at = now()
 WHERE id = $2
@@ -3260,6 +3409,102 @@ func (q *Queries) SetRunHealth(ctx context.Context, arg SetRunHealthParams) (int
 	return result.RowsAffected(), nil
 }
 
+const setRunLimitWait = `-- name: SetRunLimitWait :execrows
+UPDATE runs SET
+    status           = 'limit_wait',
+    limit_resets_at  = $1,
+    rate_limit_type  = $2,
+    retry_not_before = $3,
+    limit_wait_count = limit_wait_count + 1,
+    session_id       = COALESCE($4, session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at       = now()
+WHERE id = $5 AND worker_id = $6
+  AND status = 'running'
+  AND kind <> 'judge'
+`
+
+type SetRunLimitWaitParams struct {
+	LimitResetsAt  pgtype.Timestamptz `json:"limit_resets_at"`
+	RateLimitType  pgtype.Text        `json:"rate_limit_type"`
+	RetryNotBefore pgtype.Timestamptz `json:"retry_not_before"`
+	SessionID      pgtype.Text        `json:"session_id"`
+	ID             uuid.UUID          `json:"id"`
+	WorkerID       pgtype.UUID        `json:"worker_id"`
+}
+
+// Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
+// M2). running → limit_wait, non-terminal: the run keeps its issue, its session,
+// its worker affinity and its message history, and the sweeper promotes it back to
+// queued once retry_not_before passes.
+//
+// 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), WHICH IS THE FIRST POSITIVE
+// SOURCE GUARD IN THIS FILE'S WORKER-REPORT FAMILY — every sibling above is
+// negative (status NOT IN (terminal)). Do NOT "normalize" it to match them.
+// Negative here would admit three transitions that must never happen and one that
+// would be actively unsafe:
+//   - queued/claimed → limit_wait: an affinity-queued run parked by a stale report
+//     would leave the sweeper's promotion pass owning a run no worker holds.
+//   - awaiting_approval → limit_wait: a run sitting at the plan gate is not
+//     spending tokens, so it cannot have hit a limit; parking one would swallow the
+//     human's pending approval.
+//   - limit_wait → limit_wait: a re-delivered park report would bump
+//     limit_wait_count a second time and burn RUN_LIMIT_MAX_WAITS on one event.
+//
+// With the positive guard, every one of those is a 0-row no-op, which the service
+// surfaces to the worker as 409 / applied=false. Re-delivery is therefore
+// idempotent, and the worker's cleanup carve-out keys off the RETURNED STATUS
+// rather than off applied, so a refused park cleans up rather than leaking.
+//
+// kind <> 'judge' is Decision 14: a judge run is executed by a different runner
+// with its own error path, its value decays (a judge parked for days is reviewing a
+// run nobody remembers), and it is never re-enqueued. It dies with an explanatory
+// reason instead. The guard lives HERE, in SQL, rather than only in Go, because the
+// Go side is what composes that better death and a bypass would silently park.
+// 'chat' needs no clause: a chat run never reaches SetState's run lane at all.
+//
+// retry_not_before is computed in GO and passed in — never derived here from
+// limit_resets_at. It carries the Decision 4 cross-check against this user's own
+// gauge, Decision 6e's pool awareness, jitter, and the RUN_LIMIT_MAX_PARK clamp,
+// none of which SQL is positioned to do. limit_resets_at is the WORKER'S REPORT,
+// kept for display and the M5 Slack line; it is deliberately not the gate, so a
+// compromised worker cannot park a run for years.
+//
+// limit_wait_count bumps here rather than in Go so the increment and the transition
+// are one statement: a run cannot end up parked without its budget being spent.
+// It is distinct from requeue_count on purpose (Decision 5) — requeue_count counts
+// worker deaths, this counts limit parks, and a shared counter would let one
+// exhaust the other's budget.
+//
+// 🔴 THE HEALTH RESET IS MANDATORY HERE, NOT THE STYLE CHOICE THE PRD CALLED IT.
+// ListActiveRunsForHealth is a POSITIVE allowlist ('queued','running',
+// 'awaiting_approval'), so the PRD #47 detector never revisits a parked run. That
+// is listed as a free win — a park can never read "stalled" — and it cuts the other
+// way too: whatever flag was live at park time would FREEZE for the entire park,
+// because nothing will ever revisit the row to clear it. A run parked while flagged
+// stalled would stay stalled for days, and it is user-visible rather than cosmetic
+// (cmd/uzi's crewStateFor reads health AFTER the terminal and gate checks, so a
+// parked run falls straight into crewStalled). That is Success Criterion 2 failing
+// through the health column instead of the status column. Do NOT "fix" it by adding
+// limit_wait to ListActiveRunsForHealth: stalled/looping/slow all describe a
+// RUNNING agent, and making a park flaggable re-introduces the false alarm
+// Decision 3 banks on avoiding. health_notified_at is NOT reset, matching every
+// other exit contract in this file.
+func (q *Queries) SetRunLimitWait(ctx context.Context, arg SetRunLimitWaitParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunLimitWait,
+		arg.LimitResetsAt,
+		arg.RateLimitType,
+		arg.RetryNotBefore,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setRunMRState = `-- name: SetRunMRState :execrows
 
 UPDATE runs SET mr_state = $1, updated_at = now()
@@ -3373,6 +3618,46 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 		arg.ID,
 		arg.WorkerID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setRunWaitOnLimit = `-- name: SetRunWaitOnLimit :execrows
+UPDATE runs SET wait_on_limit = $1, updated_at = now()
+WHERE id = $2 AND user_id = $3
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type SetRunWaitOnLimitParams struct {
+	WaitOnLimit bool      `json:"wait_on_limit"`
+	ID          uuid.UUID `json:"id"`
+	UserID      uuid.UUID `json:"user_id"`
+}
+
+// Flip ONE run's usage-limit opt-in after the fact (PRD #35 Decision 7, the per-run
+// surface the user ruled for on 2026-07-27 in place of a start-run modal).
+//
+// Owner-scoped: a run is toggled by the person whose credentials it spends, and the
+// predicate is the write's own authorization rather than a fact maintained
+// elsewhere. A foreign run returns 0 rows, which the handler maps to 404 — never
+// 403, which would confirm the run exists.
+//
+// The status guard is CancelRunServerSide's, deliberately reused verbatim: negative,
+// so it covers limit_wait for free and needs no edit for any future non-terminal
+// status. A terminal run is a no-op rather than an error — the toggle changes FUTURE
+// limit behaviour, and a finished run has none.
+//
+// 🔴 IT DOES NOT TOUCH status, AND MUST NOT. Flipping the flag OFF on a parked run
+// does not un-park it: Decision 11's cancel is that control, and silently failing a
+// user's run because they changed a preference would destroy work they never asked
+// to lose. Flipping it ON while parked is likewise inert — the run is already
+// parked. The flag is read at the NEXT limit event and at the next claim (the worker
+// re-reads it from the row every time), which is what makes a mid-flight change take
+// effect without this statement needing to reach into the state machine.
+func (q *Queries) SetRunWaitOnLimit(ctx context.Context, arg SetRunWaitOnLimitParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunWaitOnLimit, arg.WaitOnLimit, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}

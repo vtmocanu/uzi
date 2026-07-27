@@ -351,6 +351,14 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		// middleware, so an implementation that widened all three passes it.
 		{"autopilot opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/autopilot"},
 		{"judge opt-in (spends unattended, D23 group split)", http.MethodPut, "/api/me/judge"},
+		// PRD #35 Decision 7. Both wait-on-limit routes are cookie-only for the same
+		// reason as their neighbours: consent to uzi holding an issue's one-active lock
+		// and a worker's disk for up to RUN_LIMIT_MAX_PARK on the caller's behalf. Listed
+		// here because route_limiter_mounts_test pins the LIMITER, not the auth
+		// middleware, so an implementation that mounted these on RequireUser would pass
+		// that test and silently widen a consent switch to a stolen CLI token.
+		{"wait-on-limit default (park consent)", http.MethodPut, "/api/me/wait-on-limit"},
+		{"wait-on-limit per run (park consent)", http.MethodPut, "/api/runs/" + runID.String() + "/wait-on-limit"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)

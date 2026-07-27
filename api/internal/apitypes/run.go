@@ -185,12 +185,19 @@ type RunDTO struct {
 	// run back to queued.
 	//
 	// The two are separate fields because they are separate facts and they routinely
-	// differ: RetryNotBefore carries jitter, is clamped to RUN_LIMIT_MAX_PARK, is
+	// differ: RetryNotBefore carries jitter, is bounded by RUN_LIMIT_MAX_PARK, is
 	// cross-checked against the owner's own rate-limit gauge, and is pool-aware — a
 	// user with a second credential that still has headroom is promoted early, so
 	// RetryNotBefore can be far EARLIER than LimitResetsAt. Render the countdown off
 	// RetryNotBefore (that is when work resumes) and LimitResetsAt only as context.
 	// Both null for a run that has never parked.
+	//
+	// "Bounded by", not "clamped to", and the distinction is user-visible: PRD #35
+	// Decision 4 says a computed stamp beyond RUN_LIMIT_MAX_PARK FAILS the run with a
+	// clear reason rather than being pulled back to the ceiling. So a client will never
+	// see a RetryNotBefore sitting exactly at now+RUN_LIMIT_MAX_PARK as the result of a
+	// clamp — that run is `failed`, not parked. (Corrected 2026-07-27: this comment
+	// said "clamped", which would have a client render a wait that never happens.)
 	LimitResetsAt  *time.Time `json:"limit_resets_at"`
 	RetryNotBefore *time.Time `json:"retry_not_before"`
 	// LimitWaitCount is how many times this run has parked, capped server-side by

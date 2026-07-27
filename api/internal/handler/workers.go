@@ -675,6 +675,14 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	user, _ := mw.UserFromContext(r.Context())
 	var req struct {
 		IssueIID int64 `json:"issue_iid"`
+		// PRD #35 Decision 7: the per-run usage-limit opt-in, for CLI and API callers.
+		// A POINTER, so "the caller said false" and "the caller said nothing" stay
+		// distinct — a plain bool would make every existing client silently override
+		// the user's own Settings default with false the moment this field shipped.
+		// The web start button omits it and inherits the default (the user ruled
+		// against a start-run modal on 2026-07-27); the per-run toggle is
+		// PUT /api/runs/{id}/wait-on-limit.
+		WaitOnLimit *bool `json:"wait_on_limit"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -712,7 +720,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 
 	// The description cap is enforced inside CreateRun (shared with the autopilot
 	// path), surfaced here as ErrDescriptionTooLarge → 422.
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD)
+	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD, req.WaitOnLimit)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):

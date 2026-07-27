@@ -645,6 +645,54 @@ func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgt
 	return theme, err
 }
 
+const setUserWaitOnLimit = `-- name: SetUserWaitOnLimit :one
+UPDATE users SET wait_on_limit = $2 WHERE id = $1
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit
+`
+
+type SetUserWaitOnLimitParams struct {
+	ID          uuid.UUID `json:"id"`
+	WaitOnLimit bool      `json:"wait_on_limit"`
+}
+
+// Flip a user's usage-limit park default (PRD #35 Decision 7). Per-user consent to
+// a run PARKING rather than failing when the owner's Anthropic window is exhausted;
+// default false, set from the user's own Settings page.
+//
+// It is the DEFAULT a new run inherits, never a retroactive switch: every run
+// carries its own runs.wait_on_limit, stamped at creation, and flipping this changes
+// nothing about a run that already exists (parked or otherwise). That is the same
+// shape as autopilot_enabled above and is what makes the per-run toggle
+// (SetRunWaitOnLimit) a separate write rather than a filter over this one.
+func (q *Queries) SetUserWaitOnLimit(ctx context.Context, arg SetUserWaitOnLimitParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserWaitOnLimit, arg.ID, arg.WaitOnLimit)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+		&i.JudgeEnabled,
+		&i.JudgeAnthropicSecretID,
+		&i.WaitOnLimit,
+	)
+	return i, err
+}
+
 const updatePassword = `-- name: UpdatePassword :exec
 UPDATE users
 SET password_hash = $2, token_version = token_version + 1

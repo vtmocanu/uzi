@@ -58,6 +58,30 @@ type ClaimPayload struct {
 	// awaiting_approval in front of a human who already approved, and can fail with
 	// REASON_NO_PLAN when the resumed session declines to re-emit signal_plan.
 	PlanApproved bool `json:"plan_approved"`
+	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
+	// agent_exclusions), replayed on every claim. Omitted when the run has none.
+	//
+	// 🔴 IT SHIPS BECAUSE PlanApproved SHIPS, AND THE TWO COME FROM ONE HUMAN
+	// VERDICT. Normally the selection reaches the worker on the approve_plan
+	// verdict — but a run resumed with plan_approved already true HAS NO VERDICT to
+	// carry it, so the worker falls through to resolveAgentSelection's "absent"
+	// default (repo when a roster was detected, else own, NO exclusions). The
+	// consequence is concrete: a human who excluded a subagent at the plan gate gets
+	// it back after a park, silently.
+	//
+	// The argument for fixing it is NOT that exclusions are a security control —
+	// they are not, every subagent still comes from the same vetted set and the
+	// Agent-guard hook is still frozen to it. It is that Decision 6b's whole premise
+	// is "we may skip the gate BECAUSE the human already approved". Propagating the
+	// approval while dropping the exclusions that were part of the same decision
+	// honours half a verdict, and that is worse than honouring none, because the
+	// user gets no signal: they excluded something deliberately, the run resumes,
+	// and it comes back.
+	//
+	// Nil, not an empty selection, when the run never reached a gate — the worker's
+	// absent-default is correct there and must stay reachable. Additive on the wire:
+	// an old worker ignores the key and behaves exactly as it does today.
+	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through

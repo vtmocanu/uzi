@@ -97,6 +97,30 @@ SELECT s.id                     AS user_secret_id,
 FROM user_secrets s
 LEFT JOIN anthropic_rate_limits rl ON rl.user_secret_id = s.id
 LEFT JOIN (
+    -- 🔴 'limit_wait' IS EXCLUDED DELIBERATELY, AND WIDENING THIS STATUS SET TO
+    -- INCLUDE IT IS WRONG (PRD #35, ADR-35 D4). This is the line someone reaches for
+    -- on noticing that a promoted wave can converge, so the reasoning lives here
+    -- rather than in the ADR alone — an unexplained exclusion reads as an oversight
+    -- and gets "fixed".
+    --
+    -- A PARKED RUN'S anthropic_secret_id NAMES THE CREDENTIAL IT SPENT, NOT THE ONE
+    -- IT IS ABOUT TO SPEND. The park does not clear it, promotion does not clear it,
+    -- and only the next claim's recordRunCredential overwrites it. So counting parked
+    -- runs would pile phantom load onto the EXHAUSTED credential — the one the ranker
+    -- is already avoiding for being empty — and would add exactly ZERO asymmetry
+    -- between the candidates a promoted wave will actually converge on.
+    --
+    -- The general form, which is the part worth preserving: the in-flight bias works
+    -- because it is PER-TOKEN ASYMMETRIC, and a run that has not yet chosen
+    -- contributes no asymmetry. Parked load is structurally unrankable. No widening
+    -- of this counter — by status, by retry_not_before, by anything — can spread a
+    -- wave, because the information it would need does not exist until the run picks.
+    -- The mechanism that DOES spread a wave is the jitter on retry_not_before
+    -- (workersvc/limitwait.go); if convergence ever bites, that range is the knob.
+    --
+    -- 'awaiting_approval' counts for the opposite reason and the contrast is the
+    -- point: that run's worker is holding its session and WILL resume on that same
+    -- token, so its load is real and already directed.
     SELECT r.anthropic_secret_id AS sid, count(*) AS n
     FROM runs r
     WHERE r.user_id = $1
