@@ -688,9 +688,12 @@ describe("dependency provisioning notes (#157)", () => {
     // whatever the rebuilder failed to think of, which is precisely how the original
     // test went blind; my own first attempt missed homoglyphs, zalgo stacks, the Unicode
     // TAG block (the standard invisible-ASCII smuggling vector for LLMs), variation
-    // selectors and the bidi isolates. Characters are built from code points rather than
-    // written literally, because a literal RLO or ZWSP in a fixture is invisible to a
-    // reviewer and to grep.
+    // selectors and the bidi isolates.
+    //
+    // DO NOT "TIDY" THESE INTO LITERAL CHARACTERS. They are built from code points on
+    // purpose: a literal RLO or ZWSP is invisible to a reviewer, invisible to `grep`, and
+    // does not survive copy-paste reliably — so the fixture whose entire job is to be
+    // checked becomes the one file nobody can check. The escape is the readable form.
     //
     // The last few entries are NOT attacks and must not be read as such: `my project` and
     // `café` are ordinary directory names, kept here because the clamp mangles them and

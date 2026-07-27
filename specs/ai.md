@@ -12309,3 +12309,27 @@ Two things worth keeping:
   prefix, or colliding through the filter (`build!` and `build#` both render `build?`), are
   otherwise indistinguishable — and one can be installed while the other failed, so the note would
   assert both about the same visible string.
+
+  **Numbering fixes the contradiction, not the unactionability, and the second one hits LEGITIMATE
+  repos.** `my project` and `café` are ordinary directory names; they render `my?project` and `caf?`,
+  which look like paths, are not paths, and which the `failed` branch instructs the agent to go and
+  install — the same false belief this note exists to remove, arriving via honest inputs rather than
+  hostile ones. Entries whose rendering was lossy are therefore flagged BY INDEX, outside the fence,
+  telling the agent to locate the real directory with `ls` first. Widening the charset is the wrong
+  fix and this finding is exactly the pressure that would tempt it: allowing spaces is defensible on
+  the feed and dangerous on the prompt, which is the concrete case behind the shared-charset
+  decision above. Not merge-blocking, because it degrades to the pre-#157 status quo — the agent
+  discovers the real state and installs, which is what run `51757591` did — and it cannot manufacture
+  a false "installed", since the affected rows are in the `failed` list. That is what separates it
+  from the `truncated` gap, which created a false belief of *completeness* with no signal at all.
+
+  **What is verified about the fence, and what is NOT — the honest limit.** Its CONSTRUCTION is
+  verified by execution: 56 hostile names driven through the real function, none escaping the
+  allowlist, none adding a row, none producing a lone surrogate, and tag forgery blocked twice over
+  (an unpredictable nonce, *and* a clamp that strips `<` and `>` so a name cannot spell a tag shape
+  at all). Its EFFICACY is not verified, and no test in this repo can verify it: the payload still
+  reaches the model's context, and the fence relabels it as data. That the model then OBEYS that
+  labelling is an assumption inherited from the existing `fenceNonce()` call sites (memory, job
+  logs, the improve_uzi backlog), not something this work established. Same reduction-not-a-close
+  register as `--ignore-scripts` in §398 — say what was measured, and say what rests on an
+  assumption.
