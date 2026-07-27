@@ -6,6 +6,36 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-07-27
+
+### Fixed
+
+- **The agent no longer reinstalls dependencies the worker has already provisioned.**
+  0.11.9 added JS dependency provisioning before the agent's first turn, and it works: the
+  first real run after it shipped installed both workspaces before the agent's first tool
+  call, and hit zero `command not found` for a gate tool where earlier runs hit them
+  routinely. But nothing told the agent any of that, so it planned an `npm ci` at plan time
+  (when the background install genuinely has not finished yet) and then ran it. Since
+  `npm ci` deletes `node_modules` before installing, that destroyed the provisioned tree and
+  rebuilt it, costing exactly the time the feature exists to save. The agent is now told:
+  the plan prompts state the mechanism without promising it will succeed, since the install
+  can fail; the implement prompt carries the actual per directory results, reporting a
+  failed directory as failed so the agent can react rather than trusting a claim that is
+  false for that run. It also now says when discovery hit its directory bound, so a bounded
+  scan cannot read as full coverage (issue #157).
+
+- **Repo supplied directory names reaching the agent's prompt are contained.** Those names
+  come from reading an untrusted cloned repo, and they land outside the fences that mark
+  quoted content as data, which is the one position where instruction shaped text is what
+  those fences exist to stop. A repo could commit a directory whose name reads as an
+  instruction. Names are now filtered to a conservative character set, length bounded, and
+  placed inside a nonce fence whose tag a repo cannot forge, since the tag is drawn at
+  random during the run while the name was committed to git before the run existed. A name
+  the filter had to alter is flagged as not being a usable path, with a pointer to locate
+  the real directory, so honest names like `my project` or `café` do not silently become
+  paths that cannot be found. This reduces the surface rather than closing it: the fence
+  relabels the text as data, it does not remove it from the model's context (issue #157).
+
 ## [0.11.10] - 2026-07-27
 
 ### Fixed
