@@ -149,10 +149,57 @@ node --import tsx --test test/worker.test.ts   # single file
 
 ```sh
 ./e2e/run-e2e.sh        # isolated stack, dummy creds, stub executor; KEEP_STACK=1 to inspect
-./scripts/smoke.sh      # auth-API smoke; expects a FRESH stack (docker compose down -v first)
+./scripts/smoke.sh      # auth-API smoke; expects a FRESH stack. Tear down with
+                        # `docker compose -p <your-project> down -v`, NEVER a bare
+                        # `down -v` and never `-p uzi` (see below).
 ```
 
-**🔴 `smoke.sh` HAS NO ISOLATION OF ITS OWN, AND THE OBVIOUS WAY TO GIVE IT SOME REACHES THE REAL STACK.** Unlike `run-e2e.sh`, it never inherited the overlay treatment. Two independent facts combine, and closing either one alone is not enough:
+**🔴 `smoke.sh` HAS NO ISOLATION OF ITS OWN, AND THE OBVIOUS WAY TO GIVE IT SOME REACHES THE REAL STACK.** Unlike `run-e2e.sh`, it never inherited the overlay treatment.
+
+**Run exactly this.** Every earlier version of this entry stated the constraints correctly and left the assembly to the reader, and every defect found in it since has been an assembly step rather than a wrong fact:
+
+```yaml
+# overlay.yml
+services:
+  web:
+    ports: !override                             # on the ports KEY, not on the list item
+      - "127.0.0.1:${SMOKE_WEB_PORT}:8080"
+```
+
+```sh
+# dummy.env  (JWT_SECRET and UZI_SECRET_KEY use DIFFERENT generators, see item 3)
+SMOKE_WEB_PORT=27072
+JWT_SECRET=$(openssl rand -hex 64)
+UZI_SECRET_KEY=$(openssl rand -base64 32)
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+# UZI_SEED_* deliberately ABSENT: smoke.sh needs no seeded admin (item 4)
+```
+
+```sh
+# 1. Render and CHECK: only the remapped port, and nothing seeds.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml config
+
+# 2. Start detached. A foreground `up` blocks forever and you never get a shell.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml up -d --wait db api web
+
+# 3. PROVE the port is yours before writing anything. If this 404s or connects to
+#    something you did not start, STOP: 8080 is the real stack.
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:27072/api/health
+
+# 4. BASE must match the overlay's published port. Without it smoke.sh writes to :8080.
+BASE="http://127.0.0.1:27072" bash scripts/smoke.sh
+
+# 5. Tear down YOUR project by name. Also required between retries: a failed first
+#    `up` leaves pgdata initialised with the old password and SASL auth then fails.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml down -v
+```
+
+**The compose prefix is written out at every step on purpose.** Do not factor it into `C="env -i …"`: zsh does not word-split an unquoted variable in command position, so `$C config` tries to exec a command whose name is the whole string. That trap is documented in this very file, and introducing it inside the fix for a different trap would be its own joke. A shell function is fine; a string variable is not.
+
+**Why each piece is there.** These are the constraints, and they are what stops someone simplifying the block above back into something broken:
 
 1. **`docker-compose.yml` hardcodes `"127.0.0.1:8080:8080"`** with no `${VAR:-}` (line 200), and **Compose APPENDS override ports rather than replacing them**. Measured 2026-07-28 by rendering, not by starting:
 
@@ -167,7 +214,7 @@ So `env -i … --env-file <dummy.env> -p smk-<unique> up` is **NOT isolated**, a
 
 **Both halves are required:** a `ports: !override` overlay **and** an explicit `BASE=http://127.0.0.1:<port>`. `e2e/docker-compose.e2e.yml` is the precedent and exists for exactly this reason.
 
-**Two more things the recipe needs, both found by RUNNING it and neither guessable from reading:**
+**Found by RUNNING it, and neither guessable from reading:**
 
 3. **Both secrets must be GENERATED, and THE TWO FORMATS DIFFER.** Neither is optional and neither accepts a made-up string:
 
