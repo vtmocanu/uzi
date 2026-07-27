@@ -1132,8 +1132,20 @@ function RecommendationFiler({
       const { draft } = await api.getIssueDraft(runId, rec.id);
       setDraft(draft);
       setRepoId(draft.default_repo_id);
-      setTitle(draft.title);
-      setDescription(draft.description);
+      // Issue #124 / LOW-1: sanitize what UZI supplies, leave what the USER types alone.
+      // These are controlled components, so the state IS what gets POSTed — filtering
+      // `value=` would silently rewrite the user's own typing. The SEED is uzi-supplied
+      // (a server draft templated from `rec.target` + `rationale_md`), so it is exactly
+      // the boundary that may be cleaned.
+      //
+      // The ingest strip means new rows can no longer carry Cf at all; this covers reviews
+      // stored BEFORE it, the same argument the renderer-side strip rests on. It is also
+      // on the SAFE side of the quick-action ordering trap: measured, a Cf strip applied
+      // BEFORE the server's StripUnfencedSlashLines makes `<ZWSP>/label ~backdoor` into a
+      // line the slash-pass then DROPS, whereas stripping AFTER that pass would turn an
+      // inert line into a live GitLab quick action.
+      setTitle(stripUnsafeChars(draft.title));
+      setDescription(stripUnsafeChars(draft.description));
     } catch (e) {
       setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
     } finally {

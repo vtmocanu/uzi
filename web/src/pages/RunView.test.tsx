@@ -290,11 +290,16 @@ describe("JudgePanel (PRD #46 M4)", () => {
       }),
     });
     const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
-    await screen.findByText(/The review approved this change/);
+    // The await must resolve whether or not the strip works. Awaiting the CLEANED text
+    // here would make a mutation red at a 5s findByText timeout instead of at the
+    // assertion below — a red that looks like proof and measures something else. The
+    // verdict chip is a closed enum, so it is on screen in both states.
+    await screen.findByText("Issues found");
 
     // Nothing in the panel's rendered text carries a character from either category. This
     // is asserted over the WHOLE subtree rather than per-field on purpose: a new judge
-    // field added to this panel without the strip fails here.
+    // field added to this panel without the strip fails here. Asserted FIRST, so it is
+    // what a mutation reds on.
     const rendered = container.textContent ?? "";
     expect(rendered).not.toMatch(/[\p{Cf}]/u);
     expect(rendered).toContain("The review approved this change");
@@ -383,6 +388,36 @@ describe("JudgePanel (PRD #46 M4)", () => {
       ...over,
     };
   }
+
+  // Issue #124 / LOW-1. The draft is templated server-side from `rec.target` +
+  // `rationale_md`, so a review stored BEFORE the ingest strip can still seed a bidi
+  // override into it — and this body is written to the user's forge. The strip belongs at
+  // the SEED, not on `value=`: these are controlled components, so the state IS the POST
+  // body, and filtering the value would silently rewrite what the user typed.
+  it("strips format characters from the SEEDED draft, before the user can edit it (#124)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({
+      draft: draftFixture({
+        title: "Improve the \u202Ereviewer",
+        description: "## What the judge found\n\n\u200Bmalicious\u202E line",
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    fireEvent.click(await screen.findByText("File issue"));
+    await screen.findByText("Draft issue");
+
+    // Read the CONTROL VALUES, not the rendered text: these are what a Create click posts.
+    const title = screen.getByDisplayValue(/Improve the/) as HTMLInputElement;
+    const body = screen.getByDisplayValue(/What the judge found/) as HTMLTextAreaElement;
+    expect(title.value).not.toMatch(/[\p{Cf}]/u);
+    expect(body.value).not.toMatch(/[\p{Cf}]/u);
+    expect(title.value).toBe("Improve the reviewer");
+    // …and the markdown structure is intact: the strip spares \n, so the fenced template
+    // the server built is still a template and not one run-on line.
+    expect(body.value).toContain("## What the judge found");
+    expect(body.value).toContain("\n");
+  });
 
   it("opens the draft with templated fields on File issue click (state B)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });

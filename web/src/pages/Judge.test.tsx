@@ -142,14 +142,20 @@ describe("Judge — bidi/zero-width characters are stripped from backlog free te
       }),
     );
     const { container } = renderJudge();
-    await screen.findByText("The judge approved this");
-
-    // Expand the occurrences so run_title is on screen too — an un-expanded row would
-    // let a missed strip pass unnoticed.
+    // EVERY await here must resolve whether or not the strip works. The first cut of this
+    // test awaited `findByText("The judge approved this")`, which cannot match while the
+    // text still carries U+202E — so under a mutation the case reddened at a 5s
+    // findByText TIMEOUT and the Cf assertion below never executed at all. A red that
+    // looks like proof and measures something else is worse than no control: it is the
+    // instrument that is blind, not the code that is clean. These three anchors are
+    // stable under both states — a fixed aria-label prefix, a fixed button label, and a
+    // pattern the format character cannot break.
+    await screen.findByLabelText(/^Select /);
     fireEvent.click(screen.getByLabelText("Expand occurrences"));
-    await screen.findByText("A run");
+    await screen.findByText(/A .*run/);
 
     const rendered = container.textContent ?? "";
+    // Asserted FIRST, so it is the assertion a mutation reds on.
     expect(rendered).not.toMatch(/[\p{Cf}]/u);
     // The target is the searchable string, and the checkbox label quotes it too, so the
     // accessible name cannot disagree with what is on screen.
