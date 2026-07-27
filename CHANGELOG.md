@@ -77,6 +77,32 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   email. Coverage is per-surface, not blanket: `agent_label` is a separate, still-open
   gap tracked as issue #164 (issue #124).
 
+- **The judge no longer recommends installing a tool that policy permanently forbids.**
+  A credential-bearing CLI such as `glab`, `gh`, `aws` or `az` is barred outright, even
+  against an explicit admin allowlist, because a logged-in one reachable from the agent's
+  shell would defeat the rule that the worker holds the forge credential and the agent does
+  not. But nothing told either half of the judge that: the deterministic missing-tool scan
+  keys on a `command not found` string rather than on whether the tool could ever be
+  installed, and the judge model was never told the class exists. Both could produce an
+  install-worker-tool recommendation nobody could action, and two such recommendations had
+  reached the backlog. Seeing one of these absent is the policy working, so the scan now
+  drops them and the judge prompt names the barred class, redirecting the model to report
+  the wasted effort as a prompt or agent defect, which is actionable. Ordinary missing tools
+  are unaffected and still reported. The
+  suppression matches on the EXECUTABLE rather than the package name, which is the part
+  that is easy to get wrong: the barred package is `awscli` while the command a shell
+  reports is `aws`, so a name comparison would have covered `glab` and quietly missed the
+  whole cloud-CLI half of the list.
+
+- **Two password-manager CLIs an admin could allowlist are now barred, as was always
+  intended.** The list of credential-bearing tools that may never be installed carried
+  entries for `op` and `bw`, which are not real package names and therefore matched
+  nothing — the 1Password and Bitwarden CLIs have been installable the whole time. The
+  real names are now on the list. Nothing in the live allowlist or any repo's tool
+  profile named either, so no existing configuration is affected. What changes is that an
+  administrator can no longer add either one to the allowlist; a repository asking for one
+  was already refused, simply for not being allowlisted rather than for being barred.
+
 ## [0.11.12] - 2026-07-27
 
 ### Fixed

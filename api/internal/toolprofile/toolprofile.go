@@ -19,6 +19,7 @@
 package toolprofile
 
 import (
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -69,6 +70,13 @@ var denylist = map[string]bool{
 	"azure-cli": true, "google-cloud-sdk": true, "gcloud": true,
 	"kubelogin": true, "oci-cli": true, "doctl": true, "flyctl": true,
 	"heroku": true, "vault": true, "op": true, "bw": true,
+	// `op` and `bw` above are NOT nixpkgs attribute names — verified at the pinned rev
+	// (agent/devbox-global/devbox.lock), where both fail to evaluate. They were dead
+	// entries: the evident intent was to bar the 1Password and Bitwarden CLIs, and the
+	// real attributes are these, which were allowlistable the whole time. Added
+	// 2026-07-27 to realize that intent, not to widen policy. The bare names stay as
+	// defensive aliases, the same shape as `gcloud` beside `google-cloud-sdk`.
+	"_1password-cli": true, "bitwarden-cli": true,
 }
 
 // Denied reports whether pkg's base name is a credential-bearing CLI barred by
@@ -76,6 +84,106 @@ var denylist = map[string]bool{
 func Denied(pkg string) bool {
 	base, _ := Split(pkg)
 	return denylist[base]
+}
+
+// deniedPackageExecutables maps each denylisted PACKAGE to the executables it puts on
+// PATH. The denylist above is keyed by package name, which is right for provisioning
+// (a package name is what an admin allowlists and what devbox installs) and wrong for
+// anything observing a SHELL, where only the executable ever appears.
+//
+// The two diverge exactly where it would hurt: `awscli` installs `aws`, `azure-cli`
+// installs `az`, `google-cloud-sdk` installs gcloud/gsutil/bq. A name-equality check
+// against the denylist would cover glab and quietly miss every one of those.
+//
+// The key set MUST equal the denylist's key set; TestDeniedExecutablesCoverDenylist
+// asserts it in both directions, so adding a package to the denylist without naming
+// its executables fails the TEST rather than silently narrowing the check. (It fails
+// the test, not the build — Go compiles fine either way. The distinction matters: a
+// check that reports green while covering a subset is the exact defect the toolchain
+// guard in agent/devbox-global was rewritten to stop.)
+//
+// An executable listed here must NOT also be a package that is absent from the
+// denylist — otherwise an installable tool's CLI becomes permanently unreportable.
+// That is not hypothetical: `flyctl` symlinks its binary to `fly`, but nixpkgs `fly`
+// is the Concourse CI client, a different and allowlistable tool. Listing the alias
+// suppressed Concourse's CLI. TestDeniedExecutablesAreNotInstallablePackages pins it.
+var deniedPackageExecutables = map[string][]string{
+	"glab": {"glab"},
+	"gh":   {"gh"},
+	"hub":  {"hub"},
+	"tea":  {"tea"},
+	// The AWS CLI ships as `aws` from either package generation, plus a completer.
+	"awscli":      {"aws", "aws_completer"},
+	"awscli2":     {"aws", "aws_completer"},
+	"aws-sam-cli": {"sam"},
+	"azure-cli":   {"az"},
+	// google-cloud-sdk symlinks FIVE programs into bin, and the two easiest to forget
+	// are the credential helpers — precisely the ones worth keeping unobservable.
+	"google-cloud-sdk": {"gcloud", "gsutil", "bq", "git-credential-gcloud.sh", "docker-credential-gcloud"},
+	"gcloud":           {"gcloud"},
+	"kubelogin":        {"kubelogin"},
+	"oci-cli":          {"oci"},
+	"doctl":            {"doctl"},
+	// NOT `fly`: that alias belongs to flyctl, but the nixpkgs package named `fly` is
+	// the Concourse CI CLI, which is allowlistable. See the note above.
+	"flyctl":         {"flyctl"},
+	"heroku":         {"heroku"},
+	"vault":          {"vault"},
+	"op":             {"op"},
+	"bw":             {"bw"},
+	"_1password-cli": {"op"},
+	"bitwarden-cli":  {"bw"},
+}
+
+// deniedExecutableSet is the flattened reverse index of deniedPackageExecutables,
+// built once so lookups are O(1) on a hot scan path.
+var deniedExecutableSet = func() map[string]bool {
+	s := make(map[string]bool)
+	for _, execs := range deniedPackageExecutables {
+		for _, e := range execs {
+			s[e] = true
+		}
+	}
+	return s
+}()
+
+// DeniedExecutable reports whether cmd is an executable installed by a denylisted,
+// credential-bearing package — i.e. a command that can never be added through the
+// ALLOWLIST path, so observing it missing there is the policy working rather than a
+// gap to report.
+//
+// SCOPE, stated precisely because the obvious stronger claim is false. The denylist is
+// enforced on the TIER-1 path at three points — the admin allowlist write (via Denied),
+// and profile save + claim assembly (via Resolve → Allowed, which reads the denylist map
+// directly rather than going through Denied). It is NOT consulted on the tier-2 path: a cloned repo's own
+// devbox.json under repo_devbox_opt_in is filtered by SHAPE ONLY, so a repo that opts in
+// CAN install these. See the dated correction at agent/src/provision.ts (PRD #123 §6),
+// which retracted exactly this over-claim.
+//
+// (An earlier draft of this note said Denied() has "exactly one call site" and inferred
+// tier-1 was bounded only at the allowlist write. The call-site count was right and the
+// inference wrong — Allowed() reads the map without going through Denied, so a
+// grandfathered allowlist row still cannot pass a denied package at claim time.)
+//
+// The residual: if a tier-2 install of such a tool fails, the run really is missing
+// something it was meant to have and this suppression hides it. Not theoretical —
+// vtmocanu/uzi itself has repo_devbox_opt_in true. Narrow, accepted, recorded.
+//
+// SECOND RESIDUAL, from the basenaming below: a repo-local script sharing a name with a
+// denied CLI (`./scripts/vault`, `tools/op`) is suppressed too. Path forms were the
+// bypass basenaming exists to close, so this is deliberate — a denied CLI leaking past
+// the filter is worse than a repo script going unreported — but it is a real widening
+// and not a corner case.
+//
+// Distinct from Denied, which takes a PACKAGE name. Callers that observe shell output
+// (the judge's command-not-found scan) want this one.
+//
+// Basenames the path forms: the exec.LookPath error the scan matches carries a full
+// path (`exec: "/usr/local/bin/glab": executable file not found`), so a bare map
+// lookup would miss it — measured, before this was added. Mirrors Denied(), which
+// normalizes with Split() for the same reason.
+func DeniedExecutable(cmd string) bool {
+	return deniedExecutableSet[path.Base(strings.TrimSpace(cmd))]
 }
 
 // pkgNameRe bounds a well-formed package token: a nix-ish package name with an

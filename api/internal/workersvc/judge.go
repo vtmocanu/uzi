@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path"
 	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 )
 
 const (
@@ -100,6 +102,11 @@ var (
 // shellNames are the interpreters that REPORT a missing command; they are never the
 // missing command themselves, so the bash/zsh forms (`zsh: command not found: foo`)
 // would otherwise flag the shell prefix. Filtered out of the results.
+//
+// The path entries (`/bin/sh`, `/bin/bash`, `/usr/bin/env`) are now UNREACHABLE, since
+// normalizeCommandToken basenames before this map is consulted and the bare names below
+// already cover them. Kept rather than deleted: harmless, and removing them would make
+// this map silently wrong again if the basenaming were ever reverted.
 var shellNames = map[string]bool{
 	"bash": true, "zsh": true, "sh": true, "dash": true, "ash": true, "ksh": true,
 	"fish": true, "/bin/sh": true, "/bin/bash": true, "/usr/bin/env": true, "env": true,
@@ -144,9 +151,28 @@ func payloadText(p []byte) string {
 }
 
 // normalizeCommandToken trims whitespace and surrounding quotes off a flagged
-// executable name, the way the scan has always keyed its dedupe map.
+// executable name, then reduces it to its BASENAME.
+//
+// The basename is not cosmetic. reExecNotFound captures `/` and `.`, so Go's
+// exec.LookPath error arrives as a full path, and without this the scan carried it
+// through in two damaging ways: the recommendation's target became `/usr/bin/jq`
+// rather than `jq` — and `(category, target)` is the coordinate the cross-run backlog
+// dedupes on, so the same tool split into separate rows per invocation path — and the
+// `seen` map keyed on the raw token, so one run hitting both `jq: command not found`
+// and `exec: "/usr/bin/jq"` produced TWO candidates for one tool, consuming two of the
+// judgeMissCandidateCap slots.
+//
+// It also repairs a THIRD defect that predates the denylist work: executablesIn already
+// basenames (basenameToken), so the `green` index and the same-result veto have always
+// been keyed on basenames. A path-form candidate could therefore never match its own
+// green entry — `/usr/bin/helm` against `helm` — which meant suppressResolved could not
+// suppress it and observedGreenTools could not veto it. All three now agree.
 func normalizeCommandToken(cmd string) string {
-	return strings.Trim(strings.TrimSpace(cmd), `"'`)
+	trimmed := strings.Trim(strings.TrimSpace(cmd), `"'`)
+	if trimmed == "" {
+		return ""
+	}
+	return path.Base(trimmed)
 }
 
 // scanCommandNotFound flags missing-executable evidence in a run's tool_result
@@ -181,7 +207,25 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 
 		forEachNotFound(text, func(cmd, evidence string) {
 			cmd = normalizeCommandToken(cmd)
-			if cmd == "" || shellNames[cmd] || seen[cmd] || len(out) >= judgeMissCandidateCap {
+			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
+			// barred by Decision 6 and rejected when an admin allowlists it
+			// (toolprofile.Denied). Recommending its installation can never be actioned,
+			// so observing it absent is the policy working rather than a finding.
+			//
+			// FILTERED HERE, at collection, and that placement is load-bearing rather than
+			// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
+			// caught later (in suppressResolved, or downstream at recommendation time)
+			// would still consume a candidate slot and crowd out a genuine miss — the
+			// precise failure the cap's own comment above documents at length.
+			//
+			// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
+			// the sampled trace and can emit the same recommendation on its own; both
+			// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
+			// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
+			// the barred class so the model reclassifies to adjust_template/improve_agent,
+			// which is the actionable category — that prompt line, not this filter, is
+			// what addresses those two.
+			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || seen[cmd] || len(out) >= judgeMissCandidateCap {
 				return
 			}
 			seen[cmd] = true
