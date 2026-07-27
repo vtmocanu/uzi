@@ -5,6 +5,7 @@
 
 import {
   ApiError,
+  isTerminalRun,
   type AutoStatus,
   type BindMode,
   type AgentSelectionInput,
@@ -2158,6 +2159,22 @@ export const mockApi = {
       .map((t) => ({ name: t.name, description: t.description }));
     return delay({ run: { ...run, own_agents } }, 60);
   },
+  // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
+  // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
+  // `limit_wait` is admitted for free.
+  //
+  // 🔴 IT MUST NOT TOUCH `status`. A parked run stays parked with its clock intact;
+  // this changes what happens at the NEXT limit. A mock that helpfully un-parked the
+  // run would teach the demo (and anyone testing against it) the one wrong thing
+  // about this control.
+  setRunWaitOnLimit: async (id: string, enabled: boolean) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (isTerminalRun(run.status)) throw new ApiError(409, "this run has already finished");
+    patchRun(id, { wait_on_limit: enabled });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
   getRunReview: async (id: string) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");

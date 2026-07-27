@@ -1976,6 +1976,24 @@ const realApi = {
       ...(selection ? { selection } : {}),
     }),
 
+  /**
+   * PRD #35: flip THIS run's usage-limit opt-in. Owner-scoped; returns the updated run.
+   *
+   * 🔴 IT CHANGES THE NEXT LIMIT, NOT THE CURRENT STATUS. Sending `false` to a run
+   * that is already parked does NOT un-park, cancel or fail it — the park keeps its
+   * clock and the run still resumes; only a future limit is affected. Cancelling is
+   * `submitRunInput(id, "cancel")`, and conflating the two would be the expensive
+   * mistake here, so it is written at the call site rather than left to the name.
+   *
+   * The server guards it with the same NEGATIVE predicate CancelRunServerSide uses
+   * (`status NOT IN ('completed','failed','cancelled')`), so it is a no-op on a
+   * terminal run and covers `limit_wait` for free. Callers still gate the control on
+   * canToggleWaitOnLimit (lib/limitWait.ts) — that is the UI agreeing with the
+   * server, not the enforcement.
+   */
+  setRunWaitOnLimit: (id: string, enabled: boolean) =>
+    request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
+
   // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
   // getRunReview reads the verdict + recommendations for the run page (owner-or-
   // admin scoped server-side); review is null for a visible-but-unjudged run.

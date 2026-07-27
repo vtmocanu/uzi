@@ -38,6 +38,11 @@ import type {
 const NOW = Date.now();
 export const minsAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
 export const daysAgo = (d: number) => new Date(NOW - d * 86_400_000).toISOString();
+// minsAhead is the FUTURE direction, which nothing needed until PRD #35: a parked
+// run's whole surface is a countdown, and a countdown seeded in the past renders the
+// already-expired state instead of the one worth looking at. Relative to the same
+// frozen NOW as its siblings, so the demo's clocks stay consistent with each other.
+export const minsAhead = (m: number) => new Date(NOW + m * 60_000).toISOString();
 
 // ── Users ────────────────────────────────────────────────────────────────────
 
@@ -939,6 +944,32 @@ export const mockBoards: Record<string, Board> = {
           pipeline_id: 4201,
           synced_at: minsAgo(3),
         },
+      },
+      {
+        // PRD #35: the board's only parked card. It is what makes runBadge's
+        // `limit_wait` arm reachable in mock mode — and the card is deliberately the
+        // STATIC form: LatestRun carries no reset timestamps, so there is nothing to
+        // count down from here. If a future change makes this card show a countdown,
+        // something widened LatestRun and the Board.tsx zero-delta constraint is gone.
+        iid: 23,
+        title: "Stream run logs to the CLI with backpressure",
+        state: "opened",
+        labels: ["PRD", "In progress"],
+        web_url: uziUrl(23),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: true,
+        column: "In progress",
+        closed: false,
+        conflict: false,
+        latest_run: latestRun({
+          id: "run-limit-wait",
+          status: "limit_wait",
+          worker_name: "laptop",
+          created_at: minsAgo(141),
+          updated_at: minsAgo(6),
+        }),
+        pipeline: null,
       },
       {
         iid: 21,
@@ -1846,6 +1877,74 @@ export const mockRuns: Run[] = [
     created_at: daysAgo(3.1),
     updated_at: daysAgo(3),
   },
+  {
+    // PRD #35: a run PARKED on an Anthropic usage limit — the only fixture whose
+    // status is `limit_wait`, so it is the only one that renders the warn pill, the
+    // resume countdown, and the per-run toggle in its parked form.
+    //
+    // Its two timestamps are deliberately in the FUTURE and deliberately NOT equal.
+    // Everything else in this file is `minsAgo`, and a countdown seeded in the past
+    // renders "Resuming shortly" — which is a real state, but not the one anybody
+    // opens this fixture to look at.
+    //
+    // 🔴 retry_not_before is EARLIER than limit_resets_at, and that is the whole
+    // point of the pair. It is not an offset or a fudge: the stamp is pool-aware, so
+    // an owner whose second credential still has headroom is promoted before the
+    // dead credential's window rolls over. A fixture with retry_not_before >=
+    // limit_resets_at would let a countdown wired to the wrong field look right.
+    id: "run-limit-wait",
+    repo_id: "repo-uzi",
+    issue_iid: 23,
+    issue_title: "Stream run logs to the CLI with backpressure",
+    issue_description: "See prds/23-cli-log-stream.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "limit_wait",
+    requeue_count: 0,
+    // The park does NOT bump requeue_count (that counts worker deaths); the run has
+    // been round twice, which is what makes the "attempt 2" clause render.
+    iteration_count: 2,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: "agent/issue-24",
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    // 🔴 `ok`, NOT a flag, and this is a fixture assertion rather than a default. The
+    // park query CLEARS the health columns on entry precisely because the health
+    // detector's allowlist never revisits a parked run, so a flag live at park time
+    // would freeze for the whole park. A fixture carrying `stalled` here would
+    // reproduce the bug that clearing exists to prevent, and it would look plausible.
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: 3,
+    wait_on_limit: true,
+    limit_resets_at: minsAhead(154),
+    retry_not_before: minsAhead(97),
+    limit_wait_count: 2,
+    rate_limit_type: "five_hour",
+    claimed_at: minsAgo(140),
+    started_at: minsAgo(139),
+    finished_at: null,
+    created_at: minsAgo(141),
+    updated_at: minsAgo(6),
+  },
 ];
 
 export function SAMPLE_PLAN(): string {
@@ -2042,6 +2141,49 @@ export const mockFailedMessages: RunMessage[] = [
     usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 },
     modelUsage: { "claude-sonnet-5": { inputTokens: 8_200, outputTokens: 1_900, cacheReadInputTokens: 42_000, cacheCreationInputTokens: 0, costUSD: 0.11 } },
   }),
+];
+
+// ── Parked-on-a-usage-limit history (PRD #35) ────────────────────────────────
+// The stream behind run-limit-wait. It is the only fixture carrying the two new
+// message kinds, so it is what makes their render cases reachable in mock mode —
+// and mock mode is how this gets browser-validated at all, since a non-mock
+// `vite dev`/`preview` of this repo proxies /api at whatever real stack is running.
+//
+// It carries BOTH kinds even though one run can only have parked, because they are
+// two different rows (warn vs. danger) and the pair in one visible stream is the
+// only way to see that the distinction survives. The `limit_hit` here is the earlier
+// death of a run that had NOT opted in, replayed in the same log for that reason.
+
+let limitSeq = 0;
+const lm = (kind: string, agent: string | null, payload: unknown, minAgo: number): RunMessage => ({
+  seq: ++limitSeq,
+  kind,
+  agent,
+  agent_instance: null,
+  agent_label: null,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+export const mockLimitWaitMessages: RunMessage[] = [
+  lm("status", null, { event: "init", model: "claude-opus-4-8" }, 139),
+  lm("text", "lead", { text: "Reading the worker heartbeat path to scope the metrics endpoint." }, 138),
+  lm("tool_use", "lead", { id: "lw-1", name: "Read", input: { file_path: "api/internal/handler/workers.go" } }, 138),
+  lm("tool_result", "lead", { tool_use_id: "lw-1", content: "// Heartbeat records liveness for the claim path…" }, 137),
+  // The first park. resets_at is an EPOCH NUMBER here on purpose: that is the shape
+  // the wire contract carries, and a fixture that only ever used an ISO string would
+  // never exercise parseFeedInstant's numeric arm.
+  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: Math.floor((NOW + 41 * 60_000) / 1000), attempt: 1 }, 92),
+  lm("status", null, { text: "resumed after the usage window reopened" }, 44),
+  lm("text", "coder", { text: "Picking the metrics endpoint back up from the plan." }, 43),
+  lm("tool_use", "coder", { id: "lw-2", name: "Edit", input: { file_path: "api/internal/handler/metrics.go" } }, 40),
+  lm("tool_result", "coder", { tool_use_id: "lw-2", content: "ok" }, 40),
+  // The second park — the live one, and the reason the run row reads "attempt 2".
+  lm("limit_wait", "worker", { rate_limit_type: "five_hour", resets_at: minsAhead(154), attempt: 2 }, 6),
+  // A limit_hit from an opted-OUT run, replayed here so the danger-toned variant is
+  // visible somewhere in mock mode. Its window name is one this build knows; the
+  // untrusted-value path is covered by tests rather than by a hostile fixture.
+  lm("limit_hit", "worker", { rate_limit_type: "seven_day_opus", resets_at: minsAhead(3_400) }, 5),
 ];
 
 // ── Crew-roster demo runs (PRD #95 M2) ───────────────────────────────────────

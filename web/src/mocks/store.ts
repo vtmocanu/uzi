@@ -19,6 +19,7 @@ import {
   mockFailedMessages,
   mockLaneMessages,
   mockLaneRuns,
+  mockLimitWaitMessages,
   mockProposals,
   mockRuns,
 } from "./data";
@@ -62,6 +63,8 @@ function seed(): MockState {
   messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
+  // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows.
+  messages.set("run-limit-wait", [...mockLimitWaitMessages]);
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));

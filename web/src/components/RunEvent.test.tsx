@@ -877,3 +877,114 @@ describe("FinishTokens $0 cost (Decision 8)", () => {
     expect(container.textContent).not.toContain("$");
   });
 });
+
+// PRD #35. The two rows share a component and differ in tone and wording, so each
+// case here names which of the two it is pinning.
+describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
+  const RESETS = Date.UTC(2026, 6, 27, 21, 0, 0);
+
+  it("renders a limit_wait row as a warn-toned PAUSE, never as breakage", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: RESETS, attempt: 1 } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).toContain("paused until it resets");
+    expect(container.textContent).toContain("5-hour window");
+    // Warn, not danger: nothing failed and the run comes back on its own.
+    expect(container.querySelector(".text-warn")).not.toBeNull();
+    expect(container.querySelector(".text-danger")).toBeNull();
+  });
+
+  it("renders a limit_hit row as a DANGER-toned death, with no 'paused' wording", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 2, kind: "limit_hit", payload: { rate_limit_type: "seven_day_opus", resets_at: RESETS } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).not.toContain("paused");
+    expect(container.textContent).toContain("7-day Opus window");
+    expect(container.querySelector(".text-danger")).not.toBeNull();
+  });
+
+  it("🔴 does NOT echo an unrecognised rate_limit_type — the server's allowlist cannot reach this field", () => {
+    // The `rate_limit_type` on a run_message payload is arbitrary worker-authored
+    // text: payloads are worker JSON and the only server-side processing is a NUL
+    // strip and a rune cap. The enum allowlist people reach for when reviewing this
+    // guards the run ROW's column, on a different write path entirely.
+    //
+    // So the assertion is stronger than "it is escaped": the value must not appear in
+    // the output at all, and the sentence must still read correctly without it.
+    const hostile = "<img src=x onerror=alert(1)>";
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 3, kind: "limit_wait", payload: { rate_limit_type: hostile } })} live={false} />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).not.toContain("onerror");
+    expect(container.textContent).not.toContain("img src");
+    // The row is still useful without the clause.
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+  });
+
+  it("drops a malformed resets_at rather than rendering a plausible-looking wrong date", () => {
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 4, kind: "limit_wait", payload: { resets_at: "whenever", attempt: 3 } })} live={false} />,
+    );
+    // Not a bare `not.toContain("resets")` — the row's own sentence ends "…until it
+    // resets", so that would pass for the wrong reason and fail for the right one.
+    // The clause under test is "resets <date>".
+    expect(container.textContent).not.toMatch(/resets \S/);
+    expect(container.textContent).not.toContain("Invalid");
+    expect(container.textContent).not.toContain("NaN");
+    // The attempt still renders — one unusable field must not blank the others.
+    expect(container.textContent).toContain("attempt 3");
+  });
+
+  it("promotes an epoch-SECONDS resets_at instead of rendering 1970", () => {
+    // The wire contract carries the reset as an epoch number and normalizes seconds
+    // to milliseconds; a payload built off that field can be either.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 5, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: RESETS / 1000 } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain(new Date(RESETS).toLocaleString());
+    expect(container.textContent).not.toContain("1970");
+  });
+
+  it("hides 'attempt 1', which is noise on the row that IS the first attempt", () => {
+    const first = render(
+      <RunEventRow msg={msg({ seq: 6, kind: "limit_wait", payload: { attempt: 1 } })} live={false} />,
+    );
+    expect(first.container.textContent).not.toContain("attempt");
+    cleanup();
+    const second = render(
+      <RunEventRow msg={msg({ seq: 7, kind: "limit_wait", payload: { attempt: 2 } })} live={false} />,
+    );
+    expect(second.container.textContent).toContain("attempt 2");
+  });
+
+  it("renders a bare payload without inventing detail", () => {
+    // An older worker, or a kind that carries no structure. The row still has to say
+    // the one thing it is for.
+    const { container } = render(<RunEventRow msg={msg({ seq: 8, kind: "limit_wait", payload: null })} live={false} />);
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).not.toContain("(");
+  });
+
+  it("no longer falls through to the 'unrenderable' arm", () => {
+    // What both kinds rendered as before this change: a muted "unrenderable
+    // limit_wait event" line. Pinned so a future refactor that drops the cases fails
+    // here rather than quietly regressing to it.
+    for (const kind of ["limit_wait", "limit_hit"]) {
+      cleanup();
+      const { container } = render(<RunEventRow msg={msg({ seq: 9, kind, payload: {} })} live={false} />);
+      expect(container.textContent).not.toContain("unrenderable");
+    }
+  });
+});

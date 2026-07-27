@@ -26,6 +26,7 @@ import {
   type TriageCounts,
 } from "../lib/api";
 import { coordKey, recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
+import { canToggleWaitOnLimit, formatCountdown, runWindowLabel } from "../lib/limitWait";
 import { stripUnsafeChars } from "../lib/safeText";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import {
@@ -136,9 +137,129 @@ export function HealthFlag({ run }: { run: Run }) {
   );
 }
 
+/**
+ * PRD #35: the usage-limit surface — the resume countdown while a run is parked, and
+ * the per-run opt-in for the NEXT limit. One component for both because they are one
+ * decision from the user's side, and splitting them would put the toggle in two
+ * places depending on status.
+ *
+ * 🔴 THE TOGGLE DOES NOT UN-PARK A RUN, and the label has to survive being read in a
+ * hurry by someone whose run is stuck. Flipping it off while parked changes what
+ * happens at the NEXT limit; this park keeps its clock, and the way out of it is
+ * Stop. That is why the checkbox says "future" in its own words rather than relying
+ * on the section heading, and why it does not move or disappear when the run parks.
+ *
+ * Weight scales with state on purpose: parked, it is a warn box carrying the one
+ * fact the user came for; otherwise it is a single faint line, because a control for
+ * a limit nobody has hit yet must not outrank the run.
+ *
+ * Exported for the same reason HealthFlag and RunCompletedLine are — RunView needs
+ * routing, a live stream and a dozen API mocks to mount, so the countdown and the
+ * inertness rule would otherwise only be reachable through the whole page.
+ */
+export function LimitWaitPanel({
+  run,
+  busy,
+  onToggle,
+}: {
+  run: Run;
+  busy: boolean;
+  onToggle: (enabled: boolean) => void;
+}) {
+  const parked = run.status === "limit_wait";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    // Only while parked: off the park there is no clock, and a 1s interval running
+    // for the life of every run view is pure waste. 1s (not HealthFlag's 30s)
+    // because the countdown drops to seconds in its last minute, which is exactly
+    // when someone is watching it.
+    if (!parked) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [parked]);
+
+  // Terminal: no future limit to have an opinion about, and the server would no-op
+  // the write anyway. Nothing renders at all — not a disabled checkbox, which would
+  // only invite the question of why it is there.
+  if (!canToggleWaitOnLimit(run.status)) return null;
+
+  const toggle = (
+    <label className="flex items-center gap-2 text-xs">
+      <input
+        type="checkbox"
+        className="h-3.5 w-3.5 accent-brand"
+        checked={run.wait_on_limit}
+        disabled={busy}
+        onChange={(e) => onToggle(e.target.checked)}
+      />
+      <span className={parked ? "text-fg" : "text-muted"}>
+        Wait out future Anthropic usage limits on this run
+      </span>
+    </label>
+  );
+
+  if (!parked) return <div className="px-1">{toggle}</div>;
+
+  // 🔴 THE COUNTDOWN READS retry_not_before, NEVER limit_resets_at. They are
+  // different instants and the gap is not an offset: retry_not_before carries
+  // jitter, is clamped, is cross-checked against the owner's own rate-limit gauge,
+  // and is pool-aware — a user with a second credential that still has headroom is
+  // promoted EARLIER than the dead credential's window reopens. limit_resets_at is
+  // context ("which window, and when does it roll over"), which is why it renders as
+  // a separate clause rather than as the number the user is waiting on.
+  const countdown = formatCountdown(run.retry_not_before, now);
+  const windowName = runWindowLabel(run.rate_limit_type);
+  const resetsAt = run.limit_resets_at ? new Date(run.limit_resets_at) : null;
+  const context = [
+    windowName && resetsAt && Number.isFinite(resetsAt.getTime())
+      ? `${windowName} reopens ${resetsAt.toLocaleString()}`
+      : windowName,
+    // "attempt 1" is noise on a first park; the count only becomes information once
+    // the run has been round more than once, which is also when the retry budget
+    // starts to matter. The CAP is deliberately not on RunDTO (one server constant
+    // does not belong on every row of a list response), so this is "attempt N", not
+    // "attempt N of M".
+    run.limit_wait_count > 1 ? `attempt ${run.limit_wait_count}` : null,
+  ]
+    .filter((s): s is string => s != null && s !== "")
+    .join(" · ");
+
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          {/* role="status" so the countdown's arrival is announced, like HealthFlag. */}
+          <p role="status" className="text-sm font-semibold text-warn">
+            <span aria-hidden="true">⏸ </span>
+            Paused on an Anthropic usage limit
+          </p>
+          <p className="mt-0.5 text-xs text-muted">
+            {countdown ? (
+              <>
+                Resumes in <span className="tabular-nums text-fg">{countdown}</span>.
+              </>
+            ) : (
+              // Past retry_not_before: the promotion pass runs on a ticker, so the
+              // run is waiting on the next sweep rather than overdue. Counting up
+              // into a negative would read as a fault where there is none.
+              <>Resuming shortly.</>
+            )}
+            {context && <span> {context}.</span>}
+          </p>
+          <p className="mt-1.5 text-xs text-faint">
+            Nothing is lost — the run keeps its branch and its history and picks up where it left off. Stop it
+            if you would rather not wait.
+          </p>
+        </div>
+        {toggle}
+      </div>
+    </div>
+  );
+}
+
 export function RunView() {
   const { id = "" } = useParams();
-  const { run, messages, connected, error, submit, inputs, canSteer } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -298,6 +419,24 @@ export function RunView() {
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+
+      {/* PRD #35: the usage-limit strip. High in the stack because on a parked run it
+          carries the only thing the user came to find out — when it resumes — and low
+          in weight otherwise, where it is just the per-run opt-in. Renders nothing at
+          all for a terminal run. */}
+      <LimitWaitPanel
+        run={run}
+        busy={busy}
+        onToggle={(enabled) =>
+          act(async () => {
+            await api.setRunWaitOnLimit(run.id, enabled);
+            // The flag is not a status change, so no WS frame announces it — without
+            // this refetch the checkbox would snap back to the stale run on the next
+            // render, which reads as the write having failed.
+            await refreshRun();
+          })
+        }
+      />
 
       {/* Terminal hero: the outcome, front and center. */}
       {run.status === "completed" && (

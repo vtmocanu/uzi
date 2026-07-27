@@ -17,6 +17,7 @@ import {
   runStatusTone,
   shouldShowHealthFlag,
 } from "./runBadge";
+import { RUN_STATUS_TONES } from "../components/ui";
 import type { LatestRun, RunStatus } from "./api";
 
 // run builds a LatestRun with sane defaults, overridable per test.
@@ -127,6 +128,79 @@ describe("runBadge taxonomy", () => {
       mrIid: 42,
       mrState: "open",
     });
+  });
+
+  // PRD #35. Note what this replaces: before the explicit arm, `limit_wait` fell to
+  // runBadge's `default:` and rendered as a NEUTRAL GREY pill reading "limit wait" —
+  // legible, and wrong twice over, since a parked run is neither idle nor
+  // indistinguishable from a stopped one.
+  it("limit_wait → warn 'limit wait', with a title that explains the wait", () => {
+    const b = runBadge(run({ status: "limit_wait" }), NOW);
+    expect(b).toMatchObject({ kind: "badge", label: "limit wait", tone: "warning", pulse: false });
+    if (b.kind === "badge") expect(b.title).toMatch(/resumes on its own/i);
+  });
+
+  it("🔴 limit_wait's badge is STATIC — no countdown, no elapsed, on any input", () => {
+    // The board's LatestRun projection carries neither retry_not_before nor
+    // limit_resets_at, so there is nothing here to count down from. This is the test
+    // that fails if someone widens LatestRun to put a countdown on the card — which
+    // would also force a Board.tsx prop change, the one thing PRD #35's web work is
+    // not allowed to do while PRD #102 rewrites that file.
+    const early = runBadge(run({ status: "limit_wait", created_at: "2026-07-04T11:00:00Z" }), NOW);
+    const late = runBadge(run({ status: "limit_wait", created_at: "2026-07-04T11:59:00Z" }), NOW);
+    expect(early).toEqual(late);
+    if (early.kind === "badge") expect(early.label).toBe("limit wait");
+  });
+
+  it("🔴 a parked run carrying a stale health flag renders 'limit wait', NOT '⚠ stalled'", () => {
+    // The belt to the server's braces. The server clears health on park entry — it
+    // has to, because its health detector's allowlist never revisits a parked run, so
+    // a flag live at park time would freeze for days. This asserts the web does not
+    // depend on that having worked: `limit_wait` is absent from
+    // HEALTH_FLAGGABLE_STATUSES, so healthBadge returns null and the status wins.
+    //
+    // Getting this backwards is the concrete failure the design names: a run behaving
+    // exactly as designed, sitting on the board under a red-flag "stalled" chip.
+    const b = runBadge(
+      run({ status: "limit_wait", health: "stalled", health_since: "2026-07-04T11:59:00Z" }),
+      NOW,
+    );
+    expect(b).toMatchObject({ kind: "badge", label: "limit wait", tone: "warning" });
+    expect(isHealthFlaggableStatus("limit_wait")).toBe(false);
+    expect(shouldShowHealthFlag("stalled", "limit_wait")).toBe(false);
+  });
+});
+
+// PRD #35. runBadge.ts's header has always CLAIMED its tones mirror StatusPill's
+// RUN_STATUS_TONES "so one status renders one color everywhere". Until this, nothing
+// enforced it: the two maps live in different files, neither imports the other, and a
+// status added to one renders in a different colour on the other surface with no
+// build error and no failing test. The mirror was a comment.
+describe("RUN_STATUS_TONES ↔ runStatusTone agreement", () => {
+  it("gives every status in the pill map the same tone on the board/list surface", () => {
+    for (const [status, cfg] of Object.entries(RUN_STATUS_TONES)) {
+      // stop_kind null: the "stopped" nuance is a runBadge-only overlay that
+      // deliberately has no StatusPill counterpart (RunView passes the literal
+      // "stopped", which is not a status at all), so it is out of scope here.
+      expect([status, runStatusTone(status, null)]).toEqual([status, cfg.tone]);
+    }
+  });
+
+  it("covers limit_wait specifically, on both surfaces", () => {
+    // Named separately from the loop because the loop would still pass if BOTH maps
+    // were missing the status — it iterates the pill map, so an absent key is an
+    // absent assertion. This is the case that would have caught a limit_wait added to
+    // only one of the two.
+    expect(RUN_STATUS_TONES["limit_wait"]).toEqual({ tone: "warning" });
+    expect(runStatusTone("limit_wait", null)).toBe("warning");
+  });
+
+  it("leaves the unknown-status fallback alone", () => {
+    // Adding a key must not change how a status NOBODY has heard of behaves — an old
+    // web build against a newer server still has to degrade to a neutral pill rather
+    // than crash or borrow a neighbour's colour.
+    expect(RUN_STATUS_TONES["nine_hour_experimental"]).toBeUndefined();
+    expect(runStatusTone("nine_hour_experimental", null)).toBe("neutral");
   });
 });
 
