@@ -25,7 +25,7 @@
 // verbatim by the web and the CLI. A `100 - pct` or a synced_at comparison in
 // web/ is a bug by construction, not a style preference.
 //
-// M4 adds Select (the ranker) to this package; M2 ships the gate it stands on.
+// M2 shipped Classify (the gate); M4 adds Select (the ranker) on top of it.
 package autoselect
 
 import (
