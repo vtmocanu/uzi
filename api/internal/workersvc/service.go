@@ -95,6 +95,11 @@ var (
 	// someone else. The composite FK refuses the same binding independently, so this
 	// exists to produce the right status code, not to be the security control.
 	ErrSecretNotOwned = errors.New("anthropic secret not found for this user")
+	// ErrInvalidBindMode is a bind mode outside the closed set (PRD #111 M3) → 400.
+	// The database CHECK (00088) refuses the same value independently; this exists so
+	// the caller gets a status naming the legal modes rather than a 500 from a
+	// constraint violation.
+	ErrInvalidBindMode = errors.New("invalid anthropic bind mode")
 
 	// Agent-memory sentinels (PRD #90), mapped to HTTP by the worker handlers.
 	// ErrMemoryNoRepo rejects a save/read on a repo-less run (runs.repo_id is
@@ -940,6 +945,28 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 	return nil
 }
 
+// Worker Anthropic bind modes (PRD #111 M3, D1), mirroring migration 00088's CHECK.
+// The set is CLOSED: BindModeDefault spends the owner's default credential,
+// BindModePinned the one workers.anthropic_secret_id names, and BindModeAuto lets
+// the selector choose from the owner's opted-in pool at claim time.
+const (
+	BindModeDefault = "default"
+	BindModePinned  = "pinned"
+	BindModeAuto    = "auto"
+)
+
+// ValidBindMode reports whether a string is one of the three modes. Exported
+// because the handler validates a request body against the same closed set the
+// database CHECK enforces, and two spellings of one vocabulary is how a 500 from a
+// constraint violation replaces a 400 that could have named the legal values.
+func ValidBindMode(mode string) bool {
+	switch mode {
+	case BindModeDefault, BindModePinned, BindModeAuto:
+		return true
+	}
+	return false
+}
+
 // claimSecretID resolves WHICH credential a run-lane claim spends, and is the one
 // place that decision is made (R4: three copies of resolution drift, and a wrong
 // fallback spends the wrong account silently).
@@ -950,9 +977,10 @@ func (s *Service) recordRunCredential(ctx context.Context, run store.Run, cred c
 //     follows the judge binding" would simply be false while appearing to be
 //     handled. It belongs with the judge because it is uzi reviewing and improving
 //     itself — the same activity the judge binding exists to bill separately —
-//     not work the user asked a particular worker to do.
-//   - everything else on this lane (issue, ci_fix) → the CLAIMING worker's binding,
-//     else the owner's default.
+//     not work the user asked a particular worker to do. It is checked FIRST, so a
+//     worker's bind mode — auto included — never applies to it.
+//   - everything else on this lane (issue, ci_fix) → the claiming worker's BIND
+//     MODE decides.
 //
 // Judge runs never reach here; they fork to assembleJudgeClaim earlier.
 func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store.Run) (*uuid.UUID, error) {
@@ -962,11 +990,34 @@ func (s *Service) claimSecretID(ctx context.Context, wkr store.Worker, run store
 	return workerSecretID(wkr), nil
 }
 
-// workerSecretID is a worker's Anthropic binding as openAnthropic's override:
-// nil when the worker names no credential, which resolves the owner's default
-// (PRD #104 M3). An invalid/unset pgtype.UUID and a NULL column are the same
-// thing here — "no binding" — so this is the one place that translation lives.
+// workerSecretID is a worker's Anthropic binding as openAnthropic's override: nil
+// means "the owner's default", which is what a nil resolves to downstream.
+//
+// The MODE is what decides, and the id is read in exactly one of the three
+// (PRD #111 M3):
+//
+//   - pinned → the named credential. A NULL id here is D9: it resolves as default,
+//     which is what this function already did for an unset binding before the mode
+//     column existed, so the rule is kept true rather than newly invented. It is
+//     also not a hypothetical — 00078's FK nulls the id when the token is deleted
+//     and deliberately leaves the mode, so every pinned worker whose credential is
+//     removed lands here.
+//   - default → nil, and the id is NOT read. A stale id left behind by a mode
+//     change therefore cannot leak into a claim.
+//   - auto → nil FOR NOW. M3 ships the mode; M4 fills in this arm with the
+//     selector. Until then an auto worker behaves exactly as a default one, which
+//     is also the state auto degrades to when the pool is empty or stale (D7/R2) —
+//     so the interim behaviour is a supported outcome of the finished feature, not
+//     a placeholder that does something the design forbids.
+//
+// An unrecognised mode is impossible through the API (00088's CHECK and
+// ValidBindMode both reject it) and resolves as default if one ever appears, which
+// is the safe direction: spending the owner's default is what every worker did
+// before any of this existed.
 func workerSecretID(wkr store.Worker) *uuid.UUID {
+	if wkr.AnthropicBindMode != BindModePinned {
+		return nil
+	}
 	if !wkr.AnthropicSecretID.Valid {
 		return nil
 	}
@@ -2247,7 +2298,18 @@ func (s *Service) resolveSecretLabel(ctx context.Context, userID uuid.UUID, labe
 // UPDATE's own WHERE, which is scoped to user_id. And in the composite FK, which
 // is the layer that still refuses a cross-user binding when this check is bypassed
 // — the one the acceptance test exercises with the handler check stubbed out.
-func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID uuid.UUID, secretID *uuid.UUID) (store.Worker, error) {
+func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID uuid.UUID, mode string, secretID *uuid.UUID) (store.Worker, error) {
+	if !ValidBindMode(mode) {
+		return store.Worker{}, ErrInvalidBindMode
+	}
+	// A non-pinned mode never carries an id. Enforced HERE rather than trusted from
+	// the caller, because the pair is what makes the resolution rule work: a
+	// 'default' or 'auto' worker that kept a stale id would be one refactor away
+	// from spending it, and workerSecretID's "the id is read only in pinned mode" is
+	// a much weaker guarantee if the column is allowed to disagree with the mode.
+	if mode != BindModePinned {
+		secretID = nil
+	}
 	var bind pgtype.UUID
 	if secretID != nil {
 		// Confirm the secret is this user's before writing, so the caller gets a 404
@@ -2267,6 +2329,7 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 		ID:                workerID,
 		UserID:            userID,
 		AnthropicSecretID: bind,
+		AnthropicBindMode: mode,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

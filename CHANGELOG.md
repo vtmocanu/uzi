@@ -12,6 +12,16 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **Workers can be set to pick their Anthropic token automatically.** Settings → Workers gains
+  an **auto (from pool)** option beside the existing per-token choices, and `uzi worker
+  set-token <id> --auto` does the same from the CLI. An auto worker chooses per claim from the
+  tokens you opted into the pool, so it needs no restart and no new join token to change what
+  it spends. Existing workers are untouched: one with a pinned token stays pinned, one without
+  stays on your default. A worker whose pinned token you later delete now says plainly that it
+  uses your default, rather than showing a pin to a token that no longer exists. **The
+  selector itself lands next** — until then an auto worker spends your default token, which is
+  also what it falls back to when the pool is empty or its readings are stale (PRD #111 M3).
+
 - **An opt-in pool for auto-selecting Anthropic tokens.** Settings → Anthropic tokens gains a
   per-token "Auto-select from this token" toggle, and `uzi token pool <label> --on|--off` does
   the same from the CLI. The pool is empty by default and opting a token in is deliberate: a

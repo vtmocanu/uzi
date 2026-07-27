@@ -108,6 +108,24 @@ var runInputKinds = map[string]bool{
 // workerDTO/runDTO/messageDTO moved to the stdlib-only apitypes leaf (PRD #64 M1);
 // the mappers below stay here as the store→DTO builders.
 
+// effectiveBindMode maps a worker's stored bind mode to the one a client should
+// render (PRD #111 M3, D9): 'pinned' with no credential id reports 'default'.
+//
+// The state is real and reachable, not defensive: 00078's FK nulls
+// workers.anthropic_secret_id when the credential is deleted and deliberately
+// leaves the mode alone (a coupling CHECK is impossible — see 00088), so every
+// worker pinned to a token their owner then deletes sits in it. Resolution already
+// treats that worker as default; reporting the raw column would have every client
+// draw a pin to a token that does not exist, and each of them would need this same
+// three-line rule to avoid it. Applying it once, server-side, is the same reasoning
+// as M2's auto_status: one implementation of a rule that two surfaces read.
+func effectiveBindMode(mode string, secretID pgtype.UUID) string {
+	if mode == workersvc.BindModePinned && !secretID.Valid {
+		return workersvc.BindModeDefault
+	}
+	return mode
+}
+
 // workerDTOFromWorker builds the DTO from a bare worker row plus its active (non-chat)
 // run count and its any-kind busy flag — both computed by the list queries, never
 // derivable from a bare Worker row. The register/heartbeat/create paths hold neither
@@ -144,6 +162,7 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		UpgradeTarget:        upgradeTarget,
 		AnthropicSecretID:    uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel: textPtrValue(secretLabel != "", secretLabel),
+		AnthropicBindMode:    effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
 		ID:                   w.ID.String(),
 		Name:                 w.Name,
 		Status:               w.Status,
@@ -185,6 +204,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion string, now, apiSt
 		UpgradeLastExitCode:      int32PtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
 		AnthropicSecretID:        uuidPtrValue(w.AnthropicSecretID),
 		AnthropicSecretLabel:     textPtrValue(w.AnthropicSecretLabel.Valid, w.AnthropicSecretLabel.String),
+		AnthropicBindMode:        effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
 		ID:                       w.ID.String(),
 		Name:                     w.Name,
 		Status:                   w.Status,
@@ -496,6 +516,8 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		AnthropicToken json.RawMessage `json:"anthropic_token"`
+		// PRD #111 M3. Optional, and its absence is not a clear — see below.
+		AnthropicBindMode *string `json:"anthropic_bind_mode"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -506,14 +528,50 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "anthropic_token must be a token label, null, or omitted")
 		return
 	}
+	// The MODE the caller is asking for, derived when they did not say (PRD #111 M3).
+	//
+	// Deriving rather than requiring is what keeps every pre-#111 client working
+	// unchanged: a label has always meant "pin to this" and null "use my default",
+	// which are exactly `pinned` and `default`. So the existing web PATCH and
+	// `uzi worker set-token` keep their meaning with no version negotiation, and the
+	// derivation is the same rule 00088's backfill applies to existing rows.
+	mode := workersvc.BindModePinned
+	if token.label == "" {
+		mode = workersvc.BindModeDefault
+	}
+	if req.AnthropicBindMode != nil {
+		mode = *req.AnthropicBindMode
+		if !workersvc.ValidBindMode(mode) {
+			httpx.Error(w, http.StatusBadRequest, "anthropic_bind_mode must be one of: default, pinned, auto")
+			return
+		}
+		// A mode and a token that contradict each other are REFUSED, not silently
+		// reconciled. Either choice of winner spends a credential the caller did not
+		// ask for on some request, and "auto" arriving with a leftover label is the
+		// realistic shape of a half-updated client — exactly when a quiet reconcile
+		// does the most damage.
+		switch {
+		case mode == workersvc.BindModePinned && token.label == "":
+			httpx.Error(w, http.StatusBadRequest, "anthropic_bind_mode=pinned requires a token label in anthropic_token")
+			return
+		case mode != workersvc.BindModePinned && token.label != "":
+			httpx.Error(w, http.StatusBadRequest, "anthropic_token must be null when anthropic_bind_mode is default or auto")
+			return
+		}
+	}
 	// An omitted key is NOT a clear. Today this route carries only the binding, so a
 	// body without it asks for nothing and is a client bug worth naming — but the
 	// rule is the load-bearing part: PATCH means "change what I named", and the day
 	// this body grows a second field, absent-means-clear would wipe a user's binding
 	// every time someone renamed a worker. Answering 400 rather than 200-with-no-op
 	// avoids inventing a read path just to echo an unchanged worker back.
-	if !token.present {
-		httpx.Error(w, http.StatusBadRequest, "anthropic_token is required; pass null to use your default token")
+	//
+	// `anthropic_bind_mode` alone satisfies it: a caller switching a worker to auto
+	// has named what they are changing, and requiring a redundant `"anthropic_token":
+	// null` beside it would be ceremony, not safety.
+	if !token.present && req.AnthropicBindMode == nil {
+		httpx.Error(w, http.StatusBadRequest,
+			"anthropic_token or anthropic_bind_mode is required; pass anthropic_token null to use your default token")
 		return
 	}
 
@@ -532,9 +590,15 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 		secretID = &resolved
 	}
 
-	wkr, err := h.wsvc.SetWorkerAnthropicToken(r.Context(), user.ID, id, secretID)
+	wkr, err := h.wsvc.SetWorkerAnthropicToken(r.Context(), user.ID, id, mode, secretID)
 	if err != nil {
 		switch {
+		case errors.Is(err, workersvc.ErrInvalidBindMode):
+			// Unreachable through this handler (ValidBindMode ran above), and mapped
+			// anyway: the service is the layer that owns the vocabulary, so a future
+			// caller that skips the check gets a 400 naming the problem rather than a
+			// 500 from 00088's CHECK.
+			httpx.Error(w, http.StatusBadRequest, "anthropic_bind_mode must be one of: default, pinned, auto")
 		case errors.Is(err, workersvc.ErrWorkerNotFound), errors.Is(err, workersvc.ErrSecretNotOwned):
 			// Both are 404, and deliberately the same 404: distinguishing them would
 			// tell a caller which of the two ids they guessed happens to exist.

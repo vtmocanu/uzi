@@ -693,7 +693,20 @@ export interface Worker {
   // the DEFAULT (D1) — the binding covers the run lane only.
   anthropic_secret_id: string | null;
   anthropic_secret_label: string | null;
+  /** How this worker's run-lane claims choose a credential (PRD #111 M3):
+   *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
+   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *
+   *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
+   *  nulls the worker's id server-side and leaves the stored mode alone, so the
+   *  database legitimately holds "pinned" with no id — a worker that resolves as
+   *  default. The API applies that rule before answering, so "pinned" here always
+   *  has an id beside it and no client needs to re-derive it. */
+  anthropic_bind_mode: BindMode;
 }
+
+/** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
+export type BindMode = "default" | "pinned" | "auto";
 
 export interface AdminWorker extends Worker {
   owner_email: string;
@@ -1806,8 +1819,16 @@ const realApi = {
   // null so it falls back to the default (PRD #104 M3). Takes a LABEL, not an id —
   // the name is what a human picks. Lands on the worker's NEXT claim: no restart,
   // no re-minted join token.
-  setWorkerToken: (id: string, label: string | null) =>
-    request<{ worker: Worker }>("PATCH", `/workers/${id}`, { anthropic_token: label }),
+  /** Set HOW a worker chooses its Anthropic credential (PRD #111 M3). The mode and
+   *  the label travel together because the server refuses a contradictory pair
+   *  (a label with "default"/"auto", or "pinned" with none) rather than silently
+   *  reconciling it — either winner would spend a credential the caller did not
+   *  ask for. */
+  setWorkerBindMode: (id: string, mode: BindMode, label: string | null) =>
+    request<{ worker: Worker }>("PATCH", `/workers/${id}`, {
+      anthropic_bind_mode: mode,
+      anthropic_token: mode === "pinned" ? label : null,
+    }),
 
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.

@@ -25,8 +25,18 @@ RETURNING *;
 --
 -- Takes effect on the worker's NEXT claim — no restart, no re-minted join token,
 -- because the token never rides the worker, only each claim response.
+--
+-- Since PRD #111 M3 it writes the BIND MODE in the same statement, and that is the
+-- point rather than a convenience: mode and id describe one decision, so writing
+-- them separately would open a window where a worker reads 'pinned' with the old
+-- id, or 'default' while still carrying one. One UPDATE makes the pair atomic. The
+-- caller is responsible for sending a coherent pair (a NULL id with 'pinned' is
+-- legal here and resolves as 'default' per D9 — see 00088 for why no CHECK can
+-- enforce the coupling).
 UPDATE workers
-SET anthropic_secret_id = @anthropic_secret_id, updated_at = now()
+SET anthropic_secret_id = @anthropic_secret_id,
+    anthropic_bind_mode = @anthropic_bind_mode,
+    updated_at = now()
 WHERE id = @id AND user_id = @user_id
 RETURNING *;
 

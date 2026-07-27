@@ -747,7 +747,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type CreateWorkerParams struct {
@@ -795,6 +795,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -1392,7 +1393,7 @@ func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRun
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -1420,12 +1421,13 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -1458,12 +1460,13 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -1492,6 +1495,7 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -1506,7 +1510,7 @@ UPDATE workers SET
     stats_source          = $4,
     updated_at            = now()
 WHERE id = $5
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type HeartbeatWorkerParams struct {
@@ -1555,6 +1559,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -1764,7 +1769,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -1826,6 +1831,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.HostedGeneration,
 			&i.Worker.DockerEnabled,
 			&i.Worker.AnthropicSecretID,
+			&i.Worker.AnthropicBindMode,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -2362,7 +2368,7 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -2422,6 +2428,7 @@ type ListWorkersByUserRow struct {
 	HostedGeneration      int64              `json:"hosted_generation"`
 	DockerEnabled         pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID     pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode     string             `json:"anthropic_bind_mode"`
 	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                  bool               `json:"busy"`
 	ActiveRuns            int64              `json:"active_runs"`
@@ -2486,6 +2493,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.HostedGeneration,
 			&i.DockerEnabled,
 			&i.AnthropicSecretID,
+			&i.AnthropicBindMode,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -2586,7 +2594,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since = NULL, updated_at = now()
@@ -2619,7 +2627,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -2651,6 +2659,7 @@ type RegisterWorkerRow struct {
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -2714,6 +2723,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }
@@ -3268,13 +3278,16 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 
 const setWorkerAnthropicSecret = `-- name: SetWorkerAnthropicSecret :one
 UPDATE workers
-SET anthropic_secret_id = $1, updated_at = now()
-WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id
+SET anthropic_secret_id = $1,
+    anthropic_bind_mode = $2,
+    updated_at = now()
+WHERE id = $3 AND user_id = $4
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode
 `
 
 type SetWorkerAnthropicSecretParams struct {
 	AnthropicSecretID pgtype.UUID `json:"anthropic_secret_id"`
+	AnthropicBindMode string      `json:"anthropic_bind_mode"`
 	ID                uuid.UUID   `json:"id"`
 	UserID            uuid.UUID   `json:"user_id"`
 }
@@ -3293,8 +3306,21 @@ type SetWorkerAnthropicSecretParams struct {
 //
 // Takes effect on the worker's NEXT claim — no restart, no re-minted join token,
 // because the token never rides the worker, only each claim response.
+//
+// Since PRD #111 M3 it writes the BIND MODE in the same statement, and that is the
+// point rather than a convenience: mode and id describe one decision, so writing
+// them separately would open a window where a worker reads 'pinned' with the old
+// id, or 'default' while still carrying one. One UPDATE makes the pair atomic. The
+// caller is responsible for sending a coherent pair (a NULL id with 'pinned' is
+// legal here and resolves as 'default' per D9 — see 00088 for why no CHECK can
+// enforce the coupling).
 func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnthropicSecretParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, setWorkerAnthropicSecret, arg.AnthropicSecretID, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, setWorkerAnthropicSecret,
+		arg.AnthropicSecretID,
+		arg.AnthropicBindMode,
+		arg.ID,
+		arg.UserID,
+	)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -3318,6 +3344,7 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.HostedGeneration,
 		&i.DockerEnabled,
 		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
 	)
 	return i, err
 }

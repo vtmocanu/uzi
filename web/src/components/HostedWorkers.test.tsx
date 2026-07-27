@@ -48,6 +48,7 @@ const provisioned: Worker = {
   stats_source: null,
   anthropic_secret_id: null,
   anthropic_secret_label: null,
+  anthropic_bind_mode: "default",
 };
 
 function renderCard(hostedCount = 0, onProvisioned = vi.fn()) {

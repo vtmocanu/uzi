@@ -1098,6 +1098,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -1127,6 +1128,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // PRD #113 M5: the FAILED upgrade. Present so the demo can show the failed-worker
@@ -1172,6 +1174,7 @@ export const mockWorkers: Worker[] = [
     stats_source: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
@@ -1201,6 +1204,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "process",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
   {
     // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
@@ -1234,6 +1238,7 @@ export const mockWorkers: Worker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
   },
 ];
 
@@ -1270,6 +1275,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     stats_source: "cgroup",
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
     owner_email: "mira@uzi.local",
   },
 ];

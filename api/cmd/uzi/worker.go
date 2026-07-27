@@ -73,41 +73,62 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	// set-token points a worker at one of the caller's named Anthropic tokens
-	// (PRD #104 M3). Unlike `create`, this mints nothing and hands back no
-	// credential — it re-points a worker between tokens the caller already owns —
-	// so it is reachable from a CLI token (D8).
+	// set-token sets HOW a worker chooses its Anthropic credential (PRD #104 M3,
+	// widened by PRD #111 M3). Unlike `create`, this mints nothing and hands back no
+	// credential — it re-points a worker between tokens the caller already owns — so
+	// it is reachable from a CLI token (D8).
 	//
-	// `--default` and a label are mutually exclusive, and one of them is required:
-	// `uzi worker set-token <id>` with neither would be ambiguous between "clear the
+	// Exactly ONE of a label, --default or --auto, and one of them is required:
+	// `uzi worker set-token <id>` with none would be ambiguous between "clear the
 	// binding" and "show me the binding", and silently picking either is worse than
-	// asking.
-	var toDefault bool
+	// asking. The command keeps its name rather than becoming `set-bind-mode`,
+	// because a rename would break every script that already calls it and the verb
+	// still describes what a user is doing — choosing which token pays.
+	var toDefault, toAuto bool
 	setToken := &cobra.Command{
 		Use:   "set-token <worker-id> [label]",
-		Short: "Point a worker at one of your Anthropic tokens (or --default)",
-		Long: "Bind a worker to a named Anthropic token, so its runs spend that\n" +
-			"credential instead of your default one. Pass --default to clear the\n" +
-			"binding and fall back to your default token.\n\n" +
+		Short: "Choose how a worker picks its Anthropic token: a label, --default, or --auto",
+		Long: "Choose which Anthropic credential a worker's runs spend.\n\n" +
+			"  <label>     pin the worker to that named token\n" +
+			"  --default   use your default token\n" +
+			"  --auto      let uzi pick per claim, from the tokens you opted into the\n" +
+			"              pool with `uzi token pool` — preferring the account with the\n" +
+			"              most rate-limit headroom\n\n" +
+			"With --auto and an empty or unreadable pool the worker simply uses your\n" +
+			"default token; auto never fails a run for want of a candidate.\n\n" +
 			"Takes effect on the worker's next claim: no restart, no new join token.\n" +
-			"Chat runs on a bound worker still spend your default token.",
+			"Chat runs still spend your default token whatever the mode.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			label := ""
 			if len(args) == 2 {
 				label = args[1]
 			}
+			// Counted rather than checked pairwise: with three choices, pairwise
+			// conditions grow quadratically and the one that gets forgotten is always
+			// the pair added last.
+			chosen := 0
+			for _, on := range []bool{label != "", toDefault, toAuto} {
+				if on {
+					chosen++
+				}
+			}
+			if chosen != 1 {
+				return uzicli.Exitf(uzicli.ExitUsage,
+					"pass exactly one of: a token label, --default, or --auto")
+			}
+			mode := "pinned"
 			switch {
-			case toDefault && label != "":
-				return uzicli.Exitf(uzicli.ExitUsage, "pass either a token label or --default, not both")
-			case !toDefault && label == "":
-				return uzicli.Exitf(uzicli.ExitUsage, "pass a token label, or --default to clear the binding")
+			case toDefault:
+				mode = "default"
+			case toAuto:
+				mode = "auto"
 			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			wkr, err := c.SetWorkerToken(cmd.Context(), args[0], label)
+			wkr, err := c.SetWorkerBindMode(cmd.Context(), args[0], mode, label)
 			if err != nil {
 				return err
 			}
@@ -116,15 +137,21 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(wkr)
 			}
 			if !gf.quiet {
-				if label == "" {
+				switch mode {
+				case "auto":
+					p.Printf("worker %s now auto-selects from your Anthropic token pool\n", args[0])
+				case "default":
 					p.Printf("worker %s now uses your default Anthropic token\n", args[0])
-				} else {
-					p.Printf("worker %s now uses Anthropic token %q\n", args[0], label)
+				default:
+					// The label is user-authored; cellText is what every other
+					// user-authored cell in this binary goes through.
+					p.Printf("worker %s now uses Anthropic token %q\n", args[0], cellText(label))
 				}
 			}
 			return nil
 		},
 	}
+	setToken.Flags().BoolVar(&toAuto, "auto", false, "auto-select per claim from your opted-in token pool")
 	setToken.Flags().BoolVar(&toDefault, "default", false, "clear the binding; use the account default token")
 
 	cmd.AddCommand(list, rm, setToken)

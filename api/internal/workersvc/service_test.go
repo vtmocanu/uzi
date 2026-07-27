@@ -2413,7 +2413,10 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 		t.Fatalf("unbound worker claimed %q, want the owner's default token", got)
 	}
 
-	// 2. Bound to console-key → that credential, same worker row.
+	// 2. Bound to console-key → that credential, same worker row. Since PRD #111 M3
+	// the MODE is what makes the id readable at all, so a rebind sets both — which is
+	// exactly what SetWorkerAnthropicToken writes in one statement.
+	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: consoleID, Valid: true}
 	if got := claimToken(t, wkr); got != consoleToken {
 		t.Fatalf("bound worker claimed %q, want the console-key token — a rebind did not reach the claim payload", got)
@@ -2451,7 +2454,11 @@ func TestClaimRebindChangesCredentialWithoutRestart(t *testing.T) {
 		t.Fatalf("the unbound claim's open was scoped to %v, want the run owner %v", fs.byIDLookups[0].UserID, owner)
 	}
 
-	// 3. Unbound again → back to the default, no restart in between.
+	// 3. Unbound again → back to the default, no restart in between. Both fields,
+	// because that is what a real unbind writes: leaving mode=pinned with a NULL id
+	// would exercise D9's FALLBACK (a deleted token) rather than a deliberate
+	// unbind, and those are different facts that happen to resolve the same way.
+	wkr.AnthropicBindMode = BindModeDefault
 	wkr.AnthropicSecretID = pgtype.UUID{}
 	if got := claimToken(t, wkr); got != defaultToken {
 		t.Fatalf("after clearing the binding the worker claimed %q, want the default again", got)
@@ -2488,6 +2495,7 @@ func TestClaimBoundToVanishedSecretFailsClosed(t *testing.T) {
 	svc := New(fs, box, testParams())
 
 	wkr := worker()
+	wkr.AnthropicBindMode = BindModePinned
 	wkr.AnthropicSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 
 	payload, err := svc.Claim(context.Background(), wkr)
@@ -2527,7 +2535,11 @@ func TestJudgeClaimIgnoresWorkerBinding(t *testing.T) {
 	}
 	svc := New(fs, box, testParams())
 
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: consoleID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2601,7 +2613,11 @@ func TestJudgeClaimUsesJudgeBinding(t *testing.T) {
 
 	// The claiming worker is bound to something ELSE entirely, to prove the judge
 	// lane ignores it (D1).
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: workerBoundID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -2757,7 +2773,11 @@ func TestSelfImproveClaimFollowsJudgeBinding(t *testing.T) {
 	svc := New(fs, box, testParams())
 
 	// Claimed by a worker bound to a DIFFERENT credential: the judge binding wins.
-	wkr := store.Worker{ID: uuid.New(), UserID: owner, AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: workerID, Valid: true},
+	}
 	payload, err := svc.Claim(context.Background(), wkr)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)

@@ -5,6 +5,7 @@
 
 import {
   ApiError,
+  type BindMode,
   type AgentSelectionInput,
   type AgentTemplate,
   type AgentTemplateInput,
@@ -1842,6 +1843,7 @@ export const mockApi = {
       stats_source: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
+      anthropic_bind_mode: "default" as const,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -1854,18 +1856,28 @@ export const mockApi = {
   // PRD #104 M3: rebind a worker to a named token, or clear it with null. Mirrors
   // the real route's label→id resolution and its 400 for an unknown label, so the
   // picker's error path is browsable.
-  setWorkerToken: async (id: string, label: string | null) => {
+  setWorkerBindMode: async (id: string, mode: BindMode, label: string | null) => {
     const w = workers.find((x) => x.id === id);
     if (!w) throw new ApiError(404, "worker not found");
-    if (label === null || label.trim() === "") {
+    // Mirrors the server's refusal of a contradictory pair, so the picker's error
+    // path is browsable in the mock rather than only in production.
+    if (mode !== "pinned" && label !== null && label.trim() !== "") {
+      throw new ApiError(400, "anthropic_token must be null when anthropic_bind_mode is default or auto");
+    }
+    if (mode !== "pinned") {
+      w.anthropic_bind_mode = mode;
       w.anthropic_secret_id = null;
       w.anthropic_secret_label = null;
       return delay({ worker: { ...w } });
+    }
+    if (label === null || label.trim() === "") {
+      throw new ApiError(400, "anthropic_bind_mode=pinned requires a token label in anthropic_token");
     }
     const secret = secrets.find(
       (x) => x.kind === "anthropic_token" && x.label.toLowerCase() === label.trim().toLowerCase(),
     );
     if (!secret) throw new ApiError(400, "no Anthropic token with that label");
+    w.anthropic_bind_mode = "pinned";
     w.anthropic_secret_id = secret.id;
     w.anthropic_secret_label = secret.label;
     return delay({ worker: { ...w } });
@@ -1927,6 +1939,7 @@ export const mockApi = {
       stats_source: null,
       anthropic_secret_id: null,
       anthropic_secret_label: null,
+      anthropic_bind_mode: "default" as const,
     };
     workers.push(w);
     // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does

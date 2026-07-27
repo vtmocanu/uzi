@@ -238,6 +238,23 @@ var knownInstructions = []knownInstruction{
 			"resolution check is the complete bar for a help reference.",
 	},
 	{
+		command:  "uzi token pool",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH PRD #111 M3. `uzi worker set-token --auto` names the command
+		// that fills the pool it selects from, because "auto" is inert until a user
+		// has opted at least one token in — a help text that omitted it would send
+		// someone to a mode that silently does nothing.
+		//
+		// HELP, derived: the span sits in a cobra Long field (worker.go), which
+		// classifyKind reads as documentation rather than an emitter. Nothing runs it
+		// and nothing should; the complete bar for a help reference is that the path
+		// RESOLVES, and it does — `uzi token pool` is a real subcommand, pinned by
+		// TestTokenSubcommands and exercised by four tests in token_test.go.
+		note: "HELP: `uzi worker set-token`'s Long help cross-links the command that " +
+			"populates the auto-selection pool (worker.go). Never emitted at runtime; the " +
+			"path-resolution check is the complete bar.",
+	},
+	{
 		command:  "uzi review backlog",
 		evidence: evidenceHelpOnly,
 		// CORRECTED. The old note said "Printed by both truncation warnings". It is not:

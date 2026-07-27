@@ -66,7 +66,11 @@ func (b *bindStore) SetWorkerAnthropicSecret(_ context.Context, arg store.SetWor
 	if b.setErr != nil {
 		return store.Worker{}, b.setErr
 	}
-	return store.Worker{ID: arg.ID, UserID: arg.UserID, AnthropicSecretID: arg.AnthropicSecretID}, nil
+	return store.Worker{
+		ID: arg.ID, UserID: arg.UserID,
+		AnthropicSecretID: arg.AnthropicSecretID,
+		AnthropicBindMode: arg.AnthropicBindMode,
+	}, nil
 }
 
 func newBindHandler(t *testing.T, st *bindStore) *Handler {
@@ -264,7 +268,10 @@ func TestPatchWorkerRequiresAuth(t *testing.T) {
 // (unbound ⇒ the owner's default), a set column is the id string.
 func TestWorkerDTOCarriesBinding(t *testing.T) {
 	id := uuid.New()
-	bound := workerDTOFromWorker(store.Worker{AnthropicSecretID: pgtype.UUID{Bytes: id, Valid: true}}, 0, false, "console-key", "", time.Now(), time.Now())
+	bound := workerDTOFromWorker(store.Worker{
+		AnthropicBindMode: workersvc.BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: id, Valid: true},
+	}, 0, false, "console-key", "", time.Now(), time.Now())
 	if bound.AnthropicSecretID == nil || *bound.AnthropicSecretID != id.String() {
 		t.Fatalf("bound id = %v, want %s", bound.AnthropicSecretID, id)
 	}
@@ -275,5 +282,161 @@ func TestWorkerDTOCarriesBinding(t *testing.T) {
 	if unbound.AnthropicSecretID != nil || unbound.AnthropicSecretLabel != nil {
 		t.Fatalf("unbound worker must serialize both fields as null, got %v/%v",
 			unbound.AnthropicSecretID, unbound.AnthropicSecretLabel)
+	}
+}
+
+// --- PRD #111 M3: the bind mode --------------------------------------------
+
+// bindModeOf decodes the effective mode the response reports.
+func bindModeOf(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env struct {
+		Worker struct {
+			AnthropicBindMode string `json:"anthropic_bind_mode"`
+		} `json:"worker"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	return env.Worker.AnthropicBindMode
+}
+
+// TestPatchWorkerDerivesModeFromTokenField: a body with no mode keeps its
+// pre-#111 meaning exactly. That is what lets every existing client — the shipped
+// web picker, `uzi worker set-token`, anyone's script — keep working with no
+// version negotiation, and it is the same rule 00088's backfill applies to rows.
+func TestPatchWorkerDerivesModeFromTokenField(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	secretID, workerID := uuid.New(), uuid.New()
+	for _, tc := range []struct{ name, body, wantMode string }{
+		{"a label means pinned", `{"anthropic_token":"console-key"}`, workersvc.BindModePinned},
+		{"null means default", `{"anthropic_token":null}`, workersvc.BindModeDefault},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &bindStore{
+				secrets: map[uuid.UUID]uuid.UUID{secretID: owner.ID},
+				labels:  map[string]uuid.UUID{owner.ID.String() + "|console-key": secretID},
+			}
+			h := newBindHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.PatchWorker(rec, patchWorkerReq(t, owner, workerID, tc.body))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if st.setArg.AnthropicBindMode != tc.wantMode {
+				t.Fatalf("wrote mode %q, want %q", st.setArg.AnthropicBindMode, tc.wantMode)
+			}
+		})
+	}
+}
+
+// TestPatchWorkerSetsAutoMode: the third mode, with no token, writes 'auto' AND a
+// NULL id. The id half matters: a stale id left beside a non-pinned mode is one
+// refactor away from being spent.
+func TestPatchWorkerSetsAutoMode(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	workerID := uuid.New()
+	st := &bindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newBindHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.PatchWorker(rec, patchWorkerReq(t, owner, workerID, `{"anthropic_bind_mode":"auto"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.setArg.AnthropicBindMode != workersvc.BindModeAuto {
+		t.Fatalf("wrote mode %q, want auto", st.setArg.AnthropicBindMode)
+	}
+	if st.setArg.AnthropicSecretID.Valid {
+		t.Fatalf("auto wrote a credential id (%+v); a non-pinned mode must carry none", st.setArg.AnthropicSecretID)
+	}
+	if got := bindModeOf(t, rec); got != workersvc.BindModeAuto {
+		t.Fatalf("response mode = %q, want auto", got)
+	}
+}
+
+// TestPatchWorkerRefusesContradictoryModeAndToken: a mode and a token that
+// disagree are REFUSED rather than reconciled. Either choice of winner spends a
+// credential the caller did not ask for on some request, and "auto" arriving with
+// a leftover label is the realistic shape of a half-updated client — exactly when
+// a quiet reconcile does the most damage.
+func TestPatchWorkerRefusesContradictoryModeAndToken(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	secretID, workerID := uuid.New(), uuid.New()
+	for _, tc := range []struct{ name, body string }{
+		{"auto with a label", `{"anthropic_bind_mode":"auto","anthropic_token":"console-key"}`},
+		{"default with a label", `{"anthropic_bind_mode":"default","anthropic_token":"console-key"}`},
+		{"pinned with no label", `{"anthropic_bind_mode":"pinned","anthropic_token":null}`},
+		{"pinned with nothing at all", `{"anthropic_bind_mode":"pinned"}`},
+		{"an illegal mode", `{"anthropic_bind_mode":"whatever","anthropic_token":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &bindStore{
+				secrets: map[uuid.UUID]uuid.UUID{secretID: owner.ID},
+				labels:  map[string]uuid.UUID{owner.ID.String() + "|console-key": secretID},
+			}
+			h := newBindHandler(t, st)
+			rec := httptest.NewRecorder()
+			h.PatchWorker(rec, patchWorkerReq(t, owner, workerID, tc.body))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			// And nothing was written. A 400 that had already mutated the row would be
+			// the worst of both.
+			if st.setCalled {
+				t.Fatalf("a refused request still wrote %+v", st.setArg)
+			}
+		})
+	}
+}
+
+// TestPatchWorkerModeAloneSatisfiesTheRequiredField: `anthropic_bind_mode` on its
+// own is a complete request. Requiring a redundant `"anthropic_token": null`
+// beside it would be ceremony — the caller has named what they are changing, which
+// is the whole rule the omitted-key 400 exists to enforce.
+func TestPatchWorkerModeAloneSatisfiesTheRequiredField(t *testing.T) {
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	st := &bindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	h := newBindHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.PatchWorker(rec, patchWorkerReq(t, owner, uuid.New(), `{"anthropic_bind_mode":"default"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	// An empty body still is not: it names nothing.
+	st2 := &bindStore{secrets: map[uuid.UUID]uuid.UUID{}, labels: map[string]uuid.UUID{}}
+	rec2 := httptest.NewRecorder()
+	newBindHandler(t, st2).PatchWorker(rec2, patchWorkerReq(t, owner, uuid.New(), `{}`))
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("empty body: code = %d, want 400", rec2.Code)
+	}
+}
+
+// TestEffectiveBindModeHidesAPhantomPin is D9 at the DTO boundary. 00078's FK nulls
+// a worker's credential id when the token is deleted and deliberately leaves the
+// mode alone, so the database legitimately holds 'pinned' with no id. Resolution
+// treats that worker as default; the API must say so, or every client draws a pin
+// to a token that does not exist.
+func TestEffectiveBindModeHidesAPhantomPin(t *testing.T) {
+	id := uuid.New()
+	bound := pgtype.UUID{Bytes: id, Valid: true}
+	for _, tc := range []struct {
+		name, stored, want string
+		secret             pgtype.UUID
+	}{
+		{"pinned with an id stays pinned", workersvc.BindModePinned, workersvc.BindModePinned, bound},
+		{"pinned with NO id reports default", workersvc.BindModePinned, workersvc.BindModeDefault, pgtype.UUID{}},
+		{"auto is untouched by the id", workersvc.BindModeAuto, workersvc.BindModeAuto, pgtype.UUID{}},
+		{"default is untouched", workersvc.BindModeDefault, workersvc.BindModeDefault, pgtype.UUID{}},
+		// An auto worker carrying a stale id must still read auto: the id is not
+		// read in that mode, so reporting 'pinned' would describe a spend that
+		// cannot happen.
+		{"auto with a stale id still reports auto", workersvc.BindModeAuto, workersvc.BindModeAuto, bound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveBindMode(tc.stored, tc.secret); got != tc.want {
+				t.Fatalf("effectiveBindMode(%q, valid=%v) = %q, want %q", tc.stored, tc.secret.Valid, got, tc.want)
+			}
+		})
 	}
 }

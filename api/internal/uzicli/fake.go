@@ -70,7 +70,11 @@ type FakeClient struct {
 	// same value the command passes for --default, so the tests assert on both.
 	LastSetTokenWorkerID string
 	LastSetTokenLabel    string
-	SetTokenWorker       apitypes.WorkerDTO
+	// LastSetTokenMode is the PRD #111 M3 bind mode the command sent. Recorded
+	// separately from the label because the two are what a caller can get WRONG
+	// together — "auto" with a leftover label is the realistic half-updated client.
+	LastSetTokenMode string
+	SetTokenWorker   apitypes.WorkerDTO
 
 	// Agent memory (PRD #90): ListMemory returns Memories; DeleteMemory records the
 	// id it was asked to purge.
@@ -214,9 +218,10 @@ func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	return f.Err
 }
 
-func (f *FakeClient) SetWorkerToken(_ context.Context, id, label string) (apitypes.WorkerDTO, error) {
+func (f *FakeClient) SetWorkerBindMode(_ context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
 	f.LastSetTokenWorkerID = id
 	f.LastSetTokenLabel = label
+	f.LastSetTokenMode = mode
 	if f.Err != nil {
 		return apitypes.WorkerDTO{}, f.Err
 	}

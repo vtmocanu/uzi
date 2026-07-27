@@ -452,6 +452,7 @@ type Worker struct {
 	HostedGeneration   int64              `json:"hosted_generation"`
 	DockerEnabled      pgtype.Bool        `json:"docker_enabled"`
 	AnthropicSecretID  pgtype.UUID        `json:"anthropic_secret_id"`
+	AnthropicBindMode  string             `json:"anthropic_bind_mode"`
 }
 
 type WorkerUpgradeMute struct {

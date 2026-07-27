@@ -128,7 +128,11 @@ func TestClaimRecordsOwnerDefaultCredential(t *testing.T) {
 // from a default that happens to name the same token (D20).
 func TestClaimRecordsWorkerBoundCredential(t *testing.T) {
 	f := newClaimFixture(t)
-	wkr := store.Worker{ID: uuid.New(), UserID: f.owner, AnthropicSecretID: pgtype.UUID{Bytes: f.consoleID, Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: f.owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: f.consoleID, Valid: true},
+	}
 
 	if _, err := f.svc.Claim(context.Background(), wkr); err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -161,7 +165,11 @@ func TestClaimRecordsWorkerBoundCredential(t *testing.T) {
 // terminally, exactly as it did before.
 func TestClaimRecordsNothingWhenOpenFails(t *testing.T) {
 	f := newClaimFixture(t)
-	wkr := store.Worker{ID: uuid.New(), UserID: f.owner, AnthropicSecretID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+	wkr := store.Worker{
+		ID: uuid.New(), UserID: f.owner,
+		AnthropicBindMode: BindModePinned,
+		AnthropicSecretID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
+	}
 
 	payload, err := f.svc.Claim(context.Background(), wkr)
 	if err != nil {

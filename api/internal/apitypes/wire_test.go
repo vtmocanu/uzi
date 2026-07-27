@@ -318,6 +318,9 @@ var workerDTOKeys = []string{
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.
 	"anthropic_secret_id", "anthropic_secret_label",
+	// PRD #111 M3: HOW this worker chooses — default | pinned | auto. The server
+	// reports the EFFECTIVE mode, so "pinned" always has an id beside it.
+	"anthropic_bind_mode",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

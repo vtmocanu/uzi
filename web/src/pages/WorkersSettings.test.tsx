@@ -19,7 +19,7 @@ vi.mock("../lib/api", async (importActual) => {
       // The page reads the user's tokens alongside the workers (PRD #104 M6) to
       // populate the per-row token picker.
       listSecrets: vi.fn(),
-      setWorkerToken: vi.fn(),
+      setWorkerBindMode: vi.fn(),
       createWorker: vi.fn(),
       deleteWorker: vi.fn(),
       hostedConfig: vi.fn(),
@@ -66,6 +66,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     // until someone binds one, which is the state these pre-#104 tests assume.
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
     id: "w1",
     name: "laptop",
     status: "online",
@@ -603,8 +604,12 @@ describe("WorkersSettings token binding (PRD #104)", () => {
   it("rebinds a worker to a named token by label", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
-    mockApi.setWorkerToken.mockResolvedValue({
-      worker: aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" }),
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({
+        anthropic_bind_mode: "pinned",
+        anthropic_secret_id: "sec-console",
+        anthropic_secret_label: "console-key",
+      }),
     });
     renderPage();
     await screen.findByText("laptop");
@@ -615,23 +620,89 @@ describe("WorkersSettings token binding (PRD #104)", () => {
     expect(picker.className).toContain("bg-raised");
     expect(picker.className).toContain("border-edge");
     fireEvent.change(picker, { target: { value: "console-key" } });
-    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", "console-key"));
+    await waitFor(() =>
+      expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "pinned", "console-key"),
+    );
     // The announcement says WHEN it takes effect — a user who expects to restart
     // something will otherwise go looking for the control to do it.
     expect(await screen.findByText(/from its next claim/i)).toBeTruthy();
   });
 
-  // Selecting "default token" CLEARS the binding — sent as null, not as a label.
+  // Selecting "default token" CLEARS the binding — mode "default", label null.
   it("clears the binding when the picker returns to the default", async () => {
     mockApi.listWorkers.mockResolvedValue({
-      workers: [aWorker({ anthropic_secret_id: "sec-console", anthropic_secret_label: "console-key" })],
+      workers: [
+        aWorker({
+          anthropic_bind_mode: "pinned",
+          anthropic_secret_id: "sec-console",
+          anthropic_secret_label: "console-key",
+        }),
+      ],
     });
     mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
-    mockApi.setWorkerToken.mockResolvedValue({ worker: aWorker() });
+    mockApi.setWorkerBindMode.mockResolvedValue({ worker: aWorker() });
     renderPage();
     await screen.findByText("laptop");
     const picker = await screen.findByLabelText("Anthropic token for laptop");
     fireEvent.change(picker, { target: { value: "" } });
-    await waitFor(() => expect(mockApi.setWorkerToken).toHaveBeenCalledWith("w1", null));
+    await waitFor(() => expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "default", null));
+  });
+
+  // --- PRD #111 M3: the third mode -----------------------------------------
+
+  // The auto option sends mode "auto" with NO label. The server refuses a label
+  // alongside a non-pinned mode rather than reconciling it, so a picker that sent
+  // the sentinel through as a label would 400 rather than silently mis-bind.
+  it("switches a worker to auto, sending no label", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    mockApi.setWorkerBindMode.mockResolvedValue({
+      worker: aWorker({ anthropic_bind_mode: "auto" }),
+    });
+    renderPage();
+    await screen.findByText("laptop");
+    const picker = await screen.findByLabelText("Anthropic token for laptop");
+    fireEvent.change(picker, { target: { value: "\u0000auto" } });
+    await waitFor(() => expect(mockApi.setWorkerBindMode).toHaveBeenCalledWith("w1", "auto", null));
+    expect(await screen.findByText(/auto-selects from your token pool/i)).toBeTruthy();
+  });
+
+  // An auto worker must READ as auto, not as "spends your default token" — which
+  // is what an id-first render would say, since an auto worker holds no pin. That
+  // is the state auto DEGRADES to when the pool is empty, not what it is.
+  it("describes an auto worker as auto-selecting, not as using the default", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ anthropic_bind_mode: "auto" })],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.getByText(/auto-selects from your/i)).toBeTruthy();
+    expect(screen.queryByText(/spends your default token/i)).toBeNull();
+    // …and the picker reflects it rather than showing "default token".
+    const picker = (await screen.findByLabelText(
+      "Anthropic token for laptop",
+    )) as HTMLSelectElement;
+    expect(picker.value).toBe("\u0000auto");
+  });
+
+  // D9 end to end: the server reports the EFFECTIVE mode, so a worker whose pinned
+  // token was deleted arrives as "default" with a null label and must render as
+  // using the default — never as a pin to a token that no longer exists.
+  it("renders a worker whose pinned token was deleted as using the default", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({
+          anthropic_bind_mode: "default",
+          anthropic_secret_id: null,
+          anthropic_secret_label: null,
+        }),
+      ],
+    });
+    mockApi.listSecrets.mockResolvedValue({ secrets: twoTokens });
+    renderPage();
+    await screen.findByText("laptop");
+    expect(screen.getByText(/spends your default token/i)).toBeTruthy();
+    expect(screen.queryByText(/auto-selects/i)).toBeNull();
   });
 });

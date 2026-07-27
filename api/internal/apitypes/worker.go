@@ -101,6 +101,19 @@ type WorkerDTO struct {
 	// property of the run lane, not of the worker's every activity.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// AnthropicBindMode is how this worker's run-lane claims choose a credential
+	// (PRD #111 M3): "default" (the owner's default), "pinned" (the id above), or
+	// "auto" (the selector picks from the owner's opted-in pool at claim time).
+	//
+	// 🔴 IT IS THE EFFECTIVE MODE, NOT THE STORED COLUMN, and the difference is the
+	// whole reason a client can trust it. 00078's FK nulls anthropic_secret_id when
+	// the credential is deleted and deliberately leaves the mode alone, so the
+	// database legitimately holds "pinned" with no id — a worker that D9 resolves as
+	// default. Shipping the raw column would let every client render a pin to a token
+	// that no longer exists, and each of them would have to re-derive the same rule to
+	// avoid it. The server applies it once instead, so "pinned" here always has an id
+	// beside it.
+	AnthropicBindMode string `json:"anthropic_bind_mode"`
 }
 
 // AdminWorkerDTO is a worker plus its owner email for the admin Agents-status

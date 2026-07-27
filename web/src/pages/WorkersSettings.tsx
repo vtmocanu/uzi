@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, type SecretMeta, type Worker } from "../lib/api";
+import { api, ApiError, type BindMode, type SecretMeta, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
@@ -84,17 +84,31 @@ export function WorkersSettings() {
   // picker returns to "default token". The change lands on the worker's NEXT
   // claim — no restart — which the announcement says, because a user who expects
   // to restart something will otherwise go looking for the control to do it.
+  // The picker's <option> values encode the MODE, not just a label, because since
+  // PRD #111 M3 there are three kinds of choice and only one of them names a token.
+  // AUTO_OPTION is a sentinel rather than a label, and it is deliberately a string
+  // no label can collide with: labels are user-authored, so a bare "auto" would be
+  // ambiguous the moment someone names a token `auto`.
+  const AUTO_OPTION = "\u0000auto";
+
   const rebind = useCallback(
-    async (workerId: string, label: string) => {
+    async (workerId: string, choice: string) => {
       setError("");
       setTokenBusy(workerId);
+      const mode: BindMode = choice === AUTO_OPTION ? "auto" : choice === "" ? "default" : "pinned";
       try {
-        const { worker } = await api.setWorkerToken(workerId, label === "" ? null : label);
+        const { worker } = await api.setWorkerBindMode(
+          workerId,
+          mode,
+          mode === "pinned" ? choice : null,
+        );
         setWorkers((prev) => prev.map((w) => (w.id === worker.id ? worker : w)));
         announce(
-          label === ""
-            ? `${worker.name} now spends your default token, from its next claim.`
-            : `${worker.name} now spends ${label}, from its next claim.`,
+          mode === "auto"
+            ? `${worker.name} now auto-selects from your token pool, from its next claim.`
+            : mode === "default"
+              ? `${worker.name} now spends your default token, from its next claim.`
+              : `${worker.name} now spends ${choice}, from its next claim.`,
         );
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to change the worker's token");
@@ -363,7 +377,20 @@ export function WorkersSettings() {
                         carries the label alongside the id — never from a source that
                         could supply an id with a null label. */}
                     <div className="mt-1 text-xs text-muted">
-                      {w.anthropic_secret_id ? (
+                      {/* auto is checked FIRST and independently of the id, because an
+                          auto worker holds no pin at all — reading the id first would
+                          fall through to "spends your default token", which is what an
+                          auto worker does only when its pool is empty, not what it IS.
+                          The server already resolves a pinned-but-idless worker to
+                          `default` (D9), so no rule is re-derived here. */}
+                      {w.anthropic_bind_mode === "auto" ? (
+                        <span>
+                          auto-selects from your{" "}
+                          <Link to="/settings" className="underline hover:text-fg">
+                            token pool
+                          </Link>
+                        </span>
+                      ) : w.anthropic_secret_id ? (
                         <>
                           spends{" "}
                           <strong className="font-medium text-fg">
@@ -435,11 +462,21 @@ export function WorkersSettings() {
                       <Select
                         aria-label={`Anthropic token for ${w.name}`}
                         className="h-8 max-w-[11rem] text-xs"
-                        value={w.anthropic_secret_label ?? ""}
+                        // Driven by the MODE first (PRD #111 M3): an auto worker
+                        // selects the sentinel, everything else falls back to the
+                        // label, and a worker whose pinned token was deleted arrives
+                        // here as mode "default" with a null label — so it shows
+                        // "default token", which is what it now spends.
+                        value={
+                          w.anthropic_bind_mode === "auto"
+                            ? AUTO_OPTION
+                            : (w.anthropic_secret_label ?? "")
+                        }
                         disabled={tokenBusy === w.id}
                         onChange={(e) => void rebind(w.id, e.target.value)}
                       >
                         <option value="">default token</option>
+                        <option value={AUTO_OPTION}>auto (from pool)</option>
                         {tokens.map((t) => (
                           <option key={t.id} value={t.label}>
                             {t.label}

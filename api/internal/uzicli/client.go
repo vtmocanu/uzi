@@ -98,15 +98,19 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
 	// there is no create counterpart here.
 	DeleteWorker(ctx context.Context, id string) error
-	// SetWorkerToken points a worker at one of the caller's named Anthropic tokens,
-	// or clears the binding when label is "" so the worker falls back to the
-	// caller's default: PATCH /api/workers/{id} {anthropic_token}. It takes a LABEL,
-	// the name a human knows, not a secret id. Unlike minting a worker this yields
-	// no credential the caller lacks, so it is RequireUser and reachable from a CLI
-	// token (PRD #104 D8). An unknown label is a 400 (exit 3); an unknown/foreign
-	// worker is a 404 (exit 4). The change lands on the worker's next claim — no
-	// restart, no re-minted join token.
-	SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error)
+	// SetWorkerBindMode sets HOW a worker chooses its Anthropic credential:
+	// PATCH /api/workers/{id} {anthropic_bind_mode, anthropic_token}.
+	//
+	//   - "pinned" + a LABEL (the name a human knows, not a secret id) → that token;
+	//   - "default" → the caller's default token;
+	//   - "auto"    → the selector picks from the caller's opted-in pool per claim.
+	//
+	// Unlike minting a worker this yields no credential the caller lacks, so it is
+	// RequireUser and reachable from a CLI token (PRD #104 D8). An unknown label or
+	// an illegal mode is a 400 (exit 3); an unknown/foreign worker is a 404 (exit 4).
+	// The change lands on the worker's next claim — no restart, no re-minted join
+	// token.
+	SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error)
 	// ListMemory returns the caller's agent memory across all repos (PRD #90):
 	// GET /api/me/memory. Each entry carries its repo + provenance so the owner can
 	// see what a future run would read back.
@@ -555,13 +559,15 @@ func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
 }
 
-func (c *HTTPClient) SetWorkerToken(ctx context.Context, id, label string) (apitypes.WorkerDTO, error) {
-	// An empty label sends JSON null, which is what clears the binding — distinct
-	// from omitting the field, which would mean "leave it alone". *string is what
-	// makes the two expressible on the wire.
+func (c *HTTPClient) SetWorkerBindMode(ctx context.Context, id, mode, label string) (apitypes.WorkerDTO, error) {
+	// An empty label sends JSON null, which is what a non-pinned mode requires —
+	// distinct from omitting the field, which would mean "leave it alone". *string is
+	// what makes the two expressible on the wire, and the server REFUSES a label
+	// alongside default/auto rather than quietly dropping one of them.
 	body := struct {
-		AnthropicToken *string `json:"anthropic_token"`
-	}{}
+		AnthropicBindMode string  `json:"anthropic_bind_mode"`
+		AnthropicToken    *string `json:"anthropic_token"`
+	}{AnthropicBindMode: mode}
 	if label != "" {
 		body.AnthropicToken = &label
 	}

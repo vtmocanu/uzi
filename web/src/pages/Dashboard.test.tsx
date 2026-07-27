@@ -119,6 +119,7 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     stats_source: null,
     anthropic_secret_id: null,
     anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
     ...over,
   };
 }

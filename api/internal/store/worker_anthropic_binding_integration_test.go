@@ -92,9 +92,13 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	}
 
 	// --- 1. Cross-user binding is refused by the SCHEMA, not by a handler ---
+	// The mode rides along since PRD #111 M3 (00088): the column is NOT NULL with a
+	// CHECK, so a call omitting it describes a row the database cannot hold and would
+	// fail on the CHECK — masking the FK violation this case is actually about.
 	_, err = q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
 		ID: wkr.ID, UserID: owner,
 		AnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
+		AnthropicBindMode: "pinned",
 	})
 	if err == nil {
 		t.Fatal("binding a worker to ANOTHER user's secret succeeded — the composite FK is not doing its job, " +
@@ -116,6 +120,7 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	bound, err := q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
 		ID: wkr.ID, UserID: owner,
 		AnthropicSecretID: pgtype.UUID{Bytes: ownerConsole, Valid: true},
+		AnthropicBindMode: "pinned",
 	})
 	if err != nil {
 		t.Fatalf("bind to own secret: %v", err)
@@ -128,6 +133,7 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	if _, err := q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
 		ID: wkr.ID, UserID: stranger,
 		AnthropicSecretID: pgtype.UUID{Bytes: strangerToken, Valid: true},
+		AnthropicBindMode: "pinned",
 	}); err == nil {
 		t.Fatal("a stranger rebinding someone else's worker must affect no rows (pgx.ErrNoRows), got success")
 	}
@@ -151,6 +157,7 @@ func TestWorkerAnthropicBindingLiveDB(t *testing.T) {
 	// --- 3. An explicit NULL binding is legal (MATCH SIMPLE) ---
 	if _, err := q.SetWorkerAnthropicSecret(ctx, store.SetWorkerAnthropicSecretParams{
 		ID: wkr.ID, UserID: owner, AnthropicSecretID: pgtype.UUID{},
+		AnthropicBindMode: "default",
 	}); err != nil {
 		t.Fatalf("clearing a binding to NULL must be legal: %v", err)
 	}
