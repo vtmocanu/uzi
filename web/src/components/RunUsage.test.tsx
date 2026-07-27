@@ -301,7 +301,8 @@ describe("RunUsagePanel accessibility (item 8)", () => {
       expect(label).toMatch(/scrollable$/);
       expect(label).not.toMatch(/\btable\b/);
       // …and NO tabIndex, asserted rather than merely omitted. Chrome focuses overflowing
-      // scrollers natively (measured: Tab lands here, ArrowRight scrolls 0 -> 299), and it
+      // scrollers natively (web-ux, Chrome 150 at 375px: Tab lands here, ArrowRight scrolls
+      // scrollLeft 0 -> 299), and it
       // does so ONLY while they overflow — so an unconditional tab stop is dead weight at
       // every desktop width. This assertion stops it being re-added as an "improvement" on
       // the strength of the property read that produced the original finding.

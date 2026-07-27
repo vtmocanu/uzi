@@ -143,10 +143,25 @@ export interface RunnerClone {
    *  branch's previous cycles, or a human's commits. Issue #105 uses it to warn the
    *  lead off redoing work it can no longer remember doing. */
   priorCommits: number;
-  /** The commit the branch was checked out AT, resolved off the FRESH remote-tracking ref
-   *  in the bare (`refs/remotes/origin/*`, which every fetch updates): the default branch's
-   *  current tip for a new branch, the branch's own current origin tip on a resume. Full
-   *  40-char SHA.
+  /** The commit the branch was checked out AT, resolved off the fresh remote-tracking ref
+   *  in the bare (`refs/remotes/origin/*`, which every fetch updates) WHERE ONE EXISTS: the
+   *  default branch's current tip for a new branch, the branch's own current origin tip on
+   *  a resume. Full 40-char SHA.
+   *
+   *  "Where one exists" is load-bearing, not hedging. `defaultBranchRef` is a fallback chain
+   *  and its last three rungs — `refs/heads/main`, `refs/heads/master`, then the bare's own
+   *  `HEAD` — are the MIRROR-LAYOUT fallback, i.e. exactly the frozen refs this comment warns
+   *  about. On those rungs `baseCommit` IS the frozen mirror, and so is `defaultBranchCommit`,
+   *  since defaultBranchSha resolves through the same function.
+   *
+   *  How reachable that is, stated as what was and was not established: `cloneBare` rewrites
+   *  the refspec and fetches before returning, so the remote-tracking refs exist by the time
+   *  any normal run resolves a base. But its post-clone `fetch` is NOT covered by the
+   *  `fs.rm` that cleans up a failed `clone`, so a bare whose first fetch died can persist
+   *  on disk carrying `refs/heads/*` only. Whether a run then reaches `defaultBranchRef` in
+   *  that state was NOT determined — it needs a warm bare in that condition. Treat this as a
+   *  narrow window rather than a routine path, and do not assume the base is fresh when the
+   *  bare has no `refs/remotes/origin/*`.
    *
    *  Load-bearing for the lead, which otherwise has to GUESS the branch's parent from the
    *  clone's local default branch. That ref is NOT a substitute, and not for the reason an
@@ -395,7 +410,10 @@ export class GitCache {
    *  caller can treat a non-zero count as "there is prior work here" and nothing else. */
   /** The default branch's tip as a full OID, or undefined when it cannot be resolved.
    *  Best-effort by construction (same posture as commitsAheadOfDefault): this feeds a
-   *  prompt note, and a run must never fail because a repo has no default branch. */
+   *  prompt note, and a run must never fail because a repo has no default branch.
+   *
+   *  Inherits defaultBranchRef's fallback chain, so on its mirror-layout rungs this returns
+   *  the FROZEN ref rather than a fresh tip — see RunnerClone.baseCommit for the window. */
   private async defaultBranchSha(barePath: string): Promise<string | undefined> {
     const ref = await this.defaultBranchRef(barePath).catch(() => undefined);
     if (!ref) return undefined;

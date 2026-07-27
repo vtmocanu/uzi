@@ -157,7 +157,10 @@ export function RunUsagePanel({ usage }: { usage: RunUsage }) {
             focusable. It carries role + a name and DELIBERATELY NO `tabIndex`.
             Driven for real in Chrome 150 at 375px: Tab from the summary already lands on
             this div (Chrome focuses overflowing scrollers natively, `tabIndex` -1, no
-            attribute) and ArrowRight scrolls it 0 -> 299. So on the MEASURED engine there is
+            attribute) and ArrowRight scrolls it 0 -> 299 (web-ux, re-measured in Chrome 150 at
+            375px during item 8 verification: scrollLeft 0 -> 200 -> 299, max 299 — read the
+            SETTLED value, since Chrome animates the scroll and an intermediate read lies).
+            So on the MEASURED engine there is
             no 2.1.1 failure to fix, and Chrome makes it focusable ONLY while it actually
             overflows — an unconditional tabIndex={0} would plant a permanent empty tab stop
             at every desktop width (1280px: scrollWidth == clientWidth == 950, Tab skips it).
