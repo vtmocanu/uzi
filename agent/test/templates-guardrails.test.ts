@@ -161,15 +161,35 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must register the /nix/var/nix/gcroots/uzi-toolchain GC root`,
       );
       // The fail-closed build assertion: a broken toolchain fails the BUILD, not a silent 127 at
-      // run time. `command -v` checks each tool SEPARATELY (multi-operand `command -v` validates
-      // only the first), so all four must be present as their own `command -v` clause.
-      for (const tool of ["python3", "go", "gcc", "pip"]) {
-        assert.match(
-          text,
-          new RegExp(`command -v ${tool}\\b`),
-          `${name}/Dockerfile must carry a fail-closed 'command -v ${tool}' build assertion`,
-        );
-      }
+      // run time.
+      //
+      // This used to assert four literal `command -v <tool>` clauses. That encoding was the
+      // defect: the line named five binaries and never grew with devbox.json, so by 0.11.11 it
+      // verified 5 of 13 packages while passing. The guard is now a script whose FIRST check is
+      // its own coverage against what devbox actually installed, so the invariant worth pinning
+      // here is that the script is wired in — not which binaries it happens to name today.
+      assert.match(
+        text,
+        /COPY\s+agent\/devbox-global\/toolchain-guard\.tsv\b/,
+        `${name}/Dockerfile must COPY the toolchain guard map`,
+      );
+      assert.match(
+        text,
+        /COPY\s+agent\/devbox-global\/assert-toolchain\.sh\b/,
+        `${name}/Dockerfile must COPY the toolchain guard script`,
+      );
+      assert.match(
+        text,
+        /RUN\s+bash\s+\/tmp\/assert-toolchain\.sh\s+\/tmp\/toolchain-guard\.tsv\b/,
+        `${name}/Dockerfile must RUN the fail-closed toolchain guard`,
+      );
+      // Ordering is load-bearing and silent if wrong: the guard resolves binaries against
+      // /opt/uzi-toolchain/bin, so running it before that lands on PATH would fail every build
+      // for the wrong reason.
+      assert.ok(
+        text.indexOf('ENV PATH="/opt/uzi-toolchain/bin') < text.indexOf("RUN bash /tmp/assert-toolchain.sh"),
+        `${name}/Dockerfile must put the toolchain on PATH BEFORE running the guard`,
+      );
     });
 
     it(`${name}: wires the PRD #87 browser (shim + M4 launch ENV + fail-closed guard) in lockstep`, () => {
@@ -526,6 +546,19 @@ function parseStringList(text: string, anchor: RegExp): string[] {
 // the default worker toolchain both templates bake. Pin that it lists go + python + pip so
 // a drop can't silently ship a worker without them. Read as text (devbox.json is HuJSON —
 // it carries `//` comments — so JSON.parse would reject it).
+// The manifest's package list, DERIVED. devbox.json is HuJSON (it carries `//` comments),
+// so JSON.parse rejects it; strip line comments inside the array before pulling the strings.
+function manifestPackages(hujson: string): string[] {
+  const m = /"packages"\s*:\s*\[([^\]]*)\]/.exec(hujson);
+  assert.ok(m, "devbox.json must carry a packages array");
+  const body = m![1]!.replace(/\/\/[^\n]*/g, "");
+  return [...body.matchAll(/"([^"]+)"/g)].map((x) => x[1]!).sort();
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 describe("devbox-global default toolchain manifest", () => {
   const manifest = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.json"), "utf8");
   const lock = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.lock"), "utf8");
@@ -553,17 +586,47 @@ describe("devbox-global default toolchain manifest", () => {
   });
   // Every manifest package must be pinned in the sibling lock at the SAME nixpkgs rev (the
   // pin the Dockerfiles COPY in before `devbox global install`); an unpinned package floats.
-  it("pins every add-on package in devbox.lock at the toolchain nixpkgs rev", () => {
+  //
+  // DERIVED from the manifest, not a hardcoded list. This test used to name four packages
+  // literally, which is the same defect the build guard had: `file`, `perl`, `coreutils`,
+  // `kubernetes-helm` and `kubeconform` were added in 0.11.11 and this test kept passing
+  // without checking a single one of their pins. A list written once in a test rots exactly
+  // like a list written once in a Dockerfile.
+  it("pins EVERY manifest package in devbox.lock at the toolchain nixpkgs rev", () => {
     const revMatch = /github:NixOS\/nixpkgs\/([0-9a-f]{40})#go\b/.exec(lock);
     assert.ok(revMatch, "lock must pin go at a concrete nixpkgs rev to anchor the toolchain pin");
     const rev = revMatch![1];
-    for (const pkg of ["chromium", "fontconfig", "dejavu_fonts", "openssl.bin"]) {
+    const packages = manifestPackages(manifest);
+    assert.ok(packages.length > 0, "manifest package list must not parse empty (the regex would silently pass)");
+    for (const pkg of packages) {
       assert.match(
         lock,
-        new RegExp(`github:NixOS/nixpkgs/${rev}#${pkg}\\b`),
+        new RegExp(`github:NixOS/nixpkgs/${rev}#${escapeRe(pkg)}\\b`),
         `devbox.lock must pin ${pkg} at the same rev (${rev}) as the rest of the toolchain`,
       );
     }
+  });
+
+  // The build guard (agent/devbox-global/assert-toolchain.sh) enforces this at IMAGE BUILD
+  // time against what devbox actually installed, which is the authoritative check. This is
+  // the same invariant asserted statically so it fails in `test:agent` in seconds instead of
+  // nine minutes into `build:agent` — and, more importantly, so it fails at all on an MR
+  // whose build jobs never run because an earlier stage went red.
+  it("guards EVERY manifest package in toolchain-guard.tsv (both directions)", () => {
+    const guardText = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/toolchain-guard.tsv"), "utf8");
+    const guarded = guardText
+      .split("\n")
+      .filter((l) => l.trim() !== "" && !l.trimStart().startsWith("#"))
+      .map((l) => l.split("\t")[0]!.trim())
+      .sort();
+    const packages = manifestPackages(manifest);
+    assert.ok(packages.length > 0, "manifest package list must not parse empty");
+    assert.deepStrictEqual(
+      guarded,
+      packages,
+      "every devbox.json package needs a toolchain-guard.tsv row and vice versa — " +
+        "an unguarded package ships a silent exit 127 to every subagent",
+    );
   });
 });
 

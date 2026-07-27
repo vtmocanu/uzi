@@ -31,6 +31,38 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   without the phrase — or written in a form the scan cannot read — fails there rather than
   silently turning its chip red again (issue #116).
 
+## [0.11.12] - 2026-07-27
+
+### Fixed
+
+- **`file` did not work in 0.11.11, despite that release announcing it.** The package was
+  declared as bare `file`, and devbox resolved that to the package's `dev` output -- headers
+  and libmagic, containing no `file` program at all. `devbox global install` reported success,
+  so the image shipped with `file` simply absent from the toolchain, exactly the silent
+  `command not found` the release was meant to remove. It is now declared `file.out`, the
+  output that carries the program, and verified from the realized profile rather than from a
+  shell that had the raw store path on its search path -- which is what made the original
+  check look green. This is the same trap `openssl.bin` documents; the earlier note reasoned
+  from a nixpkgs attribute that turns out not to govern what devbox installs, and that
+  reasoning is now corrected in place. Found by the new guard below, on its first real run.
+
+- **The worker image's toolchain guard had stopped covering the toolchain, and now cannot
+  drift again.** The guard exists so a broken toolchain fails the image BUILD instead of
+  shipping a silent `command not found` to every subagent at run time. It was a hardcoded
+  line naming five binaries, and it never grew as the manifest did: `chromium`,
+  `fontconfig` and `dejavu_fonts` arrived, then `file`, `perl`, `coreutils`,
+  `kubernetes-helm` and `kubeconform` in 0.11.11, none of them guarded. By that release it
+  was verifying 5 of 13 packages while reporting success, so a green `publish:agent` said
+  nothing about whether `helm` resolved. Worse than an uncovered package is a green light
+  nobody re-derives. The guard now checks its own coverage: it reads what `devbox global
+  install` actually installed and fails the build if any package lacks a row in
+  `agent/devbox-global/toolchain-guard.tsv`, so adding a package without guarding it is no
+  longer possible. Each row also runs its tool rather than only resolving it, because a nix
+  package can land its libraries and manual pages while its CLI never appears -- the
+  `openssl.bin` bug this guard missed the first time. Packages that legitimately ship no
+  binary are declared as such rather than guessed: `fontconfig` sounds like it provides
+  `fc-cache` and does not.
+
 ## [0.11.11] - 2026-07-27
 
 ### Added
