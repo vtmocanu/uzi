@@ -747,12 +747,12 @@ and starts being something the next reader will trust without checking.
 
 ## An instrument that cannot produce the disconfirming answer is not evidence
 
-**This is the fold of the section above and eight separate incidents from PRD #102.** Each
+**This is the fold of the section above and nine separate incidents from PRD #102.** Each
 was a different tool failing a different way; the shape underneath is one. Before believing a
 result, ask what answer the instrument *could not have returned*. If that answer is the one
 that would have proved you wrong, the run measured your setup, not the code.
 
-The eight, each measured, so nobody has to take the abstraction on faith:
+The nine, each measured, so nobody has to take the abstraction on faith:
 
 | the instrument | what it could not return |
 |---|---|
@@ -764,6 +764,7 @@ The eight, each measured, so nobody has to take the abstraction on faith:
 | a mutation that failed to compile | a red for the stated reason; vitest printed `Tests  no tests` and it read as "unguarded" |
 | a mutation reddening on `SQLSTATE 42P18` | a red for the stated reason: Postgres rejected the *parameter typing*, not the predicate, so the run proved nothing about the predicate |
 | a direction inversion that made the action a no-op | a red at all: the assertion never ran, so green meant "nothing happened", not "the behaviour holds" |
+| a test that aborts before its own assertions | the disconfirming answer: a `t.Fatalf` on a status **identical in both configurations** fired before the row checks, so the checks that could have discriminated never executed |
 
 **The operational form, for mutation testing specifically: a mutation is verified by the tests
 going red FOR THE REASON THE MUTATION NAMES.** Read the failure text, never the count. Two
@@ -771,7 +772,10 @@ agents on this branch shipped mutations that reddened for unrelated reasons and 
 confirmation.
 
 CLAUDE.md's **"compile the mutation before you believe it"** is necessary and **not
-sufficient** — it eliminates only row 6. Rows 7 and 8 compile perfectly and still say nothing.
+sufficient** — it eliminates only row 6. Rows 7 and 8 compile perfectly and still say nothing,
+and row 9 is not about mutation at all: **the test aborted before reaching the assertions that
+would have discriminated**, so the guard has to be ordering, not compilation. Put the checks
+that can only fail in one configuration BEFORE any check that fails identically in both.
 
 **Two more from M6, added because they are the shapes a green looks most trustworthy in:**
 
