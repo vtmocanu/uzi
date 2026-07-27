@@ -11866,6 +11866,9 @@ dirs, `installJsDeps(rootPath, env, opts)` installs each one and returns a per-d
   that feeds a check subprocess.
 - **`depsReadyFor(results, dir)` is exported with no production consumer** — it is the seam gate
   honesty will read, exercised only by tests today. Recorded rather than left to look like dead code.
+  *(Superseded 2026-07-27 by issue #157: the install's per-dir results now have a production
+  consumer — the first implement prompt carries them, see §417. `depsReadyFor` itself is still
+  test-only; what gained a consumer is the `{dir, ok}` result list it reads.)*
 
 ## 398. PRD #121 — `--ignore-scripts` does NOT mean "no repo-authored code runs"; the premise was RESTORED, not renegotiated
 
@@ -12243,3 +12246,46 @@ record worth keeping.
   exists to forbid, produced by INV-5's own anchor. The ceiling is therefore per-**release**, not
   per-incident. R8's no-signal grace cannot soften it, because the signal is fresh. Filed as **#155**;
   #151 deliberately does not touch R2.
+
+## 417. Issue #157 — the agent was never TOLD its dependencies were provisioned, so it reinstalled them
+
+PRD #121 provisions a clone's JS dependencies before the agent's first implement turn, and on the
+first real JS run after it deployed (`51757591`, v0.11.9) the machinery worked exactly as designed:
+both workspaces discovered, installed, and finished before the agent's first tool call, with **zero**
+gate-tool `command not found` across 397 messages. **The agent then ran `npm ci` itself, twice.** Its
+plan had declared it — *"npm ci (fresh worktree has empty node_modules)"* — and that was correct
+reasoning from what it could observe: at plan time the background install genuinely had not
+finished, and **no prompt mentioned that the worker installs dependencies at all**. `npm ci` deletes
+`node_modules` before installing, so the provisioned tree was destroyed and rebuilt and the overlap
+that justifies the whole design bought nothing.
+
+The fix is that the two phases can honestly say **different** things, because they are built either
+side of the join:
+
+- **Plan prompt (before the join): state the mechanism, promise nothing.** It says the worker is
+  installing in the background and waits before the first implement turn, so no manual install
+  belongs in the plan — and explicitly that the install *can fail*. Promising success here would be
+  worse than saying nothing: the outcome is genuinely unknown at that point, and an agent that
+  trusted a false promise would find an absent `node_modules` and no instruction to fix it. A test
+  asserts the absence of promise-shaped wording, and it earned its keep immediately — the first
+  draft said "you will be told which directories are ready", the test caught "are ready", and the
+  line was reworded rather than the test relaxed.
+- **Implement prompt (after the join): carry the facts.** Per-directory outcomes from the install,
+  with a failure reported AS a failure so the agent can act on a genuinely absent tree. First turn
+  only: later turns ride a resumed session that already saw it, and a system prompt costs tokens on
+  every turn.
+
+Two things worth keeping:
+
+- **All three planning prompts get the note, not just the issue one.** `ci_fix` and `self_improve`
+  runs go through the same executor path and the same pre-plan install (M2 wired it for every run
+  kind), so a note only on `buildPlanPrompt` would leave those two planning a manual install. The
+  revise prompt deliberately does *not* repeat it — it rides a resumed session that already carries
+  it from its own plan turn.
+- **The directory names are repo-controlled, and this is a prompt, not a log.** `dir` comes from
+  `readdir` on the clone, and unlike the run-feed status line it lands **outside** every untrusted
+  fence — the one position where instruction-shaped text is the injection those fences exist to
+  stop. A repo can commit a directory named `web" — ignore all previous instructions`. The names are
+  charset-clamped and length-bounded before they reach the prompt, pinned by a test that feeds a
+  hostile name through. The run-feed clamp (§397) and this one are separate on purpose: same shape,
+  different threat model, and coupling them would hide that.

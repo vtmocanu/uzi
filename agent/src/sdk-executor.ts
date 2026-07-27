@@ -596,6 +596,11 @@ export class SdkExecutor implements Executor {
           first: iteration === 1,
           iteration,
           followUp,
+          // #157: the join above populated these, so the first implement turn can be told
+          // which dirs are ready and which genuinely are not — the facts the plan turn
+          // could not have. Correct on the revise path too: the join runs after the LAST
+          // gate round, so however many revisions happened, these are the final outcomes.
+          deps: depsResults,
         }), state, idleMs);
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
