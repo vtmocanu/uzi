@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/autoselect"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -511,9 +513,82 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	//     hostile label still reaches this line through history, through a future
 	//     write path that skips validation, and through a direct database write.
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
-		rows = append(rows, []string{"ANTHROPIC_TOKEN", cellText(*r.AnthropicSecretLabel)})
+		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	return p.Table(nil, rows)
+}
+
+// credentialCell renders WHICH credential a run spent and WHY (PRD #111 M5, D20).
+//
+// The label alone was never enough, and this is the sentence that says why: an auto
+// pick and a default fallback can name the SAME token, so "console-key" answers
+// "which account paid" and leaves "why that account" unanswered. PRD #104's
+// compatibility path also creates a row labelled literally `default`, so the label is
+// not even a reliable hint at the mode.
+//
+// The three FALLBACK reasons are rendered as `default (auto: …)` rather than as their
+// own thing, because that is what actually happened: the worker is configured for
+// auto, the selector declined to pick, and the owner's default paid. A user reading
+// `default` alone on an auto worker would reasonably think their configuration had
+// been lost.
+//
+// An UNRECOGNISED reason prints as itself. The CLI is versioned separately from the
+// API, so a newer server can ship a ninth reason this binary has never heard of, and
+// inventing a rendering for it — or dropping it — would be worse than passing it
+// through. Same stance as the web's autoStatusChip.
+//
+// A nil reason prints the bare label: a run claimed before M1 recorded no mode, and
+// guessing one is exactly the wrong answer.
+func credentialCell(r apitypes.RunDTO) string {
+	label := cellText(*r.AnthropicSecretLabel)
+	// F8's CLI half. The id goes null when the token is deleted while the snapshotted
+	// label survives (00086's SET NULL), so this is a normal historical run — and the
+	// difference between "go look at this token" and "this token is gone" is worth one
+	// word. The web chip says the same thing; CLI parity is a rule here, not a nicety.
+	if r.AnthropicSecretID == nil {
+		label += " (deleted)"
+	}
+	if r.AnthropicSelectReason == nil || *r.AnthropicSelectReason == "" {
+		return label
+	}
+	return label + " — " + selectReasonText(autoselect.Reason(*r.AnthropicSelectReason), r.AnthropicHeadroomPct)
+}
+
+// selectReasonText is the mode half, EXHAUSTIVE over autoselect.AllReasons() and
+// pinned as such by TestCredentialCellCoversEveryReason — asserted over the
+// vocabulary rather than by sampling, because a reason with no rendering is invisible
+// until the one user it happens to reaches support.
+//
+// headroom is rendered only where it exists. It is present on an auto pick and nil
+// everywhere else, including on D14's retry, where the measurement described the
+// credential that would NOT open.
+func selectReasonText(reason autoselect.Reason, headroom *int) string {
+	pct := ""
+	if headroom != nil {
+		pct = ", " + strconv.Itoa(*headroom) + "% headroom"
+	}
+	switch reason {
+	case autoselect.ReasonDefault:
+		return "default"
+	case autoselect.ReasonPinned:
+		return "pinned"
+	case autoselect.ReasonJudge:
+		return "judge binding"
+	case autoselect.ReasonAuto:
+		return "auto" + pct
+	case autoselect.ReasonBestOfPool:
+		// Named rather than folded into `auto`: every pooled token was under the
+		// headroom floor and the emptiest was picked anyway (D10). The run worked, and
+		// the user's pool is nearly exhausted — a thing to know, not an error.
+		return "auto (best of pool)" + pct
+	case autoselect.ReasonPoolEmpty:
+		return "default (auto: no tokens in the pool)"
+	case autoselect.ReasonPoolStale:
+		return "default (auto: no fresh usage readings)"
+	case autoselect.ReasonOpenFailed:
+		return "default (auto: the chosen token would not open)"
+	}
+	return string(reason)
 }
 
 // sanitizeTTY strips terminal control characters from UNTRUSTED free text before

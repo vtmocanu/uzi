@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -156,5 +157,80 @@ func TestWorkerSetTokenErrorCodes(t *testing.T) {
 				t.Fatalf("exit = %d, want %d", code, tc.want)
 			}
 		})
+	}
+}
+
+// TestWorkerListShowsBindMode is PRD #111 M5, and it closes a CLI-parity hole M3
+// opened: `uzi worker set-token --auto` is a WRITE the CLI can perform, and until
+// this column there was no human-readable READ to confirm it — only `--json`. A
+// three-way user choice you can set and cannot see is worse than one you cannot set.
+//
+// The fixture stages all three modes at once because the failure that matters is a
+// renderer that collapses two of them. One mode per test would pass against a
+// function that returned the same word for `default` and `auto`.
+//
+// MUTATION THIS CATCHES: returning w.AnthropicBindMode verbatim for `pinned` — the
+// pinned row then reads "pinned" instead of naming the token, which is the fact a
+// user needs and the argument `uzi worker set-token` takes back.
+func TestWorkerListShowsBindMode(t *testing.T) {
+	label := "console-key"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "alpha", Status: "online", AnthropicBindMode: "default"},
+		{ID: "w2", Name: "bravo", Status: "online", AnthropicBindMode: "auto"},
+		{
+			ID: "w3", Name: "charlie", Status: "online", AnthropicBindMode: "pinned",
+			AnthropicSecretID: sptr("sec-1"), AnthropicSecretLabel: &label,
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "TOKEN") {
+		t.Fatalf("worker list is missing the TOKEN column: %q", out)
+	}
+	cellOf := func(name string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) {
+				f := strings.Fields(line)
+				return f[len(f)-1]
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	if got := cellOf("alpha"); got != "default" {
+		t.Errorf("default worker's TOKEN = %q, want default", got)
+	}
+	if got := cellOf("bravo"); got != "auto" {
+		t.Errorf("auto worker's TOKEN = %q, want auto — an auto worker has no fixed token, and "+
+			"naming one would present a snapshot as a setting", got)
+	}
+	// The LABEL, not the word "pinned": it is what the user set and what
+	// `uzi worker set-token` takes back.
+	if got := cellOf("charlie"); got != "console-key" {
+		t.Errorf("pinned worker's TOKEN = %q, want the label console-key", got)
+	}
+}
+
+// TestBindModeCellUnknownPassesThrough: the CLI ships separately from the API, so a
+// newer server can send a fourth mode. Printing it as itself is honest; mapping it to
+// "default" would state something false about where a worker's money goes.
+func TestBindModeCellUnknownPassesThrough(t *testing.T) {
+	got := bindModeCell(apitypes.WorkerDTO{AnthropicBindMode: "some_future_mode"})
+	if got != "some_future_mode" {
+		t.Fatalf("cell = %q, want the unrecognised mode verbatim", got)
+	}
+}
+
+// TestBindModeCellPinnedWithNoLabel is belt-and-braces against a DTO that
+// contradicts itself. The server reports the EFFECTIVE mode, so `pinned` always
+// arrives with a label — D9's pinned-with-a-deleted-token case is mapped to
+// `default` upstream. If one ever arrives anyway, "default" is what such a worker
+// would actually spend, so it is the honest cell.
+func TestBindModeCellPinnedWithNoLabel(t *testing.T) {
+	if got := bindModeCell(apitypes.WorkerDTO{AnthropicBindMode: "pinned"}); got != "default" {
+		t.Fatalf("cell = %q, want default — a pin with no credential resolves as the default (D9)", got)
 	}
 }

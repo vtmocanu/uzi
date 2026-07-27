@@ -37,7 +37,9 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(workers))
 			for _, w := range workers {
-				rows = append(rows, []string{w.ID, w.Name, w.Status, strOr(w.Version, "-"), upgradeCell(w)})
+				rows = append(rows, []string{
+					w.ID, w.Name, w.Status, strOr(w.Version, "-"), upgradeCell(w), bindModeCell(w),
+				})
 			}
 			// VERSION is here because docs/run-auto-stopped.md's first remedy for an
 			// auto-stopped run is "check the worker's version" — v0.10.1+ isolates a
@@ -46,7 +48,11 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// (WorkersSettings.tsx); the CLI is a first-class second consumer and did
 			// not, so the doc shipped a remedy one of its two audiences could not
 			// follow. "-" when a worker has never registered a version.
-			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE"}, rows)
+			// TOKEN is PRD #111 M5, and it closes a CLI-parity hole M3 opened: the CLI
+			// gained a WRITE (`worker set-token --auto`) with no human-readable READ, so
+			// the only way to confirm what a worker was set to was `--json`. A three-way
+			// user choice you can set and cannot see is worse than one you cannot set.
+			return p.Table([]string{"ID", "NAME", "STATUS", "VERSION", "UPGRADE", "TOKEN"}, rows)
 		},
 	}
 
@@ -184,4 +190,45 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 		// not as "-" hiding a state this build has no opinion about.
 		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
 	}
+}
+
+// bindModeCell renders HOW a worker chooses its Anthropic credential, for
+// `uzi worker list`'s TOKEN column (PRD #111 M5).
+//
+// The three modes need three different renderings because they answer different
+// questions, and only one of them has a name to show:
+//
+//	default  →  "default"        the owner's default token; no binding
+//	pinned   →  "<label>"        the credential itself, which is the useful fact
+//	auto     →  "auto"           chosen per claim from the pool; no fixed answer
+//
+// A pinned worker prints its LABEL rather than the word "pinned" because the label
+// is what the user set and what `uzi worker set-token` takes back. The other two have
+// no label to print: `default` resolves at claim time and `auto` resolves differently
+// on every claim, so naming a token there would be a snapshot presented as a setting.
+//
+// The server reports the EFFECTIVE mode (handler's effectiveBindMode), so `pinned`
+// always arrives with an id and a label beside it — D9's pinned-with-a-deleted-token
+// case has already been mapped to `default` upstream. The nil guard below is
+// therefore belt-and-braces against a DTO that contradicts itself, not a case the
+// current server can produce; it renders "default" because that is what such a
+// worker would actually spend.
+//
+// An UNRECOGNISED mode prints as itself, for the reason every other renderer in this
+// PRD does: the CLI is versioned separately from the API.
+func bindModeCell(w apitypes.WorkerDTO) string {
+	switch w.AnthropicBindMode {
+	case "default":
+		return "default"
+	case "auto":
+		return "auto"
+	case "pinned":
+		if w.AnthropicSecretLabel == nil || *w.AnthropicSecretLabel == "" {
+			return "default"
+		}
+		// User-authored text into a table cell: cellText folds newlines and tabs,
+		// which would otherwise break the column rail, and caps the length.
+		return cellText(*w.AnthropicSecretLabel)
+	}
+	return w.AnthropicBindMode
 }
