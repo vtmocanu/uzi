@@ -7,7 +7,9 @@ audience: user
 # Board
 
 Each enabled repo gets a board in the sidebar: a kanban view of its GitLab
-issues, kept in sync with the forge in both directions. Cards also carry
+issues, kept in sync with the forge in both directions. By default it shows
+the repo's `PRD`-labeled issues, the ones uzi works; **Show other issues**
+brings in the repo's other open issues alongside them. Cards also carry
 their latest agent run, so the board doubles as a run tracker: it moves
 issues automatically as a run progresses and refreshes itself, without a
 manual reload.
@@ -211,14 +213,44 @@ without a manual **Refresh** — a brief toast ("#42 → Human Review")
 announces each one. **Refresh** still triggers an immediate full sync if you
 don't want to wait.
 
-## Why only some issues show up
+One exception, and it looks like a bug if you do not know about it. Issues
+without the `PRD` label are synced **open-only**, so closing one on the forge
+is not something the frequent poll can see. The card keeps looking open until
+the next reconcile pass (about 10 minutes at the shipped defaults), and then
+it disappears rather than sliding into **Closed**. `PRD` cards are unaffected:
+they animate into **Closed** as they always have.
 
-The board lists only issues carrying the **`PRD`** label (uzi works PRDs,
-not arbitrary tickets). Each card also needs its issue description to link a
+## Which issues show up
+
+The board always shows issues carrying the **`PRD`** label: those are the
+ones uzi works, and only they can start a run. Everything else about a card
+follows from that. A `PRD` card also needs its issue description to link a
 `prds/*.md` file; a card missing that link shows a warning badge and is
 excluded from agent pickup until the link is added. A card carrying more
 than one column label (edited outside uzi) shows a conflict badge and
 displays in its highest-positioned column until the next move normalizes it.
+
+### Show other issues
+
+**Show other issues** adds the repo's other **open** issues to the board, so
+you can triage the whole backlog in one place instead of switching to GitLab
+to see what else is filed. It is off by default, it is remembered per board
+and per browser, and it changes only what you see: nobody else's board moves,
+and no label is written.
+
+These cards are drawn with a **dashed border** and no background fill, and
+they behave differently in two ways:
+
+- **They cannot start a run.** uzi works `PRD` issues, and that stays true
+  whether or not a card is on screen. A stray `prds/*.md` link in an
+  unrelated issue does not make it runnable.
+- **They offer Promote instead.** One click adds the `PRD` label on the forge
+  and the card becomes an ordinary board citizen: run controls, chips and all.
+  There is no un-promote in uzi; remove the label in GitLab if you change your
+  mind.
+
+Closed issues without the `PRD` label never appear at all, and uzi's own
+self-improvement tracking issue is always hidden.
 
 A run that finishes a PRD is asked to move the file to `prds/done/` in its own
 merge request (see [Agent skills](./skills.md)). Once that merge request

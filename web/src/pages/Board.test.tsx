@@ -178,6 +178,13 @@ describe("IssueCard label chips (PRD #102 M4)", () => {
     expect(more.getAttribute("tabindex")).toBe("0");
     more.focus();
     expect(document.activeElement).toBe(more);
+    // N1. A bare <span> is role=generic, which ARIA 1.2 forbids naming, so the
+    // aria-label above is invalid on it and a conforming AT drops it — Firefox
+    // announces only "+2". This assertion is the ONLY instrument in this repo that
+    // can see that: jsdom does not enforce ARIA name prohibitions, and Chromium
+    // exposes the name regardless, so a browser check passes too. It is asserted on
+    // the ATTRIBUTE for exactly that reason.
+    expect(more.getAttribute("role")).toBe("img");
   });
 
   it("strips the chip's title ATTRIBUTE, not only its text (#124, m-3)", () => {

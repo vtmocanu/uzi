@@ -1259,6 +1259,17 @@ export function IssueCard({
               // Focusable and named, not hover-only. The withheld labels rode a `title`
               // alone, which no keyboard or screen-reader user can reach — the same
               // accessibility class as the drag gesture the ↑/↓ buttons exist for.
+              //
+              // N1: role="img" is REQUIRED here, not decoration. A bare <span> has the
+              // implicit role `generic`, and ARIA 1.2 prohibits naming a generic
+              // element — so aria-label on it is invalid and a conforming AT drops it.
+              // Chromium exposes the name anyway, which is why neither of this repo's
+              // two web instruments can see the defect: the jsdom test passes and a
+              // Chromium browser check passes. Firefox announces only "+2", and the
+              // withheld labels are lost exactly for the users this attribute exists
+              // to serve. role="img" permits a name, replaces the abbreviated content
+              // with it, and stays non-interactive, which is what this token is.
+              role="img"
               tabIndex={0}
               aria-label={`${chipOverflow} more label${chipOverflow > 1 ? "s" : ""}: ${stripUnsafeChars(hiddenChips.join(", "))}`}
               className="rounded text-[11px] text-faint"

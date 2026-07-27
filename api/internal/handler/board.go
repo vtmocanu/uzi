@@ -197,11 +197,16 @@ type boardDTO struct {
 
 // ── Board ───────────────────────────────────────────────────────────────────
 
-// GetBoard returns a repo's kanban board: its configured columns plus the
-// cached PRD-labeled issues as cards, each resolved to a column. The first time
-// a board is opened (no columns yet) it seeds the default columns as labels on
-// the forge and imports the current PRD issues — a deliberate, documented side
-// effect.
+// GetBoard returns a repo's kanban board: its configured columns plus the cached
+// issues as cards, each resolved to a column. The first time a board is opened (no
+// columns yet) it seeds the default columns as labels on the forge and imports the
+// current issues — a deliberate, documented side effect.
+//
+// The payload carries every cached issue, PRD-labelled or not (PRD #102 M6). The
+// non-PRD ones are filtered CLIENT-side, at render, behind a per-browser toggle:
+// they have to be in the payload regardless, because the board freeze is computed
+// from the whole set and dropping the hidden cards from it would null their stored
+// order (Decision 7b's payload-set rule).
 func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {

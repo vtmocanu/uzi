@@ -364,7 +364,13 @@ SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
 
 -- name: DeleteIssuesNotIn :execrows
 -- Reconcile eviction: drop cached issues absent from the fresh forge set. An
--- empty keep-set deletes everything for the repo (all PRD issues gone forge-side).
+-- empty keep-set deletes everything for the repo (nothing came back forge-side).
+--
+-- Since PRD #102 M6 the keep-set is the UNION of TWO fetches — the PRD-labelled set
+-- and every open issue — so a caller that builds it from one of them wipes whatever
+-- the other owns, on every poll. forgesvc.FullSync is the only production caller and
+-- it fails closed if either fetch errors, which is what makes an empty keep-set here
+-- mean "the forge really is empty" rather than "one request timed out".
 DELETE FROM issues
 WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
 
