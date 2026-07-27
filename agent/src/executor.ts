@@ -98,6 +98,24 @@ export interface RunContext {
    *  an amnesiac lead is told to read the existing commits rather than redo them —
    *  the honest degradation must not become silently duplicated work. */
   priorWork?: PriorWork;
+  /** PRD #35 Decision 6b: this run's plan is ALREADY APPROVED and its SDK session is
+   *  resumable here, so the executor skips the Phase-1 planning turn and the gate and
+   *  goes straight to implement⇄review with `approvedPlan` below.
+   *
+   *  Set by the RUNNER, which is the only layer that knows all three facts: the
+   *  server said plan_approved, a session id survived, and issue #105's transcript
+   *  check did not drop it. Without this a park-and-resume re-plans, re-parks the run
+   *  at awaiting_approval in front of a human who already approved, and can fail
+   *  outright with REASON_NO_PLAN when the resumed session declines to re-emit
+   *  signal_plan — the run's own approval turned into a dead end.
+   *
+   *  A park BEFORE approval (only reachable if the planning turn itself died on a
+   *  limit) leaves this false and resumes into planning exactly as today. */
+  planApproved?: boolean;
+  /** The already-approved plan text to seed the implement loop with (PRD #35). Only
+   *  meaningful with `planApproved`; the executor refuses to skip the gate without
+   *  it, because an empty plan would enter implement with no instructions. */
+  approvedPlan?: string;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */

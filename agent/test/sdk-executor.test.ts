@@ -1934,3 +1934,43 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     );
   });
 });
+
+// ── PRD #35 Decision 6b: a resume past an approval that already happened ──────
+describe("SdkExecutor — pre-approved resume skips the planning turn and the gate", () => {
+  const preApproved = { planApproved: true, sessionId: "sess-parked", approvedPlan: "# Approved plan\nship it" };
+
+  it("skips both, and never calls gatePlan, when the plan is approved and the session resumable", async () => {
+    // One turn only: the implement turn. A run that still planned would need two.
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx(preApproved);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    // The gate is what a HUMAN answers. Asking again for a plan they already
+    // approved is exactly what turns a park into an unattended stall — and can fail
+    // outright with REASON_NO_PLAN when the resumed session declines to re-emit it.
+    assert.deepStrictEqual(probe.gated, [], "gatePlan must not be called for an already-approved plan");
+    assert.strictEqual(turns.length, 1, "no planning turn should run");
+    assert.ok(
+      probe.emits.some((m) => JSON.stringify(m).includes("skipping the planning turn")),
+      "the feed must say the planning turn was skipped",
+    );
+  });
+
+  // Each condition ALONE must not skip. These are the cases where planning is still
+  // the right answer, and skipping on any of them would enter implement with no plan
+  // or resume a session that is not there.
+  for (const [name, over] of [
+    ["there is no session to resume (issue #105 dropped it)", { sessionId: null }],
+    ["the plan is not approved yet — a park during the planning phase", { planApproved: false }],
+    ["it is approved but no plan text arrived", { approvedPlan: "" }],
+  ] as [string, Partial<RunContext>][]) {
+    it(`still plans and gates when ${name}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ ...preApproved, ...over });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(probe.gated.length, 1, "the gate must still run");
+    });
+  }
+});

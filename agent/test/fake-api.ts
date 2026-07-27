@@ -42,6 +42,7 @@ export class FakeApi {
   private readonly alreadyTerminal = new Set<string>();
   private readonly stateStatusOverride = new Map<string, string>();
   private readonly stateRawOverride = new Map<string, { status: number; body: string }>();
+  private readonly refuseAllStates = new Set<string>();
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -132,6 +133,14 @@ export class FakeApi {
    *  older-server shapes a JSON-typed helper cannot express. */
   sendRawState(runId: string, status: number, body: string): void {
     this.stateRawOverride.set(runId, { status, body });
+  }
+
+  /** Refuse EVERY /state report for this run with a 409, whatever its status.
+   *  markAlreadyTerminal only fires for terminal reports, so it cannot express a
+   *  non-terminal report (limit_wait) racing a server-side cancel — which is
+   *  precisely the case PRD #35's park has to survive. */
+  refuseStateWith409(runId: string): void {
+    this.refuseAllStates.add(runId);
   }
 
   setInputs(runId: string, inputs: UserInput[]): void {
@@ -268,6 +277,9 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
+    if (this.refuseAllStates.has(runId)) {
+      return send(res, 409, { error: "run already terminal", run: { id: runId, status: "cancelled" } });
+    }
     const terminal = body.status === "completed" || body.status === "failed";
     // Both answers carry `{"run": {...}}` because BOTH real handlers do
     // (handler/worker_protocol.go, the 409 at :483 and the 200 at :486). This fake
