@@ -13474,15 +13474,28 @@ park a run for years, and cannot spend more than its own owner's retry budget.
   precedent). They count different failures — worker deaths versus limit parks — and a shared
   counter lets one exhaust the other's budget.
 
-**🔴 THE SHIPPED FALLBACK IS A FLAT 15 MINUTES, NOT THE PRD's EXPONENTIAL ONE.** When nothing says
-when the window reopens — the worker reported no usable reset, the gauge has none, no pooled
-alternative contributes — the base is `now + 15m`. PRD #35 Decision 4 still prescribes
-`15m × 2^(limit_wait_count−1)` capped at 4h, and **the code is what shipped**; a rebuild should
-build the flat constant unless the owner rules otherwise. The reasoning: the whole default budget
-then spans ~75 minutes of parking before the run fails honestly, which is a defensible ceiling for a
-no-information case, and an operator with something to say about their limits already has two env
-knobs to say it with. This case is **ordinary, not defensive** — the classifier's primary signal is
-`terminal_reason`, which names the cause outright and carries no timestamp of its own.
+**🔴 THE SHIPPED UNKNOWN-RESET FALLBACK IS A FLAT 15 MINUTES, AND IT IS A KNOWN REGRESSION UNDER AN
+OPEN FIX — DO NOT COPY IT INTO A REBUILD.** When nothing says when the window reopens — the worker
+reported no usable reset, the gauge has none, no pooled alternative contributes — the code currently
+takes `now + 15m`. Decision 4 prescribes `15m × 2^(limit_wait_count−1)` capped at 4h, **the
+architect has ruled the flat constant a regression rather than an alternative, and the PRD's form
+stands.** This paragraph deliberately records the code as it is, because that is what the system
+does today; **it becomes a plain statement of the exponential form once the fix actually lands, and
+not before.** The case is **ordinary, not defensive**, which is why it is worth the argument at all:
+the classifier's primary signal names the cause outright and carries no timestamp of its own, so a
+limit death with no reset is a normal outcome rather than a malformed report.
+
+**The reasoning generalises past this knob and is the reason to prefer a schedule over a constant
+anywhere a retry clock is guessed: an exponential schedule's error is recoverable in one direction
+and fatal in the other, and it errs on the recoverable side.** If the window had actually reopened
+early, the first resume succeeds and the schedule never advances — so the pessimism costs nothing.
+If the window is genuinely long, the schedule buys the hours. A flat constant inverts that: it
+cannot buy the hours, so it burns the whole retry budget in ~75 minutes and fails a run that would
+have succeeded later — putting the **unrecoverable** failure on the **likely** side for precisely
+the case this feature is named after. The flat constant's defence (a bounded ~75-minute ceiling for
+a no-information case, with two env knobs for an operator who knows better) answers the wrong
+question: the ceiling only binds when the guess is *too pessimistic*, which is the direction that
+was already safe.
 
 **Almost every guard the new status needed already existed, and the two that did not are the ones a
 rebuild will miss.** The asymmetry is worth stating as a rule because it decides the work:
@@ -13783,13 +13796,22 @@ weaker on expressions than on columns, and an uncast `EXISTS` types as `interfac
 with the run's auto-approve flag. The plan text itself was **already** on the claim payload, so this
 is one new field, not two.
 
-**🔴 THE SKIP ALSO REQUIRES A NON-EMPTY PLAN, AND THE PRD's RULE DID NOT.** An autopilot run never
-reports `awaiting_approval`, so its stored plan is NULL while `plan_approved` is true by virtue of
-auto-approve; skipping on that combination enters the implement loop **with no plan at all**. The
-contract is: **the server states the fact, the worker decides what it can do with it** — the worker
-skips only when `plan_approved` **and** the plan text is non-empty **and** the session is resumable.
-Accepted residual: an autopilot run re-plans on resume, costing one turn, because its resumed
-session still holds the plan in the transcript and it cannot gate anyway.
+**🔴 THE SKIP ALSO REQUIRES A NON-EMPTY PLAN.** An autopilot run never reports `awaiting_approval`,
+so its stored plan is NULL while `plan_approved` is true by virtue of auto-approve; skipping on that
+combination enters the implement loop **with no plan at all**. The contract is: **the server states
+the fact, the worker decides what it can do with it** — the worker skips only when `plan_approved`
+**and** the plan text is non-empty **and** the session is resumable. Accepted residual: an autopilot
+run re-plans on resume, costing one turn, because its resumed session still holds the plan in the
+transcript and it cannot gate anyway. Persisting the plan for autopilot runs would remove even that
+and is a different PRD's scope.
+
+*(Provenance, corrected: this is a DOCUMENTED DESIGN RULING, not something the implementation added
+on its own authority. Decision 6b's **original** rule lacked it; the **M0 design gate** added it
+deliberately, for exactly the autopilot reason above, and the code implements that ruling verbatim.
+An earlier version of this paragraph was headed "…AND THE PRD's RULE DID NOT", echoing the PRD
+addendum's own phrasing about its own superseded text — which reads, out of that context, as though
+the current PRD were incomplete and would send the next reader off to "fix" a decision that is
+already recorded there.)*
 
 **The runner is the only layer that knows all three facts** — the server said approved, a session id
 arrived, and issue #105's transcript check did not drop it — so it resolves them and hands the
