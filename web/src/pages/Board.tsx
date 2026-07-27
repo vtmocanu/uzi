@@ -145,6 +145,41 @@ export function Board() {
   // reject the second.
   const [reordering, setReordering] = useState(false);
   const reorderRef = useRef(false);
+  // B1. `reordering` drives the buttons' `disabled`, and DISABLING A FOCUSED BUTTON
+  // BLURS IT — the browser moves focus to <body> and never brings it back. Measured by
+  // the browser pass every 100ms from 101ms to 901ms: `disabled=true active=BODY`,
+  // still BODY after the button was re-enabled, on a card that was mid-column
+  // throughout (so not the legitimate end-of-column case).
+  //
+  // The cost is what makes it blocking rather than cosmetic: it is 38 Tab presses from
+  // page start to the first card's move button, so "move this card up three places"
+  // becomes 38 tabs, one press, 38 tabs, one press. The buttons exist to satisfy
+  // WCAG 2.1.1; this made them single-use, and fails 2.4.3 (Focus Order) as well.
+  //
+  // Restoring focus rather than dropping `disabled`: the busy signal is worth keeping,
+  // and the ref guard above already makes a second press harmless, so `disabled` is now
+  // purely an affordance. React replaces the button element on re-render, so the
+  // restore matches on the accessible NAME, which is stable across a within-column move
+  // (same card, same direction, same lane).
+  const refocusName = useRef<string | null>(null);
+  useEffect(() => {
+    if (reordering || refocusName.current == null) return;
+    const want = refocusName.current;
+    refocusName.current = null;
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>("button[aria-label]"));
+    const exact = buttons.find((b) => b.getAttribute("aria-label") === want);
+    // The card may have reached the end of its column, which legitimately disables the
+    // button it was moved with. Fall back to the card's OTHER direction so focus stays
+    // on the card the user was working with instead of falling to <body> anyway.
+    if (exact && !exact.disabled) {
+      exact.focus();
+      return;
+    }
+    const sibling = want.includes(" up in ")
+      ? want.replace(" up in ", " down in ")
+      : want.replace(" down in ", " up in ");
+    buttons.find((b) => b.getAttribute("aria-label") === sibling && !b.disabled)?.focus();
+  }, [reordering]);
 
   // Start-run preconditions, refreshed alongside the board: whether the user has a
   // worker and an Anthropic token. Whether an issue already has an active run now
@@ -503,6 +538,9 @@ export function Board() {
       const lane = cardsByColumn.get(columnKeyForCard(card)) ?? [];
       const anchor = neighbourAnchor(lane, card.iid, direction);
       if (!anchor) return; // already at that end
+      // Recorded BEFORE the await, because `reordering` flips to true inside applyDrop
+      // and the button is blurred the moment it is disabled.
+      refocusName.current = `Move issue #${card.iid} ${direction} in ${columnLabel(card)}`;
       // ONLY on success. This is the announcement channel for users who cannot see the
       // board, so a toast that fires regardless is not a cosmetic slip — it is the
       // feedback saying the opposite of what happened.
@@ -986,7 +1024,7 @@ export function IssueCard({
                 onClick={onMoveUp}
                 aria-label={`Move issue #${card.iid} up in ${laneLabel}`}
                 title={`Move issue #${card.iid} up in ${laneLabel}`}
-                className="rounded px-1 text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
+                className="inline-flex min-h-6 min-w-6 items-center justify-center rounded text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
               >
                 ↑
               </button>
@@ -997,7 +1035,7 @@ export function IssueCard({
                 onClick={onMoveDown}
                 aria-label={`Move issue #${card.iid} down in ${laneLabel}`}
                 title={`Move issue #${card.iid} down in ${laneLabel}`}
-                className="rounded px-1 text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
+                className="inline-flex min-h-6 min-w-6 items-center justify-center rounded text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
               >
                 ↓
               </button>

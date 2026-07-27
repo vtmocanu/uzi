@@ -655,6 +655,74 @@ describe("Board — sort modes and manual ordering (PRD #102 M5)", () => {
     await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(2));
   });
 
+  // B1 (browser pass). Disabling a focused button blurs it, so every keyboard reorder
+  // dropped focus to <body> and never restored it. At 38 Tab presses to reach the first
+  // move button, that made the affordance single-use — defeating the WCAG 2.1.1 reason
+  // it exists, and failing 2.4.3 on the way.
+  it("keeps focus on the moved card's control after a keyboard reorder", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    // JSDOM DOES NOT IMPLEMENT BLUR-ON-DISABLE, so it cannot reproduce B1's trigger on
+    // its own: written without the explicit blur below, this test passes against the
+    // UNFIXED code — an assertion looking straight at the defect and unable to see it.
+    // The blur is therefore simulated, and what this pins is the RESTORE, which is the
+    // half that is real code. The trigger is browser-only and stays with the web-ux pass.
+    //
+    // The reorder is held unresolved so the blur lands while the operation is genuinely
+    // in flight; a plain click resolves the whole flow inside fireEvent's act() and
+    // there is no in-flight window to blur into.
+    let release: (v: { board: BoardData }) => void = () => {};
+    mockApi.reorderBoard.mockImplementation(
+      () => new Promise<{ board: BoardData }>((res) => { release = res; }),
+    );
+
+    const down = moveBtn(1, "down");
+    down.focus();
+    expect(document.activeElement).toBe(down);
+
+    fireEvent.click(down);
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    // Focus is moved to <body> directly rather than via down.blur(): jsdom refuses to
+    // blur a DISABLED element, and the button is disabled by now — the same jsdom/browser
+    // divergence one layer down. <body> is where a real browser puts focus when the
+    // focused control is disabled, so this reproduces the end state faithfully.
+    document.body.tabIndex = -1;
+    document.body.focus();
+    expect(document.activeElement).toBe(document.body);
+
+    release({ board: aBoard() });
+    await waitFor(() => expect(document.activeElement).not.toBe(document.body));
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Move issue #1 down in Backlog");
+  });
+
+  it("falls back to the card's other control when the move disabled the pressed one", async () => {
+    // A card moved to the end of its column legitimately loses that direction. Focus
+    // must land on the sibling rather than on <body>, which is the same failure by a
+    // different route.
+    mockApi.reorderBoard.mockImplementation(async () => ({
+      board: aBoard({ cards: [...cards().filter((c) => c.iid !== 4), cards()[3]] }),
+    }));
+    renderBoard();
+    await screen.findByText("Backlog");
+    const down = moveBtn(4, "down");
+    down.focus();
+    fireEvent.click(moveBtn(1, "down"));
+    await waitFor(() => expect(mockApi.reorderBoard).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(document.activeElement).not.toBe(document.body));
+  });
+
+  // S1 (browser pass). Measured 17.4 x 12 CSS px with centres 17.4px apart: fails
+  // WCAG 2.5.8 and its spacing exception. These ARE the single-pointer alternative
+  // SC 2.5.7 requires for users who cannot drag, so the remedy had a smaller target
+  // than the gesture it replaces.
+  it("gives the reorder controls a 24px minimum target", async () => {
+    renderBoard();
+    await screen.findByText("Backlog");
+    const cls = moveBtn(1, "down").className;
+    expect(cls).toContain("min-h-6");
+    expect(cls).toContain("min-w-6");
+  });
+
   it("degrades a corrupt persisted mode to Manual instead of breaking the board", async () => {
     store.set("uzi.board.repo-1.sortMode", '"not-a-mode"');
     renderBoard();
