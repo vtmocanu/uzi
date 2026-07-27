@@ -7,6 +7,7 @@ import type { AgentSelection, AgentSource, AgentTemplate, ClaimConfig, ClaimPipe
 import type { PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
+import { LimitReachedError } from "./limit.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { gitEnv } from "./git.js";
@@ -212,6 +213,34 @@ export const STUB_FAIL_SENTINEL = "UZI_STUB_FAIL";
  * SDK. Off unless present.
  */
 export const STUB_NOT_CODE_SENTINEL = "UZI_STUB_NOT_CODE";
+
+/**
+ * Sentinel that makes the stub die on a simulated Anthropic usage limit (PRD #35),
+ * standing in for a turn whose result frame carried `blocking_limit`. The E2E needs
+ * it because the park path is otherwise unreachable without a real exhausted
+ * subscription — the same reason STUB_INTERLEAVE_SENTINEL exists for multi-agent
+ * streams.
+ *
+ * It fires ONLY on the first attempt, keyed on `ctx.planApproved`. That is what makes
+ * the headline scenario expressible end to end: attempt 1 plans, gates, then parks;
+ * the resume arrives pre-approved, does NOT throw, and completes. A sentinel that
+ * fired every time could only ever prove the park, never the recovery.
+ *
+ * Append `:noreset` to report NO reset time, which drives the server's exponential
+ * fallback schedule instead of the reported-reset path. On a poller-disabled
+ * deployment — which the E2E overlay is, `UZI_USAGE_POLL_INTERVAL: "0"` — that
+ * fallback is the ORDINARY path rather than an edge case, because every gauge row
+ * classifies stale and neither the cross-check nor NextAvailable can contribute.
+ */
+export const STUB_LIMIT_SENTINEL = "UZI_STUB_LIMIT";
+
+/**
+ * How far ahead the stub claims the window reopens. Deliberately small: the server
+ * floors retry_not_before at `now + jitter` (60-180s), so anything under that is
+ * equivalent, and the point is to exercise the REPORTED-RESET branch of the real
+ * computation rather than to control the wait — which the server owns.
+ */
+const STUB_LIMIT_RESET_MS = 5_000;
 
 /**
  * Sentinel that makes the stub emit a scripted INTERLEAVED multi-agent message
@@ -462,6 +491,36 @@ export class StubExecutor implements Executor {
     // during "implementation", exercising the worker-terminated failure path.
     if (ctx.issueDescription.includes(STUB_FAIL_SENTINEL) || ctx.issueTitle.includes(STUB_FAIL_SENTINEL)) {
       throw new Error(`stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`);
+    }
+
+    // PRD #35 E2E hook: die on a simulated usage limit, but only on the FIRST
+    // attempt. `planApproved` is the discriminator because it is exactly what the
+    // server sets once a human approved and the run is resuming — so the resume runs
+    // straight through and completes, which is the whole point of the scenario.
+    const limitText = `${ctx.issueDescription}\n${ctx.issueTitle}`;
+    if (limitText.includes(STUB_LIMIT_SENTINEL) && !ctx.planApproved) {
+      const noReset = limitText.includes(`${STUB_LIMIT_SENTINEL}:noreset`);
+      // Report a synthetic SDK session id, standing in for the live session exactly
+      // as the stub already stands in for usage frames and interleaved streams.
+      // Without it runs.session_id stays NULL, the resumed run has no session,
+      // plan_approved is unusable, and every resume goes back through the plan gate —
+      // so the gate-skip path would be untestable under the stub.
+      //
+      // Reported HERE rather than at the top of run(), deliberately: onSessionId
+      // triggers an extra `running` state report, and doing it unconditionally
+      // changed the observable report sequence of EVERY stub run (three existing
+      // tests pinned the old sequence and went red). Scoped to the sentinel, an
+      // ordinary stub run is byte-identical to before.
+      //
+      // Derived from the run id so it is stable across a resume of the SAME run.
+      ctx.onSessionId?.(`stub-session-${ctx.runId}`);
+      throw new LimitReachedError({
+        rateLimitType: "five_hour",
+        // Omitted for :noreset, which is what sends the server down its exponential
+        // fallback rather than the reported-reset branch.
+        resetsAtMs: noReset ? undefined : Date.now() + STUB_LIMIT_RESET_MS,
+        detail: "stub sentinel",
+      });
     }
 
     // PRD #43 M5: emit a scripted interleaved multi-agent stream so the E2E can
