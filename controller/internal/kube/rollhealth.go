@@ -88,15 +88,68 @@ var blockingReasons = map[string]bool{
 }
 
 // deriveRollHealth folds a worker's pods into one RollHealth, given wantHash — the
-// spec hash the worker's Deployment currently asks for.
+// spec hash the worker's Deployment currently asks for — and replicaFailure, the reason
+// on that Deployment's ReplicaFailure condition when it is True (empty otherwise).
 //
 // pods are this worker's pods only (label-selected by the caller). now is injected
 // rather than read from the clock so the age arm is testable without sleeping.
-func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconcile.RollHealth {
-	// No pod at all is the Recreate gap: the old pod is terminating or gone and the
-	// new one has not been created. Rolling, with no phase_since — there is nothing
-	// to date it from, and inventing now() would restart the clock every tick.
+func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now time.Time) reconcile.RollHealth {
 	if len(pods) == 0 {
+		// A POD-LESS WORKER HAS TWO CAUSES AND THEY NEED OPPOSITE ANSWERS (issue #148).
+		//
+		// The ordinary one is the Recreate gap: the old pod is terminating or gone and
+		// the new one has not been created yet. MEASURED at ~1.4s on a healthy roll, and
+		// it happens on EVERY release, so reporting `stuck` for pod-lessness as such
+		// would turn the whole fleet's badge red every time uzi ships — the cry-wolf
+		// failure PRD #113 exists to prevent, arriving through this branch.
+		//
+		// The other is a Deployment that can never produce a pod at all: no
+		// ServiceAccount, an exceeded quota, an admission rejection. Before this branch
+		// existed it inherited the gap's answer and was therefore NEVER alerted on — not
+		// at MaxUpgradingWindow, not ever. `rolling` becomes api R2 `upgrading`, which
+		// Decision 1 deliberately excludes from the attention set; the three stuck arms
+		// below all need a pod and this branch returns before reaching them; and past the
+		// INV-5 ceiling the row falls back to version compare, where a worker that never
+		// registered reports no version and classifies `unknown` — also not an alert.
+		// MEASURED on 0.11.8, worker d26fb0f9: `upgrading` for 45 minutes, then `unknown`
+		// forever, both silent, while the cause sat on the Deployment the whole time.
+		//
+		// THE DISCRIMINATOR IS THE CONDITION, NOT THE POD-LESSNESS. ReplicaFailure=True is
+		// the Deployment controller's assertion that a pod create FAILED — a different
+		// claim from "no pod exists yet", which is all the gap can say. A healthy Recreate
+		// gap carries no such condition, so the two cases separate cleanly and the
+		// anti-cry-wolf property survives.
+		//
+		// Fires on the FIRST observation, with no age or restart threshold, matching how
+		// blockingReasons is treated below. That admits one known false positive: a
+		// create failure that resolves on its own (a quota freed, a ServiceAccount created
+		// a moment later) badges `upgrade_failed` for the tick or two before the condition
+		// clears. Accepted deliberately — a brief loud tick is the recoverable direction,
+		// and permanent silence is the bug being fixed here.
+		//
+		// Only the REASON is carried, never the condition's `message`. That is the same
+		// line the pod path holds (see likelyCause's comment in the web): a k8s message is
+		// free text carrying namespaces, object names and paths. It would also not survive
+		// the trip, and this is MEASURED rather than argued — the live message on #148's own
+		// worker was 185 bytes against the api's 64-byte cap on controller-supplied display
+		// strings, and the truncation lands before the cause is reached: `pods
+		// "uzi-hw-d26fb0f9-…-65965d65fc-" i`, with "serviceaccount … not found" gone. See
+		// rollhealth_test.go, which carries the string verbatim as a fixture.
+		//
+		// MEASURED the same day: reason is `FailedCreate` (the replicaset controller's, copied
+		// onto the Deployment by the deployment controller), and a HEALTHY worker's Deployment
+		// carries no ReplicaFailure condition at all. Nothing here hardcodes `FailedCreate`
+		// though — whatever reason the condition carries is what travels.
+		if replicaFailure != "" {
+			// No PhaseSince, for the same reason the gap has none: there is no pod to date
+			// this from. The condition's own LastTransitionTime is deliberately not used —
+			// RollHealth.PhaseSince is documented as a POD timestamp on every other path,
+			// and quietly making it sometimes a Deployment timestamp would break the one
+			// api rule that reads it.
+			return reconcile.RollHealth{Phase: protocol.PhaseStuck, BlockingReason: replicaFailure}
+		}
+		// The gap. Rolling, with no phase_since — there is nothing to date it from, and
+		// inventing now() would restart the clock every tick.
 		return reconcile.RollHealth{Phase: protocol.PhaseRolling}
 	}
 
@@ -111,6 +164,15 @@ func deriveRollHealth(pods []corev1.Pod, wantHash string, now time.Time) reconci
 	}
 	if current == nil {
 		// Only stale pods: the new one is not up yet. Same state as the gap.
+		//
+		// DELIBERATELY NOT gated on replicaFailure, unlike the pod-less branch above. The
+		// worker Deployment's strategy is Recreate — MEASURED off the live spec on
+		// dev-cluster, `strategy.type: Recreate`, not merely assumed from the renderer — so
+		// the old pod is deleted BEFORE the new one is created. A stale pod still being
+		// present therefore means the delete is in flight and the create has not been
+		// attempted for it yet, which is a transient by construction. The permanent case
+		// (the create attempted and refused) always arrives at the pod-less branch, which is
+		// why one gate is sufficient and two would add a cry-wolf window for no coverage.
 		return reconcile.RollHealth{Phase: protocol.PhaseRolling}
 	}
 

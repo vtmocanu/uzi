@@ -257,6 +257,42 @@ describe("likelyCause", () => {
     expect(noCode).not.toMatch(/exit code/);
   });
 
+  it("survives the reason FLICKERING between CrashLoopBackOff and Error (#146)", () => {
+    // MEASURED on 0.11.8: a fast-failing seed-nix alternates between waiting:CrashLoopBackOff
+    // and terminated:Error as kubelet cycles it, 71% / 29% in steady state. The badge stayed
+    // `upgrade_failed` throughout; only this guidance dropped out, so an operator saw the
+    // explanation for an unchanged failure appear and vanish on ~3 ticks in 10.
+    //
+    // Asserted as an INVARIANT ACROSS BOTH REASONS in one test, not as two independent
+    // cases. The bug was never "Error returns null" on its own — it was that two
+    // observations of the SAME incident disagreed, and only a comparison can see that.
+    const crash = likelyCause("seed-nix", "CrashLoopBackOff", 2);
+    const err = likelyCause("seed-nix", "Error", 2);
+    expect(err).not.toBeNull();
+    expect(err).toEqual(crash);
+
+    // CONTROL 1, aimed at the specific way this could pass vacuously: a gate widened to
+    // ignore the reason entirely would return the seed-nix copy for ANY reason on that
+    // container, which is a confident wrong diagnosis rather than a missing one.
+    expect(likelyCause("seed-nix", "FailedMount", 2)).toBeNull();
+    expect(likelyCause("seed-nix", "PodInitializing", 2)).toBeNull();
+
+    // CONTROL 2: `Error` is still scoped to seed-nix. Widening the REASON must not widen
+    // the CONTAINER — the /nix copy is about the store reseed and says nothing true about
+    // the agent container exiting non-zero.
+    expect(likelyCause("worker", "Error", 2)).toBeNull();
+
+    // CONTROL 3: an explicit exit 0 with reason `Error` is self-contradictory (k8s sets
+    // `Error` for a non-zero termination), so it gets silence rather than a guess.
+    expect(likelyCause("seed-nix", "Error", 0)).toBeNull();
+
+    // ...but an ABSENT code is not a contradiction, and this is the asymmetry that keeps
+    // the fix from being a regression: CrashLoopBackOff has never required a code, and the
+    // test above pins that it still does not.
+    expect(likelyCause("seed-nix", "Error", null)).toMatch(/out of space/);
+    expect(likelyCause("seed-nix", "Error", null)).not.toMatch(/exit code/);
+  });
+
   it("does not present the image-pull causes as an exhaustive pair", () => {
     // Worker images come from Harbor, so unreachable and rate-limited are as live as a
     // bad tag or a missing pull secret.

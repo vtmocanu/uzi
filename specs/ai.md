@@ -12167,3 +12167,56 @@ is entitled to make yet.
   `defaultCheckRunner` carries the same `execFile`+`timeout` defect under the uid split that §397
   avoided in `js-deps` (measured: the timeout kills from the worker uid, gets `EPERM`, and leaves the
   runner process alive past its cap).
+## 402. The INV-5 ceiling gates R2 only, and two claims in §391-§392 were false when written or falsified since
+
+Three separate corrections, filed together because one landing (#148 + #151) is what disproved all
+three. Recorded as a correction rather than by rewriting those sections, following §396's precedent:
+§387-§395 were written before live validation and their being wrong in a specific place is itself the
+record worth keeping.
+
+- **§392 said stuck-ness is "derived from pod fields only, statelessly", and enumerated three arms.
+  That is now FALSE, not merely incomplete.** #148 added a FOURTH arm, and it is the only one that
+  does not read a pod: when a hosted worker has **zero** pods and its Deployment carries
+  `ReplicaFailure=True`, `deriveRollHealth` returns `stuck` plus the condition's `reason`
+  (`controller/internal/kube/rollhealth.go`). The object read is the *Deployment's* own
+  `.status.conditions`, not a pod. "Statelessly" survives — the arm holds no memory and re-derives
+  from the current object every tick — but "pod fields only" does not, and a reader trusting it would
+  conclude the pod-less case cannot be detected at all, which is exactly the bug #148 was.
+  Measured on dev-cluster: `ReplicaFailure=True reason=FailedCreate` with 185 bytes of message, and a
+  healthy hosted worker carries **no** `ReplicaFailure` condition at all, so absence is the healthy
+  state rather than `False`.
+
+- **The "paired set-guard" in §391 was never implemented, and it is load-bearing for the bug it would
+  have prevented.** §391 states: *"arm the clock only where version-compare would already say
+  `outdated`"*, justified as keeping the innocent-restart case vacuous. **No such condition exists.**
+  Not in `api/internal/handler/controller_status.go` (every valid-phase entry passes straight
+  through), not in `RecordRollHealth`, and not in the SQL, which arms on
+  `phase IN ('rolling','stuck')` and nothing else. It is not among the claims §396 retracts, so it
+  has been standing unqualified. The cost is precisely #151: the worker that motivated it had
+  **never registered**, so version-compare answered `unknown` rather than `outdated`, and under the
+  documented guard the anchor would never have armed and the incident could not have happened.
+  **Retracted here rather than implemented** — with R1 no longer ceiling-gated, the guard's remaining
+  value is confined to R2, and adding a version-compare precondition to the arming path is a change to
+  an owner-accepted invariant that deserves its own issue rather than riding this one.
+
+- **The ceiling now gates R2 only (#151).** Past `MaxUpgradingWindow` a `rolling` report stops
+  suppressing the version compare, as before; a `stuck` report is **still believed**. The two
+  directions are not symmetric, and the reason recorded in the code is deliberately not the soft
+  "false alarms are self-limiting" one: the controller already **owns** these workers' Deployments, so
+  a compromised controller does not need to assert `upgrade_failed` when it can cause it; and the
+  suppression direction INV-5 exists for is already conceded through B-1 (§391, D10's third
+  amendment), which accepts an indefinitely green fleet with "keep the behaviour, make it visible".
+  Gating R1 bought a bound on the loud direction while the silent one stayed unbounded.
+  What it cost, measured: the anchor arms on the first non-terminal report, which for a hosted worker
+  is while it is still being **provisioned** and nothing is wrong yet. Worker `d26fb0f9` spent 33m50s
+  of a 45m budget pod-less before its pod could appear, leaving a **70-second** window in which the
+  truthful `upgrade_failed` was reachable. So the ceiling measures "how long have we believed a roll
+  is in progress" while being read as "how long may a pod be broken before we say so".
+
+- **Still open, in the same anchor, and NOT fixed by the above.** `upgrading_since` clears only on a
+  version move at register, so any transient not-Ready blip arms it permanently for that release (the
+  blip's restart re-registers at the same version, so nothing clears). R2 is still gated on it, so a
+  worker that blipped once can badge `outdated` on a **later, healthy** roll — the cry-wolf Decision 1
+  exists to forbid, produced by INV-5's own anchor. The ceiling is therefore per-**release**, not
+  per-incident. R8's no-signal grace cannot soften it, because the signal is fresh. Filed as **#155**;
+  #151 deliberately does not touch R2.

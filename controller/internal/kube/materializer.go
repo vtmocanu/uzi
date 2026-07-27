@@ -112,6 +112,17 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// written straight onto ObservedWorker.Roll because the pod pass REPLACES Roll
 	// wholesale, which would drop anything stashed there first.
 	targetImages := map[string]string{}
+	// The reason on each worker Deployment's ReplicaFailure condition when it is True —
+	// the Deployment controller saying a pod create FAILED, as opposed to a pod merely
+	// not existing yet (issue #148). Collected in the same pass as targetImages, and for
+	// the same reason: the pod pass below replaces Roll wholesale.
+	//
+	// This is read off an object ALREADY IN HAND and needs no RBAC beyond the `get/list
+	// deployments` this loop is built on. That is what makes the fix cheap: the cause of a
+	// pod that can never be created is on the Deployment's own status, not in Events —
+	// which PRD #113 declined to grant (`events: list` was refused) and which this does
+	// not reopen.
+	replicaFailures := map[string]string{}
 
 	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -128,6 +139,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.HasDeployment = true
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
+		}
+		if reason := replicaFailureReason(d); reason != "" {
+			replicaFailures[id] = reason
 		}
 		// Read the drift signals off the POD TEMPLATE's annotations — where we stamped
 		// them, and where they have to be for a change to roll the pod at all.
@@ -233,7 +247,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// wantHash is what this worker's DEPLOYMENT currently asks for, already read
 		// off its pod template above. Passing it is what makes the derivation about
 		// pod readiness rather than deployment drift — see rollhealth.go's header.
-		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, now)
+		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, replicaFailures[o.ID], now)
 		o.Roll.TargetImage = targetImages[o.ID]
 	}
 	// A worker seen ONLY as pods (its Deployment already gone, its pods still
@@ -244,10 +258,68 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		if o.HasDeployment {
 			continue // already derived above
 		}
-		o.Roll = deriveRollHealth(ps, o.SpecHash, now)
+		// replicaFailures is empty here by construction — this loop is the workers with NO
+		// Deployment, so there is no Deployment status to have read a condition off.
+		// Indexed rather than passed as a literal "" so the two call sites cannot drift.
+		o.Roll = deriveRollHealth(ps, o.SpecHash, replicaFailures[id], now)
 		o.Roll.TargetImage = targetImages[id]
 	}
 	return nil
+}
+
+// replicaFailureReason returns the reason on a worker Deployment's ReplicaFailure
+// condition when that condition is True, and "" otherwise.
+//
+// "" INCLUDES THE ABSENT CASE, and absence is the healthy state rather than an unknown one.
+// MEASURED BY EXPERIMENT on dev-cluster, 2026-07-26: creating the missing ServiceAccount
+// made one pod create succeed and Kubernetes REMOVED the condition outright — it did not set
+// it False. Deleting the ServiceAccount again brought it back within ~15s. So there is no
+// ConditionFalse state to handle on a real cluster, and the condition tracks CURRENT state,
+// not history.
+//
+// That non-stickiness cuts both ways and both are load-bearing:
+//
+//   - It is why this is safe. The condition cannot be a stale accusation left over from a
+//     failure that was already fixed, so `stuck` here always means "creates are failing NOW".
+//   - It is why nothing may assume the condition persists. In the genuinely broken state it
+//     was present continuously for ~32 minutes (20:10→20:42), so a controller on the 10s
+//     default cadence sees it on essentially every tick — but one successful create clears
+//     it, and the next tick correctly reports the gap instead.
+//
+// The REASON only. The condition's `message` is not returned and must not be: see the
+// pod-less branch in rollhealth.go for both halves of why (free text, and a 64-byte cap
+// downstream that keeps only its prefix — measured to be pure pod name).
+//
+// Deployment, not ReplicaSet, and that matters for RBAC: the Deployment controller copies
+// its newest ReplicaSet's ReplicaFailure condition onto the Deployment, so the signal is
+// readable from the object this controller already lists. Nothing here needs
+// `replicasets: list`. (Confirmed on the live object: the ReplicaSet carries the identical
+// condition, same reason, same message. Either would do; only one is already granted.)
+//
+// CONSIDERED AND REJECTED as the discriminator: `Progressing=False` /
+// `ProgressDeadlineExceeded`, which sits on the same object and is Kubernetes' own canonical
+// "this rollout failed" signal. It is broader — it also catches a pod that exists and never
+// becomes Ready — and its message is 94 bytes rather than 185. But MEASURED on the same
+// worker, it is LATE: absent at 20:14 and 20:42 with `Progressing=True`, and appearing only
+// once `progressDeadlineSeconds` elapsed (600 on the live spec, the k8s default). Ten minutes
+// of silence is most of what #148 is complaining about, and the arm would also fire on a
+// genuinely slow cold pull of the browser-inflated agent image. ReplicaFailure is immediate
+// and names the actual cause, so it is the primary signal.
+//
+// Adding ProgressDeadlineExceeded as a SECOND, catch-all arm is a live option and is not
+// taken here — the stall shapes it would add are already covered by the pod path's three
+// arms, so its marginal coverage is "pod-less AND no ReplicaFailure AND stalled past the
+// deadline", against a real cry-wolf cost on slow pulls. Worth noting that its 600s deadline
+// happens to equal the controller's own stuckAge; that is two independent defaults matching,
+// NOT designed coupling, and neither may be tuned on the assumption the other follows.
+func replicaFailureReason(d *appsv1.Deployment) string {
+	for i := range d.Status.Conditions {
+		c := &d.Status.Conditions[i]
+		if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
+			return c.Reason
+		}
+	}
+	return ""
 }
 
 // workerImage returns the agent container's image from a worker Deployment's pod
