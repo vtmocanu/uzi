@@ -43,7 +43,16 @@ function Td({ children, left, total, mono }: { children: ReactNode; left?: boole
       className={cx(
         "px-2.5 py-1.5",
         left ? cx("text-left", mono ? "font-mono" : "font-sans") : "text-right font-mono tabular-nums",
-        total ? "font-semibold text-fg" : cx("text-muted", left && "text-fg"),
+        // Issue #152: these three are mutually EXCLUSIVE, and the non-total branch used to
+        // be additive — a left cell got `text-muted` AND `text-fg`. Same specificity, so
+        // stylesheet order decides it, and in the built CSS `.text-fg` precedes
+        // `.text-muted` (re-measured 2026-07-27 on `npm run build`: 24360 vs 24602; the
+        // issue measured 24294/24536, so the ORDER is the durable fact, not the offsets).
+        // `text-muted` therefore always won and the left-cell rule was dead, silently
+        // dimming the Agent, Phase and Model columns against the approved mocks. Cosmetic,
+        // but a contrast regression — and the shape reappears easily: never hand cx() two
+        // colour classes for one element and expect the later argument to win.
+        total ? "font-semibold text-fg" : left ? "text-fg" : "text-muted",
         !total && "border-b border-edge/50",
       )}
     >

@@ -214,3 +214,64 @@ describe("RunUsagePanel $0 cost (Decision 8)", () => {
     expect(container.textContent).not.toContain("$0.00");
   });
 });
+
+// Issue #152: `Td`'s colour branch was ADDITIVE — a left cell got `text-muted text-fg`
+// both. Equal specificity, so stylesheet order decided it, and `.text-fg` precedes
+// `.text-muted` in the built CSS (re-measured 2026-07-27 on `npm run build`: 24360 vs
+// 24602; the issue measured 24294/24536, so the ORDER is the durable fact, not the
+// offsets). `text-muted` therefore always won and the
+// left-cell rule was dead. The Agent, Phase and Model columns therefore rendered dim
+// against the approved mocks.
+//
+// Asserting BOTH halves is the point: `expect(classes).toContain("text-fg")` alone passes
+// against the buggy code, because the buggy code emits `text-fg` too — it just also emits
+// the class that beats it. The absence is the whole assertion.
+function tableWithHeader(container: HTMLElement, first: string): HTMLTableElement {
+  const table = [...container.querySelectorAll("table")].find(
+    (t) => t.querySelector("thead th")?.textContent?.trim() === first,
+  );
+  if (!table) throw new Error(`table with first header "${first}" not found`);
+  return table;
+}
+function cellClasses(table: HTMLTableElement, row: number, col: number): string[] {
+  const cell = table.tBodies[0]!.rows[row]?.cells[col];
+  if (!cell) throw new Error(`no cell at row ${row}, col ${col}`);
+  return [...cell.classList];
+}
+
+describe("RunUsagePanel cell colour is exclusive (issue #152)", () => {
+  it("gives a left-aligned body cell text-fg and NOT text-muted", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+
+    for (const [label, table, col] of [
+      ["phase", tableWithHeader(container, "Phase"), 0],
+      ["agent", tableWithHeader(container, "Agent"), 0],
+      ["model", tableWithHeader(container, "Agent"), 1], // PRD #93's Model column, `left mono`
+    ] as const) {
+      const classes = cellClasses(table, 0, col);
+      expect(classes, `${label} column must be readable`).toContain("text-fg");
+      expect(classes, `${label} column must NOT also carry the muted class that beats it`).not.toContain("text-muted");
+    }
+  });
+
+  it("leaves the numeric columns muted, so the fix did not just brighten everything", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    // Right-aligned, non-total: still the dim treatment the mock asks for. Without this,
+    // `text-fg` everywhere would pass the test above and lose the whole visual hierarchy.
+    const classes = cellClasses(tableWithHeader(container, "Phase"), 0, 1);
+    expect(classes).toContain("text-muted");
+    expect(classes).not.toContain("text-fg");
+  });
+
+  it("keeps the total row emphasised and unmuted, left cell included", () => {
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(twoPhase())} />);
+    const table = tableWithHeader(container, "Phase");
+    const last = table.tBodies[0]!.rows.length - 1;
+    for (const col of [0, 1]) {
+      const classes = cellClasses(table, last, col);
+      expect(classes).toContain("font-semibold");
+      expect(classes).toContain("text-fg");
+      expect(classes).not.toContain("text-muted");
+    }
+  });
+});
