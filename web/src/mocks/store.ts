@@ -63,8 +63,12 @@ function seed(): MockState {
   messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
-  // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows.
+  // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows. The
+  // degraded-countdown fixture shares it — the rows are the same shape and it exists
+  // for the run-row states (expired stamp, 7-day window, suppressed attempt), not for
+  // a different feed.
   messages.set("run-limit-wait", [...mockLimitWaitMessages]);
+  messages.set("run-limit-wait-due", mockLimitWaitMessages.map((m) => ({ ...m })));
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));

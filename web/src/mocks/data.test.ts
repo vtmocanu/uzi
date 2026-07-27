@@ -71,10 +71,29 @@ describe("mock token fixtures agree with each other (PRD #111, web-ux F1)", () =
 // to catch anything. Every one of them is satisfiable by a fixture that looks fine.
 describe("the parked-run fixture can actually discriminate (PRD #35)", () => {
   const parked = mockRuns.find((r) => r.id === "run-limit-wait");
+  const due = mockRuns.find((r) => r.id === "run-limit-wait-due");
 
-  it("exists and is the demo's only limit_wait run", () => {
+  it("exists alongside a second, DEGRADED parked fixture", () => {
+    // Two, not one. The second exists because the first cannot reach the degraded
+    // countdown states — expired stamp, multi-day window, suppressed attempt — and
+    // the browser validator had to override Date.now() inside the page to see them.
+    // A state reachable only by patching the clock regresses silently.
     expect(parked, "no run-limit-wait fixture — nothing in mock mode renders a park").toBeDefined();
-    expect(mockRuns.filter((r) => r.status === "limit_wait")).toHaveLength(1);
+    expect(due, "no run-limit-wait-due fixture — the expired-countdown branch is unreachable").toBeDefined();
+    expect(mockRuns.filter((r) => r.status === "limit_wait")).toHaveLength(2);
+  });
+
+  it("🔴 the second fixture reaches the branches the first cannot", () => {
+    // Each assertion here is one branch that would otherwise need a patched clock.
+    // retry_not_before in the PAST -> "Resuming shortly" instead of a countdown.
+    expect(Date.parse(due!.retry_not_before!)).toBeLessThan(Date.now());
+    // A multi-day window -> formatCountdown's "Nd Nh" arm and the long-horizon reset.
+    expect(due!.rate_limit_type).toBe("seven_day");
+    expect(Date.parse(due!.limit_resets_at!) - Date.now()).toBeGreaterThan(4 * 86_400_000);
+    // count == 1 -> the SUPPRESSED attempt clause, the opposite of the first fixture.
+    expect(due!.limit_wait_count).toBe(1);
+    // Still the pool-aware ordering, and by days rather than an hour.
+    expect(Date.parse(due!.retry_not_before!)).toBeLessThan(Date.parse(due!.limit_resets_at!));
   });
 
   it("🔴 stamps retry_not_before EARLIER than limit_resets_at", () => {

@@ -137,6 +137,14 @@ export function HealthFlag({ run }: { run: Run }) {
   );
 }
 
+// capitalise fronts the window clause when it stands as its own sentence. The clause
+// is built lower-case because its other use is mid-sentence ("sooner than the 5-hour
+// window reopens …"), and one string serving both readings beats two near-identical
+// ones that can drift apart.
+function capitalise(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 /**
  * PRD #35: the usage-limit surface — the resume countdown while a run is parked, and
  * the per-run opt-in for the NEXT limit. One component for both because they are one
@@ -161,10 +169,16 @@ export function LimitWaitPanel({
   run,
   busy,
   onToggle,
+  onStop,
 }: {
   run: Run;
   busy: boolean;
   onToggle: (enabled: boolean) => void;
+  // web-ux F1: the panel carries its OWN Stop, rather than pointing at the one in the
+  // steer card 596px below it. The old copy's "Stop it if you would rather not wait"
+  // was the faintest text on the page (4.56 contrast) and named a control the user
+  // then had to hunt for past the whole activity feed.
+  onStop: () => void;
 }) {
   const parked = run.status === "limit_wait";
   const [now, setNow] = useState(() => Date.now());
@@ -187,7 +201,9 @@ export function LimitWaitPanel({
     <label className="flex items-center gap-2 text-xs">
       <input
         type="checkbox"
-        className="h-3.5 w-3.5 accent-brand"
+        // h-4 w-4, matching Settings and every other checkbox in the app. This PRD
+        // introduced the only h-3.5 in the codebase (web-ux nit).
+        className="h-4 w-4 accent-brand"
         checked={run.wait_on_limit}
         disabled={busy}
         onChange={(e) => onToggle(e.target.checked)}
@@ -209,26 +225,60 @@ export function LimitWaitPanel({
   // a separate clause rather than as the number the user is waiting on.
   const countdown = formatCountdown(run.retry_not_before, now);
   const windowName = runWindowLabel(run.rate_limit_type);
-  const resetsAt = run.limit_resets_at ? new Date(run.limit_resets_at) : null;
-  const context = [
-    windowName && resetsAt && Number.isFinite(resetsAt.getTime())
-      ? `${windowName} reopens ${resetsAt.toLocaleString()}`
-      : windowName,
-    // "attempt 1" is noise on a first park; the count only becomes information once
-    // the run has been round more than once, which is also when the retry budget
-    // starts to matter. The CAP is deliberately not on RunDTO (one server constant
-    // does not belong on every row of a list response), so this is "attempt N", not
-    // "attempt N of M".
-    run.limit_wait_count > 1 ? `attempt ${run.limit_wait_count}` : null,
-  ]
-    .filter((s): s is string => s != null && s !== "")
-    .join(" · ");
+  const resetsMs = run.limit_resets_at ? Date.parse(run.limit_resets_at) : NaN;
+  const retryMs = run.retry_not_before ? Date.parse(run.retry_not_before) : NaN;
+  const hasReset = Number.isFinite(resetsMs);
+
+  // web-ux F4: rendered plainly, the two numbers read as a contradiction — "resumes in
+  // 1h 36m" beside a window that reopens 57 minutes LATER. The code is right and the
+  // gap is the pool-aware stamp doing its job, but nothing on the panel said so, and a
+  // user who spots it concludes one of the numbers is wrong.
+  //
+  // Detected from the VALUES, not assumed: the ordering can go either way. The stamp
+  // starts at max(worker reset, gauge reset), so jitter and the cross-check push it
+  // LATER, while an alternative credential with headroom pulls it EARLIER. Only the
+  // earlier case is surprising, so only it gets the clause.
+  //
+  // The wording claims the RULE, not the cause: retry_not_before means "the earliest
+  // moment this user could spend anything", which is exactly "as soon as one of your
+  // tokens can pay for it". Naming a second credential specifically would be a guess —
+  // the DTO carries no field saying which leg of the computation won.
+  const resumesEarly = hasReset && Number.isFinite(retryMs) && retryMs < resetsMs;
+
+  // Seconds on a multi-hour horizon are noise (web-ux nit): toLocaleString() renders
+  // "01:37:11" for an instant that is only known to within a poll interval anyway.
+  const resetText = hasReset
+    ? new Date(resetsMs).toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      })
+    : null;
+
+  // Kept as SEPARATE clauses rather than one joined string: the window clause has to
+  // sit inside the "sooner than …" sentence when the run resumes early, and the
+  // attempt has to stay outside it. Joining them with " · " first put "attempt 2"
+  // between "reopens <date>" and "because uzi resumes…", splitting one sentence
+  // around an unrelated fact.
+  const windowClause = windowName && resetText ? `the ${windowName} reopens ${resetText}` : windowName;
+  // "attempt 1" is noise on a first park; the count only becomes information once the
+  // run has been round more than once, which is also when the retry budget starts to
+  // matter. The CAP is deliberately not on RunDTO (one server constant does not belong
+  // on every row of a list response), so this is "attempt N", not "attempt N of M".
+  const attemptClause = run.limit_wait_count > 1 ? `Attempt ${run.limit_wait_count}.` : null;
 
   return (
     <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          {/* role="status" so the countdown's arrival is announced, like HealthFlag. */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* role="status" announces the PARK when this panel mounts — the heading
+              below, not the countdown, which sits in a sibling <p> outside this live
+              region and is deliberately NOT announced: a per-second countdown inside
+              a live region would interrupt a screen reader every second, which is
+              hostile. The park's arrival is separately narrated by ActivityFeed's own
+              polite region when the limit_wait message lands.
+              (This comment previously claimed the countdown was announced here. It
+              was never true — the behaviour is correct and the comment was the bug,
+              which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
             Paused on an Anthropic usage limit
@@ -236,22 +286,38 @@ export function LimitWaitPanel({
           <p className="mt-0.5 text-xs text-muted">
             {countdown ? (
               <>
-                Resumes in <span className="tabular-nums text-fg">{countdown}</span>.
+                Resumes in <span className="tabular-nums text-fg">{countdown}</span>
+                {resumesEarly && windowClause ? (
+                  <> — sooner than {windowClause}, because uzi resumes as soon as any of your tokens can pay for it.</>
+                ) : (
+                  <>.{windowClause && ` ${capitalise(windowClause)}.`}</>
+                )}
               </>
             ) : (
               // Past retry_not_before: the promotion pass runs on a ticker, so the
               // run is waiting on the next sweep rather than overdue. Counting up
               // into a negative would read as a fault where there is none.
-              <>Resuming shortly.</>
+              <>Resuming shortly.{windowClause && ` ${capitalise(windowClause)}.`}</>
             )}
-            {context && <span> {context}.</span>}
+            {attemptClause && ` ${attemptClause}`}
           </p>
-          <p className="mt-1.5 text-xs text-faint">
-            Nothing is lost — the run keeps its branch and its history and picks up where it left off. Stop it
-            if you would rather not wait.
+          {/* text-muted, not text-faint (web-ux F1): at 4.56 this was the faintest
+              text on the panel while being the only thing telling a stuck user that
+              nothing is lost. The pointer to Stop is now the button beside it. */}
+          <p className="mt-1.5 text-xs text-muted">
+            Nothing is lost — the run keeps its branch and its history and picks up where it left off.
           </p>
         </div>
-        {toggle}
+        {/* A ROW, not a column. As a column with items-end it wrapped under the prose
+            at ordinary widths and left the Stop button stranded mid-panel with the
+            checkbox orphaned beneath it — the two controls read as unrelated. Side by
+            side they wrap as one unit and stay legible from 390px up. */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {toggle}
+          <Button variant="danger" size="sm" disabled={busy} onClick={onStop}>
+            Stop run
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -388,8 +454,22 @@ export function RunView() {
               {/* Run-health warn chip (PRD #47), next to the LIVE STAGE label. */}
               <HealthFlag run={run} />
               {/* The live/offline WS indicator is only meaningful while the run is
-                  active; a terminal run has no stream, so never show "completed • live". */}
-              {!terminal && (
+                  active; a terminal run has no stream, so never show "completed • live".
+
+                  PRD #35 (web-ux F2): a PARKED run is also excluded, and that is a
+                  correctness fix rather than tidiness. `live` is drawn in the `ok`
+                  tone — a green go-signal — so on a parked run it sat directly beside
+                  the amber "limit wait" pill, telling the user two opposite things at
+                  once. And it is not even a claim about the run: it reports the
+                  WEBSOCKET, which is genuinely connected while nothing whatsoever
+                  happens for hours.
+
+                  This is Success Criterion 2 ("visibly waiting, never stalled")
+                  failing from the other side: not a false alarm, a false all-clear.
+                  `awaiting_approval` has the same shape and keeps the chip, because a
+                  human gate is minutes and someone is expected to be looking; a park
+                  is hours by design, which is what makes it different in kind. */}
+              {!terminal && run.status !== "limit_wait" && (
                 <span
                   title={connected ? "Live" : "Reconnecting…"}
                   className={cx(
@@ -427,6 +507,7 @@ export function RunView() {
       <LimitWaitPanel
         run={run}
         busy={busy}
+        onStop={() => act(() => submit("cancel"))}
         onToggle={(enabled) =>
           act(async () => {
             await api.setRunWaitOnLimit(run.id, enabled);

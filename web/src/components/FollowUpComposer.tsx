@@ -8,7 +8,15 @@ import { Button, Textarea } from "./ui";
 // survives the run going terminal (Decision 7/B1); the Stop-run action is a card-level
 // steering control, not a composer concern. On send it clears the textarea; M3 layers the
 // optimistic queue entry on top of the same onSend.
-export function FollowUpComposer({ busy, onSend }: { busy: boolean; onSend: (text: string) => void }) {
+export function FollowUpComposer({
+  busy,
+  onSend,
+  parked = false,
+}: {
+  busy: boolean;
+  onSend: (text: string) => void;
+  parked?: boolean;
+}) {
   const [text, setText] = useState("");
   const send = () => {
     const t = text.trim();
@@ -20,7 +28,20 @@ export function FollowUpComposer({ busy, onSend }: { busy: boolean; onSend: (tex
     <div className="space-y-3">
       <Textarea
         rows={2}
-        placeholder="Send a follow-up message (resumes the agent as its next turn)"
+        // PRD #35 (web-ux F1): the default placeholder promises "resumes the agent as
+        // its next turn", which on a run parked on a usage limit is the opposite of
+        // what happens — nothing resumes for hours. That mattered more than the
+        // wording suggests: this composer's Send is the page's only FILLED primary
+        // button, so a user hunting for a way out of a park was being offered the one
+        // control that reads like an escape and is not.
+        //
+        // The queue still accepts the message (it is delivered on resume, which is
+        // genuinely useful), so the fix is honesty about WHEN, not disabling it.
+        placeholder={
+          parked
+            ? "Send a follow-up message (queued until the run resumes)"
+            : "Send a follow-up message (resumes the agent as its next turn)"
+        }
         value={text}
         onChange={(e) => setText(e.target.value)}
       />

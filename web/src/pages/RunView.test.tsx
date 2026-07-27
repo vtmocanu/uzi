@@ -1082,7 +1082,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
   it("renders NOTHING for a terminal run — there is no future limit to opt into", () => {
     for (const status of ["completed", "failed", "cancelled"] as const) {
       cleanup();
-      const { container } = render(<LimitWaitPanel run={run({ status })} busy={false} onToggle={() => {}} />);
+      const { container } = render(<LimitWaitPanel run={run({ status })} busy={false} onToggle={() => {}} onStop={() => {}} />);
       // Not "a disabled checkbox": a control that cannot do anything only invites the
       // question of why it is there.
       expect(container.textContent).toBe("");
@@ -1092,7 +1092,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
 
   it("shows only the quiet toggle for a live, never-parked run", () => {
     const { container } = render(
-      <LimitWaitPanel run={run({ status: "running" })} busy={false} onToggle={() => {}} />,
+      <LimitWaitPanel run={run({ status: "running" })} busy={false} onToggle={() => {}} onStop={() => {}} />,
     );
     expect(container.querySelector("input[type=checkbox]")).not.toBeNull();
     expect(container.textContent).toContain("Wait out future Anthropic usage limits");
@@ -1108,22 +1108,83 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // before the dead credential's window rolls over, so the stamp is routinely
     // EARLIER. A countdown wired to limit_resets_at would tell the user to wait 5h
     // for a run that comes back in 2h 14m, and would look entirely plausible.
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} />);
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
     expect(container.textContent).toContain("2h 14m");
     expect(container.textContent).not.toContain("5h 0m");
   });
 
   it("renders limit_resets_at as CONTEXT, named as its window", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} />);
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
     expect(container.textContent).toContain("5-hour window reopens");
-    expect(container.textContent).toContain(new Date(ahead(5 * 3_600_000)).toLocaleString());
+    // Formatted WITHOUT seconds (web-ux nit): toLocaleString() renders "7:00:00 PM"
+    // for an instant known only to within a poll interval, so the precision is a
+    // lie as well as noise.
+    expect(container.textContent).toContain(
+      new Date(ahead(5 * 3_600_000)).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
+    );
+    expect(container.textContent).not.toMatch(/\d:\d\d:\d\d/);
+  });
+
+  it("🔴 explains the gap when the run resumes BEFORE its window reopens", () => {
+    // web-ux F4. Rendered plainly the two numbers read as a contradiction: "resumes in
+    // 2h 14m" beside a window reopening ~3h later. The code was right and nothing said
+    // why, so a user who notices concludes one number is wrong.
+    //
+    // The claim is the RULE, not a cause: retry_not_before means "the earliest moment
+    // this user could spend anything". Naming a second credential would be a guess —
+    // no DTO field says which leg of the computation won.
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    expect(container.textContent).toMatch(/sooner than the 5-hour window reopens/);
+    expect(container.textContent).toMatch(/as soon as any of your tokens can pay for it/);
+  });
+
+  it("does NOT explain a gap that does not exist — the ordering can go either way", () => {
+    // The stamp starts at max(worker reset, gauge reset), so jitter and the
+    // cross-check push it LATER; only an alternative credential pulls it earlier. A
+    // panel that always printed "sooner than…" would be wrong half the time, so this
+    // is derived from the values rather than assumed from the feature.
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked({ retry_not_before: ahead(6 * 3_600_000) })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(container.textContent).not.toMatch(/sooner than/);
+    expect(container.textContent).toContain("The 5-hour window reopens");
+  });
+
+  it("keeps the attempt clause OUT of the explanatory sentence", () => {
+    // The first version joined window and attempt with " · " before composing, which
+    // put "attempt 2" between "reopens <date>" and "because uzi resumes…" — one
+    // sentence split around an unrelated fact.
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    expect(container.textContent).toMatch(/pay for it\.\s*Attempt 2\./);
+  });
+
+  it("🔴 offers Stop IN the panel, not 600px below it", () => {
+    // web-ux F1: the only pointer to the real control was "Stop it if you would rather
+    // not wait" at 4.56 contrast, and `Stop run` lived past the whole activity card.
+    // Meanwhile the page's one FILLED primary button was `Send follow-up`, which on a
+    // parked run promises the opposite of what it does.
+    const onStop = vi.fn();
+    render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={onStop} />);
+    const stop = screen.getByRole("button", { name: /stop run/i });
+    fireEvent.click(stop);
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not offer Stop on a live, never-parked run — the steer card owns that", () => {
+    render(<LimitWaitPanel run={run({ status: "running" })} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
   });
 
   it("says 'Resuming shortly' once the clock has passed, never a negative countdown", () => {
     // The promotion pass runs on a ticker, so an expired stamp means "waiting on the
     // next sweep", not "late". Counting up would read as a fault where there is none.
     const { container } = render(
-      <LimitWaitPanel run={parked({ retry_not_before: ahead(-90_000) })} busy={false} onToggle={() => {}} />,
+      <LimitWaitPanel run={parked({ retry_not_before: ahead(-90_000) })} busy={false} onToggle={() => {}} onStop={() => {}} />,
     );
     expect(container.textContent).toContain("Resuming shortly");
     // Targeted at a NEGATIVE DURATION, not at the character: "5-hour window" and the
@@ -1137,7 +1198,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
 
   it("ticks the countdown down as time passes", () => {
     const { container } = render(
-      <LimitWaitPanel run={parked({ retry_not_before: ahead(65_000) })} busy={false} onToggle={() => {}} />,
+      <LimitWaitPanel run={parked({ retry_not_before: ahead(65_000) })} busy={false} onToggle={() => {}} onStop={() => {}} />,
     );
     expect(container.textContent).toContain("1m 05s");
     act(() => {
@@ -1147,11 +1208,13 @@ describe("LimitWaitPanel (PRD #35)", () => {
   });
 
   it("shows 'attempt N' only from the second park", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} />);
-    expect(container.textContent).toContain("attempt 2");
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    // Case-insensitive on the word, exact on the number: it is capitalised now that it
+    // stands as its own sentence rather than riding a " · " join.
+    expect(container.textContent).toMatch(/attempt 2/i);
     cleanup();
     const first = render(
-      <LimitWaitPanel run={parked({ limit_wait_count: 1 })} busy={false} onToggle={() => {}} />,
+      <LimitWaitPanel run={parked({ limit_wait_count: 1 })} busy={false} onToggle={() => {}} onStop={() => {}} />,
     );
     expect(first.container.textContent).not.toContain("attempt");
   });
@@ -1162,7 +1225,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // clock and the run still resumes. So the checkbox must be present, enabled, and
     // must hand the caller nothing but the new boolean.
     const onToggle = vi.fn();
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={onToggle} />);
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={onToggle} onStop={() => {}} />);
     const box = container.querySelector("input[type=checkbox]") as HTMLInputElement;
     expect(box).not.toBeNull();
     expect(box.disabled).toBe(false);
@@ -1180,7 +1243,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // Reachable: the owner turned it off mid-park. The box must follow the flag, not
     // the status, or the user cannot tell that their change landed.
     const { container } = render(
-      <LimitWaitPanel run={parked({ wait_on_limit: false })} busy={false} onToggle={() => {}} />,
+      <LimitWaitPanel run={parked({ wait_on_limit: false })} busy={false} onToggle={() => {}} onStop={() => {}} />,
     );
     const box = container.querySelector("input[type=checkbox]") as HTMLInputElement;
     expect(box.checked).toBe(false);
@@ -1188,12 +1251,12 @@ describe("LimitWaitPanel (PRD #35)", () => {
   });
 
   it("disables the box while a write is in flight", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy onToggle={() => {}} />);
+    const { container } = render(<LimitWaitPanel run={parked()} busy onToggle={() => {}} onStop={() => {}} />);
     expect((container.querySelector("input[type=checkbox]") as HTMLInputElement).disabled).toBe(true);
   });
 
   it("announces the park politely rather than silently", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} />);
+    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
     expect(container.querySelector('[role="status"]')?.textContent).toContain("Paused on an Anthropic usage limit");
   });
 
@@ -1205,6 +1268,7 @@ describe("LimitWaitPanel (PRD #35)", () => {
         run={parked({ retry_not_before: null, limit_resets_at: null, rate_limit_type: null })}
         busy={false}
         onToggle={() => {}}
+        onStop={() => {}}
       />,
     );
     expect(container.textContent).toContain("Resuming shortly");

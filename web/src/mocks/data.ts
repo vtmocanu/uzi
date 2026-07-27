@@ -1955,6 +1955,71 @@ export const mockRuns: Run[] = [
     created_at: minsAgo(141),
     updated_at: minsAgo(6),
   },
+  {
+    // PRD #35, second parked run: the DEGRADED countdown states, which the first
+    // fixture cannot reach. Added because the browser validator had to override
+    // Date.now() inside the page to see them at all, and a state reachable only by
+    // patching the clock is one that regresses silently.
+    //
+    // Three things differ from run-limit-wait, each unlocking a branch:
+    //   * retry_not_before is in the PAST → "Resuming shortly" instead of a countdown.
+    //     Real, not a broken fixture: the promotion pass runs on a ticker, so an
+    //     expired stamp means "waiting for the next sweep".
+    //   * the window is seven_day and days out → exercises formatCountdown's "Nd Nh"
+    //     arm and the long-horizon reset text, where the two fixtures' 5-hour and
+    //     7-day framing must not be swapped.
+    //   * limit_wait_count is 1 → the SUPPRESSED "attempt" clause, the opposite of
+    //     the first fixture's "attempt 2".
+    //
+    // Note retry_not_before is EARLIER than limit_resets_at here too, and by six days
+    // rather than an hour — the pool-aware promotion at its most visible, and the case
+    // where the "sooner than…" explanation earns its place.
+    id: "run-limit-wait-due",
+    repo_id: "repo-atlas",
+    issue_iid: 9,
+    issue_title: "Cache the tenant lookup in the auth middleware",
+    issue_description: "See prds/9-tenant-cache.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "limit_wait",
+    requeue_count: 0,
+    iteration_count: 1,
+    auto_approve: false,
+    worker_id: "w-ci",
+    branch: "agent/issue-9",
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-console",
+    anthropic_secret_label: "console-key",
+    anthropic_select_reason: "auto",
+    anthropic_headroom_pct: 1,
+    wait_on_limit: true,
+    limit_resets_at: minsAhead(6 * 24 * 60),
+    retry_not_before: minsAgo(3),
+    limit_wait_count: 1,
+    rate_limit_type: "seven_day",
+    claimed_at: minsAgo(300),
+    started_at: minsAgo(299),
+    finished_at: null,
+    created_at: minsAgo(301),
+    updated_at: minsAgo(3),
+  },
 ];
 
 export function SAMPLE_PLAN(): string {

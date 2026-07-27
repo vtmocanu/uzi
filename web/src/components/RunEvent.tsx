@@ -875,7 +875,22 @@ function LimitRow({ payload, parked = false }: { payload?: Record<string, unknow
       )}
     >
       <span aria-hidden="true">{parked ? "⏸" : "✗"}</span>
-      {parked ? "Anthropic usage limit reached — paused until it resets" : "Anthropic usage limit reached"}
+      {/* web-ux F3: both predicates are POSITIVE, and the death row's is not optional.
+          It used to read "Anthropic usage limit reached" against the park's "…reached
+          — paused until it resets", making the death text a strict PREFIX of the
+          park's: the terminal outcome was carried by a MISSING clause, plus colour,
+          plus a glyph that is aria-hidden. Sighted colourblind users were fine (⏸ vs
+          ✗ carries it in grayscale); a screen-reader user got the more severe of the
+          two events as the LESS marked one, which is exactly backwards.
+
+          "the run failed here" rather than "waiting is off for this run": today the
+          only emitter of limit_hit is runner.ts's opted-out branch, so the cause would
+          be accurate — but judge-runner.ts reports the same structured facts on its
+          own failure path and gaining a feed line there is a one-line change. The
+          outcome is true for every emitter; the cause is true for the current one. */}
+      {parked
+        ? "Anthropic usage limit reached — paused until it resets"
+        : "Anthropic usage limit reached — the run failed here"}
       {detail && <span className="font-normal opacity-90">({detail})</span>}
     </div>
   );

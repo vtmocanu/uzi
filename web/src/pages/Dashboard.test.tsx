@@ -336,3 +336,62 @@ describe("Dashboard usage cards (PRD #40)", () => {
     expect(mockApi.getAdminUsage).not.toHaveBeenCalled();
   });
 });
+
+// PRD #35 (web-ux F2). `!isTerminalRun` was doing duty as "actively working", which was
+// harmless while every non-terminal status resolved in minutes. `limit_wait` is the
+// first that lasts HOURS by design, so the hint became a claim that is simply false.
+describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
+  const flush = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  };
+
+  it("keeps the old copy exactly when nothing is parked", () => {
+    // The regression guard. A factory with no parked run must read as it always did —
+    // this change is meant to be invisible until it has something to say.
+    return (async () => {
+      mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "running" }), aRun({ id: "r2", status: "queued" })] });
+      renderDashboard();
+      await flush();
+      expect(screen.getByText("agents at work")).toBeTruthy();
+    })();
+  });
+
+  it("🔴 splits the hint when a run is parked, rather than calling it work", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ status: "running" }),
+        aRun({ id: "r2", status: "queued" }),
+        aRun({ id: "r3", status: "limit_wait" }),
+      ],
+    });
+    renderDashboard();
+    await flush();
+    expect(screen.queryByText("agents at work")).toBeNull();
+    expect(screen.getByText("2 at work · 1 waiting on a usage limit")).toBeTruthy();
+  });
+
+  it("🔴 still COUNTS the parked run — splitting the hint must not hide it", async () => {
+    // The opposite failure, and the reason this is a hint change rather than a filter:
+    // excluding parked runs from the tile would make them vanish from the one surface
+    // that says how much is in flight.
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ status: "running" }), aRun({ id: "r3", status: "limit_wait" })],
+    });
+    const { container } = renderDashboard();
+    await flush();
+    expect(screen.getByText("Active runs")).toBeTruthy();
+    expect(container.textContent).toContain("1 at work · 1 waiting on a usage limit");
+    // The tile's value is 2, not 1.
+    const tile = screen.getByText("Active runs").closest("a") ?? screen.getByText("Active runs").parentElement;
+    expect(tile?.textContent).toMatch(/2/);
+  });
+
+  it("reads 'nothing in flight' when every run is terminal", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "completed" })] });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText("nothing in flight")).toBeTruthy();
+  });
+});

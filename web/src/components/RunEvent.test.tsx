@@ -912,6 +912,46 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     expect(container.querySelector(".text-danger")).not.toBeNull();
   });
 
+  it("🔴 states the death in TEXT — its predicate is not a prefix of the park's", () => {
+    // web-ux F3. The death row used to read "Anthropic usage limit reached" against
+    // the park's "…reached — paused until it resets", so the death text was a strict
+    // PREFIX of the park's and the terminal outcome was carried entirely by a MISSING
+    // clause, plus colour, plus a glyph that is aria-hidden.
+    //
+    // Grayscale was fine (⏸ vs ✗ carries it), so this was never a colourblindness
+    // problem — it was a screen-reader one, and in the worst direction: the MORE
+    // severe of the two events announced as the LESS marked one.
+    const hit = render(
+      <RunEventRow msg={msg({ seq: 20, kind: "limit_hit", payload: { rate_limit_type: "five_hour" } })} live={false} />,
+    );
+    const hitText = hit.container.textContent ?? "";
+    cleanup();
+    const wait = render(
+      <RunEventRow msg={msg({ seq: 21, kind: "limit_wait", payload: { rate_limit_type: "five_hour" } })} live={false} />,
+    );
+    const waitText = wait.container.textContent ?? "";
+
+    // The load-bearing property, asserted structurally rather than by matching a
+    // sentence: neither row's text may be a prefix of the other's, or the difference
+    // is again carried by absence.
+    expect(waitText.startsWith(hitText)).toBe(false);
+    expect(hitText.startsWith(waitText)).toBe(false);
+    // And the death states its outcome positively.
+    expect(hitText).toMatch(/the run failed here/i);
+  });
+
+  it("words the death by OUTCOME, not by cause", () => {
+    // "waiting is off for this run" would be accurate today — runner.ts's opted-out
+    // branch is limit_hit's only emitter. It is not accurate by construction:
+    // judge-runner.ts already reports the same structured facts on its own failure
+    // path, and gaining a feed line there is a one-line change. The outcome holds for
+    // any emitter; the cause holds only for the current one.
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 22, kind: "limit_hit", payload: {} })} live={false} />,
+    );
+    expect(container.textContent).not.toMatch(/waiting is off|opted out/i);
+  });
+
   it("🔴 does NOT echo an unrecognised rate_limit_type — the server's allowlist cannot reach this field", () => {
     // The `rate_limit_type` on a run_message payload is arbitrary worker-authored
     // text: payloads are worker JSON and the only server-side processing is a NUL
