@@ -2947,10 +2947,17 @@ type SetRunAnthropicSecretParams struct {
 //
 // reason is the mode that named the credential; headroom is NULL until M4 has one
 // to record (see 00086). updated_at follows house style and is safe here
-// specifically because the run is 'claimed' at this instant: ClaimRun's affinity
-// predicate reads r.updated_at only for status = 'queued' rows (:406), and
-// ListActiveRunsForHealth deliberately excludes 'claimed'. No reader of
-// runs.updated_at applies to a claimed run.
+// specifically because the run is 'claimed' at this instant, which holds for BOTH
+// lanes that call this write, not just the run lane:
+//   - ClaimRun's affinity predicate reads r.updated_at only for status = 'queued'
+//     rows (:406);
+//   - ClaimChatRun has its OWN affinity predicate over r.updated_at (chat.sql:72),
+//     likewise narrowed to status = 'queued';
+//   - ListActiveRunsForHealth deliberately excludes 'claimed' entirely.
+//
+// So no reader of runs.updated_at applies to a claimed run on either lane. Naming
+// one of the two readers, as this comment first did, would have left a reader of
+// the same column unaccounted for while reading as though the set were complete.
 func (q *Queries) SetRunAnthropicSecret(ctx context.Context, arg SetRunAnthropicSecretParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunAnthropicSecret,
 		arg.AnthropicSecretID,

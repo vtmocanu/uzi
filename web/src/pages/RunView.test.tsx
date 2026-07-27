@@ -2,6 +2,11 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { PlanPanel, AgentRosterSummary, JudgePanel, derivePlanRevision } from "./RunView";
+// ?raw rather than node:fs — the web tsconfig has no node types, and this repo
+// already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
+// and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
+// against the real file under both tsc and vitest.
+import runViewSource from "./RunView.tsx?raw";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -812,5 +817,30 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
     // The superseded v1 is preserved in the collapsed history accordion.
     expect(container.textContent).toContain("superseded");
     expect(container.textContent).toContain("v1 body");
+  });
+});
+
+// PRD #111 M1: the credential chip must be WIRED INTO the page, not merely exist.
+//
+// Measured before this test was written: deleting `<RunCredential run={run} />` from
+// RunView left the entire web suite green — 94 files, 1069 tests, exit 0. The
+// component had its own unit tests and the page fixtures had gained two fields, but
+// nothing anywhere asserted the two were connected, so M1's only user-visible web
+// surface was effectively untested.
+//
+// A SOURCE assertion rather than a render one, and the limit is worth stating: the
+// chip sits inside PageHeader's titleNode, deep in the page component, which this
+// file does not render (it exports and tests the panels, not the page — rendering it
+// needs a router, the auth context and a live WS stream). So this proves the wiring
+// EXISTS; RunCredential.test.tsx proves what it renders. Together they cover what a
+// single page-level render would, and this half reddens on exactly the mutation that
+// went undetected.
+describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
+  it("renders the credential chip in the run header", () => {
+    expect(runViewSource).toContain("<RunCredential run={run} />");
+  });
+
+  it("imports the component it renders", () => {
+    expect(runViewSource).toContain('from "../components/RunCredential"');
   });
 });

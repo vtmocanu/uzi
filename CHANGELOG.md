@@ -27,9 +27,11 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   `UZI_AUTOSELECT_INFLIGHT_PENALTY` — see
   [docs/configuration.md](docs/configuration.md).
 
-- **Every run now names the Anthropic credential it spent.** The run view carries a `token
-  <label>` chip and `uzi run get` an `ANTHROPIC_TOKEN` row, on all three lanes (issue/ci_fix,
-  judge and chat). Until now a run recorded what it cost but not which account paid, which was
+- **Every run now names the Anthropic credential it spent.** The credential is **recorded on
+  all three lanes** (issue/ci_fix, judge and chat) and **shown in the run view** as a `token
+  <label>` chip and by `uzi run get` as an `ANTHROPIC_TOKEN` row. A chat conversation has its
+  own view and does not show the chip yet, though its spend is recorded like any other run's.
+  Until now a run recorded what it cost but not which account paid, which was
   a distinction without a difference while a user could hold one token and stopped being one
   the moment PRD #104 let them hold several. The label is a snapshot taken when the run was
   claimed, so it survives that token being renamed or deleted: a finished run keeps naming the

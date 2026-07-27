@@ -6,18 +6,25 @@ import { RunCredential } from "./RunCredential";
 afterEach(cleanup);
 
 describe("RunCredential (PRD #111 M1)", () => {
+  // One test, not two. It used to be two, the second named "still names the account
+  // after the token is deleted (id null, label kept)" — a claim this fixture cannot
+  // make and never made: neither case supplies an id, so the two were the same input
+  // under different names and no mutation separated them.
+  //
+  // What actually forbids id-gating is the PROP TYPE. The component takes
+  // `Pick<Run, "anthropic_secret_label">`, so the id is not in scope and a
+  // `run.anthropic_secret_id && …` guard would not compile. That is a stronger
+  // guarantee than a runtime assertion, and it is enforced by `npm run typecheck`,
+  // not here. Widening the prop to test the deleted-token case at runtime would
+  // REMOVE that guarantee in order to assert it, which is a bad trade.
+  //
+  // The reason it matters, kept because it is the component's whole purpose: the id
+  // is a live FK the server nulls when the token is deleted, while the label is a
+  // claim-time snapshot that survives. A component gated on the id would blank
+  // exactly the historical runs whose attribution is least recoverable elsewhere.
   it("names the credential the run spent", () => {
     render(<RunCredential run={{ anthropic_secret_label: "console-key" }} />);
     expect(screen.getByText(/console-key/)).toBeTruthy();
-  });
-
-  // The case the whole component exists for. The id is a live FK the server nulls
-  // when the token is deleted; the label is a claim-time snapshot that survives it.
-  // A component gated on the id would blank exactly the historical runs whose
-  // attribution is least recoverable from anywhere else.
-  it("still names the account after the token is deleted (id null, label kept)", () => {
-    render(<RunCredential run={{ anthropic_secret_label: "retired-key" }} />);
-    expect(screen.getByText(/retired-key/)).toBeTruthy();
   });
 
   // Two facts, one assertion each, because they arrive by different routes: a run

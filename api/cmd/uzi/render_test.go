@@ -130,11 +130,25 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	//     stored before M2 landed (existing rows are not re-validated), a future write
 	//     path that forgets the check, and a row written straight to the database.
 	//
-	// The `cellText` mutation control on this test is the live half — swapping it for
-	// sanitizeTTY or the raw string reddens the assertions below.
+	// 🔴 THE NEWLINE PROBE IS THE ONLY ONE THAT DISCRIMINATES, AND IT WAS WRONG.
+	// It read `"\n\nnext-line"` — a DOUBLE newline neither implementation ever emits —
+	// so it was satisfied by construction. The bidi and ESC probes do not discriminate
+	// either: sanitizeTTY and cellText both strip unicode.Cf and unicode.IsControl, so
+	// two of the three agree under either helper. Measured: swapping cellText for
+	// sanitizeTTY left this test GREEN.
+	//
+	// Newline FOLDING is the whole difference between them (cellText → compactText
+	// replaces "\n" with a space; sanitizeTTY deliberately spares "\n"), so a single
+	// "\nnext-line" is what tells them apart, and it is what is asserted now.
+	//
+	// The class this belongs to is worth naming: the broken implementation and the
+	// correct one AGREE on the case that was picked, so the fixture passed against
+	// both and read as proof of something it never tested.
 	hostile := "safe‮dnetsop\x1b[31m\nnext-line"
 	out := render(&hostile)
-	for _, bad := range []string{"‮", "\x1b", "\n\nnext-line"} {
+	// The first two pin the shared floor (either helper satisfies them); the third is
+	// the discriminating one.
+	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile label reached the terminal carrying %q, got:\n%q", bad, out)
 		}
