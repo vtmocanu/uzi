@@ -1,8 +1,12 @@
 # Secrets / local env
 .env
 
-# Node
-web/node_modules/
+# Node. No trailing slash on node_modules: CLAUDE.md tells a worktree that needs
+# deps to SYMLINK node_modules from a long-lived worktree rather than run `npm ci`
+# (whose agent-browser postinstall clobbers the host's binary). A `dir/` pattern
+# matches directories ONLY, so the prescribed symlink showed up as untracked and one
+# `git add -A` from committing a link pointing outside the repo.
+web/node_modules
 web/dist/
 
 # Go

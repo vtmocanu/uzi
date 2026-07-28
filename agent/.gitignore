@@ -1,3 +1,6 @@
-node_modules/
+# No trailing slash: see the root .gitignore. A symlinked node_modules (the workflow
+# CLAUDE.md prescribes instead of `npm ci` here) is not a directory entry, so `dir/`
+# would not ignore it.
+node_modules
 dist/
 *.log
