@@ -284,6 +284,145 @@ describe("RunEventRow rendering", () => {
     expect(container.textContent).toContain("drop step 1");
   });
 
+  // ── PRD #88: the clarification round-trip in the feed ──────────────────────
+
+  it("renders NO ordinal marker — a row cannot count what only the feed knows (D-R)", () => {
+    // The `#N` marker used to read `generation` off the payload. That field is gone
+    // (39cffd4c) because it was an inert display value carrying the name of a struck
+    // mechanism. The replacement counts `question` messages, which a single row holds
+    // none of, so the marker moved to the panel rather than being faked here. A stray
+    // `generation` from an older worker must not resurrect it.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "question",
+          payload: {
+            question_id: "q-1",
+            generation: 4,
+            questions: [{ question: "Which backend?", header: "Storage" }],
+          },
+        })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("question for you");
+    expect(container.textContent).not.toContain("#4");
+    expect(container.textContent).not.toContain("4");
+  });
+
+  it("renders a question row with its header, prose and option labels", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "question",
+          payload: {
+            question_id: "q-1",
+            questions: [
+              {
+                question: "Which storage backend?",
+                header: "Storage",
+                options: [
+                  { label: "Postgres table", description: "one more migration" },
+                  { label: "In-memory ring", description: "lost on restart" },
+                ],
+              },
+            ],
+          },
+        })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("question for you");
+    expect(container.textContent).toContain("Storage");
+    expect(container.textContent).toContain("Which storage backend?");
+    expect(container.textContent).toContain("Postgres table");
+  });
+
+  it("renders question TEXT escaped, never as a live element", () => {
+    // Question text is model-authored from repo/issue content the agent read, so it is
+    // attacker-influenceable — the same threat model as plan_feedback above, arriving
+    // through a kind that did not exist when that test was written.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "question",
+          payload: {
+            question_id: "q-1",
+            questions: [
+              {
+                question: "Use <script>alert(1)</script> or <img src=x onerror=alert(2)>?",
+                header: "Header <script>alert(3)</script>",
+              },
+            ],
+          },
+        })}
+        live={false}
+      />,
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("Use");
+  });
+
+  it("renders an option LABEL as a text child and never as an attribute", () => {
+    // D-K: chips are the residual. A label routed into title/href/style would escape the
+    // <Markdown> sink AND be invisible to every textContent assertion, so the check has
+    // to be about attributes, not about text.
+    const label = 'javascript:alert(1)" onmouseover="alert(2)';
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "question",
+          payload: {
+            question_id: "q-1",
+            questions: [{ question: "Pick?", header: "H", options: [{ label, description: "d" }] }],
+          },
+        })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain(label);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("[title]")).toBeNull();
+    expect(container.querySelector("[onmouseover]")).toBeNull();
+  });
+
+  it("degrades a question with no question_id to the unrenderable line", () => {
+    // An id-less question can be displayed but never answered (the api rejects an answer
+    // that names no question), so it must not masquerade as an actionable one.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "question", payload: { questions: [{ question: "q", header: "h" }] } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("unrenderable question event");
+  });
+
+  it("renders the answer echo escaped, and names an empty answer rather than hiding it", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 2, kind: "answer", payload: { answers: ["Postgres <script>alert(1)</script>", ""] } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("your answer");
+    expect(container.textContent).toContain("Postgres");
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.textContent).toContain("(no answer given)");
+  });
+
+  it("renders an answer with no answers at all as a stated absence", () => {
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 2, kind: "answer", payload: {} })} live={false} />,
+    );
+    expect(container.textContent).toContain("(no answer text)");
+  });
+
   it("falls back for an unknown kind, surfacing any extractable text", () => {
     const { container } = render(
       <RunEventRow msg={msg({ seq: 1, kind: "mystery", payload: { text: "some detail" } })} live={false} />,

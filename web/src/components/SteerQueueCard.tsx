@@ -14,15 +14,35 @@ import { FollowUpComposer } from "./FollowUpComposer";
 //
 // Delivery state (Decision 7) is derived CLIENT-SIDE from (consumed_at, run.status): a
 // stamped consumed_at means the worker has the input for its next turn (not that it acted
-// on it — see the PRD's consumed-but-dropped caveats). The gate copy needs the run's
-// awaiting_approval status; RunView passes it via `status` (optional so the card still
-// renders without it — the gate case then degrades to a plain "Delivered").
+// on it — see the PRD's consumed-but-dropped caveats). The parked copy needs the run's
+// status (awaiting_approval, or awaiting_input since PRD #88); RunView passes it via
+// `status` (optional so the card still renders without it — those cases then degrade to
+// a plain "Delivered").
 
 type Delivery = { label: string; tone: BadgeTone; title: string };
 
+// PARKED_COPY is the qualified wording for a follow-up consumed while the run is
+// blocked on a human (PRD #95 S3, extended by PRD #88). A follow-up submitted at a park
+// IS consumed immediately — the steering channel polls throughout — but the worker only
+// applies it on its next turn, which does not come until the human acts. A bare
+// "Delivered" would mislead in both cases; naming the WRONG action would too, which is
+// why this is keyed on the status rather than on one "parked" boolean.
+const PARKED_COPY: Record<string, Delivery> = {
+  awaiting_approval: {
+    label: "Delivered — applies after approval",
+    tone: "warning",
+    title: "Handed to the worker, but it takes effect only after you approve the plan.",
+  },
+  awaiting_input: {
+    label: "Delivered — applies after you answer",
+    tone: "warning",
+    title: "Handed to the worker, but it takes effect only after you answer its question.",
+  },
+};
+
 // deliveryFor maps one follow-up to its chip. Order matters: the unconsumed→terminal
 // "Not delivered" case must be checked before the generic Queued.
-function deliveryFor(input: SteerInput, terminal: boolean, atGate: boolean): Delivery {
+function deliveryFor(input: SteerInput, terminal: boolean, parked: Delivery | undefined): Delivery {
   const consumed = input.consumed_at != null;
   if (!consumed) {
     if (terminal) {
@@ -37,16 +57,7 @@ function deliveryFor(input: SteerInput, terminal: boolean, atGate: boolean): Del
     // it is genuinely pending.
     return { label: "Queued", tone: "queue", title: "Waiting for the worker to consume this follow-up." };
   }
-  if (atGate) {
-    // Consumed while the run is blocked on the human's plan approval (S3): a follow-up
-    // submitted at a gate IS consumed immediately, but only takes effect once the plan
-    // is approved. The qualified copy is honest; a bare "Delivered" would mislead.
-    return {
-      label: "Delivered — applies after approval",
-      tone: "warning",
-      title: "Handed to the worker, but it takes effect only after you approve the plan.",
-    };
-  }
+  if (parked) return parked;
   return {
     label: "Delivered",
     tone: "ok",
@@ -65,8 +76,8 @@ export function SteerQueueCard({
 }: {
   inputs: SteerInput[];
   terminal: boolean;
-  // The run status, used only to render the gate copy ("Delivered — applies after
-  // approval") when awaiting_approval. Optional: absent degrades that case to "Delivered".
+  // The run status, used only to render the parked copy ("Delivered — applies after
+  // approval" / "…after you answer"). Optional: absent degrades those to "Delivered".
   status?: string;
   // canSteer is false for a NON-OWNER viewer (a non-owner admin can open the owner-or-
   // admin run view, but the owner-only /inputs 404s — useRunStream reports that here).
@@ -85,7 +96,7 @@ export function SteerQueueCard({
   // an empty queue still renders — it carries the composer.
   if (inputs.length === 0 && (terminal || !canSteer)) return null;
 
-  const atGate = status === "awaiting_approval";
+  const parked = status ? PARKED_COPY[status] : undefined;
 
   return (
     <Card className="space-y-3 p-4">
@@ -94,7 +105,7 @@ export function SteerQueueCard({
       {inputs.length > 0 && (
         <ul className="space-y-1.5">
           {inputs.map((i) => {
-            const d = deliveryFor(i, terminal, atGate);
+            const d = deliveryFor(i, terminal, parked);
             return (
               <li
                 key={i.id}

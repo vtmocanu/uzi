@@ -6,7 +6,7 @@
 // not unit-tested). The favicon is ALWAYS the ember brand mark, theme-independent:
 // a tab has no theme context, so it must read on any browser chrome.
 
-import { isStoppedRun } from "./runBadge";
+import { isStoppedRun, needsHumanAttention } from "./runBadge";
 import type { StopKind } from "./api";
 
 // FaviconState is the derived tab signal, most-urgent first in the priority ladder.
@@ -38,8 +38,11 @@ function isFreshFailure(run: FaviconRun, baselineFailedIds: Set<string>): boolea
 // into one tab signal by a first-match-wins priority ladder (PRD #70 Decision Log):
 //   1. failed    — a fresh genuine failure outranks everything: a break the user did
 //                  not already know about is the loudest thing a tab can say.
-//   2. attention — a run awaiting the user's approval, or any unread notification:
-//                  the user is the blocker and a worker is held.
+//   2. attention — a run awaiting the user's approval OR their answer to a
+//                  clarification question (PRD #88), or any unread notification: the
+//                  user is the blocker and a worker is held. The tab dot cannot say
+//                  WHICH, and does not need to — it says "you are the blocker", and a
+//                  parked question is exactly that.
 //   3. running   — work is in flight (queued/claimed/running) but nothing needs the
 //                  user right now.
 //   4. idle      — nothing live; restore the plain mark.
@@ -49,7 +52,7 @@ export function deriveFaviconState(
   baselineFailedIds: Set<string>,
 ): FaviconState {
   if (runs.some((r) => isFreshFailure(r, baselineFailedIds))) return "failed";
-  if (unread > 0 || runs.some((r) => r.status === "awaiting_approval")) return "attention";
+  if (unread > 0 || runs.some((r) => needsHumanAttention(r.status))) return "attention";
   if (runs.some((r) => RUNNING_STATUSES.has(r.status))) return "running";
   return "idle";
 }

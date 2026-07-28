@@ -25,6 +25,8 @@ import {
   canOpenRunView,
   hasActiveRun,
   isAwaitingApproval,
+  isAwaitingInput,
+  needsHumanAttention,
   retryHint,
   runBadge,
 } from "../lib/runBadge";
@@ -219,6 +221,12 @@ export function Board() {
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
   const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);
+  // The viewer's runs on this repo parked on a clarification question (PRD #88). A
+  // SEPARATE bucket from awaitingRuns, not a widening of it: the strip below names what
+  // the run needs, and "needs approval" pointed at a parked question would send the user
+  // looking for a plan gate that is not there. Same visual treatment, different words —
+  // which is the whole reason awaiting_input is its own status.
+  const [questionRuns, setQuestionRuns] = useState<RunListItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
   // (PRD #47): any non-ok flag except approval_idle, which the awaiting bucket above
   // already covers. Issue runs only (a ci_fix run has no board card to link to).
@@ -297,6 +305,7 @@ export function Board() {
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
+      setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
       setStuckRuns(
         runs.filter((r) => r.health !== "ok" && r.health !== "approval_idle" && r.issue_iid != null),
       );
@@ -774,7 +783,7 @@ export function Board() {
 
       {error && <Alert message={error} />}
 
-      {(awaitingRuns.length > 0 || stuckRuns.length > 0) && (
+      {(awaitingRuns.length > 0 || questionRuns.length > 0 || stuckRuns.length > 0) && (
         <div
           role="status"
           aria-live="polite"
@@ -784,13 +793,16 @@ export function Board() {
             {[
               awaitingRuns.length > 0 &&
                 `${awaitingRuns.length} run${awaitingRuns.length > 1 ? "s" : ""} ${awaitingRuns.length > 1 ? "need" : "needs"} approval`,
+              // PRD #88: its own clause, so the strip says which action is owed.
+              questionRuns.length > 0 &&
+                `${questionRuns.length} run${questionRuns.length > 1 ? "s" : ""} ${questionRuns.length > 1 ? "need" : "needs"} an answer`,
               stuckRuns.length > 0 &&
                 `${stuckRuns.length} run${stuckRuns.length > 1 ? "s" : ""} ${stuckRuns.length > 1 ? "look" : "looks"} stuck`,
             ]
               .filter(Boolean)
               .join(" · ")}
           </span>
-          {[...awaitingRuns, ...stuckRuns].map((r) => (
+          {[...awaitingRuns, ...questionRuns, ...stuckRuns].map((r) => (
             <Link
               key={r.id}
               to={`/runs/${r.id}`}
@@ -1131,9 +1143,12 @@ export function IssueCard({
   const run = card.latest_run;
   const badge = run ? runBadge(run, Date.now()) : null;
   const hint = run ? retryHint(run.run_count) : null;
-  // awaiting_approval is the loudest card state: a human is the blocker while a
+  // A human-blocked run is the loudest card state: a person owes it an action while a
   // worker is held busy. Give the whole card a warn ring so it can't be missed.
-  const loud = isAwaitingApproval(run?.status ?? "");
+  // PRD #88 D-O #4 puts awaiting_input on exactly this treatment — same debt, and the
+  // PRD's own framing is that it is the third human-in-the-loop channel. The ring is
+  // presentation, so the two share it; the STRIP above still names them separately.
+  const loud = needsHumanAttention(run?.status ?? "");
   // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
   // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
   // before it becomes an anchor. A null (rows created before it landed — all GitLab)
@@ -1156,8 +1171,9 @@ export function IssueCard({
       className={cx(
         "group rounded-lg border p-3 text-sm transition-colors",
         // D17. Dashed rather than dimmed: opacity-40 already means "being dragged
-        // right now", and border-warn/60 ring-2 is `loud`, reserved for
-        // awaiting_approval. A permanently dim card reads as perpetually mid-drag,
+        // right now", and border-warn/60 ring-2 is `loud`, reserved for a run blocked
+        // on a human (awaiting_approval, or awaiting_input since PRD #88 — see
+        // needsHumanAttention). A permanently dim card reads as perpetually mid-drag,
         // and ring treatment would put the least urgent card on the board at the top
         // of the hierarchy.
         //
@@ -1185,7 +1201,7 @@ export function IssueCard({
         // border-faint is reused rather than invented: it is the app-wide
         // de-emphasised token, so a card wearing it reads as quiet, which is what a
         // non-PRD card is. It collides with neither treatment Decision 17 ruled out —
-        // `loud` (the warn ring, reserved for awaiting_approval) nor opacity-40
+        // `loud` (the warn ring, reserved for a human-blocked run) nor opacity-40
         // (being dragged right now).
         //
         // Second cue: the BUTTON below reads "Promote to PRD" where a PRD card reads

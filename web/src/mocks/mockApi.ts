@@ -2443,7 +2443,12 @@ export const mockApi = {
   },
   submitRunInput: async (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
-    handleInput(id, kind, body);
+    // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
+    // answer to a question that has moved on, a 400 for a malformed body) rather than
+    // resolving 200 over a no-op. A mock that swallows a refusal is how a surface ends up
+    // built against a laxer contract than the one that ships.
+    const rejection = handleInput(id, kind, body);
+    if (rejection) throw new ApiError(rejection.status, rejection.message);
     // PRD #37: mirror the selection onto the run row so the mock's read-only
     // post-approval view has something to show.
     if (kind === "approve_plan" && selection) {

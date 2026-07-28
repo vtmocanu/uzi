@@ -145,6 +145,14 @@ export function getRun(runId: string): Run | undefined {
   return state.runs.get(runId);
 }
 
+// listMessages is a read-only view of a run's log. The engine derives from it rather
+// than keeping a parallel counter, so a mock script folds the feed the same way the real
+// UI does — the derivation IS the contract under test (PRD #88 D-L), and a second source
+// of truth in the mock would be a place for the two to disagree.
+export function listMessages(runId: string): readonly RunMessage[] {
+  return state.messages.get(runId) ?? [];
+}
+
 let runCounter = 0;
 export function nextRunId(): string {
   return `run-new-${++runCounter}`;

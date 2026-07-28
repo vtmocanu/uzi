@@ -7,11 +7,13 @@ import {
   healthBadge,
   healthFlagLabel,
   isAwaitingApproval,
+  isAwaitingInput,
   isHealthFlaggableStatus,
   isStoppedRun,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
+  needsHumanAttention,
   retryHint,
   runBadge,
   runStatusTone,
@@ -355,6 +357,43 @@ describe("isAwaitingApproval (attention strip filter)", () => {
   it("flags only awaiting_approval", () => {
     expect(isAwaitingApproval("awaiting_approval")).toBe(true);
     expect(isAwaitingApproval("running")).toBe(false);
+  });
+
+  // PRD #88. The two predicates must stay DISJOINT: the run status is split precisely
+  // so a surface can tell "approve my plan" from "answer my question", and the board
+  // strip names the action. Widening isAwaitingApproval to cover both would put back
+  // exactly what the status split removed, and tell a user to approve a plan that does
+  // not exist.
+  it("does NOT absorb awaiting_input, and its sibling does not absorb approval", () => {
+    expect(isAwaitingApproval("awaiting_input")).toBe(false);
+    expect(isAwaitingInput("awaiting_input")).toBe(true);
+    expect(isAwaitingInput("awaiting_approval")).toBe(false);
+    expect(isAwaitingInput("running")).toBe(false);
+  });
+});
+
+describe("needsHumanAttention (the shared treatment, PRD #88 D-O #4)", () => {
+  it("is the union of the two human-blocked statuses and nothing else", () => {
+    expect(needsHumanAttention("awaiting_approval")).toBe(true);
+    expect(needsHumanAttention("awaiting_input")).toBe(true);
+    for (const s of ["queued", "claimed", "running", "completed", "failed", "cancelled", ""]) {
+      expect(needsHumanAttention(s)).toBe(false);
+    }
+  });
+});
+
+describe("awaiting_input presentation (PRD #88)", () => {
+  it("gets the SAME warn tone as the plan gate", () => {
+    expect(runStatusTone("awaiting_input", null)).toBe("warning");
+    expect(runStatusTone("awaiting_input", null)).toBe(runStatusTone("awaiting_approval", null));
+  });
+
+  it("has its own badge case rather than falling to the neutral default", () => {
+    // The default arm hardcodes `neutral`, so without an explicit case a parked question
+    // would render as a calm grey chip indistinguishable from `cancelled` — despite
+    // runStatusTone above saying warning. The two are separate code paths.
+    const badge = runBadge(run({ status: "awaiting_input" }), NOW);
+    expect(badge).toEqual({ kind: "badge", label: "needs your answer", tone: "warning", pulse: false });
   });
 });
 
