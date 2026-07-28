@@ -11,7 +11,7 @@ import {
   formatUptime,
   liveUptimeSeconds,
 } from "./BuildInfoPopover";
-import { mockBuildInfo, mockBuildInfoUnstamped } from "../mocks/data";
+import { mockBuildInfo, mockBuildInfoNoUptime, mockBuildInfoUnstamped } from "../mocks/data";
 import type { BuildInfo } from "../lib/api";
 
 // BOTH fixtures live in ONE file, which is only possible because this component
@@ -183,7 +183,7 @@ describe("BuildInfoPopover — fully-stamped build", () => {
 });
 
 describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
-  it("OMITS the rows the server did not send rather than rendering unknowns", () => {
+  it("OMITS the LDFLAGS rows the server did not send, and KEEPS uptime", () => {
     render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
 
     const pop = popover();
@@ -193,25 +193,35 @@ describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
     // Age still works — it is computed here from `founded`, which is always sent.
     expect(pop.textContent).toContain("25 days old");
     expect(pop.textContent).toContain("Founded");
-    // The three stamped fields are ABSENT, and so are their labels. A row reading
+    // The three STAMPED fields are absent, and so are their labels. A row reading
     // "Built —" would be the same "claiming to know things it does not" the
     // server's omit rule exists to prevent.
     expect(pop.textContent).not.toContain("Built");
     expect(pop.textContent).not.toContain("Commit");
-    expect(pop.textContent).not.toContain("Uptime");
     // No commit count either: M3 is independently droppable, so an age-only
     // subtitle is a supported final state, not a loading intermediate.
     expect(pop.textContent).not.toContain("commits");
+    // …but UPTIME IS PRESENT, and that is the point of this fixture. A laptop
+    // stack omits only what ldflags would have stamped; the process is running, so
+    // `handler.New()`'s startedAt is set and Version emits uptime_seconds. Asserting
+    // its ABSENCE here — as this test used to — pinned a body no server sends.
+    expect(pop.textContent).toContain("Uptime");
+    expect(pop.textContent).toContain("4m");
   });
 
-  it("does not render an uptime row for an absent reading", () => {
+  it("does not render an uptime row when uptime itself is unknown", () => {
+    // The two-key body: a struct-literal `Handler` leaves startedAt zero and Version
+    // omits rather than reporting two millennia. A real wire shape, but a TEST
+    // construction — not a laptop's, which is the distinction mockBuildInfoNoUptime
+    // exists to keep.
+    //
     // Guards the difference between "absent" and 0: a bare `omitempty` int on the
     // server would have swallowed a genuine 0, and rendering "0s" for UNKNOWN here
     // would reintroduce the same conflation from the other end.
-    const { rerender } = render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    const { rerender } = render(<BuildInfoPopover info={mockBuildInfoNoUptime} now={NOW} />);
     expect(popover().textContent).not.toContain("Uptime");
 
-    rerender(<BuildInfoPopover info={{ ...mockBuildInfoUnstamped, uptime_seconds: 0 }} now={NOW} />);
+    rerender(<BuildInfoPopover info={{ ...mockBuildInfoNoUptime, uptime_seconds: 0 }} now={NOW} />);
     expect(popover().textContent).toContain("Uptime");
     expect(popover().textContent).toContain("0s");
   });
