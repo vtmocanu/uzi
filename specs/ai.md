@@ -6274,7 +6274,11 @@ M6):
 - **Release runbook ordering:** bump `Chart.yaml` version/appVersion in an MR → merge → tag THAT
   (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
   slower publish, not a failure) and `assert-version` (§246) holds. Rollback = revert the argo
-  `targetRevision` MR.
+  `targetRevision` MR. **Corrected 2026-07-28 (issue #178): "cold cache" is not the only way this
+  step can go wrong.** Tagging a commit whose message contains `[skip ci]` skips the tag pipeline
+  entirely, not just its cache warmth, and publishes nothing while `git push` still reports success.
+  `deploy/README.md` now warns against it separately; recover with `glab ci run --branch <tag>`
+  rather than moving the tag.
 
 ## 251. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
 
