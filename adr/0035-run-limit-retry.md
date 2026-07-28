@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #35 in flight — this ADR records the M0 design gate, not a merged implementation)
 **Date**: 2026-07-27
 **Deciders**: architect (M0 design gate), team lead, Vlad (open questions 1 and 2)
-**PRD**: [prds/35-run-limit-retry.md](../prds/35-run-limit-retry.md) (GitLab issue [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)) — the PRD carries the milestones, the fourteen decisions and the decision log; this ADR carries **one** decision, because it is the one most likely to be re-litigated by someone reading the PRD's original three options and wondering why the recommended one was not built.
+**PRD**: [prds/done/35-run-limit-retry.md](../prds/done/35-run-limit-retry.md) (GitLab issue [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)) — the PRD carries the milestones, the fourteen decisions and the decision log; this ADR carries **one** decision, because it is the one most likely to be re-litigated by someone reading the PRD's original three options and wondering why the recommended one was not built.
 
 ## Decision (summary)
 
@@ -288,10 +288,8 @@ own decisions, and duplicating them here would create two records to keep in ste
 - **The four independent guardrail layers** are untouched by this PRD. Nothing here
   changes what a worker may do, only which credential it is handed and when.
 
-## Note for whoever merges PRD #35
+## Linked from ARCHITECTURE.md
 
-This ADR is **not yet linked from `ARCHITECTURE.md`**, deliberately: ARCHITECTURE.md
-describes what uzi *is*, and PRD #35 is not built. Add the link in the same change
-that archives the PRD to `prds/done/`, alongside the run-lifecycle paragraph that
-describes the `limit_wait` state — not before, or ARCHITECTURE.md documents a status
-the database does not have.
+Discharged on merge (2026-07-28): the `limit_wait` transition and a link to this ADR
+landed in ARCHITECTURE.md's Run lifecycle section in the same change that archived the
+PRD to `prds/done/`, per the note this section replaces.

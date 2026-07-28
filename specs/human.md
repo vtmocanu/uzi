@@ -551,7 +551,7 @@ Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/111-auto-select-anthropic
 
 ## Feature #35 — Retry after an Anthropic usage limit
 
-Tracked as GitLab issue vtmocanu/uzi#35; PRD at `prds/35-run-limit-retry.md`;
+Tracked as GitLab issue vtmocanu/uzi#35; PRD at `prds/done/35-run-limit-retry.md`;
 ADR at `adr/0035-run-limit-retry.md`.
 
 - When a run hits the Anthropic usage limit, retry after a delay — back off until

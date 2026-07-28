@@ -1,7 +1,8 @@
 # PRD #35: Retry after Anthropic usage limit — park runs until the limit resets
 
 **GitLab Issue**: [vtmocanu/uzi#35](https://gitlab.example.com/vtmocanu/uzi/-/issues/35)
-**Status**: Draft — reviewed 2026-07-12 by 3 agents (design review, security audit, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). **Re-verified 2026-07-27 against HEAD `ca597779`** (1343 commits / 185 merges after authoring) — citations refreshed, six claims refuted, four prescriptions dropped as already-satisfied (marked ↳2026-07-27). The original header claimed "Fact-check: every claim verified"; that was not true of the prior-art paragraph, which was wrong at authoring time against a submodule pointer that never moved — see the Prior-art note below.
+**Status**: **COMPLETE** (created 2026-07-12; completed 2026-07-28) — MR [!143](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/143), 49 commits from `2c93a4af`. All milestones landed (M0, M-SEAM, M1-M6, M-CLI), built across five file-disjoint worktrees that merged with zero conflicts; every code milestone reviewed and security-audited; full `run-e2e.sh` green (210 PASS) including four new PRD #35 scenarios.
+Re-verified 2026-07-27 against HEAD `ca597779` before implementation began (1343 commits after authoring) — citations refreshed, six claims refuted, four prescriptions dropped as already-satisfied (marked ↳2026-07-27). The original header claimed "Fact-check: every claim verified"; that was not true of the prior-art paragraph, which was wrong at authoring time against a submodule pointer that never moved — see the Prior-art note below.
 **Priority**: Medium
 **Created**: 2026-07-12
 **Depends on**: PRD #4 (runs/claim/sweeper, done), PRD #42 (worker run slots, done).
@@ -866,7 +867,7 @@ this PRD supersedes that stance for sustained limits.
   `.claude/agent-team-tasks/prd-35-design.md`, and it records six findings that
   change the milestones below (see the 2026-07-27 M0 Decision Log entry).
 
-- [ ] **M-SEAM — Freeze the wire contract before the parallel milestones** (new at
+- [x] **M-SEAM — Freeze the wire contract before the parallel milestones** (new at
   M0; blocks M1/M2/M3/M4/M-CLI). M1..M4 as written are **not** file-disjoint — all
   four need the `RunState`/`StateRequest`/`ClaimPayload`/`RunDTO`/`RunStatus`
   additions, and M2/M3/M5 all edit `workersvc/service.go` plus the sqlc-generated
@@ -876,7 +877,7 @@ this PRD supersedes that stance for sustained limits.
   member each downstream milestone reads is enumerated in the design brief; a field
   missing from those lists means the seam is incomplete and is an escalation, not an
   edit to a frozen file.
-- [ ] **M1 — Worker detection + park path**: rate-limit observer beside
+- [x] **M1 — Worker detection + park path**: rate-limit observer beside
   `mapSdkMessage` (captures latest `rate_limit_info`), classification per Decision 1
   precedence (terminal_reason primary; corroborated-rejected secondary), typed
   `LimitReachedError` with normalized `resetsAt` + `rateLimitType`, runner branch:
@@ -888,7 +889,7 @@ this PRD supersedes that stance for sustained limits.
   stale-rejected + error_max_turns NOT classified, transient api_retry NOT
   classified, seconds-vs-ms normalization, **and a carve-out test that asserts a
   parked run's `skillsPluginDir` and run HOME both still exist on disk**).
-- [ ] **M2 — Schema + server park machinery**: migration (Decision 13, renumbered
+- [x] **M2 — Schema + server park machinery**: migration (Decision 13, renumbered
   00090+), `SetRunLimitWait` transition (source-guarded `running`-only, idempotent on
   re-delivery, allowlists `rate_limit_type`, computes/clamps `retry_not_before`,
   bumps `limit_wait_count`, enforces `RUN_LIMIT_MAX_WAITS` / `RUN_LIMIT_MAX_PARK`
@@ -901,7 +902,7 @@ this PRD supersedes that stance for sustained limits.
   (Decision 10), sweeper-exclusion tests **re-established against today's nine-pass
   `Sweep`** — a parked run is never RUN_TIMEOUT-failed, stale-requeued, or
   auto-stopped (PRD #108); cancel-while-parked applies immediately.
-- [ ] **M3 — Opt-in surfaces**: `users.wait_on_limit` + `PUT /me/wait-on-limit` +
+- [x] **M3 — Opt-in surfaces**: `users.wait_on_limit` + `PUT /me/wait-on-limit` +
   Settings toggle; `CreateRun` wire defaulting from the user setting; **all four**
   creation paths stamp the flag (Decision 7); tests (default inheritance, explicit
   override, flag survives resume).
@@ -922,7 +923,7 @@ this PRD supersedes that stance for sustained limits.
 
   The web half of this belongs to the **web lane**, not the api lane, so `RunView.tsx`
   keeps one owner alongside M4's countdown strip.
-- [ ] **M4 — Web UX**: `RunStatus`/tones/`limit_wait` pill, run-view countdown strip
+- [x] **M4 — Web UX**: `RunStatus`/tones/`limit_wait` pill, run-view countdown strip
   (resets-at + attempt N/cap), runs list + board card badge **including
   `web/src/lib/runBadge.ts`** (Decision 10), `limit_wait`/`limit_hit` render cases in
   RunEvent/ActivityFeed; vitest coverage incl. escaped rendering.
@@ -942,14 +943,14 @@ this PRD supersedes that stance for sustained limits.
   "limit wait" pill and the **countdown lives only on the run view**, which reads the
   full `Run`. The two constraints compose: a board countdown would have forced a
   `LatestRun` widening *and* a `Board.tsx` prop change.
-- [ ] **M-CLI — CLI + TUI** (↳2026-07-27 — new, and repo-mandated: "New uzi
+- [x] **M-CLI — CLI + TUI** (↳2026-07-27 — new, and repo-mandated: "New uzi
   functionality ⇒ check whether `api/cmd/uzi/` needs a matching CLI change"):
   `terminalRunStatuses` (`api/cmd/uzi/run.go:48`) must not gain `limit_wait` (it is
   non-terminal) but every status-switch around it must handle it — the
   awaiting-approval branch at `run.go:842` is the shape to follow — plus the TUI crew
   lane mapping (`api/cmd/uzi/tui_lanes_test.go:143-152`). A parked run should read as
   waiting with its countdown, not fall through to a default lane.
-- [ ] **M5 — Slack + docs + specs**: notifier gains `statusLabel` (`slacksvc/notifier.go:588`)
+- [x] **M5 — Slack + docs + specs**: notifier gains `statusLabel` (`slacksvc/notifier.go:588`)
   + `renderThread` (`:549`) cases for `limit_wait` (else a park edits the root to raw
   "limit_wait" and posts nothing — both switches have `default:` arms that behave
   exactly that way today) and `GetSlackRunContext` (`:265`) selects the reset
@@ -965,7 +966,7 @@ this PRD supersedes that stance for sustained limits.
   **↳M0 — M5 must NOT "fix" `api/internal/slacksvc/health.go:51`.** Its
   `isHealthFlaggableStatus` is a positive allowlist that already excludes a parked run
   correctly; it is now listed in Decision 3's inventory as already-satisfied.
-- [ ] **M6 — E2E**: stub-executor scenarios — opt-in park → sweeper promotes (short
+- [x] **M6 — E2E**: stub-executor scenarios — opt-in park → sweeper promotes (short
   test clock) → resume **skips the gate** and completes; opt-out fails with
   explanatory reason; cancel-while-parked cancels immediately; full-stack smoke.
 
