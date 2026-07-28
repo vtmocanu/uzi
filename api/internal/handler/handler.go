@@ -107,8 +107,10 @@ type Handler struct {
 	// the uzi CLI report one coordinate", which was false as written: the CLI was not
 	// a consumer at all — api/internal/uzicli held no /version call, `uzi version`
 	// printed only its own stamp, and the two agreed solely because the same tag
-	// stamps both. #175 M4 makes the shared coordinate real rather than assumed. If
-	// M4 is ever dropped, this comment goes back to naming one consumer.)
+	// stamps both. #175 M4 made the shared coordinate real rather than assumed; the
+	// call is uzicli.(*HTTPClient).BuildInfo. Kept because the claim above was wrong
+	// once for a reason worth remembering — two coordinates agreeing is not the same
+	// as one being read.)
 	version string
 	// commit / builtAt / commits are the rest of GET /api/version's build coordinates
 	// (PRD #175), stamped into cmd/server by the same ldflags line as version and
