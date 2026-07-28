@@ -124,17 +124,43 @@ export function BuildInfoPopover({
   // structural fact about this component's environment.
   const popId = useId();
 
+  // EVERY optional field is type-guarded at this boundary, because this is where an
+  // untrusted response becomes rendered text. Our own server cannot send these as
+  // null (`*int` + `omitempty` omits the key), but `=== undefined` is not the same
+  // test as "is a usable number", and the two ways it differs are both live:
+  //
+  //   - `uptime_seconds: null` passed `=== undefined`, reached formatUptime, and
+  //     Math.floor(null) rendered **"Uptime 0s"** — reintroducing at this end of the
+  //     wire exactly the absent-vs-zero conflation that M1 made UptimeSeconds a
+  //     POINTER to prevent. A wrong value that looks right is worse than a throw.
+  //   - `commits: null` reached formatCount and THREW on .toLocaleString. There is
+  //     no ErrorBoundary anywhere in web/src (checked), so a render throw here
+  //     unmounts the tree — the same outcome AppShell.buildinfo.failure.test.tsx
+  //     exists to prevent for a rejected fetch.
+  //
+  // Number.isFinite as well as typeof, so NaN and Infinity degrade to unknown
+  // rather than to "NaNs". Guarded HERE rather than inside the formatters so those
+  // keep honest `number` signatures — the same split ageInDays and formatDay
+  // already use, which is what made those two fields safe and these three not.
+  const commits =
+    typeof info.commits === "number" && Number.isFinite(info.commits) ? info.commits : null;
+  const uptimeSeconds =
+    typeof info.uptime_seconds === "number" && Number.isFinite(info.uptime_seconds)
+      ? info.uptime_seconds
+      : null;
+  const commit = typeof info.commit === "string" && info.commit ? info.commit : null;
+
   const label = displayVersion(info.version);
   const days = ageInDays(info.founded, now);
   const built = formatDay(info.built_at);
   const founded = formatDay(info.founded);
   const uptime =
-    info.uptime_seconds === undefined
+    uptimeSeconds === null
       ? null
       : formatUptime(
           fetchedAtMs === undefined
-            ? info.uptime_seconds
-            : liveUptimeSeconds(info.uptime_seconds, fetchedAtMs, now),
+            ? uptimeSeconds
+            : liveUptimeSeconds(uptimeSeconds, fetchedAtMs, now),
         );
 
   // The subtitle line: age, then the commit count when the build carries one. M3
@@ -142,8 +168,8 @@ export function BuildInfoPopover({
   // not a loading intermediate.
   const subParts: string[] = [];
   if (days !== null) subParts.push(days === 1 ? "1 day old" : `${days} days old`);
-  if (info.commits !== undefined) {
-    subParts.push(info.commits === 1 ? "1 commit" : `${formatCount(info.commits)} commits`);
+  if (commits !== null) {
+    subParts.push(commits === 1 ? "1 commit" : `${formatCount(commits)} commits`);
   }
 
   return (
@@ -202,8 +228,12 @@ export function BuildInfoPopover({
           // wrong — in the drawer it rides ABOVE that overlay already, and on
           // desktop the overlay is lg:hidden and cannot coexist.
           "absolute bottom-full z-10 mb-2 w-[226px] rounded-lg border border-edge bg-raised p-3 shadow-2xl",
-          // Collapsed the rail is 56px wide, so a left-anchored popover would hang
-          // over the content; nudge it clear of the rail's right edge instead.
+          // Left-anchored in BOTH states, inset from the rail edge. Collapsed, the
+          // rail is 56px (`w-14`, AppShell.tsx) against this panel's 226px, so it
+          // overhangs the content by ~170px — deliberately, since there is nowhere
+          // else for a 226px panel to go, and it is why the no-clipping note above
+          // matters. The 4px difference between the two insets is cosmetic and
+          // changes nothing about that overhang.
           collapsed ? "left-1" : "left-2",
           "transition-opacity duration-150 motion-reduce:transition-none",
           open ? "opacity-100" : "pointer-events-none opacity-0",
@@ -218,7 +248,7 @@ export function BuildInfoPopover({
         <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
           {founded && <Row label="Founded" value={founded} />}
           {built && <Row label="Built" value={built} />}
-          {info.commit && <Row label="Commit" value={info.commit.slice(0, 7)} />}
+          {commit && <Row label="Commit" value={commit.slice(0, 7)} />}
           {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
       </div>

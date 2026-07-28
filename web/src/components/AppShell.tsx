@@ -85,7 +85,14 @@ function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
   return snapshot;
 }
 
-// The whole build-info object (PRD #175), for the footer popover.
+// The whole build-info object (PRD #175). The seam the PRD's M2 bullet names, and
+// deliberately still exported even though NOTHING OUTSIDE THIS MODULE CALLS IT
+// today: SidebarContent needs `fetchedAtMs` to keep the uptime honest, so it uses
+// the private snapshot hook, and useAppVersion fifteen lines below is the only
+// caller. The intended external consumers are the PRD's named follow-ups — an
+// /about page and the CLI's `server` block (M4) — both of which want the whole
+// object rather than a projection. Recorded rather than dropped so the next reader
+// does not have to guess whether this is dead surface or a contract.
 export function useBuildInfo(): BuildInfo | null {
   return useBuildInfoSnapshot()?.info ?? null;
 }

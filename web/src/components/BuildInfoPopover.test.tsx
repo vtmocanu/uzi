@@ -149,6 +149,60 @@ describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
     expect(popover().textContent).toContain("0s");
   });
 
+  // A `null` where the type says `number | undefined` is not reachable from OUR Go
+  // server — `*int` with `omitempty` omits the key — but `api: typeof realApi`
+  // cannot enforce the degraded shape (every field but version and founded is
+  // optional, so a thin mock typechecks), and these two fields are the ones where
+  // a wrong value is silent rather than loud.
+  it("treats a null uptime as UNKNOWN, not as zero", () => {
+    // Measured before the guard: `info.uptime_seconds === undefined` is false for
+    // null, so it reached formatUptime and Math.floor(null) rendered "Uptime 0s" —
+    // the exact absent-vs-zero conflation M1 made the server field a POINTER to
+    // prevent, reintroduced at the consuming end.
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfoUnstamped, uptime_seconds: null as unknown as number }}
+        now={NOW}
+      />,
+    );
+    expect(popover().textContent).not.toContain("Uptime");
+    expect(popover().textContent).not.toContain("0s");
+  });
+
+  it("treats a null commit count as UNKNOWN instead of throwing the shell down", () => {
+    // Measured before the guard: this THREW (TypeError, .toLocaleString of null).
+    // There is no ErrorBoundary anywhere in web/src, so a throw here unmounts the
+    // tree — the same failure AppShell.buildinfo.failure.test.tsx guards for a
+    // rejected fetch.
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfoUnstamped, commits: null as unknown as number }}
+        now={NOW}
+      />,
+    );
+    expect(popover().textContent).toContain("25 days old");
+    expect(popover().textContent).not.toContain("commit");
+  });
+
+  it("degrades NaN and a non-string commit to UNKNOWN rather than to 'NaNs'", () => {
+    render(
+      <BuildInfoPopover
+        info={{
+          ...mockBuildInfoUnstamped,
+          uptime_seconds: Number.NaN,
+          commits: Number.NaN,
+          commit: 12345 as unknown as string,
+        }}
+        now={NOW}
+      />,
+    );
+    const text = popover().textContent ?? "";
+    expect(text).not.toContain("NaN");
+    expect(text).not.toContain("Uptime");
+    expect(text).not.toContain("Commit");
+    expect(text).toContain("25 days old");
+  });
+
   it("survives a response missing founded without rendering NaN", () => {
     // Not a shape the server produces — `founded` is a const it always sends — but
     // an older server or a hand-rolled test double must not put "NaN days old" in
