@@ -350,12 +350,18 @@ export function FleetUpgradePanel({
   cpVersion,
 }: {
   workers: Worker[];
-  // null while GET /api/version is still in flight; "" once it resolved with no stamp. The
-  // DISTINCTION matters: they were conflated, and because the version fetch loses the race
-  // with the workers load by ~400ms, the panel rendered a full bar and five badges under a
-  // heading that said "no release stamp — classification off". Measured at T+270ms, flipping
+  // null while GET /api/version is still in flight; "" once it SETTLED without a usable
+  // release. The DISTINCTION matters: they were conflated, and because the version fetch
+  // loses the race with the workers load by ~400ms, the panel rendered a full bar and five
+  // badges under a heading that said classification was off. Measured at T+270ms, flipping
   // at T+670ms. Self-contradictory copy on every first paint, and structural rather than a
   // demo artifact.
+  //
+  // "" HAS TWO UPSTREAM CAUSES and the panel cannot tell them apart: the body carried an
+  // empty version, or the fetch FAILED (useAppVersion in AppShell.tsx, PRD #175). The
+  // second was unreachable until the snapshot gained a distinct failed state — before
+  // that a failed fetch arrived here as null and this panel sat on the in-flight blank
+  // forever. Whatever this arm says has to be true of both.
   cpVersion: string | null;
 }) {
   const { counts, attention, divergentCount, divergentTargets } = fleetSummary(workers, cpVersion ?? "");
@@ -383,7 +389,23 @@ export function FleetUpgradePanel({
           ) : cpVersion ? (
             <>target release v{cpVersion}</>
           ) : (
-            <>no release stamp — classification off</>
+            // Names the two things that are ACTUALLY degraded, which is all of them:
+            // the control plane's own release cannot be stated, and hosted-worker
+            // divergence cannot be checked against it (fleetSummary's `cpVersion &&`
+            // guard means that comparison is silently skipped, so its absence below is
+            // not evidence of agreement).
+            //
+            // This used to read "no release stamp — classification off", which was
+            // FALSE and, until the failed-fetch state existed, unreachable — so nobody
+            // had ever read it. Classification is server-side: every count, the bar and
+            // the attention line come from each worker's own upgrade_status and are
+            // untouched by this fetch failing. Saying it is off while rendering a full
+            // classified bar underneath is the same self-contradiction the prop comment
+            // above records as a measured bug, arriving by a different route.
+            //
+            // Neutral register, like the divergence note below: this is a degraded
+            // reading, not an incident.
+            <>control-plane release unknown — targets unchecked</>
           )}
         </span>
       </div>

@@ -83,6 +83,22 @@ type Client interface {
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
+	// BuildInfo reads the server's build coordinates from the UNAUTHENTICATED
+	// GET /api/version (PRD #175 M4).
+	//
+	// It goes through newRequest, so credentialSafeBase gates it, and that is
+	// REQUIRED rather than merely consistent. The ROUTE needs no credential; the
+	// REQUEST carries one anyway, because newRequest attaches
+	// `Authorization: Bearer <token>` to every request whose client holds a token
+	// and does not special-case this one. So skipping the https-or-loopback guard
+	// here — on the reasonable-sounding grounds that the endpoint is public —
+	// would put a real uzc_ token in cleartext on the first
+	// `uzi version --url http://…`. Measured, not inferred: a loopback server sees
+	// `Authorization: Bearer uzc_…` on this call.
+	//
+	// Pinned by TestBuildInfoIsGatedByCredentialSafeBase, whose third arm asserts
+	// the token IS attached — the fact the guard's necessity rests on.
+	BuildInfo(ctx context.Context) (apitypes.BuildInfoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
@@ -709,6 +725,36 @@ func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) 
 		return nil, err
 	}
 	return env.Repos, nil
+}
+
+// BuildInfo reads GET /api/version. The response is decoded into the SHARED
+// apitypes.BuildInfoDTO rather than a CLI-local struct, which is what keeps
+// "unknown" distinguishable from zero for the fields that carry that distinction:
+// Commits and UptimeSeconds are pointers, and Commit and BuiltAt are omitempty, so
+// an unstamped server's absent values stay absent through `uzi version --json`. A
+// local struct with plain int fields would render a dev server as commits 0 and
+// uptime 0 — a build claiming to know things it does not, which is precisely what
+// the server side of this PRD spent a pointer to prevent.
+//
+// FOUNDED IS THE EXCEPTION, and the boundary is worth stating because the sentence
+// above is otherwise one field too broad. Founded has no omitempty — deliberately,
+// since the server always sends it and TestBuildInfoDTOTags pins version+founded as
+// the always-present pair. Against a PRE-#175 server, which sends neither, the
+// decode leaves it "" and re-marshalling emits `"founded": ""`: present-but-empty,
+// the one place this response conflates unknown with empty. Adding omitempty would
+// fix the rollout-window cosmetic by changing the server's contract, which is the
+// wrong trade. The window closes when the server is upgraded.
+//
+// Confined to --json. The text path skips empty values (serverRows in
+// cmd/uzi/version.go), so it already prints nothing for an unknown founded.
+// Measured against a server returning `{"version":"0.11.11"}`: --json emits
+// `"founded": ""` while the text output shows only the version line.
+func (c *HTTPClient) BuildInfo(ctx context.Context) (apitypes.BuildInfoDTO, error) {
+	var out apitypes.BuildInfoDTO
+	if err := c.get(ctx, "/api/version", &out); err != nil {
+		return apitypes.BuildInfoDTO{}, err
+	}
+	return out, nil
 }
 
 func (c *HTTPClient) AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error) {

@@ -546,6 +546,46 @@ export interface AuthConfig {
   password_login_enabled?: boolean;
 }
 
+// BuildInfo is the unauthenticated GET /api/version response (PRD #175) — the set
+// of coordinates a deployed instance can state about itself. Mirrors
+// api/internal/apitypes/buildinfo.go.
+//
+// `version` and `founded` are always present; everything else is OMITTED when the
+// build did not stamp it, never zero-valued. A `dev` build reporting commit "" and
+// built_at "0001-01-01T00:00:00Z" would claim to know things it does not, so the
+// optional markers here are load-bearing: the degraded shape is the COMMON case
+// (every local docker-compose stack), not an edge.
+//
+// Nothing in this response is private — the image tag is in the chart, the commit
+// is in the repo. `uptime_seconds` is the only runtime (rather than build) fact,
+// and it is accepted as public; see the Version doc comment in
+// api/internal/handler/handler.go, which is where that rule is enforced.
+export interface BuildInfo {
+  // The Model-B release coordinate (== image tag == chart appVersion), bare: the
+  // Dockerfile strips a leading v and the SPA re-adds one for display. "dev" on an
+  // un-stamped build. This key and value are unchanged from the single-string
+  // response this type widened — WorkersSettings feeds it to PRD #113's worker
+  // upgrade classification, so it gates a fleet feature.
+  version: string;
+  // Date of the project's first commit, YYYY-MM-DD. The AGE is computed HERE from
+  // it rather than sent: two sources of truth would disagree the moment a
+  // long-lived SPA session crosses midnight, and deriving it means the number stays
+  // correct without a release.
+  founded: string;
+  // When the image was built, RFC3339 UTC. Absent on an un-stamped build.
+  built_at?: string;
+  // Full 40-char source SHA; consumers truncate for display so the stored value
+  // stays greppable. Absent on an un-stamped build.
+  commit?: string;
+  // Commits in the history the image was built from (PRD #175 M3). Independently
+  // droppable — every consumer must render correctly without it.
+  commits?: number;
+  // How long the process has been serving. A pointer server-side because 0 is a
+  // legitimate uptime in a process's first second, so absent means UNKNOWN here and
+  // must not be rendered as "up 0s".
+  uptime_seconds?: number;
+}
+
 // ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
 // A Bearer credential the `uzi` CLI presents (sha256 at rest). scope is a
 // ceiling: 'user' is the owner's own authority, 'admin_ro' reads the whole
@@ -666,7 +706,14 @@ export interface Worker {
   upgrade_detail: string | null;
   // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
   // hosted worker with a fresh report, otherwise the control plane's own version. "" when
-  // the control plane has no version stamp (classification off).
+  // the control plane has no version stamp — SERVER-SIDE classification is genuinely off
+  // in that case, and this field is the api's own, so the phrase is accurate here.
+  //
+  // Not to be confused with the Fleet panel's arm for a cpVersion the SPA could not
+  // fetch, which used to say the same words and no longer does (PRD #175): there,
+  // classification had already happened server-side and only the SPA's copy of the
+  // release was missing. Same phrase, opposite situation — a grep for the retired
+  // wording lands here first.
   //
   // Rendered by the Fleet panel when it differs from the control-plane version. That
   // divergence is a supported operation — values.yaml may pin the worker image — and it is
@@ -1706,9 +1753,11 @@ const realApi = {
   login: (email: string, password: string) =>
     request<SessionResponse>("POST", "/auth/login", { email, password }),
   authConfig: () => request<AuthConfig>("GET", "/auth/config"),
-  // Server build version (Model B: the release git tag; "dev" on a local build).
-  // Unauthenticated, like /health — the shell footer reads it.
-  version: () => request<{ version: string }>("GET", "/version"),
+  // Server build info (PRD #175). Unauthenticated, like /health — the shell footer
+  // reads it for the version badge and its popover. Widened from {version} to
+  // BuildInfo; the `version` key did not move, rename or nest, because it also
+  // feeds PRD #113's worker upgrade classification.
+  version: () => request<BuildInfo>("GET", "/version"),
   // The Workers nav badge's count (PRD #113 M6). Its own endpoint rather than a fold over
   // listWorkers: the Workers page's poll is page-local and visibility-gated, so a badge
   // fed from it would be stale or absent exactly when the operator is not on that page,

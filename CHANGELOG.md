@@ -23,6 +23,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **The footer version badge is now a build-info popover.** Hover, focus or tap it to see the
+  release version, the project's founding date, age (computed client-side, so it stays correct
+  between releases), and process uptime, plus, on a release image built in CI, the source commit,
+  build timestamp and commit count. `GET /api/version` keeps its `version` key unchanged, both
+  name and value, and adds the rest of those fields alongside it; unstamped fields are omitted
+  rather than zero-filled, so a local `docker compose` build reports only version, founding date
+  and uptime, and the commit count is available only on a tagged release build. `uzi version`
+  now reports the server's build info alongside its own: the CLI's own version stays top-level
+  and the server's nests under a `server` key, so existing `--json` parsers are unaffected
+  (PRD #175).
+
 - **Manual drag-to-reorder for board cards, a sort switcher, and a keyboard
   equivalent.** Drag a card within its column to set the board's order by
   hand, or use the new per-card up/down buttons for the same reorder without

@@ -33,6 +33,11 @@ type FakeClient struct {
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
 
+	// Build is the canned GET /api/version reply; BuildErr fails that one call
+	// without failing the rest (see BuildInfo).
+	Build    apitypes.BuildInfoDTO
+	BuildErr error
+
 	// Auth-flow canned replies (uzi login). StartCLIAuth returns AuthStart;
 	// PollCLIAuth pops the front of AuthPolls each call (and repeats the last entry
 	// once drained), so a test can script start → pending → authorized.
@@ -314,6 +319,21 @@ func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {
 		return nil, f.Err
 	}
 	return f.Repos, nil
+}
+
+// BuildInfo returns Build, or BuildErr when set. BuildErr is SEPARATE from the
+// blanket Err on purpose: `uzi version` must succeed when the server is
+// unreachable, so a test needs to fail this one call without failing everything
+// else the command might do. Err still applies when BuildErr is unset, so the
+// usual "every method fails" fixture keeps working.
+func (f *FakeClient) BuildInfo(context.Context) (apitypes.BuildInfoDTO, error) {
+	if f.BuildErr != nil {
+		return apitypes.BuildInfoDTO{}, f.BuildErr
+	}
+	if f.Err != nil {
+		return apitypes.BuildInfoDTO{}, f.Err
+	}
+	return f.Build, nil
 }
 
 func (f *FakeClient) AdminListUsers(context.Context) ([]apitypes.UserDTO, error) {
