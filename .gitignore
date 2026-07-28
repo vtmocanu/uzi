@@ -2,7 +2,14 @@
 .env
 
 # Node
-web/node_modules/
+# No trailing slash: a trailing slash matches only DIRECTORIES, and the pattern
+# CLAUDE.md recommends for throwaway worktrees is a SYMLINK to a long-lived
+# worktree's node_modules (it avoids `npm ci`, which clobbers the host's
+# agent-browser). That symlink was unignored and one `git add -A` from being
+# committed. Bare path matches file, dir and symlink alike.
+web/node_modules
+agent/node_modules
+node_modules
 web/dist/
 
 # Go

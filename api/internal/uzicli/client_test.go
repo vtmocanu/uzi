@@ -360,3 +360,76 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildInfoIsGatedByCredentialSafeBase pins the property that makes the https
+// guard REQUIRED on this call rather than merely consistent with the others.
+//
+// GET /api/version is an unauthenticated ROUTE, so it is tempting to argue the
+// guard is defence-in-depth here and skip it. The argument is wrong, and the third
+// arm below is why: newRequest attaches `Authorization: Bearer <token>` to EVERY
+// request whose client holds one, this call included. The route needs no
+// credential; the request carries one anyway. Skipping credentialSafeBase for
+// BuildInfo would therefore put a real uzc_ token on the wire in cleartext the
+// first time someone ran `uzi version --url http://…`.
+//
+// Nothing else pins this. Every `uzi version` command test uses FakeClient, which
+// has no BaseURL and never reaches the guard — so the whole M4 suite would stay
+// green if a future change built a bare http.Client for this one call.
+//
+// The loopback arm is what makes the refusal attributable: without it, a guard
+// that blanket-refused http would pass the first arm while breaking every compose
+// user.
+func TestBuildInfoIsGatedByCredentialSafeBase(t *testing.T) {
+	t.Run("non-loopback http is refused before any request is sent", func(t *testing.T) {
+		c := NewHTTPClient(Settings{URL: "http://uzi.example.com", Token: "uzc_secret"})
+
+		_, err := c.BuildInfo(context.Background())
+		if err == nil {
+			t.Fatal("want a refusal for a plain-http remote, got nil — the bearer token would have gone out in cleartext")
+		}
+		if ExitCodeFor(err) != ExitUsage {
+			t.Errorf("exit = %d, want %d", ExitCodeFor(err), ExitUsage)
+		}
+		// The guard's own message, not just any error: a connection failure would
+		// also be non-nil, and would mean the request WAS attempted.
+		if !strings.Contains(err.Error(), "refusing to send credentials") {
+			t.Errorf("error is not the credential guard's: %v", err)
+		}
+	})
+
+	t.Run("loopback http is allowed", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
+		}))
+		defer srv.Close()
+
+		c := NewHTTPClient(Settings{URL: srv.URL, Token: "uzc_secret"})
+		got, err := c.BuildInfo(context.Background())
+		if err != nil {
+			t.Fatalf("loopback http must be allowed (it is the compose stack): %v", err)
+		}
+		if got.Version != "0.11.12" {
+			t.Errorf("version = %q, want %q", got.Version, "0.11.12")
+		}
+	})
+
+	t.Run("the request carries the bearer token, which is why the guard is required", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			w.Write([]byte(`{"version":"0.11.12","founded":"2026-07-03"}`))
+		}))
+		defer srv.Close()
+
+		c := NewHTTPClient(Settings{URL: srv.URL, Token: "uzc_SECRETTOKENVALUE"})
+		if _, err := c.BuildInfo(context.Background()); err != nil {
+			t.Fatalf("BuildInfo: %v", err)
+		}
+		if gotAuth != "Bearer uzc_SECRETTOKENVALUE" {
+			t.Fatalf("Authorization = %q, want the bearer token.\n"+
+				"If this now fails because the token is NOT attached, the guard's justification has "+
+				"changed and the doc comments on BuildInfo and Client.BuildInfo must be re-derived — "+
+				"do not simply delete this arm.", gotAuth)
+		}
+	})
+}
