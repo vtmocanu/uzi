@@ -19,13 +19,39 @@ export type RunState =
    *  open_question_id; the api rejects it otherwise, because a park with no question
    *  identity can never satisfy SetRunRunning's resume guard. */
   | "awaiting_input"
+  | "limit_wait"
   | "completed"
   | "failed";
 
-export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
-  "completed",
-  "failed",
-]);
+// TERMINAL_STATES lived here and was DELETED (PRD #35). A repo-wide grep found
+// exactly one line — its own definition. No reader anywhere, not even in this file,
+// and `noUnusedLocals` could never flag it because it was exported.
+//
+// PRD #35 first added a warning comment telling a future editor not to put
+// `limit_wait` in the Set. That comment's own reasoning is the argument for this
+// deletion: adding a member was type-legal and nothing would have failed, so the Set
+// could not enforce anything. Leaving it would have left a no-op looking like a
+// guardrail, which is worse than either having it or not.
+//
+// WHERE THE DISTINCTION IS ACTUALLY ENFORCED — corrected, because the first version
+// of this note named three places and two of them do not enforce terminality at all:
+// the `RunState` union above is the reportable DOMAIN (all five statuses a worker may
+// send, terminal or not), and the server's status CHECK is likewise a domain
+// constraint over all eight. Neither says anything about which are terminal.
+//
+// The one that matters, and that the first version omitted, is
+// **`TERMINAL_RUN_STATUSES` in `home-reclaim.ts`** — same package, the only live
+// terminal set in the agent, and the one whose modification breaks PRD #35. Adding
+// `limit_wait` there makes the stranded-HOME sweep delete a PARKED run's SDK
+// transcript, which is the ~170 MB the whole resume depends on. The warning this
+// deleted Set used to carry now lives there, where it has teeth: unlike here, that
+// change has a destructive consequence AND a test that catches it.
+//
+// `uzicli`'s `terminalRunStatuses` is genuinely a terminal set, but it lives in
+// another service and gates whether `uzi run logs --follow` stops polling.
+//
+// If a consumer for a Set like this ever appears here, add it back with that
+// consumer — not before.
 
 /** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal; PRD #41
  *  adds plan_feedback + plan_revising — the DB column carries no CHECK, so these need
@@ -54,7 +80,28 @@ export type MessageKind =
   | "question"
   /** PRD #88: the answer that resolved a question (payload `{ question_id, answers }`),
    *  echoed to the feed so the round-trip is auditable, mirroring plan_feedback. */
-  | "answer";
+  | "answer"
+  /** PRD #35 Decision 10: the run is being PARKED until the owner's Anthropic usage
+   *  window reopens. Payload `{ rate_limit_type?: string, resets_at?: string }` —
+   *  both OMITTED rather than null when unknown, so "unknown" has one shape.
+   *
+   *  Structured rather than a `status` line with the facts baked into prose, and the
+   *  reason is not tidiness: the renderer must map `rate_limit_type` through a
+   *  known-value lookup with a neutral fallback, because a feed payload is
+   *  WORKER-AUTHORED and the server's enum allowlist never reaches it. A value
+   *  interpolated into a sentence cannot be mapped without re-parsing the sentence,
+   *  and re-parsing worker text to decide how to render it is worse than the bare
+   *  string we had.
+   *
+   *  Decision 10 also lists an `attempt` key. It is deliberately NOT emitted — see
+   *  RunRunner.handleLimitReached; the worker cannot know it, and the run row's
+   *  authoritative `limit_wait_count` is already on the DTO. */
+  | "limit_wait"
+  /** PRD #35 Decision 8: the run hit a usage limit and is NOT waiting for it — an
+   *  opted-out run, or one whose park the server declined. Same payload as
+   *  `limit_wait`. The two are distinct kinds because they mean opposite things to a
+   *  reader: one says "this will resume", the other says "this is over". */
+  | "limit_hit";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text; PRD #88 adds
@@ -329,8 +376,11 @@ export interface ClaimConfig {
 /**
  * Response body of a successful (200) claim.
  *
- * The server also sends top-level run fields the worker does not consume in M2
- * (status, iteration_count, requeue_count, plan_md); they are ignored here.
+ * The server also sends top-level run fields the worker does not consume
+ * (status, iteration_count, requeue_count); they are ignored here.
+ *
+ * `plan_md` used to be in that ignored list and no longer is — PRD #35's resume
+ * path consumes it, so it is declared below.
  */
 export interface ClaimResponse {
   run_id: string;
@@ -389,6 +439,44 @@ export interface ClaimResponse {
    *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
    *  The judge interprets it; if the model call fails it is the fallback. */
   judge_signal?: JudgeSignal | null;
+  /** The plan already captured for this run (PRD #35 Decision 6b). The server has
+   *  always sent this (`ClaimPayload.PlanMd`); it was simply undeclared here while
+   *  nothing read it. A resumed run whose plan was already approved replays THIS
+   *  text instead of re-planning, so the field is now load-bearing.
+   *  Null on a fresh run and on any run that never reached the gate. */
+  plan_md?: string | null;
+  /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
+   *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is
+   *  autopilot". On a resume with a resumable session this lets the worker skip the
+   *  Phase-1 planning turn and the gate entirely: without it a park-and-resume
+   *  re-generates a plan, re-parks the run at awaiting_approval for a human who
+   *  already approved one, and can fail outright with REASON_NO_PLAN when the resumed
+   *  session declines to re-emit signal_plan.
+   *  Absent on an older server ⇒ treat as false, i.e. plan as today. */
+  plan_approved?: boolean;
+  /** The run's PERSISTED subagent selection (`runs.agent_source` /
+   *  `agent_exclusions`), replayed on every claim (PRD #35).
+   *
+   *  It ships because `plan_approved` ships, and the two come from ONE human verdict.
+   *  Normally the selection reaches the worker on the approve_plan verdict — but a
+   *  run resumed with `plan_approved` already true HAS NO VERDICT to carry it, so
+   *  without this the worker falls through to resolveAgentSelection's "absent"
+   *  default and a human who excluded a subagent at the gate gets it back after a
+   *  park, silently. Decision 6b's premise is "we may skip the gate BECAUSE the human
+   *  approved"; honouring the approval while dropping the exclusions that were part
+   *  of the same decision honours half a verdict.
+   *
+   *  ABSENT — not an empty selection — when the run never reached a gate. The
+   *  worker's absent-default is correct there and must stay reachable, so treat a
+   *  missing key as "absent", never as "source own with no exclusions". Also absent
+   *  from an older server, which is the same case and wants the same handling. */
+  agent_selection?: AgentSelection;
+  /** This run's usage-limit opt-in (PRD #35 Decision 7), read from the runs row on
+   *  EVERY claim so a resumed or re-queued run keeps it — the same convention as
+   *  `auto_approve` above, and for the same reason: an unattended resume must not
+   *  silently lose the behaviour the user chose. Absent on an older server ⇒ false,
+   *  i.e. a limit death fails the run as it does today. */
+  wait_on_limit?: boolean;
 }
 
 /** One deterministic missing-executable hit (PRD #46 Decision 4). */
@@ -760,7 +848,14 @@ export function resolveAgentSelection(
   }
 }
 
-/** Body of POST /runs/:id/state. Fields are set per target status. */
+/** Body of POST /runs/:id/state. Fields are set per target status.
+ *
+ *  NOTE FOR ANYONE GREPPING THIS FILE: `plan_md` is declared on FOUR separate
+ *  interfaces here (this one, `ClaimResponse`, `WorkerRunDetail`, `JudgeTraceTarget`).
+ *  A bare grep for the symbol returns four hits with no indication of which owns
+ *  which line, and that ambiguity has already produced one wrong citation acted on by
+ *  three people — `protocol.ts:451` was read as the claim payload when it is
+ *  `WorkerRunDetail`. Scope to the enclosing interface before concluding anything. */
 export interface StateRequest {
   status: RunState;
   /** awaiting_approval carries the captured plan. */
@@ -808,6 +903,53 @@ export interface StateRequest {
    *  Human-gated runs persist their selection through the `approve_plan` input
    *  instead, so this is absent there. */
   agent_selection?: AgentSelection;
+  /** limit_wait (PRD #35): the epoch at which the exhausted Anthropic usage window
+   *  reopens, taken from the SDK's `SDKRateLimitInfo.resetsAt`. That field is a bare
+   *  `number` in the typings with no unit declared, so the WORKER normalizes it
+   *  (< 10^12 ⇒ seconds ⇒ ×1000) before sending and the server re-validates rather
+   *  than trusting the normalization. Absent when the frames carried no usable
+   *  reset — the server then falls back to its exponential park schedule. */
+  limit_resets_at?: number;
+  /** limit_wait (PRD #35): the SDK's `rateLimitType` verbatim, e.g. "five_hour".
+   *  Sent unvalidated ON PURPOSE — the server allowlists it against the SDK union
+   *  and coerces anything else to "unknown" before it reaches the DB, the DTO, the
+   *  feed or Slack. Doing the allowlisting here as well would put the authoritative
+   *  copy of the vocabulary on the untrusted side. */
+  rate_limit_type?: string;
+}
+
+/**
+ * What the server answered a state report with (PRD #35's park acknowledgement
+ * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
+ * REAL status has always been on the wire; `reportState` used to discard it.
+ *
+ * 🔴 THE PARK DECISION KEYS ON `status`, NEVER ON `applied`. A caller deciding
+ * whether to preserve on-disk state must test `status === "limit_wait"` positively.
+ * `applied` is diagnostics only, and using it here is a trap with a live failure
+ * mode: "not parked" has five causes, and on THREE of them — the retry budget
+ * exhausted, the RUN_LIMIT_MAX_PARK clamp exceeded, and the `wait_on_limit=false`
+ * coercion — the server *fails the run and answers 200*, so `applied` is **true**.
+ * Those three are the designed terminal paths for a run that keeps hitting limits,
+ * i.e. the exact population this feature serves, so an `applied`-keyed branch leaks
+ * the clone, the plugin dir and up to ~170 MB of run HOME on the most common cause
+ * of all.
+ *
+ * Testing one literal positively is also why there is no enumeration of the five
+ * causes: the default arm becomes "the run is not parked", so an unforeseen cause, a
+ * future status, an older server and a parse failure all land on the safe side by
+ * construction. An enumeration would go stale; this cannot.
+ */
+export interface StateAck {
+  /** Whether the server applied the transition. Diagnostics and logging only —
+   *  see the warning above before branching on it. */
+  applied: boolean;
+  /** The run's authoritative status after the report, as the server reported it.
+   *  A plain string, NOT `RunState`: `RunState` is what a worker may REPORT, while
+   *  this is any status a run may hold ("queued", "cancelled", …).
+   *  `undefined` when the server's answer carried no readable status — an older
+   *  server, an unparseable body, or a 4xx recognised as already-terminal by its
+   *  text. Undefined must always be treated as "not parked". */
+  status?: string;
 }
 
 export interface UserInput {

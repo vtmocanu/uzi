@@ -10,12 +10,17 @@
 --
 -- Why identity and not a count: the run parks on the SAME question again after a
 -- worker death (RequeueWorkerRuns re-queues, the resumed worker re-parks re-using the
--- question id — see 00091). A count-based key would advance on that re-park and post
+-- question id — see 00092). A count-based key would advance on that re-park and post
 -- the same question a second time; equality on the id is a no-op across the requeue by
--- construction, which is the same reason 00091 keys the resume guard on identity.
+-- construction, which is the same reason 00092 keys the resume guard on identity.
 --
--- NOTE (goose numbering): drafted as the next free number above the live head 00091 on
--- this branch. Renumbered at the landing merge if a parallel PRD lands a lower one.
+-- NOTE (goose numbering): drafted as 00092 above what was then the branch head, and
+-- renumbered to 00093 at the landing merge — PRD #35 had landed 00091_run_limit_wait
+-- on main, so the #88 pair shifted up by one. The citations above point at 00092, the
+-- sibling #88 migration, NOT at main's 00091. Stated explicitly because before this
+-- edit the sentence was wrong twice over: it named a number this file no longer has,
+-- and 00091 had since become an unrelated PRD's migration, so a reader following it
+-- would have landed somewhere plausible and irrelevant.
 ALTER TABLE slack_run_messages ADD COLUMN question_id text;
 
 -- The `ts` of the message that CARRIED that question into the thread, which is what

@@ -4,6 +4,11 @@
 -- judge-run-scoped endpoint, and posts back a verdict + recommendations.
 
 -- name: CreateJudgeRun :one
+-- wait_on_limit is deliberately NOT stamped here: a judge run NEVER parks
+-- (PRD #35 Decision 14), and the column's DEFAULT false is the whole mechanism.
+-- SetRunLimitWait additionally carries `AND kind <> 'judge'`, so this is the second
+-- of two independent guards rather than the only one. Stated because an unstamped
+-- column among three stamped siblings otherwise reads as the omission it is not.
 -- Enqueue a judge run for a finished target run (Decision 2). Owned by the SAME user
 -- as the target (never cross-user). issue_title/description are synthesized — a judge
 -- has no issue. The one-active-judge-per-target partial unique index (00057) makes a

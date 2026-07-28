@@ -37,6 +37,17 @@ const (
 	agentSourceRepo = "repo"
 )
 
+// statusLimitWait is the status a run carries while parked behind its owner's
+// exhausted Anthropic usage window (PRD #35). Named so the three surfaces that must
+// agree about it — the follow loop, the steer queue's delivery label and `uzi run
+// get`'s detail block — compare against one literal.
+//
+// NON-TERMINAL, and that is the whole reason it needs handling rather than a slot in
+// terminalRunStatuses: a parked run is promoted back to `queued` by the server's sweep
+// once retry_not_before passes, and resumes on the same SDK session. Treating it as
+// terminal would make `--follow` exit on a run that is about to produce more messages.
+const statusLimitWait = "limit_wait"
+
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
 // (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;
@@ -47,6 +58,12 @@ var logsPollInterval = 2 * time.Second
 // arrive. `uzi run logs --follow` stops once the run reaches one of them (after a
 // final drain) instead of polling forever — otherwise an agent capturing a
 // finished run hangs. Mirrors the store's `status NOT IN (...)` active filter.
+//
+// statusLimitWait is NOT here, and it is the one omission worth writing down because
+// it looks like an oversight: a park is a long silence, which is exactly what this map
+// is used to end. But the run resumes, and stopping the follow on it would truncate
+// the capture in the middle of a run that finishes normally hours later. The silence
+// is instead EXPLAINED — see the follow loop's one-shot notice below.
 var terminalRunStatuses = map[string]bool{
 	"completed": true,
 	"failed":    true,
@@ -135,6 +152,10 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				return nil
 			}
+			// parked tracks whether the LAST poll saw the run parked on a usage limit,
+			// so the notice below fires on the EDGE into the park rather than every
+			// 2 seconds for the hours one lasts.
+			parked := false
 			for {
 				if err := drain(); err != nil {
 					return err
@@ -153,6 +174,32 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				if terminalRunStatuses[run.Status] {
 					return drain()
+				}
+				// A park is the only status this loop rides out that produces NOTHING
+				// for hours, and it is indistinguishable from a hang or a wedged agent
+				// from the outside — the failure mode the milestone exists to fix.
+				//
+				// STDERR, not the Printer: the Printer is stdout, and `--json` streams
+				// NDJSON there for an agent to parse line by line (renderMessage). A
+				// human-readable notice on that stream would corrupt the contract. This
+				// is the same split cobra's deprecation notice already uses here.
+				if run.Status == statusLimitWait {
+					if !parked {
+						parked = true
+						fmt.Fprintf(env.Stderr, "run %s %s — still following; it resumes on its own\n",
+							args[0], limitWaitLine(run, time.Now()))
+					}
+				} else if parked {
+					parked = false
+					// cellText, NOT sanitizeTTY, and the difference is the whole point:
+					// sanitizeTTY spares "\n", so a status carrying one would inject a
+					// line onto stderr. Unreachable today because runs_status_check
+					// constrains status to eight values — which is precisely the argument
+					// limitWaitLine's own comment REJECTS for rate_limit_type ("server-
+					// controlled today" is exactly the assumption that rots). Holding one
+					// line of this file to a weaker standard than the line beside it, on a
+					// premise that line disowns, is not a defensible split.
+					fmt.Fprintf(env.Stderr, "run %s resumed (%s)\n", args[0], cellText(run.Status))
 				}
 				select {
 				case <-cmd.Context().Done():
@@ -203,7 +250,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.CreateRun(cmd.Context(), repoID, issue)
+			run, err := c.CreateRun(cmd.Context(), repoID, issue, waitOnLimitFlag(cmd))
 			if err != nil {
 				return err
 			}
@@ -212,6 +259,9 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	create.Flags().String("repo", "", "repo id to run against (see 'uzi repo list')")
 	create.Flags().Int64("issue", 0, "the PRD issue IID to run")
+	create.Flags().Bool("wait-on-limit", false,
+		"park this run until the Anthropic usage window reopens instead of failing it; "+
+			"omit to inherit your Settings default, or pass --wait-on-limit=false to force off")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
@@ -611,7 +661,41 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
+	rows = append(rows, limitWaitRows(r, time.Now())...)
 	return p.Table(nil, rows)
+}
+
+// limitWaitRows is the usage-limit park block of `uzi run get` (PRD #35), split out
+// because it is the one part of this render with a live clock in it and therefore the
+// one part worth testing without a Printer.
+//
+// It answers TWO different questions off the SAME columns, and conflating them would
+// be the bug. The server leaves limit_resets_at / retry_not_before / rate_limit_type in
+// place across a promotion, deliberately, as history — so on a parked run they say
+// "here is when this resumes", and on a run that has already resumed the identical
+// columns say "this run spent part of its wall clock waiting on a usage limit". A
+// completed run rendering "resumes in 4h12m" would be the natural result of ignoring
+// the distinction, and it would be nonsense.
+func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
+	// WAIT_ON_LIMIT rides every run, unlike its neighbours above, because it is
+	// meaningful BEFORE any park has happened — it is the answer to "will this run
+	// survive a usage limit, or just die on one?", which is a question about a queued
+	// run as much as a parked one. A conditional row would make "off" indistinguishable
+	// from an old CLI that does not know the field.
+	rows := [][]string{{"WAIT_ON_LIMIT", boolStr(r.WaitOnLimit)}}
+	if r.Status == statusLimitWait {
+		rows = append(rows, []string{"LIMIT_WAIT", limitWaitLine(r, now)})
+		// The reported window reset, as CONTEXT for the countdown above and never as a
+		// substitute for it: a pool-aware promotion can land hours earlier than this.
+		if r.LimitResetsAt != nil {
+			rows = append(rows, []string{"LIMIT_RESETS_AT", r.LimitResetsAt.UTC().Format(time.RFC3339)})
+		}
+		return rows
+	}
+	if r.LimitWaitCount > 0 {
+		rows = append(rows, []string{"LIMIT_WAITS", itoa(int(r.LimitWaitCount)) + " (resumed)"})
+	}
+	return rows
 }
 
 // credentialCell renders WHICH credential a run spent and WHY (PRD #111 M5, D20).
@@ -921,17 +1005,32 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 // steerState derives a follow-up's delivery label from its consumed_at and the
 // run's live status, mirroring PRD #95 Decision 7 as closely as the CLI can:
 //   - not consumed, run terminal  → "not delivered (run finished)"
+//   - not consumed, run parked    → "queued (run paused on a usage limit)"
 //   - not consumed, otherwise     → "queued"
 //   - consumed, run at plan gate  → "delivered (applies after approval)"
+//   - consumed, run parked        → "delivered (run paused on a usage limit)"
 //   - consumed, otherwise         → "delivered"
 //
 // runStatus may be "" when the run's status could not be fetched (Decision 10
 // floor): the gate/terminal nuance is then dropped and only queued/delivered
 // show — the acceptable CLI minimum.
+//
+// The two statusLimitWait arms are a SUFFIX on the existing answer, never a
+// replacement for it (PRD #35). A park changes nothing about whether a follow-up was
+// handed to the worker; it changes only whether anything is currently acting on it.
+// Rewriting "queued" to something else on a parked run would be the same lie as
+// dropping the park entirely, one level down: the queue state is still queued.
 func steerState(consumedAt *time.Time, runStatus string) string {
+	// A parked run is deliberately NOT terminal here, matching terminalRunStatuses:
+	// its queue survives the park and drains when the run resumes, so "not delivered
+	// (run finished)" would be false.
+	const parkedSuffix = " (run paused on a usage limit)"
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
 			return "not delivered (run finished)"
+		}
+		if runStatus == statusLimitWait {
+			return "queued" + parkedSuffix
 		}
 		return "queued"
 	}
@@ -944,6 +1043,9 @@ func steerState(consumedAt *time.Time, runStatus string) string {
 		// the user owes is different, and telling them to approve something would be
 		// simply wrong.
 		return "delivered (applies after the question is answered)"
+	}
+	if runStatus == statusLimitWait {
+		return "delivered" + parkedSuffix
 	}
 	return "delivered"
 }
@@ -967,6 +1069,124 @@ func relAge(t time.Time) string {
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	default:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// waitOnLimitFlag resolves `--wait-on-limit` into the TRI-STATE the create endpoint
+// takes (PRD #35 Decision 7): nil omits the key so the server stamps the run from the
+// owner's Settings default, &true opts this run in, &false opts it explicitly out.
+//
+// 🔴 THE DEFAULT VALUE IN THE FLAG DEFINITION IS NOT THE DEFAULT BEHAVIOUR, and that
+// is the trap this function exists to remove. `Bool("wait-on-limit", false, …)` makes
+// GetBool return false when the flag is absent — identical to `--wait-on-limit=false`.
+// Passing that straight through would send `"wait_on_limit": false` on EVERY CLI-created
+// run and silently override the user's own Settings default, which is precisely the
+// regression the server's field comment cites for taking a *bool. Changed() is what
+// separates "the user said false" from "the user said nothing"; pflag sets it for
+// `--wait-on-limit` and for `--wait-on-limit=false` alike, and leaves it false when the
+// flag is absent, which is exactly the three-way split needed.
+//
+// There is NO precedent for a tri-state flag in this CLI — `--force`, `--with-token`
+// and `--follow` are all plain switches whose false is a real default rather than an
+// absence — so this is the first, and the Changed() idiom is the standard pflag answer
+// rather than an invention. A `--no-wait-on-limit` twin was the alternative and loses:
+// two flags need a mutual-exclusion check, and they can be passed together.
+//
+// Note `--wait-on-limit false` (a SPACE, not `=`) does not set false — pflag reads a
+// bare bool flag as true and leaves `false` as a positional argument. `create` is
+// cobra.NoArgs, so that mistake is a loud usage error rather than a silent inversion,
+// which is why it needs no guard of its own.
+func waitOnLimitFlag(cmd *cobra.Command) *bool {
+	if !cmd.Flags().Changed("wait-on-limit") {
+		return nil
+	}
+	v, err := cmd.Flags().GetBool("wait-on-limit")
+	if err != nil {
+		return nil
+	}
+	return &v
+}
+
+// limitWaitLine is the ONE sentence every CLI surface renders for a parked run
+// (PRD #35): `uzi run get`'s detail block, the `--follow` notice and the TUI's run
+// header all call this, so the terminal cannot give three readings of one park.
+//
+// It returns "" for a run that is not parked, which is what makes it safe to call
+// unconditionally at each of those sites.
+//
+// The countdown is off RetryNotBefore, NOT LimitResetsAt, and the two routinely
+// differ — RetryNotBefore carries jitter, is clamped to RUN_LIMIT_MAX_PARK, is
+// cross-checked against the owner's gauge and is pool-aware, so a user with a second
+// credential that still has headroom is promoted long BEFORE the window it hit
+// reopens. RetryNotBefore is when work resumes; LimitResetsAt is context, and
+// renderRunDetail prints it as its own row rather than folding it in here.
+//
+// RateLimitType is server-allowlisted (anything outside the SDK union is coerced to
+// "unknown"), so it is an enum by the time it reaches here — and it still goes through
+// cellText, for the same reason the STOP_KIND row does: "server-controlled today" is
+// exactly the assumption that rots, and this string lands in a table cell where a
+// newline breaks the rail. An UNRECOGNISED type prints as itself; the CLI is versioned
+// separately from the API, so inventing a rendering for a member a newer server ships,
+// or dropping it, would both be worse than passing it through.
+func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
+	if r.Status != statusLimitWait {
+		return ""
+	}
+	line := "paused: Anthropic usage limit"
+	if t := cellText(strOr(r.RateLimitType, "")); t != "" {
+		line += " (" + t + ")"
+	}
+	line += " · " + resumesIn(r.RetryNotBefore, now)
+	// Attempt N, never "N/cap": the cap is one server constant and is deliberately not
+	// on RunDTO, so a denominator here would have to be a second copy of it in a binary
+	// that ships on its own release cadence. 0 is a run that has not parked, which this
+	// function has already excluded — but the guard stays, because a server that
+	// reports a park without a count should print no number rather than "attempt 0".
+	if r.LimitWaitCount > 0 {
+		line += " · attempt " + itoa(int(r.LimitWaitCount))
+	}
+	return line
+}
+
+// resumesIn renders the promotion clock for a parked run.
+//
+// A nil RetryNotBefore is a real case, not a defensive branch: an older server, or a
+// park whose stamp failed to record. It must not render as "resumes in 0s" (a promise
+// the CLI cannot keep) nor be silently omitted (the park then reads as an unexplained
+// hang), so it says what is actually known.
+//
+// A stamp already in the past is the NORMAL steady state for a few seconds — the
+// sweeper runs on a ticker, so there is always a window where the clock has passed and
+// the promotion has not fired yet.
+func resumesIn(retryNotBefore *time.Time, now time.Time) string {
+	if retryNotBefore == nil {
+		return "no resume time recorded"
+	}
+	d := retryNotBefore.Sub(now)
+	if d <= 0 {
+		return "resuming shortly"
+	}
+	return "resumes in " + fmtUntil(d)
+}
+
+// fmtUntil renders a forward-looking duration at TWO units, which is where it parts
+// company with relAge's single unit next door.
+//
+// relAge answers "how old is this row" for a table column, where 3h is precise enough.
+// This answers "when do I come back", over a range that runs from seconds to the
+// seven-day window RUN_LIMIT_MAX_PARK clamps to — and across that range a single unit
+// is unusable: a park with 3h59m left and one with 3h01m left both read "3h", which is
+// an hour of error on the only number the user came for.
+func fmtUntil(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
 }
 

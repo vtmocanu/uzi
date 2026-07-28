@@ -89,6 +89,11 @@ function runFixture(over: Partial<Run> = {}): Run {
     anthropic_secret_label: null,
     anthropic_select_reason: null,
     anthropic_headroom_pct: null,
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,
@@ -1077,5 +1082,55 @@ describe("ActivityFeed lane label is untrusted-ish text (PRD #99 Decision 7)", (
     const visible = header?.querySelector(".font-mono")?.textContent ?? "";
     expect(visible.endsWith("…")).toBe(true);
     expect(aria).toContain(visible);
+  });
+});
+
+// PRD #35. The park is the event this feed most needs to narrate: the run goes quiet
+// for hours and, without a line, the only signal is that nothing is happening.
+describe("ActivityFeed — usage-limit park (PRD #35)", () => {
+  const region = () => document.querySelector('[aria-live="polite"]') as HTMLElement;
+
+  it("announces a park to the live region", () => {
+    // Before this, `limit_wait` was not in the meaningful set, so a screen-reader user
+    // got silence at the exact moment a sighted user got a warn-toned row.
+    renderFeed(
+      [m(1, "status", { event: "init", model: "claude-opus-4-8" }, "lead"), m(2, "limit_wait", { rate_limit_type: "five_hour" }, "worker")],
+      { status: "limit_wait" },
+    );
+    expect(region().textContent).toContain("paused on an Anthropic usage limit");
+  });
+
+  it("announces a limit death distinctly from a park", () => {
+    // Rendered NON-terminal on purpose, and this is the real sequence rather than a
+    // convenience: the worker emits the feed line, the message is persisted and
+    // broadcast, and only then does the state report land. Rendering this at
+    // `failed` would assert nothing about the limit at all — the region's terminal
+    // arm writes "Run finished" last and wins, which is existing behaviour and
+    // correct, but it is not what this case is about.
+    renderFeed([m(1, "limit_hit", { rate_limit_type: "five_hour" }, "worker")], { status: "running" });
+    expect(region().textContent).toContain("hit an Anthropic usage limit");
+    expect(region().textContent).not.toContain("paused");
+  });
+
+  it("🔴 announces FIXED text — the payload is worker-authored and this is read aloud", () => {
+    // The announcement is heard out of context, so it interpolates nothing. Also note
+    // it does not announce the reset time: the region fires once, at the park, while
+    // the run view's countdown is the surface that stays true as the clock moves.
+    const hostile = "<img src=x onerror=alert(1)> five_hour";
+    renderFeed([m(1, "limit_wait", { rate_limit_type: hostile, resets_at: "whenever" }, "worker")], {
+      status: "limit_wait",
+    });
+    const text = region().textContent ?? "";
+    expect(text).toBe("Run paused on an Anthropic usage limit");
+    expect(text).not.toContain("onerror");
+  });
+
+  it("renders the park row in the pane, not as an 'unrenderable' line", () => {
+    const { container } = renderFeed(
+      [m(1, "limit_wait", { rate_limit_type: "five_hour", attempt: 2 }, "worker")],
+      { status: "limit_wait" },
+    );
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).not.toContain("unrenderable");
   });
 });

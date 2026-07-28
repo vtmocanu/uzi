@@ -298,6 +298,11 @@ type Run struct {
 	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
 	AnthropicSelectReason pgtype.Text        `json:"anthropic_select_reason"`
 	AnthropicHeadroomPct  pgtype.Int2        `json:"anthropic_headroom_pct"`
+	WaitOnLimit           bool               `json:"wait_on_limit"`
+	LimitResetsAt         pgtype.Timestamptz `json:"limit_resets_at"`
+	RetryNotBefore        pgtype.Timestamptz `json:"retry_not_before"`
+	LimitWaitCount        int32              `json:"limit_wait_count"`
+	RateLimitType         pgtype.Text        `json:"rate_limit_type"`
 	OpenQuestionID        pgtype.Text        `json:"open_question_id"`
 }
 
@@ -412,6 +417,7 @@ type User struct {
 	OidcSubject            pgtype.Text        `json:"oidc_subject"`
 	JudgeEnabled           bool               `json:"judge_enabled"`
 	JudgeAnthropicSecretID pgtype.UUID        `json:"judge_anthropic_secret_id"`
+	WaitOnLimit            bool               `json:"wait_on_limit"`
 }
 
 type UserSecret struct {

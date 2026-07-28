@@ -9,6 +9,7 @@ import {
   type OutgoingMessage,
   type RegisterRequest,
   type RegisterResponse,
+  type StateAck,
   type StateRequest,
   type UserInput,
   type InputsResponse,
@@ -131,24 +132,55 @@ export class WorkerClient {
   }
 
   /**
-   * Report a run state. Every report — terminal (completed/failed) and
-   * non-terminal (running/awaiting_approval) alike — is retried with bounded
-   * backoff on transient failures: the server transition is idempotent, so a
-   * retried non-terminal report is safe (PRD: "/state is retried with backoff"),
-   * and a terminal report *must* reach the server. An "already terminal" server
-   * response (409, or a 4xx body mentioning terminal) is treated as success
-   * (multica) so a lost ack / duplicate replay is safe. A 4xx is otherwise fatal.
+   * Report a run state and return what the server made of it. Every report —
+   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
+   * limit_wait) alike — is retried with bounded backoff on transient failures: the
+   * server transition is idempotent, so a retried non-terminal report is safe
+   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
+   * server. An "already terminal" server response (409, or a 4xx body mentioning
+   * terminal) does not throw (multica) so a lost ack / duplicate replay is safe. A
+   * 4xx is otherwise fatal.
+   *
+   * The RESULT used to be discarded. It is now returned, because `limit_wait`
+   * (PRD #35) is the first report whose consequence is that the caller SKIPS
+   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
+   * Read the warning on StateAck before branching on it: the answer is
+   * `status === "limit_wait"`, never `applied`.
+   *
+   * 200 and 409 are both read for their body rather than routed through
+   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
+   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
+   * so parsing a 409's status back out of the error text would work in tests and
+   * fail on real runs.
    */
-  async reportState(runId: string, body: StateRequest): Promise<void> {
+  async reportState(runId: string, body: StateRequest): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     for (let attempt = 0; ; attempt++) {
       try {
-        await this.postJSON(path, body);
-        return;
+        const res = await this.fetchRaw("POST", path, body);
+        // 409 = the server declined the transition and is telling us the run's real
+        // status. Not an error, and not a retry: the server has moved on.
+        if (res.status === 200 || res.status === 409) {
+          const ack: StateAck = { applied: res.status === 200, status: await readRunStatus(res) };
+          if (!ack.applied) {
+            this.log.info("state report not applied server-side", {
+              run_id: runId,
+              reported: body.status,
+              server_status: ack.status ?? "unknown",
+            });
+          }
+          return ack;
+        }
+        if (res.status >= 400) throw await this.toError("POST", path, res);
+        // A 2xx we do not model (e.g. 204 from an older server): the report landed,
+        // but no status came back. Undefined reads as "not parked", which is safe.
+        return { applied: true, status: undefined };
       } catch (err) {
         if (this.isAlreadyTerminal(err)) {
+          // A 4xx whose TEXT says terminal. The status is not recoverable here, and
+          // an absent status is the safe answer for every caller.
           this.log.info("state already terminal server-side, treating as success", { run_id: runId, status: body.status });
-          return;
+          return { applied: false, status: undefined };
         }
         if (!isTransient(err) || attempt >= this.terminalRetrySchedule.length) throw err;
         const delay = this.terminalRetrySchedule[attempt] ?? 0;
@@ -243,11 +275,18 @@ export class WorkerClient {
     return res.memories ?? [];
   }
 
-  /** A 409, or a 4xx body mentioning "terminal", means the server already
-   *  finalized the run — an idempotent success for any state report. */
+  /** A 4xx body mentioning "terminal": the server already finalized the run, so the
+   *  report does not throw.
+   *
+   *  This used to say "a 409, or a 4xx body mentioning terminal … an idempotent
+   *  success for any state report", and both halves are now false. reportState
+   *  handles 409 inline (it needs the body, and a 409 never reaches here any more),
+   *  and "success" is no longer the whole story: since PRD #35 a declined report is
+   *  reported to the caller as `applied: false` rather than being flattened into the
+   *  success path, because a caller that skips filesystem cleanup on the strength of
+   *  a park must be able to tell that the park did not happen. */
   private isAlreadyTerminal(err: unknown): boolean {
     if (!(err instanceof RequestError)) return false;
-    if (err.status === 409) return true;
     return err.status < 500 && /terminal/i.test(err.body);
   }
 
@@ -288,6 +327,30 @@ export class WorkerClient {
       // ignore body read failures — the status is the signal that matters.
     }
     return new RequestError(method, path, res.status, text);
+  }
+}
+
+/**
+ * Pull `run.status` out of a /state response body (`{"run": <RunDTO>}`, the shape
+ * both the 200 and the 409 path return).
+ *
+ * TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
+ * body with no run, a non-string status, an older server that sent nothing — yields
+ * `undefined` rather than throwing. That is not defensiveness for its own sake: the
+ * caller's rule is a POSITIVE test for one literal, so `undefined` means "not
+ * parked", which is the safe answer to every one of those failures. A throw here
+ * would instead surface as a state report that appears to have failed, and would be
+ * retried against a server that already applied it.
+ */
+async function readRunStatus(res: Response): Promise<string | undefined> {
+  try {
+    const text = await res.text();
+    if (!text) return undefined;
+    const parsed = JSON.parse(text) as { run?: { status?: unknown } };
+    const status = parsed?.run?.status;
+    return typeof status === "string" ? status : undefined;
+  } catch {
+    return undefined;
   }
 }
 

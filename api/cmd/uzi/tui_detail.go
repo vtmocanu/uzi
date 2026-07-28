@@ -186,6 +186,21 @@ func (m tuiModel) renderDetail() string {
 	}
 	sb.WriteString("\n")
 
+	// The park line (PRD #35). The status word alone is already in the header, and it
+	// is not enough: "limit_wait" tells a user their run stopped and nothing about
+	// whether it is coming back. This is the countdown, drawn in the crewWaiting colour
+	// so it matches the dot every lane in the rail below is about to show.
+	//
+	// It sits ABOVE the transport line rather than beside it because the two describe
+	// different things and would be read as one if adjacent: the transport line is
+	// about THIS CLIENT's connection ("live", "reconnecting"), and a park is a fact
+	// about the run that a perfectly healthy socket reports. Same reason the countdown
+	// is not appended to the header — a run that is both parked and being polled has
+	// two independent things to say.
+	if line := limitWaitLine(d.run, time.Now()); line != "" {
+		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)) + "\n")
+	}
+
 	// The transport line is never silent about a degradation: a user watching a stale
 	// pane must be able to see WHY it is stale.
 	switch {

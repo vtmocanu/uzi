@@ -191,7 +191,9 @@ type ViewMode = "agent" | "timeline";
 const VIEW_KEY = "uzi.activity.view";
 
 function storedView(): ViewMode {
-  return prefs.get<ViewMode>(VIEW_KEY, "agent") === "timeline" ? "timeline" : "agent";
+  return prefs.get<ViewMode>(VIEW_KEY, "agent") === "timeline"
+    ? "timeline"
+    : "agent";
 }
 
 // isEmptyText marks a text message that renders to nothing (RunEventRow returns
@@ -237,7 +239,11 @@ function crewStateFor(
   // does — the lead is stopped between turns and nothing else can proceed — so it joins
   // the gate arm rather than falling through to the recency split, which would age every
   // lane to `idle` while a human is simply thinking.
-  if (run.status === "awaiting_approval" || run.status === "awaiting_input" || run.health === "waiting_worker")
+  if (
+    run.status === "awaiting_approval" ||
+    run.status === "awaiting_input" ||
+    run.health === "waiting_worker"
+  )
     return "waiting";
   if (actor === activeActor) {
     return STALLED_HEALTH.has(run.health) ? "stalled" : "working";
@@ -248,7 +254,9 @@ function crewStateFor(
 }
 
 function isTerminalStatus(status: string): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return (
+    status === "completed" || status === "failed" || status === "cancelled"
+  );
 }
 
 // Presentation: the dot inherits the chip's tone via bg-current (mirrors Badge). The
@@ -317,6 +325,15 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return "Asked you a question";
     case "answer":
       return "Received your answer";
+    // PRD #35. Fixed strings, deliberately: this one-liner is the lane header's live
+    // summary and the payload behind these two kinds is worker-authored, so the one
+    // place that must not interpolate it is the line a user reads at a glance
+    // without the surrounding row's context. The window, reset and attempt are on
+    // the feed row itself, where they go through the closed lookup.
+    case "limit_wait":
+      return "Paused on a usage limit";
+    case "limit_hit":
+      return "Hit a usage limit";
     default:
       return "";
   }
@@ -453,7 +470,8 @@ export function ActivityFeed({
   const newestMsg = visible.length ? visible[visible.length - 1] : undefined;
   const newestAgent = newestMsg ? (newestMsg.agent ?? LEAD) : undefined;
   const newestLane = newestMsg ? laneKeyOf(newestMsg) : undefined;
-  const live = !terminal && (run.status === "running" || run.status === "claimed");
+  const live =
+    !terminal && (run.status === "running" || run.status === "claimed");
   const liveSpeaker = live ? newestAgent : undefined;
   const liveLane = live ? newestLane : undefined;
   // activeAgent drives RunEventRow's running-tool spinner; keep it running-only (the
@@ -469,7 +487,9 @@ export function ActivityFeed({
   // Overrides are keyed by the CURRENT view's actor key (lane key vs role name). The two
   // key spaces overlap only where a lane has no instance and is keyed by its role, which
   // is the case where carrying the choice across a view flip is the right answer anyway.
-  const [overrides, setOverrides] = useState<Map<string, boolean>>(() => new Map());
+  const [overrides, setOverrides] = useState<Map<string, boolean>>(
+    () => new Map(),
+  );
   const [bulk, setBulk] = useState<"none" | "all" | "collapsed">("none");
   const actorKeys = byAgent ? lanes.map((l) => l.key) : crew.order;
   const countFor = (key: string): number =>
@@ -501,7 +521,9 @@ export function ActivityFeed({
   // querySelector" refactor — hence the note rather than a runtime guard.
   const jumpTo = (key: string) => {
     setOverrides((prev) => new Map(prev).set(key, true));
-    document.getElementById(`agent-anchor-${key}`)?.scrollIntoView?.({ block: "start" });
+    document
+      .getElementById(`agent-anchor-${key}`)
+      ?.scrollIntoView?.({ block: "start" });
   };
   const allExpanded = actorKeys.length > 0 && actorKeys.every(isExpanded);
 
@@ -539,12 +561,19 @@ export function ActivityFeed({
     return { order, count };
   }, [lanes]);
   const showRollup =
-    lanes.length > GLANCE_LANES || roles.order.some((r) => (roles.count.get(r) ?? 0) >= 2);
+    lanes.length > GLANCE_LANES ||
+    roles.order.some((r) => (roles.count.get(r) ?? 0) >= 2);
   const worstStateFor = (role: string): CrewState => {
     let worst: CrewState = "done";
     for (const l of lanes) {
       if (l.role !== role) continue;
-      const s = crewStateFor(run, l.key, liveLane, laneAgg.get(l.key)?.lastMs ?? 0, now);
+      const s = crewStateFor(
+        run,
+        l.key,
+        liveLane,
+        laneAgg.get(l.key)?.lastMs ?? 0,
+        now,
+      );
       if (STATE_PRIORITY[s] < STATE_PRIORITY[worst]) worst = s;
     }
     return worst;
@@ -557,7 +586,11 @@ export function ActivityFeed({
     () =>
       roles.order
         .map((role, seen) => ({ role, seen, state: worstStateFor(role) }))
-        .sort((a, b) => STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] || a.seen - b.seen),
+        .sort(
+          (a, b) =>
+            STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state] ||
+            a.seen - b.seen,
+        ),
     // worstStateFor closes over lanes/liveLane/laneAgg/now, so every input is listed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [roles, lanes, liveLane, laneAgg, now, run],
@@ -571,7 +604,9 @@ export function ActivityFeed({
       return next;
     });
     // Literal id, not a selector — see the note on jumpTo above.
-    document.getElementById(`agent-anchor-${hits[0].key}`)?.scrollIntoView?.({ block: "start" });
+    document
+      .getElementById(`agent-anchor-${hits[0].key}`)
+      ?.scrollIntoView?.({ block: "start" });
   };
 
   const visibleToolUseIds = useMemo(() => {
@@ -590,12 +625,17 @@ export function ActivityFeed({
   // frame. Unchanged from PRD #38: it narrates the ROLE, never a `toolu_*` lane key,
   // which no screen-reader user could act on.
   const [announcement, setAnnouncement] = useState("");
-  const announcedRef = useRef({ agent: undefined as string | undefined, seq: 0, terminal: false });
+  const announcedRef = useRef({
+    agent: undefined as string | undefined,
+    seq: 0,
+    terminal: false,
+  });
   useEffect(() => {
     const seen = announcedRef.current;
     let next: string | null = null;
 
-    if (activeAgent && activeAgent !== seen.agent) next = `${activeAgent} is now active`;
+    if (activeAgent && activeAgent !== seen.agent)
+      next = `${activeAgent} is now active`;
     seen.agent = activeAgent;
 
     let meaningful: RunMessage | undefined;
@@ -605,7 +645,13 @@ export function ActivityFeed({
         mm.kind === "error" ||
         mm.kind === "plan" ||
         mm.kind === "plan_revising" ||
-        mm.kind === "plan_feedback"
+        mm.kind === "plan_feedback" ||
+        // PRD #35: a park is exactly the event this region exists for — the run goes
+        // quiet for hours and nothing else on the page says why at the moment it
+        // happens. A sighted user gets the warn-toned row; without this a screen
+        // reader gets silence.
+        mm.kind === "limit_wait" ||
+        mm.kind === "limit_hit"
       )
         meaningful = mm;
     }
@@ -620,7 +666,16 @@ export function ActivityFeed({
               ? "Revising the plan"
               : meaningful.kind === "plan_feedback"
                 ? "Revision feedback sent"
-                : describeStatus(meaningful.payload);
+                : // Fixed strings for the same reason agentOneLiner uses them: the
+                  // payload is worker-authored and this is announced, not read in
+                  // context. Announcing the reset time would also be wrong here —
+                  // the region fires once, at the park, and the run view's countdown
+                  // is the surface that stays true as the clock moves.
+                  meaningful.kind === "limit_wait"
+                  ? "Run paused on an Anthropic usage limit"
+                  : meaningful.kind === "limit_hit"
+                    ? "Run hit an Anthropic usage limit"
+                    : describeStatus(meaningful.payload);
     }
 
     if (terminal && !seen.terminal) next = "Run finished";
@@ -641,7 +696,9 @@ export function ActivityFeed({
           viewport it used to push the whole page sideways rather than wrap. Wrapping
           is inert from 640px up, where it has always fit on one line. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Activity</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
+          Activity
+        </h2>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           {/* By agent / Timeline (Decision 2). By-agent groups an invocation's whole
               contribution into one lane; Timeline is the raw chronological stream. */}
@@ -659,7 +716,9 @@ export function ActivityFeed({
                 className={cx(
                   "px-2.5 py-1 transition-colors",
                   v === "timeline" && "border-l border-edge",
-                  view === v ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60",
+                  view === v
+                    ? "bg-raised font-medium text-fg"
+                    : "text-muted hover:bg-raised/60",
                 )}
               >
                 {v === "agent" ? "By agent" : "Timeline"}
@@ -699,7 +758,10 @@ export function ActivityFeed({
         // Small By-agent crew: NO strip. Every collapsed lane already carries name + dot
         // + state, so a roster beside it would re-render the lane list (Decision 5).
         showRollup && (
-          <div aria-label="Crew" className="flex flex-wrap items-center gap-1.5">
+          <div
+            aria-label="Crew"
+            className="flex flex-wrap items-center gap-1.5"
+          >
             {rolesByAttention.map(({ role: r, state }) => {
               const n = roles.count.get(r) ?? 0;
               return (
@@ -722,8 +784,12 @@ export function ActivityFeed({
                     )}
                   />
                   <span className="font-medium text-fg">{r}</span>
-                  {n > 1 && <span className="tabular-nums text-faint">×{n}</span>}
-                  <span className="text-[11px] uppercase tracking-wide opacity-80">{state}</span>
+                  {n > 1 && (
+                    <span className="tabular-nums text-faint">×{n}</span>
+                  )}
+                  <span className="text-[11px] uppercase tracking-wide opacity-80">
+                    {state}
+                  </span>
                 </button>
               );
             })}
@@ -734,7 +800,13 @@ export function ActivityFeed({
         // a fixed status + jump strip is still the best navigation aid.
         <div aria-label="Crew" className="flex flex-wrap gap-1.5">
           {crew.order.map((a) => {
-            const state = crewStateFor(run, a, liveSpeaker, crew.lastMs.get(a) ?? 0, now);
+            const state = crewStateFor(
+              run,
+              a,
+              liveSpeaker,
+              crew.lastMs.get(a) ?? 0,
+              now,
+            );
             return (
               <button
                 key={a}
@@ -755,7 +827,9 @@ export function ActivityFeed({
                   )}
                 />
                 <span className="font-medium text-fg">{a}</span>
-                <span className="text-[11px] uppercase tracking-wide opacity-80">{state}</span>
+                <span className="text-[11px] uppercase tracking-wide opacity-80">
+                  {state}
+                </span>
               </button>
             );
           })}
@@ -770,7 +844,9 @@ export function ActivityFeed({
 
       {actorKeys.length === 0 ? (
         <p className="py-6 text-center text-sm text-muted">
-          {terminal ? "No messages were recorded for this run." : "Waiting for the agent…"}
+          {terminal
+            ? "No messages were recorded for this run."
+            : "Waiting for the agent…"}
         </p>
       ) : (
         <div
@@ -800,7 +876,13 @@ export function ActivityFeed({
                   label={laneLabelText(l.label)}
                   messages={l.messages}
                   startedAt={l.startedAt}
-                  state={crewStateFor(run, l.key, liveLane, laneAgg.get(l.key)?.lastMs ?? 0, now)}
+                  state={crewStateFor(
+                    run,
+                    l.key,
+                    liveLane,
+                    laneAgg.get(l.key)?.lastMs ?? 0,
+                    now,
+                  )}
                   live={l.key === activeLane}
                   expanded={isExpanded(l.key)}
                   followLive={followLive}
@@ -823,7 +905,9 @@ export function ActivityFeed({
                 return (
                   <AgentBlock
                     key={`${g.agent}-${firstSeq}`}
-                    anchorId={firstBlock ? `agent-anchor-${g.agent}` : undefined}
+                    anchorId={
+                      firstBlock ? `agent-anchor-${g.agent}` : undefined
+                    }
                     bodyId={`agent-body-${firstSeq}`}
                     agent={g.agent}
                     messages={g.messages}
@@ -831,7 +915,9 @@ export function ActivityFeed({
                     live={g.agent === activeAgent}
                     expanded={isExpanded(g.agent)}
                     followLive={followLive}
-                    oneLiner={firstBlock ? agentOneLiner(crew.latest.get(g.agent)) : ""}
+                    oneLiner={
+                      firstBlock ? agentOneLiner(crew.latest.get(g.agent)) : ""
+                    }
                     unseen={firstBlock ? unseenFor(g.agent) : 0}
                     onToggle={() => toggleActor(g.agent)}
                     now={now}
@@ -907,7 +993,10 @@ function AgentBlock({
   const flushRail = () => {
     if (rail.length === 0) return;
     rows.push(
-      <div key={`rail-${railSeq}`} className="space-y-2 border-l border-tool-rail/70 pl-3">
+      <div
+        key={`rail-${railSeq}`}
+        className="space-y-2 border-l border-tool-rail/70 pl-3"
+      >
         {rail}
       </div>,
     );
@@ -925,19 +1014,36 @@ function AgentBlock({
     if (m.kind === "tool_use" || m.kind === "thinking") {
       const result =
         m.kind === "tool_use"
-          ? toolIndex.resultByUseId.get((m.payload as { id?: string } | null)?.id ?? "")
+          ? toolIndex.resultByUseId.get(
+              (m.payload as { id?: string } | null)?.id ?? "",
+            )
           : undefined;
       if (rail.length === 0) railSeq = m.seq;
-      rail.push(<RunEventRow key={m.seq} msg={m} result={result} live={live} />);
+      rail.push(
+        <RunEventRow key={m.seq} msg={m} result={result} live={live} />,
+      );
       continue;
     }
     flushRail();
-    rows.push(<RunEventRow key={m.seq} msg={m} live={live} phaseUsage={phaseUsageBySeq?.get(m.seq)} />);
+    rows.push(
+      <RunEventRow
+        key={m.seq}
+        msg={m}
+        live={live}
+        phaseUsage={phaseUsageBySeq?.get(m.seq)}
+      />,
+    );
   }
   flushRail();
 
   return (
-    <div id={anchorId} className={cx("rounded-lg border-l-2 bg-surface/60 py-3 pl-3 pr-3", accent)}>
+    <div
+      id={anchorId}
+      className={cx(
+        "rounded-lg border-l-2 bg-surface/60 py-3 pl-3 pr-3",
+        accent,
+      )}
+    >
       <div className={cx("flex items-center gap-2", expanded && "mb-2")}>
         <button
           type="button"
@@ -949,7 +1055,10 @@ function AgentBlock({
         >
           <span
             aria-hidden="true"
-            className={cx("inline-flex transition-transform", expanded && "rotate-90")}
+            className={cx(
+              "inline-flex transition-transform",
+              expanded && "rotate-90",
+            )}
           >
             <ChevronRightIcon />
           </span>
@@ -957,7 +1066,10 @@ function AgentBlock({
         {state && (
           <span
             title={`${name}: ${state}`}
-            className={cx("inline-flex shrink-0 items-center", CREW_TONE[state])}
+            className={cx(
+              "inline-flex shrink-0 items-center",
+              CREW_TONE[state],
+            )}
           >
             <span
               aria-hidden="true"
@@ -968,7 +1080,12 @@ function AgentBlock({
             />
           </span>
         )}
-        <span className={cx("max-w-[40%] shrink-0 truncate text-sm font-semibold", accent.split(" ")[0])}>
+        <span
+          className={cx(
+            "max-w-[40%] shrink-0 truncate text-sm font-semibold",
+            accent.split(" ")[0],
+          )}
+        >
           {agent}
         </span>
         {label && (
@@ -1016,7 +1133,12 @@ function AgentBlock({
           </span>
         )}
         {state && (
-          <span className={cx("shrink-0 text-[11px] uppercase tracking-wide", CREW_TONE[state])}>
+          <span
+            className={cx(
+              "shrink-0 text-[11px] uppercase tracking-wide",
+              CREW_TONE[state],
+            )}
+          >
             {state}
           </span>
         )}
@@ -1040,7 +1162,10 @@ function AgentBlock({
             +{unseen}
           </span>
         )}
-        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-faint" title={startedAt}>
+        <span
+          className="ml-auto shrink-0 text-[11px] tabular-nums text-faint"
+          title={startedAt}
+        >
           {relativeTime(startedAt, now)}
         </span>
       </div>

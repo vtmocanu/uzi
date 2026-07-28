@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -27,6 +28,7 @@ import (
 
 type awaitingInputFixture struct {
 	q        *store.Queries
+	pool     *pgxpool.Pool
 	userID   uuid.UUID
 	repoID   uuid.UUID
 	workerID uuid.UUID
@@ -58,7 +60,7 @@ func setupAwaitingInput(ctx context.Context, t *testing.T, dsn string) (*awaitin
 		`INSERT INTO runs (id, user_id, repo_id, worker_id, issue_iid, issue_title, issue_description, status)
 		 VALUES ($1, $2, $3, $4, 1, 't', 'd', 'running')`, runID, userID, repoID, workerID)
 
-	return &awaitingInputFixture{q: store.New(pool), userID: userID, repoID: repoID, workerID: workerID, runID: runID},
+	return &awaitingInputFixture{q: store.New(pool), pool: pool, userID: userID, repoID: repoID, workerID: workerID, runID: runID},
 		func() { pool.Close() }
 }
 
@@ -503,4 +505,28 @@ func TestAwaitingInputConstraintsLiveDB(t *testing.T) {
 	}); err == nil {
 		t.Fatal("the kind CHECK accepted a bogus value — the widening dropped the constraint instead of extending it")
 	}
+
+	// D-AF regression: runs_status_check must hold BOTH new statuses.
+	//
+	// This migration DROPs and re-ADDs runs_status_check, and it was authored when
+	// 00090 was head — before PRD #35 landed 'limit_wait'. Renumbering it above #35's
+	// migration made it run second, so a value list that forgot 'limit_wait' would
+	// silently narrow the domain back and reject every later park. The failure is
+	// invisible to every test that does not put a run in that status, which is why it
+	// is asserted here rather than left to the migration applying cleanly.
+	for _, st := range []string{"awaiting_input", "limit_wait", "awaiting_approval", "running"} {
+		if _, err := pgExec(ctx, f, st); err != nil {
+			t.Fatalf("runs_status_check rejected %q, which is a shipped status: %v", st, err)
+		}
+	}
+}
+
+// pgExec sets the fixture run's status directly, bypassing the typed setters, so the
+// CHECK is what is under test rather than a query's own guards.
+func pgExec(ctx context.Context, f *awaitingInputFixture, status string) (int64, error) {
+	tag, err := f.pool.Exec(ctx, `UPDATE runs SET status = $2 WHERE id = $1`, f.runID, status)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

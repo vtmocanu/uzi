@@ -4,13 +4,20 @@
 -- sixth steering-input kind, 'answer'.
 --
 -- The runs.status CHECK is an unnamed inline constraint from 00020 that Postgres
--- auto-named runs_status_check; widen it. NOTE the seven existing values are
--- carried verbatim — a DROP+ADD that re-derives the list from anything but the
--- live constraint silently deletes whatever it forgets.
+-- auto-named runs_status_check; widen it. NOTE the eight existing values are carried
+-- verbatim — a DROP+ADD that re-derives the list from anything but the LIVE constraint
+-- silently deletes whatever it forgets.
+--
+-- That is not hypothetical here. This migration was written when 00090 was head and
+-- listed seven values; PRD #35 then landed 00091_run_limit_wait, adding 'limit_wait'.
+-- Renumbering this file above it made it run SECOND, so the seven-value list would
+-- have dropped 'limit_wait' — failing the ALTER outright on any database holding a
+-- parked run, and silently rejecting every later limit_wait write on one that did not.
+-- An enumeration is a measurement with a shelf life, and a merge is when it expires.
 ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_status_check;
 ALTER TABLE runs ADD CONSTRAINT runs_status_check
     CHECK (status IN ('queued', 'claimed', 'running', 'awaiting_approval', 'awaiting_input',
-                      'completed', 'failed', 'cancelled'));
+                      'limit_wait', 'completed', 'failed', 'cancelled'));
 
 -- run_user_inputs.kind was already re-named by 00074 (PRD #41, which added
 -- 'revise_plan'). Re-add from 00074's FIVE-value list plus 'answer' = six. Writing
@@ -50,6 +57,10 @@ ALTER TABLE run_user_inputs ADD CONSTRAINT run_user_inputs_kind_check
     CHECK (kind IN ('follow_up', 'approve_plan', 'reject_plan', 'cancel', 'revise_plan'));
 
 ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_status_check;
+-- Down narrows to the EIGHT values that existed immediately before this migration —
+-- i.e. 00091_run_limit_wait's set, WITH 'limit_wait' — not to 00020's original seven.
+-- Rolling back to seven would delete PRD #35's status on the way down, which is the
+-- same defect this migration's Up was fixed for, in the direction nobody watches.
 ALTER TABLE runs ADD CONSTRAINT runs_status_check
     CHECK (status IN ('queued', 'claimed', 'running', 'awaiting_approval',
-                      'completed', 'failed', 'cancelled'));
+                      'limit_wait', 'completed', 'failed', 'cancelled'));

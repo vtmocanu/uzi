@@ -185,6 +185,11 @@ func TestNotifierDecisionPartialMap(t *testing.T) {
 		{"running", later, decision{act: false, clear: false}},
 		{"awaiting_approval", later, decision{act: false, clear: false}},
 		{"claimed", later, decision{act: false, clear: false}},
+		// PRD #35: a park moves no card, so the notifier stays partial here even though
+		// the RECONCILER's total map gained limit_wait. Asserted rather than left to the
+		// default arm, because the two maps disagreeing is the whole design and a reader
+		// who sees limit_wait added to one will reach for the other.
+		{"limit_wait", later, decision{act: false, clear: false}},
 	}
 	for _, tc := range tests {
 		if got := notifierDecision(tc.status, tc.origin); got != tc.want {
@@ -207,6 +212,12 @@ func TestReconcilerDecisionTotalMap(t *testing.T) {
 		{"claimed", later, decision{act: true, target: board.ColumnInProgress}},
 		{"running", later, decision{act: true, target: board.ColumnInProgress}},
 		{"awaiting_approval", later, decision{act: true, target: board.ColumnInProgress}},
+		// PRD #35: a parked run is working — it holds its issue, its session and its
+		// branch, and it resumes on its own. The default arm would be
+		// {act:false, clear:false}, which leaves a pending move marker UNHEALED and
+		// trips the 30m give-up warn; a park routinely outlasts 30 minutes by design,
+		// so that warn would be the normal case rather than an exception.
+		{"limit_wait", later, decision{act: true, target: board.ColumnInProgress}},
 		{"completed", later, decision{act: true, target: board.ColumnHumanReview}},
 		{"failed", later, decision{act: true, target: "Later"}},
 		{"cancelled", later, decision{act: true, target: "Later"}},

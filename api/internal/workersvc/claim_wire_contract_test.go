@@ -17,9 +17,27 @@ const wireContractFixture = "testdata/claim_skills_wire.json"
 
 // sampleClaimPayloadWithSkills is a representative, fully-populated claim showing
 // every PRD #16 wire addition: repo.skills_enabled, the skills union, the
-// skills_dropped log, per-template ClaimAgent.skills, and the config caps. Values
-// are fixed (no random uuids) so the golden file is stable. Secrets are obvious
-// non-credentials so scanners never flag the fixture.
+// skills_dropped log, per-template ClaimAgent.skills, and the config caps — plus,
+// since PRD #35, the usage-limit park fields. Values are fixed (no random uuids) so
+// the golden file is stable. Secrets are obvious non-credentials so scanners never
+// flag the fixture.
+//
+// The booleans are deliberately set NON-DEFAULT (true), exactly as AutoApprove
+// already was.
+//
+// The reason is NOT the one this comment used to give — that "a golden carrying every
+// flag at its zero value would still pass against a producer that dropped the field
+// entirely". That is false, and measured false: TestClaimSkillsWireContract compares
+// json.MarshalIndent byte-for-byte against the file and NONE of these tags carries
+// omitempty, so a dropped field omits the KEY and the bytes differ whatever the value
+// was. Demonstrated by deleting `"wait_on_limit"` from the golden and watching the
+// test go red — a golden at false and a golden at true both catch it.
+//
+// The real reason, which is weaker but still sufficient: a non-default value is what
+// distinguishes "wired" from "present and always zero" for a future producer built
+// from the REAL claim path rather than from this hand-built fixture. A fixture full
+// of zero values agrees with a server that computes them all wrong in the same
+// direction.
 func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
 	i64ptr := func(v int64) *int64 { return &v }
@@ -37,6 +55,12 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		RequeueCount:     0,
 		PlanMd:           strptr("# Plan\n"),
 		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
+		WaitOnLimit:      true, // PRD #35 Decision 7: the run's usage-limit opt-in
+		PlanApproved:     true,
+		// PRD #35: the persisted selection rides the claim so a resumed, already-approved
+		// run keeps the exclusions the same human verdict carried. NON-EMPTY on purpose —
+		// an empty exclusions list here would agree with a producer that dropped them.
+		AgentSelection: &AgentSelection{Source: "repo", Exclusions: []string{"reviewer"}}, // PRD #35 Decision 6b: lets a resume skip the plan gate
 		Repo: ClaimRepo{
 			ID:            "22222222-2222-2222-2222-222222222222",
 			URL:           "https://gitlab.example.com/g/p",

@@ -69,10 +69,19 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
   });
 
   it("removes every terminal status and NO non-terminal one", async () => {
-    // Pin the vocabulary against the runs.status CHECK (migration 00020) rather
-    // than trusting the set literal to have stayed in step with it.
+    // Pin the vocabulary against the runs.status CHECK rather than trusting the set
+    // literal to have stayed in step with it. The CHECK holds EIGHT values since
+    // migration 00091 widened 00020's seven with `limit_wait` (PRD #35), so the
+    // non-terminal list below carries all five non-terminal ones.
     assert.deepStrictEqual([...TERMINAL_RUN_STATUSES].sort(), ["cancelled", "completed", "failed"]);
-    const nonTerminal = ["queued", "claimed", "running", "awaiting_approval"];
+    // 🔴 `limit_wait` is the load-bearing entry here, not a completeness nicety.
+    // A parked run's HOME is past minAgeMs (3h) for essentially its whole park (up
+    // to RUN_LIMIT_MAX_PARK, default 8d), so it is a candidate on EVERY sweep and
+    // survives ONLY because the API answers `limit_wait` and this status is not
+    // terminal. Without this case that protection was accidental and untested: the
+    // set-membership assert above would still pass with the sweep deleting a parked
+    // HOME, because it pins the SET and not the end-to-end skip.
+    const nonTerminal = ["queued", "claimed", "running", "awaiting_approval", "limit_wait"];
     for (const status of [...TERMINAL_RUN_STATUSES, ...nonTerminal]) {
       fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(root, { recursive: true });

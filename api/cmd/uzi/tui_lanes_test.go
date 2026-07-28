@@ -121,6 +121,18 @@ func TestLaneLabelClampIsRuneSafe(t *testing.T) {
 }
 
 // The D5 ladder, all six rungs plus the three traps.
+//
+// 🔴 NOT EXHAUSTIVE OVER STATUSES, and it is not trying to be. `limit_wait` (PRD #35)
+// rides the same gate rung as `awaiting_approval` and is covered by
+// TestCrewStateForParkedRun below, deliberately kept separate.
+//
+// The reason is structural rather than tidiness: each row here isolates ONE rung's
+// precedence, so a single `limit_wait` row would pin the VERDICT without pinning WHICH
+// RUNG produced it — and the whole point of the park's placement is that it fires above
+// two rungs that answer differently (recency says `idle`, a frozen health flag says
+// `stalled`). Proving that needs the stale-vs-fresh and flagged-vs-ok PAIRS, which one
+// table row structurally cannot hold. Folding it in would produce a row that passes for
+// a reason nobody could later separate from the one intended.
 func TestCrewStateForLadder(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	const me, other = "toolu_me", "toolu_other"
@@ -170,6 +182,68 @@ func TestCrewStateForLadder(t *testing.T) {
 	if got := crewStateFor("running", "ok", me, me, longCall, now); got != crewWorking {
 		t.Errorf("a healthy %v tool call by the ACTIVE speaker = %s, want working — the active lane trusts run.health and must never be gated by the %v recency window",
 			now.Sub(longCall), got, laneStaleAfter)
+	}
+}
+
+// PRD #35 Success Criterion 2, on the CLI's side of it: "a parked run is visibly
+// waiting, never stalled".
+//
+// Kept OUT of the ladder table above deliberately. Two of these three cases pass
+// against the un-fixed ladder for reasons that have nothing to do with the park, so
+// folding them into a 12-row table would have hidden which rows actually carry the
+// property. Measured against `crewStateFor` with the statusLimitWait clause removed:
+//
+//	stale + no active speaker  → crewIdle     (would have read "nobody is coming")
+//	stalled health + active    → crewStalled  (the criterion failing outright)
+//	fresh + no active speaker  → crewWaiting  (right answer, wrong reason — recency)
+//
+// The third is here for completeness and pins nothing; the first two are the test.
+func TestCrewStateForParkedRun(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	const me = "toolu_me"
+
+	// A park runs for HOURS, so every lane is far past the 45s recency window. Without
+	// the statusLimitWait rung this is the case the rail actually shows, and `idle`
+	// says "nothing is happening and nobody is coming" about a run with a server-side
+	// promotion already scheduled.
+	if got := crewStateFor(statusLimitWait, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
+		t.Errorf("crewStateFor(limit_wait, quiet for 4h) = %s, want %s — a parked run is waiting on a scheduled promotion, not idle", got, crewWaiting)
+	}
+
+	// 🔴 THE ONE THAT MATTERS, and the reason this test does not just trust the api
+	// lane. ListActiveRunsForHealth is a POSITIVE allowlist over
+	// (queued, running, awaiting_approval), so the PRD #47 detector never revisits a
+	// parked run: whatever health flag was live at park time is FROZEN for the whole
+	// park, which can be days. The server clears it on the park write, but if that ever
+	// regresses the symptom appears HERE, and "visibly waiting, never stalled" would be
+	// failing through the health column while the status column looked fine.
+	for _, health := range []string{"stalled", "slow", "looping"} {
+		if got := crewStateFor(statusLimitWait, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
+			t.Errorf("crewStateFor(limit_wait, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a parked run read stalled",
+				health, got, crewWaiting)
+		}
+	}
+
+	// Same answer from the other side of the recency split, so the rung is proven to be
+	// the source of the verdict rather than the timer happening to agree.
+	if got := crewStateFor(statusLimitWait, "ok", me, "", now.Add(-5*time.Second), now); got != crewWaiting {
+		t.Errorf("crewStateFor(limit_wait, recent) = %s, want %s", got, crewWaiting)
+	}
+
+	// The park is NOT terminal, which is the inverse property and the one that would
+	// silently break `uzi run logs --follow` and the stream reconcile if it were.
+	if isTerminalRunStatus(statusLimitWait) {
+		t.Error("isTerminalRunStatus(limit_wait) = true — a parked run resumes, so treating it as terminal draws every lane `done` on a run that is about to start talking again")
+	}
+	if terminalRunStatuses[statusLimitWait] {
+		t.Error("run.go's terminalRunStatuses contains limit_wait — `uzi run logs --follow` would exit mid-run and truncate the capture")
+	}
+
+	// No active speaker on a parked run: nothing is executing, so naming one lane the
+	// active one would be a lie (and would earn it a `working` dot on the rung below).
+	frames := []laneFrame{lf(1, "coder", "toolu_01", "", time.Minute, now)}
+	if got := activeLaneKey(statusLimitWait, frames); got != "" {
+		t.Errorf("activeLaneKey(limit_wait) = %q, want \"\" — a parked run has no executing agent", got)
 	}
 }
 

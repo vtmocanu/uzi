@@ -24,6 +24,16 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
+  /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
+   *  inherits it, including the three kinds with no start affordance at all
+   *  (autopilot, ci_fix, self_improve), which is why the default exists rather than
+   *  a per-start prompt. Default false; toggled from their own Settings.
+   *
+   *  It is a DEFAULT, not a live switch: changing it never touches a run that
+   *  already exists. `Run.wait_on_limit` is the per-run value, set from this at
+   *  creation and overridable on the run view — so the two disagreeing is the normal
+   *  state of a user who overrode one run, not a sync bug to fix. */
+  wait_on_limit: boolean;
   // Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4),
   // independent of what their runs spend — the point of the feature. Both null ⇒
   // unbound ⇒ their default token. The label, never the value.
@@ -575,7 +585,8 @@ export interface CliTokenMint {
 // ── CLI browser-login consent flow (PRD #64 M5/M6) ────────────────────────────
 // The `/cli-auth` consent page reads a pending request and approves/denies it.
 // status mirrors the server enum; a stale-but-pending row reports "expired".
-export type CliAuthStatus = "pending" | "approved" | "denied" | "consumed" | "expired";
+export type CliAuthStatus =
+  "pending" | "approved" | "denied" | "consumed" | "expired";
 
 // CliAuthRequestMeta is GET /api/auth/cli/request/{id}. It carries client_desc +
 // status + expiry and DELIBERATELY NOT the user_code: the human must type the
@@ -652,7 +663,8 @@ export interface Worker {
   // "unknown" is the honest answer, not an error: an unstamped image, an unparseable
   // report, or a "dev" control plane all land here, and none of them should raise an
   // alert.
-  upgrade_status: "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
+  upgrade_status:
+    "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
   upgrade_detail: string | null;
   // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
   // hosted worker with a fresh report, otherwise the control plane's own version. "" when
@@ -741,12 +753,19 @@ export type RunStatus =
    *  to the person who owes the run an action. M1 lands the type; the badge, tone and
    *  composer are M2. */
   | "awaiting_input"
+  /** Parked until the owner's Anthropic usage window reopens (PRD #35).
+   *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
+  | "limit_wait"
   | "completed"
   | "failed"
   | "cancelled";
 
 // TERMINAL_RUN_STATUSES mirrors the DB CHECK: a run in any of these is finished.
-export const TERMINAL_RUN_STATUSES: RunStatus[] = ["completed", "failed", "cancelled"];
+export const TERMINAL_RUN_STATUSES: RunStatus[] = [
+  "completed",
+  "failed",
+  "cancelled",
+];
 
 export function isTerminalRun(status: string): boolean {
   return (TERMINAL_RUN_STATUSES as string[]).includes(status);
@@ -776,12 +795,7 @@ export type StopKind = "cancelled" | "plan_rejected" | "auto_stopped";
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  | "ok"
-  | "stalled"
-  | "looping"
-  | "slow"
-  | "waiting_worker"
-  | "approval_idle";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -902,6 +916,38 @@ export interface Run {
    *  Since PRD #111 M1 it can be read together with the credential above: what the
    *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
+  /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
+   *  the run parks at status "limit_wait" and resumes when the window reopens,
+   *  instead of failing. Present on every run from creation, so it is what a "will
+   *  retry on limit" affordance renders BEFORE any park has happened. */
+  wait_on_limit: boolean;
+  /** PRD #35: when the exhausted window reopens, as REPORTED by the worker off the
+   *  SDK frame, and when the server will actually promote the run back to queued.
+   *
+   *  🔴 THESE ARE NOT THE SAME INSTANT AND THE COUNTDOWN READS `retry_not_before`.
+   *  That is when work resumes. It carries jitter, is clamped to RUN_LIMIT_MAX_PARK,
+   *  is cross-checked against the owner's own rate-limit gauge, and is POOL-AWARE —
+   *  a user whose second credential still has headroom is promoted early, so
+   *  retry_not_before is routinely EARLIER than limit_resets_at, not merely offset
+   *  from it. Render limit_resets_at as context ("the five-hour window reopens at
+   *  …") and never compute the countdown from it.
+   *
+   *  Both null for a run that has never parked. ISO-8601 strings, like every other
+   *  timestamp on this type. */
+  limit_resets_at: string | null;
+  retry_not_before: string | null;
+  /** PRD #35: how many times this run has parked (0 if never), capped server-side
+   *  by RUN_LIMIT_MAX_WAITS. The CAP is deliberately not on this type — it is one
+   *  server constant and does not belong on every row of a list response — so render
+   *  "attempt N", not "attempt N/M", unless the denominator is fetched from /api/me. */
+  limit_wait_count: number;
+  /** PRD #35: which window rejected the run ("five_hour", "seven_day", …). Already
+   *  allowlisted against the SDK union server-side, with anything unrecognised
+   *  coerced to "unknown", so it is a safe enum here and never worker free text —
+   *  but render an unrecognised value honestly rather than dropping it, since the
+   *  vocabulary is the SDK's and a newer server can ship a member this build has not
+   *  heard of. Null for a run that has never parked. */
+  rate_limit_type: string | null;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
@@ -1229,7 +1275,8 @@ export interface IssueDraft {
 
 // The ?bucket= filter matches the GROUP rollup, not a member. "all" is unfiltered;
 // the other four are the #94 ladder's rungs. Default is "todo".
-export type JudgeBacklogBucket = "todo" | "filed" | "done" | "dismissed" | "all";
+export type JudgeBacklogBucket =
+  "todo" | "filed" | "done" | "dismissed" | "all";
 
 // Disposition scope for the bulk fan-out (PRD #98 Decision 3). "open" (default) only
 // touches members the ladder buckets as todo — a filed/settled member is left alone;
@@ -1387,7 +1434,13 @@ export interface RunMessage {
  *  its body is JSON — `{ question_id, answers }` — because an answer has to name the
  *  question it answers; the api rejects one that names a question which is no longer
  *  open, and one submitted while the run is not parked at all. */
-export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "revise_plan" | "cancel" | "answer";
+export type RunInputKind =
+  | "follow_up"
+  | "approve_plan"
+  | "reject_plan"
+  | "revise_plan"
+  | "cancel"
+  | "answer";
 
 // SteerInput is one follow_up steer-queue entry (PRD #95), from GET /api/runs/{id}/
 // inputs. Delivery status is derived client-side: consumed_at null ⇒ Queued (the worker
@@ -1563,7 +1616,10 @@ export function isHttpsUrl(url: string | null | undefined): boolean {
 // routing it through isHttpsUrl here is the load-bearing guard: a hostile http: or
 // javascript: mr_web_url is rejected and never becomes an anchor href. Shared by
 // every MR-link surface so the guard can never be forgotten at one of them.
-export function preferForgeUrl(persisted: string | null | undefined, legacy: string | null): string | null {
+export function preferForgeUrl(
+  persisted: string | null | undefined,
+  legacy: string | null,
+): string | null {
   return isHttpsUrl(persisted) ? persisted! : legacy;
 }
 
@@ -1581,7 +1637,9 @@ export class ApiError extends Error {
 }
 
 function readCookie(name: string): string | null {
-  const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+  const match = document.cookie.match(
+    new RegExp("(?:^|; )" + name + "=([^;]*)"),
+  );
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -1596,7 +1654,9 @@ function readCookie(name: string): string | null {
 // -empty session and never bounces a signed-out visitor off a public page.
 type UnauthorizedHandler = () => void;
 let unauthorizedHandler: UnauthorizedHandler | null = null;
-export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+export function setUnauthorizedHandler(
+  handler: UnauthorizedHandler | null,
+): void {
   unauthorizedHandler = handler;
 }
 
@@ -1608,7 +1668,9 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): voi
 // swallows the 409 still trips the refresh.
 type VaultLockedHandler = () => void;
 let vaultLockedHandler: VaultLockedHandler | null = null;
-export function setVaultLockedHandler(handler: VaultLockedHandler | null): void {
+export function setVaultLockedHandler(
+  handler: VaultLockedHandler | null,
+): void {
   vaultLockedHandler = handler;
 }
 
@@ -1622,7 +1684,11 @@ export function isVaultLocked(err: unknown): boolean {
   );
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -1651,11 +1717,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
   if (!res.ok) {
     if (res.status === 401) unauthorizedHandler?.();
-    if (res.status === 409 && (payload as { code?: string } | null)?.code === "vault_locked") {
+    if (
+      res.status === 409 &&
+      (payload as { code?: string } | null)?.code === "vault_locked"
+    ) {
       vaultLockedHandler?.();
     }
     const message =
-      (payload as { error?: string } | null)?.error ?? `request failed (${res.status})`;
+      (payload as { error?: string } | null)?.error ??
+      `request failed (${res.status})`;
     throw new ApiError(res.status, message, payload);
   }
   return payload as T;
@@ -1679,12 +1749,17 @@ const realApi = {
   // fed from it would be stale or absent exactly when the operator is not on that page,
   // which is the only situation a nav badge exists for.
   workerUpgradeSummary: () =>
-    request<{ attention: number; target_release: string }>("GET", "/me/workers/upgrade-summary"),
+    request<{ attention: number; target_release: string }>(
+      "GET",
+      "/me/workers/upgrade-summary",
+    ),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
-    request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+    request<{ user: User }>("PATCH", `/admin/users/${id}`, {
+      is_active: isActive,
+    }),
   // Admin per-user run-judge toggle (PRD #46): force any user's opt-in. Actor is
   // admin (route-gated); target is the path id, never the body. Returns the user.
   setUserJudgeEnabled: (id: string, enabled: boolean) =>
@@ -1694,15 +1769,39 @@ const realApi = {
     request<SettingsResponse>("PUT", "/admin/settings", { settings }),
   // Vault migration progress (PRD #32): count of stored secrets still master-sealed
   // (owners who have not unlocked since the vault rolled out). Admin-only.
-  vaultMigration: () => request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
+  vaultMigration: () =>
+    request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
   // Self-improvement config (PRD #46 M5). Admin-only. update sets the enabling admin
   // as the run owner from the session (never the body).
-  getSelfimprove: () => request<{ selfimprove: SelfimproveConfig }>("GET", "/admin/selfimprove"),
+  getSelfimprove: () =>
+    request<{ selfimprove: SelfimproveConfig }>("GET", "/admin/selfimprove"),
   updateSelfimprove: (input: SelfimproveUpdate) =>
-    request<{ selfimprove: SelfimproveConfig }>("PUT", "/admin/selfimprove", input),
+    request<{ selfimprove: SelfimproveConfig }>(
+      "PUT",
+      "/admin/selfimprove",
+      input,
+    ),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  /**
+   * PRD #35: flip the current user's DEFAULT for the usage-limit park. Returns the
+   * updated user.
+   *
+   * 🔴 IT DOES NOT REACH RUNS THAT ALREADY EXIST — not even queued ones, and not the
+   * one the user is looking at. The flag is copied onto each run at creation, so this
+   * changes what the NEXT run inherits and nothing else. The per-run control is
+   * setRunWaitOnLimit below; the two are separate endpoints because they answer
+   * different questions, and a single "sync everything" write would silently undo
+   * every per-run override the user had made.
+   *
+   * The reason this default is load-bearing rather than a convenience: autopilot,
+   * ci_fix and self_improve runs have NO start affordance at all, so for two of the
+   * three kinds that park, this setting is the only way the opt-in can ever be
+   * expressed.
+   */
+  setWaitOnLimit: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
   // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
   // the body carries no user id. Returns the updated user.
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):
@@ -1731,33 +1830,47 @@ const realApi = {
   patchAnthropicToken: (
     id: string,
     body: { label?: string; default?: boolean; token?: string },
-  ) => request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}`, body),
+  ) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/anthropic_token/${id}`,
+      body,
+    ),
   // The auto-selection pool toggle (PRD #111 M2, D13). Its OWN narrow route, not a
   // field on the PATCH above: every other secrets write is cookie-only because a
   // Bearer-reachable mint would let a stolen CLI token replace a user's credentials,
   // and moving that PATCH to reach this toggle would have taken rename, rotate and
   // set-default along with it.
   setTokenAutoEligible: (id: string, autoEligible: boolean) =>
-    request<{ secret: SecretMeta }>("PATCH", `/me/secrets/anthropic_token/${id}/auto-eligible`, {
-      auto_eligible: autoEligible,
-    }),
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/anthropic_token/${id}/auto-eligible`,
+      {
+        auto_eligible: autoEligible,
+      },
+    ),
   deleteAnthropicTokenById: (id: string) =>
     request<null>("DELETE", `/me/secrets/anthropic_token/${id}`),
   putAnthropicToken: (token: string) =>
-    request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
-  deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
+    request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", {
+      token,
+    }),
+  deleteAnthropicToken: () =>
+    request<null>("DELETE", "/me/secrets/anthropic_token"),
 
   // Vault (PRD #32): unlock re-derives the DEK from the login password (204, or
   // 403 on a wrong password); lock evicts it; status is a lightweight poll. Unlock
   // and lock return no body.
-  vaultUnlock: (password: string) => request<null>("POST", "/vault/unlock", { password }),
+  vaultUnlock: (password: string) =>
+    request<null>("POST", "/vault/unlock", { password }),
   // Create a passwordless (OIDC) user's vault from a chosen passphrase (PRD #45).
   // Create-only: 409 if a vault already exists; 204 on success (vault then unlocked).
   vaultCreatePassphrase: (passphrase: string) =>
     request<null>("POST", "/vault/passphrase", { passphrase }),
   vaultLock: () => request<null>("POST", "/vault/lock"),
   vaultStatus: () => request<{ unlocked: boolean }>("GET", "/vault/status"),
-  getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),
+  getMySettings: () =>
+    request<{ settings: UserSettings }>("GET", "/me/settings"),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
   // Slack linking (PRD #25 M3), own-user only. member_id null clears the override
@@ -1767,26 +1880,43 @@ const realApi = {
   setMySlackNotify: (notify: boolean) =>
     request<{ slack: SlackLink }>("PUT", "/me/slack/notify", { notify }),
   setMySlackOverride: (memberId: string | null) =>
-    request<{ slack: SlackLink }>("PUT", "/me/slack/override", { member_id: memberId }),
+    request<{ slack: SlackLink }>("PUT", "/me/slack/override", {
+      member_id: memberId,
+    }),
   testMySlackDM: () => request<{ status: string }>("POST", "/me/slack/test-dm"),
   // Just the live Slack socket state, for the admin chip's poll (PRD #25 M3).
-  getSlackStatus: () => request<{ slack_status: string }>("GET", "/admin/slack/status"),
+  getSlackStatus: () =>
+    request<{ slack_status: string }>("GET", "/admin/slack/status"),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
   getTemplateAllocations: () =>
-    request<{ templates: TemplateAllocation[] }>("GET", "/agent-templates/allocations"),
+    request<{ templates: TemplateAllocation[] }>(
+      "GET",
+      "/agent-templates/allocations",
+    ),
   setTemplateAllocations: (input: TemplateAllocationsInput) =>
-    request<{ templates: TemplateAllocation[] }>("PUT", "/agent-templates/allocations", input),
+    request<{ templates: TemplateAllocation[] }>(
+      "PUT",
+      "/agent-templates/allocations",
+      input,
+    ),
   getAgentTemplate: (id: string) =>
     request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
   createAgentTemplate: (input: AgentTemplateInput) =>
     request<{ template: AgentTemplate }>("POST", "/agent-templates", input),
   updateAgentTemplate: (id: string, input: AgentTemplateInput) =>
-    request<{ template: AgentTemplate }>("PUT", `/agent-templates/${id}`, input),
+    request<{ template: AgentTemplate }>(
+      "PUT",
+      `/agent-templates/${id}`,
+      input,
+    ),
   deleteAgentTemplate: (id: string) =>
     request<null>("DELETE", `/agent-templates/${id}`),
   resetAgentTemplate: (id: string) =>
-    request<{ template: AgentTemplate }>("POST", `/agent-templates/${id}/reset`),
+    request<{ template: AgentTemplate }>(
+      "POST",
+      `/agent-templates/${id}/reset`,
+    ),
 
   // Agent skills (PRD #16).
   listSkills: () => request<{ skills: Skill[] }>("GET", "/skills"),
@@ -1796,11 +1926,19 @@ const realApi = {
   updateSkill: (id: string, input: SkillUpdateInput) =>
     request<{ skill: Skill }>("PUT", `/skills/${id}`, input),
   deleteSkill: (id: string) => request<null>("DELETE", `/skills/${id}`),
-  resetSkill: (id: string) => request<{ skill: Skill }>("POST", `/skills/${id}/reset`),
+  resetSkill: (id: string) =>
+    request<{ skill: Skill }>("POST", `/skills/${id}/reset`),
   getTemplateSkills: (id: string) =>
-    request<{ allocations: TemplateSkills }>("GET", `/agent-templates/${id}/skills`),
+    request<{ allocations: TemplateSkills }>(
+      "GET",
+      `/agent-templates/${id}/skills`,
+    ),
   setTemplateSkills: (id: string, input: AllocationsInput) =>
-    request<{ allocations: TemplateSkills }>("PUT", `/agent-templates/${id}/skills`, input),
+    request<{ allocations: TemplateSkills }>(
+      "PUT",
+      `/agent-templates/${id}/skills`,
+      input,
+    ),
 
   // Tool allowlist + per-repo tool profiles (PRD #18 M4). The allowlist is readable
   // by any user (the repo picker needs it); writes are admin-only. A repo's profile
@@ -1810,17 +1948,24 @@ const realApi = {
   createToolAllowlistEntry: (input: ToolAllowlistWriteInput) =>
     request<{ entry: ToolAllowlistEntry }>("POST", "/tool-allowlist", input),
   updateToolAllowlistEntry: (id: string, input: ToolAllowlistWriteInput) =>
-    request<{ entry: ToolAllowlistEntry }>("PUT", `/tool-allowlist/${id}`, input),
+    request<{ entry: ToolAllowlistEntry }>(
+      "PUT",
+      `/tool-allowlist/${id}`,
+      input,
+    ),
   deleteToolAllowlistEntry: (id: string) =>
     request<null>("DELETE", `/tool-allowlist/${id}`),
   getRepoToolProfile: (repoId: string) =>
     request<{ packages: string[] }>("GET", `/repos/${repoId}/tool-profile`),
   setRepoToolProfile: (repoId: string, packages: string[]) =>
-    request<{ packages: string[] }>("PUT", `/repos/${repoId}/tool-profile`, { packages }),
+    request<{ packages: string[] }>("PUT", `/repos/${repoId}/tool-profile`, {
+      packages,
+    }),
 
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
-  listConnections: () => request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
+  listConnections: () =>
+    request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
   createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
     request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
       base_url: baseUrl,
@@ -1828,32 +1973,53 @@ const realApi = {
       forge_type: forgeType,
     }),
   verifyConnection: (id: string) =>
-    request<{ connection: ForgeConnection }>("POST", `/forge/connections/${id}/verify`),
+    request<{ connection: ForgeConnection }>(
+      "POST",
+      `/forge/connections/${id}/verify`,
+    ),
   // Set (or clear, with "") the connecting user's own forge username for autopilot
   // attribution. The API best-effort-verifies it and may return a `warning` while
   // still saving (verified-or-warned, PRD #19 M3).
   updateConnection: (id: string, humanUsername: string) =>
-    request<{ connection: ForgeConnection; warning?: string }>("PUT", `/forge/connections/${id}`, {
-      human_username: humanUsername,
-    }),
+    request<{ connection: ForgeConnection; warning?: string }>(
+      "PUT",
+      `/forge/connections/${id}`,
+      {
+        human_username: humanUsername,
+      },
+    ),
   privilegeCheck: (id: string) =>
-    request<{ report: PrivilegeReport }>("POST", `/forge/connections/${id}/privilege-check`),
-  deleteConnection: (id: string) => request<null>("DELETE", `/forge/connections/${id}`),
+    request<{ report: PrivilegeReport }>(
+      "POST",
+      `/forge/connections/${id}/privilege-check`,
+    ),
+  deleteConnection: (id: string) =>
+    request<null>("DELETE", `/forge/connections/${id}`),
   listProjects: (connectionId: string) =>
-    request<{ repos: Repo[] }>("GET", `/forge/connections/${connectionId}/projects`),
+    request<{ repos: Repo[] }>(
+      "GET",
+      `/forge/connections/${connectionId}/projects`,
+    ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
   setRepoEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
   setRepoSkillsEnabled: (id: string, enabled: boolean) =>
-    request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_skills_enabled: enabled }),
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      repo_skills_enabled: enabled,
+    }),
   // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
-    request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_devbox_opt_in: enabled }),
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
+      repo_devbox_opt_in: enabled,
+    }),
 
-  getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
+  getBoard: (repoId: string) =>
+    request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>
-    request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, { columns }),
+    request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, {
+      columns,
+    }),
   // Replace the board's manual card order wholesale (PRD #102 M5). `iids` is the
   // board-GLOBAL order of every non-closed card, not just the column that changed:
   // the drop freezes the whole displayed order before it moves anything, so a card
@@ -1864,25 +2030,36 @@ const realApi = {
   getIssue: (repoId: string, iid: number) =>
     request<{ issue: IssueDetail }>("GET", `/repos/${repoId}/issues/${iid}`),
   moveIssue: (repoId: string, iid: number, toColumn: string) =>
-    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, {
+      to_column: toColumn,
+    }),
   // Apply/remove the PRDLESS label from the UI (PRD #22 M4). Forge-first, so the
   // returned card is authoritative — the caller replaces its card with it (no
   // optimistic update).
   setIssuePrdless: (repoId: string, iid: number, apply: boolean) =>
-    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/prdless`, { apply }),
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/prdless`, {
+      apply,
+    }),
   // Promote a non-PRD issue by adding the PRD label (PRD #102 M6, Decision 15).
   // Forge-first and apply-only — there is no demote, so no boolean. The returned
   // card is authoritative, like the prdless toggle above.
   promoteIssue: (repoId: string, iid: number) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/promote`),
-  syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
+  syncRepo: (repoId: string) =>
+    request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
   createIssue: (repoId: string, title: string, description: string) =>
-    request<{ card: Card }>("POST", `/repos/${repoId}/issues`, { title, description }),
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues`, {
+      title,
+      description,
+    }),
 
   // Agent runtime (PRD #4).
   listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),
   createWorker: (name: string, template?: string) =>
-    request<{ worker: Worker; token: string }>("POST", "/workers", { name, template }),
+    request<{ worker: Worker; token: string }>("POST", "/workers", {
+      name,
+      template,
+    }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
   // Point a worker at one of the caller's named tokens, or clear the binding with
   // null so it falls back to the default (PRD #104 M3). Takes a LABEL, not an id —
@@ -1923,11 +2100,23 @@ const realApi = {
    * form sets docker, never name) and is always sent as an explicit bool: absent reads
    * as false server-side, but sending it keeps the request self-describing.
    */
-  provisionHostedWorker: (template: string, size: string, docker = false, name?: string) =>
-    request<{ worker: Worker }>("POST", "/workers/hosted", { template, size, name, docker }),
+  provisionHostedWorker: (
+    template: string,
+    size: string,
+    docker = false,
+    name?: string,
+  ) =>
+    request<{ worker: Worker }>("POST", "/workers/hosted", {
+      template,
+      size,
+      name,
+      docker,
+    }),
 
   createRun: (repoId: string, issueIid: number) =>
-    request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
+    request<{ run: Run }>("POST", `/repos/${repoId}/runs`, {
+      issue_iid: issueIid,
+    }),
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
@@ -1936,7 +2125,10 @@ const realApi = {
     if (params?.repoId) q.set("repo_id", params.repoId);
     if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
     const qs = q.toString();
-    return request<{ runs: RunListItem[] }>("GET", qs ? `/runs?${qs}` : "/runs");
+    return request<{ runs: RunListItem[] }>(
+      "GET",
+      qs ? `/runs?${qs}` : "/runs",
+    );
   },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
   /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
@@ -1945,29 +2137,61 @@ const realApi = {
   getAdminUsage: () => request<AdminUsage>("GET", "/admin/usage"),
   /** The caller's own Claude rate-limit reading (PRD #53): the two windows, or a
    *  no_token / unavailable status. Percentages only — the token never leaves the api. */
-  getMyRateLimits: () => request<MyRateLimitsResponse>("GET", "/me/rate-limits"),
+  getMyRateLimits: () =>
+    request<MyRateLimitsResponse>("GET", "/me/rate-limits"),
   /** Every user's rate-limit reading (PRD #53). Admin-only — a non-admin 403s. */
-  getAdminRateLimits: () => request<AdminRateLimits>("GET", "/admin/rate-limits"),
+  getAdminRateLimits: () =>
+    request<AdminRateLimits>("GET", "/admin/rate-limits"),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
       "GET",
-      afterSeq > 0 ? `/runs/${id}/messages?after=${afterSeq}` : `/runs/${id}/messages`,
+      afterSeq > 0
+        ? `/runs/${id}/messages?after=${afterSeq}`
+        : `/runs/${id}/messages`,
     ),
   // The run's follow_up steer queue with delivery status (PRD #95). Owner-only: a
   // non-owner (incl. admin_ro) gets 404, which the caller treats as "no queue".
-  getRunInputs: (id: string) => request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
+  getRunInputs: (id: string) =>
+    request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
   // A follow_up write returns the created row's id + created_at (PRD #95 S2) so the
   // web's optimistic queue entry adopts the real id and reconciles; other kinds omit
   // them (they are server-side or own their own UI). Both fields optional on the wire.
-  submitRunInput: (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) =>
-    request<{ server_side: boolean; id?: number; created_at?: string }>("POST", `/runs/${id}/inputs`, {
-      kind,
-      body,
-      // PRD #37: the structured agent selection is legal only on approve_plan; the
-      // server ignores/validates it per kind. Omitted entirely when absent so a
-      // plain follow-up/cancel body is unchanged.
-      ...(selection ? { selection } : {}),
-    }),
+  submitRunInput: (
+    id: string,
+    kind: RunInputKind,
+    body = "",
+    selection?: AgentSelectionInput,
+  ) =>
+    request<{ server_side: boolean; id?: number; created_at?: string }>(
+      "POST",
+      `/runs/${id}/inputs`,
+      {
+        kind,
+        body,
+        // PRD #37: the structured agent selection is legal only on approve_plan; the
+        // server ignores/validates it per kind. Omitted entirely when absent so a
+        // plain follow-up/cancel body is unchanged.
+        ...(selection ? { selection } : {}),
+      },
+    ),
+
+  /**
+   * PRD #35: flip THIS run's usage-limit opt-in. Owner-scoped; returns the updated run.
+   *
+   * 🔴 IT CHANGES THE NEXT LIMIT, NOT THE CURRENT STATUS. Sending `false` to a run
+   * that is already parked does NOT un-park, cancel or fail it — the park keeps its
+   * clock and the run still resumes; only a future limit is affected. Cancelling is
+   * `submitRunInput(id, "cancel")`, and conflating the two would be the expensive
+   * mistake here, so it is written at the call site rather than left to the name.
+   *
+   * The server guards it with the same NEGATIVE predicate CancelRunServerSide uses
+   * (`status NOT IN ('completed','failed','cancelled')`), so it is a no-op on a
+   * terminal run and covers `limit_wait` for free. Callers still gate the control on
+   * canToggleWaitOnLimit (lib/limitWait.ts) — that is the UI agreeing with the
+   * server, not the enforcement.
+   */
+  setRunWaitOnLimit: (id: string, enabled: boolean) =>
+    request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
 
   // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
   // getRunReview reads the verdict + recommendations for the run page (owner-or-
@@ -1975,8 +2199,10 @@ const realApi = {
   // rerunJudge enqueues a fresh judge for a terminal run (owner-only spend), behind
   // the per-user spend limiter; the new verdict arrives asynchronously once the
   // judge run finishes, so callers re-fetch getRunReview.
-  getRunReview: (id: string) => request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
-  rerunJudge: (id: string) => request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
+  getRunReview: (id: string) =>
+    request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
+  rerunJudge: (id: string) =>
+    request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
 
   // ── File a forge issue from a recommendation (PRD #68) ──────────────────────
   // getIssueDraft reads the server-templated draft (owner-or-admin, no write, no token
@@ -1988,7 +2214,11 @@ const realApi = {
       "GET",
       `/runs/${runId}/review/recommendations/${recId}/issue-draft`,
     ),
-  fileIssue: (runId: string, recId: string, body: { repo_id: string; title: string; description: string }) =>
+  fileIssue: (
+    runId: string,
+    recId: string,
+    body: { repo_id: string; title: string; description: string },
+  ) =>
     request<{ issue: CreatedIssue; warning?: string }>(
       "POST",
       `/runs/${runId}/review/recommendations/${recId}/issue`,
@@ -2042,7 +2272,10 @@ const realApi = {
     if (bucket) qs.set("bucket", bucket);
     if (run) qs.set("run", run);
     const suffix = qs.toString();
-    return request<JudgeBacklog>("GET", `/me/judge/recommendations${suffix ? `?${suffix}` : ""}`);
+    return request<JudgeBacklog>(
+      "GET",
+      `/me/judge/recommendations${suffix ? `?${suffix}` : ""}`,
+    );
   },
   // bulkSetJudgeDisposition fans one verdict out to every member coordinate of the
   // given groups (RequireUser, owner-only, idempotent, no token spend, no forge write).
@@ -2056,12 +2289,16 @@ const realApi = {
     reason?: "wont_do" | "not_an_issue",
     scope: JudgeDispositionScope = "open",
   ) =>
-    request<JudgeDispositionResult>("PUT", "/me/judge/recommendations/disposition", {
-      items,
-      status,
-      scope,
-      ...(status === "dismissed" ? { reason } : {}),
-    }),
+    request<JudgeDispositionResult>(
+      "PUT",
+      "/me/judge/recommendations/disposition",
+      {
+        items,
+        status,
+        scope,
+        ...(status === "dismissed" ? { reason } : {}),
+      },
+    ),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/
@@ -2069,39 +2306,59 @@ const realApi = {
   // create/continue return a full runDTO under `run`; the list returns the Chat
   // view shape per item plus the max_turns envelope constant.
   listChats: () => request<ChatListResponse>("GET", "/chats"),
-  createChat: (message: string) => request<{ run: Run }>("POST", "/chats", { message }),
+  createChat: (message: string) =>
+    request<{ run: Run }>("POST", "/chats", { message }),
   // 202 {server_side}; the reply arrives over the run stream (mirrors submitRunInput).
   sendChatMessage: (id: string, message: string) =>
-    request<{ server_side: boolean }>("POST", `/chats/${id}/messages`, { message }),
-  endChat: (id: string) => request<{ server_side: boolean }>("POST", `/chats/${id}/end`),
+    request<{ server_side: boolean }>("POST", `/chats/${id}/messages`, {
+      message,
+    }),
+  endChat: (id: string) =>
+    request<{ server_side: boolean }>("POST", `/chats/${id}/end`),
   // Continue creates a NEW chat run carrying resume_of_run_id (Decision 11).
-  continueChat: (id: string) => request<{ run: Run }>("POST", `/chats/${id}/continue`),
+  continueChat: (id: string) =>
+    request<{ run: Run }>("POST", `/chats/${id}/continue`),
   // The ONLY forge-write path from chat: session + CSRF, forge-first (Decision 8).
   // 200 {issue}: the real created issue (the card renders its link).
   confirmProposal: (chatId: string, proposalId: string) =>
-    request<{ issue: CreatedIssue }>("POST", `/chats/${chatId}/proposals/${proposalId}/confirm`),
+    request<{ issue: CreatedIssue }>(
+      "POST",
+      `/chats/${chatId}/proposals/${proposalId}/confirm`,
+    ),
   // 204 No Content: the card updates its state locally.
   dismissProposal: (chatId: string, proposalId: string) =>
     request<null>("POST", `/chats/${chatId}/proposals/${proposalId}/dismiss`),
 
-  adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
+  adminListWorkers: () =>
+    request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
 
   // Notifications inbox (PRD #46 M2). listNotifications is the caller's own inbox;
   // { all: true } asks for every user's (admin only — a non-admin gets 403). The
   // envelope's `unread` is always the caller's own count (the bell badge).
   // unreadNotificationCount is the bell's lightweight poll (no rows).
-  listNotifications: (params?: { all?: boolean; limit?: number; offset?: number }) => {
+  listNotifications: (params?: {
+    all?: boolean;
+    limit?: number;
+    offset?: number;
+  }) => {
     const q = new URLSearchParams();
     if (params?.all) q.set("all", "1");
     if (params?.limit != null) q.set("limit", String(params.limit));
     if (params?.offset != null) q.set("offset", String(params.offset));
     const qs = q.toString();
-    return request<NotificationList>("GET", qs ? `/notifications?${qs}` : "/notifications");
+    return request<NotificationList>(
+      "GET",
+      qs ? `/notifications?${qs}` : "/notifications",
+    );
   },
-  unreadNotificationCount: () => request<{ unread: number }>("GET", "/notifications/unread_count"),
+  unreadNotificationCount: () =>
+    request<{ unread: number }>("GET", "/notifications/unread_count"),
   markNotificationRead: (id: string) =>
-    request<{ notification: Notification }>("POST", `/notifications/${id}/read`),
+    request<{ notification: Notification }>(
+      "POST",
+      `/notifications/${id}/read`,
+    ),
 
   // ── CLI tokens (PRD #64) — cookie-only CRUD ────────────────────────────────
   // A CLI token can never reach these endpoints (deliberate: a stolen token would
@@ -2110,7 +2367,8 @@ const realApi = {
   listCliTokens: () => request<{ tokens: CliToken[] }>("GET", "/me/cli-tokens"),
   createCliToken: (name: string, scope: CliTokenScope) =>
     request<CliTokenMint>("POST", "/me/cli-tokens", { name, scope }),
-  revokeCliToken: (id: string) => request<null>("DELETE", `/me/cli-tokens/${id}`),
+  revokeCliToken: (id: string) =>
+    request<null>("DELETE", `/me/cli-tokens/${id}`),
   // The panic button for a lost laptop: one query revokes every un-revoked token
   // of the caller. Idempotent (a second call is a no-op 204).
   revokeAllCliTokens: () => request<null>("POST", "/me/cli-tokens/revoke-all"),
@@ -2127,7 +2385,9 @@ const realApi = {
       scope,
     }),
   denyCliAuth: (requestId: string) =>
-    request<{ status: string }>("POST", "/auth/cli/deny", { request_id: requestId }),
+    request<{ status: string }>("POST", "/auth/cli/deny", {
+      request_id: requestId,
+    }),
 
   // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
   // list is newest-first across all the caller's repos (the component groups by

@@ -1,6 +1,5 @@
-# No trailing slash: see the root .gitignore. A symlinked node_modules (the workflow
-# CLAUDE.md prescribes instead of `npm ci` here) is not a directory entry, so `dir/`
-# would not ignore it.
+# No trailing slash: see the note in the repo-root .gitignore. This directory is
+# the one CLAUDE.md most often tells you to symlink instead of `npm ci`-ing.
 node_modules
 dist/
 *.log

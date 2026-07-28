@@ -72,6 +72,18 @@ Note the irony, because it inverts the usual intuition: **`./e2e/run-store-it.sh
 
 Migrations are goose SQL files embedded via `go:embed` and run at API boot; there is no separate migration step.
 
+**A MIGRATION COMMENT MAY NEVER CONTAIN THE LITERAL `+goose` — not quoted, not in prose, not while warning someone off an annotation.** goose's parser (v3.27.2, `internal/sqlparser/parser.go`) triggers on `HasPrefix(TrimSpace(line), "--") && Contains(line, "+goose")`, so the token **anywhere** on a comment line makes that line an annotation. The hazard is the token, not the annotation's name: `-- see the +goose docs` fails to parse exactly like a malformed one. Measured 2026-07-27, writing the sentence *"do not add `-- +goose NO TRANSACTION` to this file"* into a Down comment:
+
+```
+ERROR 00090_run_limit_wait.sql: failed to parse SQL migration file:
+failed to parse annotation line "-- ... DO NOT ADD `-- +goose NO TRANSACTION` ...":
+"... `  NO TRANSACTION` ..." not supported: invalid annotation
+```
+
+**The blast radius is not one file: `store.Migrate` runs at API BOOT, so every later migration stays unapplied.** The whole LiveDB sweep went `RUN=172 PASS=0 FAIL=172`, every failure that one parse error.
+
+**Nothing in the local gate can see it.** `go build`, `go vet` and `go test -count=1 ./...` are all green — the file is valid SQL, and every `store.Migrate` caller outside `cmd/server/main.go` is a live-DB test that self-skips without `UZI_TEST_DATABASE_URL`, which is exactly how the mandated pre-push gate is run. **`sqlc generate` is green too, and the tempting explanation is wrong**: sqlc *does* read this directory (`sqlc.yaml`'s `schema:`) and *will* fail on a syntax error there — it validates the SQL and is blind to the annotations, which is a different claim from "it never looks". CI **does** catch it: `test:api-store-it` runs with the var set, and any `*LiveDB` test calls `store.Migrate`. So the exposure is local-only and the window is one push.
+
 **Live-DB tests (`*LiveDB`) are NOT covered by `go test ./...`.** They skip silently without `UZI_TEST_DATABASE_URL`, and they go RED if you export it for an ordinary run (package binaries race one shared database and truncate mid-flight). Run the ordinary gate with the var UNSET; run the live sweep via `./e2e/run-store-it.sh`, or by hand with `-p 1` — load-bearing, not a speed knob, because without it you get nondeterministic reds that move between runs and look exactly like a regression in whatever you just touched.
 
 **A GREEN from a live-DB suite is not evidence unless the run proves it ran.** Measured 2026-07-21: with `UZI_TEST_DATABASE_URL` unset, the sweep exits 0 and both packages print `ok` while reporting `RUN=n PASS=0 SKIP=n` — every test in the suite ran nothing. (The tally that day was 108; it was 128 within hours. **The run count is whatever the suite holds when you read this; `PASS=0` is the point.**) Exit code and "no failures printed" are both satisfiable by a run in which not one assertion executed. Require a positive control: the named test appears as `--- PASS`/`--- FAIL`, zero `--- SKIP` lines, `RUN > 0`. A run failing any of those is INVALID, never green. (A skipped sweep costs ~0.6s per package against 4-20s for a real one, so a sub-second package time is the tell.)

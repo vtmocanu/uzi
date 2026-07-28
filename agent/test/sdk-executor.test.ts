@@ -1934,3 +1934,81 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     );
   });
 });
+
+// ── PRD #35 Decision 6b: a resume past an approval that already happened ──────
+describe("SdkExecutor — pre-approved resume skips the planning turn and the gate", () => {
+  const preApproved = { planApproved: true, sessionId: "sess-parked", approvedPlan: "# Approved plan\nship it" };
+
+  // 🔴 THE HALF-A-VERDICT CASE. plan_approved and the selection come from ONE human
+  // decision, so a resume that honours the approval must honour the exclusions too.
+  // Before the claim carried the selection this silently resolved to the absent
+  // default, and a human who excluded `reviewer` at the gate got it back after a
+  // park with no signal.
+  it("honours the persisted selection the claim carried, not the absent-default", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      ...preApproved,
+      agents: [lead, coder, reviewer],
+      // The clone HAS a roster, so the absent-default resolves to `repo` — a
+      // different SOURCE and a genuinely different set. The persisted selection says
+      // `own` minus `reviewer`, so honouring it must yield the owner's roster with
+      // `reviewer` gone. That distinguishes it from BOTH the absent-default and a
+      // plain `own` with no exclusions.
+      repoAgents: [repoCoder, repoAuditor],
+      approvedSelection: { source: "own", exclusions: ["reviewer"] },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder"]);
+  });
+
+  it("falls back to the absent-default when the claim carried no selection", async () => {
+    // A gate-less run, or an older server. Absence is not a signal to distrust, so
+    // this must NOT force `own` — resolveAgentSelection's documented default applies,
+    // which with a detected roster is `repo`.
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      ...preApproved,
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, repoAuditor],
+      approvedSelection: undefined,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, [], "still skips the gate");
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  it("skips both, and never calls gatePlan, when the plan is approved and the session resumable", async () => {
+    // One turn only: the implement turn. A run that still planned would need two.
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx(preApproved);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    // The gate is what a HUMAN answers. Asking again for a plan they already
+    // approved is exactly what turns a park into an unattended stall — and can fail
+    // outright with REASON_NO_PLAN when the resumed session declines to re-emit it.
+    assert.deepStrictEqual(probe.gated, [], "gatePlan must not be called for an already-approved plan");
+    assert.strictEqual(turns.length, 1, "no planning turn should run");
+    assert.ok(
+      probe.emits.some((m) => JSON.stringify(m).includes("skipping the planning turn")),
+      "the feed must say the planning turn was skipped",
+    );
+  });
+
+  // Each condition ALONE must not skip. These are the cases where planning is still
+  // the right answer, and skipping on any of them would enter implement with no plan
+  // or resume a session that is not there.
+  for (const [name, over] of [
+    ["there is no session to resume (issue #105 dropped it)", { sessionId: null }],
+    ["the plan is not approved yet — a park during the planning phase", { planApproved: false }],
+    ["it is approved but no plan text arrived", { approvedPlan: "" }],
+  ] as [string, Partial<RunContext>][]) {
+    it(`still plans and gates when ${name}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ ...preApproved, ...over });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(probe.gated.length, 1, "the gate must still run");
+    });
+  }
+});

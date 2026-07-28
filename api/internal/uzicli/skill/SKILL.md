@@ -83,7 +83,7 @@ uzi run list
 uzi run get <run-id>
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid>
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
@@ -145,6 +145,12 @@ uzi version
   mode each message is one JSON object per line (NDJSON), so `--follow` streams.
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
+  `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
+  your Settings default; pass `--wait-on-limit` to make this run park until your
+  Anthropic usage window reopens instead of failing; pass `--wait-on-limit=false`
+  (with the `=`, since a bare bool flag consumes no following word) to force it off
+  for this run only. A parked run holds its issue and its worker's disk until it
+  resumes, so it is opt-in rather than the default.
 - `uzi run approve <run-id>` — approve the plan gate. By default the run uses its
   own default subagent roster. To choose the roster explicitly, pass
   `--agent-source own|repo` (`own` = your template roster, `repo` = the agents

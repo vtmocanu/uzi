@@ -25,7 +25,7 @@ func questionJSON(t *testing.T, id string, qs ...questionItem) []byte {
 	return b
 }
 
-func parkedCtx(t *testing.T, questionID string) (store.GetSlackRunContextRow, []byte) {
+func parkedQuestionCtx(t *testing.T, questionID string) (store.GetSlackRunContextRow, []byte) {
 	t.Helper()
 	rc := baseRun("awaiting_input")
 	return rc, questionJSON(t, questionID, questionItem{
@@ -53,7 +53,7 @@ func contextTexts(blks []slack.Block) string {
 // A run parking at awaiting_input posts the question into its DM thread and records
 // the question's identity on the anchor. The root line must NOT read the raw enum.
 func TestNotifierAwaitingInputPostsQuestionInThread(t *testing.T) {
-	rc, payload := parkedCtx(t, "q-1")
+	rc, payload := parkedQuestionCtx(t, "q-1")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,
 		msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "root1"},
@@ -100,7 +100,7 @@ func TestNotifierAwaitingInputPostsQuestionInThread(t *testing.T) {
 // is still honoured. Advance the ts here and that reply becomes retroactively stale:
 // the user answered correctly, got a ✅, and the run discards it.
 func TestNotifierAwaitingInputRepostSameQuestionIsNoop(t *testing.T) {
-	rc, payload := parkedCtx(t, "q-1")
+	rc, payload := parkedQuestionCtx(t, "q-1")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,
 		msg: store.SlackRunMessage{
@@ -127,7 +127,7 @@ func TestNotifierAwaitingInputRepostSameQuestionIsNoop(t *testing.T) {
 // while every reply stayed unbindable, so the question would sit on screen answerable
 // by nobody.
 func TestNotifierQuestionWithNoTsIsNotRecorded(t *testing.T) {
-	rc, payload := parkedCtx(t, "q-1")
+	rc, payload := parkedQuestionCtx(t, "q-1")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,
 		msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "root1"},
@@ -156,7 +156,7 @@ func (p *tslessPoster) PostBlocks(ctx context.Context, ch, thread, fallback stri
 // A genuinely NEW question (question 2 of the run) carries a new id and does post,
 // which is the control that makes the dedupe above a dedupe rather than a mute.
 func TestNotifierAwaitingInputSecondQuestionPosts(t *testing.T) {
-	rc, payload := parkedCtx(t, "q-2")
+	rc, payload := parkedQuestionCtx(t, "q-2")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,
 		msg: store.SlackRunMessage{
@@ -199,7 +199,7 @@ func TestNotifierAwaitingInputWithNoQuestionYetWaits(t *testing.T) {
 // A failed post must not record the question as delivered, or the retry on the next
 // state event would be deduped away and the question would never reach Slack.
 func TestNotifierQuestionPostFailureIsNotRecorded(t *testing.T) {
-	rc, payload := parkedCtx(t, "q-1")
+	rc, payload := parkedQuestionCtx(t, "q-1")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,
 		msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "root1"},
@@ -217,7 +217,7 @@ func TestNotifierQuestionPostFailureIsNotRecorded(t *testing.T) {
 // A run that is not parked never posts a question card, even with a question message
 // left over from an earlier park — the status is what says "answer me now".
 func TestNotifierNonParkedStatusPostsNoQuestion(t *testing.T) {
-	_, payload := parkedCtx(t, "q-1")
+	_, payload := parkedQuestionCtx(t, "q-1")
 	rc := baseRun("running")
 	fs := &fakeNotifStore{
 		rc: rc, delivery: txt("U123"), question: payload,

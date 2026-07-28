@@ -1043,6 +1043,13 @@ func (f *autoStopSweepStore) SweepIdleChatRuns(context.Context, pgtype.Timestamp
 func (f *autoStopSweepStore) SweepStuckConfirmingProposals(context.Context, pgtype.Timestamptz) ([]uuid.UUID, error) {
 	return nil, nil
 }
+
+// PRD #35's promotion pass. Empty, like the other passes this fixture does not
+// exercise: it is here so Sweep runs end to end, and returning nothing keeps this
+// file's subject (the auto-stop streak) the only thing moving.
+func (f *autoStopSweepStore) PromoteLimitWaitRuns(context.Context, pgtype.Timestamptz) ([]store.PromoteLimitWaitRunsRow, error) {
+	return nil, nil
+}
 func (f *autoStopSweepStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
 	return f.active, nil
 }

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type {
+  AgentSelection,
   AgentSource,
   AgentTemplate,
   AskUserQuestion,
@@ -19,6 +20,7 @@ import type {
 import type { AnswerVerdict, PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
+import { LimitReachedError } from "./limit.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { gitEnv } from "./git.js";
@@ -110,6 +112,31 @@ export interface RunContext {
    *  an amnesiac lead is told to read the existing commits rather than redo them —
    *  the honest degradation must not become silently duplicated work. */
   priorWork?: PriorWork;
+  /** PRD #35 Decision 6b: this run's plan is ALREADY APPROVED and its SDK session is
+   *  resumable here, so the executor skips the Phase-1 planning turn and the gate and
+   *  goes straight to implement⇄review with `approvedPlan` below.
+   *
+   *  Set by the RUNNER, which is the only layer that knows all three facts: the
+   *  server said plan_approved, a session id survived, and issue #105's transcript
+   *  check did not drop it. Without this a park-and-resume re-plans, re-parks the run
+   *  at awaiting_approval in front of a human who already approved, and can fail
+   *  outright with REASON_NO_PLAN when the resumed session declines to re-emit
+   *  signal_plan — the run's own approval turned into a dead end.
+   *
+   *  A park BEFORE approval (only reachable if the planning turn itself died on a
+   *  limit) leaves this false and resumes into planning exactly as today. */
+  planApproved?: boolean;
+  /** The already-approved plan text to seed the implement loop with (PRD #35). Only
+   *  meaningful with `planApproved`; the executor refuses to skip the gate without
+   *  it, because an empty plan would enter implement with no instructions. */
+  approvedPlan?: string;
+  /** The run's persisted subagent selection, replayed on the claim (PRD #35).
+   *
+   *  Used on the pre-approved resume path, where there is no approve_plan verdict to
+   *  carry it. Absent means the run never reached a gate (or the server predates the
+   *  field), and the executor then applies resolveAgentSelection's absent-default —
+   *  which is the CORRECT answer for a gate-less run, not a fallback to tolerate. */
+  approvedSelection?: AgentSelection;
   /** Called once with the SDK session id when first observed (for /state). */
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
@@ -218,6 +245,34 @@ export const STUB_NOT_CODE_SENTINEL = "UZI_STUB_NOT_CODE";
  *  plays for the approval gate. Placed BEFORE the plan gate so it exercises M4's
  *  pre-run park, which is the path that used to hard-fail on REASON_NO_PLAN. */
 export const STUB_ASK_SENTINEL = "UZI_STUB_ASK";
+
+/**
+ * Sentinel that makes the stub die on a simulated Anthropic usage limit (PRD #35),
+ * standing in for a turn whose result frame carried `blocking_limit`. The E2E needs
+ * it because the park path is otherwise unreachable without a real exhausted
+ * subscription — the same reason STUB_INTERLEAVE_SENTINEL exists for multi-agent
+ * streams.
+ *
+ * It fires ONLY on the first attempt, keyed on `ctx.planApproved`. That is what makes
+ * the headline scenario expressible end to end: attempt 1 plans, gates, then parks;
+ * the resume arrives pre-approved, does NOT throw, and completes. A sentinel that
+ * fired every time could only ever prove the park, never the recovery.
+ *
+ * Append `:noreset` to report NO reset time, which drives the server's exponential
+ * fallback schedule instead of the reported-reset path. On a poller-disabled
+ * deployment — which the E2E overlay is, `UZI_USAGE_POLL_INTERVAL: "0"` — that
+ * fallback is the ORDINARY path rather than an edge case, because every gauge row
+ * classifies stale and neither the cross-check nor NextAvailable can contribute.
+ */
+export const STUB_LIMIT_SENTINEL = "UZI_STUB_LIMIT";
+
+/**
+ * How far ahead the stub claims the window reopens. Deliberately small: the server
+ * floors retry_not_before at `now + jitter` (60-180s), so anything under that is
+ * equivalent, and the point is to exercise the REPORTED-RESET branch of the real
+ * computation rather than to control the wait — which the server owns.
+ */
+const STUB_LIMIT_RESET_MS = 5_000;
 
 /**
  * Sentinel that makes the stub emit a scripted INTERLEAVED multi-agent message
@@ -529,60 +584,90 @@ export class StubExecutor implements Executor {
       }
     }
 
+    // PRD #35 Decision 6b, stub half: a resume PAST an approval that already happened
+    // must not ask for it again. Both conditions are required for the same reasons
+    // sdk-executor.ts gives at its own `preApproved`: without the plan text there are
+    // no instructions to implement, and `planApproved` alone does not imply one.
+    //
+    // `ctx.sessionId` is deliberately NOT re-checked here, though SdkExecutor does
+    // check it. The runner already ANDs the claim's plan_approved with a surviving
+    // session id before setting ctx.planApproved (runner.ts), so a run whose
+    // transcript was dropped never reaches this branch; and the stub has no SDK
+    // conversation to resume, so a session id would be a proxy for nothing it uses.
+    //
+    // Without this the stub re-enters ctx.gatePlan on the resumed run and parks it at
+    // awaiting_approval a SECOND time, waiting on a human verdict that the unattended
+    // recovery path has no one left to give — measured 2026-07-28 on the M6 e2e, where
+    // the sweeper-promoted run went limit_wait -> awaiting_approval with
+    // limit_wait_count=1 and sat there until the harness timed out. The class doc above
+    // already claims the gate handling "mirrors SdkExecutor's"; this is what makes that
+    // true, and the M6 e2e asserts the resulting feed line appears exactly once.
+    const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
+
     if (this.opts.planGate && ctx.gatePlan) {
-      const planMd = [
-        isCIFix
-          ? `## Stub CI-fix diagnosis for \`${ctx.branch}\``
-          : `## Stub plan for issue #${ctx.issueIid}`,
-        ``,
-        ...(notCode
-          ? [
-              `VERDICT: not_code`,
-              ``,
-              `The failure is an infra/flaky problem, not a code bug (stub diagnosis).`,
-            ]
-          : [
-              `- write a marker file documenting the run`,
-              `- commit it on \`${ctx.branch}\``,
-            ]),
-        ``,
-        `Generated by the stub executor to drive the plan-approval gate with`,
-        `no live Anthropic session.`,
-      ].join("\n");
-      // Plan gate (+ revision loop, PRD #41). The stub synthesizes plan text instead
-      // of driving a live SDK, so a `revise` verdict appends a version marker to the
-      // canned plan and re-gates it — mirroring sdk-executor.ts's revise loop so the
-      // E2E can assert on the plan_feedback + plan_revising feed contract. The server
-      // enforces PLAN_MAX_REVISIONS at submit time, so the stub needs no local cap; it
-      // stays fail-closed via the post-loop guards (only `approve` reaches implement).
-      let revisedPlan = planMd;
-      let verdict = await ctx.gatePlan(revisedPlan);
-      let round = 0;
-      while (verdict.kind === "revise") {
-        // Record the reviewer's feedback on the feed BEFORE the next gatePlan flushes
-        // the revised plan, so the feed never lags the awaiting_approval re-report —
-        // same ordering as the real executor.
+      if (preApproved) {
         ctx.emit({
-          kind: "plan_feedback",
+          kind: "status",
           agent: "worker",
-          payload: { feedback: verdict.feedback },
+          payload: {
+            text: "resuming an already-approved plan — skipping the planning turn and the approval gate",
+          },
         });
-        round++;
-        ctx.emit({
-          kind: "plan_revising",
-          agent: "worker",
-          payload: { round },
-        });
-        revisedPlan = `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
-        verdict = await ctx.gatePlan(revisedPlan);
+      } else {
+        const planMd = [
+          isCIFix
+            ? `## Stub CI-fix diagnosis for \`${ctx.branch}\``
+            : `## Stub plan for issue #${ctx.issueIid}`,
+          ``,
+          ...(notCode
+            ? [
+                `VERDICT: not_code`,
+                ``,
+                `The failure is an infra/flaky problem, not a code bug (stub diagnosis).`,
+              ]
+            : [
+                `- write a marker file documenting the run`,
+                `- commit it on \`${ctx.branch}\``,
+              ]),
+          ``,
+          `Generated by the stub executor to drive the plan-approval gate with`,
+          `no live Anthropic session.`,
+        ].join("\n");
+        // Plan gate (+ revision loop, PRD #41). The stub synthesizes plan text instead
+        // of driving a live SDK, so a `revise` verdict appends a version marker to the
+        // canned plan and re-gates it — mirroring sdk-executor.ts's revise loop so the
+        // E2E can assert on the plan_feedback + plan_revising feed contract. The server
+        // enforces PLAN_MAX_REVISIONS at submit time, so the stub needs no local cap; it
+        // stays fail-closed via the post-loop guards (only `approve` reaches implement).
+        let revisedPlan = planMd;
+        let verdict = await ctx.gatePlan(revisedPlan);
+        let round = 0;
+        while (verdict.kind === "revise") {
+          // Record the reviewer's feedback on the feed BEFORE the next gatePlan flushes
+          // the revised plan, so the feed never lags the awaiting_approval re-report —
+          // same ordering as the real executor.
+          ctx.emit({
+            kind: "plan_feedback",
+            agent: "worker",
+            payload: { feedback: verdict.feedback },
+          });
+          round++;
+          ctx.emit({
+            kind: "plan_revising",
+            agent: "worker",
+            payload: { round },
+          });
+          revisedPlan = `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
+          verdict = await ctx.gatePlan(revisedPlan);
+        }
+        // Fail closed: only an approve may proceed to implement. revise exits the loop
+        // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a
+        // future PlanVerdict variant is added, these lines stop type-checking, forcing it
+        // to be handled rather than silently falling through to an unapproved plan.
+        if (verdict.kind === "reject")
+          throw new PlanRejectedError(verdict.reason);
+        if (verdict.kind === "cancel") throw new Error("run cancelled");
       }
-      if (verdict.kind === "reject")
-        throw new PlanRejectedError(verdict.reason);
-      if (verdict.kind === "cancel") throw new Error("run cancelled");
-      // Fail closed: only an approve may proceed to implement. revise exits the loop
-      // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a
-      // future PlanVerdict variant is added, this line stops type-checking, forcing it to
-      // be handled rather than silently falling through to implementing an unapproved plan.
       if (notCode) {
         ctx.emit({
           kind: "status",
@@ -608,6 +693,36 @@ export class StubExecutor implements Executor {
       throw new Error(
         `stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`,
       );
+    }
+
+    // PRD #35 E2E hook: die on a simulated usage limit, but only on the FIRST
+    // attempt. `planApproved` is the discriminator because it is exactly what the
+    // server sets once a human approved and the run is resuming — so the resume runs
+    // straight through and completes, which is the whole point of the scenario.
+    const limitText = `${ctx.issueDescription}\n${ctx.issueTitle}`;
+    if (limitText.includes(STUB_LIMIT_SENTINEL) && !ctx.planApproved) {
+      const noReset = limitText.includes(`${STUB_LIMIT_SENTINEL}:noreset`);
+      // Report a synthetic SDK session id, standing in for the live session exactly
+      // as the stub already stands in for usage frames and interleaved streams.
+      // Without it runs.session_id stays NULL, the resumed run has no session,
+      // plan_approved is unusable, and every resume goes back through the plan gate —
+      // so the gate-skip path would be untestable under the stub.
+      //
+      // Reported HERE rather than at the top of run(), deliberately: onSessionId
+      // triggers an extra `running` state report, and doing it unconditionally
+      // changed the observable report sequence of EVERY stub run (three existing
+      // tests pinned the old sequence and went red). Scoped to the sentinel, an
+      // ordinary stub run is byte-identical to before.
+      //
+      // Derived from the run id so it is stable across a resume of the SAME run.
+      ctx.onSessionId?.(`stub-session-${ctx.runId}`);
+      throw new LimitReachedError({
+        rateLimitType: "five_hour",
+        // Omitted for :noreset, which is what sends the server down its exponential
+        // fallback rather than the reported-reset branch.
+        resetsAtMs: noReset ? undefined : Date.now() + STUB_LIMIT_RESET_MS,
+        detail: "stub sentinel",
+      });
     }
 
     // PRD #43 M5: emit a scripted interleaved multi-agent stream so the E2E can
