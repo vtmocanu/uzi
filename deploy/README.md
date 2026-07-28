@@ -80,12 +80,41 @@ Cutting a release is three steps; only the tag push publishes anything.
    kaniko-builds + pushes both images (`:<tag>` + `:<short-sha>`) and
    `helm package` + `helm push`es the OCI chart, all at that version.
 
-   > **Tag a commit already merged to `main`.** Its default-branch pipeline
-   > already ran a protected-ref build that **warmed the Harbor layer cache**, so
-   > the tag pipeline's builds are mostly cache hits. Tagging a commit whose
-   > default-branch build has not run yet just means a **cold cache** — slower
-   > publish, not a failure. (MR pipelines build cache-less by design — Decision
-   > 2 — so only the merge-to-`main` build warms the cache.)
+   > **Tag a commit already merged to `main`, and never one carrying a
+   > skip-CI marker.** Its default-branch pipeline already ran a
+   > protected-ref build that **warmed the Harbor layer cache**, so the tag
+   > pipeline's builds are mostly cache hits. Tagging a commit whose
+   > default-branch build has not run yet just means a **cold cache**: slower
+   > publish, not a failure. (MR pipelines build cache-less by design,
+   > Decision 2, so only the merge-to-`main` build warms the cache.)
+   >
+   > **A skip-CI commit is not a cache problem, it is no publish at all.**
+   > GitLab skips pipelines for a commit whose message carries a marker like
+   > `[skip ci]` or `[ci skip]` (at least; any capitalization, matched
+   > anywhere in the message including the body, not just the subject
+   > line). That reaches the tag pipeline too: it is push-triggered the
+   > same as the branch pipeline for that commit, so both get skipped
+   > together.
+   >
+   > This is easy to miss because every signal still looks fine: `git push
+   > origin v0.1.0` reports `* [new tag]` exactly like a healthy push, and
+   > nothing errors anywhere. Even the instrument meant to catch it needs
+   > care: right after pushing the tag you are still standing on `main`, so
+   > a bare `glab ci status` reports `main`'s own pipeline, not the tag's,
+   > and it too reads `skipped` (same commit, same marker), the right word
+   > for the wrong ref with no way to tell them apart. Check `glab ci
+   > status --branch v0.1.0` instead, but that only confirms a pipeline
+   > exists for the tag and what it reports; a pipeline can run and still
+   > fail a publish job partway through, so it cannot tell you the images
+   > and chart actually landed in Harbor. Check both, in order: the scoped
+   > status tells you whether a pipeline ran at all, the images and chart
+   > in Harbor tell you whether it published.
+   >
+   > If it happens, do not move the tag. A skip-CI marker suppresses only
+   > push-triggered pipelines; a manually created one runs regardless:
+   > `glab ci run --branch v0.1.0` (`--branch` takes any ref, a tag
+   > included, despite the name) recovers the release with the tag left in
+   > place.
 
 3. **Point ArgoCD at the new version (a second MR, to `argo-apps`).**
    Bump `targetRevision` in `apps/uzi/app.uzi.yaml` to the new chart version, MR
