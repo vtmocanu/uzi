@@ -6275,10 +6275,12 @@ M6):
   (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
   slower publish, not a failure) and `assert-version` (§246) holds. Rollback = revert the argo
   `targetRevision` MR. **Corrected 2026-07-28 (issue #178): "cold cache" is not the only way this
-  step can go wrong.** Tagging a commit whose message contains `[skip ci]` skips the tag pipeline
-  entirely, not just its cache warmth, and publishes nothing while `git push` still reports success.
-  `deploy/README.md` now warns against it separately; recover with `glab ci run --branch <tag>`
-  rather than moving the tag.
+  step can go wrong.** Tagging a commit whose message carries a skip-CI marker (`[skip ci]`,
+  `[ci skip]`, at least, any capitalization, anywhere in the message) skips the tag pipeline
+  entirely, not just its cache warmth, and publishes nothing while `git push` still reports
+  success and a bare `glab ci status` right after the push reports `main`'s pipeline, not the
+  tag's. `deploy/README.md` now warns against it separately; recover with `glab ci run --branch
+  <tag>` rather than moving the tag.
 
 ## 251. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
 

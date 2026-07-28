@@ -8,12 +8,15 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Fixed
 
-- **The release runbook no longer describes a `[skip ci]` commit as merely a cold-cache
-  slowdown.** GitLab applies `[skip ci]` to the commit, not the ref, so tagging one skips
-  the tag pipeline too and publishes nothing, while `git push` and `glab ci status` both
-  still look healthy. `deploy/README.md` now calls this out separately from the cache
-  note it used to be folded into, and covers the recovery: trigger the pipeline manually
-  with `glab ci run --branch <tag>` rather than moving the tag (issue #178).
+- **The release runbook no longer describes a skip-CI commit as merely a cold-cache
+  slowdown.** GitLab applies a skip-CI marker (`[skip ci]`, `[ci skip]`, at least, any
+  capitalization, anywhere in the message) to the commit, not the ref, so tagging one
+  skips the tag pipeline too and publishes nothing, while `git push` still reports
+  success and a bare `glab ci status` right after the push reports `main`'s pipeline,
+  not the tag's. `deploy/README.md` now calls this out separately from the cache note
+  it used to be folded into, names `glab ci status --branch <tag>` as the check that
+  actually looks at the right ref, and covers the recovery: trigger the pipeline
+  manually with `glab ci run --branch <tag>` rather than moving the tag (issue #178).
 
 ## [0.12.0] - 2026-07-28
 

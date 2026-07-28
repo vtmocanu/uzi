@@ -80,25 +80,34 @@ Cutting a release is three steps; only the tag push publishes anything.
    kaniko-builds + pushes both images (`:<tag>` + `:<short-sha>`) and
    `helm package` + `helm push`es the OCI chart, all at that version.
 
-   > **Tag a commit already merged to `main`, and never one whose message
-   > contains `[skip ci]`.** Its default-branch pipeline already ran a
+   > **Tag a commit already merged to `main`, and never one carrying a
+   > skip-CI marker.** Its default-branch pipeline already ran a
    > protected-ref build that **warmed the Harbor layer cache**, so the tag
    > pipeline's builds are mostly cache hits. Tagging a commit whose
    > default-branch build has not run yet just means a **cold cache**: slower
    > publish, not a failure. (MR pipelines build cache-less by design,
    > Decision 2, so only the merge-to-`main` build warms the cache.)
    >
-   > **A `[skip ci]` commit is not a cache problem, it is no publish at all.**
-   > GitLab applies `[skip ci]` to the commit, not the ref, so the tag
-   > pipeline is skipped along with the push-triggered one. This is easy to
-   > miss because every signal still looks fine: `git push origin v0.1.0`
-   > reports `* [new tag]` exactly like a healthy push, `glab ci status` says
-   > `skipped` (which reads as a deliberate skip, not a broken release), and
-   > nothing errors anywhere. The only way to catch it is to check afterward
-   > for the images and chart that should have been published, not to trust
-   > the push output.
+   > **A skip-CI commit is not a cache problem, it is no publish at all.**
+   > GitLab skips pipelines for a commit whose message carries a marker like
+   > `[skip ci]` or `[ci skip]` (at least; any capitalization, matched
+   > anywhere in the message including the body, not just the subject
+   > line). That reaches the tag pipeline too: it is push-triggered the
+   > same as the branch pipeline for that commit, so both get skipped
+   > together.
    >
-   > If it happens, do not move the tag. `[skip ci]` suppresses only
+   > This is easy to miss because every signal still looks fine: `git push
+   > origin v0.1.0` reports `* [new tag]` exactly like a healthy push, and
+   > nothing errors anywhere. Even the instrument meant to catch it needs
+   > care: right after pushing the tag you are still standing on `main`, so
+   > a bare `glab ci status` reports `main`'s own pipeline, not the tag's,
+   > and it too reads `skipped` (same commit, same marker), the right word
+   > for the wrong ref with no way to tell them apart. Check `glab ci
+   > status --branch v0.1.0` specifically. The only reliable check is to
+   > look afterward for the images and chart that should have published,
+   > not to trust the push output or an unscoped status.
+   >
+   > If it happens, do not move the tag. A skip-CI marker suppresses only
    > push-triggered pipelines; a manually created one runs regardless:
    > `glab ci run --branch v0.1.0` recovers the release with the tag left in
    > place.
