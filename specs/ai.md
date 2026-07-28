@@ -404,8 +404,8 @@ Serves human: "kept in sync two-way between uzi and GitLab".
   is shared by handlers and the poller (`IncrementalSync`/`FullSync` against a
   narrow `IssueStore` interface, unit-tested with a fake store + mocked `Forge`).
 - **Incremental pull** (`api/internal/poller.Engine`, one background goroutine):
-  per enabled repo, `ListIssues(labels=PRD, state=all, updated_after=HWM)` each
-  `FORGE_POLL_INTERVAL` (default 60s). **HWM = max `updated_at` returned by the
+  per enabled repo, `ListIssues(labels=PRD, state=all, updated_after=<PRD mark>)` each
+  `FORGE_POLL_INTERVAL` (default 60s). **A mark = max `updated_at` returned by the
   forge**, never the client clock (skew would drop updates); GitLab's
   `updated_after` is inclusive at second granularity, so boundary rows re-fetch and
   dedupe by upsert.
@@ -417,8 +417,12 @@ Serves human: "kept in sync two-way between uzi and GitLab".
   `POST /api/repos/:id/sync` and the Refresh button run the same full sync.
 - **Since PRD #102 M6 both paths issue TWO fetches**, not one: the PRD-labelled
   one above plus an additive `state=opened`, no-label one, with the keep-set the
-  union and the HWM the *minimum* of the two. Both paths fail closed. See §444 —
-  it changes the eviction and HWM rules stated in this section.
+  *union* of the two. Both paths fail closed. See §444 — it changes the eviction
+  rule stated in this section.
+- **Each fetch carries its OWN mark** (`forgesvc.Marks{PRD, Open}`, issue #177);
+  the two are never combined, each advances only on its own fetch's evidence, and
+  each lower bound is guarded independently. See §447, which supersedes the
+  single-shared-mark rule M6 shipped.
 - **Push is forge-first**: a move calls `UpdateIssueLabels` before touching the
   cache and updates the cache only on success — a failed forge write leaves the
   card put (**snap-back**), never an optimistic divergence. Conflicts resolve
@@ -449,8 +453,9 @@ Serves human: best-practice (protect the upstream forge; abuse resistance).
 - **Poller bounding**: per-tick **bounded concurrency of 4**
   (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** clamped to one poll
   interval, so a slow forge can't let ticks pile up. In-memory per-repo state
-  (`hwm`, poll count) — a disabled repo drops out; a re-enabled one restarts with a
-  fresh full reconcile.
+  (`marks forgesvc.Marks` — one high-water mark per fetch, §447 — plus poll count)
+  — a disabled repo drops out; a re-enabled one restarts with a fresh full
+  reconcile.
 
 ## 24. Startup admin seed
 
@@ -2178,7 +2183,7 @@ manual refresh.
   on a **cap-1 buffered** `forceReconcile chan struct{}`, handled in the Run
   goroutine's `select` (same goroutine that runs a tick, so the per-repo state reset
   needs no lock). The reset zeroes every enabled repo's `pollCount`; the next tick
-  full-syncs all of them (FullSync ignores the HWM, so leaving it intact is fine).
+  full-syncs all of them (FullSync takes no marks, so leaving them intact is fine).
 - **The PUT returns after signalling** — it does not block on the sync itself, which
   needs each connection's decrypted PAT and belongs in the poller. **Coalescing**: a
   burst of PUTs collapses to a single pending reconcile (cap-1 + non-blocking send).
@@ -14376,7 +14381,7 @@ order of every non-closed card, then applies the move** — freeze, then move.
   `onCardDragOver` calls `preventDefault()` before its self early-return, so the
   browser permits the drop.
 
-## 444. PRD #102 M6 — the additive fetch: a second request, a union that fails closed, and an HWM that takes the MINIMUM
+## 444. PRD #102 M6 — the additive fetch: a second request, a union that fails closed, and a shared HWM that took the MINIMUM (the HWM half is SUPERSEDED by §447)
 
 Serves `specs/human.md` (user, 2026-07-20): the board may DISPLAY open issues
 without the `PRD` label, opt-in and off by default.
@@ -14422,27 +14427,36 @@ without the `PRD` label, opt-in and off by default.
   fails, nothing is deleted and the whole sync returns an error — there is
   deliberately no "the extra fetch is best-effort, log and continue" path. This is
   the highest-risk change in the PRD.
-- **The shared high-water-mark takes the MINIMUM of the two fetches, never the
-  maximum.** The poller holds one `hwm` per repo and both paths feed it. The fetches
-  are separate round trips: the PRD fetch observes the forge at tA, the open fetch at
-  a later tB, so everything the *pair* is known to have seen is bounded by tA. A PRD
-  issue updated in (tA, tB) appears in neither result — too late for the first fetch,
-  discarded from the second — so a mark taken from the later fetch steps over an
-  update nobody observed and the row sits stale until the next reconcile. The zero
-  cases are **not symmetric**, and the asymmetry is the fetch order: `openMax` zero
-  constrains nothing (the open fetch ran second), while `prdMax` zero is the pre-M6
-  "nothing to advance to" case and preserves the caller's existing mark.
-  - **That second case carries a standing cost, knowingly unfixed.** A repo with open
-    issues but NO PRD issues has `prdMax` zero on every pass, so its mark never
-    advances and every `IncrementalSync` re-reads from the same bound — now paying
-    **two** unbounded fetches per poll rather than one. Correctness is unaffected
-    (upserts are idempotent; the window only re-covers covered ground) and the pre-M6
-    code had the identical no-advance behaviour on the PRD fetch, so M6 doubles the
-    traffic rather than introducing the defect. Not fixed because every fix is worse:
-    advancing on `openMax` alone is the unsound case above, and a per-path mark is a
-    wider change to the poller's state than this milestone should carry. It is the
-    same unboundedness the PRD's "M6 scale" open question names and wants the same
-    answer — a cap or a per-repo opt-in.
+- **M6 shipped ONE shared high-water mark, and a shared mark had to take the
+  MINIMUM of the two fetches, never the maximum.** *(SUPERSEDED 2026-07-28 by §447,
+  issue #177: there is no shared mark any more — `forgesvc.Marks` carries one per
+  fetch and the two are never combined. Kept, in past tense, rather than deleted,
+  because the reasoning below is exactly what makes folding the two marks back into
+  one look like a simplification when it is not; §447 records why `min()` is
+  dissolved by the split rather than lost in it.)* The poller held one `hwm` per
+  repo and both paths fed it. The fetches are separate round trips: the PRD fetch
+  observes the forge at tA, the open fetch at a later tB, so everything the *pair*
+  is known to have seen is bounded by tA. A PRD issue updated in (tA, tB) appears in
+  neither result — too late for the first fetch, discarded from the second — so a
+  shared mark taken from the later fetch steps over an update nobody observed and
+  the row sits stale until the next reconcile. The zero cases were **not
+  symmetric**, and the asymmetry was the fetch order: `openMax` zero constrained
+  nothing (the open fetch ran second), while `prdMax` zero was the pre-M6 "nothing
+  to advance to" case and preserved the caller's existing mark.
+  - **That second case carried a standing cost, knowingly unfixed at M6 and FIXED by
+    issue #177 (§447).** A repo with open issues but NO PRD issues had `prdMax` zero
+    on every pass, so its mark never advanced and every `IncrementalSync` re-read
+    from the same bound — paying **two** unbounded fetches per poll rather than one.
+    Correctness was unaffected (upserts are idempotent; the window only re-covers
+    covered ground) and the pre-M6 code had the identical no-advance behaviour on the
+    PRD fetch, so M6 doubled the traffic rather than introducing the defect. M6 left
+    it because every fix available *within a shared mark* was worse: advancing on
+    `openMax` alone is the unsound case above, and a per-path mark was judged a wider
+    change to the poller's state than that milestone should carry. That judgement is
+    what #177 revisited and reversed — the per-path mark turned out to need no
+    migration at all, since the mark was only ever in-memory. **The "M6 scale" open
+    question is only half-answered**: the stall is gone, but the *unbounded fetch*
+    remains, and a `FullSync` cap is deliberately still not shipped (§447).
 - **A soft-fail would have been worse than losing one fetch's rows**: returning nil
   with an advanced mark makes the next `IncrementalSync` permanently skip the failed
   path's window until the next full reconcile — roughly ten minutes at shipped
@@ -14596,3 +14610,105 @@ because of that, and none of them said so out loud except one SQL comment.
     cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
+
+## 447. Issue #177 — one high-water mark PER FETCH: what the shared mark cost, and why `min()` is dissolved rather than lost
+
+Serves human: "kept in two-way sync between uzi and GitLab" (`specs/human.md`,
+Feature #2) — the mark is what keeps the incremental tier of that sync bounded.
+Supersedes the HWM half of §444; the eviction/union half of §444 is untouched.
+
+- **The defect was a permanent STALL, not a skew.** The old `advanceHWM` returned
+  `prdMax` whenever *either* input was zero. A repo with open issues but no
+  PRD-labelled ones has `prdMax` zero on every pass, so its mark never advanced at
+  all and every `IncrementalSync` re-read the whole open set from the beginning,
+  forever. Pre-existing in shape, but PRD #102 M6 changed both the cost (two list
+  calls, the additive one unbounded) and the *reachability*, since M6 is precisely
+  what makes a board useful for a repo with no PRD issues yet. §444 named this cost
+  and priced it as knowingly-unfixed; this is the fix.
+- **One mark per fetch: `forgesvc.Marks{PRD, Open}`.** `PRD` bounds the PRD-labelled
+  fetch (`state=all`); `Open` bounds the additive open, no-label fetch. Each advances
+  only on its OWN fetch's evidence, to the max forge `updated_at` over that fetch's
+  raw result, and never backwards (`Marks.Advance` folds field-wise, keeping the
+  later of each). An empty result carries no evidence and leaves its mark exactly
+  where it was. Combining ACROSS the fields is the one thing the type exists to stop.
+  `advanceHWM` is deleted rather than re-signatured: with separate marks there is
+  nothing to combine.
+- **The invariant is "never past the instant its fetch OBSERVED", which is NOT "never
+  past that fetch's max".** A mark routinely sits above the max of the batch in front
+  of it — that is what monotonicity means, and a fetch returning only older rows must
+  not drag a mark down. What must never happen is a mark exceeding the read instant,
+  because that is what skips a window.
+- **`min()` is DISSOLVED, not lost — this is the paragraph that stops the next reader
+  folding the two fields back into one.** The fetches are separate round trips: the
+  PRD fetch observes the forge at tA, the open fetch at a later tB. A *shared* mark
+  had to take the minimum, because a PRD-labelled issue updated in (tA, tB) appears
+  in neither result (too late for the first fetch, dropped from the second), so a
+  shared mark taken from the later fetch steps straight over an update nobody
+  observed. Per-fetch, `prdMax <= tA` and `openMax <= tB` each hold on their own: the
+  PRD mark stays bounded by tA, so the next PRD fetch still returns that issue, and
+  the Open mark advancing to `openMax` skips nothing IT owns, because any open issue
+  updated before tB was in that fetch. `min()` existed only because the open fetch's
+  later evidence could push the SHARED mark past tA. With a mark per fetch it has
+  nothing left to protect.
+- **Two INDEPENDENT zero-guards, one per lower bound.** A zero mark sends no
+  `updated_after` on its own fetch and leaves the other's bound alone. A single
+  shared guard would drop BOTH bounds the moment either mark was zero, which is the
+  unbounded re-read above wearing a different hat.
+- **Both marks derive from the RAW fetch result, never from the write path, and the
+  symmetry is load-bearing rather than tidy.** `upsertIssues` substitutes
+  `time.Now()` for a zero `UpdatedAt` because `issues.forge_updated_at` is `NOT
+  NULL`, so a mark read off what was WRITTEN jumps to wall-clock now for any issue
+  the forge reports without an `updated_at` — later than the instant its fetch
+  observed, the one thing a mark must never be. The shared `min()` usually masked
+  that by clamping against the other fetch's max; per-fetch marks have nothing to
+  clamp against, so the exposure would be complete. Reading the raw result errs the
+  safe way instead: a mark that stays too small re-reads, it never skips.
+  `upsertIssues` therefore returns an `error` only, and no mark may be re-derived
+  from it. **Consequence worth recording because it inverts a driver comment nobody
+  would re-check**: both drivers map a nil `UpdatedAt` to the zero time on the stated
+  belief that "the sync engine treats it as no HWM advance" — false for the PRD path
+  before this change, and true only *because* of it.
+- **The raw result is read BEFORE `withoutLabel` drops the PRD-labelled rows.** The
+  value bounds *when the forge was read*, and a row that was read and then discarded
+  witnesses that reading just as well as one that was kept.
+- **Fail-closed is unchanged and stays strict.** On either fetch's error NEITHER mark
+  advances and the caller's pair comes back untouched — not just the failed path's.
+  Both fetches complete before any upsert runs, so a half-failure means neither
+  path's rows were written, and advancing the successful path's mark would skip a
+  window whose rows never reached the cache. `FullSync` takes no marks at all and
+  returns the pair it OBSERVED, the zero pair on any error, which folds in as a
+  no-op.
+- **Nothing to migrate; the mark was never persisted.** The pair lives only in
+  `poller.repoState`, which is process-local. A restart empties the map, `pollCount`
+  is 0, and the first tick reconciles via `FullSync`, which seeds both marks from its
+  own result. This is what made the change cheap enough to reverse M6's "wider change
+  than this milestone should carry" judgement.
+- **NARROWING, seen and priced (auditor advisory, Low).** A forge-supplied
+  FUTURE-dated `updated_at` now pins its own mark forward; the old shared `min()`
+  incidentally clamped such a value against the other path's max. Not a regression in
+  kind — the soundness argument always assumed `updated_at <= the read instant`, and
+  a forge violating that broke the old mark too, just less visibly. It is bounded by
+  the reconcile re-seed (`FORGE_RECONCILE_EVERY` × `FORGE_POLL_INTERVAL`, roughly ten
+  minutes at shipped defaults). Eviction is unaffected: the keep-set is built from
+  what the fetches returned and never from a mark.
+- **The M6-scale `FullSync` cap was deliberately EXCLUDED, and the reason is
+  structural, not scheduling.** `FullSync`'s keep-set drives `DeleteIssuesNotIn`, so
+  a capped fetch yields a partial keep-set and evicts every row past the cap. A cap
+  is therefore not a smaller version of this change; it is a different design that
+  must bound the fetch and the eviction together. Recording the exclusion because an
+  unstated one reads as an oversight, and the next person to reach for a cap needs
+  the eviction coupling before they start.
+- **UNVERIFIED ASSUMPTION, recorded as one rather than asserted: that GitLab and
+  Forgejo bump an issue's `updated_at` when a label is added or removed.** The
+  per-mark label-transition argument in the `Marks` doc rests on it, and as of
+  2026-07-28 it had been checked against neither forge's documentation (a
+  verification was in flight when this section was written). If it is FALSE the
+  design has a real problem — a de-labelled issue would enter neither fetch's
+  incremental window and would wait for the reconcile tier. Do not promote this to a
+  fact without a citation; a spec asserting it would be the artifact that hides the
+  problem.
+- **A test that passes ONE value to both marks certifies a single-mark
+  implementation.** A constraint on any rebuild, not test narration: fixtures must
+  use `prdMax != openMax` and caller pairs with `PRD != Open`, and must assert BOTH
+  returned fields. Without that, nothing distinguishes per-fetch marks from the old
+  shared `min`, from a naive shared `max`, or from one mark under a two-field name.
