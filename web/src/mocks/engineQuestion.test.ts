@@ -198,6 +198,62 @@ describe("mock engine: revise_plan no longer falls through (PRD #41, fixed with 
   });
 });
 
+describe("the board card follows the run it names", () => {
+  // 🔴 MEASURED IN THE BROWSER: the attention strip read "1 run needs an answer" while
+  // the card it linked to was badged "awaiting approval". The strip comes from listRuns
+  // (live); the card came from the board fixture, frozen at seed. A self-contradicting
+  // demo is its own defect, and it also meant the awaiting_input CARD was un-driven —
+  // no fixture seeds that status, so nothing but this sync can produce it.
+  //
+  // Not PRD #88-specific: every scripted status transition has been invisible on the
+  // board since the mock was written. The clarification park is just the first one whose
+  // two renderings were on screen together to disagree out loud.
+  function cardFor(runId: string) {
+    for (const board of state.boards.values()) {
+      const card = board.cards.find((c) => c.latest_run?.id === runId);
+      if (card) return card;
+    }
+    return undefined;
+  }
+
+  it("moves the card's badge with the run through the whole journey", () => {
+    expect(cardFor(RUN_ID)).toBeDefined();
+    handleInput(RUN_ID, "approve_plan", "");
+    drain();
+    expect(state.runs.get(RUN_ID)!.status).toBe("awaiting_input");
+    expect(cardFor(RUN_ID)!.latest_run!.status).toBe("awaiting_input");
+
+    const open = latestQuestion()!;
+    handleInput(RUN_ID, "answer", encodeAnswerBody(open.questionId, open.questions.map(() => "ok")));
+    expect(cardFor(RUN_ID)!.latest_run!.status).toBe("running");
+  });
+
+  it("carries the stop signal too, so a cancelled card reads 'stopped' not 'failed'", () => {
+    // stop_kind is what isStoppedRun keys on. Syncing status without it would badge a
+    // cancelled run as breakage on the board while the run view calls it stopped — the
+    // same class of contradiction one field over.
+    handleInput(RUN_ID, "cancel", "");
+    const run = state.runs.get(RUN_ID)!;
+    const card = cardFor(RUN_ID)!.latest_run!;
+    expect(card.status).toBe(run.status);
+    expect(card.stop_kind).toBe("cancelled");
+  });
+
+  it("does NOT clobber the card-only projection fields", () => {
+    // LatestRun is a projection, not a subset of Run: run_count/is_mine/owner_name are
+    // computed for the card and a run patch must leave them alone. A wholesale spread
+    // would have quietly emptied them.
+    const before = { ...cardFor(RUN_ID)!.latest_run! };
+    handleInput(RUN_ID, "approve_plan", "");
+    drain();
+    const after = cardFor(RUN_ID)!.latest_run!;
+    expect(after.id).toBe(before.id);
+    expect(after.run_count).toBe(before.run_count);
+    expect(after.is_mine).toBe(before.is_mine);
+    expect(after.owner_name).toBe(before.owner_name);
+  });
+});
+
 describe("the question fixture DISCRIMINATES (D-N)", () => {
   // A count assertion over the shapes, so a case silently dropped from the script fails
   // here. Snapshotting the demo instead would lock in whatever blind spot it has.

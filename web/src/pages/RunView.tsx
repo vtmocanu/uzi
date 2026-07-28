@@ -185,6 +185,28 @@ export function RunView() {
   // web, Slack and the CLI all read the same rule off the same messages.
   const openQuestion = useMemo(() => deriveOpenQuestion(messages), [messages]);
 
+  // A parked run is announced to assistive tech. Measured in the browser: without this a
+  // screen-reader user reading the feed gets NO signal that the run stopped and is now
+  // waiting on them — it just goes quiet until the 24h deadline fails it.
+  //
+  // The region is rendered UNCONDITIONALLY below and only its CONTENT changes here. That
+  // is the whole fix and it is not the obvious shape: a region created in the same tick
+  // as its first message is typically silent, because assistive tech announces CHANGES to
+  // a region that already existed. Board.tsx's S5 note records this and calls it "the
+  // worst kind of accessibility bug: the markup looks right". Putting role="status" on
+  // the QuestionPanel itself — which mounts with the park — would have been exactly that.
+  const [parkAnnounce, setParkAnnounce] = useState("");
+  const parked = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  useEffect(() => {
+    // Keyed on the question IDENTITY, so a second question re-announces while a re-render
+    // of the same park stays quiet.
+    if (parked === "") {
+      setParkAnnounce("");
+      return;
+    }
+    setParkAnnounce("The agent is asking you a question. The run is parked until you answer.");
+  }, [parked]);
+
   if (!run) {
     return (
       <div className="space-y-4">
@@ -302,6 +324,15 @@ export function RunView() {
           </div>
         }
       />
+
+      {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
+          parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
+          because the panel below already carries the message for everyone else. The
+          effect fires after mount, so the region exists before its content changes even
+          on a page load that arrives at an already-parked run. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {parkAnnounce}
+      </div>
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}

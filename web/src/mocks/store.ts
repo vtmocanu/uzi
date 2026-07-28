@@ -130,11 +130,54 @@ export function appendMessage(
   return msg;
 }
 
+// The LatestRun fields a board card MIRRORS from the run row. Enumerated rather than
+// spread wholesale because LatestRun is a projection, not a subset: it carries derived
+// fields (run_count, is_mine, owner_name, worker_name) that a run patch must never
+// clobber, and Run carries a great deal a card has no business holding.
+const CARD_MIRRORED_FIELDS = [
+  "status",
+  "mr_iid",
+  "mr_web_url",
+  "mr_state",
+  "failure_reason",
+  "stop_kind",
+  "health",
+  "health_reason",
+  "health_since",
+] as const;
+
+// syncCards propagates a run patch onto any board card whose latest_run IS this run.
+//
+// 🔴 WITHOUT THIS THE DEMO CONTRADICTS ITSELF, measured in the browser: the board's
+// attention strip read "1 run needs an answer" while the very card it linked to was
+// badged "awaiting approval", because the strip comes from listRuns (live) and the card
+// from the board fixture (frozen at seed). Not specific to PRD #88 — every scripted
+// status transition has been invisible on the board since the mock was written; the
+// clarification park is just the first one whose strip and card were on screen together
+// to disagree out loud.
+//
+// It also makes the awaiting_input CARD reachable at all. The badge, the warn ring and
+// needsHumanAttention are product code with unit tests, but the surface was un-driven
+// end to end: no fixture seeds that status, so nothing but this sync can produce it.
+function syncCards(runId: string, patch: Partial<Run>): void {
+  for (const board of state.boards.values()) {
+    for (const card of board.cards) {
+      if (card.latest_run?.id !== runId) continue;
+      const merged = { ...card.latest_run, updated_at: new Date().toISOString() };
+      for (const key of CARD_MIRRORED_FIELDS) {
+        if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
+      }
+      card.latest_run = merged;
+    }
+  }
+}
+
 export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
   const run = state.runs.get(runId);
   if (!run) return undefined;
   const next = { ...run, ...patch, updated_at: new Date().toISOString() };
   state.runs.set(runId, next);
+  syncCards(runId, patch);
   if (patch.status && patch.status !== run.status) {
     broadcast(runId, { type: "state", status: patch.status as RunStatus });
   }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button, Textarea, cx } from "./ui";
 import { Markdown } from "./Markdown";
 import { answersReady, composeAnswer, encodeAnswerBody, type OpenQuestion } from "../lib/runQuestion";
@@ -57,6 +57,27 @@ export function QuestionPanel({
   // multiSelect question and a single-select one share one state shape.
   const [picked, setPicked] = useState<Set<string>>(() => new Set());
   const [texts, setTexts] = useState<string[]>(() => question.questions.map(() => ""));
+  const hintId = useId();
+  // Located by querySelector off a stable container ref rather than by a direct ref: the
+  // `ui` Textarea is a plain (non-forwardRef) component. RunView's DispositionControls
+  // solves the same problem the same way for the same reason — changing a shared
+  // primitive to buy one focus call would be the larger edit.
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  // MEASURED (web-ux, browser): when the panel appears, focus is left on <body> and the
+  // first answer box is tab stop 25 of 40, behind the whole sidebar, with no skip link.
+  // The run is parked on this control, so a keyboard user is made to Tab ~26 times to
+  // reach the one thing the app says is blocking.
+  //
+  // Moving focus on mount is normally the wrong instinct, and RunEvent's ToolResultBody
+  // deliberately does NOT do it ("never on the error auto-expand, which would steal focus
+  // as the feed renders"). The distinction is that a feed row appearing is incidental to
+  // what the user is doing, whereas this panel appearing IS the app stopping and asking.
+  // Keyed on questionId so a second park re-focuses: the panel unmounts and remounts
+  // between questions, but keying on the id survives a future change that reuses it.
+  useEffect(() => {
+    bodyRef.current?.querySelector("textarea")?.focus();
+  }, [question.questionId]);
 
   const toggle = (qIndex: number, oIndex: number, multi: boolean) => {
     const key = selectionKey(qIndex, oIndex);
@@ -106,8 +127,11 @@ export function QuestionPanel({
             )}
           </h2>
           <p className="text-xs text-muted">
-            The agent stopped to ask{multiple ? ` ${question.questions.length} questions` : ""} — the run is
-            parked until you answer.
+            {/* `multiple` used to gate the whole phrase, so a SINGLE-question park — the
+                modal case in production — read "The agent stopped to ask — the run is
+                parked". The count is the variable part; the noun is not. */}
+            The agent stopped to ask{multiple ? ` ${question.questions.length} questions` : " a question"} —
+            the run is parked until you answer.
           </p>
         </div>
         {onCancel && (
@@ -117,7 +141,7 @@ export function QuestionPanel({
         )}
       </div>
 
-      <div className="space-y-4 p-4">
+      <div ref={bodyRef} className="space-y-4 p-4">
         {question.questions.map((q, qi) => (
           <div key={qi} className="space-y-2">
             {q.header.trim() !== "" && (
@@ -131,7 +155,18 @@ export function QuestionPanel({
 
             {q.options.length > 0 && (
               <div className="space-y-1.5">
-                <div className="flex flex-wrap gap-1.5">
+                {/* MEASURED (web-ux): with the chips in a bare <div>, question 2's chips
+                    sit between "Answer to question 1" and "Answer to question 2" in tab
+                    order and read as belonging to question 1 — the visual grouping was
+                    carried entirely by CSS. The group names itself after its question, and
+                    aria-describedby carries the single-vs-multi rule programmatically
+                    rather than leaving it in a <p> nothing points at. */}
+                <div
+                  role="group"
+                  aria-label={q.header.trim() !== "" ? q.header : `Options for question ${qi + 1}`}
+                  aria-describedby={`${hintId}-${qi}`}
+                  className="flex flex-wrap gap-1.5"
+                >
                   {q.options.map((o, oi) => {
                     const on = picked.has(selectionKey(qi, oi));
                     return (
@@ -154,13 +189,16 @@ export function QuestionPanel({
                       >
                         <span className="font-medium">{o.label}</span>
                         {o.description.trim() !== "" && (
-                          <span className="ml-1.5 text-faint">— {o.description}</span>
+                          // The leading space is INSIDE the string: the visual gap is a
+                          // CSS margin, which contributes nothing to the accessible name,
+                          // so without it the chip announces as "Postgres table— Simplest".
+                          <span className="ml-1.5 text-faint">{` — ${o.description}`}</span>
                         )}
                       </button>
                     );
                   })}
                 </div>
-                <p className="text-[11px] text-faint">
+                <p id={`${hintId}-${qi}`} className="text-[11px] text-faint">
                   {q.multiSelect ? "Pick any that apply" : "Pick one"} — or write your own answer below.
                   Suggestions come from the agent.
                 </p>

@@ -218,8 +218,22 @@ const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
   cancelled: { tone: "neutral" },
 };
 
+// RUN_STATUS_LABELS overrides the default `status.replace(/_/g," ")` where the raw enum
+// makes a poor sentence. It exists because that fallback and runBadge's label switch are
+// two independent renderings of one status, and they had silently diverged: runBadge
+// deliberately says "needs your answer" for awaiting_input on the reasoning that
+// "awaiting input" reads as machine-waiting-for-machine, while this pill printed exactly
+// the phrasing that reasoning rejects — on the run header and every Runs-list row.
+//
+// The divergence was free until now only because `awaiting_approval` happens to read
+// fine de-underscored. Keep the two in step for any status added here.
+const RUN_STATUS_LABELS: Record<string, string> = {
+  awaiting_input: "needs your answer",
+};
+
 export function StatusPill({ status }: { status: string }) {
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
+  const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   return (
     <span
       className={cx(
@@ -231,7 +245,7 @@ export function StatusPill({ status }: { status: string }) {
         aria-hidden="true"
         className={cx("h-1.5 w-1.5 rounded-full bg-current", cfg.pulse && "animate-pulse")}
       />
-      {status.replace(/_/g, " ")}
+      {label}
     </span>
   );
 }

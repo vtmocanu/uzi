@@ -16,6 +16,7 @@ import {
 // and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
 // against the real file under both tsc and vitest.
 import runViewSource from "./RunView.tsx?raw";
+import questionPanelSource from "../components/QuestionPanel.tsx?raw";
 import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
@@ -1074,5 +1075,35 @@ describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
 
   it("submits the answer under the `answer` steering kind", () => {
     expect(live).toContain('submit("answer", body)');
+  });
+
+  it("announces the park from an ALWAYS-MOUNTED live region, outside the panel's gate", () => {
+    // The structural property is the whole fix and it is not the obvious shape: a region
+    // created in the same tick as its first message is typically silent, because
+    // assistive tech announces CHANGES to a region that already existed. Board.tsx's S5
+    // note records this and calls it "the worst kind of accessibility bug: the markup
+    // looks right". role="status" on QuestionPanel — which mounts WITH the park — would
+    // have been exactly that, and would have browser-tested as present.
+    //
+    // Same source-text instrument and same ceiling as above: it proves the text is there
+    // and uncommented, not that it runs. What it CAN prove structurally is placement, by
+    // where the region sits relative to the panel's conditional.
+    const region = live.indexOf('role="status" aria-live="polite"');
+    const panelGate = live.indexOf('run.status === "awaiting_input" && openQuestion');
+    expect(region).toBeGreaterThan(-1);
+    expect(panelGate).toBeGreaterThan(-1);
+    expect(region).toBeLessThan(panelGate);
+  });
+});
+
+describe("the park announcement does not live inside the panel (PRD #88 M2, a11y)", () => {
+  // An ABSENCE assertion, and deliberately on the OTHER file. It is the durable half of
+  // the pair above: someone tidying the announcement "closer to where it belongs" would
+  // move it into QuestionPanel, where it mounts with its own content and goes silent.
+  // Absence assertions are correct to ignore commented-out code (disabled code is not a
+  // second implementation), so this needs no comment-stripping.
+  it("QuestionPanel declares no live region of its own", () => {
+    expect(questionPanelSource).not.toContain("aria-live");
+    expect(questionPanelSource).not.toContain('role="status"');
   });
 });

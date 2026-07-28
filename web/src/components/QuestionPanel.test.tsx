@@ -53,6 +53,80 @@ function bodyOf(onAnswer: ReturnType<typeof vi.fn>): { question_id: string; answ
 }
 
 describe("QuestionPanel", () => {
+  // ── web-ux browser findings ────────────────────────────────────────────────
+
+  it("names the noun on a SINGLE-question park, not just the count", () => {
+    // `multiple` gated the whole phrase, so the modal production case read "The agent
+    // stopped to ask — the run is parked until you answer." The count is the variable
+    // part; the noun is not.
+    const { container } = render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={vi.fn()} />);
+    expect(container.textContent).toContain("stopped to ask a question");
+    cleanup();
+    const two: QuestionPayload = {
+      questionId: "q-two",
+      questions: [FREE_TEXT.questions[0], FREE_TEXT.questions[0]],
+    };
+    expect(
+      render(<QuestionPanel open={open(two)} busy={false} onAnswer={vi.fn()} />).container.textContent,
+    ).toContain("stopped to ask 2 questions");
+  });
+
+  it("focuses the first answer box on mount, and again on a NEW question", () => {
+    // Measured in the browser: focus was left on <body> and the first answer box was tab
+    // stop 25 of 40, behind the whole sidebar — so a keyboard user Tabbed ~26 times to
+    // reach the control the app says is blocking the run.
+    const { rerender } = render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={vi.fn()} />);
+    const first = screen.getByLabelText("Your answer");
+    expect(document.activeElement).toBe(first);
+    // Blur, then hand the panel a DIFFERENT question: the second park must re-focus.
+    (document.activeElement as HTMLElement).blur();
+    expect(document.activeElement).not.toBe(first);
+    rerender(<QuestionPanel open={open(SINGLE_SELECT, 2)} busy={false} onAnswer={vi.fn()} />);
+    expect(document.activeElement).toBe(screen.getByLabelText("Your answer"));
+  });
+
+  it("groups each question's chips and names the group after its question", () => {
+    // Measured: with the chips in a bare <div>, question 2's chips sat between "Answer to
+    // question 1" and "Answer to question 2" in tab order and read as belonging to
+    // question 1 — the grouping was carried entirely by CSS.
+    const two: QuestionPayload = {
+      questionId: "q-two",
+      questions: [
+        { question: "First?", header: "Storage", options: [{ label: "a1", description: "" }], multiSelect: false },
+        { question: "Second?", header: "", options: [{ label: "b1", description: "" }], multiSelect: true },
+      ],
+    };
+    render(<QuestionPanel open={open(two)} busy={false} onAnswer={vi.fn()} />);
+    const named = screen.getByRole("group", { name: "Storage" });
+    expect(named.textContent).toContain("a1");
+    // A question with no header still gets a distinguishable name rather than none.
+    const fallback = screen.getByRole("group", { name: "Options for question 2" });
+    expect(fallback.textContent).toContain("b1");
+  });
+
+  it("conveys single-vs-multi select programmatically, not just visually", () => {
+    render(<QuestionPanel open={open(MULTI_SELECT)} busy={false} onAnswer={vi.fn()} />);
+    const group = screen.getByRole("group", { name: "Fields" });
+    const describedBy = group.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toContain("Pick any that apply");
+    cleanup();
+    render(<QuestionPanel open={open(SINGLE_SELECT)} busy={false} onAnswer={vi.fn()} />);
+    const single = screen.getByRole("group", { name: "Storage" });
+    expect(document.getElementById(single.getAttribute("aria-describedby")!)?.textContent).toContain("Pick one");
+  });
+
+  it("separates a chip's label from its description IN THE ACCESSIBLE NAME", () => {
+    // The visual gap is a CSS margin, which contributes nothing to the accessible name —
+    // so the chip announced as "Postgres table— Simplest…" with no space before the dash.
+    // An accessible-name assertion is the only instrument that sees this; a screenshot
+    // and a textContent check both look fine.
+    render(<QuestionPanel open={open(SINGLE_SELECT)} busy={false} onAnswer={vi.fn()} />);
+    const chip = screen.getByRole("button", { name: /Postgres table/ });
+    expect(chip.textContent).toContain("Postgres table — one more migration");
+    expect(chip.textContent).not.toContain("table—");
+  });
+
   it("blocks the submit until every question has an answer", () => {
     const onAnswer = vi.fn();
     render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={onAnswer} />);
