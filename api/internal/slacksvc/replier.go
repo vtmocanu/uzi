@@ -276,9 +276,23 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 // past is rejected by the server rather than silently retargeted.
 //
 // Two replies racing before the worker consumes the first are BOTH accepted (same
-// question, run still parked) and the worker takes the first — first-wins worker-side,
+// question, run still parked) and the worker takes ONE of them, discarding the rest —
 // deliberately not a compare-and-swap: unlike a plan revision the loser is harmless,
-// being one more consumed input the worker discards.
+// being one more consumed input the worker drops.
+//
+// WHICH one it takes depends on whether they arrive in the same poll, and the precise
+// answer is worth having because "first-wins" (what this comment used to say) is only
+// half true. SteeringChannel.route assigns a SINGLE buffer slot per routed input, and
+// pollLoop routes an entire /inputs batch before servicing the waiter once. So within
+// one batch the LAST reply overwrites the earlier ones and wins; across batches the
+// first wins, because it has already resolved the park and the later reply arrives
+// with nothing waiting on it and no matching open question.
+//
+// Not a security property either way — same authenticated owner, same question, and
+// the server has already bound the reply to the anchor's question id. It is recorded
+// because it is a present-tense claim about a concurrency path, and the previous
+// wording would send someone debugging a "lost" reply looking for a bug that is
+// actually the documented behaviour.
 func (r *Replier) answer(ctx context.Context, m MessageReply, userID uuid.UUID, anchor store.SlackRunMessage, text string) {
 	qid := strings.TrimSpace(anchor.QuestionID.String)
 	qts := strings.TrimSpace(anchor.QuestionTs.String)
