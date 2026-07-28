@@ -138,6 +138,8 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 
 **The framing worth keeping, and the reason this outranks a wrong claim: this is the GATE lying, not a claim lying.** A wrong claim gets reviewed. A wrong gate is what the review relies on.
 
+**A FOURTH form landed after the three above, one level up again: it is the CHECK ON THEM lying rather than a reporting expression. `npx vitest run $FILES`, with a space-joined string variable.** Measured 2026-07-28 (PRD #175) by the reviewer, inside the harness it had just built to verify a mutation round: zsh does not word-split an unquoted variable, so vitest received one bogus path, matched nothing, and the grep printed nothing — **for all four mutations AND for the control**. Empty output reads exactly like "no failures". The mechanism is the same zsh word-splitting trap the third form above turns on and that this file already documents at the `C="env -i …"` paragraph below, which makes that cross-reference **load-bearing twice inside one entry** — and it still took someone who had read past it. So the rule that generalises past shells and past mutation testing, and the positive prescription the three numbered forms do not supply: **a control that produces no output is not a control.** The failure was never "the mutation did not redden", it was "the harness never ran and silence was read as green". A control must yield a POSITIVE observation — a named test, a nonzero count, a line you can point at — because if its evidence is an absence, it cannot tell a live harness from one that never executed, and every result standing on it is unfalsifiable.
+
 ### web (Vite + React + TS)
 
 ```sh
