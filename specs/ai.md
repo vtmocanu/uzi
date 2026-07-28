@@ -14593,9 +14593,16 @@ because of that, and none of them said so out loud except one SQL comment.
 
 # PRD #88 — Ask-user clarification: agent-initiated questions before and during a run
 
-Serves human Feature #88. Numbers start at 455 because 447 is `origin/main`'s
-(issue #177) and 448–454 are held by the in-flight PRD #175 branch; re-derive above
-the live head at landing, per the goose-style renumber rule.
+Serves human Feature #88.
+
+**Numbering note, and the rule it corrects.** These start at 455, not at 447. "Next
+above the merged head" is **wrong by construction** — a merged tree cannot see what
+landed on `main` *after* the merge commit, nor what an unmerged sibling holds. Both
+had happened: 447 was `origin/main`'s (issue #177, landed after this branch's merge)
+and 448–454 were held by the in-flight PRD #175 branch. **The rule is "first free
+across all remotes"**, swept at write time, then re-derived above the live head at
+landing per the goose-style renumber rule. The 447–454 gap here is intended; closing
+it recreates the collision.
 
 ## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
 
@@ -14804,3 +14811,47 @@ the live head at landing, per the goose-style renumber rule.
   would have reproduced that exactly. It gained a `never` guard, and the mock parks
   **twice**, because a one-question fixture cannot tell a real ordinal from a
   hardcoded 1.
+
+## 460. PRD #88 — what this increment does NOT deliver, and the one omission that was DELIBERATE
+
+Recorded in `ai.md` rather than only in the MR because an MR description is ephemeral
+and a coverage claim is what a later reader most needs bounded. **"e2e green" will
+otherwise be read as covering all of these, and it covers none of them.**
+
+- **🔴 The k8s runtime was not exercised, and this one deviates from a stated
+  convention.** Everything here was validated on compose plus unit tests. The sharp
+  part is that §458's claim-config decision was made **precisely because** a worker env
+  knob is unreachable on a hosted worker — so the decision's own motivation is the
+  thing that went untested. Highest-value follow-up of the five for anyone re-running
+  this on the primary runtime.
+- **🔴 No requeue was exercised end to end.** §456's identity keying exists to protect
+  exactly one chain: park → worker death → requeue → resume → re-park → the pre-death
+  answer still honoured. The runner layer proves it with a seeded claim; the SQL layer
+  proves the sweeps. **Nothing kills a worker mid-park and watches the two halves join
+  up** — they meet only on paper, at the seam the whole design was built for.
+- **Slack has no e2e at all.** The M3 round trip is covered only by Go unit tests
+  against fakes, which includes §457's `ts`-ordered derivation — the subtlest mechanism
+  in this PRD, pinned at the unit layer and nowhere else. Nothing in any run posted to
+  or read from Slack.
+- **`executor=stub` only.** No live SDK session, so the prompt's "when to ask" guidance
+  and the credential prohibition are pinned by string assertions and by nothing
+  behavioural. A real lead deciding *when* to ask is untested by construction.
+- **`QUESTION_MAX` enforcement is documented, not tested**, and neither is §458's
+  `× (RUN_MAX_REQUEUES + 1)` bound.
+
+**The deliberate omission, recorded so it is not re-filed as a defect:
+`FailRunAutoStop` has NO `awaiting_input` exclusion.** Its WHERE is
+`status NOT IN ('completed','failed','cancelled')` plus an explicit
+`AND status <> 'limit_wait'`, and that negative predicate **admits a parked run**.
+`awaiting_input` sits in exactly the position `limit_wait` spent a clause on, and for
+the same reason: a parked run's message writes are not in a permanent-failure loop,
+they have simply stopped, because the worker went away by design and the server owns
+the resume. It is unreachable **today** only because `workersvc/autostop.go`'s
+`if run.Status != "running"` excludes it — **the invariant is stated in a different
+package from the one that enforces it**, and that Go line's own comment justifies
+itself entirely in terms of `queued` and the requeue streak, never mentioning parking.
+Anyone relaxing it later makes parked runs auto-stoppable with no SQL backstop and no
+failing test. The clause was written and then reverted when `sqlc generate` could not
+reach its proxy, and ruled a follow-up rather than a blocker on the unreachability.
+**Follow-up, not a gap — and the case for adding it is that unreachability is a
+property of another package, not of this statement.**
