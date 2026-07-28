@@ -14789,6 +14789,29 @@ refuted it independently, from different starting points, before any code was wr
     usually more correct operator, so the likeliest future cleanup — typechecks clean and
     reddens nothing else while changing what the panel receives. Read it as pinning the
     FOLD, not a tri-state.
+  - **TWO tests guard this seam and NEITHER is redundant, because each is blind to the
+    other's property.** The operator test above is the ENTIRE guard against `??`; the
+    chain test below cannot catch it, by construction, since its version is non-empty and
+    the two operators agree on every non-empty string. Stated because a later reader
+    counting two tests over one hook is exactly the reader who deletes one.
+  - **The chain's POSITIVE arm had no coverage at all until it was given its own file,
+    and the hole was proven by mutation rather than argued.** `GET /api/version` →
+    `useBuildInfoSnapshot` → `useBuildInfo` → `useAppVersion` → `WorkersSettings`
+    `cpVersion` → `FleetUpgradePanel` was tested at both ends and nowhere in between:
+    `WorkerUpgradeBadge.test.tsx` passes `cpVersion` as a PROP so no hook runs and its
+    only target-release assertion is an ABSENCE, and `WorkersSettings.test.tsx` resolves
+    `{version: ""}`, which the fold turns into the PENDING arm. Measured: hard-wiring
+    `cpVersion` to null — the page ignoring the endpoint this PRD widened, completely —
+    left the suite green at 1373/1373.
+    - **The fixture is a VERBATIM live wire body, and its field values must stay DISTINCT
+      FROM ONE ANOTHER.** That distinctness is the whole discriminating power: projecting
+      the wrong field (`?.version` → `?.founded`) has to yield a visibly wrong string. A
+      later tidy-up aligning `founded` with `version` would disarm the test while leaving
+      it green — the same silent-disarm shape as a mutation applied to a file that does
+      not execute.
+    - It also asserts the NEGATIVE: none of the widened body's other coordinates reach
+      the fleet panel. That panel is a classification surface, not a build-info surface;
+      the rest of the set belongs to the footer popover.
 - **The shared value is a SNAPSHOT (`{info, fetchedAtMs}`), not the payload.**
   `uptime_seconds` is a reading taken at the fetch, so the popover re-bases it against
   the wall clock; a session left open for hours would otherwise keep reporting the uptime
@@ -14809,8 +14832,10 @@ refuted it independently, from different starting points, before any code was wr
   vitest isolates per FILE, so a component reading it directly could not be exercised with
   more than one response shape in one file — the second would reuse the first's resolved
   promise and pass or fail for the wrong reason. Taking the data as a prop removes the
-  hazard instead of working around it, and it is why the web tests are split across four
-  files rather than organised by subject.
+  hazard instead of working around it. It is also why the tests that DO drive the promise
+  are one file per response shape rather than organised by subject: a per-file split is
+  the only isolation vitest offers here, so the file count is a consequence of the missing
+  reset seam and not a taste.
   - **THREE fixtures, because "degraded" is not one shape, and the first attempt got the
     common one backwards.** A laptop `docker compose` build omits the three ldflags fields
     but KEEPS `uptime_seconds`, because `handler.New` always sets `startedAt` — three keys,
