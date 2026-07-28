@@ -1,7 +1,7 @@
 # PRD #102: Board v2 — column rename, label chips, sorting + manual ordering, non-PRD issues
 
 **GitLab Issue**: [#102](https://gitlab.example.com/vtmocanu/uzi/-/issues/102)
-**Status**: Draft (created 2026-07-20; M5 widened to sort modes 2026-07-27)
+**Status**: Complete (merged 2026-07-28 via MR !142, `7b02b1a0`)
 **Priority**: Medium
 
 Four board changes, bundled because they all land in `Board.tsx` and the
