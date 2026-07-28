@@ -6,9 +6,10 @@
 // Everything either side of that chain was tested and the chain itself was not.
 // WorkerUpgradeBadge.test.tsx passes cpVersion as a PROP, so no hook runs, and its
 // only target-release assertion is an ABSENCE (`queryByText(...)).toBeNull()`).
-// WorkersSettings.test.tsx resolves `{version: ""}`, which useAppVersion folds to
-// null — the PENDING arm. So the positive arm had never been driven from a wire
-// response at all.
+// WorkersSettings.test.tsx resolves `{version: ""}` — the SETTLED-UNKNOWN arm.
+// (When this file was written that value folded to null and drove the PENDING arm;
+// the tri-state fix changed which of the two it exercises, and neither is this
+// one.) So the positive arm had never been driven from a wire response at all.
 //
 // Measured, not inferred: with this file removed and `cpVersion` in
 // WorkersSettings.tsx hard-wired to null — the page ignoring the hook completely —

@@ -4,28 +4,28 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useAppVersion, useBuildInfo } from "./AppShell";
 import { api } from "../lib/api";
 
-// A FOURTH file, for one response shape, for the same reason as the other three:
-// the promise behind these hooks is memoised at module scope with no reset seam,
-// and vitest isolates per FILE, so a file that has already resolved it cannot
-// resolve it again differently.
+// Own file, for the same reason as the sibling build-info test files: the promise
+// behind these hooks is memoised at module scope with no reset seam, and vitest
+// isolates per FILE, so a file that has already resolved it cannot resolve it
+// again differently. It renders the HOOKS rather than the shell, which is what
+// keeps it small — only `api.version` is reachable from here.
 //
-// It renders the HOOKS rather than the shell, which is what keeps the file small —
-// only `api.version` is reachable from here, so none of AppShell's other polls
-// need stubbing.
+// WHAT IT NOW GUARDS: the SETTLED-BUT-UNKNOWN state, `""`, reached here by a body
+// carrying an empty `version`. It is the middle of useAppVersion's three states and
+// the one that is invisible from every other test — the panel copy it drives ("no
+// release stamp — classification off") is identical whether the fetch failed or
+// resolved empty, so only this file can tell you WHICH input produced it.
 //
-// What it pins: `useAppVersion` is `useBuildInfo()?.version || null`, and that `||`
-// FOLDS a resolved-but-empty version into null. Flipping it to `??` — the single
-// most likely future "cleanup", since `??` is usually the more correct operator —
-// leaves typecheck clean and every other test green while changing what
-// FleetUpgradePanel receives. Without this assertion nothing notices.
+// This file previously asserted the OPPOSITE: that `""` folded to `null`. That was
+// the correct pin while the fold existed, and it is why flipping `||` to `??` used
+// to redden here and nowhere else out of 1374 tests. The fold is gone now — a
+// resolved empty version is settled information, not an absence — so the assertion
+// inverted with the contract rather than being deleted with it.
 //
-// Read it as pinning the fold, NOT as pinning a tri-state. The fold is why
-// `cpVersion` is only ever null or a non-empty string, so the panel's
-// resolved-but-unstamped arm is unreachable from this producer — pre-existing,
-// unchanged by #175, and explained at useAppVersion in AppShell.tsx. A future
-// change that makes that arm live has to reintroduce a distinct resolved-but-failed
-// value upstream; it will also have to change this test, which is the point of
-// having it.
+// The complementary arm, a FAILED fetch reaching the same `""` through a different
+// path, is in WorkersSettings.cpversion.failed.test.tsx, driven all the way to the
+// rendered copy. Both are needed: this one pins the mapping, that one pins that a
+// consumer actually renders it.
 
 vi.mock("../lib/api", () => ({
   MOCK_MODE: false,
@@ -35,19 +35,27 @@ vi.mocked(api).version.mockResolvedValue({ version: "", founded: "2026-07-03" })
 
 afterEach(cleanup);
 
-describe("useAppVersion over useBuildInfo — one promise, two shapes", () => {
-  it("projects an EMPTY version to null while useBuildInfo still reports the object", async () => {
+describe("useAppVersion over useBuildInfo — three states from one promise", () => {
+  it("reports a resolved EMPTY version as '' — settled and unknown, not in flight", async () => {
     const { result } = renderHook(() => ({ version: useAppVersion(), info: useBuildInfo() }));
+
+    // In flight: null, and null ONLY here. Every later assertion depends on this
+    // one having been true first, which is what makes "" mean settled.
+    expect(result.current.version).toBeNull();
 
     await waitFor(() => expect(result.current.info).not.toBeNull());
 
-    // The build info resolved and is a real object — this is NOT the in-flight state.
+    // The body resolved and is a real object — not the in-flight state.
     expect(result.current.info).toEqual({ version: "", founded: "2026-07-03" });
     expect(result.current.info!.version).toBe("");
 
-    // …and the projection maps that empty string to null. `??` would return "" here
-    // and this assertion is the only thing standing between the two operators.
-    expect(result.current.version).toBeNull();
+    // …and the projection passes the empty string THROUGH rather than folding it to
+    // null. `|| ""` would give the same answer here; the reason the line reads `??`
+    // is stated at the hook. What must not come back is `null`, which would put a
+    // settled answer back into the in-flight bucket and re-kill the panel's third
+    // arm — the whole defect this change exists to fix.
+    expect(result.current.version).toBe("");
+    expect(result.current.version).not.toBeNull();
 
     // One request served both hooks.
     expect(vi.mocked(api).version).toHaveBeenCalledTimes(1);

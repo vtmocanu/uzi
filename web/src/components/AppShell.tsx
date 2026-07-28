@@ -52,9 +52,21 @@ const WORKERS_ATTENTION_POLL_MS = 60_000;
 
 // The server build info, fetched once and shared. Memoised at module scope so the
 // two SidebarContent mounts (desktop rail + mobile drawer) and any remount reuse a
-// single unauthenticated GET /api/version. A failed fetch resolves to null
-// (rendered as nothing), never a thrown error in the shell — a 401 or a 500 on
-// this endpoint must not take the chrome down with it.
+// single unauthenticated GET /api/version. A failed fetch is SWALLOWED, never a
+// thrown error in the shell — a 401 or a 500 on this endpoint must not take the
+// chrome down with it.
+//
+// THREE STATES, DISCRIMINATED, and the discriminant is the point. `null` used to
+// mean both "still in flight" and "the fetch failed", which made
+// FleetUpgradePanel's third arm unreachable: a fleet page whose /api/version call
+// 500s showed a permanent blank "pending" instead of telling the operator that
+// upgrade classification was off. Resolving a failure to `null` and resolving a
+// success to an object are indistinguishable to a consumer holding only the
+// result, so the failure needs a value of its own rather than an absence.
+//
+//   snapshot === null   -> IN FLIGHT. Nothing has settled yet.
+//   { status: "failed" } -> settled, and we will never know. Permanent.
+//   { status: "ok", … }  -> settled with a body.
 //
 // fetchedAtMs rides along with the payload rather than being read at render time:
 // `uptime_seconds` is a reading taken at the fetch, and the popover re-bases it
@@ -62,8 +74,13 @@ const WORKERS_ATTENTION_POLL_MS = 60_000;
 // the uptime the API had at mount. Sampling the instant HERE (once, when the
 // shared promise settles) rather than in each consumer is what keeps the two
 // mounts agreeing.
-type BuildInfoSnapshot = { info: BuildInfo; fetchedAtMs: number };
-let buildInfoPromise: Promise<BuildInfoSnapshot | null> | null = null;
+type BuildInfoSnapshot =
+  | { status: "ok"; info: BuildInfo; fetchedAtMs: number }
+  | { status: "failed" };
+
+const BUILD_INFO_FAILED: BuildInfoSnapshot = { status: "failed" };
+
+let buildInfoPromise: Promise<BuildInfoSnapshot> | null = null;
 
 function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
   const [snapshot, setSnapshot] = useState<BuildInfoSnapshot | null>(null);
@@ -71,8 +88,12 @@ function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
     if (!buildInfoPromise) {
       buildInfoPromise = api
         .version()
-        .then((info) => ({ info, fetchedAtMs: Date.now() }))
-        .catch(() => null);
+        .then((info): BuildInfoSnapshot => ({ status: "ok", info, fetchedAtMs: Date.now() }))
+        // The swallow is unchanged in strength — nothing rethrows, and the shell
+        // renders on. What changed is that it now resolves to a VALUE saying the
+        // fetch failed, instead of to the same `null` an unsettled promise looks
+        // like.
+        .catch((): BuildInfoSnapshot => BUILD_INFO_FAILED);
     }
     let live = true;
     buildInfoPromise.then((s) => {
@@ -93,8 +114,14 @@ function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
 // /about page and the CLI's `server` block (M4) — both of which want the whole
 // object rather than a projection. Recorded rather than dropped so the next reader
 // does not have to guess whether this is dead surface or a contract.
+//
+// DELIBERATELY two-state, and it does not gain the third: there is nothing to
+// render for a failed fetch and nothing to render while one is in flight, so both
+// are `null` here. The distinction lives in useAppVersion below, whose consumer
+// renders different copy for the two.
 export function useBuildInfo(): BuildInfo | null {
-  return useBuildInfoSnapshot()?.info ?? null;
+  const s = useBuildInfoSnapshot();
+  return s?.status === "ok" ? s.info : null;
 }
 
 // Exported so the Workers page can state the fleet's target release from the SAME
@@ -102,38 +129,42 @@ export function useBuildInfo(): BuildInfo | null {
 // reusing this hook costs no extra request and — more importantly — makes it impossible
 // for the panel and the footer to disagree about what release the control plane is.
 //
-// KEPT as a projection over useBuildInfo rather than collapsed into it (PRD #175
-// Decision Log) — but NOT because this operator preserves a tri-state. It does not,
-// and an earlier version of this comment claimed it did.
+// THE TRI-STATE IS NOW REAL, and this hook is the only place it is produced:
 //
-// `"" || null` is `null`, so this hook emits exactly TWO states: null, or a
-// non-empty string. BOTH failure modes land on null — a rejected fetch resolves the
-// shared promise to null at the snapshot level above, and a `{"version": ""}` body
-// is folded here. FleetUpgradePanel is WRITTEN for three: its prop comment and
-// `versionPending = cpVersion === null` (WorkerUpgradeBadge.tsx) separate "in
-// flight" from "resolved with no stamp", because conflating them once rendered a
-// full fleet bar under a heading saying classification was off, at T+270ms and
-// flipping at T+670ms. From THIS producer the middle state never arrives, so
-// `versionPending` is true both while the fetch is in flight and after it has
-// permanently failed. The panel's own comment is about what the prop accepts; this
-// one is about what the only production caller can supply.
+//   null  -> IN FLIGHT.        FleetUpgradePanel renders &nbsp; — it asserts nothing
+//                              while the answer is still coming.
+//   ""    -> SETTLED, UNKNOWN. The fetch failed, or the body carried an empty
+//                              version. The panel says "no release stamp —
+//                              classification off", which is the truth and is
+//                              actionable; a permanent blank is neither.
+//   "x"   -> SETTLED, STAMPED. The panel says "target release vx".
 //
-// The fold is PRE-EXISTING and unchanged by #175 — pre-PRD (`a4fbb86f`) the hook
-// ended `setVersion(v || null)`, which collapses identically. It stays that way
-// deliberately: making the dead arm live changes what a fleet-facing panel renders,
-// which is a behaviour change and the user's call, not this PRD's.
+// Until this change the middle state was UNREACHABLE. `"" || null` is `null` and a
+// failed fetch resolved the shared promise to `null` too, so `versionPending` was
+// true both while the fetch was in flight AND forever after it had failed — the
+// third arm of a panel written for three could never fire. The conflation it was
+// written to prevent is a measured one: a full fleet bar rendered under a heading
+// saying classification was off, at T+270ms, flipping at T+670ms.
 //
-// If it is ever fixed, FLIPPING `||` TO `??` IS NOT THE FIX, and it is the obvious
-// wrong move. A failed fetch never produces a BuildInfo at all, so `??` would only
-// ever surface a resolved-but-empty `version` — which the server does not send.
-// A real fix needs a distinct resolved-but-failed state in BuildInfoSnapshot.
+// FLIPPING `||` TO `??` WOULD NOT HAVE FIXED IT, and remains the obvious wrong
+// move if anyone revisits this: a failed fetch produced no BuildInfo at all, so no
+// operator on `.version` could distinguish it. The fix had to be the discriminated
+// snapshot above; this projection is downstream of it.
 //
-// What the split still buys, and the reason to keep it: this is the ONE place the
-// fold happens, so every consumer sees the same two-state value rather than each
-// writing its own `.version || null` — and a consumer reaching for `.version`
-// directly would get "" back and reintroduce the conflation at the call site.
+// `?? ""` rather than `|| ""` on the last line, and the difference is the whole
+// point: `||` would fold a resolved empty version back into the same bucket as…
+// itself, harmlessly, but `??` states the intent — only ABSENT becomes "", and a
+// server-sent "" is already the settled-unknown value we want to pass through.
+//
+// Kept as a projection over useBuildInfo rather than collapsed into it (PRD #175
+// Decision Log): this is the ONE place the mapping happens, so every consumer sees
+// the same three-state value instead of each reimplementing it at its own call
+// site — which is exactly how the two failure modes got conflated in the first
+// place.
 export function useAppVersion(): string | null {
-  return useBuildInfo()?.version || null;
+  const s = useBuildInfoSnapshot();
+  if (s === null) return null;
+  return s.status === "ok" ? (s.info.version ?? "") : "";
 }
 
 function isNavActive(pathname: string, href: string): boolean {
@@ -557,7 +588,7 @@ function SidebarContent({
             tooltip firing alongside a custom popover is two overlapping panels
             saying different things. Renders nothing at all until the fetch resolves
             with a version, exactly as the old badge did. */}
-        {build?.info.version && (
+        {build?.status === "ok" && build.info.version && (
           <BuildInfoPopover info={build.info} collapsed={collapsed} fetchedAtMs={build.fetchedAtMs} />
         )}
       </div>
