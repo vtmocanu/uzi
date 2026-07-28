@@ -377,12 +377,32 @@ func TestRegisterSweepsMoveAwaitingInputLiveDB(t *testing.T) {
 // parked at the PLAN gate. A merged `status NOT IN (...) OR kind IN (...)` predicate
 // passes every happy path above and fails exactly here.
 //
-// Both live in this file on purpose. An earlier version of this comment claimed the
-// second direction was covered by "its mirror in the plan-gate tests" — it was not;
-// run_running_guard_integration_test.go contains no `answer` at all, so deleting the
-// PLAN clause left the whole suite green. A comment that sends the next reader
-// looking in the wrong place is worse than no comment, because it stops them looking
-// at all.
+// Both live in this file on purpose, and what they uniquely catch is narrower than
+// two earlier versions of this comment claimed. Measured against a real Postgres, by
+// mutating the GENERATED const in runtime.sql.go (the .sql file is semantically inert
+// until sqlc regenerates):
+//
+//	                                    plan clause    the two clauses
+//	                                     DELETED         MERGED
+//	ClausesAreIndependent (dir 1)         pass            FAIL
+//	AnswerDoesNotSatisfyPlanGate (dir 2)  FAIL            FAIL
+//	SetRunRunningAnswerGuard              pass            FAIL
+//	AwaitingApprovalGuard (pre-existing)  FAIL            pass   ← blind to the merge
+//
+// So DELETING the plan clause was never invisible: the pre-existing PRD #44 F2 guard
+// test has always caught it. MERGING the two into one
+// `status NOT IN (...) OR kind IN (...)` predicate is the hole these tests exist for —
+// a merged predicate still satisfies every fixture holding the matching input kind,
+// so only a fixture holding the WRONG kind for its gate can tell the difference, and
+// that is exactly what direction 2 builds.
+//
+// Two corrections got us here and the second is the instructive one. The first
+// version pointed at "its mirror in the plan-gate tests", which did not exist —
+// run_running_guard_integration_test.go contains no `answer` at all. The second said
+// deletion left the suite green; it did not. Both were claims about what a test
+// guards, written without running the mutation they named. A comment that
+// misdescribes its own test's value fails the same way as one pointing at the wrong
+// file: it stops the next reader checking.
 func TestSetRunRunningClausesAreIndependentLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
