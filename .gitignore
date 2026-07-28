@@ -51,3 +51,5 @@ coverage.out
 .dot-agent-deck/
 # ignoreme folder
 ignoreme/
+# CI dotenv report: publish:assert-changelog writes the commit count here (PRD #175 M3)
+commit_count.env

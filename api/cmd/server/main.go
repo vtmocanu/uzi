@@ -58,7 +58,12 @@ var version = "dev"
 //
 //	-X main.commit=<full 40-char source SHA>
 //	-X main.builtAt=<RFC3339 UTC>
-//	-X main.commits=<decimal commit count>   (PRD #175 M3)
+//	-X main.commits=<decimal commit count>
+//
+// commits is the one that needs history the image build does not have — the publish
+// context is api/ with no .git, and the kaniko image carries no git. CI computes it in
+// publish:assert-changelog and delivers it as a dotenv report (PRD #175 M3), which is
+// why its CI path looks nothing like the other two.
 //
 // They live in THIS package because that is the only place the linker can reach: the
 // values are served from internal/handler, but -X names a package-level string var by
