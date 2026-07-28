@@ -35,6 +35,14 @@ type NotifierStore interface {
 	// the monotonic plan generation the notifier uses to tell a new plan version from a
 	// redundant awaiting_approval re-broadcast (PRD #41 Decision 10a/e).
 	CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (int64, error)
+	// GetLatestRunQuestion returns the newest kind='question' run_message payload —
+	// the clarification question a parked run is waiting on (PRD #88 M3). No row = the
+	// question is not flushed yet; the notifier waits rather than posting a park it
+	// cannot explain.
+	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
+	// SetSlackRunQuestion records which question the run's thread already carries, so a
+	// re-park on the SAME question after a worker death does not post it twice.
+	SetSlackRunQuestion(ctx context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and
@@ -337,6 +345,64 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	}
 
 	n.handleGate(ctx, rc, anchor, base)
+	n.handleQuestion(ctx, rc, anchor, base)
+}
+
+// handleQuestion posts a clarification question into the run's DM thread when the run
+// parks at awaiting_input (PRD #88 M3). It is the question's counterpart to
+// handleGate, and deliberately much smaller: there is no button, no anchor state
+// machine and no compare-and-swap, because the distinct awaiting_input status is
+// itself the routing signal the replier reads (D5) — the plan gate needed gate_state
+// only because a revision keeps the run at awaiting_approval.
+//
+// Dedupe is by question IDENTITY, not by a count and not by "is the run parked":
+// awaiting_input is re-broadcast for the SAME question after a worker death (the run
+// re-queues, the resumed worker re-parks re-using the question id), so a count-based
+// key would post the card a second time while an identity comparison is a no-op across
+// the requeue by construction. A genuinely new question carries a new id and posts.
+//
+// All best-effort: a failure is logged (redacted) and never affects the run.
+func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, base string) {
+	if rc.Status != "awaiting_input" {
+		return
+	}
+	raw, err := n.store.GetLatestRunQuestion(ctx, rc.ID)
+	if err != nil {
+		// No row: the state report reached us before the question message was durable.
+		// Waiting is correct — a later event re-drives this with the question present, and
+		// posting "the run needs your answer" with no question would be worse than late.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("load question", err)
+		}
+		return
+	}
+	q, ok := parseQuestionPayload(raw)
+	if !ok {
+		n.logf("parse question payload", fmt.Errorf("run %s: unusable question payload", rc.ID))
+		return
+	}
+	if anchor.QuestionID.Valid && anchor.QuestionID.String == q.QuestionID {
+		return // already on screen in this thread — a re-park, not a new question
+	}
+	ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs,
+		"The run needs your answer", questionThreadBlocks(rc.ID, q, base))
+	if err != nil {
+		n.logf("post question in thread", err)
+		return // do not record it as posted; a later event retries
+	}
+	// The ts is recorded with the id because the replier orders inbound replies against
+	// it — a reply before this card answers a superseded question. A post whose ts came
+	// back empty is therefore worse than not recording at all: it would satisfy the
+	// notifier's dedupe (never re-posting) while leaving every reply unbindable.
+	if ts == "" {
+		n.logf("record question", fmt.Errorf("run %s: question posted with no ts", rc.ID))
+		return
+	}
+	if _, err := n.store.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
+		RunID: rc.ID, QuestionID: pgText(q.QuestionID), QuestionTs: pgText(ts),
+	}); err != nil {
+		n.logf("record question", err)
+	}
 }
 
 // handleGate manages the approval-gate message's lifecycle on the notifier's
@@ -593,6 +659,11 @@ func statusLabel(rc store.GetSlackRunContextRow) string {
 		return "▶ running"
 	case "awaiting_approval":
 		return "⏸ needs your approval"
+	case "awaiting_input":
+		// Without this case the default arm below renders the raw enum `awaiting_input`
+		// on the root line of a user-facing DM — the web has a replace(/_/g," ") fallback,
+		// Slack has none (PRD #88 M3).
+		return "⏸ needs your answer"
 	case "completed":
 		if rc.MrIid.Valid {
 			return fmt.Sprintf("✅ completed (%s %s%d)", forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)

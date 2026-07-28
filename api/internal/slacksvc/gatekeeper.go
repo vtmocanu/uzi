@@ -52,6 +52,20 @@ type PlanGateSubmitter interface {
 	// validates the source against the run's real roster and rejects with the
 	// ErrSelectionRejected sentinel when it no longer holds.
 	SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string) error
+	// SubmitAnswer enqueues an `answer` to the clarification question named by
+	// questionID, carrying the user's reply text (PRD #88 M3).
+	//
+	// It takes the id and the text as plain strings for the same reason SubmitApproval
+	// takes a source string: the JSON body is workersvc's own AnswerBody, built by the
+	// adapter in main, so the wire shape is declared EXACTLY ONCE and Slack cannot drift
+	// into being a second contract. The server re-validates questionID against the run's
+	// open_question_id and re-encodes from its own scrubbed values, so what is passed
+	// here is a request, never a trusted record.
+	//
+	// A run that has moved off that question is rejected with the ErrAnswerStale /
+	// ErrNotAwaitingInput sentinels rather than a generic error, so the replier can say
+	// which happened.
+	SubmitAnswer(ctx context.Context, userID, runID uuid.UUID, questionID, text string) error
 }
 
 // Gatekeeper handles the Slack approval-gate buttons (PRD #25 M4): Approve,
