@@ -160,11 +160,14 @@ func TestFullSyncEvictsNothingWhenEitherFetchFails(t *testing.T) {
 			if len(st.deleteCalls) != 0 {
 				t.Errorf("a half-failed fetch must evict NOTHING, got %+v", st.deleteCalls)
 			}
-			// BOTH fields, including the half that succeeded: FullSync reports
-			// observations for the poller to Advance into its own pair, and the zero
-			// pair is what makes that fold a no-op. Reporting the successful fetch's
-			// mark would advance the caller past a window whose rows were never
-			// written, since neither half's upserts ran.
+			// BOTH fields, because FullSync reports observations for the poller to
+			// Advance into its own pair and the zero pair is what makes that fold a
+			// no-op. The two rows reach that zero pair by DIFFERENT routes, and only
+			// the second is a real test of the rule: when the PRD fetch fails
+			// FullSync returns before the open fetch is ever issued, so Open is zero
+			// trivially; when the OPEN fetch fails the PRD fetch has already come
+			// back with rows, and reporting its mark would advance the caller past a
+			// window whose rows were never written, since neither half's upserts ran.
 			if !marks.PRD.IsZero() || !marks.Open.IsZero() {
 				t.Errorf("marks = %+v, want the zero pair so the poller keeps the marks it had", marks)
 			}
@@ -298,31 +301,50 @@ func TestPerPathMarksAdvanceIndependently(t *testing.T) {
 // when the forge was read, and computing the bound after the discard would stall the
 // Open mark on any repo whose only open issues carry the PRD label — which is the
 // same permanent stall issue #177 fixes, arriving through the other door.
+//
+// BOTH sync paths, because both derive their Open mark this way and both maxUpdatedAt's
+// doc and this comment state the raw-result property unconditionally. The predecessor
+// covered IncrementalSync only, which left FullSync free to compute its Open mark from
+// the post-withoutLabel slice with the whole suite still green.
 func TestSyncCountsDiscardedRowsTowardsTheOpenMark(t *testing.T) {
-	st := &fakeStore{}
-	svc := newTestService(st)
 	prdMax := time.Unix(5000, 0)
 	openMax := time.Unix(3000, 0)
-	f := &fakeForge{
-		issues: []forge.Issue{labelled(1, prdMax, prdLabel)},
-		// Every row here is discarded by the PRD filter, so the FILTERED max is zero
-		// while the raw one is not.
-		openIssues: []forge.Issue{labelled(1, openMax, prdLabel)},
+	newFake := func() *fakeForge {
+		return &fakeForge{
+			issues: []forge.Issue{labelled(1, prdMax, prdLabel)},
+			// Every row here is discarded by the PRD filter, so the FILTERED max is
+			// zero while the raw one is not.
+			openIssues: []forge.Issue{labelled(1, openMax, prdLabel)},
+		}
+	}
+	assert := func(t *testing.T, got Marks) {
+		t.Helper()
+		if !got.Open.Equal(openMax) {
+			t.Errorf("Open mark = %v, want %v — the discarded row is still evidence of when the open fetch ran; a post-withoutLabel max gives zero and never advances", got.Open, openMax)
+		}
+		if !got.PRD.Equal(prdMax) {
+			t.Errorf("PRD mark = %v, want %v — its own fetch is untouched by what the open one discarded", got.PRD, prdMax)
+		}
 	}
 
-	// The caller's Open mark differs from openMax, so "advanced to 3000" and "left
-	// alone" are distinguishable outcomes.
-	start := Marks{PRD: time.Unix(1, 0), Open: time.Unix(2, 0)}
-	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
-	if err != nil {
-		t.Fatalf("IncrementalSync: %v", err)
-	}
-	if !got.Open.Equal(openMax) {
-		t.Fatalf("Open mark = %v, want %v — the discarded row is still evidence of when the open fetch ran; a post-withoutLabel max gives zero and never advances", got.Open, openMax)
-	}
-	if !got.PRD.Equal(prdMax) {
-		t.Fatalf("PRD mark = %v, want %v — its own fetch is untouched by what the open one discarded", got.PRD, prdMax)
-	}
+	t.Run("FullSync", func(t *testing.T) {
+		got, err := newTestService(&fakeStore{}).FullSync(context.Background(), uuid.New(), 7, newFake())
+		if err != nil {
+			t.Fatalf("FullSync: %v", err)
+		}
+		assert(t, got)
+	})
+
+	t.Run("IncrementalSync", func(t *testing.T) {
+		// The caller's Open mark differs from openMax, so "advanced to 3000" and
+		// "left alone" are distinguishable outcomes.
+		start := Marks{PRD: time.Unix(1, 0), Open: time.Unix(2, 0)}
+		got, err := newTestService(&fakeStore{}).IncrementalSync(context.Background(), uuid.New(), 7, newFake(), start)
+		if err != nil {
+			t.Fatalf("IncrementalSync: %v", err)
+		}
+		assert(t, got)
+	})
 }
 
 // TestPerPathMarksZeroCases pins what an EMPTY fetch means, at the Sync level where

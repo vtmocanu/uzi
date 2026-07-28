@@ -301,8 +301,15 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 // FETCH (issue #177), not one shared between them. PRD bounds the PRD-labelled
 // fetch (state=all); Open bounds the additive open, no-label fetch. Each mark
 // advances only on its OWN fetch's evidence: to the max forge updated_at over
-// that fetch's RAW result, never past it, and never backwards. An empty result
-// carries no evidence and leaves its mark exactly where it was.
+// that fetch's RAW result, and never backwards. An empty result carries no
+// evidence and leaves its mark exactly where it was.
+//
+// The invariant is "never past the INSTANT ITS FETCH OBSERVED", which is not the
+// same as "never past that fetch's max". A mark routinely sits ABOVE the max of
+// the batch in front of it — Advance keeps 9000 over a fetch whose newest row is
+// 100, which is what monotonicity means and what
+// TestIncrementalSyncKeepsHWMWhenBatchOlder asserts. What must never happen is a
+// mark exceeding the read instant, because that is what skips a window.
 //
 // It replaces a single shared mark, and the reason that one could not work is
 // worth keeping, because folding these two fields back into one reads like a
@@ -331,11 +338,32 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 // beginning, forever. PRD #102 M6 is precisely what makes a board useful for such
 // a repo, and it is also what doubled the traffic that stall costs.
 //
-// Label transitions still work, per mark. An issue that GAINS the PRD label at t1
-// has its updated_at bumped to t1, and PRD < t1, so the PRD fetch returns it. One
-// that LOSES the label at t1 cannot appear in the PRD fetch, but Open < t1 and
-// withoutLabel now keeps it, so the open fetch does. One that loses the label AND
-// closes appears in neither; FullSync's eviction handles it, unchanged.
+// Label transitions still work, per mark. A transition bumps the issue's
+// updated_at to t1, and each mark is bounded by the instant its own last fetch
+// observed, so a mark below t1 means that fetch has not yet covered the change
+// and will return it.
+//
+//   - GAINS the PRD label at t1: PRD < t1 (the mark predates the change), so the
+//     PRD fetch returns it.
+//   - LOSES the label at t1: it cannot appear in the PRD fetch at all, but
+//     withoutLabel now KEEPS it, so the open fetch is what carries it — and if
+//     Open < t1 the very next open fetch does. Open >= t1 is possible when the
+//     loss predates the last open fetch, but then that fetch already returned the
+//     issue and it is already synced, so there is nothing left owing either way.
+//   - Loses the label AND closes: it appears in neither fetch; FullSync's
+//     eviction handles it, unchanged.
+//
+// NARROWING, seen and priced (auditor advisory, Low). A forge-supplied
+// FUTURE-dated updated_at now pins its own mark forward. The old shared min()
+// incidentally clamped such a value on one path against the other path's max;
+// per-fetch marks have nothing to clamp against, so one bad timestamp bounds one
+// fetch until it is repaired. This is not a regression in kind — the soundness
+// argument above always assumed updated_at <= the read instant, and a forge
+// violating that broke the old mark too, just less visibly. It is bounded:
+// FullSync takes no marks, so the next reconcile re-seeds both from its own
+// result, within FORGE_RECONCILE_EVERY × FORGE_POLL_INTERVAL (roughly ten
+// minutes at shipped defaults). Eviction is unaffected, since the keep-set is
+// built from what the fetches returned and never from a mark.
 type Marks struct {
 	PRD  time.Time // bounds the PRD-labelled fetch (state=all)
 	Open time.Time // bounds the additive open, no-label fetch
