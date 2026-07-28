@@ -25,8 +25,8 @@ import { RUN_ID_RE } from "./util.js";
  *  - the status lookup 404'd → also unknown, skip. A 404 is *probably* a deleted
  *    run whose HOME is genuinely garbage, but "probably" is not the standard
  *    here, and the cost of being wrong is asymmetric;
- *  - any non-terminal status (`queued`, `claimed`, `running`, `awaiting_approval`)
- *    → the run may still resume into this HOME, skip.
+ *  - any non-terminal status (`queued`, `claimed`, `running`, `awaiting_approval`,
+ *    `awaiting_input`) → the run may still resume into this HOME, skip.
  *
  * A requeued run reads `queued`, and a run live on ANOTHER worker sharing the
  * volume reads `running` — both non-terminal, both skipped.
@@ -54,9 +54,15 @@ import { RUN_ID_RE } from "./util.js";
  * is over", and a future reader must not upgrade that to "nothing is writing".
  */
 
-/** Run statuses a run never leaves (`runs.status` CHECK, migration `00020`:
- *  queued/claimed/running/awaiting_approval/completed/failed/cancelled). A run in
- *  one of these will never resume, so its HOME cannot be wanted again. */
+/** Run statuses a run never leaves (`runs.status` CHECK, created by migration
+ *  `00020` and widened by `00091` for PRD #88's clarification park: queued/claimed/
+ *  running/awaiting_approval/awaiting_input/completed/failed/cancelled). A run in one
+ *  of these will never resume, so its HOME cannot be wanted again.
+ *
+ *  The SET itself needed no change when the CHECK widened — it enumerates the
+ *  terminal statuses, and awaiting_input is non-terminal, so a parked run is
+ *  correctly skipped. Only this comment's enumeration was a present-tense claim about
+ *  current code that had gone stale. */
 export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
 
 /**
