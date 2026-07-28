@@ -14591,7 +14591,7 @@ because of that, and none of them said so out loud except one SQL comment.
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
 
-## 447. PRD #175 M1 — `GET /api/version` widens into a build-info object: `version` does not move, unknown is ABSENT, and the key set is closed by a walk over the TYPE
+## 448. PRD #175 M1 — `GET /api/version` widens into a build-info object: `version` does not move, unknown is ABSENT, and the key set is closed by a walk over the TYPE
 
 The endpoint returned one string. It now returns `apitypes.BuildInfoDTO`: `version` and
 `founded` always, plus `built_at`, `commit`, `commits` and `uptime_seconds` when the
@@ -14604,14 +14604,14 @@ not to any consumer of it.
   coordinated change across the SPA, the CLI, two route-classification tests and a
   feature that gates fleet upgrades.
   - **This section owns the KEY's stability; the PATH from that key to `cpVersion` is
-    §450's.** They move independently — the chain between them has already been
+    §451's.** They move independently — the chain between them has already been
     reshaped once without this bullet changing — so a change to how the value travels
     is not a reason to edit this one, and a reader who finds the two describing
     different things is reading them correctly.
 - **Unknown is OMITTED, never zero-valued.** A `dev` build reporting `commit: ""` and
   `built_at: "0001-01-01T00:00:00Z"` claims to know things it does not; omission keeps
   "we don't know" distinguishable from "the value is empty". This is the rule the rest
-  of the PRD keeps paying for at every boundary the value crosses (§450, §451).
+  of the PRD keeps paying for at every boundary the value crosses (§451, §452).
   - **`uptime_seconds` and `commits` are POINTERS for correctness, not tidiness.**
     `omitempty` on a bare `int64` would drop a genuine 0, and 0 is a legitimate uptime
     in a process's first second.
@@ -14632,7 +14632,7 @@ not to any consumer of it.
   home.** It was chosen at implementation time as the tidy option; `TestNoServerDeps`
   in `api/cmd/uzi/deps_test.go` bans `internal/handler` from the CLI's dependency
   closure, so a handler-local DTO would have FORCED M4 to duplicate the struct — the
-  duplication that quietly destroys the unknown-versus-zero distinction (§451).
+  duplication that quietly destroys the unknown-versus-zero distinction (§452).
   - **The package doc changed with it, and that is bigger than one type.** Until
     `BuildInfoDTO`, every type in that leaf sat behind `RequireUser`, so "is this field
     safe to expose?" had ONE package-level answer. It now has two. Someone adding a
@@ -14655,7 +14655,7 @@ not to any consumer of it.
     field behind it is a stale reason, and a stale reason is what makes the next
     addition look pre-approved.
 
-## 448. PRD #175 — `uptime_seconds` is a considered DISCLOSURE, and the reason first given for keeping it was a claim about the UI
+## 449. PRD #175 — `uptime_seconds` is a considered DISCLOSURE, and the reason first given for keeping it was a claim about the UI
 
 The decision: **no signed-out popover, and `uptime_seconds` is kept and declared
 public.** That is what the PRD recommended. Its stated REASON — "it keeps the blast
@@ -14697,15 +14697,15 @@ refuted it independently, from different starting points, before any code was wr
   runtime fact lives on this endpoint, "which replica", "how many replicas", "what
   region", "what pod" become the same kind of request rather than obviously out of
   scope, and every one of those is identity- or topology-bearing. The counterweight is
-  §447's closed key set, which matters more after this decision than before it.
+  §448's closed key set, which matters more after this decision than before it.
 
-## 449. PRD #175 M1/M3 — the stamps are ldflags on `cmd/server`, `built_at` is a CI VARIABLE and never a `date`, and the count rides a dotenv
+## 450. PRD #175 M1/M3 — the stamps are ldflags on `cmd/server`, `built_at` is a CI VARIABLE and never a `date`, and the count rides a dotenv
 
 - **`-X` names a package-level var by ITS OWN package path**, so `commit`, `builtAt` and
   `commits` live in `main` (`api/cmd/server`) even though they are served from
   `internal/handler`. They reach the handler through a single
   `SetBuildInfo(BuildStamp{…})` call as RAW strings: the handler decides what absent or
-  unparseable means, so there is exactly one such place (§447).
+  unparseable means, so there is exactly one such place (§448).
   - `BuildStamp` is a struct rather than three positional string parameters, which could
     be miscalled with two of them swapped and nothing — not the compiler, not vet —
     would say so.
@@ -14772,42 +14772,43 @@ refuted it independently, from different starting points, before any code was wr
   `CLAUDE.md`'s `semver.Compare` warning is entirely about which side of this line a
   string sits on.
 
-## 450. PRD #175 M2 — one promise, two hooks, a popover that takes its data as a PROP, and a CLOSED panel that is still the description
+## 451. PRD #175 M2 — one promise, two hooks, a popover that takes its data as a PROP, and a CLOSED panel that is still the description
 
-- **`useAppVersion` survives as a `.version` projection over `useBuildInfo`, both backed
-  by ONE module-scope promise — but NOT because the projection preserves a tri-state. It
-  FOLDS one, and the first version of the code comment claimed the opposite.** `"" ||
-  null` is `null`, so the hook emits exactly TWO states: null, or a non-empty string, and
-  both failure modes land on the same one — a rejected fetch resolves the shared snapshot
-  to null, and a `{"version": ""}` body is folded here. `FleetUpgradePanel` is written
-  for THREE: its `versionPending = cpVersion === null` separates "in flight" from
-  "resolved with no stamp", because conflating them once rendered a full fleet bar under
-  a heading saying classification was off, at T+270ms and flipping at T+670ms. From this
-  producer the middle state never arrives (§452). The fold is PRE-EXISTING — on `main`
-  the hook already ended `setVersion(v || null)` over a `.catch(() => "")` — and #175
-  changed the mechanism without changing the behaviour.
-  - **What the split still buys, and the reason to keep it:** this is the ONE place the
-    fold happens, so every consumer sees the same two-state value instead of writing its
-    own `.version || null`, and a consumer reaching for `.version` directly would get
-    `""` back and reintroduce the conflation at the call site.
-  - `AppShell.hooks.empty.test.tsx` pins the operator: flipping `||` to `??` — the
-    usually more correct operator, so the likeliest future cleanup — typechecks clean and
-    reddens nothing else while changing what the panel receives. Read it as pinning the
-    FOLD, not a tri-state.
-  - **TWO tests guard this seam and NEITHER is redundant, because each is blind to the
-    other's property.** The operator test above is the ENTIRE guard against `??`; the
-    chain test below cannot catch it, by construction, since its version is non-empty and
-    the two operators agree on every non-empty string. Stated because a later reader
-    counting two tests over one hook is exactly the reader who deletes one.
+- **Two hooks over ONE module-scope promise: `useBuildInfo` for the object, `useAppVersion`
+  for the release coordinate.** One request, two shapes, and the release coordinate's
+  state machine is §454's — that hook no longer projects over `useBuildInfo` at all, and
+  the fold this bullet used to describe is gone.
+  > **SUPERSEDED 2026-07-28 as to MECHANISM, by the tri-state fix (§454), on the owner's
+  > authority.** What stood here was accurate when written and is now false in four ways,
+  > kept in outline because the seam's INTENT outlived all four: `useAppVersion` was a
+  > `.version` projection over `useBuildInfo` (it now reads the snapshot directly, because
+  > it needs a discriminant `useBuildInfo` deliberately discards); it emitted TWO states
+  > (now three); both failure modes landed on `null` (a failed fetch is now `""`); and
+  > `AppShell.hooks.empty.test.tsx` pinned the FOLD (it now pins the pass-through, its
+  > assertion inverted with the contract rather than deleted with it). This is the second
+  > time this seam kept its shape while its justification was replaced, which is the
+  > durable observation about it.
+  - **What the split buys, and the one thing that survived both rewrites:** ONE place owns
+    the mapping, so every consumer sees the same value instead of reimplementing it at its
+    own call site — which is exactly how the two failure modes got conflated in the first
+    place.
+  - **`useBuildInfo` has ZERO production callers, and that is recorded rather than
+    resolved.** `SidebarContent` needs `fetchedAtMs` so it takes the private snapshot
+    hook; `useAppVersion` needs the discriminant so it does too. It is kept because it is
+    the seam the PRD specifies and its intended consumers are that PRD's named follow-ups
+    (an `/about` page, the CLI's `server` block), both of which want the whole object.
+    Deleting it would delete the contract, not an unused function — and if those
+    follow-ups are abandoned, this goes with them.
   - **The chain's POSITIVE arm had no coverage at all until it was given its own file,
     and the hole was proven by mutation rather than argued.** `GET /api/version` →
-    `useBuildInfoSnapshot` → `useBuildInfo` → `useAppVersion` → `WorkersSettings`
-    `cpVersion` → `FleetUpgradePanel` was tested at both ends and nowhere in between:
+    `useBuildInfoSnapshot` → `useAppVersion` → `WorkersSettings` `cpVersion` →
+    `FleetUpgradePanel` was tested at both ends and nowhere in between:
     `WorkerUpgradeBadge.test.tsx` passes `cpVersion` as a PROP so no hook runs and its
     only target-release assertion is an ABSENCE, and `WorkersSettings.test.tsx` resolves
-    `{version: ""}`, which the fold turns into the PENDING arm. Measured: hard-wiring
-    `cpVersion` to null — the page ignoring the endpoint this PRD widened, completely —
-    left the suite green at 1373/1373.
+    `{version: ""}`, which is a different arm either way — the PENDING one when that file
+    was written, the SETTLED-UNKNOWN one since §454. Measured: hard-wiring `cpVersion` to
+    null — the page ignoring the endpoint this PRD widened, completely — left the suite
+    green at 1373/1373.
     - **The fixture is a VERBATIM live wire body, and its field values must stay DISTINCT
       FROM ONE ANOTHER.** That distinctness is the whole discriminating power: projecting
       the wrong field (`?.version` → `?.founded`) has to yield a visibly wrong string. A
@@ -14861,7 +14862,7 @@ refuted it independently, from different starting points, before any code was wr
   render throw unmounts the shell. So every optional field is guarded with `typeof` plus
   `Number.isFinite` at the render boundary, not inside the formatters, which keep honest
   `number` signatures. Same boundary as the commit-SHA validity gate living server-side
-  (§447): the wire is not a place where either end can assume the other.
+  (§448): the wire is not a place where either end can assume the other.
 - **The failed fetch resolves to `null`, never a throw** — a 401 or a 500 on this endpoint
   must not take the chrome down with it. The popover's optional rows are simply absent,
   so an unstamped build shows a SHORTER panel rather than rows reading "unknown".
@@ -14870,7 +14871,7 @@ refuted it independently, from different starting points, before any code was wr
   renders minute-granular and carries the raw RFC3339, seconds and all. Until the row
   carried the full form it never reached the DOM at all, so selecting the row copied
   `366a282` and the operator was back to prefix-matching by hand — which is most of what
-  this PRD set out to delete. The server's `isFullSHA` gate (§447) exists to make the
+  this PRD set out to delete. The server's `isFullSHA` gate (§448) exists to make the
   stored value greppable, and that property dies at the render boundary if the renderer is
   the last place the full string exists.
   - **`built_at` renders the TIME, not the day alone.** Two images can ship the same day,
@@ -14914,7 +14915,7 @@ refuted it independently, from different starting points, before any code was wr
   and only has to beat its own siblings. Nothing above the footer sets `overflow-hidden`,
   so it is not clipped.
 
-## 451. PRD #175 M4 — `uzi version` WRAPS rather than reshapes, and the SHARED DTO is the only thing that keeps "unknown" unknown
+## 452. PRD #175 M4 — `uzi version` WRAPS rather than reshapes, and the SHARED DTO is the only thing that keeps "unknown" unknown
 
 - **The `--json` shape is `{version, server?}`: top-level `version` keeps its exact
   meaning — the CLI's own ldflags stamp — and the server's coordinates nest under a new
@@ -14925,7 +14926,7 @@ refuted it independently, from different starting points, before any code was wr
   `omitempty` tags verbatim, so an unstamped server's absent fields stay absent in
   `uzi version --json`. A local struct with plain `int` fields would render a dev server
   as `commits: 0` and `uptime: 0` — a build claiming to know things it does not, which is
-  the whole thing the server side spent a pointer to prevent. §447's dependency-closure
+  the whole thing the server side spent a pointer to prevent. §448's dependency-closure
   test is what makes the shared type reachable at all.
   - **`founded` is the exception, and the boundary is worth stating.** It has no
     `omitempty` — the server always sends it, and `TestBuildInfoDTOTags` pins
@@ -14956,7 +14957,7 @@ refuted it independently, from different starting points, before any code was wr
   the fact the guard's necessity rests on.
 - **The two consumers render `commit` differently ON PURPOSE.** `uzi version` prints all
   40 characters, because a terminal is exactly where greppable matters; the SPA popover
-  shortens it for a footer with no room, and carries the full value on the row (§450).
+  shortens it for a footer with no room, and carries the full value on the row (§451).
   What they must agree on is that the FULL value stays reachable — that is the property
   asked for, not a display convention.
 - **Two files the file map must not forget.** `uzicli.FakeClient` implements the widened
@@ -14965,37 +14966,37 @@ refuted it independently, from different starting points, before any code was wr
   nicety: `TestSkillMatchesCommandTree` asserts both directions between it and the command
   tree.
 
-## 452. PRD #175 — what this increment does NOT deliver, and the one hook arm that is DEAD
+## 453. PRD #175 — what this increment does NOT deliver, and the one open item that CLOSED
 
 - **No signed-out popover and no `/about` page.** Both are named follow-ups and both
-  would widen this body's audience, so either one re-opens §448's uptime judgement rather
+  would widen this body's audience, so either one re-opens §449's uptime judgement rather
   than inheriting it.
-- **🔴 `useAppVersion` CANNOT PRODUCE THE `""` ARM `FleetUpgradePanel` IMPLEMENTS —
-  pre-existing, preserved exactly by M2, and out of this PRD's scope.** The panel's prop
-  comment documents `""` as "resolved with no stamp" and its own test renders
-  `cpVersion=""` directly, so it is written for a tri-state its only production caller
-  cannot supply. **The MECHANISM changed under #175 while the behaviour did not, which is
-  why the obvious fix is not one:** before, `.catch(() => "")` plus `v || null` collapsed
-  `""` to `null`; now `.catch(() => null)` means a failed fetch never produces a
-  `BuildInfo` at all. So flipping `||` to `??` would have fixed it under the old code and
-  does NOT fix it now — `??` would only surface a resolved-but-EMPTY version, which the
-  server does not send (`SetVersion("")` leaves the `"dev"` default). A real fix must
-  reintroduce a distinct resolved-but-failed state in `BuildInfoSnapshot`.
-  - Symptom: a failed `GET /api/version` leaves the fleet panel reporting "version
-    pending" forever instead of "no release stamp — classification off", because
-    `versionPending` is true both while the fetch is in flight AND after it has
-    permanently failed. Fleet-facing, and a behaviour change to fix, so it is the owner's
-    call rather than this PRD's.
-  - **The two-hook seam of §450 stands on a different footing than the one first written
-    for it**: not "it preserves the tri-state" (it does not), but "it is the single site
-    of the fold". Recorded together because the seam kept its shape while its
-    justification was replaced.
+- **~~`useAppVersion` cannot produce the `""` arm `FleetUpgradePanel` implements.~~
+  DELIVERED 2026-07-28 — see §454.** This was the single largest open item in the
+  increment and it is no longer open.
+  > **The entry is retired in place rather than deleted, and the distinction matters for
+  > a "what we did not deliver" section:** a list that quietly loses its own open items
+  > reads as though they were never there, which makes it useless as a record of what a
+  > rebuild inherits. What it said, so the supersession is legible: the panel implements
+  > a tri-state its only production caller could not supply, because a failed fetch and
+  > an in-flight one both arrived as `null`; the fix would have to reintroduce a distinct
+  > resolved-but-failed state in `BuildInfoSnapshot`; and it was a behaviour change, so
+  > the owner's call rather than this PRD's.
+  >
+  > **Every part of that held, including the prescription.** The fix is exactly the
+  > discriminated snapshot the entry named, and the two traps it recorded were both real:
+  > flipping `||` to `??` would not have fixed it (a failed fetch produced no `BuildInfo`
+  > for any operator to act on), and the fix had to land upstream of the projection. The
+  > owner authorised it 2026-07-28; the lead ruled it a FIX rather than a ratified
+  > requirement, so nothing about it is in `specs/human.md` — the panel already
+  > implemented and tested the arm, so this made an existing constraint reachable rather
+  > than adding a new one.
 - **`commits` is only ever present on a tagged release build.** It is independently
   droppable by construction: nothing may depend on its presence, and every consumer must
   render correctly without it. Neither the compose stack nor the e2e harness ever sees it.
 - **Neither CI expansion has a pre-merge proof, by construction.** `$CI_JOB_STARTED_AT`
   and the dotenv both expand only in a tag pipeline, and both fail silently into an
-  omitted field. The permanent observation point in §449 is the only place a regression
+  omitted field. The permanent observation point in §450 is the only place a regression
   would ever be visible, and it is post-merge. Also unmeasured: whether `started_at` is
   populated at the moment the runner receives the payload — if it is not, released images
   simply carry no `built_at`, and the first release is where that shows.
@@ -15003,3 +15004,70 @@ refuted it independently, from different starting points, before any code was wr
   Go would hand over `vcs.revision` and `vcs.time` for free. It cannot work here —
   `publish:api`'s kaniko context is `api/`, with no `.git` in it to stamp from — and
   `-buildvcs=false` is additionally a deliberate reproducibility choice.
+
+## 454. PRD #175 / issue #16 — the failure gets a VALUE: three discriminated states, and the arm the panel already had
+
+Owner-authorised 2026-07-28, ruled a fix rather than a ratified requirement (`human.md`
+untouched: the consumer already implemented and tested the arm, so this made an existing
+constraint reachable rather than adding one). It closes §453's largest open item and
+supersedes §451's fold.
+
+- **A settled failure needs a VALUE, not an absence — that is the whole fix and it
+  generalises past this hook.** Resolving a failure to `null` and resolving a success to
+  an object are indistinguishable to a consumer holding only the result, so the shared
+  promise now resolves to a discriminated `BuildInfoSnapshot`:
+
+  | snapshot | meaning |
+  |---|---|
+  | `null` | IN FLIGHT — nothing has settled |
+  | `{status:"failed"}` | settled, and we will never know. Permanent |
+  | `{status:"ok",info,fetchedAtMs}` | settled with a body |
+
+  The swallow is **unchanged in strength** — nothing rethrows and the shell still renders
+  on a 401 or a 500. What changed is what the `catch` resolves TO.
+- **`useAppVersion` is where the tri-state is produced, and it reads the snapshot
+  DIRECTLY rather than through `useBuildInfo`**, because it needs a discriminant that
+  hook deliberately discards: `null` in flight, `""` settled-unknown (failed fetch OR an
+  empty `version` in the body), `"x"` settled and stamped. `useBuildInfo` stays
+  two-state on purpose — there is nothing to render for either non-`ok` case.
+- **`?? ""` rather than `|| ""` on the projection, and the two are behaviourally
+  identical here.** Only ABSENT becomes `""`; a server-sent `""` is already the
+  settled-unknown value to pass through. Chosen to state the intent, which is worth
+  noting precisely because it is the rare case where the operator choice is NOT
+  load-bearing — the previous `||` was, and a reader who remembers that would assume
+  this one is too.
+- **`""` HAS TWO UPSTREAM CAUSES and the panel cannot tell them apart** — an empty
+  `version` in the body, or a failed fetch. Whatever that arm says has to be true of
+  both, which is the constraint on its copy.
+  - **The two test files are each the SOLE guard on ONE of those causes, and neither
+    subsumes the other.** Proved by mutating each path separately: folding only the
+    FAILED path back to `null` reddens `WorkersSettings.cpversion.failed.test.tsx` and
+    leaves `AppShell.hooks.empty.test.tsx` GREEN; folding only the EMPTY-BODY path
+    reddens `hooks.empty` and leaves `cpversion.failed` GREEN. One pins the mapping, the
+    other pins that a consumer actually renders it.
+  - This replaces §451's "each blind to the other's property" pairing, which was true of
+    the old pair and is retired with the fold it described. The durable half is unchanged
+    and is why both are recorded: **a reader counting two tests over one hook is the
+    reader who deletes one.**
+- **🔴 THE COPY THE PANEL USED TO RENDER WAS FALSE, AND NOBODY HAD EVER READ IT.**
+  `no release stamp — classification off` claimed classification had stopped while the
+  panel rendered a fully classified fleet underneath it. It now reads **`control-plane
+  release unknown — targets unchecked`**, which names the two things actually degraded.
+  Unreachable code and false copy is a combination worth naming: the arm could not fire
+  until this fix, so the sentence had never been shown to anyone who could notice.
+  - **Everything except divergence is SERVER-computed**, which is what made the old copy
+    false: the counts, the bar and the attention line all come from each worker's own
+    `upgrade_status` and never consult `cpVersion`. A failed version fetch degrades
+    exactly one comparison, not the classification.
+  - **🔴 THE DIVERGENCE CHECK IS SKIPPED SILENTLY WHEN `cpVersion` IS FALSY.**
+    `fleetSummary`'s hosted-worker comparison is guarded by `… && cpVersion && …`, so
+    `divergentCount` is 0 exactly when the control-plane release is unknown — **the
+    ABSENCE of a divergence note in that state is not evidence of agreement.** That is
+    what "targets unchecked" exists to say. Invisible in the code and found only by
+    auditing the fix, which is why it is written down rather than left to the guard.
+- **The same self-contradiction, twice, by different routes.** The measured bug this seam
+  was built for (a full fleet bar under a heading saying classification was off, T+270ms
+  flipping at T+670ms) and this false copy are the same failure: a panel asserting its
+  own numbers are meaningless while rendering them. The first arrived through a race, the
+  second through unreachable copy. Worth pairing, because the next instance will arrive
+  through a third route and the shape is the recognisable part.

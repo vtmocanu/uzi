@@ -574,7 +574,7 @@ Tracked as GitLab issue vtmocanu/uzi#175; PRD at `prds/175-build-info-popover.md
 **Ratified [user 2026-07-28].** The user asked for the feature and stated no design
 requirement; the team decided its shape. The two below were put to the owner because
 they are durable product constraints rather than implementation choices. Every other
-decision on this feature is the team's and lives in `specs/ai.md` §447-§452.
+decision on this feature is the team's and lives in `specs/ai.md` §448-§454.
 
 - `GET /api/version` publishes `uptime_seconds` on an unauthenticated, unrate-limited,
   ingress-reachable endpoint. Uptime is accepted as public; severity Low.
