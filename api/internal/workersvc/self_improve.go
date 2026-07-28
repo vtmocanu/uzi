@@ -40,6 +40,8 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 		IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
 		IssueTitle:       title,
 		IssueDescription: description,
+		// PRD #35: the OWNER's default. An engine tick has no user in the loop either.
+		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

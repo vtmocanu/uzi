@@ -877,3 +877,170 @@ describe("FinishTokens $0 cost (Decision 8)", () => {
     expect(container.textContent).not.toContain("$");
   });
 });
+
+// PRD #35. The two rows share a component and differ in tone and wording, so each
+// case here names which of the two it is pinning.
+describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
+  const RESETS = Date.UTC(2026, 6, 27, 21, 0, 0);
+  const ISO = new Date(RESETS).toISOString();
+
+  it("renders a limit_wait row as a warn-toned PAUSE, never as breakage", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: ISO } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).toContain("paused until it resets");
+    expect(container.textContent).toContain("5-hour window");
+    // Warn, not danger: nothing failed and the run comes back on its own.
+    expect(container.querySelector(".text-warn")).not.toBeNull();
+    expect(container.querySelector(".text-danger")).toBeNull();
+  });
+
+  it("renders a limit_hit row as a DANGER-toned death, with no 'paused' wording", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 2, kind: "limit_hit", payload: { rate_limit_type: "seven_day_opus", resets_at: ISO } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+    expect(container.textContent).not.toContain("paused");
+    expect(container.textContent).toContain("7-day Opus window");
+    expect(container.querySelector(".text-danger")).not.toBeNull();
+  });
+
+  it("🔴 states the death in TEXT — its predicate is not a prefix of the park's", () => {
+    // web-ux F3. The death row used to read "Anthropic usage limit reached" against
+    // the park's "…reached — paused until it resets", so the death text was a strict
+    // PREFIX of the park's and the terminal outcome was carried entirely by a MISSING
+    // clause, plus colour, plus a glyph that is aria-hidden.
+    //
+    // Grayscale was fine (⏸ vs ✗ carries it), so this was never a colourblindness
+    // problem — it was a screen-reader one, and in the worst direction: the MORE
+    // severe of the two events announced as the LESS marked one.
+    const hit = render(
+      <RunEventRow msg={msg({ seq: 20, kind: "limit_hit", payload: { rate_limit_type: "five_hour" } })} live={false} />,
+    );
+    const hitText = hit.container.textContent ?? "";
+    cleanup();
+    const wait = render(
+      <RunEventRow msg={msg({ seq: 21, kind: "limit_wait", payload: { rate_limit_type: "five_hour" } })} live={false} />,
+    );
+    const waitText = wait.container.textContent ?? "";
+
+    // The load-bearing property, asserted structurally rather than by matching a
+    // sentence: neither row's text may be a prefix of the other's, or the difference
+    // is again carried by absence.
+    expect(waitText.startsWith(hitText)).toBe(false);
+    expect(hitText.startsWith(waitText)).toBe(false);
+    // And the death states its outcome positively.
+    expect(hitText).toMatch(/the run failed here/i);
+  });
+
+  it("words the death by OUTCOME, not by cause", () => {
+    // "waiting is off for this run" would be accurate today — runner.ts's opted-out
+    // branch is limit_hit's only emitter. It is not accurate by construction:
+    // judge-runner.ts already reports the same structured facts on its own failure
+    // path, and gaining a feed line there is a one-line change. The outcome holds for
+    // any emitter; the cause holds only for the current one.
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 22, kind: "limit_hit", payload: {} })} live={false} />,
+    );
+    expect(container.textContent).not.toMatch(/waiting is off|opted out/i);
+  });
+
+  it("🔴 does NOT echo an unrecognised rate_limit_type — the server's allowlist cannot reach this field", () => {
+    // The `rate_limit_type` on a run_message payload is arbitrary worker-authored
+    // text: payloads are worker JSON and the only server-side processing is a NUL
+    // strip and a rune cap. The enum allowlist people reach for when reviewing this
+    // guards the run ROW's column, on a different write path entirely.
+    //
+    // So the assertion is stronger than "it is escaped": the value must not appear in
+    // the output at all, and the sentence must still read correctly without it.
+    const hostile = "<img src=x onerror=alert(1)>";
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 3, kind: "limit_wait", payload: { rate_limit_type: hostile } })} live={false} />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).not.toContain("onerror");
+    expect(container.textContent).not.toContain("img src");
+    // The row is still useful without the clause.
+    expect(container.textContent).toContain("Anthropic usage limit reached");
+  });
+
+  it("drops a malformed resets_at rather than rendering a plausible-looking wrong date", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 4, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: "whenever" } })}
+        live={false}
+      />,
+    );
+    // Not a bare `not.toContain("resets")` — the row's own sentence ends "…until it
+    // resets", so that would pass for the wrong reason and fail for the right one.
+    // The clause under test is "resets <date>".
+    expect(container.textContent).not.toMatch(/resets \S/);
+    expect(container.textContent).not.toContain("Invalid");
+    expect(container.textContent).not.toContain("NaN");
+    // The window still renders — one unusable field must not blank the other.
+    expect(container.textContent).toContain("5-hour window");
+  });
+
+  it("guards against a NUMERIC resets_at, which the contract forbids and the field cannot", () => {
+    // The worker emits an ISO string. But this payload reaches the database through
+    // nothing but a NUL strip and a rune cap, so "the emitter promises a string" is a
+    // statement about the worker we ship, not about the bytes that can arrive. A
+    // seconds-valued number falling through would render an authoritative-looking
+    // 1970 — worse than no clause. This is a guard, not the contract, and the case
+    // exists so nobody deletes the arm as dead code.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 5, kind: "limit_wait", payload: { rate_limit_type: "five_hour", resets_at: RESETS / 1000 } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain(new Date(RESETS).toLocaleString());
+    expect(container.textContent).not.toContain("1970");
+  });
+
+  it("🔴 never renders an 'attempt' clause, even when a payload carries one", () => {
+    // The key was in PRD Decision 10 and was DROPPED: limit_wait_count is incremented
+    // by the server after this message is written, so any worker-supplied value is a
+    // stale N-1 that disagrees with the run row. The live count renders in the
+    // run-view strip, off the DTO.
+    //
+    // Asserted against a payload that HAS the key, because that is the only version
+    // of this test that fails against a renderer which quietly reads it again.
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 6, kind: "limit_wait", payload: { rate_limit_type: "five_hour", attempt: 7 } })} live={false} />,
+    );
+    expect(container.textContent).not.toContain("attempt");
+    expect(container.textContent).not.toContain("7");
+    expect(container.textContent).toContain("5-hour window");
+  });
+
+  it("renders the OMITTED-key payload without inventing detail", () => {
+    // Both keys are left out rather than sent as null when the SDK frame carried
+    // neither, so this is what "unknown" actually looks like on the wire. The row
+    // still has to say the one thing it is for.
+    for (const payload of [{}, null]) {
+      cleanup();
+      const { container } = render(<RunEventRow msg={msg({ seq: 8, kind: "limit_wait", payload })} live={false} />);
+      expect(container.textContent).toContain("Anthropic usage limit reached");
+      expect(container.textContent).not.toContain("(");
+    }
+  });
+
+  it("no longer falls through to the 'unrenderable' arm", () => {
+    // What both kinds rendered as before this change: a muted "unrenderable
+    // limit_wait event" line. Pinned so a future refactor that drops the cases fails
+    // here rather than quietly regressing to it.
+    for (const kind of ["limit_wait", "limit_hit"]) {
+      cleanup();
+      const { container } = render(<RunEventRow msg={msg({ seq: 9, kind, payload: {} })} live={false} />);
+      expect(container.textContent).not.toContain("unrenderable");
+    }
+  });
+});

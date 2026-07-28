@@ -2,7 +2,12 @@
 .env
 
 # Node
-web/node_modules/
+# No trailing slash on node_modules, deliberately: a trailing slash matches a
+# DIRECTORY only, and CLAUDE.md tells you to symlink node_modules from another
+# worktree rather than run `npm ci` (its postinstall clobbers the host's
+# agent-browser). A symlink is not a directory, so `web/node_modules/` left the
+# symlink untracked and one `git add -A` staged a link pointing outside the repo.
+web/node_modules
 web/dist/
 
 # Go

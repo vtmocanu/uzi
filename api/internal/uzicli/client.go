@@ -100,8 +100,16 @@ type Client interface {
 	// terminal (Reason set). POST not GET so the verifier never lands in an access log.
 	PollCLIAuth(ctx context.Context, requestID, verifier string) (CLIAuthPollResult, error)
 	// CreateRun queues an agent run on a repo's PRD issue: POST /api/repos/{id}/runs
-	// {issue_iid}. Returns the created run.
-	CreateRun(ctx context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error)
+	// {issue_iid, wait_on_limit?}. Returns the created run.
+	//
+	// waitOnLimit is the PRD #35 usage-limit opt-in and is TRI-STATE, which is why it
+	// is a pointer rather than a bool: nil OMITS the key, and the server then stamps
+	// the run from the owner's own Settings default. A non-nil false is a different
+	// statement — "this run, explicitly, must not park" — and overrides that default.
+	// Collapsing the two would make every CLI-created run silently opt OUT the moment
+	// this parameter shipped, which is the exact defect the server's own field comment
+	// cites for taking a *bool.
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error)
 	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
 	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
 	// sel is legal only with approve_plan; the server validates it against the run's
@@ -824,11 +832,20 @@ func pollStatusField(body []byte) string {
 	return "expired"
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	reqBody := map[string]int64{"issue_iid": issueIID}
+	// A struct rather than the map this used to build, because the map could not
+	// express the tri-state: `omitempty` on a POINTER omits only nil, so a non-nil
+	// false still marshals as `"wait_on_limit": false`. That is the whole contract —
+	// omitted means "inherit my default", present-and-false means "explicitly not this
+	// run". A `map[string]any` with an `if != nil` guard would work too and is worse:
+	// it puts the rule in a conditional instead of in the type.
+	reqBody := struct {
+		IssueIID    int64 `json:"issue_iid"`
+		WaitOnLimit *bool `json:"wait_on_limit,omitempty"`
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}

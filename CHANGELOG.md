@@ -102,6 +102,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   column, so the three-way choice the CLI could already *set* is finally one it can *show*
   (PRD #111 M1 + M5).
 
+- **A run that hits your Anthropic usage limit can now pause instead of failing.** Opt in
+  per run from the run view, or set the default for every new run in Settings — off until
+  you turn it on, and the Settings default is the **only** way to reach an autopilot,
+  CI-fix, or self-improvement run, since none of those has a start button of its own. A
+  paused run keeps its branch, its history, and an already-approved plan: once your 5-hour
+  or 7-day window reopens it resumes on the same worker in the same session, without asking
+  you to re-approve a plan it already had. It can pause more than once if the limit keeps
+  recurring, backing off between attempts, up to a retry budget an operator can tune
+  alongside how long any one pause may last (`RUN_LIMIT_MAX_WAITS`, `RUN_LIMIT_MAX_PARK` —
+  see [docs/configuration.md](docs/configuration.md)). A run that stays opted out still
+  fails the moment it hits the limit, exactly as before, but now says which window and when
+  it resets instead of a bare `agent run failed: error_during_execution` (PRD #35).
+
 ### Changed
 
 - **The board's implicit first column is now named Backlog, not Open.**

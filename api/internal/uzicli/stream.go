@@ -42,13 +42,45 @@ var knownRunEventTypes = map[string]struct{}{
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a
-// CHECK constraint over exactly these seven values (migration 00020_workers_runs.sql).
-// A value outside the set cannot be stored, so one arriving on the wire means the
-// server is newer than this binary — which is precisely when it must not be trusted
-// to mean "active".
+// CHECK constraint over exactly these eight values (runs_status_check, declared
+// inline in 00020_workers_runs.sql and widened with 'limit_wait' by PRD #35's
+// migration). A value outside the set cannot be stored, so one arriving on the wire
+// means the server is newer than this binary — which is precisely when it must not be
+// trusted to mean "active".
+//
+// THIS MAP MUST BE WIDENED IN THE SAME COMMIT AS THE CHECK. It is not a display
+// concern: NormalizeRunEvent rewrites any status outside it to RunStatusUnknown at the
+// DECODE boundary, so a status the DB accepts and this map omits reaches every CLI and
+// TUI consumer as "unknown" — silently, and with the opposite meaning to the one
+// intended, since the comment below turns an unrecognised status into "do not trust
+// this to be active".
+//
+// Two tests enforce this, and they cover different halves:
+//
+//   - TestKnownRunStatusesMatchTheDocumentedCount pins the map against the COUNT in the
+//     first sentence, so editing one without the other fails.
+//   - TestKnownRunStatusesMatchTheMigrationCheck pins it against runs_status_check
+//     ITSELF, parsed out of the migration that last declares it. That is the one that
+//     matters: it is what makes "widen the CHECK, forget this map" a red test instead of
+//     a silent downgrade of every run in the new status.
+//
+// An earlier version of this comment claimed the second test was impossible here,
+// because uzicli is a leaf package that cannot import the store. That was wrong twice
+// over: the package already imports apitypes and coder/websocket, and reading a file
+// needs no import at all — internal/uzicli sits at the same depth as internal/workersvc,
+// whose auto_select_test.go established the `../store/migrations/` path literal.
+//
+// What is still NOT covered is one narrow case, measured rather than assumed: a future
+// migration that widens the domain WITHOUT ever naming runs_status_check passes
+// silently, because the scan selects its file by that name. A plain rename does not
+// slip through — it fails loudly instead — and a DROP-then-ADD-under-a-new-name is
+// caught, because the DROP still names it. See the test for the full table.
 var knownRunStatuses = map[string]struct{}{
 	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
-	"completed": {}, "failed": {}, "cancelled": {},
+	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.
+	// NON-terminal — it is deliberately absent from terminalRunStatuses below.
+	"limit_wait": {},
+	"completed":  {}, "failed": {}, "cancelled": {},
 }
 
 // terminalRunStatuses are the three a run never leaves. Verified against the requeue

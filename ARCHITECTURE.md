@@ -473,8 +473,24 @@ issue). Status is a linear state machine:
 queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → running → completed
                                                                              → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
+   ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
+
+- **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
+  exhausts the owner's Anthropic usage limit **parks** instead of failing: the
+  worker's slot is released, but its runner clone, skills plugin dir and per-run
+  SDK home stay on disk, which is what lets the resume continue the same session
+  rather than starting fresh. A sweeper pass promotes it back to `queued` once
+  `retry_not_before` passes, and the resume skips the plan gate when the plan was
+  already approved. Two independent guards keep the on-disk state alive: the
+  runner's cleanup carve-out (teardown) and `home-reclaim`'s terminal-status check
+  (the background sweep, hours later) — losing either loses the transcript. The
+  park is server-timed and server-clamped, never worker-trusted; `retry_not_before`
+  means *the earliest moment this user could spend anything*, computed at park time
+  across the whole credential pool. See [adr/0035-run-limit-retry.md](adr/0035-run-limit-retry.md)
+  for why that timing could not be deferred to the claim, and
+  `prds/done/35-run-limit-retry.md` for the fourteen decisions.
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),

@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -320,7 +321,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
-		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7); return e }},
+		{"create-run", func(c *HTTPClient) error { _, e := c.CreateRun(context.Background(), "p1", 7, nil); return e }},
 		{"submit-run-input", func(c *HTTPClient) error {
 			_, e := c.SubmitRunInput(context.Background(), "r1", "cancel", "", nil)
 			return e
@@ -358,5 +359,61 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 				t.Errorf("%s/%s: err is not *ExitError: %T %v", call.name, sName, err, err)
 			}
 		}
+	}
+}
+
+// TestCreateRunWireBodyOmitsAbsentWaitOnLimit asserts the tri-state on the WIRE, which
+// is the only place it is actually decided.
+//
+// The command-level test proves the CLI resolves the flag to nil; this proves nil then
+// produces a body with NO `wait_on_limit` key at all. Those are two different failures
+// with the same visible symptom: a `map[string]any{"wait_on_limit": waitOnLimit}` built
+// without a nil guard, or a non-pointer field, marshals `"wait_on_limit": null` or
+// `false` — both of which the server reads as a decision the user never made, and
+// neither of which the command-level test can see.
+//
+// Asserted on the RAW BYTES rather than by decoding into a struct: decoding into a
+// *bool maps an explicit `null` and an absent key to the same nil, so it would agree
+// with the broken implementation.
+func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
+	tr := true
+	fa := false
+	for _, tc := range []struct {
+		name        string
+		in          *bool
+		wantPresent bool
+		wantJSON    string
+	}{
+		{"absent omits the key entirely", nil, false, ""},
+		{"explicit true", &tr, true, `"wait_on_limit":true`},
+		{"explicit false is SENT, not omitted", &fa, true, `"wait_on_limit":false`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b := make([]byte, r.ContentLength)
+				_, _ = io.ReadFull(r.Body, b)
+				body = string(b)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"queued"}}`))
+			}))
+			defer srv.Close()
+
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			if !strings.Contains(body, `"issue_iid":42`) {
+				t.Errorf("body lost issue_iid: %s", body)
+			}
+			if got := strings.Contains(body, "wait_on_limit"); got != tc.wantPresent {
+				t.Errorf("wait_on_limit present = %v, want %v; body = %s\n"+
+					"An absent flag must send NO key — the server stamps the run from the owner's Settings "+
+					"default when the field is missing, and reads null or false as an explicit decision.",
+					got, tc.wantPresent, body)
+			}
+			if tc.wantJSON != "" && !strings.Contains(body, tc.wantJSON) {
+				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+		})
 	}
 }

@@ -40,6 +40,9 @@ export class FakeApi {
   private msgFailRemaining = 0;
   private msgFailStatus = 503;
   private readonly alreadyTerminal = new Set<string>();
+  private readonly stateStatusOverride = new Map<string, string>();
+  private readonly stateRawOverride = new Map<string, { status: number; body: string }>();
+  private readonly refuseAllStates = new Set<string>();
 
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
@@ -108,6 +111,36 @@ export class FakeApi {
   /** Make /state answer 409 for this run's terminal reports (already finalized). */
   markAlreadyTerminal(runId: string): void {
     this.alreadyTerminal.add(runId);
+  }
+
+  /**
+   * Make /state answer 200 while reporting a DIFFERENT status than the one asked
+   * for — the shape the real server produces when it declines a park on one of its
+   * designed paths (retry budget exhausted, RUN_LIMIT_MAX_PARK clamp exceeded, or
+   * the wait_on_limit=false coercion) and fails the run instead.
+   *
+   * This is the case an `applied`-keyed implementation gets wrong, because the
+   * server applied a transition — just not the requested one — so `applied` is
+   * true (PRD #35's park acknowledgement contract). Without this hook the fake can
+   * only express "applied" and "409", and a test suite built on those two passes
+   * against the broken implementation.
+   */
+  overrideStateStatus(runId: string, status: string): void {
+    this.stateStatusOverride.set(runId, status);
+  }
+
+  /** Answer /state for this run with a verbatim body — for the malformed and
+   *  older-server shapes a JSON-typed helper cannot express. */
+  sendRawState(runId: string, status: number, body: string): void {
+    this.stateRawOverride.set(runId, { status, body });
+  }
+
+  /** Refuse EVERY /state report for this run with a 409, whatever its status.
+   *  markAlreadyTerminal only fires for terminal reports, so it cannot express a
+   *  non-terminal report (limit_wait) racing a server-side cancel — which is
+   *  precisely the case PRD #35's park has to survive. */
+  refuseStateWith409(runId: string): void {
+    this.refuseAllStates.add(runId);
   }
 
   setInputs(runId: string, inputs: UserInput[]): void {
@@ -237,13 +270,28 @@ export class FakeApi {
       this.stateFailRemaining--;
       return send(res, this.stateFailStatus, { error: "injected failure" });
     }
+    const raw = this.stateRawOverride.get(runId);
+    if (raw) {
+      res.writeHead(raw.status, { "Content-Type": "application/json" });
+      res.end(raw.body);
+      return;
+    }
     const body = json as unknown as StateRequest;
+    if (this.refuseAllStates.has(runId)) {
+      return send(res, 409, { error: "run already terminal", run: { id: runId, status: "cancelled" } });
+    }
     const terminal = body.status === "completed" || body.status === "failed";
+    // Both answers carry `{"run": {...}}` because BOTH real handlers do
+    // (handler/worker_protocol.go, the 409 at :483 and the 200 at :486). This fake
+    // used to answer `{}` and `{"error": ...}`, which was harmless while the client
+    // discarded the body and became a lie the moment PRD #35 made the run's real
+    // status load-bearing — the exact "two lenient fakes" drift the claim wire
+    // contract exists to prevent, one endpoint over.
     if (terminal && this.alreadyTerminal.has(runId)) {
-      return send(res, 409, { error: "run already terminal" });
+      return send(res, 409, { error: "run already terminal", run: { id: runId, status: "cancelled" } });
     }
     this.states.push({ runId, body });
-    send(res, 200, {});
+    send(res, 200, { run: { id: runId, status: this.stateStatusOverride.get(runId) ?? body.status } });
   }
 }
 

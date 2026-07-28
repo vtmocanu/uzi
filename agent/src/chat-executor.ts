@@ -39,6 +39,7 @@ import { buildSdkEnv } from "./sdk-env.js";
 import { buildPreToolUseHook, buildPathGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
+import { classifyLimitFailure, describeLimit, RateLimitObserver } from "./limit.js";
 import { errMessage } from "./util.js";
 
 /** Where the worker image bakes uzi's own source, read-only (PRD #39 Decision 5). */
@@ -446,13 +447,20 @@ export class ChatExecutor {
     let turnSessionId = resumeId;
     let sawError = false;
     let errorSubtype = "unknown";
+    // PRD #35 Decision 9: chat NEVER auto-retries — a conversation turn is not
+    // work-in-progress and there is nothing to resume into. What the user gets is
+    // the truth about why the assistant went quiet, instead of a bare subtype.
+    const rateLimits = new RateLimitObserver();
+    let resultFrame: unknown;
     try {
       const queryInstance = this.queryFn({ prompt: promptStream(userMessage), options });
       for await (const msg of queryInstance) {
         const sid = sessionIdOf(msg);
         if (sid) turnSessionId = sid;
+        rateLimits.observe(msg);
         for (const em of mapSdkMessage(msg)) ctx.emit(em);
         if (isResult(msg)) {
+          resultFrame = msg;
           if (isErrorResult(msg)) {
             sawError = true;
             errorSubtype = ((msg as { subtype?: unknown }).subtype as string) ?? "unknown";
@@ -480,7 +488,11 @@ export class ChatExecutor {
       return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "timeout" });
     }
     if (sawError) {
-      ctx.emit({ kind: "error", agent: "worker", payload: { text: `chat turn failed: ${errorSubtype}` } });
+      const limit = classifyLimitFailure(resultFrame, rateLimits.latest, Date.now());
+      const text = limit
+        ? `Anthropic usage limit reached (${describeLimit(limit)}) — ask again once it resets`
+        : `chat turn failed: ${errorSubtype}`;
+      ctx.emit({ kind: "error", agent: "worker", payload: { text } });
       return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "error" });
     }
     return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "ok" });

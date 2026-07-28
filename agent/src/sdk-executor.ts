@@ -34,10 +34,11 @@ import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { installJsDeps, type JsDepsInstall, type JsDepsResult } from "./js-deps.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
-import { resolveAgentSelection, type ClaimConfig } from "./protocol.js";
+import { resolveAgentSelection, type AgentSelectionParse, type ClaimConfig } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
+import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -405,12 +406,91 @@ export class SdkExecutor implements Executor {
     let resumeId = ctx.sessionId ?? undefined;
 
     try {
+      // --- PRD #35 Decision 6b: resume past an approval that already happened ---
+      //
+      // Both conditions are required and the runner supplies both. `planApproved`
+      // alone is not enough: without a resumable session there is no conversation to
+      // continue, and without the plan text the implement loop would start with no
+      // instructions. Either missing ⇒ fall through and plan as today, which is also
+      // what a park BEFORE approval does.
+      //
+      // Skipping the gate here is NOT a weakening of the approval guardrail. The
+      // approval already happened, on this exact plan, and is recorded server-side as
+      // a consumed approve_plan input (or the run is autopilot). What is skipped is
+      // asking a human to approve the SAME plan a second time because the worker lost
+      // a token window — the alternative is not "more oversight", it is a run that
+      // parks at awaiting_approval unattended and can then die on REASON_NO_PLAN when
+      // the resumed session declines to re-emit signal_plan.
+      const preApproved = ctx.planApproved === true && !!ctx.sessionId && !!ctx.approvedPlan?.trim();
+
+      // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
+      // planning label) reads the same values on both paths.
+      const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
+      const isSelfImprove = ctx.kind === "self_improve";
+      // Assigned by the gate below, or seeded directly on the pre-approved path.
+      let approvedPlan: string;
+      // The agent selection the approve verdict carried (PRD #37).
+      //
+      // The persisted selection now arrives ON THE CLAIM (PRD #35), so a pre-approved
+      // resume honours the same human verdict that let it skip the gate. This block
+      // used to describe a LIVE DEFECT — the claim carried no selection and a human
+      // who excluded a subagent got it back after a park. That is fixed; what follows
+      // is about the one path that still resolves without a selection.
+      //
+      // WHEN THE CLAIM CARRIES NOTHING there are two cases and they want the SAME
+      // handling, which is why neither is special-cased:
+      //   - the run never reached a gate, so there is no human verdict to honour and
+      //     the absent-default IS the correct answer, not a degradation; and
+      //   - the server predates the field.
+      //
+      // WHAT THE ABSENT-DEFAULT DOES, kept because it is what the second case gets
+      // and because an earlier version of this comment understated it and got one
+      // claim wrong outright:
+      //
+      //  1. The larger effect is not exclusions, it is the SOURCE — `own` becomes
+      //     `repo` whenever the clone has a roster. Dropped exclusions are secondary.
+      //  2. "Every subagent is still drawn from the same vetted set" — WHAT THIS
+      //     COMMENT USED TO SAY — IS FALSE. selectSubagents("repo", …) returns
+      //     subagentsFromTemplates(repoTemplates, …): the CLONED REPO's
+      //     `.claude/agents/` files, not the owner's admin-allocated templates. A
+      //     different set, not the same set differently filtered.
+      //  3. The skill-scoping regime changes with the source, per agents.ts's own
+      //     docstring: `own` keeps skills per-template (the allocations ARE the
+      //     admin's scoping surface there), while `repo` gives every subagent the
+      //     run's whole surviving skill set.
+      //
+      // The SECURITY claim holds throughout, and was checked rather than assumed:
+      // repo agents carry REPO_AGENT_DENIED_TOOLS, canonicalized against aliases so a
+      // `tools: [Task]` cannot slip through; sdk-executor re-enforces it; and the
+      // Agent-guard hook's allowSet is rebuilt from the RESOLVED selection. A roster
+      // and scoping difference, never a guardrail bypass — but do not read "not a
+      // bypass" as "no difference", which is where the old wording led.
+      // Seeded from the run's PERSISTED selection when the claim carried one, so a
+      // pre-approved resume honours the same human verdict that let it skip the gate.
+      // The gated path below overwrites this from the approve verdict as before.
+      //
+      // `{status: "absent"}` when the claim carried nothing. That is the right answer
+      // for a run that never reached a gate — and for an older server that predates
+      // the field — because resolveAgentSelection's absent-default (repo when a
+      // roster was detected, else own) is exactly what such a run should get. It is
+      // NOT folded into "invalid": absence is not a signal to distrust, and forcing
+      // `own` would pin every gate-less run to a source this code guessed.
+      let approvedSelection: AgentSelectionParse = ctx.approvedSelection
+        ? { status: "ok", selection: ctx.approvedSelection }
+        : { status: "absent" };
+
+      if (preApproved) {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "resuming an already-approved plan — skipping the planning turn and the approval gate" },
+        });
+        approvedPlan = ctx.approvedPlan!;
+      } else {
       // --- Phase 1: planning turn ------------------------------------------
       // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
       // (untrusted job logs) instead of a forge issue; everything else — the plan
       // gate, the implement⇄review loop, the guardrails — is identical.
-      const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
-      const isSelfImprove = ctx.kind === "self_improve";
       let planPrompt: string;
       if (isCIFix) {
         planPrompt = buildCIFixPlanPrompt({
@@ -481,7 +561,7 @@ export class SdkExecutor implements Executor {
       // time a revise is taken. FAIL-CLOSED: the while-condition + the post-loop guards
       // guarantee the only way past this block is an `approve` (see the explicit guard).
       if (!ctx.gatePlan) throw new Error("plan gate is not wired for this run");
-      let approvedPlan = plan.plan;
+      approvedPlan = plan.plan;
       let verdict = await ctx.gatePlan(approvedPlan);
       let revisions = 0;
       while (verdict.kind === "revise") {
@@ -518,6 +598,8 @@ export class SdkExecutor implements Executor {
       // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
       // bug (e.g. a future verdict variant) and must never fall through into implement.
       if (verdict.kind !== "approve") throw new Error(`unexpected plan verdict: ${(verdict as { kind: string }).kind}`);
+      approvedSelection = verdict.selection;
+      } // end of the plan-and-gate block skipped by a pre-approved resume
 
       // A ci_fix run whose approved plan is a not_code verdict is done: no code to
       // implement, no branch to push. The run completes with the diagnosis as its
@@ -559,9 +641,12 @@ export class SdkExecutor implements Executor {
       // Agent-guard hook (its allowSet is frozen at construction — an excluded or
       // repo-sourced subagent must be denied), the lead system prompt (a repo-source
       // run adds the untrusted-review passage), and the subagent names fed to the
-      // implement prompt. Malformed selection resolves to `own`, never repo.
+      // implement prompt. Malformed selection resolves to `own`, never repo — true of
+      // an INVALID selection, and it does NOT generalise to "we never silently pick
+      // repo": an ABSENT selection resolves to repo when a roster was detected, which
+      // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
-      const resolved = resolveAgentSelection(verdict.selection, repoAvailable);
+      const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
       if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
       const selection = resolved.selection;
       // Skill scoping is source-dependent from here (PRD #72 M1): `own` keeps the
@@ -784,6 +869,13 @@ export class SdkExecutor implements Executor {
     let turnSessionId: string | undefined;
     let sawErrorResult = false;
     let errorSubtype = "unknown";
+    // PRD #35. The observer rides the SAME iteration mapSdkMessage already does —
+    // rate_limit_event is simply one of the frame types that mapper drops on its
+    // default arm, so nothing is buffered and no second pass over the turn exists.
+    // `resultFrame` is kept because classification needs the frame ITSELF
+    // (terminal_reason lives on it) and not just the subtype the collapse records.
+    const rateLimits = new RateLimitObserver();
+    let resultFrame: unknown;
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
@@ -825,6 +917,11 @@ export class SdkExecutor implements Executor {
         // PreToolUse hook). The `kind` is the ONLY thing logged — no id, no label —
         // so nothing new reaches `docker logs`, keeping the deliberate omission at
         // batcher.ts's debug line intact.
+        // PRD #35: feed the limit observer before anything can `continue` past it.
+        // Placed at the top of the per-frame body deliberately — a rate_limit_event
+        // maps to zero run messages, so any placement inside the mapSdkMessage loop
+        // below would never see one.
+        rateLimits.observe(msg);
         const orphanKind = orphanInstanceKind(msg);
         if (orphanKind !== undefined) {
           this.log.warn("frame carried parent_tool_use_id without subagent_type", {
@@ -858,6 +955,7 @@ export class SdkExecutor implements Executor {
         if (sig.prdDonePath !== undefined) result.prdDonePath = sig.prdDonePath;
 
         if (isResult(msg)) {
+          resultFrame = msg;
           if (isErrorResult(msg)) {
             sawErrorResult = true;
             errorSubtype = ((msg as { subtype?: unknown }).subtype as string) ?? "unknown";
@@ -870,7 +968,17 @@ export class SdkExecutor implements Executor {
       }
 
       if (state.tripReason) throw new Error(state.tripReason);
-      if (sawErrorResult) throw new Error(`agent run failed: ${errorSubtype}`);
+      if (sawErrorResult) {
+        // PRD #35: a usage-limit death is thrown as a TYPED error carrying the
+        // normalized reset, so the runner branches on the type rather than on
+        // message text. Everything else keeps today's collapse verbatim.
+        //
+        // The trip check above still wins: a cancel or watchdog that fired during a
+        // limit-shaped turn is a deliberate stop, not something to park and resume.
+        const limit = classifyLimitFailure(resultFrame, rateLimits.latest, Date.now());
+        if (limit) throw new LimitReachedError({ ...limit, detail: errorSubtype });
+        throw new Error(`agent run failed: ${errorSubtype}`);
+      }
       result.sessionId = turnSessionId;
       return result;
     } catch (err) {

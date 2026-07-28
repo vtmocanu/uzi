@@ -107,9 +107,23 @@ RETURNING *;
 -- Slack. COALESCE collapses BOTH NULL (no worker report) and [] (scanned, found
 -- none) to an empty array — Slack renders them identically (single-approve shape).
 -- Names ride in roster order (WITH ORDINALITY).
+--
+-- rate_limit_type / retry_not_before / limit_wait_count (PRD #35 M5) are selected
+-- FROM THE RUNS ROW because this query is an explicit column list and there is no
+-- other way to reach them: the "paused: usage limit (five_hour); resumes ~<t>" line
+-- cannot be built from a run_messages payload, which this query never joins. That
+-- is the whole reason rate_limit_type is a column on `runs` rather than living only
+-- in the feed message (see 00091's comment).
+--
+-- rate_limit_type arrives here ALREADY ALLOWLISTED — workersvc coerces anything
+-- outside the seven-member vocabulary to 'unknown' before it is stored, and 00091's
+-- CHECK is the backstop. The renderer escapes it anyway; that is defence in depth
+-- against a writer that bypassed both, which is precisely the population the CHECK
+-- exists for.
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
        r.health, r.plan_md,
+       r.rate_limit_type, r.retry_not_before, r.limit_wait_count,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)

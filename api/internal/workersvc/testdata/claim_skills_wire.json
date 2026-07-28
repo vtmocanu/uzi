@@ -12,6 +12,14 @@
   "requeue_count": 0,
   "plan_md": "# Plan\n",
   "auto_approve": true,
+  "wait_on_limit": true,
+  "plan_approved": true,
+  "agent_selection": {
+    "source": "repo",
+    "exclusions": [
+      "reviewer"
+    ]
+  },
   "repo": {
     "id": "22222222-2222-2222-2222-222222222222",
     "url": "https://gitlab.example.com/g/p",

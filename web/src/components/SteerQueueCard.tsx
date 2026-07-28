@@ -115,7 +115,7 @@ export function SteerQueueCard({
           (which it never is — a non-owner's /inputs 404s, leaving the queue empty). */}
       {!terminal && canSteer && (
         <>
-          <FollowUpComposer busy={busy} onSend={onSend} />
+          <FollowUpComposer busy={busy} onSend={onSend} parked={status === "limit_wait"} />
           <Button variant="danger" disabled={busy} onClick={onStop}>
             Stop run
           </Button>

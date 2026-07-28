@@ -160,7 +160,14 @@ func notifierDecision(status string, origin pgtype.Text) decision {
 // Decision #3).
 func reconcilerDecision(status string, origin pgtype.Text) decision {
 	switch status {
-	case "queued", "claimed", "running", "awaiting_approval":
+	// limit_wait is In Progress (PRD #35): a parked run is working — it holds its
+	// issue, its session and its branch, and it resumes on its own. It is here rather
+	// than in the default arm because that arm is {act:false, clear:false}, which
+	// leaves a pending move marker UNHEALED and trips the 30m give-up warn — and a
+	// park routinely outlasts 30 minutes by design, so the warn would be the normal
+	// case rather than an exception. Notify's partial map is deliberately NOT
+	// extended: a park moves no card, so there is nothing to notify about.
+	case "queued", "claimed", "running", "awaiting_approval", "limit_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

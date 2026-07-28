@@ -961,6 +961,83 @@ Three habits follow, all earned in that batch:
 Pairs with the per-fact sweep below: **sweep per fact, and check that your assertion can
 observe the channel the value actually travels.**
 
+## A value reconstructed at a layer that does not own it — the derived path always works on the happy path
+
+**That is why it survives review: it is not a bug on the day it is written, it is a SHAPE.**
+The tell is that a value is being reconstructed somewhere that does not own it, while the
+authoritative source sits one layer away. Nothing fails, no test reddens, and the reviewer
+reads working code. Stated as "prefer authoritative sources" the rule is unusable; stated as
+"which component OWNS this value, and am I reading it from that one?" it is checkable in
+seconds.
+
+Five instances, four of them inside one PRD (#35, 2026-07-27) and the fifth its own precedent:
+
+- **Parse a status out of a stringified error.** `agent/src/client.ts` `reportState` needed the
+  run's real status from a 409. Routing it through `postJSON` → `RequestError` and reading the
+  text would have worked — `toError` **truncates bodies at 4096 chars**, and a `RunDTO` carrying
+  `plan_md` exceeds that comfortably. So it passes against small test DTOs and fails on real
+  runs. The response body owned the value; the error string was a copy of it with a length
+  limit. Fixed by reading `res` directly for 200 and 409 instead of going through the error path.
+- **Freeze a server-owned counter into a client-authored row.** PRD #35's Decision 10 specified
+  an `attempt` key on the `limit_wait` feed payload. `runs.limit_wait_count` is incremented by
+  the SERVER inside `SetRunLimitWait`, strictly after the worker emits that message — so any
+  value the worker can emit is a stale N−1 that disagrees with the row it describes. The claim
+  payload does not carry a prior value either (`requeue_count` is a different counter). Dropped;
+  the renderer reads `limit_wait_count` off the DTO, where it is always current.
+- **Ask a past-tense column a future-tense question.** `adr/0035-run-limit-retry.md` D4: a
+  review proposed widening `ListAutoSelectCandidates`' in-flight counter to include parked runs,
+  to spread a promotion wave across credentials. `runs.anthropic_secret_id` records the
+  credential a run **spent**, not the one it is about to spend, so counting parked runs piles
+  load onto the already-excluded exhausted token and spreads nothing. Here the authoritative
+  source does not exist *yet* — the run has not chosen — which is the sharpest form of the
+  shape: the derived value is not stale, it is unobtainable.
+- **The one somebody got right first, which is why it is the reference.** PRD #111 D8
+  (`api/internal/workersvc/service.go`, `openAnthropic`): resolution used to happen inside the
+  ciphertext query, which returned only plaintext, so a run could not name the account that paid
+  for it. It now resolves the default to an id and opens **by** id, making the recorded id
+  provably the opened one. Same argument, one level down, and it cost a deliberate race window
+  to buy.
+
+**And the fifth is a DIFFERENT shape, which is the part worth knowing** — flattening it into
+the other four loses the mechanism:
+
+- **A fake that is lenient exactly where the code is fragile.** `agent/test/fake-api.ts`
+  `handleState` answered `{}` and `{"error": …}` where both real handlers answer
+  `{"run": {…}}` (`handler/worker_protocol.go`, the 409 and the 200). That was **harmless for
+  as long as the client discarded the body** and became a lie the moment PRD #35 made the run's
+  real status load-bearing.
+
+**The link is causal, and it is why the first four survive testing: while a field is unread,
+both the derived path and the fake are free to be wrong, and they are wrong in the same place.**
+So the test agrees with the bug. "It works on the happy path" understates it — the happy path is
+the only one the fake can express.
+
+**Two checks, both cheap:**
+
+1. **Which component owns this value?** If it is not the one you are reading it from, you have a
+   derived path. Ask it about the *write*, not the read: the owner is whoever last set it, and if
+   that write happens after your read, the value cannot exist yet.
+2. **If the authoritative field were wrong, would any test notice?** 🔴 **Read the whole
+   mechanism before deleting this one — it is not a paradox and it is not rhetoric.** A test can
+   only fail on a field something reads. Nothing read `/state`'s response body, so nothing
+   constrained the fake's answer, so the fake was free to answer `{}` — and the suite was green
+   *because* the field was unread, not despite it. **The green was CAUSED by the gap it was
+   being read as ruling out.** So on a field nobody consumes yet, "no test fails" is the
+   precondition for the bug rather than evidence against it, and the only way to learn anything
+   is to make something read the field.
+
+Sits with its neighbours on purpose: **TYPECHECK the mutated tree**, **Mutate at the CALL
+SITE**, and **An assertion defines its CHANNEL** are all the same family — a green or a red that
+measures the instrument instead of the code. This one is the case where the instrument was never
+pointed at the value at all.
+
+**Corollary, and it has a specific trigger: the moment a previously-ignored field becomes
+load-bearing, audit every fake of that endpoint IN THE SAME COMMIT.** Leniency that was free
+until that commit becomes a lie at exactly that commit, and it will agree with the new code
+rather than contradict it. This is the "two lenient fakes drift" problem the claim wire contract
+already guards one endpoint over; the guard did not extend to `/state` because nothing had ever
+needed `/state`'s body.
+
 ## Sweep per FACT after the last behavioural commit
 
 **A batch's own findings falsify claims in code it never touched. Nothing in a per-commit
@@ -1118,9 +1195,23 @@ person best placed to notice their own instance of it.
   own instance only because a mechanical re-screen was already running for another reason.
 - The lead prescribed an **uncompilable mutation twice — the second time inside the correction
   of the first**, by which point the failure mode was known.
+- *(PRD #35, 2026-07-27 — a later branch, same shape, added because leaving it out would be
+  selecting evidence in the section about not doing that.)* The lead ruled an `attempt` key out
+  of a feed payload and justified it with *"the rows are already distinguished by `resets_at`,
+  which differs per park **by construction**"* — about a field that is **conditionally absent**
+  (omitted when the reset is unknown, which is exactly the case the exponential fallback exists
+  for), **having been told in the same report that unknown keys are omitted rather than
+  nulled**. The property was read off the case where the field is present rather than off the
+  thing that owns it. Caught by the architect. **The ruling was right and only its justification
+  was false, which is the more dangerous half**: the lead was simultaneously asking for that
+  justification to be recorded *as reasoning others should rely on*, and had spent the same
+  session correcting this exact move in three other agents.
 
-**Four for four, and the tally includes whoever is reading this.** The fix is never "be more
-careful": it is a mechanism that does not depend on the author noticing.
+**Four for four ROLES — and the lead accounts for three of the six entries.** That is the
+opposite of what seniority predicts, and it is the finding: **holding a rule and applying it to
+yourself are separate skills**, so position in the loop is not protection. The tally includes
+whoever is reading this. The fix is never "be more careful": it is a mechanism that does not
+depend on the author noticing.
 
 **A second, distinct shape — the true local fact that ends the search.** Three times one
 validator stated something correct about the thing in front of it and stopped, because a true

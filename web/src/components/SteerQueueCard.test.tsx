@@ -6,7 +6,7 @@
 // the !terminal-gated composer, so "Not delivered — run finished" is reachable.
 
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SteerQueueCard } from "./SteerQueueCard";
 import type { SteerInput } from "../lib/api";
 
@@ -221,5 +221,42 @@ describe("SteerQueueCard smoke", () => {
     );
     expect(screen.getByText("Queued")).toBeTruthy();
     vi.restoreAllMocks();
+  });
+});
+
+// PRD #35 (web-ux F1). The composer's Send is the run page's only FILLED primary
+// button. On a parked run it sat there, fully enabled, promising "resumes the agent as
+// its next turn" — for a run that will not resume for hours — while `Stop run`, the
+// control the user was actually hunting for, was a muted outline below it.
+describe("SteerQueueCard — the composer does not promise resumption on a parked run (PRD #35)", () => {
+  const placeholder = () =>
+    (screen.getByPlaceholderText(/send a follow-up message/i) as HTMLTextAreaElement).placeholder;
+
+  it("says the message is QUEUED, not that it resumes the agent", () => {
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="limit_wait" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(placeholder()).toContain("queued until the run resumes");
+    expect(placeholder()).not.toContain("resumes the agent as its next turn");
+  });
+
+  it("leaves the copy untouched on a live run", () => {
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+    );
+    expect(placeholder()).toContain("resumes the agent as its next turn");
+  });
+
+  it("still ACCEPTS a follow-up while parked — the fix is honesty about when, not a block", () => {
+    // Queueing a message for a parked run is genuinely useful: it is delivered on
+    // resume. Disabling the composer would remove a working feature to fix a sentence.
+    const onSend = vi.fn();
+    render(
+      <SteerQueueCard inputs={[]} terminal={false} status="limit_wait" busy={false} onStop={noop} onSend={onSend} />,
+    );
+    const box = screen.getByPlaceholderText(/send a follow-up message/i) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "try the other approach" } });
+    fireEvent.click(screen.getByRole("button", { name: /send follow-up/i }));
+    expect(onSend).toHaveBeenCalledWith("try the other approach");
   });
 });
