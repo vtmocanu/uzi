@@ -120,10 +120,19 @@ func TestCountRunReviseInputsCountsConsumedRowsLiveDB(t *testing.T) {
 
 // TestCreateRunReviseInputIfUnderCapAtomicLiveDB pins the PRD #41 cap ENFORCEMENT (not just the
 // reporting count): CreateRunReviseInputIfUnderCap inserts only while the run is under the
-// cap, and — because it locks the run row FOR UPDATE and counts through that lock — two
-// concurrent submits racing at the boundary can NEVER both persist an over-cap row. This
-// is the TOCTOU the old count-then-CreateRunInput path (two round trips) allowed: web +
-// Slack submitting at N-1 could both read N-1 and both insert an N+1th row.
+// cap, and two concurrent submits racing at the boundary MUST never both persist an
+// over-cap row. That is the invariant. This test asserts it.
+//
+// THEY CURRENTLY CAN — issue #106 is OPEN. The statement takes the run row FOR UPDATE, but
+// the cap counts run_user_inputs, a DIFFERENT table, at the statement snapshot. A caller
+// that blocks on the lock therefore still counts without the winner's row: the lock does
+// not cover the count at all. revise_cap_repro_test.go forces that interleave and
+// reproduces the breach on EVERY run; this test hopes for it, and was measured catching it
+// about 1 run in 50 — so a green HERE does not verify a fix for #106.
+//
+// It is the same TOCTOU the old count-then-CreateRunInput path (two round trips) allowed,
+// and which collapsing it into a single statement was meant to close: web + Slack
+// submitting at N-1 could both read N-1 and both insert an N+1th row.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestCreateRunReviseInputIfUnderCapAtomicLiveDB(t *testing.T) {
