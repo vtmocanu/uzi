@@ -298,6 +298,7 @@ type Run struct {
 	AnthropicSecretLabel  pgtype.Text        `json:"anthropic_secret_label"`
 	AnthropicSelectReason pgtype.Text        `json:"anthropic_select_reason"`
 	AnthropicHeadroomPct  pgtype.Int2        `json:"anthropic_headroom_pct"`
+	OpenQuestionID        pgtype.Text        `json:"open_question_id"`
 }
 
 type RunMessage struct {
@@ -353,6 +354,7 @@ type RunUserInput struct {
 	Body       pgtype.Text        `json:"body"`
 	ConsumedAt pgtype.Timestamptz `json:"consumed_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	QuestionID pgtype.Text        `json:"question_id"`
 }
 
 type Skill struct {

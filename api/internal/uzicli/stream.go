@@ -42,19 +42,26 @@ var knownRunEventTypes = map[string]struct{}{
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a
-// CHECK constraint over exactly these seven values (migration 00020_workers_runs.sql).
-// A value outside the set cannot be stored, so one arriving on the wire means the
-// server is newer than this binary — which is precisely when it must not be trusted
-// to mean "active".
+// CHECK constraint over exactly these eight values (00020_workers_runs.sql, widened by
+// 00091_run_awaiting_input.sql for PRD #88's clarification park). A value outside the
+// set cannot be stored, so one arriving on the wire means the server is newer than
+// this binary — which is precisely when it must not be trusted to mean "active".
+//
+// This map and the sentence above move together with the CHECK. Leaving
+// awaiting_input out would not fail loudly: NormalizeRunEvent rewrites the status to
+// RunStatusUnknown at the decode boundary, so the TUI would quietly refuse to treat a
+// parked run as active and `uzi run get` would render it as unknown.
 var knownRunStatuses = map[string]struct{}{
-	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
+	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {}, "awaiting_input": {},
 	"completed": {}, "failed": {}, "cancelled": {},
 }
 
 // terminalRunStatuses are the three a run never leaves. Verified against the requeue
-// path, which is scoped WHERE status IN ('claimed','running','awaiting_approval')
-// (store/queries/runtime.sql RequeueRunsOfStaleWorkers / RequeueWorkerRuns) — so a
-// terminal run is never returned to 'queued' and the reconcile below can stop.
+// path, which is scoped WHERE status IN ('claimed','running','awaiting_approval',
+// 'awaiting_input') (store/queries/runtime.sql RequeueRunsOfStaleWorkers /
+// RequeueWorkerRuns) — so a terminal run is never returned to 'queued' and the
+// reconcile below can stop. PRD #88 widened that predicate rather than narrowing it,
+// so the property this set relies on is unchanged.
 var terminalRunStatuses = map[string]struct{}{
 	"completed": {}, "failed": {}, "cancelled": {},
 }

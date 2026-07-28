@@ -179,6 +179,8 @@ func run() error {
 		RunIdleTimeout:              cfg.RunIdleTimeout,
 		RunMaxIterations:            cfg.RunMaxIterations,
 		PlanMaxRevisions:            cfg.PlanMaxRevisions,
+		QuestionMax:                 cfg.QuestionMax,
+		QuestionTimeoutSeconds:      cfg.QuestionTimeoutSeconds,
 		RunMaxRequeues:              cfg.RunMaxRequeues,
 		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,

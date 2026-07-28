@@ -99,6 +99,7 @@ const maxWorkerNameBytes = 200
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
+	"answer": true,
 }
 
 // -------------------------------------------------------------------------
@@ -864,7 +865,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan, answer")
 		return
 	}
 
@@ -877,6 +878,15 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "run has already finished")
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
+		case errors.Is(err, workersvc.ErrRunNotAwaitingInput):
+			httpx.Error(w, http.StatusConflict, "run is not waiting for an answer")
+		case errors.Is(err, workersvc.ErrStaleAnswer):
+			// 409, not 400: the request was well-formed and the caller did nothing
+			// wrong — the question simply moved on (typically a Slack reply to
+			// question N landing after the lead asked N+1).
+			httpx.Error(w, http.StatusConflict, "that question has already been answered or replaced")
+		case errors.Is(err, workersvc.ErrInvalidAnswer):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		default:

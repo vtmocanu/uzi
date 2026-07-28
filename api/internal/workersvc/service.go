@@ -36,6 +36,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
@@ -77,7 +78,22 @@ var (
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
-	ErrInvalidMessage   = errors.New("invalid run message")
+	// ErrRunNotAwaitingInput rejects an `answer` for a run that is not parked on a
+	// clarification question (PRD #88 M1) → 409. Its sibling ErrStaleAnswer covers the
+	// run that IS parked but on a DIFFERENT question — the two are separated because
+	// they mean different things to a user: "nothing is being asked right now" versus
+	// "you answered a question that has already moved on".
+	ErrRunNotAwaitingInput = errors.New("run is not waiting for an answer")
+	// ErrStaleAnswer rejects an answer naming a question other than the run's currently
+	// open one (PRD #88 M1) → 409. The common cause is benign and expected: a Slack
+	// reply written against question N that arrives after the lead has already asked
+	// N+1. Applying it to N+1 would silently answer the wrong question.
+	ErrStaleAnswer = errors.New("answer does not match the run's open question")
+	// ErrInvalidAnswer covers a malformed `answer` body (PRD #88 M1) → 400. Rejected
+	// rather than defaulted: an answer that cannot say what it answers has no safe
+	// interpretation.
+	ErrInvalidAnswer  = errors.New("invalid answer")
+	ErrInvalidMessage = errors.New("invalid run message")
 	// ErrUnstorableMessage is a batch the DATABASE refused for a reason that can
 	// never succeed on retry (PRD #108 M2) → 400, joining ErrInvalidMessage.
 	//
@@ -213,6 +229,10 @@ type Store interface {
 	UpsertDispositionsForResolvedCoords(ctx context.Context, arg store.UpsertDispositionsForResolvedCoordsParams) (int64, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
+	// SetRunAwaitingInput parks a run on a clarification question (PRD #88 M1) and
+	// stamps the question's identity. It clears health on entry, which is what makes
+	// leaving `awaiting_input` out of ListActiveRunsForHealth safe — see the query.
+	SetRunAwaitingInput(ctx context.Context, arg store.SetRunAwaitingInputParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
 	MarkRunFailedByID(ctx context.Context, arg store.MarkRunFailedByIDParams) (int64, error)
@@ -270,6 +290,10 @@ type Store interface {
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
 	// selection atomically (PRD #37).
 	CreateApprovePlanInput(ctx context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error)
+	// CreateRunAnswerInput enqueues an `answer` and records the question it answers
+	// (PRD #88 M1). The question id is a column, not a JSON field, because
+	// SetRunRunning's resume guard compares it in SQL.
+	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 
 	// Agent memory (PRD #90): the worker-facing write/read of the per-(user,repo)
@@ -354,10 +378,18 @@ type Params struct {
 	// PlanMaxRevisions caps how many times a run's plan may be revised at the
 	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
 	// SubmitInput and shipped in the claim so the worker enforces the same limit.
-	PlanMaxRevisions     int
-	RunMaxRequeues       int
-	WorkerHeartbeatStale time.Duration
-	WorkerAffinityGrace  time.Duration
+	PlanMaxRevisions int
+	// QuestionMax and QuestionTimeoutSeconds bound the PRD #88 clarification loop.
+	// Both are enforced WORKER-side (a question is an in-process ask_user signal, so
+	// unlike a revise_plan there is no input row for the server to count) but
+	// CONFIGURED here and shipped in the claim, following plan_max_revisions rather
+	// than a worker env var: controller/internal/kube/render.go renders exactly one
+	// tuning var into a hosted worker pod, so an env knob would be unreachable on k8s.
+	QuestionMax            int
+	QuestionTimeoutSeconds int
+	RunMaxRequeues         int
+	WorkerHeartbeatStale   time.Duration
+	WorkerAffinityGrace    time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
@@ -1348,6 +1380,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RequeueCount:     run.RequeueCount,
 		PlanMd:           textPtr(run.PlanMd),
 		AutoApprove:      run.AutoApprove,
+		OpenQuestionID:   textPtr(run.OpenQuestionID),
 		Repo: ClaimRepo{
 			ID:            uuid.UUID(run.RepoID.Bytes).String(),
 			URL:           rc.RepoWebUrl,
@@ -1365,15 +1398,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
-			RunTimeoutSeconds:  int(s.p.RunTimeout.Seconds()),
-			IdleTimeoutSeconds: int(s.p.RunIdleTimeout.Seconds()),
-			MaxIterations:      s.p.RunMaxIterations,
-			PlanMaxRevisions:   s.p.PlanMaxRevisions,
-			DefaultModel:       textPtr(defaultModel),
-			SkillMaxBytes:      s.p.SkillMaxBytes,
-			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
-			ToolPackages:       toolPackages,
-			RepoDevboxOptIn:    rc.RepoDevboxOptIn,
+			RunTimeoutSeconds:      int(s.p.RunTimeout.Seconds()),
+			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			MaxIterations:          s.p.RunMaxIterations,
+			PlanMaxRevisions:       s.p.PlanMaxRevisions,
+			QuestionMax:            s.p.QuestionMax,
+			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
+			DefaultModel:           textPtr(defaultModel),
+			SkillMaxBytes:          s.p.SkillMaxBytes,
+			SkillsMaxPerRun:        s.p.SkillsMaxPerRun,
+			ToolPackages:           toolPackages,
+			RepoDevboxOptIn:        rc.RepoDevboxOptIn,
 		},
 	}, nil
 }
@@ -1498,6 +1533,21 @@ const (
 	// hostile value; the column is bare `text NOT NULL` (00020_workers_runs.sql), so
 	// the number is a policy choice, not a schema fit (PRD #108 A3).
 	maxKindRunes = 64
+
+	// maxQuestionIDRunes bounds the worker-minted clarification-question identity
+	// (PRD #88 M1). It is an opaque token the server only ever compares for equality
+	// — never parses — so the cap exists solely to keep a hostile worker from writing
+	// an unbounded value into runs.open_question_id and every answer row that quotes
+	// it. A UUID is 36; 128 leaves room for a differently-shaped id without inviting
+	// prose. Like maxKindRunes, the column is bare `text`, so this is policy.
+	maxQuestionIDRunes = 128
+
+	// maxAnswerBodyRunes bounds a user's answer to a clarification question (PRD #88
+	// M1, D-G). Slack's inbound path already caps replies at maxReplyRunes; the web
+	// and CLI paths had no bound at all, and #88 is the feature that turns "the user
+	// types free text at the agent" from an occasional follow_up into a prompted
+	// round-trip, so the cap moves to SubmitInput where every surface inherits it.
+	maxAnswerBodyRunes = 4000
 )
 
 // truncateRunes caps s at n runes, cutting on a rune boundary so the result is
@@ -2075,7 +2125,7 @@ func nonNegTokens(n int64) int64 {
 // column, the M2 worker client, and multica's protocol); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State  string  `json:"status"` // running|awaiting_approval|completed|failed
+	State  string  `json:"status"` // running|awaiting_approval|awaiting_input|completed|failed
 	PlanMd *string `json:"plan_md"`
 	Branch *string `json:"branch"`
 	MrIID  *int64  `json:"mr_iid"`
@@ -2113,6 +2163,13 @@ type StateRequest struct {
 	// report is its only channel for recording which roster it used. A human-gated run
 	// omits this and persists its selection through the approve_plan input instead.
 	AgentSelection *AgentSelection `json:"agent_selection"`
+	// OpenQuestionID is the identity of the question the run is parking on (PRD #88
+	// M1), carried only by the `awaiting_input` transition. The worker mints it at the
+	// first park and re-sends the SAME value when a resumed worker re-parks on the same
+	// question — that stability is the whole mechanism behind SetRunRunning's
+	// answer guard, which asks "was THIS question answered" rather than "has this run
+	// ever been answered". Required for `awaiting_input`; ignored on every other state.
+	OpenQuestionID *string `json:"open_question_id"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -2148,6 +2205,26 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "awaiting_approval":
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+		})
+	case "awaiting_input":
+		// PRD #88 M1: park on a clarification question. The question id is REQUIRED
+		// and rejected when absent rather than defaulted, because a NULL
+		// open_question_id makes SetRunRunning's answer guard unsatisfiable — the run
+		// would park and then be unable to resume no matter what the user answered.
+		// Failing the report is loud; a silently unresumable run is not.
+		var qid string
+		if req.OpenQuestionID != nil {
+			clean, _ := stripNUL(*req.OpenQuestionID)
+			qid = strings.TrimSpace(clean)
+		}
+		if qid == "" {
+			return store.Run{}, false, fmt.Errorf("%w: awaiting_input requires open_question_id", ErrInvalidState)
+		}
+		if len([]rune(qid)) > maxQuestionIDRunes {
+			return store.Run{}, false, fmt.Errorf("%w: open_question_id is too long", ErrInvalidState)
+		}
+		rows, err = s.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+			OpenQuestionID: pgText(qid), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
@@ -2954,6 +3031,21 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return s.submitApproval(ctx, run, *sel)
 	}
 
+	// An `answer` resolves the clarification question the run is CURRENTLY parked on
+	// (PRD #88 M1). Unlike every other kind it is rejected outright unless the run is
+	// actually asking: SubmitInput otherwise accepts any non-terminal run, so an
+	// answer posted before any ask_user would be enqueued, consumed by the steering
+	// poll, and auto-resolve the first question the moment it opened — the user would
+	// never see the question, and the feed would show it answered by text written
+	// before it existed. The run row is already loaded here, so the guard is free.
+	//
+	// It is belt-and-braces rather than the primary control (the identity check below
+	// independently rejects an answer that does not name the open question), but it
+	// rejects at the earliest point and with an error the caller can act on.
+	if kind == "answer" {
+		return s.submitAnswer(ctx, run, body)
+	}
+
 	if kind == "cancel" || kind == "reject_plan" {
 		live, err := s.hasLivePoller(ctx, run)
 		if err != nil {
@@ -3062,6 +3154,84 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		return SubmitInputResult{}, err
 	}
 	return SubmitInputResult{ServerSide: false}, nil
+}
+
+// AnswerBody is the wire shape of an `answer` steering input (PRD #88 M1). It is
+// JSON rather than the bare prose every other kind carries, because an answer must
+// name the QUESTION it answers — `approve_plan` already establishes the JSON-body
+// idiom, so this is in keeping rather than novel.
+//
+// One shape, every surface: the web and CLI construct it directly, and the Slack
+// replier (whose inbound is free text) resolves the thread anchor to the open
+// question id and constructs the same JSON server-side. There is deliberately not a
+// second, text-only contract for Slack.
+type AnswerBody struct {
+	// QuestionID names the question this answers. Compared for equality against the
+	// run's open_question_id; never parsed for meaning.
+	QuestionID string `json:"question_id"`
+	// Answers is index-aligned with the question payload's `questions` array. Free
+	// text is always allowed, including where the question offered options.
+	Answers []string `json:"answers"`
+}
+
+// submitAnswer records an answer to the clarification question a run is parked on
+// (PRD #88 M1). Four things happen here that do not happen for any other kind, and
+// each closes a failure the others do not:
+//
+//  1. The run must actually be parked. See the caller's comment.
+//  2. A malformed body is REJECTED, deliberately unlike parseAgentSelection's
+//     fallback-to-a-safe-default. There, a default is genuinely safe (the run's own
+//     agents). Here the whole point of the payload is to identify what is being
+//     answered, so accepting an unidentifiable answer IS the harm — it would resolve
+//     whatever question happens to be open.
+//  3. The named question must be the one currently open. This is the stale-answer
+//     guard, and it is keyed on identity precisely because it must survive a requeue:
+//     a worker death re-queues and re-parks the run, so any clock- or arrival-ordinal
+//     key would reject an answer the user correctly submitted before the death.
+//  4. The text is scrubbed and bounded (D-G). #88 is the feature that makes the agent
+//     ASK the user for information, which is exactly the prompt that elicits a
+//     credential paste — and the question text itself is attacker-influenceable, so an
+//     injected repo file can make the lead ask for a PAT "to continue". Slack's
+//     inbound path already scrubbed; web and CLI did not. Doing it here means every
+//     surface inherits it.
+func (s *Service) submitAnswer(ctx context.Context, run store.Run, body string) (SubmitInputResult, error) {
+	if run.Status != "awaiting_input" {
+		return SubmitInputResult{}, ErrRunNotAwaitingInput
+	}
+	var ab AnswerBody
+	if err := json.Unmarshal([]byte(body), &ab); err != nil {
+		return SubmitInputResult{}, fmt.Errorf("%w: body must be JSON {question_id, answers}", ErrInvalidAnswer)
+	}
+	qid := strings.TrimSpace(ab.QuestionID)
+	if qid == "" {
+		return SubmitInputResult{}, fmt.Errorf("%w: question_id is required", ErrInvalidAnswer)
+	}
+	// A run parked with no open question id cannot be resumed by any answer
+	// (SetRunRunning's guard is unsatisfiable), so an equality test against "" must
+	// never pass. SetState rejects an empty id at the park, making this unreachable —
+	// it is here because "unreachable" is a claim about another function.
+	if !run.OpenQuestionID.Valid || run.OpenQuestionID.String == "" || qid != run.OpenQuestionID.String {
+		return SubmitInputResult{}, ErrStaleAnswer
+	}
+	answers := make([]string, 0, len(ab.Answers))
+	for _, a := range ab.Answers {
+		clean, _ := stripNUL(a)
+		answers = append(answers, truncateRunes(secretscrub.Scrub(clean), maxAnswerBodyRunes))
+	}
+	// Re-encode from the server's own validated values rather than storing the
+	// caller's raw text, the same rule submitApproval follows: what the worker reads
+	// back is what the server checked, not what the client sent.
+	encoded, err := json.Marshal(AnswerBody{QuestionID: qid, Answers: answers})
+	if err != nil {
+		return SubmitInputResult{}, fmt.Errorf("encode answer: %w", err)
+	}
+	row, err := s.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: run.ID, Body: pgText(string(encoded)), QuestionID: pgText(qid),
+	})
+	if err != nil {
+		return SubmitInputResult{}, err
+	}
+	return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 }
 
 // orEmpty makes a nil slice marshal as `[]`, never `null` — the worker's

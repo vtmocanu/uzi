@@ -47,9 +47,14 @@ ORDER BY seq ASC
 LIMIT @lim;
 
 -- name: ListRunInputsForRun :many
--- The steering log (follow-ups + plan verdicts + cancels) of a run, oldest first,
--- capped by @lim — part of the judge trace (Decision 3).
-SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
+-- The steering log (follow-ups + plan verdicts + cancels + PRD #88 answers) of a run,
+-- oldest first, capped by @lim — part of the judge trace (Decision 3).
+--
+-- The column list is the table's FULL set (question_id, PRD #88, included), which is
+-- what keeps sqlc returning the shared RunUserInput model rather than minting a
+-- query-specific row type — dropping one re-types this query and breaks the
+-- workersvc.Store interface and its fakes.
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id FROM run_user_inputs
 WHERE run_id = @run_id
 ORDER BY id ASC
 LIMIT @lim;

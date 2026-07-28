@@ -101,7 +101,7 @@ LEFT JOIN (
     FROM runs r
     WHERE r.user_id = $1
       AND r.anthropic_secret_id IS NOT NULL
-      AND r.status IN ('claimed', 'running', 'awaiting_approval')
+      AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
     GROUP BY r.anthropic_secret_id
 ) f ON f.sid = s.id
 WHERE s.user_id = $1

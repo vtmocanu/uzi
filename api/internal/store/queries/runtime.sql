@@ -88,12 +88,12 @@ SELECT w.*,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
              AND r.kind <> 'chat'
        ) AS active_runs,
        -- Roll health (PRD #113 M4), LEFT JOINed so a worker with no report — every
@@ -399,12 +399,12 @@ SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
        ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
-             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
              AND r.kind <> 'chat'
        ) AS active_runs,
        u.email AS owner_email
@@ -591,7 +591,31 @@ WHERE runs.id = @id AND worker_id = @worker_id
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
           AND run_user_inputs.kind = 'approve_plan'
-          AND run_user_inputs.consumed_at IS NOT NULL));
+          AND run_user_inputs.consumed_at IS NOT NULL))
+  -- awaiting_input → running is guarded the same way and for the same reason
+  -- (PRD #88 M1), as a SECOND, INDEPENDENT clause. Never merge the two into
+  -- `status NOT IN (...) OR kind IN (...)`: that would let a consumed `answer`
+  -- satisfy the PLAN gate and a consumed `approve_plan` satisfy the QUESTION gate,
+  -- re-opening #44 F2 sideways.
+  --
+  -- Unlike the plan clause above, this one is keyed on the question's IDENTITY, not
+  -- merely on "an input of this kind was consumed". The plan gate's accepted
+  -- multi-round residual does not transfer: re-gating is the rare path for a plan,
+  -- while a run may ask QUESTION_MAX (default 5) questions, so a has-ever-been-
+  -- answered predicate would protect question 1 and leave 2..N with nothing — a
+  -- retry-delayed pre-park `running` report would silently un-park every later
+  -- question, which then dies on the deadline having never been surfaced.
+  --
+  -- runs.open_question_id reads the OLD row here (Postgres evaluates the WHERE, and
+  -- the SET right-hand side, against the pre-update tuple) — the same mechanism the
+  -- health CASE arms above already rely on. A NULL open_question_id makes the
+  -- equality NULL, so the guard blocks: fail-closed.
+  AND (status <> 'awaiting_input' OR EXISTS (
+        SELECT 1 FROM run_user_inputs
+        WHERE run_user_inputs.run_id = @id
+          AND run_user_inputs.kind = 'answer'
+          AND run_user_inputs.consumed_at IS NOT NULL
+          AND run_user_inputs.question_id = runs.open_question_id));
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
@@ -601,6 +625,31 @@ UPDATE runs SET
     -- Exit contract (PRD #47 Decision 3): leaving 'running' clears any running-run
     -- flag (stalled/looping/slow). The detector re-evaluates for approval_idle from
     -- this transition's fresh updated_at; health_notified_at is preserved.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: SetRunAwaitingInput :execrows
+-- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
+-- carries the same PRD #47 exit contract for the same reason.
+--
+-- The health clear is LOAD-BEARING, not cosmetic. `awaiting_input` is deliberately
+-- NOT in ListActiveRunsForHealth (a parked run is not stalled, and inventing an
+-- input_idle arm would widen the health enum across four surfaces to buy a reminder
+-- that M3's Slack post already delivers). That omission is only safe BECAUSE the run
+-- enters the park with health='ok': a run flagged stalled/looping/slow while running
+-- would otherwise carry that flag through the entire park with nothing able to clear
+-- it. The two are coupled; a live-DB test pins the pair.
+--
+-- open_question_id is the question's stable identity, supplied by the worker. A
+-- resumed worker re-parking on the SAME question re-stamps the SAME value (it reads
+-- it back off the claim), which is what makes the SetRunRunning guard above a no-op
+-- across a requeue instead of a silent rejection of an already-submitted answer.
+UPDATE runs SET
+    status           = 'awaiting_input',
+    open_question_id = @open_question_id,
+    session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -808,7 +857,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pendin
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -823,7 +872,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     -- detector re-evaluates the queued signal from this transition's updated_at.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE status IN ('claimed', 'running', 'awaiting_approval')
+WHERE status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count < @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
@@ -1059,6 +1108,26 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
 RETURNING *;
 
+-- name: CreateRunAnswerInput :one
+-- PRD #88 M1: enqueue an `answer` for the live worker. A plain insert like
+-- CreateRunInput — no stop signal, no cap, no runs-row write — but it additionally
+-- persists the QUESTION the answer belongs to, in its own column.
+--
+-- Why a dedicated column rather than reading it out of the JSON body: SetRunRunning's
+-- resume guard has to compare it, and `body::jsonb ->> 'question_id'` inside a
+-- predicate is unsafe here. body is bare `text` shared with every other kind
+-- (follow_up bodies are prose), the planner is free to evaluate the cast before the
+-- `kind = 'answer'` filter that would make it well-formed, and an invalid-JSON body
+-- then errors the whole statement rather than failing the row. The server has
+-- already parsed and validated the body by the time it calls this, so it writes the
+-- extracted value directly.
+--
+-- @question_id is the id the answer was written AGAINST, validated by the caller
+-- against the run's currently-open question before this runs.
+INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+VALUES (@run_id, 'answer', @body, @question_id)
+RETURNING *;
+
 -- name: CountRunReviseInputs :one
 -- Plan-revision cap (PRD #41): every persisted revise_plan row for the run counts
 -- toward PLAN_MAX_REVISIONS, with NO consumed_at filter — a consumed revise still
@@ -1170,7 +1239,12 @@ SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
 -- judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that would drop
 -- the newest follow-ups behind its cap on a busy/chat run. Owner-scoping is enforced at
 -- the run resolve (GetRunByIDForUser), not here.
-SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
+-- The column list is the table's FULL set (question_id, PRD #88, included and always
+-- NULL for a follow_up), which is what keeps sqlc returning the shared RunUserInput
+-- model instead of minting a query-specific row type. Dropping a column here is not a
+-- local edit: it re-types this query and breaks the workersvc.Store interface, the
+-- service signature, the handler and its fake.
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id FROM run_user_inputs
 WHERE run_id = @run_id AND kind = 'follow_up'
 ORDER BY id DESC;
 

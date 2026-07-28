@@ -675,20 +675,22 @@ func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist,
 // testParams are sane fixed knobs for the tests.
 func testParams() Params {
 	return Params{
-		RunTimeout:            2 * time.Hour,
-		RunIdleTimeout:        10 * time.Minute,
-		RunMaxIterations:      5,
-		PlanMaxRevisions:      3,
-		RunMaxRequeues:        1,
-		WorkerHeartbeatStale:  45 * time.Second,
-		WorkerAffinityGrace:   2 * time.Minute,
-		ClaimGrace:            5 * time.Minute,
-		SkillMaxBytes:         65536,
-		SkillsMaxPerRun:       32,
-		ChatIdleTimeout:       70 * time.Minute,
-		ChatMaxTurns:          50,
-		WorkerChatIdleTimeout: 60 * time.Minute,
-		WorkerChatTurnTimeout: 10 * time.Minute,
+		RunTimeout:             2 * time.Hour,
+		RunIdleTimeout:         10 * time.Minute,
+		RunMaxIterations:       5,
+		PlanMaxRevisions:       3,
+		QuestionMax:            5,     // PRD #88 clarification-question cap
+		QuestionTimeoutSeconds: 86400, // PRD #88 answer deadline (24h)
+		RunMaxRequeues:         1,
+		WorkerHeartbeatStale:   45 * time.Second,
+		WorkerAffinityGrace:    2 * time.Minute,
+		ClaimGrace:             5 * time.Minute,
+		SkillMaxBytes:          65536,
+		SkillsMaxPerRun:        32,
+		ChatIdleTimeout:        70 * time.Minute,
+		ChatMaxTurns:           50,
+		WorkerChatIdleTimeout:  60 * time.Minute,
+		WorkerChatTurnTimeout:  10 * time.Minute,
 	}
 }
 

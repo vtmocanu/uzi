@@ -43,6 +43,17 @@ type ClaimPayload struct {
 	// reads it from the row, a requeued/resumed autopilot run re-delivers it
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
+	// OpenQuestionID is the clarification question this run is already parked on
+	// (PRD #88 M1), read from the runs row and therefore re-delivered on every
+	// resume — the same reason AutoApprove is top-level rather than in ClaimConfig.
+	//
+	// It is what makes the stale-answer guard survive a worker death. The resumed
+	// worker re-parks on the SAME question and re-stamps this SAME id, so an answer
+	// the user submitted before the death still names the open question and is
+	// honoured. Minting a fresh id on the re-park (or keying the guard on a clock)
+	// would reject that answer silently, and the user would have no way to tell.
+	// Absent for a run that is not parked.
+	OpenQuestionID *string `json:"open_question_id,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
@@ -158,13 +169,24 @@ type ClaimAgent struct {
 // template's model (PRD #17 Decision 6); it is omitted when the owner has no
 // default set (NULL), so the worker falls back to the lead template's model.
 type ClaimConfig struct {
-	RunTimeoutSeconds  int     `json:"run_timeout_seconds"`
-	IdleTimeoutSeconds int     `json:"idle_timeout_seconds"`
-	MaxIterations      int     `json:"max_iterations"`
+	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+	MaxIterations      int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
-	PlanMaxRevisions   int     `json:"plan_max_revisions"`
-	DefaultModel       *string `json:"default_model,omitempty"`
+	PlanMaxRevisions int `json:"plan_max_revisions"`
+	// QuestionMax and QuestionTimeoutSeconds bound the PRD #88 clarification loop:
+	// how many times one run may stop to ask the human, and how long a single park
+	// waits before the run fails with "clarification timed out". Both are enforced
+	// worker-side — the cap counts in-process ask_user parks (there is no input row to
+	// count, unlike a revise_plan), and the deadline is a worker-held timer.
+	//
+	// The deadline is therefore NOT durable: a worker death re-queues the run and the
+	// resumed worker starts a fresh clock, so the honest worst case is
+	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1).
+	QuestionMax            int     `json:"question_max"`
+	QuestionTimeoutSeconds int     `json:"question_timeout_seconds"`
+	DefaultModel           *string `json:"default_model,omitempty"`
 	// SkillMaxBytes and SkillsMaxPerRun are the skill caps the server configured,
 	// delivered so the worker enforces the same limits (no hardcoded drift): the
 	// worker applies SkillMaxBytes to repo-borne skills and re-enforces

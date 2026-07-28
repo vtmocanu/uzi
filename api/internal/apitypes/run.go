@@ -293,9 +293,10 @@ type RunEventDTO struct {
 	Payload       json.RawMessage `json:"payload,omitempty"`
 	CreatedAt     *time.Time      `json:"created_at,omitempty"`
 	// Status is set on "state" frames and is a CLOSED set enforced by a database
-	// CHECK constraint (runs.status, migration 00020_workers_runs.sql:37): queued,
-	// claimed, running, awaiting_approval, completed, failed, cancelled. It is the
-	// field that decides whether a run reads as still live, so an unrecognised value
-	// must never reach a consumer as-is.
+	// CHECK constraint (runs.status, created by 00020_workers_runs.sql and widened by
+	// 00091_run_awaiting_input.sql): queued, claimed, running, awaiting_approval,
+	// awaiting_input, completed, failed, cancelled. It is the field that decides
+	// whether a run reads as still live, so an unrecognised value must never reach a
+	// consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames
 }

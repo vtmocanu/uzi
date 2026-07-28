@@ -54,6 +54,8 @@
     "idle_timeout_seconds": 600,
     "max_iterations": 5,
     "plan_max_revisions": 3,
+    "question_max": 5,
+    "question_timeout_seconds": 86400,
     "default_model": "sonnet",
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,

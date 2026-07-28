@@ -160,7 +160,7 @@ func notifierDecision(status string, origin pgtype.Text) decision {
 // Decision #3).
 func reconcilerDecision(status string, origin pgtype.Text) decision {
 	switch status {
-	case "queued", "claimed", "running", "awaiting_approval":
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}
