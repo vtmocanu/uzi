@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ const (
 	kindRejectPlan  = "reject_plan"
 	kindCancel      = "cancel"
 	kindFollowUp    = "follow_up"
+	kindAnswer      = "answer"
 )
 
 // agentSources are the two rosters a plan approval may draw its subagents from
@@ -279,6 +281,47 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
 
+	answer := &cobra.Command{
+		Use:   "answer <run-id>",
+		Short: "Answer the clarifying question a run is waiting on",
+		Long: "Answer the question a run asked with ask_user (PRD #88). The run parks in " +
+			"`awaiting_input` until you reply, then resumes the same agent session with your " +
+			"answer.\n\n" +
+			"The open question is read from the run's own feed — the newest `question` " +
+			"message — rather than from a run field, so the CLI, the web UI and Slack all " +
+			"derive it the same way. Pass -m, or pipe the answer on stdin. Repeat -m once " +
+			"per question when the agent asked several; answers are matched in order.\n\n" +
+			"The answer names the question it answers, so a reply written against a question " +
+			"the agent has already moved on from is rejected rather than applied to the " +
+			"current one.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			answers, _ := cmd.Flags().GetStringArray("message")
+			if len(answers) == 1 {
+				answers[0] = resolveMessage(env, answers[0])
+			} else if len(answers) == 0 {
+				answers = []string{resolveMessage(env, "")}
+			}
+			if len(answers) == 1 && strings.TrimSpace(answers[0]) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "an answer needs text: pass -m <answer> or pipe it on stdin")
+			}
+			q, err := openQuestion(cmd.Context(), c, args[0])
+			if err != nil {
+				return err
+			}
+			body, err := json.Marshal(answerBody{QuestionID: q.QuestionID, Answers: answers})
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindAnswer, string(body), nil)
+		},
+	}
+	answer.Flags().StringArrayP("message", "m", nil, "the answer (repeat once per question; or pipe a single answer on stdin)")
+
 	inputs := &cobra.Command{
 		Use:   "inputs <run-id>",
 		Short: "List a run's steer queue (follow-ups) with delivery status",
@@ -327,7 +370,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp, inputs)
+	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp, answer, inputs)
 	return cmd
 }
 
@@ -378,6 +421,57 @@ func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, 
 	return nil
 }
 
+// answerBody is the wire shape of an `answer` input (PRD #88 M1). JSON rather than
+// the bare prose every other kind carries, because an answer must name the question
+// it answers — the server rejects one naming a question that is no longer open, which
+// is what stops a reply written against an earlier question from resolving the
+// current one.
+type answerBody struct {
+	QuestionID string   `json:"question_id"`
+	Answers    []string `json:"answers"`
+}
+
+// questionPayload is the part of a `question` run-message the CLI reads.
+type questionPayload struct {
+	QuestionID string `json:"question_id"`
+	Questions  []struct {
+		Question string `json:"question"`
+		Header   string `json:"header"`
+		Options  []struct {
+			Label       string `json:"label"`
+			Description string `json:"description"`
+		} `json:"options"`
+	} `json:"questions"`
+}
+
+// openQuestion reads the run's newest `question` message and returns its payload.
+//
+// Derived from the FEED rather than a run field (PRD #88 D-L), so the CLI, the web UI
+// and Slack share one derivation rule instead of three. RunLogs returns messages in
+// seq order, so the last `question` is the open one.
+func openQuestion(ctx context.Context, c uzicli.Client, runID string) (questionPayload, error) {
+	msgs, err := c.RunLogs(ctx, runID, 0)
+	if err != nil {
+		return questionPayload{}, err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Kind != "question" {
+			continue
+		}
+		var q questionPayload
+		if err := json.Unmarshal(msgs[i].Payload, &q); err != nil {
+			return questionPayload{}, uzicli.Exitf(uzicli.ExitGeneric, "could not read the run's open question: %v", err)
+		}
+		if strings.TrimSpace(q.QuestionID) == "" {
+			return questionPayload{}, uzicli.Exitf(uzicli.ExitGeneric, "the run's open question carries no id")
+		}
+		return q, nil
+	}
+	// No question in the feed at all. Distinct from "the run moved on", which the
+	// server reports, because this one is almost always a mistyped run id.
+	return questionPayload{}, uzicli.Exitf(uzicli.ExitConflict, "run %s is not waiting for an answer", runID)
+}
+
 // inputOutcome is the human confirmation line for a submitted input.
 func inputOutcome(kind string, serverSide bool) string {
 	switch kind {
@@ -395,6 +489,8 @@ func inputOutcome(kind string, serverSide bool) string {
 		return "cancellation sent"
 	case kindFollowUp:
 		return "follow-up sent"
+	case kindAnswer:
+		return "answer sent"
 	default:
 		return "input submitted"
 	}
@@ -841,6 +937,13 @@ func steerState(consumedAt *time.Time, runStatus string) string {
 	}
 	if runStatus == "awaiting_approval" {
 		return "delivered (applies after approval)"
+	}
+	if runStatus == "awaiting_input" {
+		// PRD #88: the run is parked on a question, so a follow-up sits behind the
+		// answer rather than behind an approval. Distinct wording because the action
+		// the user owes is different, and telling them to approve something would be
+		// simply wrong.
+		return "delivered (applies after the question is answered)"
 	}
 	return "delivered"
 }

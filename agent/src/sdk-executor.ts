@@ -109,6 +109,11 @@ const REASON_CANCELLED = "run cancelled";
 const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 const REASON_NO_PLAN =
   "the agent ended the planning turn without submitting a plan";
+/** PRD #88 M4: the lead kept asking instead of planning. Distinct from
+ *  REASON_NO_PLAN so an operator reading a failed run can tell "it never produced a
+ *  plan" from "it produced only questions" — different problems with different fixes. */
+const REASON_NO_PLAN_AFTER_CLARIFICATION =
+  "the agent kept asking clarifying questions without ever submitting a plan";
 const REASON_MAX_ITERATIONS =
   "run reached the maximum implement/review iterations without completing";
 
@@ -207,6 +212,14 @@ function answeredPrompt(
     return `Q: ${q.question}\nA: ${a && a.length > 0 ? a : "(no answer given)"}`;
   });
   return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\nContinue the work with these answers.`;
+}
+
+/** Wrap an answer (or a could-not-ask notice) for a PLANNING turn. The implement-loop
+ *  wording says "continue the work", which is wrong before a plan exists — here the
+ *  required next step is the plan itself, and saying so is what stops the lead from
+ *  treating the answer as permission to start implementing. */
+function buildPlanAfterAnswerPrompt(answerBlock: string): string {
+  return `${answerBlock}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
 }
 
 /** Told to the lead when its question could not be delivered. It must not simply
@@ -610,18 +623,25 @@ export class SdkExecutor implements Executor {
         agent: "worker",
         payload: { text: `starting SDK agent (${planningLabel})` },
       });
-      const plan = await this.driveTurn(
+      /** PRD #88: parks used so far, against QUESTION_MAX. Worker-side because a
+       *  question is an in-process ask_user signal — there is no run_user_inputs row
+       *  for the server to count, unlike a revise_plan.
+       *
+       *  Declared HERE, above the planning turn, because the cap is per RUN: M4 lets
+       *  the lead ask before it plans, and a budget that reset between the planning
+       *  and implement phases would silently be worth 2 x QUESTION_MAX. */
+      const budget = { asked: 0 };
+
+      const plan = await this.drivePlanningTurn(
         ctx,
         baseOptions,
         resumeId,
         planPrompt,
         state,
         idleMs,
+        budget,
       );
       resumeId = plan.sessionId ?? resumeId;
-      // A planning turn that ends without a plan is an error — never push
-      // un-gated work, even if the lead prematurely signalled done.
-      if (plan.plan === undefined) throw new Error(REASON_NO_PLAN);
 
       // --- Plan gate (+ revision loop, PRD #41) -----------------------------
       // The gate can be re-entered N times under ONE approval budget: a `revise`
@@ -672,18 +692,16 @@ export class SdkExecutor implements Executor {
         // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
         // subagents (baseOptions), exactly like the first plan turn — the roster
         // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
-        const turn = await this.driveTurn(
+        const turn = await this.drivePlanningTurn(
           ctx,
           baseOptions,
           resumeId,
           buildRevisePlanPrompt(feedback),
           state,
           idleMs,
+          budget,
         );
         resumeId = turn.sessionId ?? resumeId;
-        // A revision turn that submits no plan fails, same as the first planning turn —
-        // never push un-gated work.
-        if (turn.plan === undefined) throw new Error(REASON_NO_PLAN);
         approvedPlan = turn.plan;
         verdict = await ctx.gatePlan(approvedPlan);
       }
@@ -791,10 +809,6 @@ export class SdkExecutor implements Executor {
       // --- Phase 2: implement ⇄ review loop --------------------------------
       let iteration = 0;
       let followUp: string | undefined;
-      /** PRD #88: parks used so far, against QUESTION_MAX. Worker-side because a
-       *  question is an in-process ask_user signal — there is no run_user_inputs row
-       *  for the server to count, unlike a revise_plan. */
-      let questionsAsked = 0;
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -855,10 +869,10 @@ export class SdkExecutor implements Executor {
           const verdict = await this.askUserOrContinue(
             ctx,
             asked,
-            questionsAsked,
+            budget.asked,
           );
           if (verdict.parked) {
-            questionsAsked++;
+            budget.asked++;
             if (verdict.cancelled)
               throw new PlanRejectedError(
                 "run cancelled while awaiting clarification",
@@ -1031,6 +1045,67 @@ export class SdkExecutor implements Executor {
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
+  /**
+   * PRD #88 M4: drive a PLANNING turn, letting the lead ask the human first.
+   *
+   * Wraps both planning-turn sites — the first plan turn and #41's revision turn —
+   * because both end in `if (plan === undefined) throw REASON_NO_PLAN` and a pre-run
+   * question ends a planning turn with questions and NO plan. Without this, the
+   * feature's own pre-run path hard-fails the run it was meant to clarify. Fixing only
+   * the first site would leave a revision turn that asks a question failing exactly
+   * that way, which is the harder of the two to reproduce.
+   *
+   * The contract narrows rather than loosens: "no plan AND no questions" is still
+   * REASON_NO_PLAN, so a lead that simply ends its turn without planning still fails
+   * closed and un-gated work is still never pushed.
+   *
+   * On an answer the SAME session is resumed and re-planned, so the lead keeps its
+   * full planning context and nothing is replayed. It eventually reaches submit_plan
+   * and the normal plan gate; M4 adds no second gate.
+   */
+  private async drivePlanningTurn(
+    ctx: RunContext,
+    options: SdkOptions,
+    resumeId: string | undefined,
+    prompt: string,
+    state: RunDrive,
+    idleMs: number,
+    budget: { asked: number },
+  ): Promise<TurnResult & { plan: string }> {
+    let turnPrompt = prompt;
+    // Bounded independently of the park cap. The cap bounds how many times we ASK;
+    // this bounds how many times we re-plan, which also covers the rounds where the
+    // question could NOT be asked (cap spent, or askUser unwired) and the lead was
+    // told to proceed. Without it a lead that answers every answer with another
+    // question would loop here forever, never planning and never failing.
+    const maxRounds = questionMax(ctx.config ?? null) + 1;
+    for (let round = 0; ; round++) {
+      const turn = await this.driveTurn(
+        ctx,
+        options,
+        resumeId,
+        turnPrompt,
+        state,
+        idleMs,
+      );
+      resumeId = turn.sessionId ?? resumeId;
+      if (turn.plan !== undefined)
+        return { ...turn, sessionId: resumeId, plan: turn.plan };
+
+      const asked = turn.questions;
+      // The unchanged contract: a planning turn that neither planned nor asked is the
+      // original error. Never push un-gated work, even if the lead signalled done.
+      if (!asked?.length) throw new Error(REASON_NO_PLAN);
+      if (round >= maxRounds)
+        throw new Error(REASON_NO_PLAN_AFTER_CLARIFICATION);
+
+      const verdict = await this.askUserOrContinue(ctx, asked, budget.asked);
+      if (verdict.cancelled) throw new Error(REASON_CANCELLED);
+      if (verdict.parked) budget.asked++;
+      turnPrompt = buildPlanAfterAnswerPrompt(verdict.followUp);
+    }
+  }
+
   /**
    * PRD #88 M1: run one clarification park, or explain why it did not happen.
    *
