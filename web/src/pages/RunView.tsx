@@ -46,7 +46,7 @@ import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
-import { QuestionPanel } from "../components/QuestionPanel";
+import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
@@ -420,6 +420,7 @@ export function RunView() {
           run={run}
           messages={messages}
           busy={busy}
+          canSteer={canSteer}
           onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
@@ -432,14 +433,25 @@ export function RunView() {
           the window before the `question` message replays (the worker flushes it first,
           but a reconnecting client can read the status back first), and the question
           alone would keep offering a composer after the run resumed. */}
-      {run.status === "awaiting_input" && openQuestion && (
-        <QuestionPanel
-          open={openQuestion}
-          busy={busy}
-          onAnswer={(body) => act(() => submit("answer", body))}
-          onCancel={() => act(() => submit("cancel"))}
-        />
-      )}
+      {run.status === "awaiting_input" &&
+        (openQuestion ? (
+          <QuestionPanel
+            open={openQuestion}
+            busy={busy}
+            canSteer={canSteer}
+            onAnswer={(body) => act(() => submit("answer", body))}
+            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+          />
+        ) : (
+          // Parked, but the question is unusable — no question_id, or nothing renderable.
+          // Previously this rendered NOTHING: the run sat at "needs your answer" with no
+          // panel and no explanation until the deadline failed it, and an absent
+          // affordance reads as "not loaded yet", so the reasonable response was to wait.
+          <UnreadableQuestion
+            busy={busy}
+            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+          />
+        ))}
 
       {/* Read-only record of which agents the run used, once a selection is made
           (at the gate or by an autopilot default). Shown for a live/terminal run;
@@ -589,6 +601,7 @@ export function PlanPanel({
   run,
   messages = [],
   busy,
+  canSteer = true,
   onApprove,
   onReject,
   onRequestChanges,
@@ -600,6 +613,15 @@ export function PlanPanel({
   // can omit it — the derivation degrades to v1 / revision 0 of 3.
   messages?: RunMessage[];
   busy: boolean;
+  // False for a NON-OWNER viewer. PRE-EXISTING and unrelated to PRD #88: POST /inputs is
+  // user-scoped, so a non-owner admin — who can legitimately OPEN this owner-or-admin run
+  // view — got an Approve button that 404s. useRunStream states the rule ("never a broken
+  // Send that 404s") and SteerQueueCard already obeyed it; this panel never did. Fixed
+  // alongside the question composer because fixing only the newer one would have left the
+  // identical hole one panel over. Defaults true so an owner is never gated by an absent
+  // prop, and it hides the ACTIONS only — the plan body stays readable, which is the whole
+  // reason a non-owner admin opens this page.
+  canSteer?: boolean;
   onApprove: (selection: AgentSelectionInput) => void;
   onReject: (reason: string) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
@@ -665,9 +687,11 @@ export function PlanPanel({
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[11px] text-faint">{roundsLabel}</span>
-            <Button variant="danger" disabled={busy} onClick={() => onCancel?.()}>
-              Cancel run
-            </Button>
+            {canSteer && (
+              <Button variant="danger" disabled={busy} onClick={() => onCancel?.()}>
+                Cancel run
+              </Button>
+            )}
           </div>
         </div>
         <div className="p-4">
@@ -691,14 +715,16 @@ export function PlanPanel({
             <VersionChip label={`v${currentVersion}`} />
           </h2>
           <p className="text-xs text-muted">
-            {requesting
-              ? "Describe what should change; the other actions return if you cancel."
-              : "The run is parked until you decide. Agent choice locks in on approval."}
+            {!canSteer
+              ? "The run is parked until its owner decides. Only they can approve or reject it."
+              : requesting
+                ? "Describe what should change; the other actions return if you cancel."
+                : "The run is parked until you decide. Agent choice locks in on approval."}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-faint">{roundsLabel}</span>
-          {!disclosing && (
+          {canSteer && !disclosing && (
             <div className="flex gap-2">
               <Button disabled={busy} onClick={() => onApprove(selection)}>
                 {approveLabel}
@@ -714,7 +740,12 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
-        <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+        {/* The picker exists to shape the approve verdict, so it is an action surface:
+            shown only to someone who can approve. The locked-in roster is a separate,
+            read-only card (AgentRosterSummary) once the run is past the gate. */}
+        {canSteer && (
+          <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+        )}
 
         {run.plan_md ? (
           <div className="max-h-96 overflow-auto rounded-lg border border-edge bg-surface p-3">

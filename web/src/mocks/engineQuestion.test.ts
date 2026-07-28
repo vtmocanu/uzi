@@ -283,3 +283,32 @@ describe("the question fixture DISCRIMINATES (D-N)", () => {
     }
   });
 });
+
+describe("the unreadable-question fixture (PRD #88 enhancement 2)", () => {
+  // The empty state was inferred from CODE and could not be produced by the demo, which
+  // is the D-N complaint one surface over: a state nothing can reach is a state nobody
+  // has looked at. This fixture is what makes it browsable and testable, so it must stay
+  // genuinely unreadable — a well-meaning "fix" adding a question_id would silently
+  // delete the coverage while leaving every test here green except this one.
+  const RUN = "run-unreadable-question";
+
+  it("seeds a run PARKED on a question the shipped parse cannot use", () => {
+    expect(state.runs.get(RUN)?.status).toBe("awaiting_input");
+    const feed = [...listMessages(RUN)];
+    expect(feed.some((m) => m.kind === "question")).toBe(true);
+    // Derived through the SHIPPED rule: deriveOpenQuestion must return null, which is
+    // exactly what makes RunView take the UnreadableQuestion branch.
+    expect(deriveOpenQuestion(feed)).toBeNull();
+  });
+
+  it("is unreadable for the RIGHT reason — a missing question_id, not empty questions", () => {
+    // Two different defects reach the same null. Pinning which one keeps the fixture
+    // exercising the shape a producer change actually yields (a field that stopped being
+    // sent), rather than an empty list nothing emits.
+    const q = [...listMessages(RUN)].filter((m) => m.kind === "question").pop()!;
+    const payload = q.payload as Record<string, unknown>;
+    expect("question_id" in payload).toBe(false);
+    expect(Array.isArray(payload.questions) && (payload.questions as unknown[]).length > 0).toBe(true);
+    expect(parseQuestionPayload(payload)).toBeNull();
+  });
+});

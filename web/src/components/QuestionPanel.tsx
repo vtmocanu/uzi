@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Button, Textarea, cx } from "./ui";
 import { Markdown } from "./Markdown";
 import { answersReady, composeAnswer, encodeAnswerBody, type OpenQuestion } from "../lib/runQuestion";
@@ -34,9 +34,52 @@ function selectionKey(qIndex: number, oIndex: number): string {
   return `${qIndex}:${oIndex}`;
 }
 
+/**
+ * UnreadableQuestion is what a parked run shows when its `question` payload cannot be
+ * used — no `question_id`, or no renderable questions (see parseQuestionPayload).
+ *
+ * Without it the run sits at "needs your answer" with NO panel and NO explanation until
+ * the 24h deadline fails it. Not a dead end — Stop run is in the steer card below — but
+ * silence, and the user has no way to learn that answering is impossible rather than
+ * merely unavailable. That is the worse half: an absent affordance reads as "not loaded
+ * yet", so the reasonable response is to wait, which is exactly what cannot help.
+ *
+ * It states the ONE thing the user can act on. It deliberately does NOT offer a composer:
+ * the api rejects an answer that names no question, so a Send here would 400 every time
+ * — the same reasoning that makes parseQuestionPayload return null rather than an id-less
+ * payload.
+ */
+export function UnreadableQuestion({ busy, onCancel }: { busy: boolean; onCancel?: () => void }) {
+  return (
+    <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
+        <div>
+          <h2 className="text-sm font-semibold text-warn">The agent's question could not be read</h2>
+          <p className="text-xs text-muted">
+            This run is parked waiting for an answer, but the question it sent cannot be displayed, so
+            there is nothing here to answer.
+          </p>
+        </div>
+        {onCancel && (
+          <Button variant="danger" disabled={busy} onClick={onCancel}>
+            Cancel run
+          </Button>
+        )}
+      </div>
+      <div className="p-4 text-sm text-muted">
+        <p>
+          The run will keep waiting until its answer deadline expires, then fail. Cancelling it now is
+          usually better than waiting. The raw question is in the activity log below.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export function QuestionPanel({
   open,
   busy,
+  canSteer = true,
   onAnswer,
   onCancel,
 }: {
@@ -45,6 +88,15 @@ export function QuestionPanel({
    *  showing question 2's round marker over question 3's text. */
   open: OpenQuestion;
   busy: boolean;
+  /** False for a NON-OWNER viewer (a non-owner admin can open the owner-or-admin run
+   *  view, but POST /inputs is user-scoped and 404s for them). useRunStream states the
+   *  rule outright — "never a broken Send that 404s" — and SteerQueueCard already obeys
+   *  it. Defaults true so an owner is never gated by an absent prop.
+   *
+   *  It hides the CONTROLS, not the content: the run view is deliberately visible to a
+   *  non-owner admin, so hiding the question itself would remove information they are
+   *  entitled to and turn a permissions boundary into a blank page. */
+  canSteer?: boolean;
   /** Submits the encoded `answer` steering body. The panel owns the encoding so the id
    *  and the answers can never be assembled apart from each other. */
   onAnswer: (body: string) => void;
@@ -113,6 +165,70 @@ export function QuestionPanel({
 
   const ready = answersReady(answers, question.questions.length);
   const multiple = question.questions.length > 1;
+
+  // Non-owner: the question is readable, nothing is answerable. Options render as inert
+  // text rather than disabled buttons — a greyed-out control still invites a click and
+  // then refuses it, which is the affordance-that-lies the canSteer rule exists to avoid.
+  if (!canSteer) {
+    return (
+      <div className="overflow-hidden rounded-xl border border-warn/40 bg-warn/5">
+        <div className="border-b border-warn/30 bg-warn/10 px-4 py-3">
+          <h2 className="text-sm font-semibold text-warn">
+            Waiting on an answer{ordinal > 1 ? ` · q${ordinal}` : ""}
+          </h2>
+          <p className="text-xs text-muted">
+            The agent asked the run's owner a question. Only they can answer it.
+          </p>
+        </div>
+        <div className="space-y-3 p-4">
+          {question.questions.map((q, qi) => (
+            <div key={qi} className="space-y-1.5">
+              {q.header.trim() !== "" && (
+                <div className="text-xs font-semibold uppercase tracking-wider text-faint">{q.header}</div>
+              )}
+              <Markdown content={q.question} />
+              {q.options.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {q.options.map((o, oi) => (
+                    <span
+                      key={oi}
+                      className="rounded-full border border-edge-strong bg-raised px-2 py-[2px] text-[11px] text-muted"
+                    >
+                      {o.label}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const submit = () => {
+    if (busy || !ready) return;
+    onAnswer(encodeAnswerBody(question.questionId, answers));
+  };
+
+  // Cmd/Ctrl+Enter submits from any answer box, pairing with the focus-on-mount above so
+  // the whole keyboard path is: park → type → chord. Without it the last step is Tabbing
+  // forward past every remaining chip and textarea to reach Send.
+  //
+  // NOT bare Enter, which ChatComposer uses. That convention holds for a single-field
+  // composer; this panel can hold several questions, so Enter must stay a newline or a
+  // multi-question answer becomes unwritable. The chord is also why Shift+Enter needs no
+  // special case here — it is already just a newline.
+  //
+  // Guarded on `ready` through submit() rather than firing a rejected request: the button
+  // is disabled in the same state, and a chord that silently does nothing is better than
+  // one that 400s.
+  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submit();
+    }
+  };
 
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
@@ -214,6 +330,7 @@ export function QuestionPanel({
                   : "Your answer (sent back into the agent's session)…"
               }
               value={texts[qi] ?? ""}
+              onKeyDown={onKeyDown}
               onChange={(e) =>
                 setTexts((prev) => {
                   const next = [...prev];
@@ -227,10 +344,11 @@ export function QuestionPanel({
 
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-[11px] text-faint">
-            Your answer resumes the agent's session where it stopped. Never paste a credential, token or
-            password — the agent must not ask for one, and the answer is stored with the run.
+            Your answer resumes the agent's session where it stopped.{" "}
+            <span className="whitespace-nowrap">⌘/Ctrl + Enter</span> sends. Never paste a credential, token
+            or password — the agent must not ask for one, and the answer is stored with the run.
           </span>
-          <Button disabled={busy || !ready} onClick={() => onAnswer(encodeAnswerBody(question.questionId, answers))}>
+          <Button disabled={busy || !ready} onClick={submit}>
             Send answer
           </Button>
         </div>

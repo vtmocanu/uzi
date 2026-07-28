@@ -21,6 +21,7 @@ import {
   mockLaneRuns,
   mockProposals,
   mockRuns,
+  mockUnreadableQuestionMessages,
 } from "./data";
 
 export interface MockState {
@@ -61,6 +62,9 @@ function seed(): MockState {
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
   messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
+  // PRD #88: the run parked on a question the UI cannot render. Seeded rather than
+  // scripted, so the empty state is reachable by URL without walking the journey.
+  messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
   messages.set("run-live", []);
   messages.set("run-cancelled", []);

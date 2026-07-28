@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { QuestionPanel } from "./QuestionPanel";
+import { QuestionPanel, UnreadableQuestion } from "./QuestionPanel";
 import type { OpenQuestion, QuestionPayload } from "../lib/runQuestion";
 
 afterEach(cleanup);
@@ -125,6 +125,70 @@ describe("QuestionPanel", () => {
     const chip = screen.getByRole("button", { name: /Postgres table/ });
     expect(chip.textContent).toContain("Postgres table — one more migration");
     expect(chip.textContent).not.toContain("table—");
+  });
+
+  // ── Enhancements (user-approved) ───────────────────────────────────────────
+
+  it("submits on Cmd/Ctrl+Enter from an answer box", () => {
+    // Pairs with the focus fix: park → type → chord, without Tabbing forward past every
+    // remaining chip and textarea to reach Send.
+    for (const mod of [{ metaKey: true }, { ctrlKey: true }]) {
+      const onAnswer = vi.fn();
+      render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={onAnswer} />);
+      const box = screen.getByLabelText("Your answer");
+      fireEvent.change(box, { target: { value: "14 days" } });
+      fireEvent.keyDown(box, { key: "Enter", ...mod });
+      expect(bodyOf(onAnswer)).toEqual({ question_id: "q-1", answers: ["14 days"] });
+      cleanup();
+    }
+  });
+
+  it("leaves BARE Enter as a newline — the panel can hold several questions", () => {
+    // ChatComposer sends on bare Enter, but it has ONE field. Here Enter must stay a
+    // newline or a multi-question answer becomes unwritable. Shift+Enter needs no case of
+    // its own for the same reason: it is already just a newline.
+    const onAnswer = vi.fn();
+    render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={onAnswer} />);
+    const box = screen.getByLabelText("Your answer");
+    fireEvent.change(box, { target: { value: "14 days" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: true });
+    expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  it("the chord obeys the same guards as the button", () => {
+    // A chord that fires while the button is disabled would submit a blank or in-flight
+    // answer — the 400 the disabled state exists to prevent.
+    const onAnswer = vi.fn();
+    const { rerender } = render(<QuestionPanel open={open(FREE_TEXT)} busy={false} onAnswer={onAnswer} />);
+    const box = screen.getByLabelText("Your answer");
+    // Empty: not ready.
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    expect(onAnswer).not.toHaveBeenCalled();
+    // Filled but busy.
+    fireEvent.change(box, { target: { value: "14 days" } });
+    rerender(<QuestionPanel open={open(FREE_TEXT)} busy={true} onAnswer={onAnswer} />);
+    fireEvent.keyDown(screen.getByLabelText("Your answer"), { key: "Enter", metaKey: true });
+    expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  it("shows the question read-only to a NON-OWNER, with no control that would 404", () => {
+    // POST /inputs is user-scoped, so a non-owner admin's Send answer 404s. The run view
+    // is deliberately open to them, so the CONTENT stays and only the controls go —
+    // hiding the question would turn a permissions boundary into a blank page.
+    render(
+      <QuestionPanel open={open(SINGLE_SELECT, 2)} busy={false} canSteer={false} onAnswer={vi.fn()} onCancel={vi.fn()} />,
+    );
+    expect(screen.getByText(/Only they can answer it/)).toBeTruthy();
+    expect(screen.getByText("Which backend?")).toBeTruthy();
+    expect(screen.getByText("Postgres table")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    // Options render as INERT text, not disabled buttons: a greyed control still invites
+    // a click and then refuses it, which is the affordance-that-lies canSteer exists to
+    // avoid.
+    expect(screen.queryByRole("button", { name: /Postgres table/ })).toBeNull();
   });
 
   it("blocks the submit until every question has an answer", () => {
@@ -276,6 +340,11 @@ describe("QuestionPanel", () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
+  it("the read-only view still marks a later question", () => {
+    render(<QuestionPanel open={open(SINGLE_SELECT, 3)} busy={false} canSteer={false} onAnswer={vi.fn()} />);
+    expect(screen.getByText(/q3/)).toBeTruthy();
+  });
+
   it("marks a LATER question with its ordinal, and marks the first with nothing", () => {
     // The ordinal comes from counting the feed (D-R), never from the payload — which no
     // longer carries one. A parked run the user meets days later must say which round it
@@ -284,5 +353,37 @@ describe("QuestionPanel", () => {
     expect(screen.getByText("q3")).toBeTruthy();
     rerender(<QuestionPanel open={open(SINGLE_SELECT, 1)} busy={false} onAnswer={vi.fn()} />);
     expect(screen.queryByText(/^q\d+$/)).toBeNull();
+  });
+});
+
+describe("UnreadableQuestion (the parked-but-unanswerable state)", () => {
+  it("explains that answering is impossible, not merely unavailable", () => {
+    // The failure it replaces was SILENCE: no panel, no explanation, until the deadline
+    // failed the run. An absent affordance reads as "not loaded yet", so the reasonable
+    // response was to wait — which is exactly what cannot help.
+    render(<UnreadableQuestion busy={false} onCancel={vi.fn()} />);
+    expect(screen.getByText(/could not be read/)).toBeTruthy();
+    expect(screen.getByText(/nothing here to answer/)).toBeTruthy();
+    // It names the one thing the user CAN do, and says what happens if they do nothing.
+    expect(screen.getByText(/answer deadline expires, then fail/)).toBeTruthy();
+  });
+
+  it("offers NO composer — a Send here would 400 every time", () => {
+    // Same reasoning that makes parseQuestionPayload return null rather than an id-less
+    // payload: the api rejects an answer that names no question.
+    render(<UnreadableQuestion busy={false} onCancel={vi.fn()} />);
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull();
+  });
+
+  it("offers Cancel run only when a handler is wired, and disables it while busy", () => {
+    const onCancel = vi.fn();
+    const { rerender } = render(<UnreadableQuestion busy={false} />);
+    expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
+    rerender(<UnreadableQuestion busy={false} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    rerender(<UnreadableQuestion busy={true} onCancel={onCancel} />);
+    expect((screen.getByRole("button", { name: "Cancel run" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

@@ -1002,6 +1002,78 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
 // EXISTS; RunCredential.test.tsx proves what it renders. Together they cover what a
 // single page-level render would, and this half reddens on exactly the mutation that
 // went undetected.
+describe("PlanPanel canSteer (PRE-EXISTING hole, fixed alongside PRD #88)", () => {
+  // POST /inputs is user-scoped, so a non-owner admin — who can legitimately OPEN this
+  // owner-or-admin run view — had an Approve button that 404s. useRunStream states the
+  // rule outright ("never a broken Send that 404s") and SteerQueueCard already obeyed it;
+  // this panel never did. Unrelated to #88 and fixed with it, because fixing only the
+  // newer question composer would have left the identical hole one panel over.
+  const gated = () =>
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [agent("coder")], own_agents: [agent("coder")] })}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+        onRequestChanges={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+
+  it("hides every verdict control from a non-owner", () => {
+    gated();
+    expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("keeps the plan READABLE — the reason a non-owner admin opens this page", () => {
+    // Hiding the panel outright would turn a permissions boundary into a blank page.
+    gated();
+    expect(screen.getByText("step one")).toBeTruthy();
+    expect(screen.getByText(/Only they can approve or reject it/)).toBeTruthy();
+  });
+
+  it("hides the agent picker, which exists only to shape a verdict they cannot cast", () => {
+    gated();
+    expect(screen.queryByRole("button", { name: /^●?\s*coder/i })).toBeNull();
+  });
+
+  it("defaults to steerable, so an owner is never gated by an absent prop", async () => {
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [agent("coder")], own_agents: [agent("coder")] })}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByRole("button", { name: /Approve plan/ })).toBeTruthy();
+  });
+
+  it("hides Cancel run from a non-owner in the REVISING state too", () => {
+    // A second branch with its own controls; gating only the open gate would leave the
+    // revising panel offering a Cancel that 404s.
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [], own_agents: [] })}
+        messages={[
+          { seq: 1, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "p" }, created_at: "2026-07-28T00:00:00Z" },
+          { seq: 2, kind: "plan_revising", agent: "lead", agent_instance: null, agent_label: null, payload: { round: 1 }, created_at: "2026-07-28T00:00:01Z" },
+        ]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByText("Revising the plan")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
+  });
+});
+
 describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
   // 🔴 A SOURCE-TEXT CONTROL IS SATISFIED BY DISABLED CODE, and the first version of
   // this guard was. `toContain` over raw file text does not know what a comment is,
@@ -1063,7 +1135,30 @@ describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
     // with nothing to answer while the question message is still replaying, and the
     // question alone keeps offering one after the run resumed (the `answer` message is
     // emitted BEFORE the `running` state report).
-    expect(live).toContain('run.status === "awaiting_input" && openQuestion');
+    const statusGate = live.indexOf('run.status === "awaiting_input" &&');
+    const questionGate = live.indexOf("openQuestion ? (");
+    const panel = live.indexOf("<QuestionPanel");
+    expect(statusGate).toBeGreaterThan(-1);
+    expect(questionGate).toBeGreaterThan(statusGate);
+    expect(panel).toBeGreaterThan(questionGate);
+  });
+
+  it("renders the UNREADABLE branch when the status is parked but the payload is not", () => {
+    // The else arm of that same conditional. Without it a parked run with an unusable
+    // payload renders nothing at all — no panel, no explanation — until the deadline.
+    const questionGate = live.indexOf("openQuestion ? (");
+    const fallback = live.indexOf("<UnreadableQuestion");
+    expect(fallback).toBeGreaterThan(questionGate);
+    expect(live).toContain('from "../components/QuestionPanel"');
+  });
+
+  it("passes canSteer to BOTH gate panels, so neither offers a Send that 404s", () => {
+    // PlanPanel's hole is PRE-EXISTING and unrelated to #88; fixing only the question
+    // composer would have left the identical hole one panel over.
+    const planPanel = live.indexOf("<PlanPanel");
+    const questionPanel = live.indexOf("<QuestionPanel");
+    expect(live.slice(planPanel, planPanel + 400)).toContain("canSteer={canSteer}");
+    expect(live.slice(questionPanel, questionPanel + 400)).toContain("canSteer={canSteer}");
   });
 
   it("derives the question from the feed rather than reading a DTO field", () => {
@@ -1089,7 +1184,7 @@ describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
     // and uncommented, not that it runs. What it CAN prove structurally is placement, by
     // where the region sits relative to the panel's conditional.
     const region = live.indexOf('role="status" aria-live="polite"');
-    const panelGate = live.indexOf('run.status === "awaiting_input" && openQuestion');
+    const panelGate = live.indexOf('run.status === "awaiting_input" &&');
     expect(region).toBeGreaterThan(-1);
     expect(panelGate).toBeGreaterThan(-1);
     expect(region).toBeLessThan(panelGate);
