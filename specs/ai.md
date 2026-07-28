@@ -14819,6 +14819,11 @@ not to any consumer of it.
 
 ## 449. PRD #175 — `uptime_seconds` is a considered DISCLOSURE, and the reason first given for keeping it was a claim about the UI
 
+Serves human: "uptime is accepted as public; severity Low" (`specs/human.md`,
+Feature #175) — **ratified 2026-07-28, after the fact rather than stated up front**.
+The requirement is the user's; the judgement below, and the four places it is
+enforced, are ours.
+
 The decision: **no signed-out popover, and `uptime_seconds` is kept and declared
 public.** That is what the PRD recommended. Its stated REASON — "it keeps the blast
 radius at zero and makes the uptime question moot", because the only consumer sits
@@ -15078,6 +15083,12 @@ refuted it independently, from different starting points, before any code was wr
   so it is not clipped.
 
 ## 452. PRD #175 M4 — `uzi version` WRAPS rather than reshapes, and the SHARED DTO is the only thing that keeps "unknown" unknown
+
+Serves human: "`uzi version --json` gains a `server` key carrying the server's build
+info, with the CLI's own `version` unchanged at the top level" (`specs/human.md`,
+Feature #175) — **ratified 2026-07-28, after the fact rather than stated up front**.
+Both halves of that sentence are one requirement, and the wrapper below is what makes
+them true at the same time.
 
 - **The `--json` shape is `{version, server?}`: top-level `version` keeps its exact
   meaning — the CLI's own ldflags stamp — and the server's coordinates nest under a new
