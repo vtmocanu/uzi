@@ -14812,7 +14812,7 @@ it recreates the collision.
   **twice**, because a one-question fixture cannot tell a real ordinal from a
   hardcoded 1.
 
-## 460. PRD #88 — what this increment does NOT deliver, and the one omission that was DELIBERATE
+## 460. PRD #88 — what this increment does NOT deliver, and the two deliberate non-fixes
 
 Recorded in `ai.md` rather than only in the MR because an MR description is ephemeral
 and a coverage claim is what a later reader most needs bounded. **"e2e green" will
@@ -14839,19 +14839,51 @@ otherwise be read as covering all of these, and it covers none of them.**
 - **`QUESTION_MAX` enforcement is documented, not tested**, and neither is §458's
   `× (RUN_MAX_REQUEUES + 1)` bound.
 
-**The deliberate omission, recorded so it is not re-filed as a defect:
-`FailRunAutoStop` has NO `awaiting_input` exclusion.** Its WHERE is
-`status NOT IN ('completed','failed','cancelled')` plus an explicit
-`AND status <> 'limit_wait'`, and that negative predicate **admits a parked run**.
-`awaiting_input` sits in exactly the position `limit_wait` spent a clause on, and for
-the same reason: a parked run's message writes are not in a permanent-failure loop,
-they have simply stopped, because the worker went away by design and the server owns
-the resume. It is unreachable **today** only because `workersvc/autostop.go`'s
-`if run.Status != "running"` excludes it — **the invariant is stated in a different
-package from the one that enforces it**, and that Go line's own comment justifies
-itself entirely in terms of `queued` and the requeue streak, never mentioning parking.
-Anyone relaxing it later makes parked runs auto-stoppable with no SQL backstop and no
-failing test. The clause was written and then reverted when `sqlc generate` could not
-reach its proxy, and ruled a follow-up rather than a blocker on the unreachability.
-**Follow-up, not a gap — and the case for adding it is that unreachability is a
-property of another package, not of this statement.**
+### Non-fix 1 — `FailRunAutoStop` GUARDS `awaiting_input`, and the clause is INERT TODAY ON PURPOSE
+
+**The guard ships.** `FailRunAutoStop`'s WHERE is
+`status NOT IN ('completed','failed','cancelled')` — a negative predicate that
+**admits a parked run** — followed by two explicit exclusions,
+`AND status <> 'limit_wait'` and `AND status <> 'awaiting_input'`, in the `.sql` and in
+the generated const that executes.
+
+**Nothing can reach the clause today**, because `workersvc/autostop.go`'s
+`if run.Status != "running"` already excludes every park. It was added anyway, and the
+reason is the decision worth keeping:
+
+- **The invariant is stated in a DIFFERENT PACKAGE from the one that enforces it.** A
+  backstop belongs where the guard is *enforced*, not where it currently happens to be
+  *derived*.
+- **That Go line's own comment does not mention parking at all** — it justifies itself
+  entirely in terms of `queued` and the requeue streak, because parking did not exist
+  when it was written. So the protection is not merely remote, it is undocumented at
+  the site a reader would check.
+- **Relaxing that one line — to cover `awaiting_approval`, say — would make parked runs
+  auto-stoppable with no SQL backstop and no failing test.** The clause costs one line
+  and removes that entire class.
+- **Auto-stopping a parked run would be wrong on the merits, not merely unreachable:**
+  its message writes are not in a permanent-failure loop, they have simply *stopped*,
+  because the worker went away by design and the server owns the resume.
+- `limit_wait` spent a clause on exactly this argument first; `awaiting_input` is the
+  same shape of park and inherits it verbatim.
+
+*(Recorded as a deferred omission for one commit, while `sqlc generate` could not reach
+its proxy, then landed. **An inert clause with no test is precisely the shape that gets
+deleted as dead code in a later tidy-up**, which is why the rationale lives here and in
+the query comment rather than only in a commit message.)*
+
+### Non-fix 2 — `uzi run answer` pulls the run's WHOLE message history to read one field
+
+Deliberate, with the trade stated rather than hidden. `openQuestion` calls `RunLogs`
+and walks backwards for the newest `question`, so a one-line command downloads the
+entire feed of a long run.
+
+- **Nothing new is exposed** — same route, same authorization as `uzi run logs`. The
+  cost is bandwidth and latency, not access.
+- **The asymmetry is what makes it worth recording:** `logs` is *expected* to be heavy
+  and `answer` is not, so the surprise lands on the verb nobody would profile.
+- **Fixing it needs a server-side "latest message of kind K" read that does not
+  exist.** Adding one for a single CLI verb was judged the wrong trade against §459's
+  one-derivation rule — which is exactly what keeps the CLI, the web UI and Slack from
+  drifting into three different notions of "the open question". **The cheap fix buys
+  bandwidth and spends the property that made the design coherent.**
