@@ -7,6 +7,7 @@ import {
   displayVersion,
   formatCount,
   formatDay,
+  formatStamp,
   formatUptime,
   liveUptimeSeconds,
 } from "./BuildInfoPopover";
@@ -60,6 +61,20 @@ describe("formatters", () => {
     expect(formatDay("nonsense")).toBeNull();
   });
 
+  it("keeps the TIME on a build stamp, in UTC and explicitly labelled", () => {
+    // Two images can ship the same day, which is exactly when someone consults
+    // this field — a day-granular stamp is silent in the case it exists for.
+    expect(formatStamp("2026-07-26T18:42:07Z")).toBe("26 Jul 2026 18:42 UTC");
+    // Not the runner's local day/hour: an instant late in the UTC day must not
+    // roll, and midnight must render 00:00 rather than 24:00.
+    expect(formatStamp("2026-07-27T23:30:00Z")).toBe("27 Jul 2026 23:30 UTC");
+    expect(formatStamp("2026-07-27T00:05:00Z")).toBe("27 Jul 2026 00:05 UTC");
+    // An offset instant is normalised to UTC, not rendered as written.
+    expect(formatStamp("2026-07-26T20:42:07+02:00")).toBe("26 Jul 2026 18:42 UTC");
+    expect(formatStamp(undefined)).toBeNull();
+    expect(formatStamp("nonsense")).toBeNull();
+  });
+
   it("groups the commit count", () => {
     expect(formatCount(2105)).toBe("2,105");
     expect(formatCount(7)).toBe("7");
@@ -104,6 +119,54 @@ describe("BuildInfoPopover — fully-stamped build", () => {
     expect(pop.textContent).not.toContain("366a282d52095312f54b99698b241ac872e20284");
     expect(pop.textContent).toContain("Uptime");
     expect(pop.textContent).toContain("3d 4h");
+  });
+
+  it("carries the FULL 40-char SHA into the DOM while displaying seven", () => {
+    // PRD :72 stamps the full SHA "so the stored value stays greppable and
+    // linkable", and M1 gates it on len==40 && hex to guarantee it. Before this,
+    // the panel rendered .slice(0,7) and nothing else, so the full value never
+    // reached the document and an operator was back to prefix-matching by hand.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const full = "366a282d52095312f54b99698b241ac872e20284";
+
+    const dd = popover().querySelector<HTMLElement>("dd[data-full]");
+    expect(dd).not.toBeNull();
+    // Displayed short…
+    expect(screen.getByText("366a282")).toBeTruthy();
+    // …carried long, in both a machine-readable attribute and a human-readable one.
+    const commitDd = [...popover().querySelectorAll<HTMLElement>("dd[data-full]")].find(
+      (el) => el.dataset.full === full,
+    );
+    expect(commitDd).toBeTruthy();
+    expect(commitDd!.getAttribute("title")).toBe(full);
+    expect(commitDd!.textContent).toBe("366a282");
+  });
+
+  it("carries the raw RFC3339 build stamp alongside the minute-granular display", () => {
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, built_at: "2026-07-26T18:42:07Z" }}
+        now={NOW}
+      />,
+    );
+    const builtDd = [...popover().querySelectorAll<HTMLElement>("dd[data-full]")].find(
+      (el) => el.dataset.full === "2026-07-26T18:42:07Z",
+    );
+    expect(builtDd).toBeTruthy();
+    // The seconds are the thing the rendered form drops, and the one time you
+    // want them is when two builds are minutes apart.
+    expect(builtDd!.getAttribute("title")).toBe("2026-07-26T18:42:07Z");
+    expect(builtDd!.textContent).toBe("26 Jul 2026 18:42 UTC");
+  });
+
+  it("renders the build time, not just the day", () => {
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, built_at: "2026-07-26T18:42:07Z" }}
+        now={NOW}
+      />,
+    );
+    expect(popover().textContent).toContain("26 Jul 2026 18:42 UTC");
   });
 
   it("labels the trigger with the display version and drops the native title", () => {
@@ -251,12 +314,41 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
     expect(popover().getAttribute("data-open")).toBe("true");
   });
 
-  it("closes on Escape", () => {
+  it("closes on Escape after FOCUS opened it", () => {
     render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
     fireEvent.focus(trigger());
     expect(popover().getAttribute("data-open")).toBe("true");
-    fireEvent.keyDown(trigger(), { key: "Escape" });
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(popover().getAttribute("data-open")).toBe("false");
+  });
+
+  it("closes on Escape after HOVER opened it, with focus elsewhere", () => {
+    // The handler used to live on the button's onKeyDown, so this case did
+    // nothing: a mouse user hovers the badge open, presses Escape, and the key
+    // event goes to whatever actually has focus. APG's tooltip pattern wants Esc
+    // to dismiss a hover-shown tooltip too.
+    render(
+      <>
+        <button type="button">elsewhere</button>
+        <BuildInfoPopover info={mockBuildInfo} now={NOW} />
+      </>,
+    );
+    const other = screen.getByRole("button", { name: "elsewhere" });
+    other.focus();
+    expect(document.activeElement).toBe(other);
+
+    fireEvent.mouseEnter(popover().parentElement!);
+    expect(popover().getAttribute("data-open")).toBe("true");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(popover().getAttribute("data-open")).toBe("false");
+  });
+
+  it("ignores other keys", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    fireEvent.focus(trigger());
+    fireEvent.keyDown(document, { key: "a" });
+    expect(popover().getAttribute("data-open")).toBe("true");
   });
 
   it("describes the trigger with the popover, by an id scoped to this instance", () => {
