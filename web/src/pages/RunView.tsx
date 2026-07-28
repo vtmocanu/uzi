@@ -46,6 +46,8 @@ import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
+import { QuestionPanel } from "../components/QuestionPanel";
+import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
 import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
@@ -177,6 +179,11 @@ export function RunView() {
   // reduction re-run as messages grow, so it folds in live (Decision 9) with no
   // accumulator. Feeds the usage panel + the per-phase finish lines in the feed.
   const usage = useMemo(() => deriveRunUsage(messages), [messages]);
+
+  // PRD #88: the open clarification question, derived from the feed by seq exactly as
+  // derivePlanRevision derives the gate state — there is NO DTO field for it (D-L), so
+  // web, Slack and the CLI all read the same rule off the same messages.
+  const openQuestion = useMemo(() => deriveOpenQuestion(messages), [messages]);
 
   if (!run) {
     return (
@@ -385,6 +392,20 @@ export function RunView() {
           onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
+          onCancel={() => act(() => submit("cancel"))}
+        />
+      )}
+
+      {/* PRD #88: the clarification park. Gated on BOTH the status and a derived open
+          question: the status alone would render a composer with nothing to answer in
+          the window before the `question` message replays (the worker flushes it first,
+          but a reconnecting client can read the status back first), and the question
+          alone would keep offering a composer after the run resumed. */}
+      {run.status === "awaiting_input" && openQuestion && (
+        <QuestionPanel
+          question={openQuestion}
+          busy={busy}
+          onAnswer={(body) => act(() => submit("answer", body))}
           onCancel={() => act(() => submit("cancel"))}
         />
       )}

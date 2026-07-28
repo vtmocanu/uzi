@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
 import { formatTokens, formatCost } from "../lib/formatTokens";
+import { parseAnswerPayload, parseQuestionPayload } from "../lib/runQuestion";
 import { Markdown } from "./Markdown";
 import { cx } from "./ui";
 import {
@@ -815,6 +816,21 @@ function ThinkingRow({ text }: { text: string }) {
   );
 }
 
+// The unknown-kind fallback line. Extracted from the `default:` arm because PRD #88's
+// `question` row also lands here when its payload is unusable — a question with no
+// question_id can be shown but never answered (the api rejects an id-less answer), so
+// it degrades to the same muted line every other unrenderable frame gets rather than
+// rendering a composer whose every submit would 400.
+function UnrenderableRow({ kind, rec }: { kind: string; rec?: Record<string, unknown> }) {
+  const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
+  return (
+    <div className="text-xs text-muted">
+      <span className="italic">unrenderable {kind} event</span>
+      {extract && <span className="ml-1 text-fg">— {truncate(extract)}</span>}
+    </div>
+  );
+}
+
 function StandaloneResult({ result }: { result: RunMessage }) {
   const id = asString(asRecord(result.payload)?.["tool_use_id"]);
   return (
@@ -904,14 +920,79 @@ export const RunEventRow = memo(function RunEventRow({
         </div>
       );
     }
-    default: {
-      const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
+    // PRD #88: the lead asked the human a question and the run parked. The row is the
+    // durable record — the ANSWER affordance lives on the run panel (QuestionPanel), so
+    // this stays a read-only transcript entry and still renders long after the run
+    // resumed.
+    //
+    // Every string in the payload is model-authored from repo/issue content the agent
+    // read, i.e. attacker-influenceable. `question` goes through the hardened <Markdown>
+    // (no rehype-raw, so raw HTML is inert text); the header and each option render as
+    // React text children. Nothing here reaches href/title/style — option `label` in a
+    // `title` attribute would be the one channel a subtree-text assertion cannot see.
+    case "question": {
+      const q = parseQuestionPayload(msg.payload);
+      if (!q) return <UnrenderableRow kind={msg.kind} rec={rec} />;
       return (
-        <div className="text-xs text-muted">
-          <span className="italic">unrenderable {msg.kind} event</span>
-          {extract && <span className="ml-1 text-fg">— {truncate(extract)}</span>}
+        <div className="rounded-md border border-warn/40 bg-warn/[0.08] px-2.5 py-1.5 text-sm">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-warn">
+            question for you{q.generation > 1 ? ` · #${q.generation}` : ""}
+          </div>
+          <ul className="space-y-2">
+            {q.questions.map((item, i) => (
+              <li key={i} className="space-y-1">
+                {item.header.trim() !== "" && (
+                  <div className="text-xs font-semibold text-fg">{item.header}</div>
+                )}
+                <Markdown content={item.question} />
+                {item.options.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {item.options.map((o, j) => (
+                      <span
+                        key={j}
+                        className="rounded-full border border-edge-strong bg-raised px-2 py-[2px] text-[11px] text-muted"
+                      >
+                        {o.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
       );
     }
+    // PRD #88: the human's answer, echoed once applied so the round-trip is auditable
+    // — the same role plan_feedback plays for a revision, and the same brand tone, so
+    // "this line is the user speaking" reads identically for both.
+    case "answer": {
+      const { answers } = parseAnswerPayload(msg.payload);
+      return (
+        <div className="rounded-md border border-brand/30 bg-brand/[0.08] px-2.5 py-1.5 text-sm">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">your answer</div>
+          {answers.length === 0 ? (
+            <span className="text-xs text-faint">(no answer text)</span>
+          ) : (
+            <ul className="space-y-1.5">
+              {answers.map((a, i) => (
+                <li key={i}>
+                  {a.trim() === "" ? (
+                    <span className="text-xs text-faint">(no answer given)</span>
+                  ) : (
+                    // The user's own text, but it round-trips through the server (and can
+                    // arrive from a Slack reply), so it is rendered through the same
+                    // escaped sink as everything else in the feed.
+                    <Markdown content={a} />
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
+    default:
+      return <UnrenderableRow kind={msg.kind} rec={rec} />;
   }
 });

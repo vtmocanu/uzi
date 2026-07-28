@@ -1043,3 +1043,36 @@ describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
     expect(live).toContain('from "../components/RunCredential"');
   });
 });
+
+describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
+  // Same instrument and the SAME acknowledged ceiling as the block above: this proves
+  // the text is present and not commented out, never that it runs. `{false && …}` still
+  // passes, and no comment-stripping reaches it. The panel's own behaviour — chips,
+  // index alignment, the escaped sinks — is covered by QuestionPanel.test.tsx against a
+  // real render; what cannot be reached from here is the PAGE, which needs a router, the
+  // auth context and a live WS stream to mount. Recorded so the next reader does not
+  // mistake four assertions for coverage of the journey.
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("gates the panel on BOTH the parked status and a derived open question", () => {
+    // Either half alone is wrong in a real window: the status alone renders a composer
+    // with nothing to answer while the question message is still replaying, and the
+    // question alone keeps offering one after the run resumed (the `answer` message is
+    // emitted BEFORE the `running` state report).
+    expect(live).toContain('run.status === "awaiting_input" && openQuestion');
+  });
+
+  it("derives the question from the feed rather than reading a DTO field", () => {
+    // PRD #88 D-L: no new column and no new DTO field. If this becomes `run.something`,
+    // web, Slack and the CLI stop sharing one derivation rule.
+    expect(live).toContain("deriveOpenQuestion(messages)");
+    expect(live).toContain('from "../lib/runQuestion"');
+  });
+
+  it("submits the answer under the `answer` steering kind", () => {
+    expect(live).toContain('submit("answer", body)');
+  });
+});
