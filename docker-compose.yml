@@ -169,9 +169,14 @@ services:
       # PRD #88 clarification bounds. Read here and shipped in the claim (enforced
       # worker-side) for the same reason PLAN_MAX_REVISIONS is: a worker env var is
       # unreachable on hosted k8s, where the controller renders exactly one tuning var
-      # into a worker pod. QUESTION_TIMEOUT_SECONDS is the deadline for ONE park and
-      # the timer is worker-held, so a requeue restarts it — the honest worst case is
-      # this value x (RUN_MAX_REQUEUES + 1).
+      # into a worker pod.
+      #
+      # NEITHER bound is durable, and that applies to BOTH of them for one reason:
+      # each is held in worker memory (a park counter and a park timer), so a worker
+      # death re-queues the run and both restart. QUESTION_MAX is the questions per
+      # ATTEMPT and QUESTION_TIMEOUT_SECONDS the wait per PARK, so the lifetime
+      # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 10 questions
+      # and 48h of waiting, not 5 and 24h.
       QUESTION_MAX: ${QUESTION_MAX:-5}
       QUESTION_TIMEOUT_SECONDS: ${QUESTION_TIMEOUT_SECONDS:-86400}
       RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}

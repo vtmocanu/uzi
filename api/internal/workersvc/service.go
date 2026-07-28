@@ -659,11 +659,20 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 
 // Register brings a worker online and recovers its orphaned runs. A registering
 // worker has, by definition, just started fresh and is executing nothing, so any
-// run it still holds (claimed/running/awaiting_approval) is orphaned: over the
-// re-queue budget it is failed, otherwise it is re-queued to this same worker
-// (affinity) to be re-claimed and resumed from the persisted session. This is
-// what makes `docker compose down && up` recover — the out-of-process worker's
-// fresh-start signal, which the server cannot infer from heartbeats alone.
+// run it still holds (claimed/running/awaiting_approval/awaiting_input) is
+// orphaned: over the re-queue budget it is failed, otherwise it is re-queued to
+// this same worker (affinity) to be re-claimed and resumed from the persisted
+// session. This is what makes `docker compose down && up` recover — the
+// out-of-process worker's fresh-start signal, which the server cannot infer from
+// heartbeats alone.
+//
+// awaiting_input (PRD #88) belongs in that set for a reason the stale-heartbeat
+// sweeps cannot cover: RegisterWorker stamps last_heartbeat_at = now(), so a worker
+// that restarts faster than WORKER_HEARTBEAT_STALE is NEVER stale and those sweeps
+// never see it. A parked run missing from these two register sweeps would sit in
+// awaiting_input forever, pointing at execution that no longer exists, with its
+// worker-held answer deadline gone and no user-visible signal — on the ordinary
+// restart path this comment already names.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
@@ -1548,6 +1557,14 @@ const (
 	// types free text at the agent" from an occasional follow_up into a prompted
 	// round-trip, so the cap moves to SubmitInput where every surface inherits it.
 	maxAnswerBodyRunes = 4000
+
+	// maxAnswerCount bounds how many answers one submission may carry (PRD #88,
+	// auditor LOW-2). It mirrors the question-side cap in agent/src/signals.ts
+	// (MAX_QUESTIONS): answers are index-aligned with the questions, so more answers
+	// than could ever have been asked is malformed by construction. Without it the
+	// only bound was the 1 MiB request body — tens of thousands of short strings,
+	// each scrubbed and re-encoded.
+	maxAnswerCount = 10
 )
 
 // truncateRunes caps s at n runes, cutting on a rune boundary so the result is
@@ -3198,6 +3215,11 @@ func (s *Service) submitAnswer(ctx context.Context, run store.Run, body string) 
 	if run.Status != "awaiting_input" {
 		return SubmitInputResult{}, ErrRunNotAwaitingInput
 	}
+	// NOTE on calling this "belt-and-braces": it is only redundant with the identity
+	// check below BECAUSE the worker clears its open-question id when a park settles
+	// (RunRunner.askUser's settle) and SetRunRunning clears the column. If either
+	// stopped, a run could sit non-parked while still naming a question, and this
+	// status check would become the only thing rejecting an answer to it.
 	var ab AnswerBody
 	if err := json.Unmarshal([]byte(body), &ab); err != nil {
 		return SubmitInputResult{}, fmt.Errorf("%w: body must be JSON {question_id, answers}", ErrInvalidAnswer)
@@ -3212,6 +3234,9 @@ func (s *Service) submitAnswer(ctx context.Context, run store.Run, body string) 
 	// it is here because "unreachable" is a claim about another function.
 	if !run.OpenQuestionID.Valid || run.OpenQuestionID.String == "" || qid != run.OpenQuestionID.String {
 		return SubmitInputResult{}, ErrStaleAnswer
+	}
+	if len(ab.Answers) > maxAnswerCount {
+		return SubmitInputResult{}, fmt.Errorf("%w: at most %d answers", ErrInvalidAnswer, maxAnswerCount)
 	}
 	answers := make([]string, 0, len(ab.Answers))
 	for _, a := range ab.Answers {

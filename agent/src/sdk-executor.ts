@@ -629,7 +629,16 @@ export class SdkExecutor implements Executor {
        *
        *  Declared HERE, above the planning turn, because the cap is per RUN: M4 lets
        *  the lead ask before it plans, and a budget that reset between the planning
-       *  and implement phases would silently be worth 2 x QUESTION_MAX. */
+       *  and implement phases would silently be worth 2 x QUESTION_MAX.
+       *
+       *  NOT DURABLE, and the honest bound is worth stating because the other #88
+       *  bound already states its own: this is worker memory, so a worker death
+       *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
+       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 10 on
+       *  defaults, not 5 — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
+       *  identical reason. Documenting one and not the other would be worse than
+       *  documenting neither: a reader who finds the timeout's caveat reasonably
+       *  infers the cap has none. */
       const budget = { asked: 0 };
 
       const plan = await this.drivePlanningTurn(

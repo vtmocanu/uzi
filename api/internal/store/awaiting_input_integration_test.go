@@ -247,10 +247,142 @@ func TestSetRunRunningAnswerGuardLiveDB(t *testing.T) {
 	}
 }
 
-// An approve_plan must not satisfy the QUESTION gate. Together with its mirror in the
-// plan-gate tests this is what pins the two clauses as independent — a merged
-// `status NOT IN (...) OR kind IN (...)` predicate would pass the happy paths above
-// and fail exactly here.
+// B2 regression, store half: leaving the park CLEARS the question id.
+//
+// Nothing else clears it, and a stale id is not inert — the claim payload re-delivers
+// open_question_id on every resume, so a worker restarting after an ANSWERED park
+// would seed its map with the resolved id and re-use it for a genuinely new question.
+// The guard would then degenerate to has-ever-been-answered and the old question's
+// answer would satisfy the new one. The worker half of this regression lives in
+// agent/test, because choosing the id is worker behaviour that no store test reaches.
+func TestSetRunRunningClearsOpenQuestionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["yes"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+	if rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	}); err != nil || rows != 1 {
+		t.Fatalf("SetRunRunning: rows=%d err=%v", rows, err)
+	}
+
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.OpenQuestionID.Valid {
+		t.Fatalf("open_question_id survived the resume as %q — a later resume would re-deliver it "+
+			"on the claim and the worker would re-use a RESOLVED question's id for a new question",
+			run.OpenQuestionID.String)
+	}
+
+	// And the clear is what makes the guard bite again: the run parks on a NEW
+	// question, and the old consumed answer must not resume it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-2"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("re-park: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 2,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("the answer to q-1 resumed a park on q-2 (%d rows)", rows)
+	}
+}
+
+// B1 regression: the REGISTER-time orphan sweeps must see a parked run.
+//
+// The stale-heartbeat sweeps cannot cover this and a test of them cannot stand in:
+// RegisterWorker stamps last_heartbeat_at = now(), so a worker restarting faster than
+// WORKER_HEARTBEAT_STALE is never stale. This is the `docker compose down && up`
+// path that RequeueWorkerRuns' own comment names.
+func TestRegisterSweepsMoveAwaitingInputLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+
+	// Within budget → re-queued to the same worker for an affinity resume.
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	rows, err := f.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
+		WorkerID: pgU(f.workerID), MaxRequeues: 3,
+	})
+	if err != nil {
+		t.Fatalf("RequeueWorkerRuns: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("RequeueWorkerRuns left the parked run alone (%d rows) — an ordinary worker "+
+			"restart strands it in awaiting_input forever, pointing at dead execution", rows)
+	}
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.Status != "queued" {
+		t.Fatalf("status = %q, want queued", run.Status)
+	}
+
+	// Over budget → failed rather than re-queued.
+	f2, done2 := setupAwaitingInput(ctx, t, dsn)
+	defer done2()
+	if _, err := f2.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f2.runID, WorkerID: pgU(f2.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	ids, err := f2.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+		FailureReason: pgT("worker restarted"), WorkerID: pgU(f2.workerID), MaxRequeues: 0,
+	})
+	if err != nil {
+		t.Fatalf("FailWorkerRunsOverCap: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("FailWorkerRunsOverCap left the parked run non-terminal (%d rows) — it would sit "+
+			"forever holding move_pending_since and a board card", len(ids))
+	}
+}
+
+// The two clauses are independent, pinned in BOTH directions.
+//
+// Direction 1 (this test): a consumed approve_plan must not resume a run parked on a
+// QUESTION. Direction 2 (the subtest below): a consumed answer must not resume a run
+// parked at the PLAN gate. A merged `status NOT IN (...) OR kind IN (...)` predicate
+// passes every happy path above and fails exactly here.
+//
+// Both live in this file on purpose. An earlier version of this comment claimed the
+// second direction was covered by "its mirror in the plan-gate tests" — it was not;
+// run_running_guard_integration_test.go contains no `answer` at all, so deleting the
+// PLAN clause left the whole suite green. A comment that sends the next reader
+// looking in the wrong place is worse than no comment, because it stops them looking
+// at all.
 func TestSetRunRunningClausesAreIndependentLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -284,6 +416,45 @@ func TestSetRunRunningClausesAreIndependentLiveDB(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("a consumed approve_plan resumed a run parked on a QUESTION (%d rows) — "+
 			"the two guard clauses have been merged, re-opening #44 F2 sideways", rows)
+	}
+}
+
+// Direction 2: a consumed `answer` must not satisfy the PLAN gate. This is the half
+// that was missing, and it is the one that catches a merged predicate.
+func TestSetRunRunningAnswerDoesNotSatisfyPlanGateLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	if _, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd: pgT("# plan"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park at the plan gate: %v", err)
+	}
+	// EXACTLY ONE input kind, and it is the wrong one for this gate (D-B): on a run
+	// holding both, either clause alone would satisfy the predicate and no assertion
+	// could observe one being deleted.
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["yes"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("a consumed answer resumed a run parked at the PLAN gate (%d rows) — the two guard "+
+			"clauses have been merged, so an answer now approves a plan no human saw", rows)
 	}
 }
 
