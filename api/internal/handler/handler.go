@@ -5,6 +5,8 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -96,9 +98,25 @@ type Handler struct {
 	usagePoker UsagePoker
 	// version is the server build version, stamped into cmd/server via ldflags
 	// (Model B: == the release git tag) and served unauthenticated at GET
-	// /api/version so the SPA footer and the uzi CLI report one coordinate. Defaults
-	// to "dev" on an un-stamped local/compose build. Set via SetVersion.
+	// /api/version, where the SPA reads it for the footer badge and for PRD #113's
+	// worker upgrade classification. Defaults to "dev" on an un-stamped local/compose
+	// build. Set via SetVersion.
+	//
+	// (This comment used to claim the endpoint existed "so the SPA footer and the uzi
+	// CLI report one coordinate". The uzi CLI was never a consumer — api/internal/uzicli
+	// contains no /version call; `uzi version` prints its own ldflags stamp, and the two
+	// agree only because the same tag stamps both. Corrected 2026-07-28 with PRD #175.)
 	version string
+	// commit / builtAt / commits are the rest of GET /api/version's build coordinates
+	// (PRD #175), stamped into cmd/server by the same ldflags line as version and
+	// carried here as the raw strings the linker injected. Empty on every un-stamped
+	// build — a local `go build`, `docker compose build`, and the MR/main validation
+	// image, since only the tag (publish) build passes them — and an empty or
+	// unparseable value is OMITTED from the response rather than served as a zero.
+	// Set via SetBuildInfo.
+	commit  string
+	builtAt string
+	commits string
 	// now / startedAt serve PRD #113's upgrade classification. startedAt anchors the
 	// no-controller-signal grace for hosted workers: Model B rolls the api in the same
 	// release as the workers, so process start is a free proxy for "a release just
@@ -217,6 +235,35 @@ func (h *Handler) SetVersion(v string) {
 	}
 }
 
+// BuildStamp carries the ldflags-injected build coordinates from cmd/server into the
+// handler (PRD #175 M1). A struct rather than three positional parameters because
+// they are all strings: a positional signature could be miscalled with two of them
+// swapped and nothing — not the compiler, not vet — would say so.
+//
+// Every field is optional and none is validated here. Unstamped or unparseable
+// values are dropped at RESPONSE time rather than at set time, so the handler holds
+// exactly what the linker injected and one place decides what "unknown" means.
+type BuildStamp struct {
+	// Commit is the full 40-char source SHA (-X main.commit).
+	Commit string
+	// BuiltAt is the image build time, expected RFC3339 in UTC (-X main.builtAt).
+	BuiltAt string
+	// Commits is the commit count as a decimal string (-X main.commits, PRD #175 M3).
+	Commits string
+}
+
+// SetBuildInfo stamps the non-version build coordinates served at GET /api/version.
+// Called once in main alongside SetVersion with the ldflags-injected values.
+//
+// Unlike SetVersion — which must not let an empty stamp clobber the "dev" default —
+// this assigns unconditionally: there is no default to protect, and empty genuinely
+// means "this build does not know", which is what the response omits.
+func (h *Handler) SetBuildInfo(s BuildStamp) {
+	h.commit = strings.TrimSpace(s.Commit)
+	h.builtAt = strings.TrimSpace(s.BuiltAt)
+	h.commits = strings.TrimSpace(s.Commits)
+}
+
 // SetReconciler wires the poller's force-reconcile signal in after construction,
 // matching how the run-lifecycle collaborators are attached in main (the poller
 // is built after the handler's other deps). Safe to leave unset in tests.
@@ -269,11 +316,51 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// Version reports the server build version (Model B: the release git tag),
-// stamped via ldflags and defaulting to "dev" on a local build. Unauthenticated
-// like Health — the SPA footer reads it, and it carries no secret.
+// foundedDate is uzi's first commit date, and the `founded` field of GET
+// /api/version. Evidence: 366a282d "Initial commit", authored 2026-07-03. A const
+// because it is never going to change; the consumer computes the project's age from
+// it, so the age stays correct without a release.
+const foundedDate = "2026-07-03"
+
+// Version reports this instance's build coordinates (PRD #175): the Model-B release
+// version, the project's founding date, this process's uptime, and — on a stamped
+// release image — the source commit, the build time and the commit count.
+//
+// Unauthenticated and unrate-limited like Health, and that is a deliberate standing
+// property rather than an oversight: every field is already public (the image tag is
+// in the chart, the commit is in the repo). A field that is NOT — a hostname, an env
+// var, a filesystem path, a dependency inventory — would change the route's trust
+// properties, and this is precisely the endpoint class where that conventionally goes
+// wrong. Check any addition against that before adding it.
+//
+// Unknown beats wrong throughout: a stamp that is absent or does not parse is omitted
+// rather than half-decoded into a plausible-looking value. See apitypes.BuildInfoDTO.
 func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]string{"version": h.version})
+	info := apitypes.BuildInfoDTO{
+		Version: h.version,
+		Founded: foundedDate,
+		Commit:  h.commit,
+	}
+	if t, err := time.Parse(time.RFC3339, h.builtAt); err == nil {
+		// Re-formatted from the parsed value, so the wire carries one canonical
+		// spelling whatever offset notation CI stamped.
+		info.BuiltAt = t.UTC().Format(time.RFC3339)
+	}
+	if n, err := strconv.Atoi(h.commits); err == nil && n >= 0 {
+		info.Commits = &n
+	}
+	// A zero startedAt is the struct-literal Handler many tests build (see clock()),
+	// not a process that started at the epoch: report unknown rather than ~2 millennia.
+	if !h.startedAt.IsZero() {
+		secs := int64(h.clock().Sub(h.startedAt).Seconds())
+		if secs < 0 {
+			// An injected clock set behind startedAt. Report the floor; a negative
+			// age is never a truer answer than zero.
+			secs = 0
+		}
+		info.UptimeSeconds = &secs
+	}
+	httpx.JSON(w, http.StatusOK, info)
 }
 
 // Routes builds the API router. authLimiter is applied per-route to the

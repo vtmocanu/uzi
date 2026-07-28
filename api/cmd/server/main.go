@@ -50,8 +50,30 @@ import (
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z" (the api
 // Dockerfile does this from the release git tag; Model B == chart appVersion ==
 // image tag). Unset on a plain local `go build`, so it defaults to "dev" and is
-// served that way at GET /api/version.
+// served that way at GET /api/version — alongside the coordinates below.
 var version = "dev"
+
+// commit, builtAt and commits are the rest of GET /api/version's build info (PRD
+// #175), stamped from the same Dockerfile ldflags line as version:
+//
+//	-X main.commit=<full 40-char source SHA>
+//	-X main.builtAt=<RFC3339 UTC>
+//	-X main.commits=<decimal commit count>   (PRD #175 M3)
+//
+// They live in THIS package because that is the only place the linker can reach: the
+// values are served from internal/handler, but -X names a package-level string var by
+// its own package path, so -X main.commit targets cmd/server and not handler.
+//
+// Only the tag (publish) build passes them, so all three are empty on a plain
+// `go build`, on `docker compose build`, and on the MR/main validation image. That is
+// deliberate rather than a gap — a `dev` build's commit is not a release coordinate —
+// and an empty value is OMITTED from the response, never served as "" or as a zero
+// timestamp.
+var (
+	commit  = ""
+	builtAt = ""
+	commits = ""
+)
 
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
@@ -522,6 +544,9 @@ func run() error {
 	boardOrderLimiter := mw.NewLimiter(cfg.BoardOrderRateLimitMax, cfg.BoardOrderRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	h.SetVersion(version)
+	// The rest of the build coordinates (PRD #175). Passed raw: the handler decides
+	// what an absent or unparseable stamp means, so there is one such place.
+	h.SetBuildInfo(handler.BuildStamp{Commit: commit, BuiltAt: builtAt, Commits: commits})
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.

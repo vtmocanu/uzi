@@ -1,0 +1,55 @@
+package apitypes
+
+// BuildInfoDTO is the unauthenticated GET /api/version response (PRD #175): the set
+// of coordinates a deployed instance can state about itself.
+//
+// The route stays unauthenticated and unrate-limited because every field here is
+// ALREADY public — the image tag is in the chart, the commit is in the repo. That is
+// a standing constraint on this type, not a description of it: no field may be added
+// that is not already public. Hostnames, environment, filesystem paths and dependency
+// inventories are exactly what a build-info endpoint conventionally leaks, and this
+// response carries none of them.
+//
+// Version and Founded are always present. Everything else is OMITTED when unknown
+// rather than zero-valued: a `dev` build reporting commit "" and built_at
+// "0001-01-01T00:00:00Z" would claim to know things it does not, and omission keeps
+// "we don't know" distinguishable from "the value is empty".
+type BuildInfoDTO struct {
+	// Version is the Model-B release coordinate (== image tag == chart appVersion),
+	// bare — the Dockerfile strips a leading v and the SPA re-adds one for display.
+	// "dev" on an un-stamped build.
+	//
+	// This key and this value are UNCHANGED from the single-string response this type
+	// widened. web/src/components/AppShell.tsx renders it in the footer and
+	// web/src/pages/WorkersSettings.tsx feeds it to PRD #113's worker upgrade
+	// classification, so it gates a fleet feature and is not merely cosmetic.
+	Version string `json:"version"`
+	// Founded is the date of this project's first commit, YYYY-MM-DD. A const, not a
+	// build stamp. The AGE is computed by the consumer from this: sending both would
+	// create two sources of truth that disagree the moment a long-lived SPA session
+	// crosses midnight, and sending founded alone means the age stays correct without
+	// a release.
+	Founded string `json:"founded"`
+	// BuiltAt is when the image was built, RFC3339 in UTC. Omitted unless it was
+	// stamped AND parsed — a mangled CI value degrades to unknown rather than to a
+	// plausible-looking lie.
+	BuiltAt string `json:"built_at,omitempty"`
+	// Commit is the full 40-char source SHA the image was built from. Full rather than
+	// short so the value stays greppable and linkable; consumers truncate for display.
+	// Omitted on an un-stamped build.
+	Commit string `json:"commit,omitempty"`
+	// Commits is the number of commits in the history the image was built from (PRD
+	// #175 M3). It is the one field whose CI plumbing is separable from the rest, so
+	// it is independently droppable: nothing may depend on its presence, and every
+	// consumer must render correctly without it.
+	Commits *int `json:"commits,omitempty"`
+	// UptimeSeconds is how long this process has been serving.
+	//
+	// A POINTER for correctness, not tidiness: 0 is a legitimate uptime during a
+	// process's first second, so `omitempty` on a bare int64 would conflate it with
+	// unknown. Unknown is not hypothetical here — many tests build a Handler as a
+	// struct literal rather than through New (see the clock() comment in
+	// internal/handler/handler.go), leaving startedAt the zero time, where a naive
+	// subtraction renders roughly two millennia.
+	UptimeSeconds *int64 `json:"uptime_seconds,omitempty"`
+}

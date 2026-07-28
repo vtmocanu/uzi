@@ -456,3 +456,38 @@ func TestRunEventDTOTags(t *testing.T) {
 		"type", "seq", "kind", "agent", "agent_instance", "agent_label",
 		"payload", "created_at", "status")
 }
+
+// BuildInfoDTO is the unauthenticated GET /api/version response (PRD #175). Both
+// halves matter and for opposite reasons.
+//
+// The DEGRADED pin is the one with teeth: an un-stamped build — every laptop, every
+// compose stack, every MR validation image — is the common case, and the contract is
+// that its unknown fields are ABSENT rather than empty. A typed decode cannot tell
+// those apart, so nothing else in the tree pins it.
+//
+// The `version` key in both is older than this type and outlives any reshape of it:
+// web/src/pages/WorkersSettings.tsx feeds it to PRD #113's worker upgrade
+// classification, so renaming or nesting it is a coordinated change across the SPA
+// and a feature that gates fleet upgrades.
+func TestBuildInfoDTOTags(t *testing.T) {
+	assertTags(t, "BuildInfoDTO(unstamped)", BuildInfoDTO{}, "version", "founded")
+
+	commits, uptime := 2060, int64(5400)
+	full := BuildInfoDTO{
+		Version:       "0.11.12",
+		Founded:       "2026-07-03",
+		BuiltAt:       "2026-07-28T09:15:00Z",
+		Commit:        "366a282d52095312f54b99698b241ac872e20284",
+		Commits:       &commits,
+		UptimeSeconds: &uptime,
+	}
+	assertTags(t, "BuildInfoDTO(stamped)", full,
+		"version", "founded", "built_at", "commit", "commits", "uptime_seconds")
+
+	// uptime_seconds is a pointer so that a genuine 0 (a process in its first second)
+	// stays on the wire. omitempty on a bare int64 would drop it and make it
+	// indistinguishable from the zero-startedAt "unknown" case.
+	zero := int64(0)
+	assertTags(t, "BuildInfoDTO(uptime 0)", BuildInfoDTO{UptimeSeconds: &zero},
+		"version", "founded", "uptime_seconds")
+}
