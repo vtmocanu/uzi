@@ -38,9 +38,16 @@ type BuildInfoDTO struct {
 	// stamped AND parsed — a mangled CI value degrades to unknown rather than to a
 	// plausible-looking lie.
 	BuiltAt string `json:"built_at,omitempty"`
-	// Commit is the full 40-char source SHA the image was built from. Full rather than
-	// short so the value stays greppable and linkable; consumers truncate for display.
-	// Omitted on an un-stamped build.
+	// Commit is the full 40-char source SHA the image was built from, and the server
+	// enforces that: a stamp that is not 40 hex characters is omitted rather than
+	// served (see isFullSHA in internal/handler). Full rather than short so the value
+	// stays greppable and linkable. Omitted on an un-stamped build.
+	//
+	// Consumers render it differently and both are deliberate, so do not read this as
+	// "consumers truncate": `uzi version` prints all 40, because a terminal is exactly
+	// where greppable matters, while the SPA popover shortens it for a footer that has
+	// no room. What the two must agree on is that the FULL value stays reachable
+	// somewhere — that is the property PRD #175 asks for, not a display convention.
 	Commit string `json:"commit,omitempty"`
 	// Commits is the number of commits in the history the image was built from (PRD
 	// #175 M3). It is the one field whose CI plumbing is separable from the rest, so

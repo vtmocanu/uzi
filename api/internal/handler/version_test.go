@@ -205,6 +205,34 @@ func TestVersionEndpointGarbageStampsOmitted(t *testing.T) {
 	}
 }
 
+// TestVersionEndpointCommitCasesAccepted pins isFullSHA's charset DECISION, which
+// its doc comment argues for and nothing tested: tightening the gate to lowercase
+// hex would have passed green, because every other commit fixture in this file is
+// lowercase.
+//
+// Uppercase never arrives in practice — git and $CI_COMMIT_SHA both emit lowercase —
+// which is exactly why the case needs a test rather than a reader's trust. Rejecting
+// a valid hex SHA over its case would be a surprising failure with no upside, and
+// "we never see it" is an argument for cheapness, not for silence.
+func TestVersionEndpointCommitCasesAccepted(t *testing.T) {
+	const lower = "366a282d52095312f54b99698b241ac872e20284"
+	for _, tc := range []struct{ name, commit string }{
+		{"lowercase", lower},
+		{"uppercase", strings.ToUpper(lower)},
+		{"mixed case", "366A282d52095312F54b99698B241ac872E20284"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+			h.SetBuildInfo(BuildStamp{Commit: tc.commit})
+
+			// Served VERBATIM, not normalised: the stamp is an identifier the server
+			// passes through, and case-folding it would be the server inventing a
+			// value the build never carried.
+			wantString(t, getVersion(t, h), "commit", tc.commit)
+		})
+	}
+}
+
 // TestVersionEndpointWhitespaceStampsTrimmed: a stamp that arrived with surrounding
 // whitespace still parses. Belt-and-braces on a value that crosses a YAML string, a
 // shell word-split and a Docker build arg before it reaches the linker.
@@ -463,9 +491,11 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 	})
 	for k := range getVersion(t, h) {
 		if _, ok := public[k]; !ok {
-			t.Errorf("the rendered response carries %q, which the tag walk did not report — the "+
-				"handler is no longer serving apitypes.BuildInfoDTO, so the walk above is not "+
-				"guarding what is actually on the wire", k)
+			t.Errorf("the rendered response carries %q, which the tag walk did not report. "+
+				"TWO causes, and the second is the one that has actually happened here: either "+
+				"the handler stopped serving apitypes.BuildInfoDTO, or the tag walk under-reports "+
+				"— buildInfoJSONKeys missed an embedded unexported struct once already, by testing "+
+				"IsExported before handling Anonymous fields. Check the walk before the handler.", k)
 		}
 	}
 }
