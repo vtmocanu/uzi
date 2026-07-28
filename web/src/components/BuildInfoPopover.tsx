@@ -77,7 +77,12 @@ export function formatStamp(iso: string | undefined): string | null {
   }).format(new Date(t))} ${new Intl.DateTimeFormat("en-GB", {
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
+    // hourCycle h23, NOT `hour12: false` — the latter maps to h24 under some
+    // locale/ICU combinations, which renders midnight as "24:05". That is exactly
+    // the output the midnight case in this file's tests exists to reject, so the
+    // spelling that states the intent directly beats the one that relies on en-GB
+    // happening to map the way we want.
+    hourCycle: "h23",
     timeZone: "UTC",
   }).format(new Date(t))} UTC`;
 }
@@ -131,9 +136,37 @@ export function liveUptimeSeconds(
 // field — see the Commit and Built call sites.
 //
 // The `title` ban from the trigger does NOT extend here, and the distinction is
-// the mechanism rather than the attribute: there, a native tooltip fired on the
-// badge ALONGSIDE this custom popover, so two panels said different things at
-// once. A title on a data row inside the panel has nothing to collide with.
+// the mechanism rather than the attribute. Three things make a row title safe
+// where the badge's was not, and the third is the load-bearing one:
+//
+//   1. The badge's title fired on the SAME hover that opened this panel — two
+//      surfaces, involuntarily, every time. A row title needs a second deliberate
+//      hover and dwell on that row.
+//   2. The badge's title duplicated this panel's heading with strictly LESS
+//      information. A row title is the UN-ABBREVIATED form of what the row shows.
+//   3. The closed panel is `pointer-events-none`, so a closed popover's rows are
+//      not hover targets and these titles cannot fire while the panel is shut.
+//      If that class is ever dropped, a mounted invisible title-bearing panel sits
+//      over the content area and this becomes a real bug.
+//
+// ⚠️ A `title` here is also the obvious way to leak 40 hex characters into the
+// TRIGGER'S ACCESSIBLE DESCRIPTION, which is computed from this panel's text (see
+// the aria-describedby note below). It does not, and that is MEASURED on the real
+// component via Chrome's AX tree over CDP (Chrome 150), not reasoned about:
+//
+//   dd with text + title  ->  the TEXT enters the description, the title does NOT
+//   dd EMPTY   + title    ->  the TITLE ENTERS THE DESCRIPTION
+//   dd EMPTY   , no title ->  contributes nothing            (the control)
+//
+// So the safety is conditional on the row having text, not on it being a `dd`.
+// Two consequences worth having in writing: the 40-char SHA stays out of the
+// description only because this row renders the 7-char form as its content, and a
+// future row that is empty-but-titled WOULD inject its title into what a screen
+// reader announces for the badge. THE MEASUREMENT TO REPEAT is the trigger's
+// computed description, not the `title` attribute's presence — and a screenshot
+// cannot settle any of this, because native tooltips are drawn by the platform
+// widget layer outside what Page.captureScreenshot composites, so an absent
+// tooltip in an image is an unobservable, not evidence.
 function Row({
   label,
   value,

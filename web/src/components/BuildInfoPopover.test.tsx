@@ -129,8 +129,12 @@ describe("BuildInfoPopover — fully-stamped build", () => {
     render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
     const full = "366a282d52095312f54b99698b241ac872e20284";
 
-    const dd = popover().querySelector<HTMLElement>("dd[data-full]");
-    expect(dd).not.toBeNull();
+    // EXACTLY TWO rows carry `full`, and the count is the assertion: `full` means
+    // "the display is an abbreviation of this", so adding it to Founded or Uptime —
+    // whose displays are not abbreviations — would be wrong and would otherwise
+    // ship green. It also bounds the a11y exposure noted at Row: a titled row is
+    // only safe while it has text content.
+    expect(popover().querySelectorAll("dd[data-full]")).toHaveLength(2);
     // Displayed short…
     expect(screen.getByText("366a282")).toBeTruthy();
     // …carried long, in both a machine-readable attribute and a human-readable one.
