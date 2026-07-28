@@ -14590,3 +14590,386 @@ because of that, and none of them said so out loud except one SQL comment.
     cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
+
+## 447. PRD #175 M1 — `GET /api/version` widens into a build-info object: `version` does not move, unknown is ABSENT, and the key set is closed by a walk over the TYPE
+
+The endpoint returned one string. It now returns `apitypes.BuildInfoDTO`: `version` and
+`founded` always, plus `built_at`, `commit`, `commits` and `uptime_seconds` when the
+build or the process knows them. Every property below belongs to the response itself,
+not to any consumer of it.
+
+- **`version` keeps its key AND its value; the widening is purely additive.** That key
+  is not only the footer badge — `web/src/pages/WorkersSettings.tsx` feeds it to PRD
+  #113's worker upgrade classification, so renaming, reshaping or nesting it is a
+  coordinated change across the SPA, the CLI, two route-classification tests and a
+  feature that gates fleet upgrades.
+- **Unknown is OMITTED, never zero-valued.** A `dev` build reporting `commit: ""` and
+  `built_at: "0001-01-01T00:00:00Z"` claims to know things it does not; omission keeps
+  "we don't know" distinguishable from "the value is empty". This is the rule the rest
+  of the PRD keeps paying for at every boundary the value crosses (§450, §451).
+  - **`uptime_seconds` and `commits` are POINTERS for correctness, not tidiness.**
+    `omitempty` on a bare `int64` would drop a genuine 0, and 0 is a legitimate uptime
+    in a process's first second.
+  - **A zero `startedAt` means unknown, not the epoch.** Many tests build `Handler` as a
+    struct literal rather than through `New`, where a naive subtraction renders roughly
+    two millennia. An injected clock set behind `startedAt` reports the floor 0, because
+    a negative age is never a truer answer than zero.
+- **Every stamp has a server-side VALIDITY gate, and one of them came into existence
+  only because someone wrote the sentence it had to make true.** `built_at` must parse
+  as RFC3339 and is re-emitted from the PARSED value, so the wire carries one canonical
+  spelling whatever offset notation CI stamped; `commits` must be a non-negative
+  integer; `commit` must be 40 hex characters (`isFullSHA`). Commit was the one field
+  served verbatim, so an unexpanded CI variable would reach the wire as the literal
+  `$CI_COMMIT_SHA` — whose first seven characters, `$CI_COM`, read like a short SHA to
+  a consumer that truncates for display. The CI comment claiming "every failure mode
+  degrades to absent, never to wrong" is what forced the gate, rather than the reverse.
+- **The DTO lives in `api/internal/apitypes`, and that turned out to be the only legal
+  home.** It was chosen at implementation time as the tidy option; `TestNoServerDeps`
+  in `api/cmd/uzi/deps_test.go` bans `internal/handler` from the CLI's dependency
+  closure, so a handler-local DTO would have FORCED M4 to duplicate the struct — the
+  duplication that quietly destroys the unknown-versus-zero distinction (§451).
+  - **The package doc changed with it, and that is bigger than one type.** Until
+    `BuildInfoDTO`, every type in that leaf sat behind `RequireUser`, so "is this field
+    safe to expose?" had ONE package-level answer. It now has two. Someone adding a
+    field to `BuildInfoDTO` is warned by its own doc; someone making a CROSS-CUTTING
+    change — a shared `Meta` embed, a `trace_id` on every DTO, a linter-driven sweep —
+    reads the package page and would not be, so the split is stated there.
+- **The closed-key-set guard walks the TYPE's struct tags. The response-level check is
+  KEPT as well, and each catches what the other structurally cannot.** A response check
+  can only reject a key that is PRESENT, so an `omitempty` field left unset by the
+  fixture is invisible to it — and that is the shape EVERY new optional field takes,
+  because the omit-never-zero rule requires it. Three agents independently defeated the
+  original response-only check with three different config-fed fields (`oidc_issuer`,
+  `db_host`, `tls_cert_path`), each of which rendered nothing under the `config.Config{}`
+  every fixture there uses. The response pass guards the tag walk's own premise — a
+  handler that stopped returning the DTO would make the walk pass vacuously — and it
+  earned that keep immediately, by catching a bug INSIDE the walk: embedded fields must
+  be handled BEFORE the `IsExported` check, because `encoding/json` promotes an
+  unexported embed's exported fields onto the wire.
+  - The allowlist maps key → REASON and is checked in both directions. An entry with no
+    field behind it is a stale reason, and a stale reason is what makes the next
+    addition look pre-approved.
+
+## 448. PRD #175 — `uptime_seconds` is a considered DISCLOSURE, and the reason first given for keeping it was a claim about the UI
+
+The decision: **no signed-out popover, and `uptime_seconds` is kept and declared
+public.** That is what the PRD recommended. Its stated REASON — "it keeps the blast
+radius at zero and makes the uptime question moot", because the only consumer sits
+behind `if (!user) return <PublicShell>` — does not hold, and an auditor and a reviewer
+refuted it independently, from different starting points, before any code was written.
+
+- **The property is enforced at the ENDPOINT, and the endpoint is unauthenticated.**
+  `r.Get("/version", h.Version)` mounts directly under `r.Route("/api")` with only
+  `Recoverer` and `RequestID` above it; `route_limiter_mounts_test.go` pins it
+  `noLimiter`; `web` same-origin-proxies `/api/*`; and in k8s
+  `deploy/chart/templates/web-ingress.yaml` publishes the SPA origin at path `/` with no
+  auth annotation by default (both are chart values, so a hardened override could narrow
+  them — the enforced property is the route mount, not the chart). So this body is
+  world-readable, credential-free and unmetered to anyone who can reach the ingress. A
+  signed-out popover changes DISCOVERABILITY, not exposure, so declining it never made
+  the question moot.
+- **The real reason the field is kept: uptime is acceptable as public.** Severity Low.
+  It discloses restart and patch cadence, and paired with `version` gives a freshness
+  oracle ("this instance has run build X unpatched for N days") plus an unauthenticated
+  liveness probe. That is a judgement, and it is recorded as one rather than as an
+  observation.
+- **Every other field passes the already-public test on its own**, which is what
+  isolates uptime as the single case needing a judgement: `version` is the chart's image
+  tag, `commit` is already pushed as the Harbor tag `:$CI_COMMIT_SHORT_SHA`, `built_at`
+  is implied by the release tag, `founded` and `commits` are a const and a count.
+  **`uptime_seconds` is the only RUNTIME fact in a response otherwise made entirely of
+  BUILD facts** — which is exactly the line the endpoint's own rule draws.
+- **The statement lives at four sites, none of them a planning doc.** `Version`'s doc
+  comment (the enforcement point), `BuildInfoDTO`'s type doc, `ARCHITECTURE.md`'s
+  trust-boundaries section, and `TestVersionEndpointCarriesNothingPrivate`, whose
+  allowlist splits "already public" from "considered disclosure" with uptime as the sole
+  member of the second class. A rule recorded only in a PRD has no gate on it, and this
+  PRD's own named follow-ups — an `/about` page, a signed-out footer — would silently
+  republish the field with nothing in the code noticing.
+- **Two consequences, both stated where a reader hits them rather than here.** "It
+  carries no secret" is no longer the whole test: a field can be secret-free and still
+  be a runtime disclosure, so weigh both. And uptime establishes a CATEGORY — once one
+  runtime fact lives on this endpoint, "which replica", "how many replicas", "what
+  region", "what pod" become the same kind of request rather than obviously out of
+  scope, and every one of those is identity- or topology-bearing. The counterweight is
+  §447's closed key set, which matters more after this decision than before it.
+
+## 449. PRD #175 M1/M3 — the stamps are ldflags on `cmd/server`, `built_at` is a CI VARIABLE and never a `date`, and the count rides a dotenv
+
+- **`-X` names a package-level var by ITS OWN package path**, so `commit`, `builtAt` and
+  `commits` live in `main` (`api/cmd/server`) even though they are served from
+  `internal/handler`. They reach the handler through a single
+  `SetBuildInfo(BuildStamp{…})` call as RAW strings: the handler decides what absent or
+  unparseable means, so there is exactly one such place (§447).
+  - `BuildStamp` is a struct rather than three positional string parameters, which could
+    be miscalled with two of them swapped and nothing — not the compiler, not vet —
+    would say so.
+  - `SetBuildInfo` assigns unconditionally, unlike `SetVersion`, which must not let an
+    empty stamp clobber the `"dev"` default. There is no default to protect here, and
+    empty genuinely means "this build does not know".
+- **Only the TAG (publish) build stamps them**, so all three are empty on a plain
+  `go build`, on `docker compose build`, and on the MR/main validation image. Deliberate:
+  a `dev` build's commit is not a release coordinate. It does NOT rest on the argument
+  first written (that a per-commit arg would cost MR kaniko cache), which is false — MR
+  builds have no cache to lose, since `.kaniko_build` gates auth and cache together on
+  `$KANIKO_AUTH`, which only the protected-ref rule sets.
+- **`built_at` is `$CI_JOB_STARTED_AT`, and `$(date -u …)` is the obvious implementation
+  and is broken twice over.** GitLab performs `os.Expand`-style VARIABLE substitution on
+  `variables:` values and never shell command substitution, so `$(` is not a variable
+  name and stays literal; and `$UZI_BUILD_ARGS` is expanded UNQUOTED in `.publish_image`'s
+  shared script — deliberately, because word-splitting is how one job passes several
+  `--build-arg` flags — which field-splits the RESULT without expanding it further.
+  kaniko would receive three literal words. Computing it with `$(date)` inside a `RUN`
+  instead, which `agent/templates/base/Dockerfile` does for its `BUILD_INFO`, reports the
+  CACHED layer's date when the layer is reused: for a field named `built_at` that is a
+  lie, so it arrives as a build ARG.
+  - Established from GitLab's implementation (`build.rb`'s `started_at&.iso8601`), not
+    from the docs page, whose "ISO 8601, UTC by default" carries a caveat this line
+    depends on. Ruby's `#iso8601` emits NO whitespace in any timezone, so the
+    word-splitting hazard is closed structurally rather than by the value happening to be
+    UTC; a non-UTC render is the `+02:00` offset form, still valid RFC3339, which the
+    server re-formats to `Z`; and `&.` means a nil `started_at` yields an EMPTY variable
+    rather than a crash, which the server omits.
+- **The commit count is computed in `publish:assert-changelog` and delivered as an
+  `artifacts: reports: dotenv`.** That job already sets `GIT_DEPTH: 0`, already runs a
+  golang image carrying git, and is already in the `.publish_needs` anchor `publish:api`
+  consumes — the edge and the full-history clone are both already paid for. The
+  alternative (compute it in `publish:api`) is DEAD rather than merely worse: that job's
+  image is `kaniko-debug`, busybox plus kaniko, with no git and no apk to add one.
+  - **Validated at the PRODUCER, because that is the only enforcement point that
+    exists.** The value crosses into `UZI_BUILD_ARGS`, expanded unquoted, so any
+    whitespace in it becomes extra flags on the kaniko command line. `git rev-list
+    --count` is numeric in practice; that makes the guard cheap, not unnecessary.
+  - **Named `UZI_COMMIT_COUNT`, never something generic.** Dotenv-report variables rank
+    below project and group variables, so a same-named project variable would silently
+    shadow the computed count. They DO outrank job-level `variables:`, which is what
+    makes the delivery work at all.
+  - **No `UZI_COMMIT_COUNT: ""` default is declared in `publish:api`.** A default would
+    work, but it puts two definitions of one name in play and makes a future reader
+    re-derive which is in force. With none there is exactly one, and an absent dotenv
+    degrades to an empty `--build-arg`, which the server treats as unstamped.
+- **The `echo "ARGS=[$UZI_BUILD_ARGS]"` in `publish:api`'s `before_script` is a PERMANENT
+  observation point, not a spent probe.** It asserts nothing and cannot fail the job. Both
+  expansions it records are performed by machinery this repo cannot exercise locally, and
+  both fail SILENTLY into an omitted field, so a regression there has no other symptom.
+  It runs on TAGS ONLY (`.publish_image`'s rules gate on `$CI_COMMIT_TAG`), so it is a
+  post-merge observation and can never serve as a pre-merge proof of either expansion.
+- **`UZI_VERSION` is deliberately OUTSIDE the "degrades to absent, never to wrong"
+  claim.** `SetVersion` rejects only the empty string and `${UZI_VERSION#v}` strips
+  nothing from a value that does not begin with `v`, so an unexpanded version arg is
+  served VERBATIM — wrong, not absent. Pre-existing and out of this PRD's scope; named so
+  the omission reads as a boundary rather than an oversight. A fifth stamp needs its own
+  gate, or the claim needs widening.
+- **The version stamp is BARE on the server and carries a `v` on the CLI, and both are
+  correct.** `api/Dockerfile` stamps `${UZI_VERSION#v}` (Model B: served value == image
+  tag == chart `appVersion`), while `Formula/uzi-cli.rb` stamps `-X main.version=v#{version}`.
+  The two binaries genuinely differ; do not "fix" one to match the other. Root
+  `CLAUDE.md`'s `semver.Compare` warning is entirely about which side of this line a
+  string sits on.
+
+## 450. PRD #175 M2 — one promise, two hooks, a popover that takes its data as a PROP, and a CLOSED panel that is still the description
+
+- **`useAppVersion` survives as a `.version` projection over `useBuildInfo`, both backed
+  by ONE module-scope promise — but NOT because the projection preserves a tri-state. It
+  FOLDS one, and the first version of the code comment claimed the opposite.** `"" ||
+  null` is `null`, so the hook emits exactly TWO states: null, or a non-empty string, and
+  both failure modes land on the same one — a rejected fetch resolves the shared snapshot
+  to null, and a `{"version": ""}` body is folded here. `FleetUpgradePanel` is written
+  for THREE: its `versionPending = cpVersion === null` separates "in flight" from
+  "resolved with no stamp", because conflating them once rendered a full fleet bar under
+  a heading saying classification was off, at T+270ms and flipping at T+670ms. From this
+  producer the middle state never arrives (§452). The fold is PRE-EXISTING — on `main`
+  the hook already ended `setVersion(v || null)` over a `.catch(() => "")` — and #175
+  changed the mechanism without changing the behaviour.
+  - **What the split still buys, and the reason to keep it:** this is the ONE place the
+    fold happens, so every consumer sees the same two-state value instead of writing its
+    own `.version || null`, and a consumer reaching for `.version` directly would get
+    `""` back and reintroduce the conflation at the call site.
+  - `AppShell.hooks.empty.test.tsx` pins the operator: flipping `||` to `??` — the
+    usually more correct operator, so the likeliest future cleanup — typechecks clean and
+    reddens nothing else while changing what the panel receives. Read it as pinning the
+    FOLD, not a tri-state.
+- **The shared value is a SNAPSHOT (`{info, fetchedAtMs}`), not the payload.**
+  `uptime_seconds` is a reading taken at the fetch, so the popover re-bases it against
+  the wall clock; a session left open for hours would otherwise keep reporting the uptime
+  the API had at mount. The instant is sampled ONCE, where the shared promise settles,
+  which is what keeps the desktop rail and the mobile drawer agreeing. Accepted cost: an
+  API restart is invisible until reload, so this OVERSTATES where the raw value
+  understated — same direction, and bounded by the session's own length.
+- **Age is computed by the CONSUMER from `founded`, and `founded` is served by the API
+  rather than hardcoded in the bundle.** Sending both `founded` and an age creates two
+  sources of truth that disagree the moment a long-lived session crosses midnight;
+  sending `founded` alone means the age stays correct without a release. The trade is a
+  dependency on the client clock, acceptable at day granularity. A web-side const would
+  have deleted the server work entirely and was declined because the CLI needs the same
+  fact, and two hardcoded copies of a project's birth date is exactly the duplication
+  that survives long enough to disagree.
+- **`BuildInfoPopover` is presentational: it takes `info` as a prop and fetches nothing.**
+  Not a style preference. The promise is memoised at module scope with NO reset seam and
+  vitest isolates per FILE, so a component reading it directly could not be exercised with
+  more than one response shape in one file — the second would reuse the first's resolved
+  promise and pass or fail for the wrong reason. Taking the data as a prop removes the
+  hazard instead of working around it, and it is why the web tests are split across four
+  files rather than organised by subject.
+  - **THREE fixtures, because "degraded" is not one shape, and the first attempt got the
+    common one backwards.** A laptop `docker compose` build omits the three ldflags fields
+    but KEEPS `uptime_seconds`, because `handler.New` always sets `startedAt` — three keys,
+    not two. The two-key body is a struct-literal `Handler`, a test construction no server
+    ever serves, and the comment had labelled that one "the COMMON case". Each fixture
+    names the situation that produces it for exactly this reason.
+  - `mockApi` serves the STAMPED fixture, so every `VITE_UZI_MOCK=1` browser pass sees
+    that shape unless the line is pointed at another one. Deliberate — a `dev` build in
+    the demo would hide the three fields this PRD exists to add — and stated so it is not
+    rediscovered as a gap.
+- **🔴 AN OMITTED FIELD IS A CONTRACT ONLY AS FAR AS THE LAST CONSUMER THAT HONOURS IT.**
+  `*int64` + `omitempty` makes absence EXPRESSIBLE on the wire; nothing makes a consumer
+  REPRESENT it. Measured at the render boundary: `uptime_seconds: null` passes
+  `=== undefined`, reaches the formatter, and renders a climbing "Uptime 2s" for a value
+  the server explicitly declined to state — re-introducing at this end of the wire exactly
+  the absent-versus-zero conflation M1 spent a pointer to prevent. And `commits: null`
+  THROWS in `.toLocaleString`; there is no `ErrorBoundary` anywhere in `web/src`, so a
+  render throw unmounts the shell. So every optional field is guarded with `typeof` plus
+  `Number.isFinite` at the render boundary, not inside the formatters, which keep honest
+  `number` signatures. Same boundary as the commit-SHA validity gate living server-side
+  (§447): the wire is not a place where either end can assume the other.
+- **The failed fetch resolves to `null`, never a throw** — a 401 or a 500 on this endpoint
+  must not take the chrome down with it. The popover's optional rows are simply absent,
+  so an unstamped build shows a SHORTER panel rather than rows reading "unknown".
+- **The display ABBREVIATES; the DOM carries the full value.** `commit` renders the 7-char
+  short SHA and carries all 40 on the row's `title` and a `data-full` attribute; `built_at`
+  renders minute-granular and carries the raw RFC3339, seconds and all. Until the row
+  carried the full form it never reached the DOM at all, so selecting the row copied
+  `366a282` and the operator was back to prefix-matching by hand — which is most of what
+  this PRD set out to delete. The server's `isFullSHA` gate (§447) exists to make the
+  stored value greppable, and that property dies at the render boundary if the renderer is
+  the last place the full string exists.
+  - **`built_at` renders the TIME, not the day alone.** Two images can ship the same day,
+    which is precisely when someone opens this panel, so a day-granular stamp is silent in
+    the case it was added for. UTC is spelled out in the string rather than implied, and
+    the hour is `hourCycle: "h23"` rather than `hour12: false` — the latter maps to h24
+    under some locale/ICU combinations and renders midnight as "24:05".
+  - `founded` stays day-only: it is a calendar fact, and rendering 00:00 UTC on it would
+    invent a precision the value does not carry.
+- **🔴 THE PANEL STAYS MOUNTED WHEN CLOSED (`opacity-0` + `pointer-events-none`, never
+  `hidden`), AND THAT IS THE MECHANISM RATHER THAN AN OVERSIGHT.** Measured against
+  Chrome's own accessibility tree over CDP, not reasoned from the markup: with the popover
+  CLOSED, the trigger computes name `v0.4.2` and a DESCRIPTION carrying every coordinate,
+  so a screen-reader user who never hovers and never focuses still gets the whole set.
+  Unmounting when closed — the obvious way to tidy this DOM — deletes that description
+  silently, and neither the markup nor the suite would look wrong afterwards; `hidden`,
+  `display:none` and `visibility:hidden` all do the same. Re-measure the AX tree if you
+  change how it hides.
+  - The same measurement BOUNDS the row `title`s: a `dd` with text contributes its TEXT
+    and not its title, while an EMPTY `dd` with a title injects the TITLE into the
+    description. So the 40-char SHA stays out of what a screen reader announces only
+    because that row renders the 7-char form as its content — a future empty-but-titled
+    row would not. The thing to re-measure is the trigger's computed description, not the
+    presence of a `title` attribute, and a screenshot settles none of it: native tooltips
+    are drawn by the platform widget layer, outside what a page screenshot composites.
+  - **The `title` ban applies to the TRIGGER, not to the rows, and the difference is
+    mechanism rather than attribute.** The badge's native tooltip fired on the same hover
+    that opened this panel — two surfaces, involuntarily, every time — and duplicated its
+    heading with strictly less information. A row title needs a second deliberate hover,
+    shows the UN-abbreviated form, and cannot fire at all while the closed panel is
+    `pointer-events-none`. That last one is load-bearing: dropping that class puts a
+    mounted invisible title-bearing panel over the content area.
+- **Escape is handled on the DOCUMENT while open, not on the button.** On the button it
+  fired only while the badge had focus, so a mouse user who hovered the panel open pressed
+  Escape and nothing happened. The listener is attached only while open, so the second
+  (closed) mount costs nothing.
+- **Two `SidebarContent` mounts exist simultaneously**, so the popover's id is
+  instance-scoped (`useId`) or `aria-describedby` becomes ambiguous. It is anchored ABOVE
+  the trigger (the footer is the last row of a viewport-pinned rail) and its `z-10` is
+  LOCAL: it sits inside the desktop aside (`z-30`) and inside the mobile drawer (`z-40`)
+  and only has to beat its own siblings. Nothing above the footer sets `overflow-hidden`,
+  so it is not clipped.
+
+## 451. PRD #175 M4 — `uzi version` WRAPS rather than reshapes, and the SHARED DTO is the only thing that keeps "unknown" unknown
+
+- **The `--json` shape is `{version, server?}`: top-level `version` keeps its exact
+  meaning — the CLI's own ldflags stamp — and the server's coordinates nest under a new
+  key.** Every existing parser reading `.version` is untouched. It is a WRAPPER, not a
+  reshape.
+- **`Server` is a pointer to the shared `apitypes.BuildInfoDTO`, and a CLI-local copy
+  would have been the quiet failure.** Re-marshalling inherits the pointers and
+  `omitempty` tags verbatim, so an unstamped server's absent fields stay absent in
+  `uzi version --json`. A local struct with plain `int` fields would render a dev server
+  as `commits: 0` and `uptime: 0` — a build claiming to know things it does not, which is
+  the whole thing the server side spent a pointer to prevent. §447's dependency-closure
+  test is what makes the shared type reachable at all.
+  - **`founded` is the exception, and the boundary is worth stating.** It has no
+    `omitempty` — the server always sends it, and `TestBuildInfoDTOTags` pins
+    `version`+`founded` as the always-present pair. Against a PRE-#175 server the decode
+    leaves it `""` and re-marshalling emits `"founded": ""`: present-but-empty, the one
+    place this response conflates unknown with empty. Adding `omitempty` would fix a
+    rollout-window cosmetic by changing the server's contract, which is the wrong trade.
+    Confined to `--json`; the text path skips empty values.
+- **Best-effort, and it exits 0 whether or not any server is reachable.** Every failure
+  returns nil, not an error: no URL configured, an unresolvable config, a plain-http
+  remote refused by the credential guard, a connection failure, a server too old to
+  answer. The no-URL case is checked BEFORE a client is built, so the common standalone
+  invocation makes no network call at all. A 2s per-call context overrides the client's
+  30s default.
+- **Default stdout must BEGIN with `vX.Y.Z`, which is stricter than the constraint first
+  recorded.** `Formula/uzi-cli.rb`'s `assert_match` is a substring match, but
+  `scripts/brew-local-test.sh` uses a `case` pattern with only a trailing `*`, anchored at
+  the start of the WHOLE stdout. The script is the stricter gate: a header line, a `uzi `
+  label or a leading blank line passes the Formula and FAILS the script. So the CLI's own
+  version is line one, alone, and server rows follow.
+- **`credentialSafeBase` is NOT bypassed for this call, and the temptation to bypass it is
+  reasonable-sounding and wrong.** The ROUTE needs no credential; the REQUEST carries one
+  anyway, because `newRequest` attaches `Authorization: Bearer <token>` to every request
+  whose client holds a token and does not special-case this one. Measured on a loopback
+  server: the header is present. Skipping the https-or-loopback guard would therefore put
+  a real `uzc_` token in cleartext on the first `uzi version --url http://…`.
+  `TestBuildInfoIsGatedByCredentialSafeBase`'s third arm asserts the token IS attached —
+  the fact the guard's necessity rests on.
+- **The two consumers render `commit` differently ON PURPOSE.** `uzi version` prints all
+  40 characters, because a terminal is exactly where greppable matters; the SPA popover
+  shortens it for a footer with no room, and carries the full value on the row (§450).
+  What they must agree on is that the FULL value stays reachable — that is the property
+  asked for, not a display convention.
+- **Two files the file map must not forget.** `uzicli.FakeClient` implements the widened
+  `Client` interface, with a `BuildErr` SEPARATE from the blanket `Err` (a test needs to
+  fail this one call while the command still succeeds). And `SKILL.md` is a GATE, not a
+  nicety: `TestSkillMatchesCommandTree` asserts both directions between it and the command
+  tree.
+
+## 452. PRD #175 — what this increment does NOT deliver, and the one hook arm that is DEAD
+
+- **No signed-out popover and no `/about` page.** Both are named follow-ups and both
+  would widen this body's audience, so either one re-opens §448's uptime judgement rather
+  than inheriting it.
+- **🔴 `useAppVersion` CANNOT PRODUCE THE `""` ARM `FleetUpgradePanel` IMPLEMENTS —
+  pre-existing, preserved exactly by M2, and out of this PRD's scope.** The panel's prop
+  comment documents `""` as "resolved with no stamp" and its own test renders
+  `cpVersion=""` directly, so it is written for a tri-state its only production caller
+  cannot supply. **The MECHANISM changed under #175 while the behaviour did not, which is
+  why the obvious fix is not one:** before, `.catch(() => "")` plus `v || null` collapsed
+  `""` to `null`; now `.catch(() => null)` means a failed fetch never produces a
+  `BuildInfo` at all. So flipping `||` to `??` would have fixed it under the old code and
+  does NOT fix it now — `??` would only surface a resolved-but-EMPTY version, which the
+  server does not send (`SetVersion("")` leaves the `"dev"` default). A real fix must
+  reintroduce a distinct resolved-but-failed state in `BuildInfoSnapshot`.
+  - Symptom: a failed `GET /api/version` leaves the fleet panel reporting "version
+    pending" forever instead of "no release stamp — classification off", because
+    `versionPending` is true both while the fetch is in flight AND after it has
+    permanently failed. Fleet-facing, and a behaviour change to fix, so it is the owner's
+    call rather than this PRD's.
+  - **The two-hook seam of §450 stands on a different footing than the one first written
+    for it**: not "it preserves the tri-state" (it does not), but "it is the single site
+    of the fold". Recorded together because the seam kept its shape while its
+    justification was replaced.
+- **`commits` is only ever present on a tagged release build.** It is independently
+  droppable by construction: nothing may depend on its presence, and every consumer must
+  render correctly without it. Neither the compose stack nor the e2e harness ever sees it.
+- **Neither CI expansion has a pre-merge proof, by construction.** `$CI_JOB_STARTED_AT`
+  and the dotenv both expand only in a tag pipeline, and both fail silently into an
+  omitted field. The permanent observation point in §449 is the only place a regression
+  would ever be visible, and it is post-merge. Also unmeasured: whether `started_at` is
+  populated at the moment the runner receives the payload — if it is not, released images
+  simply carry no `built_at`, and the first release is where that shows.
+- **Rejected, and worth not re-proposing: `debug.ReadBuildInfo()` in place of the ldflags.**
+  Go would hand over `vcs.revision` and `vcs.time` for free. It cannot work here —
+  `publish:api`'s kaniko context is `api/`, with no `.git` in it to stamp from — and
+  `-buildvcs=false` is additionally a deliberate reproducibility choice.
