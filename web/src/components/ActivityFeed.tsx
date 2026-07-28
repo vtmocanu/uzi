@@ -304,6 +304,15 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return "Revising the plan";
     case "plan_feedback":
       return "Sent revision feedback";
+    // PRD #35. Fixed strings, deliberately: this one-liner is the lane header's live
+    // summary and the payload behind these two kinds is worker-authored, so the one
+    // place that must not interpolate it is the line a user reads at a glance
+    // without the surrounding row's context. The window, reset and attempt are on
+    // the feed row itself, where they go through the closed lookup.
+    case "limit_wait":
+      return "Paused on a usage limit";
+    case "limit_hit":
+      return "Hit a usage limit";
     default:
       return "";
   }
@@ -592,7 +601,13 @@ export function ActivityFeed({
         mm.kind === "error" ||
         mm.kind === "plan" ||
         mm.kind === "plan_revising" ||
-        mm.kind === "plan_feedback"
+        mm.kind === "plan_feedback" ||
+        // PRD #35: a park is exactly the event this region exists for — the run goes
+        // quiet for hours and nothing else on the page says why at the moment it
+        // happens. A sighted user gets the warn-toned row; without this a screen
+        // reader gets silence.
+        mm.kind === "limit_wait" ||
+        mm.kind === "limit_hit"
       )
         meaningful = mm;
     }
@@ -607,7 +622,16 @@ export function ActivityFeed({
               ? "Revising the plan"
               : meaningful.kind === "plan_feedback"
                 ? "Revision feedback sent"
-                : describeStatus(meaningful.payload);
+                : // Fixed strings for the same reason agentOneLiner uses them: the
+                  // payload is worker-authored and this is announced, not read in
+                  // context. Announcing the reset time would also be wrong here —
+                  // the region fires once, at the park, and the run view's countdown
+                  // is the surface that stays true as the clock moves.
+                  meaningful.kind === "limit_wait"
+                  ? "Run paused on an Anthropic usage limit"
+                  : meaningful.kind === "limit_hit"
+                    ? "Run hit an Anthropic usage limit"
+                    : describeStatus(meaningful.payload);
     }
 
     if (terminal && !seen.terminal) next = "Run finished";

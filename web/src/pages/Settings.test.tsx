@@ -30,6 +30,7 @@ vi.mock("../lib/api", async (importActual) => {
       // never open a delete confirmation.
       listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
       setAutopilotEnabled: vi.fn(),
+      setWaitOnLimit: vi.fn(),
       setJudgeEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
@@ -59,6 +60,7 @@ const baseUser: User = {
   is_active: true,
   autopilot_enabled: false,
   judge_enabled: false,
+  wait_on_limit: false,
   judge_anthropic_secret_id: null,
   judge_anthropic_secret_label: null,
   created_at: "2026-01-01T00:00:00Z",
@@ -379,5 +381,97 @@ describe("Settings judge token picker (PRD #104)", () => {
     const toggle = await screen.findByLabelText("Judge my finished runs");
     fireEvent.click(toggle);
     await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(true));
+  });
+});
+
+// PRD #35 M3: the per-user DEFAULT for the usage-limit park. The per-RUN override
+// lives on the run view (RunView.test.tsx); this is the setting every new run
+// inherits, and the only opt-in reachable at all for the three kinds with no start
+// affordance (autopilot, ci_fix, self_improve).
+describe("Settings — usage-limit default (PRD #35 M3)", () => {
+  const limitToggle = () =>
+    screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement;
+
+  it("explains the choice in terms of what the user loses without it", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const text = container.textContent ?? "";
+    // The stake, not the mechanism: today the run FAILS and its work is gone.
+    expect(text).toMatch(/fails?/i);
+    expect(text).toMatch(/pauses?/i);
+    expect(text).toMatch(/resumes/i);
+    // The runs that cannot opt in any other way — the reason this default exists.
+    expect(text).toMatch(/autopilot/i);
+    // The cost the PRD requires surfacing: a parked run holds its disk.
+    expect(text).toMatch(/disk/i);
+  });
+
+  it("🔴 says in the UI that it does NOT change runs that already exist", () => {
+    // The single most likely misreading, and it is expensive: a user whose run is
+    // parked RIGHT NOW comes to Settings to stop it. This setting will not, and the
+    // page has to say so where they are looking rather than in a doc.
+    const { container } = render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    expect(container.textContent ?? "").toMatch(/does not change runs that already exist/i);
+  });
+
+  it("reflects the current default", () => {
+    mockAuth({ ...baseUser, wait_on_limit: true });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    expect(limitToggle().checked).toBe(true);
+  });
+
+  it("enabling calls the API and refreshes the session", async () => {
+    mockApi.setWaitOnLimit.mockResolvedValue({ user: { ...baseUser, wait_on_limit: true } });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(limitToggle());
+
+    await waitFor(() => expect(mockApi.setWaitOnLimit).toHaveBeenCalledWith(true));
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("surfaces an error and does not leave the toggle stuck", async () => {
+    mockApi.setWaitOnLimit.mockRejectedValue(new ApiError(500, "internal error"));
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(limitToggle());
+
+    expect(await screen.findByText("internal error")).toBeTruthy();
+    expect(limitToggle().disabled).toBe(false);
+  });
+
+  it("🔴 does not touch the autopilot toggle, and autopilot does not touch it", async () => {
+    // Independent writes to independent endpoints. They sit next to each other and
+    // share a card boundary, so a shared busy/error pair is the easy mistake — it
+    // would disable one control because the other failed, or blame the wrong one.
+    mockApi.setWaitOnLimit.mockRejectedValue(new ApiError(500, "limit endpoint down"));
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(limitToggle());
+    await screen.findByText("limit endpoint down");
+
+    const autopilot = screen.getByLabelText("Enable autopilot for my account") as HTMLInputElement;
+    expect(autopilot.disabled).toBe(false);
+    expect(mockApi.setAutopilotEnabled).not.toHaveBeenCalled();
   });
 });

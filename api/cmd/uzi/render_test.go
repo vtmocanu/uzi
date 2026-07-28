@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
@@ -155,5 +156,290 @@ func TestRenderRunDetailAnthropicToken(t *testing.T) {
 	}
 	if !strings.Contains(out, "safe") || !strings.Contains(out, "next-line") {
 		t.Errorf("sanitizing dropped the printable text too, got:\n%q", out)
+	}
+}
+
+// ---- PRD #35: the usage-limit park -----------------------------------------
+
+// parkedRun is the fixture every test below starts from: a run parked on a five-hour
+// window with a promotion stamped an hour out. Built by a helper rather than shared as
+// a package var so a test that mutates one field cannot silently change another's
+// input.
+func parkedRun(now time.Time) apitypes.RunDTO {
+	rlt := "five_hour"
+	retry := now.Add(time.Hour)
+	resets := now.Add(90 * time.Minute)
+	return apitypes.RunDTO{
+		ID: "run-1", Kind: "issue", Status: statusLimitWait,
+		IssueTitle: "do the thing", ForgeType: "gitlab", Health: "ok",
+		WaitOnLimit: true, RateLimitType: &rlt,
+		RetryNotBefore: &retry, LimitResetsAt: &resets, LimitWaitCount: 2,
+	}
+}
+
+// TestLimitWaitLine pins the ONE sentence every CLI surface renders for a park.
+func TestLimitWaitLine(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+
+	got := limitWaitLine(parkedRun(now), now)
+	for _, want := range []string{"paused", "five_hour", "resumes in 1h00m", "attempt 2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("limitWaitLine = %q, want it to contain %q", got, want)
+		}
+	}
+
+	// 🔴 THE COUNTDOWN IS OFF RetryNotBefore, NOT LimitResetsAt, and this fixture is
+	// built so the two disagree (60m vs 90m) precisely so the wrong field cannot pass.
+	// They differ in normal operation, not in a corner case: RetryNotBefore carries
+	// jitter, is clamped, and is pool-aware — a user with a second credential that
+	// still has headroom is promoted long before the window they hit reopens. Reading
+	// LimitResetsAt would tell that user to wait half an hour longer than they must.
+	if strings.Contains(got, "1h30m") {
+		t.Errorf("limitWaitLine = %q — the countdown is being computed from limit_resets_at; it must come from retry_not_before, which is when the server actually promotes the run", got)
+	}
+
+	// Not parked ⇒ empty, which is what makes the call safe to make unconditionally at
+	// every surface that renders it.
+	for _, status := range []string{"running", "queued", "completed", "failed", "cancelled", "awaiting_approval"} {
+		r := parkedRun(now)
+		r.Status = status
+		if line := limitWaitLine(r, now); line != "" {
+			t.Errorf("limitWaitLine(status=%q) = %q, want \"\" — only a parked run has a park to describe", status, line)
+		}
+	}
+
+	// A missing stamp is a real case (an older server, or a park whose stamp failed to
+	// record), and it must neither promise a time nor go silent.
+	noStamp := parkedRun(now)
+	noStamp.RetryNotBefore = nil
+	if line := limitWaitLine(noStamp, now); !strings.Contains(line, "no resume time recorded") {
+		t.Errorf("limitWaitLine(no retry_not_before) = %q, want it to say the resume time is unknown rather than imply one", line)
+	}
+
+	// A stamp already past is the NORMAL steady state for a few seconds — the sweeper
+	// runs on a ticker — so it must read as imminent, never as a negative countdown.
+	past := parkedRun(now)
+	elapsed := now.Add(-30 * time.Second)
+	past.RetryNotBefore = &elapsed
+	if line := limitWaitLine(past, now); !strings.Contains(line, "resuming shortly") {
+		t.Errorf("limitWaitLine(retry_not_before in the past) = %q, want \"resuming shortly\"", line)
+	}
+
+	// No count ⇒ no "attempt" clause at all, rather than "attempt 0".
+	if line := limitWaitLine(func() apitypes.RunDTO { r := parkedRun(now); r.LimitWaitCount = 0; return r }(), now); strings.Contains(line, "attempt") {
+		t.Errorf("limitWaitLine(count=0) = %q, want no attempt clause", line)
+	}
+
+	// An UNRECOGNISED type prints as itself. The server allowlists this field, but the
+	// CLI ships on its own cadence, so a newer server can send a member this binary has
+	// never heard of — and dropping it, or inventing a rendering, would both be worse
+	// than passing it through. Same stance as credentialCell's unknown reason.
+	novel := parkedRun(now)
+	future := "seven_day_opus_max"
+	novel.RateLimitType = &future
+	if line := limitWaitLine(novel, now); !strings.Contains(line, future) {
+		t.Errorf("limitWaitLine(unknown rate_limit_type) = %q, want it to render %q verbatim", line, future)
+	}
+}
+
+// TestLimitWaitLineSanitizesTheRateLimitType is the Risk 13 half.
+//
+// rate_limit_type is server-allowlisted today, which is exactly why this test states
+// what it is defending: the renderer's safety must not depend on the far side of a
+// trust boundary. The same three routes that reach credentialCell without passing a
+// validator reach here — a row written before the allowlist existed, a future write
+// path that skips it, and a direct database write.
+//
+// The NEWLINE is the discriminating probe, for the reason the ANTHROPIC_TOKEN test
+// records at length: sanitizeTTY and cellText both strip Cf and control characters, so
+// the bidi and ESC probes are satisfied by either helper and prove nothing about which
+// one is wired. Only cellText folds "\n", and only cellText keeps the table rail intact.
+func TestLimitWaitLineSanitizesTheRateLimitType(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	r := parkedRun(now)
+	hostile := "five‮ruoh_\x1b[31m\nnext-line"
+	r.RateLimitType = &hostile
+
+	got := limitWaitLine(r, now)
+	for _, bad := range []string{"‮", "\x1b", "\nnext-line"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("a hostile rate_limit_type reached the terminal carrying %q, got:\n%q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "five") || !strings.Contains(got, "next-line") {
+		t.Errorf("sanitizing dropped the printable text too, got:\n%q", got)
+	}
+
+	// TAB — the second discriminator. sanitizeTTY spares "\t" DELIBERATELY (a tab is
+	// ordinary content in the free-text columns it also serves); only cellText folds it
+	// to a space. A tab survives into a tabwriter cell and walks the whole column right,
+	// with the rune offset pinned throughout — which is why the table's own alignment
+	// assertions cannot see it.
+	tabbed := parkedRun(now)
+	withTab := "five\thour"
+	tabbed.RateLimitType = &withTab
+	if line := limitWaitLine(tabbed, now); strings.Contains(line, "\t") {
+		t.Errorf("a tab in rate_limit_type reached a table cell: %q — sanitizeTTY spares tab, so this is the probe that proves cellText is wired", line)
+	}
+
+	// THE LENGTH CAP — the third, and the one with the most reach. sanitizeTTY has no
+	// length bound at all; cellText inherits compactText's 200-char cap. This is what
+	// stops an oversized value blowing the table rail.
+	//
+	// By this test's own stated standard, the DB CHECK is not the answer here: a
+	// constraint forbidding an oversized value is a guarantee made in ANOTHER package,
+	// and rate_limit_type carries no CHECK at all by design (the vocabulary is the SDK's,
+	// so 00091 deliberately left it open and put the guard in Go). The renderer must
+	// bound what it is handed.
+	oversized := parkedRun(now)
+	long := strings.Repeat("x", 250)
+	oversized.RateLimitType = &long
+	line := limitWaitLine(oversized, now)
+	if strings.Contains(line, long) {
+		t.Errorf("a 250-char rate_limit_type reached the terminal uncapped (line is %d bytes) — sanitizeTTY has no length bound, so this probe is what proves the cap is applied", len(line))
+	}
+	if !strings.Contains(line, "…") {
+		t.Errorf("an oversized rate_limit_type was neither truncated nor ellipsised: %q", line)
+	}
+}
+
+// TestFmtUntil pins the TWO-unit rendering, which is where this parts company with
+// relAge's single unit next door.
+func TestFmtUntil(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{5 * time.Second, "5s"},
+		{59 * time.Second, "59s"},
+		{time.Minute, "1m"},
+		{45 * time.Minute, "45m"},
+		{time.Hour, "1h00m"},
+		// The pair that justifies two units at all: at one unit both of these read "3h",
+		// an hour of error on the only number the user came for.
+		{3*time.Hour + 1*time.Minute, "3h01m"},
+		{3*time.Hour + 59*time.Minute, "3h59m"},
+		{25 * time.Hour, "1d1h"},
+		{7 * 24 * time.Hour, "7d0h"},
+	} {
+		if got := fmtUntil(tc.d); got != tc.want {
+			t.Errorf("fmtUntil(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+// TestRenderRunDetailLimitWait pins `uzi run get`'s park block — and specifically the
+// distinction the block exists to make, since the server leaves the same three columns
+// populated after a promotion as history.
+func TestRenderRunDetailLimitWait(t *testing.T) {
+	now := time.Now()
+	render := func(r apitypes.RunDTO) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false) // non-tty, non-json, no colour
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+
+	parked := render(parkedRun(now))
+	for _, want := range []string{"LIMIT_WAIT", "five_hour", "resumes in", "attempt 2", "LIMIT_RESETS_AT"} {
+		if !strings.Contains(parked, want) {
+			t.Errorf("a parked run's detail is missing %q, got:\n%s", want, parked)
+		}
+	}
+
+	// 🔴 THE HISTORY CASE, and the one an implementation that keys the block on the
+	// COLUMNS rather than the STATUS gets wrong. limit_resets_at / retry_not_before /
+	// rate_limit_type are deliberately left in place across a promotion, so a completed
+	// run still carries all three — and rendering "resumes in 4h12m" on a run that
+	// finished yesterday is nonsense. Same columns, different question.
+	resumed := parkedRun(now)
+	resumed.Status = "completed"
+	out := render(resumed)
+	for _, bad := range []string{"resumes in", "resuming shortly", "LIMIT_RESETS_AT"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("a run that has already resumed rendered %q — the park columns are history once the status moves on, not a live countdown, got:\n%s", bad, out)
+		}
+	}
+	// The history it SHOULD carry: this run spent part of its wall clock waiting.
+	if !strings.Contains(out, "LIMIT_WAITS") || !strings.Contains(out, "resumed") {
+		t.Errorf("a run that parked and resumed must still say so, got:\n%s", out)
+	}
+
+	// A run that never parked says nothing about parks beyond the opt-in itself.
+	never := apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"}
+	if out := render(never); strings.Contains(out, "LIMIT_WAIT ") || strings.Contains(out, "LIMIT_WAITS") || strings.Contains(out, "LIMIT_RESETS_AT") {
+		t.Errorf("a run that never hit a usage limit must render no park rows, got:\n%s", out)
+	}
+}
+
+// TestRenderRunDetailWaitOnLimitIsAlwaysPresent — unlike every other conditional row in
+// this block, the opt-in rides EVERY run.
+//
+// It is meaningful before any park has happened: it answers "will this run survive a
+// usage limit, or just die on one?", which is a question about a queued run as much as
+// a parked one. Rendering it only when true would make "off" indistinguishable from an
+// older CLI that does not know the field — and "off" is the default, so that is the
+// answer users most need to be able to read.
+func TestRenderRunDetailWaitOnLimitIsAlwaysPresent(t *testing.T) {
+	render := func(on bool) string {
+		t.Helper()
+		var buf bytes.Buffer
+		p := uzicli.NewPrinter(&buf, false, false, true, false)
+		r := apitypes.RunDTO{ID: "run-1", Kind: "issue", Status: "running", Health: "ok", WaitOnLimit: on}
+		if err := renderRunDetail(p, r); err != nil {
+			t.Fatalf("renderRunDetail: %v", err)
+		}
+		return buf.String()
+	}
+	if out := render(true); !strings.Contains(out, "WAIT_ON_LIMIT") || !strings.Contains(out, "true") {
+		t.Errorf("opted-in run: want WAIT_ON_LIMIT true, got:\n%s", out)
+	}
+	if out := render(false); !strings.Contains(out, "WAIT_ON_LIMIT") || !strings.Contains(out, "false") {
+		t.Errorf("opted-out run: want an explicit WAIT_ON_LIMIT false — a missing row is indistinguishable from an older CLI, got:\n%s", out)
+	}
+}
+
+// TestSteerStateOnAParkedRun. A park suspends the run, not the queue: nothing is
+// consuming follow-ups while parked, and everything queued drains when it resumes.
+func TestSteerStateOnAParkedRun(t *testing.T) {
+	consumed := time.Now()
+
+	// The queue state is UNCHANGED by the park — the suffix explains why nothing is
+	// moving, and must not overwrite the queued/delivered answer itself.
+	if got := steerState(nil, statusLimitWait); !strings.HasPrefix(got, "queued") {
+		t.Errorf("steerState(unconsumed, limit_wait) = %q, want it to still read as queued", got)
+	}
+	if got := steerState(&consumed, statusLimitWait); !strings.HasPrefix(got, "delivered") {
+		t.Errorf("steerState(consumed, limit_wait) = %q, want it to still read as delivered", got)
+	}
+
+	// Both say WHY nothing is happening, which is the whole point: a follow-up sitting
+	// untouched for four hours is otherwise indistinguishable from a wedged run.
+	for _, got := range []string{steerState(nil, statusLimitWait), steerState(&consumed, statusLimitWait)} {
+		if !strings.Contains(got, "usage limit") {
+			t.Errorf("steerState on a parked run = %q, want it to name the usage-limit park", got)
+		}
+	}
+
+	// 🔴 NOT "not delivered (run finished)". A parked run is not finished, and that
+	// label would tell a user their follow-up had been dropped when it is about to be
+	// delivered. This is the shape the terminal-status map would produce if limit_wait
+	// were ever added to it.
+	if strings.Contains(steerState(nil, statusLimitWait), "run finished") {
+		t.Error(`steerState(unconsumed, limit_wait) claims the run finished — a parked run resumes and its queue drains, so the follow-up has NOT been dropped`)
+	}
+
+	// Every other status is untouched.
+	if got := steerState(nil, "running"); got != "queued" {
+		t.Errorf("steerState(unconsumed, running) = %q, want %q", got, "queued")
+	}
+	if got := steerState(&consumed, "awaiting_approval"); got != "delivered (applies after approval)" {
+		t.Errorf("steerState(consumed, awaiting_approval) = %q — the gate label regressed", got)
+	}
+	if got := steerState(nil, "completed"); got != "not delivered (run finished)" {
+		t.Errorf("steerState(unconsumed, completed) = %q — the terminal label regressed", got)
 	}
 }

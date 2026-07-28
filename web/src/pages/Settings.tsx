@@ -58,6 +58,27 @@ export function Settings() {
     }
   };
 
+  const [waitLimitBusy, setWaitLimitBusy] = useState(false);
+  const [waitLimitError, setWaitLimitError] = useState("");
+
+  // PRD #35: the per-user DEFAULT for the usage-limit park. Deliberately its own
+  // busy/error pair rather than sharing autopilot's — they are independent writes to
+  // independent endpoints, and one failing must not disable or blame the other.
+  const toggleWaitOnLimit = async (enabled: boolean) => {
+    setWaitLimitError("");
+    setWaitLimitBusy(true);
+    try {
+      await api.setWaitOnLimit(enabled);
+      // Same reason as autopilot: re-read the session so useAuth().user carries the
+      // new default everywhere it is read.
+      await refresh();
+    } catch (err) {
+      setWaitLimitError(err instanceof ApiError ? err.message : "Failed to update the usage-limit default");
+    } finally {
+      setWaitLimitBusy(false);
+    }
+  };
+
   const [judgeBusy, setJudgeBusy] = useState(false);
   const [judgeError, setJudgeError] = useState("");
 
@@ -260,6 +281,47 @@ export function Settings() {
             onChange={(e) => toggleAutopilot(e.target.checked)}
           />
           <span className="text-fg">Enable autopilot for my account</span>
+        </label>
+      </Card>
+
+      {/* PRD #35. Placed after Autopilot on purpose: the two compose, and this is the
+          only place the composition is visible. An autopilot run has no start
+          affordance, so for that kind — and for CI-fix and self-improve runs — this
+          default is the ONLY way the opt-in can ever be expressed. */}
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Anthropic usage limits</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            When a run exhausts your Anthropic usage window it normally{" "}
+            <strong className="text-fg">fails</strong> and its work is lost. With this on, a run{" "}
+            <strong className="text-fg">pauses</strong> instead and resumes by itself when the window
+            reopens — it keeps its branch, its history and its place, and picks up where it left off. Runs
+            you did not start by hand (autopilot, CI fixes, self-improvement) have no other way to opt in,
+            so this setting is what covers them. Off by default.
+          </p>
+          <p className="mt-2 text-sm text-muted">
+            This is the default for <strong className="text-fg">new</strong> runs. It does not change runs
+            that already exist, including one that is paused right now — each run carries its own setting,
+            which you can flip on the run's page.
+          </p>
+          <p className="mt-2 text-sm text-faint">
+            A paused run holds onto its checkout and its cached dependencies while it waits, so several at
+            once cost real disk on the worker. There is a cap on how many times one run will wait before it
+            gives up and fails.
+          </p>
+        </div>
+
+        {waitLimitError && <Alert message={waitLimitError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={user?.wait_on_limit ?? false}
+            disabled={waitLimitBusy}
+            onChange={(e) => toggleWaitOnLimit(e.target.checked)}
+          />
+          <span className="text-fg">Pause my new runs on a usage limit instead of failing them</span>
         </label>
       </Card>
 

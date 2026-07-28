@@ -24,6 +24,16 @@ export interface User {
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
+  /** PRD #35: this user's DEFAULT for the usage-limit park — every run they create
+   *  inherits it, including the three kinds with no start affordance at all
+   *  (autopilot, ci_fix, self_improve), which is why the default exists rather than
+   *  a per-start prompt. Default false; toggled from their own Settings.
+   *
+   *  It is a DEFAULT, not a live switch: changing it never touches a run that
+   *  already exists. `Run.wait_on_limit` is the per-run value, set from this at
+   *  creation and overridable on the run view — so the two disagreeing is the normal
+   *  state of a user who overrode one run, not a sync bug to fix. */
+  wait_on_limit: boolean;
   // Which Anthropic credential this user's RETROSPECTIVES spend (PRD #104 M4),
   // independent of what their runs spend — the point of the feature. Both null ⇒
   // unbound ⇒ their default token. The label, never the value.
@@ -775,6 +785,9 @@ export type RunStatus =
   | "claimed"
   | "running"
   | "awaiting_approval"
+  /** Parked until the owner's Anthropic usage window reopens (PRD #35).
+   *  NON-terminal — deliberately absent from TERMINAL_RUN_STATUSES below. */
+  | "limit_wait"
   | "completed"
   | "failed"
   | "cancelled";
@@ -936,6 +949,38 @@ export interface Run {
    *  Since PRD #111 M1 it can be read together with the credential above: what the
    *  run cost, and which account it cost it against. */
   usage?: RunUsage | null;
+  /** PRD #35: this run's usage-limit opt-in — on a sustained Anthropic usage limit
+   *  the run parks at status "limit_wait" and resumes when the window reopens,
+   *  instead of failing. Present on every run from creation, so it is what a "will
+   *  retry on limit" affordance renders BEFORE any park has happened. */
+  wait_on_limit: boolean;
+  /** PRD #35: when the exhausted window reopens, as REPORTED by the worker off the
+   *  SDK frame, and when the server will actually promote the run back to queued.
+   *
+   *  🔴 THESE ARE NOT THE SAME INSTANT AND THE COUNTDOWN READS `retry_not_before`.
+   *  That is when work resumes. It carries jitter, is clamped to RUN_LIMIT_MAX_PARK,
+   *  is cross-checked against the owner's own rate-limit gauge, and is POOL-AWARE —
+   *  a user whose second credential still has headroom is promoted early, so
+   *  retry_not_before is routinely EARLIER than limit_resets_at, not merely offset
+   *  from it. Render limit_resets_at as context ("the five-hour window reopens at
+   *  …") and never compute the countdown from it.
+   *
+   *  Both null for a run that has never parked. ISO-8601 strings, like every other
+   *  timestamp on this type. */
+  limit_resets_at: string | null;
+  retry_not_before: string | null;
+  /** PRD #35: how many times this run has parked (0 if never), capped server-side
+   *  by RUN_LIMIT_MAX_WAITS. The CAP is deliberately not on this type — it is one
+   *  server constant and does not belong on every row of a list response — so render
+   *  "attempt N", not "attempt N/M", unless the denominator is fetched from /api/me. */
+  limit_wait_count: number;
+  /** PRD #35: which window rejected the run ("five_hour", "seven_day", …). Already
+   *  allowlisted against the SDK union server-side, with anything unrecognised
+   *  coerced to "unknown", so it is a safe enum here and never worker free text —
+   *  but render an unrecognised value honestly rather than dropping it, since the
+   *  vocabulary is the SDK's and a newer server can ship a member this build has not
+   *  heard of. Null for a run that has never parked. */
+  rate_limit_type: string | null;
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
@@ -1735,6 +1780,24 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  /**
+   * PRD #35: flip the current user's DEFAULT for the usage-limit park. Returns the
+   * updated user.
+   *
+   * 🔴 IT DOES NOT REACH RUNS THAT ALREADY EXIST — not even queued ones, and not the
+   * one the user is looking at. The flag is copied onto each run at creation, so this
+   * changes what the NEXT run inherits and nothing else. The per-run control is
+   * setRunWaitOnLimit below; the two are separate endpoints because they answer
+   * different questions, and a single "sync everything" write would silently undo
+   * every per-run override the user had made.
+   *
+   * The reason this default is load-bearing rather than a convenience: autopilot,
+   * ci_fix and self_improve runs have NO start affordance at all, so for two of the
+   * three kinds that park, this setting is the only way the opt-in can ever be
+   * expressed.
+   */
+  setWaitOnLimit: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
   // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
   // the body carries no user id. Returns the updated user.
   // enabled is required; anthropicToken is the three-way token field (PRD #104 M4):
@@ -2000,6 +2063,24 @@ const realApi = {
       // plain follow-up/cancel body is unchanged.
       ...(selection ? { selection } : {}),
     }),
+
+  /**
+   * PRD #35: flip THIS run's usage-limit opt-in. Owner-scoped; returns the updated run.
+   *
+   * 🔴 IT CHANGES THE NEXT LIMIT, NOT THE CURRENT STATUS. Sending `false` to a run
+   * that is already parked does NOT un-park, cancel or fail it — the park keeps its
+   * clock and the run still resumes; only a future limit is affected. Cancelling is
+   * `submitRunInput(id, "cancel")`, and conflating the two would be the expensive
+   * mistake here, so it is written at the call site rather than left to the name.
+   *
+   * The server guards it with the same NEGATIVE predicate CancelRunServerSide uses
+   * (`status NOT IN ('completed','failed','cancelled')`), so it is a no-op on a
+   * terminal run and covers `limit_wait` for free. Callers still gate the control on
+   * canToggleWaitOnLimit (lib/limitWait.ts) — that is the UI agreeing with the
+   * server, not the enforcement.
+   */
+  setRunWaitOnLimit: (id: string, enabled: boolean) =>
+    request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
 
   // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
   // getRunReview reads the verdict + recommendations for the run page (owner-or-

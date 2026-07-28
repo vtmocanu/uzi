@@ -203,11 +203,24 @@ export function Badge({
 // StatusPill renders a run status with a colored dot (multica gives every
 // status an icon color via issues/components/status-icon.tsx; the pill shape
 // follows its chat/components/task-status-pill.tsx).
-const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
+//
+// Exported so runBadge.test.ts can assert the two tone surfaces agree. runBadge.ts
+// carries the same taxonomy for the board card and its header says so ("Tones mirror
+// StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one color
+// everywhere") — a claim that was, until PRD #35, enforced by nothing but that
+// sentence. Exporting the map is what lets a test fail when the two drift.
+export const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
   queued: { tone: "queue" },
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
+  /** PRD #35: parked until the owner's Anthropic usage window reopens. Warn-toned
+   *  like the other "blocked on something outside the run" state, and deliberately
+   *  NOT pulsing: a pulse reads as live work, and a parked run does nothing at all
+   *  for what can be hours. The countdown that makes the wait legible needs
+   *  retry_not_before, which only the run view has — the board's LatestRun
+   *  projection does not carry it, so this pill is static everywhere it appears. */
+  limit_wait: { tone: "warning" },
   completed: { tone: "ok" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },

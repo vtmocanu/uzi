@@ -154,6 +154,9 @@ func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		PipelineID:       pgtype.Int8{Int64: snapshot.PipelineID, Valid: true},
 		PipelineRef:      pgtype.Text{String: ref, Valid: true},
 		FailureSnapshot:  snapJSON,
+		// PRD #35: the OWNER's default. A ci_fix run is created by the poller with no
+		// user in the loop, so there is no per-run request to honour.
+		WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

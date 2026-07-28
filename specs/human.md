@@ -549,6 +549,24 @@ Tracked as GitLab issue vtmocanu/uzi#111; PRD at `prds/111-auto-select-anthropic
 - Ranking is least-consumed first; a within-threshold tie goes to the account that resets soonest. [user 2026-07-22]
 - The dev-cluster k8s validation (a PRD success criterion) is deferred to a follow-up issue, not dropped. [user 2026-07-27]
 
+## Feature #35 — Retry after an Anthropic usage limit
+
+Tracked as GitLab issue vtmocanu/uzi#35; PRD at `prds/done/35-run-limit-retry.md`;
+ADR at `adr/0035-run-limit-retry.md`.
+
+- When a run hits the Anthropic usage limit, retry after a delay — back off until
+  the limit resets, instead of failing the run. [user, the originating ask on #35]
+- Two opt-in scopes: a per-user default in Settings, and a per-run choice.
+  [user, same ask]
+- The per-run scope is a toggle on the RUN VIEW while the run is non-terminal,
+  plus `wait_on_limit` on run creation for CLI/API callers; starting a run stays
+  one click and inherits the user default. [user 2026-07-27 — confirmed
+  reinterpretation of the per-run clause above: the run-start modal the PRD assumed
+  does not exist, and a toggle also reaches autopilot, `ci_fix` and `self_improve`
+  runs, which have no start affordance at all]
+- `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
+  credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

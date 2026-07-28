@@ -2,11 +2,13 @@
 .env
 
 # Node
-# No trailing slash: a trailing slash matches only DIRECTORIES, and the pattern
-# CLAUDE.md recommends for throwaway worktrees is a SYMLINK to a long-lived
-# worktree's node_modules (it avoids `npm ci`, which clobbers the host's
-# agent-browser). That symlink was unignored and one `git add -A` from being
-# committed. Bare path matches file, dir and symlink alike.
+# No trailing slash on node_modules, deliberately: a trailing slash matches a
+# DIRECTORY only, and CLAUDE.md tells you to symlink node_modules from another
+# worktree rather than run `npm ci` (its postinstall clobbers the host's
+# agent-browser). A symlink is not a directory, so `web/node_modules/` left the
+# symlink untracked and one `git add -A` staged a link pointing outside the repo.
+# The bare pattern matches file, dir and symlink alike; agent/ and the bare form
+# are here because the same symlink trick is used for both other workspaces.
 web/node_modules
 agent/node_modules
 node_modules

@@ -542,10 +542,33 @@ func renderRoot(rc store.GetSlackRunContextRow, base string) string {
 	return head
 }
 
-// renderThread returns the threaded outcome event for a terminal transition, or
-// "" for a non-terminal one. Completed carries the MR link; failed the reason. The
-// worker-originated failure reason is length-bounded and mrkdwn-escaped before it
-// goes out (it is untrusted free text with no source-side length bound).
+// renderThread returns the threaded event for a transition, or "" when the
+// transition is not worth interrupting the owner for. Completed carries the MR link;
+// failed the reason. The worker-originated failure reason is length-bounded and
+// mrkdwn-escaped before it goes out (it is untrusted free text with no source-side
+// length bound).
+//
+// 🔴 THIS USED TO READ "for a terminal transition, or "" for a NON-TERMINAL one",
+// and PRD #35 made that false: `limit_wait` is non-terminal and posts. Stated as a
+// RULING rather than left to be rediscovered, because the old sentence is exactly
+// what would make the next reader file the park case as a violation and delete it.
+//
+// The rule is "worth interrupting for", and terminality was only ever a proxy for
+// it. What broke the proxy is a status that lasts HOURS BY DESIGN — the contract was
+// written before one existed. The mechanism that forces the widening: the root line
+// is EDITED, and a Slack edit raises no notification, so a park with no threaded post
+// is never communicated at all. The user learns their run is idle by happening to
+// look, having lost the window in which they might have cancelled it.
+//
+// TWO PROPERTIES BOUND THE WIDENING, and they are what make it safe rather than
+// merely better — check any future non-terminal case against both:
+//
+//  1. It is bounded by construction. RUN_LIMIT_MAX_WAITS caps parks per run
+//     (default 5), so a run can post this at most that many times over its life.
+//  2. The RESUME posts nothing. `queued` falls to the default arm, which is right —
+//     resuming is a return to normal and the edited root already shows it. Without
+//     this half, a run that parks five times would produce ten posts and the feature
+//     would read as a notification stream.
 func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	switch rc.Status {
 	case "completed":
@@ -564,9 +587,51 @@ func renderThread(rc store.GetSlackRunContextRow, base string) string {
 		return "❌ failed"
 	case "cancelled":
 		return "🚫 cancelled"
+	case "limit_wait":
+		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
+		// two properties that bound it live on this function's doc comment above, in one
+		// place, so they cannot drift from the contract they amend.
+		return limitWaitLabel(rc)
 	default:
 		return ""
 	}
+}
+
+// limitWaitLabel renders a park for both the root line and the threaded event.
+//
+// ONE function for both on purpose: the two would otherwise drift into describing
+// the same state differently in the same DM, which is the failure the reader
+// notices and cannot explain.
+//
+// Every part is omitted when unknown rather than defaulted, exactly as the server's
+// own failure-reason composition does — the line never claims a fact uzi does not
+// have. A park with neither a window nor a stamp still renders honestly as
+// "⏸ paused: usage limit".
+func limitWaitLabel(rc store.GetSlackRunContextRow) string {
+	s := "⏸ paused: usage limit"
+	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
+		// EscapeMrkdwn even though workersvc has already allowlisted this to a
+		// seven-member enum and 00091's CHECK backstops it. The escape costs nothing and
+		// covers the exact population the CHECK exists for: a backfill, an admin tool, or
+		// a later writer that bypassed the coercion. Per-field, never on the assembled
+		// line, so the emoji and separators this function owns are not escaped.
+		s += " (" + EscapeMrkdwn(rc.RateLimitType.String) + ")"
+	}
+	if rc.RetryNotBefore.Valid {
+		// Slack's own date markup, so the timestamp renders in the READER's timezone
+		// rather than the server's. The fallback after `|` is what Slack shows when it
+		// cannot render the token, and it is UTC-explicit so a fallback is never
+		// ambiguous about which zone it means.
+		s += fmt.Sprintf("; resumes <!date^%d^{time}|%s>",
+			rc.RetryNotBefore.Time.Unix(), rc.RetryNotBefore.Time.UTC().Format("15:04 MST"))
+	}
+	if rc.LimitWaitCount > 1 {
+		// Only from the SECOND park. "attempt 1" on a first park is noise; a rising
+		// count is the signal that this run is burning its retry budget and may be about
+		// to fail for good.
+		s += fmt.Sprintf(" (pause %d)", rc.LimitWaitCount)
+	}
+	return s
 }
 
 // maxFailureReason bounds the worker-originated failure reason before it reaches
@@ -593,6 +658,8 @@ func statusLabel(rc store.GetSlackRunContextRow) string {
 		return "▶ running"
 	case "awaiting_approval":
 		return "⏸ needs your approval"
+	case "limit_wait":
+		return limitWaitLabel(rc)
 	case "completed":
 		if rc.MrIid.Valid {
 			return fmt.Sprintf("✅ completed (%s %s%d)", forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)

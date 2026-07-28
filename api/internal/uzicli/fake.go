@@ -50,11 +50,17 @@ type FakeClient struct {
 	CreatedRun         apitypes.RunDTO
 	LastCreateRepoID   string
 	LastCreateIssueIID int64
-	InputResp          apitypes.RunInputResponse
-	LastInputRunID     string
-	LastInputKind      string
-	LastInputBody      string
-	LastInputSelection *apitypes.AgentSelection
+	// LastCreateWaitOnLimit keeps the POINTER rather than a bool, so a test can tell
+	// the three cases apart: nil (the flag was not passed — inherit the user's
+	// default), &false and &true. A bool field here would silently collapse "not
+	// passed" into "passed false", which is the exact distinction the flag exists to
+	// carry, and no test could then catch its loss.
+	LastCreateWaitOnLimit *bool
+	InputResp             apitypes.RunInputResponse
+	LastInputRunID        string
+	LastInputKind         string
+	LastInputBody         string
+	LastInputSelection    *apitypes.AgentSelection
 
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
@@ -393,9 +399,10 @@ func (f *FakeClient) PollCLIAuth(context.Context, string, string) (CLIAuthPollRe
 	return res, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool) (apitypes.RunDTO, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
+	f.LastCreateWaitOnLimit = waitOnLimit
 	if f.Err != nil {
 		return apitypes.RunDTO{}, f.Err
 	}

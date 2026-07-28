@@ -11,6 +11,10 @@ Anthropic caps every account against two rolling windows — **5-hour** and
 uzi reads both windows for you, server-side, using your own
 [Anthropic tokens](./anthropic-token.md), and shows them as live meters.
 
+That covers a run that hasn't started yet. A run already **in progress**
+when it hits one of these windows is a different page —
+[Paused on a usage limit](run-limit-wait.md).
+
 **A meter is per token, not per account.** Each credential you store is
 polled and metered on its own, because that is the unit Anthropic actually
 caps — two tokens pointing at two different accounts have two independent

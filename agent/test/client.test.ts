@@ -130,8 +130,10 @@ describe("reportState", () => {
     api.markAlreadyTerminal("run-1");
     const client = newClient();
     // The server rejected it as already-terminal, so nothing was recorded, yet
-    // the client did not surface an error.
-    assert.strictEqual(await client.reportState("run-1", { status: "failed", failure_reason: "boom" }), undefined);
+    // the client did not surface an error. It now also reports WHAT happened
+    // instead of collapsing the outcome to undefined.
+    const ack = await client.reportState("run-1", { status: "failed", failure_reason: "boom" });
+    assert.deepStrictEqual(ack, { applied: false, status: "cancelled" });
     assert.strictEqual(api.states.length, 0);
   });
 
@@ -140,6 +142,50 @@ describe("reportState", () => {
     const client = newClient();
     await assert.rejects(client.reportState("run-1", { status: "completed", branch: "b" }), RequestError);
     assert.strictEqual(api.stateAttempts, 1); // no retry on a permanent error
+  });
+});
+
+// PRD #35's park acknowledgement contract, at the transport level. The
+// consequences (which filesystem paths survive a park) are asserted in M1's runner
+// tests; what is pinned HERE is that reportState surfaces the server's real answer
+// at all, since that is the input those decisions are made from.
+describe("reportState acknowledgement (PRD #35)", () => {
+  it("reports the parked status back when the server applied the park", async () => {
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "limit_wait", rate_limit_type: "five_hour" });
+    assert.deepStrictEqual(ack, { applied: true, status: "limit_wait" });
+  });
+
+  // 🔴 THE DISCRIMINATING CASE. Everything else in this file passes against an
+  // implementation that keys the park decision on `applied` instead of on `status`.
+  //
+  // The server DECLINED the park and failed the run — the designed outcome when the
+  // retry budget is exhausted, when the RUN_LIMIT_MAX_PARK clamp is exceeded, or
+  // when wait_on_limit is false and the report is coerced. It is a 200, because a
+  // transition WAS applied; it was simply not the one that was asked for. So
+  // `applied` is true here while the run is emphatically not parked, and a caller
+  // reading `applied` would preserve the clone, the skills plugin dir and up to
+  // ~170 MB of run HOME for a run that will never be claimed again.
+  //
+  // Budget exhaustion is the ordinary end of a run that keeps hitting limits, not an
+  // error path, so this is the COMMON case rather than a corner of one.
+  it("distinguishes a declined park from an applied one even though both answer 200", async () => {
+    api.overrideStateStatus("run-1", "failed");
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "limit_wait", rate_limit_type: "five_hour" });
+    assert.strictEqual(ack.applied, true, "the server applied a transition, just not the requested one");
+    assert.notStrictEqual(ack.status, "limit_wait", "the run is NOT parked and the status must say so");
+    assert.strictEqual(ack.status, "failed");
+  });
+
+  it("yields an undefined status rather than throwing when the body is unreadable", async () => {
+    // An older server, a truncated body, a proxy that rewrote the response. Every
+    // one of them must read as "not parked" rather than as a failed report: the
+    // caller's rule is a positive test for one literal, so absent is already safe.
+    api.sendRawState("run-1", 200, "not json at all");
+    const client = newClient();
+    const ack = await client.reportState("run-1", { status: "limit_wait" });
+    assert.deepStrictEqual(ack, { applied: true, status: undefined });
   });
 });
 

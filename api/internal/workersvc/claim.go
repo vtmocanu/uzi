@@ -43,6 +43,45 @@ type ClaimPayload struct {
 	// reads it from the row, a requeued/resumed autopilot run re-delivers it
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
+	// WaitOnLimit is this run's usage-limit opt-in (PRD #35 Decision 7): on a
+	// sustained Anthropic usage limit the worker parks the run instead of failing it.
+	// Top-level and re-read from the runs row on every claim, exactly like
+	// AutoApprove above and for the same reason — a resumed or re-queued run must
+	// keep the behaviour the user chose, and a park-resume-park cycle re-reads it
+	// each time.
+	WaitOnLimit bool `json:"wait_on_limit"`
+	// PlanApproved says this run's plan is already approved (PRD #35 Decision 6b),
+	// derived here rather than by the worker: a consumed approve_plan input exists
+	// for the run, OR the run is autopilot. On a resume with a resumable session the
+	// worker uses it to skip the Phase-1 planning turn and the gate, replaying
+	// PlanMd instead. Without it a park-and-resume re-plans, re-parks at
+	// awaiting_approval in front of a human who already approved, and can fail with
+	// REASON_NO_PLAN when the resumed session declines to re-emit signal_plan.
+	PlanApproved bool `json:"plan_approved"`
+	// AgentSelection is the run's PERSISTED subagent selection (runs.agent_source /
+	// agent_exclusions), replayed on every claim. Omitted when the run has none.
+	//
+	// 🔴 IT SHIPS BECAUSE PlanApproved SHIPS, AND THE TWO COME FROM ONE HUMAN
+	// VERDICT. Normally the selection reaches the worker on the approve_plan
+	// verdict — but a run resumed with plan_approved already true HAS NO VERDICT to
+	// carry it, so the worker falls through to resolveAgentSelection's "absent"
+	// default (repo when a roster was detected, else own, NO exclusions). The
+	// consequence is concrete: a human who excluded a subagent at the plan gate gets
+	// it back after a park, silently.
+	//
+	// The argument for fixing it is NOT that exclusions are a security control —
+	// they are not, every subagent still comes from the same vetted set and the
+	// Agent-guard hook is still frozen to it. It is that Decision 6b's whole premise
+	// is "we may skip the gate BECAUSE the human already approved". Propagating the
+	// approval while dropping the exclusions that were part of the same decision
+	// honours half a verdict, and that is worse than honouring none, because the
+	// user gets no signal: they excluded something deliberately, the run resumes,
+	// and it comes back.
+	//
+	// Nil, not an empty selection, when the run never reached a gate — the worker's
+	// absent-default is correct there and must stay reachable. Additive on the wire:
+	// an old worker ignores the key and behaves exactly as it does today.
+	AgentSelection *AgentSelection `json:"agent_selection,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
@@ -158,13 +197,13 @@ type ClaimAgent struct {
 // template's model (PRD #17 Decision 6); it is omitted when the owner has no
 // default set (NULL), so the worker falls back to the lead template's model.
 type ClaimConfig struct {
-	RunTimeoutSeconds  int     `json:"run_timeout_seconds"`
-	IdleTimeoutSeconds int     `json:"idle_timeout_seconds"`
-	MaxIterations      int     `json:"max_iterations"`
+	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
+	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+	MaxIterations      int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
-	PlanMaxRevisions   int     `json:"plan_max_revisions"`
-	DefaultModel       *string `json:"default_model,omitempty"`
+	PlanMaxRevisions int     `json:"plan_max_revisions"`
+	DefaultModel     *string `json:"default_model,omitempty"`
 	// SkillMaxBytes and SkillsMaxPerRun are the skill caps the server configured,
 	// delivered so the worker enforces the same limits (no hardcoded drift): the
 	// worker applies SkillMaxBytes to repo-borne skills and re-enforces

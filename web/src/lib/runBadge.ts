@@ -9,7 +9,9 @@ import { stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
-// (claimed/running), warning (awaiting), ok (completed), danger (failure).
+// (claimed/running), warning (awaiting, limit_wait), ok (completed), danger
+// (failure). Since PRD #35 that mirror is asserted by a test rather than only
+// claimed here — see the RUN_STATUS_TONES agreement case in runBadge.test.ts.
 export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
@@ -95,6 +97,10 @@ export function isStoppedRun(status: string, stopKind: StopKind | null | undefin
 // is green, claimed/running are sky. Shared by the issue-view history rows.
 export function runStatusTone(status: string, stopKind: StopKind | null | undefined): BadgeTone {
   if (status === "awaiting_approval") return "warning";
+  // PRD #35: a run parked on the owner's Anthropic usage limit. Warn, like the
+  // other "blocked on something outside the run" state — never danger: it has not
+  // failed and it resumes by itself.
+  if (status === "limit_wait") return "warning";
   if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
@@ -126,6 +132,16 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
 // HEALTH_FLAGGABLE_STATUSES mirrors the server's flaggable set: a health flag is
 // only ever rendered while a run is in one of these (belt-and-braces with the
 // server exit contract, Decision 3 — a terminal run must never show a stale ⚠).
+//
+// 🔴 `limit_wait` IS DELIBERATELY ABSENT AND MUST STAY ABSENT (PRD #35 §7.6). It
+// looks like an omission because a parked run is non-terminal, which is exactly
+// why this note is here. The server's ListActiveRunsForHealth is the same positive
+// allowlist, so nothing ever re-examines a parked run; the fix for that is the park
+// query CLEARING the health columns on entry, not making a park flaggable. The
+// detector's three signals (stalled / looping / slow) all describe a *running*
+// agent, and a run that is waiting on a clock by design would trip every one of
+// them. Adding the status here would put "⚠ stalled" on a run that is behaving
+// exactly as intended — the false alarm this design exists to avoid.
 const HEALTH_FLAGGABLE_STATUSES = new Set<string>(["queued", "running", "awaiting_approval"]);
 
 // healthFlagLabel is the short word for a flag, or null for "ok". Shared by the
@@ -240,6 +256,22 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     }
     case "awaiting_approval":
       return { kind: "badge", label: "awaiting approval", tone: "warning", pulse: false };
+    // PRD #35: parked on the owner's Anthropic usage limit. STATIC — no countdown
+    // and no elapsed, unlike the running badge above. LatestRun is a deliberately
+    // narrow board projection that carries neither retry_not_before nor
+    // limit_resets_at, so the only honest thing this surface can say is THAT the run
+    // is waiting; WHEN it resumes lives on the run view, which reads the full Run.
+    // (Widening LatestRun to put a countdown on the card would also force a
+    // Board.tsx prop change, which PRD #102 is rewriting in parallel.) The title is
+    // therefore a fixed sentence, not an interpolation.
+    case "limit_wait":
+      return {
+        kind: "badge",
+        label: "limit wait",
+        tone: "warning",
+        pulse: false,
+        title: "Paused on an Anthropic usage limit. It resumes on its own when the window reopens.",
+      };
     case "failed":
       return {
         kind: "badge",

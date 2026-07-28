@@ -469,7 +469,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, limit_wait, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -477,9 +477,24 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !applied {
-		// The run was already terminal (e.g. cancelled out from under the worker):
-		// 409 with the run's real status. The worker treats 409 as success and
-		// stops (M2 wire contract).
+		// The transition was a no-op: 409 with the run's REAL status, which the worker
+		// reads off the body.
+		//
+		// This used to say "the run was already terminal (e.g. cancelled out from under
+		// the worker)", and PRD #35 made that false in the same commit that shipped
+		// limit_wait. A 409 now means any of: the run was already terminal; the park's
+		// POSITIVE source guard rejected a report against a run that is not `running`;
+		// the report was a re-delivered park onto an already-parked run; or the run is a
+		// judge, which never parks. What they share — and the only thing the worker may
+		// infer — is that THIS report changed nothing.
+		//
+		// 🔴 A 409 IS NOT "THE RUN IS FINISHED", AND THE WORKER MUST NOT KEY CLEANUP ON
+		// IT. The worker's carve-out (skip the clone/plugin-dir/HOME removals) keys off
+		// the RETURNED STATUS being literally "limit_wait", never off applied — because
+		// the three most common ways a park does not happen (budget spent, park too far,
+		// run opted out) are server-side FAILURES delivered as 200s with
+		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
+		// disk on exactly those.
 		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run)})
 		return
 	}

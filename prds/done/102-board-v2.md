@@ -1,7 +1,7 @@
 # PRD #102: Board v2 — column rename, label chips, sorting + manual ordering, non-PRD issues
 
 **GitLab Issue**: [#102](https://gitlab.example.com/vtmocanu/uzi/-/issues/102)
-**Status**: Draft (created 2026-07-20; M5 widened to sort modes 2026-07-27)
+**Status**: Complete (merged 2026-07-28 via MR !142, `7b02b1a0`; released as `v0.12.0` and deployed to dev-cluster. M7's interactive board walkthrough deferred to the user.)
 **Priority**: Medium
 
 Four board changes, bundled because they all land in `Board.tsx` and the
@@ -696,9 +696,45 @@ still needs a `prds/*.md` link **or** `PRDLESS` before a run can start.
       `state` list param and the harness must tolerate two list calls per
       sync cycle (its eviction/race assumptions at `run-e2e.sh:239-256`
       are sensitive to sync shape).
-    - **PARTIAL at MR time (2026-07-28). The e2e half is DONE; the k8s half
-      is structurally out of reach before merge and is the only milestone
-      not closed.**
+    - **CLOSED 2026-07-28 with the interactive half DEFERRED TO THE USER, at
+      their direction.** The PRD is complete; this milestone's remaining work
+      is a manual board walkthrough the user will do later. Recorded here
+      rather than silently ticked, so nobody reads M7 as fully exercised.
+
+    - **Verified after release (`v0.12.0`, deployed to dev-cluster):**
+      - `uzi-api`, `uzi-controller`, `uzi-web` all rolled to `0.12.0` and are
+        healthy. The api pod reaching `Running` is itself evidence: migrations
+        run at boot under strict goose, so a numbering problem would surface as
+        `CrashLoopBackOff`.
+      - `goose: successfully migrated database to version: 91` against the real
+        12-day-old database, so `00090_issue_board_position` and PRD #35's
+        `00091_run_limit_wait` both applied in order. Api listening on `:8080`
+        and `:8443`; privilege sweeper 1 checked / 0 violations.
+      - `e2e:kind-smoke` green on the tag pipeline — a real KinD cluster,
+        `helm install` of this chart, and `scripts/smoke.sh` against it. It only
+        runs on protected refs, so the tag is one of the few places it executes.
+      - Every milestone's code confirmed present in the **served** bundle at
+        `uzi.example.com`: `Backlog`, `Show other issues`, `Promote to `,
+        `Move issue #`, `Still saving the previous move`, the five sort-mode
+        names, and the chip-overflow fragment.
+        **Presence in the bundle is not efficacy** — it shows the code shipped,
+        not that it renders or behaves.
+
+    - **STILL UNVERIFIED, and it is the interactive half:** a fresh repo
+      connection seeding `Planned` ahead of `In Progress`; the `Planned` label
+      appearing in that GitLab project; chips on a real card; drag and keyboard
+      reorder; the Decision 7b freeze (drag while sorted by `Last updated` and
+      confirm every *other* card holds); the non-PRD toggle, dashed treatment,
+      and Promote. Also the M3 hand-migration of `vtmocanu/uzi`'s own board,
+      which renames a live GitLab label and was never started.
+
+    - **Why it stopped here, recorded because the reason is not "we forgot":**
+      the deployment authenticates via Keycloak OIDC with password login also
+      enabled, and the cluster secret holds only service credentials
+      (`JWT_SECRET`, controller tokens, the OIDC client secret) — no seeded
+      admin. There was no credential available to drive an authenticated
+      session, and minting a real user on the instance was not something to do
+      unprompted.
     - **Done**: the fake forge now honours `state` **and `labels`** — it
       ignored *both*, and its comment claiming "the caller filters by label"
       was false, which mattered because against it the Decision 11 union

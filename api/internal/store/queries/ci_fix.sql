@@ -8,14 +8,19 @@
 -- stays self-contained. origin_column / move_pending_since stay NULL — a ci_fix
 -- run has no board card to move or restore. The uq_runs_one_active_ci_fix partial
 -- index rejects a second active fix for the same ref (23505 → 409).
+-- wait_on_limit (PRD #35) is stamped here too, from the OWNER's default: a ci_fix
+-- run is created by the poller with no user in the loop, so there is no request to
+-- override it. It parks like any other run (Decision 14) — same runner, same
+-- executor, same expense — so excluding it would have meant paying for a guard to
+-- NOT have the feature.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
-    pipeline_id, pipeline_ref, failure_snapshot
+    pipeline_id, pipeline_ref, failure_snapshot, wait_on_limit
 ) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
-    @pipeline_id, @pipeline_ref, @failure_snapshot
+    @pipeline_id, @pipeline_ref, @failure_snapshot, @wait_on_limit
 )
 RETURNING *;
 

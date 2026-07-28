@@ -171,6 +171,51 @@ type RunDTO struct {
 	// Since PRD #111 M1 it can finally be read TOGETHER with the two fields above:
 	// what a run cost, and which credential it cost it against.
 	Usage *UsageDTO `json:"usage,omitempty"`
+	// Anthropic usage-limit park (PRD #35). A run that exhausts the owner's
+	// subscription window is parked at status "limit_wait" rather than failed, and
+	// resumes once the window reopens.
+	//
+	// WaitOnLimit is the run's opt-in, resolved at creation from the owner's default
+	// or an explicit override. It is on the DTO rather than inferred from the status
+	// because it is meaningful BEFORE any park — it is what a "will retry on limit"
+	// affordance renders, and what a per-run toggle reads back.
+	WaitOnLimit bool `json:"wait_on_limit"`
+	// LimitResetsAt is when the exhausted window reopens, as REPORTED by the worker
+	// off the SDK frame. RetryNotBefore is when the server will actually promote the
+	// run back to queued.
+	//
+	// The two are separate fields because they are separate facts and they routinely
+	// differ: RetryNotBefore carries jitter, is bounded by RUN_LIMIT_MAX_PARK, is
+	// cross-checked against the owner's own rate-limit gauge, and is pool-aware — a
+	// user with a second credential that still has headroom is promoted early, so
+	// RetryNotBefore can be far EARLIER than LimitResetsAt. Render the countdown off
+	// RetryNotBefore (that is when work resumes) and LimitResetsAt only as context.
+	// Both null for a run that has never parked.
+	//
+	// "Bounded by", not "clamped to", and the distinction is user-visible: PRD #35
+	// Decision 4 says a computed stamp beyond RUN_LIMIT_MAX_PARK FAILS the run with a
+	// clear reason rather than being pulled back to the ceiling. So a client will never
+	// see a RetryNotBefore sitting exactly at now+RUN_LIMIT_MAX_PARK as the result of a
+	// clamp — that run is `failed`, not parked. (Corrected 2026-07-27: this comment
+	// said "clamped", which would have a client render a wait that never happens.)
+	LimitResetsAt  *time.Time `json:"limit_resets_at"`
+	RetryNotBefore *time.Time `json:"retry_not_before"`
+	// LimitWaitCount is how many times this run has parked, capped server-side by
+	// RUN_LIMIT_MAX_WAITS. 0 for a run that has never parked.
+	//
+	// The CAP is deliberately NOT on this DTO: it is one server constant, and
+	// repeating it on every row of a list response is the wrong shape. Render
+	// "attempt N"; if the denominator is wanted, it belongs on /api/me.
+	LimitWaitCount int32 `json:"limit_wait_count"`
+	// RateLimitType is which window rejected the run ("five_hour", "seven_day", …),
+	// already allowlisted against the SDK union server-side with anything
+	// unrecognised coerced to "unknown" — so it is a safe enum by the time it is
+	// here, never worker free text. Null for a run that has never parked.
+	//
+	// Clients must still render an unrecognised value honestly rather than dropping
+	// it: the vocabulary is the SDK's and a newer server can ship a member this
+	// client has not heard of. Same rule as AnthropicSelectReason above.
+	RateLimitType *string `json:"rate_limit_type"`
 }
 
 // RunListItemDTO is a run row for the Runs index and the admin Agents-status

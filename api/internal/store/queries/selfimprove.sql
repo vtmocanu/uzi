@@ -22,10 +22,17 @@
 -- here. The uq_runs_one_active_self_improve partial index admits at most one
 -- non-terminal self_improve instance-wide (23505 → ErrActiveSelfImproveExists), so
 -- Boot re-runs and any future replica never double-create onto the fixed branch.
+-- wait_on_limit (PRD #35) comes from the OWNER's default: like ci_fix, this run is
+-- created by an engine tick with no user in the loop. It parks (Decision 14) — it is
+-- long, repo-ful, auto_approve and expensive, exactly the run whose loss to a
+-- five-hour window hurts most. A parked one keeps holding
+-- uq_runs_one_active_self_improve, which is correct: the engine's documented
+-- behaviour on a blocked tick is "a cycle is still in flight, skip", and that is
+-- precisely true of a parked run. Cancel-while-parked is the escape hatch.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit
 ) VALUES (
-    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true
+    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit
 )
 RETURNING *;
 
