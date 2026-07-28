@@ -174,3 +174,30 @@ RETURNING *;
 -- a genuinely new plan version (post a fresh gate + plan-in-thread) from a redundant
 -- re-broadcast of the same version (no-op, never spam).
 SELECT count(*) FROM run_messages WHERE run_id = @run_id AND kind = 'plan';
+
+-- name: GetLatestRunQuestion :one
+-- The clarification question a parked run is waiting on (PRD #88 M3): the payload of
+-- the newest kind='question' run_message. The worker flushes that message BEFORE it
+-- reports awaiting_input, so a run genuinely parked always has one; no row means the
+-- notifier saw the state first and should wait for a later event rather than post a
+-- park it cannot explain.
+--
+-- The raw payload is returned and parsed in Go, unlike GetSlackRunContext's
+-- repo_agent_names, which is projected in SQL specifically so repo-authored agent
+-- DESCRIPTIONS never leave the database toward Slack. That reason inverts here: the
+-- question text IS what M3 exists to deliver, so there is nothing to withhold, and
+-- building the render in SQL would put string formatting in a query for no gain.
+SELECT payload FROM run_messages
+WHERE run_id = @run_id AND kind = 'question'
+ORDER BY seq DESC LIMIT 1;
+
+-- name: SetSlackRunQuestion :one
+-- Record which question the run's thread already carries (PRD #88 M3), so a re-park —
+-- a worker death re-queues the run and the resumed worker parks again on the SAME
+-- question id — does not post the card a second time. Unguarded on purpose: the
+-- notifier drains its queue in ONE goroutine, so there is no concurrent writer to
+-- compare against, unlike the gate's cross-surface button clicks.
+UPDATE slack_run_messages
+SET question_id = @question_id, updated_at = now()
+WHERE run_id = @run_id
+RETURNING *;
