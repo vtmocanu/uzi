@@ -162,7 +162,10 @@ Open **Settings → Notifications**:
     hours by default, `QUESTION_TIMEOUT_SECONDS`). The timer is held by the
     worker, so if that worker dies and the run is picked up again the clock
     restarts — the honest worst case is the timeout times one more than the
-    requeue limit, not the timeout flat.
+    requeue limit, not the timeout flat. The per-run question cap
+    (`QUESTION_MAX`, 5 by default) resets the same way for the same reason,
+    so it has the identical caveat: a run may ask up to 10 questions over its
+    life, not 5, if a worker dies and it's requeued in between.
   - **The ✅ means "recorded", not "delivered".** It is added once uzi has
     stored your answer for the run to collect. In the narrow window of a
     rolling worker upgrade, a run resumed onto a worker from before this

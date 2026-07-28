@@ -37,6 +37,56 @@ Autopilot runs skip this gate entirely — see [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
+## Answering a question
+
+Beyond the plan gate and a follow-up you send yourself, an agent can stop
+mid-task and ask **you** something — the run's third human-in-the-loop
+channel. When it does, the run parks at `awaiting_input`, its badge reads
+**needs your answer**, and an **Answer required** panel appears with the
+question (rendered as markdown), any suggested options as toggleable chips,
+and a free-text box per question — answering in your own words is always
+available, whether or not options are offered. If the agent batched several
+questions into one stop, they all appear together and **Send answer**
+submits them as one round; if it asked more than once in the run, the panel
+carries a small `q2`/`q3`/... marker so you know which round you're on. The
+run is still cancellable while parked, the same escape hatch a revising plan
+gate offers.
+
+**Answer from wherever you're already watching**: the web composer above,
+a reply in the run's Slack thread if you've linked your account (see
+[Slack notifications](./slack.md#using-it)), or `uzi run answer <id>` from
+the terminal (see [the CLI docs](./cli.md#commands)) — all three read the
+same open question off the run's feed, so none of them can show something
+the others don't.
+
+A few things worth knowing:
+
+- **Never paste a credential, token, or password into an answer.** The agent
+  is instructed to never ask for one; a question that does is itself a red
+  flag, wherever it reaches you. Question text is written by the agent from
+  repository and issue content, so a hostile file in a repo can steer what
+  you're asked. Your answer is scrubbed of known credential patterns and
+  length-bounded regardless of which surface you answer from, but that's a
+  backstop, not a reason to test it.
+- **Nobody answers ⇒ the run fails**, "clarification timed out", once the
+  answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
+  is no configurable default action. The timer is held by the worker, so if
+  it dies and the run is picked up again the clock restarts: the honest
+  worst case is the timeout **times one more than the requeue limit**
+  (`RUN_MAX_REQUEUES`, default 1) — 48h, not 24, on the defaults. The
+  question cap (`QUESTION_MAX`, default 5 per attempt) resets the same way,
+  for the same reason, so its honest lifetime bound is likewise **× (requeue
+  limit + 1)** — 10 questions, not 5.
+- **Autopilot runs never park on a question.** With nobody in the loop, the
+  agent auto-resolves with "proceed on your best judgment," notes the
+  assumption it made in the run feed, and keeps going — see
+  [Autopilot](./autopilot.md).
+- **A run resumed onto a worker from before this feature shipped won't
+  surface a new question at all** (it guesses instead, mid-run, or fails
+  pre-run) — a narrow window during a rolling upgrade, not a steady-state
+  concern. If a run you answered doesn't move, open it in uzi and check
+  whether it's actually still waiting.
+
 ## Lanes: one per actor, not one per turn
 
 **By agent** (the default) gives every actor a single lane holding its whole

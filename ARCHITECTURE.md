@@ -470,11 +470,16 @@ life (a DB partial unique index enforces at most one non-terminal run per
 issue). Status is a linear state machine:
 
 ```
-queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → running → completed
-                                                                             → failed
+queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
+                                                                                                                   → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
+
+`running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
+planning turn with a question instead of a plan, and again **mid-run**, at any
+point in the implement ⇄ review loop after approval — both return to `running`
+on answer, so the single edge above stands in for either occurrence.
 
 - **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
   oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
@@ -529,6 +534,50 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   for the epoch mechanism (Decisions 2/3) and
   [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
   user-facing actions.
+- **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
+  ([PRD #88](prds/88-ask-user-clarification.md)), beside the plan gate above
+  and user-initiated steering below. The lead calls an in-process `ask_user`
+  signal when it hits a fork it shouldn't resolve alone; the worker parks the
+  run, posts a `question` run-message, and awaits an `answer` steering input
+  the way `gatePlan` awaits a plan verdict. On answer it resumes the *same*
+  SDK session (no transcript replay) and continues — a **pre-run** question
+  (asked before `submit_plan`) resumes into a fresh planning turn that
+  eventually reaches the plan gate; a **mid-run** question resumes the
+  implement ⇄ review loop it interrupted. It is a distinct status rather than
+  a sub-state of `awaiting_approval`, because `SetRunRunning`'s resume
+  transition requires a *consumed* `approve_plan`, which an `answer` can
+  never satisfy — the plan gate's status could not be reused for a question.
+  It otherwise inherits `awaiting_approval`'s treatment everywhere that
+  matters: every worker-death sweep, the `busy`/`active_runs` and
+  rate-limit-window concurrency counts, and the board's move-pending
+  bookkeeping all list `awaiting_input` alongside `awaiting_approval`, so a
+  parked question is recoverable across a worker death, holds its worker
+  slot, and never wedges a board card. The resume guard is keyed on the open
+  **question's identity**, not on a timestamp or an arrival order: a
+  worker-death requeue re-parks on the *same* question id (re-stamped from
+  the claim), so an answer submitted just before the crash still resumes the
+  run afterwards, while an answer to an already-superseded question is
+  rejected. Bounded by an absolute answer deadline
+  (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a per-run question cap
+  (`QUESTION_MAX`, default 5), both enforced worker-side and both
+  **worker-in-memory** — a requeue resets both counters, so the honest
+  worst case over a run's life is each value **× (RUN_MAX_REQUEUES + 1)**,
+  not the configured value flat. Either overrun **fails the run closed**
+  ("clarification timed out"); there is no configurable default action.
+  **Autopilot never parks**: the same `claim.auto_approve` that
+  short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
+  "no human available, proceed on your best judgment" answer and noting the
+  assumption in the feed instead. The question surfaces on every surface a
+  user might be watching — the run view (an "Answer required" composer), the
+  owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
+  and all three derive the open question from the run feed rather than a
+  dedicated field, so none of them can show something the others don't. See
+  the PRD's Decision Log for the full mechanism (including the accepted
+  mixed-fleet-rollout residual: a run resumed onto a pre-#88 worker degrades
+  to guessing rather than asking, mid-run, and a pending answer in transit is
+  lost) and [docs/run-activity.md](docs/run-activity.md#answering-a-question),
+  [docs/slack.md](docs/slack.md#using-it) and [docs/cli.md](docs/cli.md#commands)
+  for the user-facing surfaces.
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
   failure carries a `failure_reason`.
@@ -1033,8 +1082,12 @@ Rationale, the decision log, and the alternatives that were rejected are in
 ## Not yet in scope
 
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
-`AskUserQuestion` mid-run steering, WS wakeup for idle workers (a 3s poll is
-the MVP), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
+WS wakeup for idle workers (a 3s poll is the MVP), **PRD #84's
+capability-aware pre-run readiness check** (the lead can already `ask_user`
+before planning — see [Run lifecycle](#run-lifecycle) — but nothing yet
+decides automatically that an issue is missing capability/tool/size and
+calls it; #88 ships the mechanism, #84 owns that trigger and remains
+Draft), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
 static-provisioning subset of the item decided 2026-07-10, specs/ai.md §168 —
 a user-triggered click provisions a persistent worker via the dedicated
 controller described [above](#worker-controller-k8s-only); the controller
