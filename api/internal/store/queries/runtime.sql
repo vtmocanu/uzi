@@ -619,8 +619,21 @@ WHERE id = @id AND user_id = @user_id;
 UPDATE runs SET
     status           = 'running',
     -- PRD #88: the run is leaving the clarification park, so the question it was
-    -- parked on is RESOLVED and its id must not survive. Nothing else clears it, and
-    -- a stale id is not inert: the claim payload re-delivers open_question_id on a
+    -- parked on is RESOLVED and its id must not survive.
+    --
+    -- 🔴 THIS IS ONE OF **TWO** CLEARS. The invariant they jointly carry:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling is
+    -- the matching clear in SetRunAwaitingApproval, which covers the
+    -- M4 PRE-RUN path — a run that parks before it plans reaches the gate with no
+    -- intervening `running` report, so this statement is never executed on it (D-AG).
+    -- Deleting either clear as redundant re-opens the defect on the path the other
+    -- one does not cover, and a third non-terminal destination added later needs its
+    -- own. The full argument lives at SetRunAwaitingApproval; this pointer exists so
+    -- the invariant is discoverable from EITHER end, which is the only version that
+    -- works — a reader who opens only this statement would otherwise learn it is the
+    -- sole clear.
+    --
+    -- A stale id is not inert: the claim payload re-delivers open_question_id on a
     -- resume, so a worker that restarts after an answered park would seed its map
     -- with the OLD id and then re-use it for a genuinely new question. That
     -- degenerates the guard below to "has ever been answered" (PRD #44 F2 again) and
@@ -695,9 +708,12 @@ UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = @plan_md,
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
-    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else: NO SETTER MAY
-    -- LEAVE A RESOLVED open_question_id BEHIND. A third non-terminal destination
-    -- added later re-opens this a third time and nothing would catch it.
+    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
+    -- SetRunRunning, which covers the mid-run path; this one covers M4's pre-run park,
+    -- which reaches the gate without ever executing that statement. A third
+    -- non-terminal destination added later re-opens this a third time and nothing
+    -- would catch it.
     --
     -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
     -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
