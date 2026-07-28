@@ -1,7 +1,15 @@
 # PRD #175: Build info in the UI — the version badge stops being a string and becomes a coordinate set
 
 **GitLab Issue**: [#175](https://gitlab.example.com/vtmocanu/uzi/-/issues/175)
-**Status**: Not started (Planned). Created 2026-07-27.
+**Status**: **Complete 2026-07-28.** Created 2026-07-27. Merged as [!144](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/144). All five milestones shipped, including M3, which was explicitly droppable and was not dropped.
+
+> **Delivered beyond the milestone list**, on the owner's approval after review: the `useAppVersion` dead-arm fix (OQ-C/D's inherited-open item — a failed `/api/version` had shown "version pending" forever instead of a degraded message), and the correction to the fleet-panel copy that fix made visible for the first time. Both are recorded in `specs/ai.md` §453-§454.
+>
+> **Two constraints were ratified into `specs/human.md`** (Feature #175, `[user 2026-07-28]`): that `uptime_seconds` is published on an unauthenticated endpoint at accepted severity Low, and that `uzi version --json` gained a `server` key. Everything else this PRD decided was the team's and lives in `specs/ai.md` §448-§454.
+>
+> **Two residuals are open by design, not by omission.** The CI stamping path (`$CI_JOB_STARTED_AT` and `$UZI_COMMIT_COUNT` expanding inside a `variables:` value) is established from GitLab's implementation source at two layers but has never been observed on our runner; a permanent echo-only `before_script` on `publish:api` answers it at the first tag pipeline, and a silent non-expansion degrades to an omitted field that looks identical to a dev build. Instance-level CI variables were not enumerated (admin scope required), so a same-named variable shadowing `UZI_COMMIT_COUNT` is unchecked.
+>
+> **Two findings were split out rather than fixed here**: [#180](https://gitlab.example.com/vtmocanu/uzi/-/issues/180) (the CLI renders server-supplied strings raw, ESC sequences included — house-wide, `uzi version` was only the command under review) and [#181](https://gitlab.example.com/vtmocanu/uzi/-/issues/181) (`specs/ai.md` has §403-§416 buried mid-file, invisible to the tail-based sweep its own numbering rule prescribes).
 **Priority**: Low — nothing is broken. `GET /api/version` works and the footer renders it. This buys instance-debuggability ("what exactly is deployed on dev-cluster right now") and a small amount of project identity.
 **Mockup**: [`prds/mockups/175-build-info-popover-mock.html`](mockups/175-build-info-popover-mock.html) — four surfaces mocked in uzi's own `ember`/`mission` chrome. Variant A (badge popover) is the one this PRD implements; the other three are kept in the file deliberately, as the record of what was rejected and why.
 
