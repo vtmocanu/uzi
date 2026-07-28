@@ -3283,6 +3283,33 @@ UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = $1,
     session_id = COALESCE($2, session_id),
+    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else: NO SETTER MAY
+    -- LEAVE A RESOLVED open_question_id BEHIND. A third non-terminal destination
+    -- added later re-opens this a third time and nothing would catch it.
+    --
+    -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
+    -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
+    -- awaiting_approval with no intervening ` + "`" + `running` + "`" + ` report — SetRunRunning's clear
+    -- is simply never reached on that path. The run then sits at the plan gate still
+    -- naming a question that was already answered; a worker death there re-delivers
+    -- the stale id on the claim, the worker re-uses it for a genuinely NEW question,
+    -- and the old consumed ` + "`" + `answer` + "`" + ` row satisfies the resume guard. That is the
+    -- has-ever-been-answered degeneration the identity keying exists to prevent,
+    -- reached through the path M4 added rather than the one B2 fixed.
+    --
+    -- The server-side clear is the ONLY defence available. The worker seeds its map
+    -- from the CLAIM, which is a snapshot taken before its own ` + "`" + `running` + "`" + ` report — so
+    -- even though that report clears the column, the worker is already holding the
+    -- stale value. No worker-side guard can distinguish a resolved id from a live one
+    -- (a claim reports status 'claimed', never the park).
+    --
+    -- Sufficient by enumeration: from awaiting_input the only non-terminal
+    -- destinations are ` + "`" + `running` + "`" + ` (cleared in SetRunRunning) and ` + "`" + `awaiting_approval` + "`" + `
+    -- (here). The terminal three never resume, so a stale id there is inert.
+    --
+    -- Unlike SetRunRunning's clear there is no WHERE-clause interaction to get wrong:
+    -- this statement's WHERE never references open_question_id.
+    open_question_id = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'running' clears any running-run
     -- flag (stalled/looping/slow). The detector re-evaluates for approval_idle from
     -- this transition's fresh updated_at; health_notified_at is preserved.

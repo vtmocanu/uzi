@@ -173,8 +173,9 @@ services:
       #
       # NEITHER bound is durable, and that applies to BOTH of them for one reason:
       # each is held in worker memory (a park counter and a park timer), so a worker
-      # death re-queues the run and both restart. QUESTION_MAX is the questions per
-      # ATTEMPT and QUESTION_TIMEOUT_SECONDS the wait per PARK, so the lifetime
+      # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
+      # park: questionDeadlines is set once on the first park and cleared only by the
+      # terminal finally, so N questions in one attempt SHARE one deadline. The lifetime
       # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 10 questions
       # and 48h of waiting, not 5 and 24h.
       QUESTION_MAX: ${QUESTION_MAX:-5}

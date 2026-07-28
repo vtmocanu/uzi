@@ -313,6 +313,75 @@ func TestSetRunRunningClearsOpenQuestionLiveDB(t *testing.T) {
 	}
 }
 
+// D-AG regression: the PRE-RUN path. A run that parks before it plans reaches the
+// plan gate WITHOUT an intervening `running` report, so SetRunRunning's clear is never
+// reached and only SetRunAwaitingApproval's can save it.
+//
+// This is the chain the runner-layer "B2, WORKER half" tests cannot express, and the
+// reason is worth stating: they reason about the id lifecycle correctly but assume
+// SetRunRunning always intervenes between a park and the next question. True mid-run,
+// false pre-run — and M4 added the pre-run path AFTER those tests were written. The
+// tests never became wrong, only insufficient, which is why nothing went red.
+func TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	// 1. Park PRE-RUN on q-1 and answer it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("pre-run park: %v", err)
+	}
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["postgres"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+
+	// 2. The lead re-plans and submits. NO `running` report happens on this path —
+	//    that absence is the whole defect, so the test must not insert one.
+	if rows, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd: pgT("# plan"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil || rows != 1 {
+		t.Fatalf("SetRunAwaitingApproval: rows=%d err=%v", rows, err)
+	}
+
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.OpenQuestionID.Valid {
+		t.Fatalf("a resolved question id survived to the plan gate as %q — a worker death here "+
+			"re-delivers it on the claim, the worker re-uses it for a NEW question, and q-1's "+
+			"consumed answer then resumes that question (D-AG)", run.OpenQuestionID.String)
+	}
+
+	// 3. The consequence, asserted directly rather than inferred: park on a NEW
+	//    question and confirm q-1's still-consumed answer does not resume it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-2"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("re-park on q-2: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("q-1's consumed answer resumed a park on q-2 via the pre-run path (%d rows)", rows)
+	}
+}
+
 // B1 regression: the REGISTER-time orphan sweeps must see a parked run.
 //
 // The stale-heartbeat sweeps cannot cover this and a test of them cannot stand in:

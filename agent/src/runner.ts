@@ -1251,16 +1251,51 @@ export class RunRunner {
     // Durable before the park is announced — see the doc comment.
     await batcher.flush().catch(() => undefined);
 
-    await reportState({
+    // Read the ACK, and read it the way PRD #35 established for its own park:
+    // `status === "awaiting_input"`, NEVER `applied`. A declined park can still have
+    // applied a different transition, so `applied` is true while the park did not
+    // happen — StateAck.applied's own doc says diagnostics only.
+    //
+    // Why this matters here and not before the merge: pre-#35 reportState returned
+    // void, so discarding it was correct. The information now exists, and without
+    // this check the two parks in this file would be asymmetric — the limit park
+    // verifies, the question park does not — which reads as an oversight rather than
+    // a decision.
+    //
+    // What the check buys: SetRunAwaitingInput matches nothing when the run went
+    // terminal under us or is no longer ours. Without it the worker would then await
+    // an answer NO SURFACE CAN PRODUCE — the status never changed, so no UI, Slack
+    // card or CLI ever shows a question — and the run would sit until
+    // QUESTION_TIMEOUT and die claiming a human ignored it. Failing here instead
+    // turns a silent 24h wait into an immediate, explained failure.
+    //
+    // A concurrent cancel is the one decline that resolves itself (the steering
+    // channel's sticky `cancelled` flag settles the wait independently), so this is
+    // belt-and-braces on that path and the only defence on the others.
+    const ack = await reportState({
       status: "awaiting_input",
       open_question_id: questionId,
     });
+    const parked = (ack as { status?: string } | undefined)?.status;
+    if (parked !== "awaiting_input") {
+      this.openQuestionIds.delete(runId);
+      throw new Error(
+        `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+      );
+    }
     runLog.info("clarification: awaiting answer", {
       run_id: runId,
       question_id: questionId,
       question_ordinal: ordinal,
     });
 
+    // LOAD-BEARING, and it reads as incidental — hence this note. Dropping the open
+    // question id here is what makes each park mint a fresh randomUUID, and that in
+    // turn is the ONLY reason SubmitInput's "reject an answer unless the run is
+    // awaiting_input" check can be described as belt-and-braces rather than as the
+    // primary defence. Its server-side counterparts are the two clears in
+    // runtime.sql (SetRunRunning and SetRunAwaitingApproval); this is the worker's
+    // half of the same invariant — no resolved id is left behind anywhere.
     const settle = (v: AnswerVerdict): AnswerVerdict => {
       this.openQuestionIds.delete(runId);
       return v;
@@ -1305,6 +1340,13 @@ const AUTOPILOT_ANSWER_NOTICE =
 /** Failure reason when a parked run's answer deadline expires (PRD #88 Decision 5a).
  *  Fail-closed: the PRD puts a configurable default action out of scope. */
 export const REASON_QUESTION_TIMEOUT = "clarification timed out";
+
+/** The server declined the clarification park (PRD #88). Distinct from a timeout so
+ *  an operator can tell "nobody answered" from "the question was never askable" —
+ *  the second means the run went terminal or changed hands mid-ask, and no human ever
+ *  saw a question to answer. */
+export const REASON_QUESTION_NOT_PARKED =
+  "could not park the run to ask a question";
 
 /** The effective answer deadline: the server-configured claim value when it is
  *  present and positive, else the worker default. An older server omits it (R8). */
