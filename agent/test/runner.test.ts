@@ -150,6 +150,19 @@ function runnerWith(
   return new RunRunner(client, git, makeExecutor, log, 20, joinToken, {
     pollMs: 5,
     planApprovalTimeoutMs: 0, // disabled — the gate resolves from injected inputs
+    // PRD #88 D-W. NOT a speed knob, and deliberately NOT 0 (which disables the
+    // deadline the way planApprovalTimeoutMs above is disabled). A clarification park
+    // blocks by design, so every way of breaking it — an autopilot run that stops
+    // short-circuiting, an id that stops being re-used — makes the park never resolve.
+    // On the 24h production default that surfaces as a wall-clock TEST TIMEOUT, and
+    // `node --test` prints `ℹ fail 0` while timing out (CLAUDE.md, measured twice on
+    // PRD #121). So the mutation controls for the ask_user tests below would have
+    // "reddened" in exactly the shape this repo warns is unreadable. A bounded
+    // deadline turns each of those hangs into a NAMED failure: the run fails with
+    // REASON_QUESTION_TIMEOUT and the assertion that fires says which property broke.
+    // Generous relative to the 5ms poll, so it is never reached while an answer is
+    // actually being delivered.
+    questionTimeoutMs: 600,
     gitlab,
   });
 }
