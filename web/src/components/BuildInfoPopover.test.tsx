@@ -7,10 +7,11 @@ import {
   displayVersion,
   formatCount,
   formatDay,
+  formatStamp,
   formatUptime,
   liveUptimeSeconds,
 } from "./BuildInfoPopover";
-import { mockBuildInfo, mockBuildInfoUnstamped } from "../mocks/data";
+import { mockBuildInfo, mockBuildInfoNoUptime, mockBuildInfoUnstamped } from "../mocks/data";
 import type { BuildInfo } from "../lib/api";
 
 // BOTH fixtures live in ONE file, which is only possible because this component
@@ -60,6 +61,20 @@ describe("formatters", () => {
     expect(formatDay("nonsense")).toBeNull();
   });
 
+  it("keeps the TIME on a build stamp, in UTC and explicitly labelled", () => {
+    // Two images can ship the same day, which is exactly when someone consults
+    // this field — a day-granular stamp is silent in the case it exists for.
+    expect(formatStamp("2026-07-26T18:42:07Z")).toBe("26 Jul 2026 18:42 UTC");
+    // Not the runner's local day/hour: an instant late in the UTC day must not
+    // roll, and midnight must render 00:00 rather than 24:00.
+    expect(formatStamp("2026-07-27T23:30:00Z")).toBe("27 Jul 2026 23:30 UTC");
+    expect(formatStamp("2026-07-27T00:05:00Z")).toBe("27 Jul 2026 00:05 UTC");
+    // An offset instant is normalised to UTC, not rendered as written.
+    expect(formatStamp("2026-07-26T20:42:07+02:00")).toBe("26 Jul 2026 18:42 UTC");
+    expect(formatStamp(undefined)).toBeNull();
+    expect(formatStamp("nonsense")).toBeNull();
+  });
+
   it("groups the commit count", () => {
     expect(formatCount(2105)).toBe("2,105");
     expect(formatCount(7)).toBe("7");
@@ -106,6 +121,58 @@ describe("BuildInfoPopover — fully-stamped build", () => {
     expect(pop.textContent).toContain("3d 4h");
   });
 
+  it("carries the FULL 40-char SHA into the DOM while displaying seven", () => {
+    // PRD :72 stamps the full SHA "so the stored value stays greppable and
+    // linkable", and M1 gates it on len==40 && hex to guarantee it. Before this,
+    // the panel rendered .slice(0,7) and nothing else, so the full value never
+    // reached the document and an operator was back to prefix-matching by hand.
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    const full = "366a282d52095312f54b99698b241ac872e20284";
+
+    // EXACTLY TWO rows carry `full`, and the count is the assertion: `full` means
+    // "the display is an abbreviation of this", so adding it to Founded or Uptime —
+    // whose displays are not abbreviations — would be wrong and would otherwise
+    // ship green. It also bounds the a11y exposure noted at Row: a titled row is
+    // only safe while it has text content.
+    expect(popover().querySelectorAll("dd[data-full]")).toHaveLength(2);
+    // Displayed short…
+    expect(screen.getByText("366a282")).toBeTruthy();
+    // …carried long, in both a machine-readable attribute and a human-readable one.
+    const commitDd = [...popover().querySelectorAll<HTMLElement>("dd[data-full]")].find(
+      (el) => el.dataset.full === full,
+    );
+    expect(commitDd).toBeTruthy();
+    expect(commitDd!.getAttribute("title")).toBe(full);
+    expect(commitDd!.textContent).toBe("366a282");
+  });
+
+  it("carries the raw RFC3339 build stamp alongside the minute-granular display", () => {
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, built_at: "2026-07-26T18:42:07Z" }}
+        now={NOW}
+      />,
+    );
+    const builtDd = [...popover().querySelectorAll<HTMLElement>("dd[data-full]")].find(
+      (el) => el.dataset.full === "2026-07-26T18:42:07Z",
+    );
+    expect(builtDd).toBeTruthy();
+    // The seconds are the thing the rendered form drops, and the one time you
+    // want them is when two builds are minutes apart.
+    expect(builtDd!.getAttribute("title")).toBe("2026-07-26T18:42:07Z");
+    expect(builtDd!.textContent).toBe("26 Jul 2026 18:42 UTC");
+  });
+
+  it("renders the build time, not just the day", () => {
+    render(
+      <BuildInfoPopover
+        info={{ ...mockBuildInfo, built_at: "2026-07-26T18:42:07Z" }}
+        now={NOW}
+      />,
+    );
+    expect(popover().textContent).toContain("26 Jul 2026 18:42 UTC");
+  });
+
   it("labels the trigger with the display version and drops the native title", () => {
     render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
     const trigger = screen.getByRole("button", { name: "v0.4.2" });
@@ -116,7 +183,7 @@ describe("BuildInfoPopover — fully-stamped build", () => {
 });
 
 describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
-  it("OMITS the rows the server did not send rather than rendering unknowns", () => {
+  it("OMITS the LDFLAGS rows the server did not send, and KEEPS uptime", () => {
     render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
 
     const pop = popover();
@@ -126,25 +193,35 @@ describe("BuildInfoPopover — un-stamped dev build (the laptop case)", () => {
     // Age still works — it is computed here from `founded`, which is always sent.
     expect(pop.textContent).toContain("25 days old");
     expect(pop.textContent).toContain("Founded");
-    // The three stamped fields are ABSENT, and so are their labels. A row reading
+    // The three STAMPED fields are absent, and so are their labels. A row reading
     // "Built —" would be the same "claiming to know things it does not" the
     // server's omit rule exists to prevent.
     expect(pop.textContent).not.toContain("Built");
     expect(pop.textContent).not.toContain("Commit");
-    expect(pop.textContent).not.toContain("Uptime");
     // No commit count either: M3 is independently droppable, so an age-only
     // subtitle is a supported final state, not a loading intermediate.
     expect(pop.textContent).not.toContain("commits");
+    // …but UPTIME IS PRESENT, and that is the point of this fixture. A laptop
+    // stack omits only what ldflags would have stamped; the process is running, so
+    // `handler.New()`'s startedAt is set and Version emits uptime_seconds. Asserting
+    // its ABSENCE here — as this test used to — pinned a body no server sends.
+    expect(pop.textContent).toContain("Uptime");
+    expect(pop.textContent).toContain("4m");
   });
 
-  it("does not render an uptime row for an absent reading", () => {
+  it("does not render an uptime row when uptime itself is unknown", () => {
+    // The two-key body: a struct-literal `Handler` leaves startedAt zero and Version
+    // omits rather than reporting two millennia. A real wire shape, but a TEST
+    // construction — not a laptop's, which is the distinction mockBuildInfoNoUptime
+    // exists to keep.
+    //
     // Guards the difference between "absent" and 0: a bare `omitempty` int on the
     // server would have swallowed a genuine 0, and rendering "0s" for UNKNOWN here
     // would reintroduce the same conflation from the other end.
-    const { rerender } = render(<BuildInfoPopover info={mockBuildInfoUnstamped} now={NOW} />);
+    const { rerender } = render(<BuildInfoPopover info={mockBuildInfoNoUptime} now={NOW} />);
     expect(popover().textContent).not.toContain("Uptime");
 
-    rerender(<BuildInfoPopover info={{ ...mockBuildInfoUnstamped, uptime_seconds: 0 }} now={NOW} />);
+    rerender(<BuildInfoPopover info={{ ...mockBuildInfoNoUptime, uptime_seconds: 0 }} now={NOW} />);
     expect(popover().textContent).toContain("Uptime");
     expect(popover().textContent).toContain("0s");
   });
@@ -251,12 +328,41 @@ describe("BuildInfoPopover — open on hover AND focus AND tap", () => {
     expect(popover().getAttribute("data-open")).toBe("true");
   });
 
-  it("closes on Escape", () => {
+  it("closes on Escape after FOCUS opened it", () => {
     render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
     fireEvent.focus(trigger());
     expect(popover().getAttribute("data-open")).toBe("true");
-    fireEvent.keyDown(trigger(), { key: "Escape" });
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(popover().getAttribute("data-open")).toBe("false");
+  });
+
+  it("closes on Escape after HOVER opened it, with focus elsewhere", () => {
+    // The handler used to live on the button's onKeyDown, so this case did
+    // nothing: a mouse user hovers the badge open, presses Escape, and the key
+    // event goes to whatever actually has focus. APG's tooltip pattern wants Esc
+    // to dismiss a hover-shown tooltip too.
+    render(
+      <>
+        <button type="button">elsewhere</button>
+        <BuildInfoPopover info={mockBuildInfo} now={NOW} />
+      </>,
+    );
+    const other = screen.getByRole("button", { name: "elsewhere" });
+    other.focus();
+    expect(document.activeElement).toBe(other);
+
+    fireEvent.mouseEnter(popover().parentElement!);
+    expect(popover().getAttribute("data-open")).toBe("true");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(popover().getAttribute("data-open")).toBe("false");
+  });
+
+  it("ignores other keys", () => {
+    render(<BuildInfoPopover info={mockBuildInfo} now={NOW} />);
+    fireEvent.focus(trigger());
+    fireEvent.keyDown(document, { key: "a" });
+    expect(popover().getAttribute("data-open")).toBe("true");
   });
 
   it("describes the trigger with the popover, by an id scoped to this instance", () => {

@@ -103,11 +103,35 @@ export function useBuildInfo(): BuildInfo | null {
 // for the panel and the footer to disagree about what release the control plane is.
 //
 // KEPT as a projection over useBuildInfo rather than collapsed into it (PRD #175
-// Decision Log). One hook returning the whole object would have been the obvious
-// refactor and is wrong: WorkerUpgradeBadge distinguishes `null` (in flight) from a
-// resolved-but-unstamped version, and conflating them rendered a full fleet bar under a
-// heading saying classification was off — measured at T+270ms, flipping at T+670ms.
-// `v || null` below is that tri-state's contract and is deliberately unchanged.
+// Decision Log) — but NOT because this operator preserves a tri-state. It does not,
+// and an earlier version of this comment claimed it did.
+//
+// `"" || null` is `null`, so this hook emits exactly TWO states: null, or a
+// non-empty string. BOTH failure modes land on null — a rejected fetch resolves the
+// shared promise to null at the snapshot level above, and a `{"version": ""}` body
+// is folded here. FleetUpgradePanel is WRITTEN for three: its prop comment and
+// `versionPending = cpVersion === null` (WorkerUpgradeBadge.tsx) separate "in
+// flight" from "resolved with no stamp", because conflating them once rendered a
+// full fleet bar under a heading saying classification was off, at T+270ms and
+// flipping at T+670ms. From THIS producer the middle state never arrives, so
+// `versionPending` is true both while the fetch is in flight and after it has
+// permanently failed. The panel's own comment is about what the prop accepts; this
+// one is about what the only production caller can supply.
+//
+// The fold is PRE-EXISTING and unchanged by #175 — pre-PRD (`a4fbb86f`) the hook
+// ended `setVersion(v || null)`, which collapses identically. It stays that way
+// deliberately: making the dead arm live changes what a fleet-facing panel renders,
+// which is a behaviour change and the user's call, not this PRD's.
+//
+// If it is ever fixed, FLIPPING `||` TO `??` IS NOT THE FIX, and it is the obvious
+// wrong move. A failed fetch never produces a BuildInfo at all, so `??` would only
+// ever surface a resolved-but-empty `version` — which the server does not send.
+// A real fix needs a distinct resolved-but-failed state in BuildInfoSnapshot.
+//
+// What the split still buys, and the reason to keep it: this is the ONE place the
+// fold happens, so every consumer sees the same two-state value rather than each
+// writing its own `.version || null` — and a consumer reaching for `.version`
+// directly would get "" back and reintroduce the conflation at the call site.
 export function useAppVersion(): string | null {
   return useBuildInfo()?.version || null;
 }

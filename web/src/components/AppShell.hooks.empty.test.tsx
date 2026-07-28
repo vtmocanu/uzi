@@ -14,10 +14,18 @@ import { api } from "../lib/api";
 // need stubbing.
 //
 // What it pins: `useAppVersion` is `useBuildInfo()?.version || null`, and that `||`
-// is load-bearing. Flipping it to `??` — the single most likely future "cleanup",
-// since `??` is usually the more correct operator — leaves typecheck clean and
-// every other test green, while changing what WorkerUpgradeBadge receives for a
-// resolved-but-unstamped version. Without this assertion nothing notices.
+// FOLDS a resolved-but-empty version into null. Flipping it to `??` — the single
+// most likely future "cleanup", since `??` is usually the more correct operator —
+// leaves typecheck clean and every other test green while changing what
+// FleetUpgradePanel receives. Without this assertion nothing notices.
+//
+// Read it as pinning the fold, NOT as pinning a tri-state. The fold is why
+// `cpVersion` is only ever null or a non-empty string, so the panel's
+// resolved-but-unstamped arm is unreachable from this producer — pre-existing,
+// unchanged by #175, and explained at useAppVersion in AppShell.tsx. A future
+// change that makes that arm live has to reintroduce a distinct resolved-but-failed
+// value upstream; it will also have to change this test, which is the point of
+// having it.
 
 vi.mock("../lib/api", () => ({
   MOCK_MODE: false,

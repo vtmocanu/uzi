@@ -975,9 +975,16 @@ export const mockApi = {
   },
 
   // The FULLY-STAMPED fixture (PRD #175), so the demo shows the popover with every
-  // row present. mockBuildInfoUnstamped is the other half of the pair and is
-  // exercised by the popover's own tests — the degraded shape is what a laptop
-  // build actually produces, and it is the one `typeof realApi` cannot enforce.
+  // row present — a `dev` build here would hide the three fields this PRD exists to
+  // add, in the build whose whole job is to show them off.
+  //
+  // KNOWN CONSEQUENCE, worth stating rather than leaving to be rediscovered: this
+  // is the default for every VITE_UZI_MOCK=1 run, so a browser pass sees the
+  // STAMPED shape unless someone swaps this line. The degraded shapes are covered
+  // in BuildInfoPopover.test.tsx (mockBuildInfoUnstamped = the laptop's three-key
+  // body, mockBuildInfoNoUptime = the struct-literal Handler's two-key one); to see
+  // either in a browser, point this line at it. `typeof realApi` cannot enforce any
+  // of it, since every field but version and founded is optional.
   version: async () => delay(mockBuildInfo),
   logout: async () => {
     state.session = null;

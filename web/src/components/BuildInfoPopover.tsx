@@ -11,7 +11,7 @@
 // promise and its assertion would pass or fail for the wrong reason. Taking the
 // data as a prop removes the hazard rather than working around it.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import type { BuildInfo } from "../lib/api";
 import { cx } from "./ui";
 
@@ -52,6 +52,39 @@ export function formatDay(iso: string | undefined): string | null {
     year: "numeric",
     timeZone: "UTC",
   }).format(new Date(t));
+}
+
+// formatStamp renders an RFC3339 instant as "26 Jul 2026 18:42 UTC" — the same
+// day format as formatDay plus the TIME, which the day alone throws away.
+//
+// The time is not decoration. `built_at` exists to answer "is this instance
+// running the fix?", and TWO IMAGES CAN SHIP THE SAME DAY — which is precisely
+// when someone opens this panel. A day-granular stamp is silent in exactly the
+// case it was added for.
+//
+// UTC is explicit in the string rather than implied. The wire value is UTC, the
+// operator reading it may not be, and a bare "18:42" against a colleague's
+// screenshot is a coordination bug waiting to happen.
+export function formatStamp(iso: string | undefined): string | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return `${new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(t))} ${new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    // hourCycle h23, NOT `hour12: false` — the latter maps to h24 under some
+    // locale/ICU combinations, which renders midnight as "24:05". That is exactly
+    // the output the midnight case in this file's tests exists to reject, so the
+    // spelling that states the intent directly beats the one that relies on en-GB
+    // happening to map the way we want.
+    hourCycle: "h23",
+    timeZone: "UTC",
+  }).format(new Date(t))} UTC`;
 }
 
 // formatCount groups thousands ("2,105"). en-US pinned for the same determinism
@@ -95,11 +128,64 @@ export function liveUptimeSeconds(
 // un-stamped build must show a SHORTER popover, never a row reading "unknown",
 // which is the same "claiming to know things it does not" the server's omit rule
 // exists to prevent.
-function Row({ label, value }: { label: string; value: string }) {
+//
+// `full` is the un-truncated wire value, carried on the row when the DISPLAY value
+// is an abbreviation of it. It lands in both `title` (a human can read it) and a
+// data attribute (a script, a devtools query or a copy-paste can retrieve it),
+// because the abbreviations here are lossy in ways that defeat the point of the
+// field — see the Commit and Built call sites.
+//
+// The `title` ban from the trigger does NOT extend here, and the distinction is
+// the mechanism rather than the attribute. Three things make a row title safe
+// where the badge's was not, and the third is the load-bearing one:
+//
+//   1. The badge's title fired on the SAME hover that opened this panel — two
+//      surfaces, involuntarily, every time. A row title needs a second deliberate
+//      hover and dwell on that row.
+//   2. The badge's title duplicated this panel's heading with strictly LESS
+//      information. A row title is the UN-ABBREVIATED form of what the row shows.
+//   3. The closed panel is `pointer-events-none`, so a closed popover's rows are
+//      not hover targets and these titles cannot fire while the panel is shut.
+//      If that class is ever dropped, a mounted invisible title-bearing panel sits
+//      over the content area and this becomes a real bug.
+//
+// ⚠️ A `title` here is also the obvious way to leak 40 hex characters into the
+// TRIGGER'S ACCESSIBLE DESCRIPTION, which is computed from this panel's text (see
+// the aria-describedby note below). It does not, and that is MEASURED on the real
+// component via Chrome's AX tree over CDP (Chrome 150), not reasoned about:
+//
+//   dd with text + title  ->  the TEXT enters the description, the title does NOT
+//   dd EMPTY   + title    ->  the TITLE ENTERS THE DESCRIPTION
+//   dd EMPTY   , no title ->  contributes nothing            (the control)
+//
+// So the safety is conditional on the row having text, not on it being a `dd`.
+// Two consequences worth having in writing: the 40-char SHA stays out of the
+// description only because this row renders the 7-char form as its content, and a
+// future row that is empty-but-titled WOULD inject its title into what a screen
+// reader announces for the badge. THE MEASUREMENT TO REPEAT is the trigger's
+// computed description, not the `title` attribute's presence — and a screenshot
+// cannot settle any of this, because native tooltips are drawn by the platform
+// widget layer outside what Page.captureScreenshot composites, so an absent
+// tooltip in an image is an unobservable, not evidence.
+function Row({
+  label,
+  value,
+  full,
+}: {
+  label: string;
+  value: string;
+  full?: string;
+}) {
   return (
     <>
       <dt className="text-faint">{label}</dt>
-      <dd className="text-right font-mono text-fg">{value}</dd>
+      <dd
+        className="text-right font-mono text-fg"
+        title={full}
+        data-full={full}
+      >
+        {value}
+      </dd>
     </>
   );
 }
@@ -123,6 +209,20 @@ export function BuildInfoPopover({
   // document and make aria-describedby ambiguous. Not a lint nit — it is the one
   // structural fact about this component's environment.
   const popId = useId();
+
+  // Escape dismisses it however it was opened. On the BUTTON's onKeyDown this only
+  // worked while the badge had focus, so a mouse user who hovered it open pressed
+  // Escape and nothing happened — the APG tooltip pattern wants Esc to dismiss a
+  // hover-shown tooltip too. Listener is attached only while open, so a closed
+  // popover (there are two mounted at once) costs nothing.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
 
   // EVERY optional field is type-guarded at this boundary, because this is where an
   // untrusted response becomes rendered text. Our own server cannot send these as
@@ -152,7 +252,10 @@ export function BuildInfoPopover({
 
   const label = displayVersion(info.version);
   const days = ageInDays(info.founded, now);
-  const built = formatDay(info.built_at);
+  // Day-and-time for the build stamp, day only for `founded` — the latter is a
+  // calendar fact with no meaningful time of day, so rendering 00:00 UTC on it
+  // would invent a precision the value does not carry.
+  const built = formatStamp(info.built_at);
   const founded = formatDay(info.founded);
   const uptime =
     uptimeSeconds === null
@@ -183,9 +286,21 @@ export function BuildInfoPopover({
       <button
         type="button"
         // aria-describedby, not aria-label: the button's own name is the version
-        // string, and the popover DESCRIBES it. The popover node stays mounted (it
-        // is faded, not unmounted) so the description is in the accessibility tree
-        // when focus lands, rather than appearing one render later.
+        // string, and the popover DESCRIBES it.
+        //
+        // 🔴 THE PANEL STAYS MOUNTED WHEN CLOSED (opacity:0, NOT `hidden`), AND
+        // THAT IS THE MECHANISM, NOT AN OVERSIGHT. Verified against Chrome's own
+        // accessibility tree over CDP rather than by reading the markup: with the
+        // popover CLOSED, this button computes
+        //   name: "v0.4.2"
+        //   description: "uzi v0.4.2 25 days old · 2,105 commits Founded 3 Jul
+        //                 2026 Built … Commit 366a282 Uptime 3d 4h"
+        // so every coordinate reaches a screen-reader user who never hovers and
+        // never focuses. Unmounting the panel when closed — the obvious way to
+        // "tidy" this DOM — deletes that description silently, and nothing in the
+        // test suite or the markup would look wrong afterwards. `hidden`,
+        // `display:none` and `visibility:hidden` all do the same. If you change
+        // how this hides, re-measure the AX tree; do not reason about it.
         //
         // No aria-expanded, deliberately: the APG tooltip pattern associates by
         // aria-describedby alone, and announcing "collapsed"/"expanded" for
@@ -194,13 +309,11 @@ export function BuildInfoPopover({
         // Focus opens it, which is what makes this keyboard-reachable at all. A tap
         // opens it through onClick — which always OPENS rather than toggling, so a
         // desktop click landing on an already-hovered badge cannot close it under
-        // the pointer.
+        // the pointer. Escape is handled on the DOCUMENT while open (see above), not
+        // here, so it works for a hover-opened popover the badge never focused.
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
         onClick={() => setOpen(true)}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") setOpen(false);
-        }}
         className={cx(
           "block w-full truncate text-left font-mono text-faint transition-colors",
           "hover:bg-raised hover:text-fg focus-visible:text-fg",
@@ -247,8 +360,19 @@ export function BuildInfoPopover({
         )}
         <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
           {founded && <Row label="Founded" value={founded} />}
-          {built && <Row label="Built" value={built} />}
-          {commit && <Row label="Commit" value={commit.slice(0, 7)} />}
+          {/* `full` is the raw RFC3339 the server sent, seconds and all — the
+              rendered form is minute-granular, and the one time you want the
+              seconds is when two builds are minutes apart. */}
+          {built && <Row label="Built" value={built} full={info.built_at} />}
+          {/* SEVEN CHARS DISPLAYED, FORTY CARRIED. M1 stamps the full SHA and
+              gates it on len==40 && hex specifically "so the stored value stays
+              greppable and linkable" (PRD :72) — and until this row carried
+              `full`, the full value never reached the DOM at all, so selecting
+              the row copied `366a282` and the operator was back to
+              prefix-matching by hand. That is most of what this PRD set out to
+              delete. The 7-char display stays: it is the standard git short SHA
+              and it is what fits. */}
+          {commit && <Row label="Commit" value={commit.slice(0, 7)} full={commit} />}
           {uptime && <Row label="Uptime" value={uptime} />}
         </dl>
       </div>
