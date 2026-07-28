@@ -311,3 +311,15 @@ as inert data.
 
 `uzi version` prints the CLI version, which equals the uzi `v*` release the
 binary was built from — so it is the exact API version this binary matches.
+
+When a server URL is configured it also reports that server's build info:
+version, source commit (full 40-char SHA), build time, commit count and uptime.
+The two are separate coordinates and can differ — the CLI is whatever you have
+installed, the server is whatever is deployed. Under `--json` the CLI's own
+version stays at the top level and the server's nests under `server`, so a
+parser reading `.version` is unaffected.
+
+The server is contacted best-effort with a short timeout, and the command exits
+0 whether or not one is reachable. Fields the server did not stamp are OMITTED
+rather than sent as empty or zero, so `server.commit` being absent means "this
+build does not know", never "the commit is empty".

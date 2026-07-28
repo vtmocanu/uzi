@@ -83,6 +83,14 @@ type Client interface {
 	// RENDERED here, never re-derived (D21).
 	SelfRateLimits(ctx context.Context) ([]apitypes.TokenRateLimitDTO, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
+	// BuildInfo reads the server's build coordinates from the UNAUTHENTICATED
+	// GET /api/version (PRD #175 M4). The only method here that needs no
+	// credential — but it still goes through newRequest, so credentialSafeBase
+	// gates it like everything else. That is deliberate: relaxing the https
+	// rule for one uncredentialed route is the shape of change that later gets
+	// copied to a credentialed one, and a plain-http remote degrading to
+	// "unreachable" costs nothing (`uzi version` never fails on it).
+	BuildInfo(ctx context.Context) (apitypes.BuildInfoDTO, error)
 	AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error)
 	AdminListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
@@ -701,6 +709,22 @@ func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) 
 		return nil, err
 	}
 	return env.Repos, nil
+}
+
+// BuildInfo reads GET /api/version. The response is decoded into the SHARED
+// apitypes.BuildInfoDTO rather than a CLI-local struct, which is what keeps
+// "unknown" distinguishable from zero: Commits and UptimeSeconds are pointers and
+// the string fields are omitempty, so an unstamped server's absent fields stay
+// absent all the way out through `uzi version --json`. A local struct with plain
+// int fields would render a dev server as commits 0 and uptime 0 — a build
+// claiming to know things it does not, which is precisely what the server side of
+// this PRD spent a pointer to prevent.
+func (c *HTTPClient) BuildInfo(ctx context.Context) (apitypes.BuildInfoDTO, error) {
+	var out apitypes.BuildInfoDTO
+	if err := c.get(ctx, "/api/version", &out); err != nil {
+		return apitypes.BuildInfoDTO{}, err
+	}
+	return out, nil
 }
 
 func (c *HTTPClient) AdminListUsers(ctx context.Context) ([]apitypes.UserDTO, error) {
