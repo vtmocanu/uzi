@@ -404,8 +404,8 @@ Serves human: "kept in sync two-way between uzi and GitLab".
   is shared by handlers and the poller (`IncrementalSync`/`FullSync` against a
   narrow `IssueStore` interface, unit-tested with a fake store + mocked `Forge`).
 - **Incremental pull** (`api/internal/poller.Engine`, one background goroutine):
-  per enabled repo, `ListIssues(labels=PRD, state=all, updated_after=HWM)` each
-  `FORGE_POLL_INTERVAL` (default 60s). **HWM = max `updated_at` returned by the
+  per enabled repo, `ListIssues(labels=PRD, state=all, updated_after=<PRD mark>)` each
+  `FORGE_POLL_INTERVAL` (default 60s). **A mark = max `updated_at` returned by the
   forge**, never the client clock (skew would drop updates); GitLab's
   `updated_after` is inclusive at second granularity, so boundary rows re-fetch and
   dedupe by upsert.
@@ -417,8 +417,12 @@ Serves human: "kept in sync two-way between uzi and GitLab".
   `POST /api/repos/:id/sync` and the Refresh button run the same full sync.
 - **Since PRD #102 M6 both paths issue TWO fetches**, not one: the PRD-labelled
   one above plus an additive `state=opened`, no-label one, with the keep-set the
-  union and the HWM the *minimum* of the two. Both paths fail closed. See §444 —
-  it changes the eviction and HWM rules stated in this section.
+  *union* of the two. Both paths fail closed. See §444 — it changes the eviction
+  rule stated in this section.
+- **Each fetch carries its OWN mark** (`forgesvc.Marks{PRD, Open}`, issue #177);
+  the two are never combined, each advances only on its own fetch's evidence, and
+  each lower bound is guarded independently. See §447, which supersedes the
+  single-shared-mark rule M6 shipped.
 - **Push is forge-first**: a move calls `UpdateIssueLabels` before touching the
   cache and updates the cache only on success — a failed forge write leaves the
   card put (**snap-back**), never an optimistic divergence. Conflicts resolve
@@ -449,8 +453,9 @@ Serves human: best-practice (protect the upstream forge; abuse resistance).
 - **Poller bounding**: per-tick **bounded concurrency of 4**
   (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** clamped to one poll
   interval, so a slow forge can't let ticks pile up. In-memory per-repo state
-  (`hwm`, poll count) — a disabled repo drops out; a re-enabled one restarts with a
-  fresh full reconcile.
+  (`marks forgesvc.Marks` — one high-water mark per fetch, §447 — plus poll count)
+  — a disabled repo drops out; a re-enabled one restarts with a fresh full
+  reconcile.
 
 ## 24. Startup admin seed
 
@@ -2178,7 +2183,7 @@ manual refresh.
   on a **cap-1 buffered** `forceReconcile chan struct{}`, handled in the Run
   goroutine's `select` (same goroutine that runs a tick, so the per-repo state reset
   needs no lock). The reset zeroes every enabled repo's `pollCount`; the next tick
-  full-syncs all of them (FullSync ignores the HWM, so leaving it intact is fine).
+  full-syncs all of them (FullSync takes no marks, so leaving them intact is fine).
 - **The PUT returns after signalling** — it does not block on the sync itself, which
   needs each connection's decrypted PAT and belongs in the poller. **Coalescing**: a
   burst of PUTs collapses to a single pending reconcile (cap-1 + non-blocking send).
@@ -6274,7 +6279,13 @@ M6):
 - **Release runbook ordering:** bump `Chart.yaml` version/appVersion in an MR → merge → tag THAT
   (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
   slower publish, not a failure) and `assert-version` (§246) holds. Rollback = revert the argo
-  `targetRevision` MR.
+  `targetRevision` MR. **Corrected 2026-07-28 (issue #178): "cold cache" is not the only way this
+  step can go wrong.** Tagging a commit whose message carries a skip-CI marker (`[skip ci]`,
+  `[ci skip]`, at least, any capitalization, anywhere in the message) skips the tag pipeline
+  entirely, not just its cache warmth, and publishes nothing while `git push` still reports
+  success and a bare `glab ci status` right after the push reports `main`'s pipeline, not the
+  tag's. `deploy/README.md` now warns against it separately; recover with `glab ci run --branch
+  <tag>` rather than moving the tag.
 
 ## 251. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
 
@@ -14370,7 +14381,7 @@ order of every non-closed card, then applies the move** — freeze, then move.
   `onCardDragOver` calls `preventDefault()` before its self early-return, so the
   browser permits the drop.
 
-## 444. PRD #102 M6 — the additive fetch: a second request, a union that fails closed, and an HWM that takes the MINIMUM
+## 444. PRD #102 M6 — the additive fetch: a second request, a union that fails closed, and a shared HWM that took the MINIMUM (the HWM half is SUPERSEDED by §447)
 
 Serves `specs/human.md` (user, 2026-07-20): the board may DISPLAY open issues
 without the `PRD` label, opt-in and off by default.
@@ -14416,27 +14427,36 @@ without the `PRD` label, opt-in and off by default.
   fails, nothing is deleted and the whole sync returns an error — there is
   deliberately no "the extra fetch is best-effort, log and continue" path. This is
   the highest-risk change in the PRD.
-- **The shared high-water-mark takes the MINIMUM of the two fetches, never the
-  maximum.** The poller holds one `hwm` per repo and both paths feed it. The fetches
-  are separate round trips: the PRD fetch observes the forge at tA, the open fetch at
-  a later tB, so everything the *pair* is known to have seen is bounded by tA. A PRD
-  issue updated in (tA, tB) appears in neither result — too late for the first fetch,
-  discarded from the second — so a mark taken from the later fetch steps over an
-  update nobody observed and the row sits stale until the next reconcile. The zero
-  cases are **not symmetric**, and the asymmetry is the fetch order: `openMax` zero
-  constrains nothing (the open fetch ran second), while `prdMax` zero is the pre-M6
-  "nothing to advance to" case and preserves the caller's existing mark.
-  - **That second case carries a standing cost, knowingly unfixed.** A repo with open
-    issues but NO PRD issues has `prdMax` zero on every pass, so its mark never
-    advances and every `IncrementalSync` re-reads from the same bound — now paying
-    **two** unbounded fetches per poll rather than one. Correctness is unaffected
-    (upserts are idempotent; the window only re-covers covered ground) and the pre-M6
-    code had the identical no-advance behaviour on the PRD fetch, so M6 doubles the
-    traffic rather than introducing the defect. Not fixed because every fix is worse:
-    advancing on `openMax` alone is the unsound case above, and a per-path mark is a
-    wider change to the poller's state than this milestone should carry. It is the
-    same unboundedness the PRD's "M6 scale" open question names and wants the same
-    answer — a cap or a per-repo opt-in.
+- **M6 shipped ONE shared high-water mark, and a shared mark had to take the
+  MINIMUM of the two fetches, never the maximum.** *(SUPERSEDED 2026-07-28 by §447,
+  issue #177: there is no shared mark any more — `forgesvc.Marks` carries one per
+  fetch and the two are never combined. Kept, in past tense, rather than deleted,
+  because the reasoning below is exactly what makes folding the two marks back into
+  one look like a simplification when it is not; §447 records why `min()` is
+  dissolved by the split rather than lost in it.)* The poller held one `hwm` per
+  repo and both paths fed it. The fetches are separate round trips: the PRD fetch
+  observes the forge at tA, the open fetch at a later tB, so everything the *pair*
+  is known to have seen is bounded by tA. A PRD issue updated in (tA, tB) appears in
+  neither result — too late for the first fetch, discarded from the second — so a
+  shared mark taken from the later fetch steps over an update nobody observed and
+  the row sits stale until the next reconcile. The zero cases were **not
+  symmetric**, and the asymmetry was the fetch order: `openMax` zero constrained
+  nothing (the open fetch ran second), while `prdMax` zero was the pre-M6 "nothing
+  to advance to" case and preserved the caller's existing mark.
+  - **That second case carried a standing cost, knowingly unfixed at M6 and FIXED by
+    issue #177 (§447).** A repo with open issues but NO PRD issues had `prdMax` zero
+    on every pass, so its mark never advanced and every `IncrementalSync` re-read
+    from the same bound — paying **two** unbounded fetches per poll rather than one.
+    Correctness was unaffected (upserts are idempotent; the window only re-covers
+    covered ground) and the pre-M6 code had the identical no-advance behaviour on the
+    PRD fetch, so M6 doubled the traffic rather than introducing the defect. M6 left
+    it because every fix available *within a shared mark* was worse: advancing on
+    `openMax` alone is the unsound case above, and a per-path mark was judged a wider
+    change to the poller's state than that milestone should carry. That judgement is
+    what #177 revisited and reversed — the per-path mark turned out to need no
+    migration at all, since the mark was only ever in-memory. **The "M6 scale" open
+    question is only half-answered**: the stall is gone, but the *unbounded fetch*
+    remains, and a `FullSync` cap is deliberately still not shipped (§447).
 - **A soft-fail would have been worse than losing one fetch's rows**: returning nil
   with an advanced mark makes the next `IncrementalSync` permanently skip the failed
   path's window until the next full reconcile — roughly ten minutes at shipped
@@ -14590,3 +14610,637 @@ because of that, and none of them said so out loud except one SQL comment.
     cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
+
+## 447. Issue #177 — one high-water mark PER FETCH: what the shared mark cost, and why `min()` is dissolved rather than lost
+
+Serves human: "kept in two-way sync between uzi and GitLab" (`specs/human.md`,
+Feature #2) — the mark is what keeps the incremental tier of that sync bounded.
+Supersedes the HWM half of §444; the eviction/union half of §444 is untouched.
+
+- **The defect was a permanent STALL, not a skew.** The old `advanceHWM` returned
+  `prdMax` whenever *either* input was zero. A repo with open issues but no
+  PRD-labelled ones has `prdMax` zero on every pass, so its mark never advanced at
+  all and every `IncrementalSync` re-read the whole open set from the beginning,
+  forever. Pre-existing in shape, but PRD #102 M6 changed both the cost (two list
+  calls, the additive one unbounded) and the *reachability*, since M6 is precisely
+  what makes a board useful for a repo with no PRD issues yet. §444 named this cost
+  and priced it as knowingly-unfixed; this is the fix.
+- **One mark per fetch: `forgesvc.Marks{PRD, Open}`.** `PRD` bounds the PRD-labelled
+  fetch (`state=all`); `Open` bounds the additive open, no-label fetch. Each advances
+  only on its OWN fetch's evidence, to the max forge `updated_at` over that fetch's
+  raw result, and never backwards (`Marks.Advance` folds field-wise, keeping the
+  later of each). An empty result carries no evidence and leaves its mark exactly
+  where it was. Combining ACROSS the fields is the one thing the type exists to stop.
+  `advanceHWM` is deleted rather than re-signatured: with separate marks there is
+  nothing to combine.
+- **The invariant is "never past the instant its fetch OBSERVED", which is NOT "never
+  past that fetch's max".** A mark routinely sits above the max of the batch in front
+  of it — that is what monotonicity means, and a fetch returning only older rows must
+  not drag a mark down. What must never happen is a mark exceeding the read instant,
+  because that is what skips a window.
+- **`min()` is DISSOLVED, not lost — this is the paragraph that stops the next reader
+  folding the two fields back into one.** The fetches are separate round trips: the
+  PRD fetch observes the forge at tA, the open fetch at a later tB. A *shared* mark
+  had to take the minimum, because a PRD-labelled issue updated in (tA, tB) appears
+  in neither result (too late for the first fetch, dropped from the second), so a
+  shared mark taken from the later fetch steps straight over an update nobody
+  observed. Per-fetch, `prdMax <= tA` and `openMax <= tB` each hold on their own: the
+  PRD mark stays bounded by tA, so the next PRD fetch still returns that issue, and
+  the Open mark advancing to `openMax` skips nothing IT owns, because any open issue
+  updated before tB was in that fetch. `min()` existed only because the open fetch's
+  later evidence could push the SHARED mark past tA. With a mark per fetch it has
+  nothing left to protect.
+- **Two INDEPENDENT zero-guards, one per lower bound.** A zero mark sends no
+  `updated_after` on its own fetch and leaves the other's bound alone. A single
+  shared guard would drop BOTH bounds the moment either mark was zero, which is the
+  unbounded re-read above wearing a different hat.
+- **Both marks derive from the RAW fetch result, never from the write path, and the
+  symmetry is load-bearing rather than tidy.** `upsertIssues` substitutes
+  `time.Now()` for a zero `UpdatedAt` because `issues.forge_updated_at` is `NOT
+  NULL`, so a mark read off what was WRITTEN jumps to wall-clock now for any issue
+  the forge reports without an `updated_at` — later than the instant its fetch
+  observed, the one thing a mark must never be. The shared `min()` usually masked
+  that by clamping against the other fetch's max; per-fetch marks have nothing to
+  clamp against, so the exposure would be complete. Reading the raw result errs the
+  safe way instead: a mark that stays too small re-reads, it never skips.
+  `upsertIssues` therefore returns an `error` only, and no mark may be re-derived
+  from it. **Consequence worth recording because it inverts a driver comment nobody
+  would re-check**: both drivers map a nil `UpdatedAt` to the zero time on the stated
+  belief that "the sync engine treats it as no HWM advance" — false for the PRD path
+  before this change, and true only *because* of it.
+- **The raw result is read BEFORE `withoutLabel` drops the PRD-labelled rows.** The
+  value bounds *when the forge was read*, and a row that was read and then discarded
+  witnesses that reading just as well as one that was kept.
+- **Fail-closed is unchanged and stays strict.** On either fetch's error NEITHER mark
+  advances and the caller's pair comes back untouched — not just the failed path's.
+  Both fetches complete before any upsert runs, so a half-failure means neither
+  path's rows were written, and advancing the successful path's mark would skip a
+  window whose rows never reached the cache. `FullSync` takes no marks at all and
+  returns the pair it OBSERVED, the zero pair on any error, which folds in as a
+  no-op.
+- **Nothing to migrate; the mark was never persisted.** The pair lives only in
+  `poller.repoState`, which is process-local. A restart empties the map, `pollCount`
+  is 0, and the first tick reconciles via `FullSync`, which seeds both marks from its
+  own result. This is what made the change cheap enough to reverse M6's "wider change
+  than this milestone should carry" judgement.
+- **NARROWING, seen and priced (auditor advisory, Low).** A forge-supplied
+  FUTURE-dated `updated_at` now pins its own mark forward; the old shared `min()`
+  incidentally clamped such a value against the other path's max. Not a regression in
+  kind — the soundness argument always assumed `updated_at <= the read instant`, and
+  a forge violating that broke the old mark too, just less visibly. It is bounded by
+  the reconcile re-seed (`FORGE_RECONCILE_EVERY` × `FORGE_POLL_INTERVAL`, roughly ten
+  minutes at shipped defaults). Eviction is unaffected: the keep-set is built from
+  what the fetches returned and never from a mark.
+- **The M6-scale `FullSync` cap was deliberately EXCLUDED, and the reason is
+  structural, not scheduling.** `FullSync`'s keep-set drives `DeleteIssuesNotIn`, so
+  a capped fetch yields a partial keep-set and evicts every row past the cap. A cap
+  is therefore not a smaller version of this change; it is a different design that
+  must bound the fetch and the eviction together. Recording the exclusion because an
+  unstated one reads as an oversight, and the next person to reach for a cap needs
+  the eviction coupling before they start.
+- **The load-bearing premise — that GitLab and Forgejo bump an issue's `updated_at`
+  when a label is added or removed — is CONFIRMED (2026-07-28), and the strength of
+  the evidence DIFFERS BY FORGE AND BY DIRECTION.** The per-mark label-transition
+  argument in the `Marks` doc rests on it; if it were false a de-labelled issue would
+  enter neither fetch's incremental window and would wait for the reconcile tier.
+  *(This bullet was written the same day as an explicitly UNVERIFIED assumption,
+  checked against neither forge's documentation, and promoted here once measured. The
+  promotion is dated because a reader has to be able to tell a verified premise from
+  an inherited one.)*
+  - **GitLab, both directions: MEASURED.** `toIssue` reads `updated_at` and the
+    request side bounds on the same field. Observed read-only against
+    `vtmocanu/uzi` via `resource_label_events` — no issue was mutated — over 178
+    issues / 320 label events, filtered to cases where a label change is provably the
+    last activity: **10 clean pure-adds and 4 clean pure-removes**, `updated_at`
+    landing 7-19ms before the event row (issue stamped, then event inserted, one
+    request).
+  - **Forgejo, add: MEASURED** (5 clean cases on codeberg.org over 898 label events).
+    **Forgejo, remove: SOURCE-DERIVED, NOT MEASURED.** `toForgejoIssue` reads
+    `updated_at`; `since` traces through `UpdatedAfterUnix` to
+    `builder.Gte{"issue.updated_unix"}`, the column `updated_at` serialises from, so
+    the loop closes. Both label directions funnel through one terminal
+    `UpdateIssueCols(ctx, opts.Issue, "updated_unix")` in `updateCommentInfos`, which
+    sits OUTSIDE the type switch, so `CommentTypeLabel` reaches it with no case of its
+    own — add and remove hit the identical line. Remove could not be isolated
+    empirically because removes are essentially always paired with an add in one PUT,
+    and the paired cases were deliberately not presented as isolated ones. A
+    refutation sweep over all 898 events found zero violations, which **rules
+    refutation out without positively confirming remove**.
+  - **🔴 ONE UNEXPLAINED GITLAB NON-BUMP IN 320 EVENTS, recorded because a systematic
+    version of it is a silent-skip bug.** Issue #1: a label added (which did bump),
+    then removed by the same actor 2.25s later, with `updated_at` never moving. Every
+    testable hypothesis was killed — snapshot skew, the label being deleted from the
+    project, a concurrent note or state change, "only bumps when the actor changes"
+    (refuted by issue #78, identical shape, which did bump), and "the issue was closed
+    at the time" (refuted by #93). Reported as unexplained rather than given an
+    invented mechanism. It is a synthetic test label on the project's first issue, so
+    it may be a one-off script artifact, but that was **not** established. Settling it
+    needs a deliberate mutation on a scratch issue, which no read-only observation can
+    substitute for.
+- **GitLab's `updated_at` means "the issue RECORD changed", not "last activity" —
+  cross-reference system notes ("mentioned in commit/MR/issue") do NOT bump it.**
+  Recorded because the natural assumption runs the other way, and the direction of the
+  error matters: this is *less* poller churn than a reader would expect, not a source
+  of missed updates.
+- **Forgejo's `since` bound is INCLUSIVE** (`Gte`), so a boundary issue re-returns
+  rather than being skipped — the same safe direction as the inclusive-at-second-
+  granularity behaviour §22 already records for the incremental path. A mark that
+  re-reads costs a duplicate upsert, which is idempotent; a mark that skips loses a
+  row until the reconcile tier.
+- **A test that passes ONE value to both marks certifies a single-mark
+  implementation.** A constraint on any rebuild, not test narration: fixtures must
+  use `prdMax != openMax` and caller pairs with `PRD != Open`, and must assert BOTH
+  returned fields. Without that, nothing distinguishes per-fetch marks from the old
+  shared `min`, from a naive shared `max`, or from one mark under a two-field name.
+
+## 448. PRD #175 M1 — `GET /api/version` widens into a build-info object: `version` does not move, unknown is ABSENT, and the key set is closed by a walk over the TYPE
+
+The endpoint returned one string. It now returns `apitypes.BuildInfoDTO`: `version` and
+`founded` always, plus `built_at`, `commit`, `commits` and `uptime_seconds` when the
+build or the process knows them. Every property below belongs to the response itself,
+not to any consumer of it.
+
+- **`version` keeps its key AND its value; the widening is purely additive.** That key
+  is not only the footer badge — `web/src/pages/WorkersSettings.tsx` feeds it to PRD
+  #113's worker upgrade classification, so renaming, reshaping or nesting it is a
+  coordinated change across the SPA, the CLI, two route-classification tests and a
+  feature that gates fleet upgrades.
+  - **This section owns the KEY's stability; the PATH from that key to `cpVersion` is
+    §451's.** They move independently — the chain between them has already been
+    reshaped once without this bullet changing — so a change to how the value travels
+    is not a reason to edit this one, and a reader who finds the two describing
+    different things is reading them correctly.
+- **Unknown is OMITTED, never zero-valued.** A `dev` build reporting `commit: ""` and
+  `built_at: "0001-01-01T00:00:00Z"` claims to know things it does not; omission keeps
+  "we don't know" distinguishable from "the value is empty". This is the rule the rest
+  of the PRD keeps paying for at every boundary the value crosses (§451, §452).
+  - **`uptime_seconds` and `commits` are POINTERS for correctness, not tidiness.**
+    `omitempty` on a bare `int64` would drop a genuine 0, and 0 is a legitimate uptime
+    in a process's first second.
+  - **A zero `startedAt` means unknown, not the epoch.** Many tests build `Handler` as a
+    struct literal rather than through `New`, where a naive subtraction renders roughly
+    two millennia. An injected clock set behind `startedAt` reports the floor 0, because
+    a negative age is never a truer answer than zero.
+- **Every stamp has a server-side VALIDITY gate, and one of them came into existence
+  only because someone wrote the sentence it had to make true.** `built_at` must parse
+  as RFC3339 and is re-emitted from the PARSED value, so the wire carries one canonical
+  spelling whatever offset notation CI stamped; `commits` must be a non-negative
+  integer; `commit` must be 40 hex characters (`isFullSHA`). Commit was the one field
+  served verbatim, so an unexpanded CI variable would reach the wire as the literal
+  `$CI_COMMIT_SHA` — whose first seven characters, `$CI_COM`, read like a short SHA to
+  a consumer that truncates for display. The CI comment claiming "every failure mode
+  degrades to absent, never to wrong" is what forced the gate, rather than the reverse.
+- **The DTO lives in `api/internal/apitypes`, and that turned out to be the only legal
+  home.** It was chosen at implementation time as the tidy option; `TestNoServerDeps`
+  in `api/cmd/uzi/deps_test.go` bans `internal/handler` from the CLI's dependency
+  closure, so a handler-local DTO would have FORCED M4 to duplicate the struct — the
+  duplication that quietly destroys the unknown-versus-zero distinction (§452).
+  - **The package doc changed with it, and that is bigger than one type.** Until
+    `BuildInfoDTO`, every type in that leaf sat behind `RequireUser`, so "is this field
+    safe to expose?" had ONE package-level answer. It now has two. Someone adding a
+    field to `BuildInfoDTO` is warned by its own doc; someone making a CROSS-CUTTING
+    change — a shared `Meta` embed, a `trace_id` on every DTO, a linter-driven sweep —
+    reads the package page and would not be, so the split is stated there.
+- **The closed-key-set guard walks the TYPE's struct tags. The response-level check is
+  KEPT as well, and each catches what the other structurally cannot.** A response check
+  can only reject a key that is PRESENT, so an `omitempty` field left unset by the
+  fixture is invisible to it — and that is the shape EVERY new optional field takes,
+  because the omit-never-zero rule requires it. Three agents independently defeated the
+  original response-only check with three different config-fed fields (`oidc_issuer`,
+  `db_host`, `tls_cert_path`), each of which rendered nothing under the `config.Config{}`
+  every fixture there uses. The response pass guards the tag walk's own premise — a
+  handler that stopped returning the DTO would make the walk pass vacuously — and it
+  earned that keep immediately, by catching a bug INSIDE the walk: embedded fields must
+  be handled BEFORE the `IsExported` check, because `encoding/json` promotes an
+  unexported embed's exported fields onto the wire.
+  - The allowlist maps key → REASON and is checked in both directions. An entry with no
+    field behind it is a stale reason, and a stale reason is what makes the next
+    addition look pre-approved.
+
+## 449. PRD #175 — `uptime_seconds` is a considered DISCLOSURE, and the reason first given for keeping it was a claim about the UI
+
+Serves human: "uptime is accepted as public; severity Low" (`specs/human.md`,
+Feature #175) — **ratified 2026-07-28, after the fact rather than stated up front**.
+The requirement is the user's; the judgement below, and the four places it is
+enforced, are ours.
+
+The decision: **no signed-out popover, and `uptime_seconds` is kept and declared
+public.** That is what the PRD recommended. Its stated REASON — "it keeps the blast
+radius at zero and makes the uptime question moot", because the only consumer sits
+behind `if (!user) return <PublicShell>` — does not hold, and an auditor and a reviewer
+refuted it independently, from different starting points, before any code was written.
+
+- **The property is enforced at the ENDPOINT, and the endpoint is unauthenticated.**
+  `r.Get("/version", h.Version)` mounts directly under `r.Route("/api")` with only
+  `Recoverer` and `RequestID` above it; `route_limiter_mounts_test.go` pins it
+  `noLimiter`; `web` same-origin-proxies `/api/*`; and in k8s
+  `deploy/chart/templates/web-ingress.yaml` publishes the SPA origin at path `/` with no
+  auth annotation by default (both are chart values, so a hardened override could narrow
+  them — the enforced property is the route mount, not the chart). So this body is
+  world-readable, credential-free and unmetered to anyone who can reach the ingress. A
+  signed-out popover changes DISCOVERABILITY, not exposure, so declining it never made
+  the question moot.
+- **The real reason the field is kept: uptime is acceptable as public.** Severity Low.
+  It discloses restart and patch cadence, and paired with `version` gives a freshness
+  oracle ("this instance has run build X unpatched for N days") plus an unauthenticated
+  liveness probe. That is a judgement, and it is recorded as one rather than as an
+  observation.
+- **Every other field passes the already-public test on its own**, which is what
+  isolates uptime as the single case needing a judgement: `version` is the chart's image
+  tag, `commit` is already pushed as the Harbor tag `:$CI_COMMIT_SHORT_SHA`, `built_at`
+  is implied by the release tag, `founded` and `commits` are a const and a count.
+  **`uptime_seconds` is the only RUNTIME fact in a response otherwise made entirely of
+  BUILD facts** — which is exactly the line the endpoint's own rule draws.
+- **The statement lives at four sites, none of them a planning doc.** `Version`'s doc
+  comment (the enforcement point), `BuildInfoDTO`'s type doc, `ARCHITECTURE.md`'s
+  trust-boundaries section, and `TestVersionEndpointCarriesNothingPrivate`, whose
+  allowlist splits "already public" from "considered disclosure" with uptime as the sole
+  member of the second class. A rule recorded only in a PRD has no gate on it, and this
+  PRD's own named follow-ups — an `/about` page, a signed-out footer — would silently
+  republish the field with nothing in the code noticing.
+- **Two consequences, both stated where a reader hits them rather than here.** "It
+  carries no secret" is no longer the whole test: a field can be secret-free and still
+  be a runtime disclosure, so weigh both. And uptime establishes a CATEGORY — once one
+  runtime fact lives on this endpoint, "which replica", "how many replicas", "what
+  region", "what pod" become the same kind of request rather than obviously out of
+  scope, and every one of those is identity- or topology-bearing. The counterweight is
+  §448's closed key set, which matters more after this decision than before it.
+
+## 450. PRD #175 M1/M3 — the stamps are ldflags on `cmd/server`, `built_at` is a CI VARIABLE and never a `date`, and the count rides a dotenv
+
+- **`-X` names a package-level var by ITS OWN package path**, so `commit`, `builtAt` and
+  `commits` live in `main` (`api/cmd/server`) even though they are served from
+  `internal/handler`. They reach the handler through a single
+  `SetBuildInfo(BuildStamp{…})` call as RAW strings: the handler decides what absent or
+  unparseable means, so there is exactly one such place (§448).
+  - `BuildStamp` is a struct rather than three positional string parameters, which could
+    be miscalled with two of them swapped and nothing — not the compiler, not vet —
+    would say so.
+  - `SetBuildInfo` assigns unconditionally, unlike `SetVersion`, which must not let an
+    empty stamp clobber the `"dev"` default. There is no default to protect here, and
+    empty genuinely means "this build does not know".
+- **Only the TAG (publish) build stamps them**, so all three are empty on a plain
+  `go build`, on `docker compose build`, and on the MR/main validation image. Deliberate:
+  a `dev` build's commit is not a release coordinate. It does NOT rest on the argument
+  first written (that a per-commit arg would cost MR kaniko cache), which is false — MR
+  builds have no cache to lose, since `.kaniko_build` gates auth and cache together on
+  `$KANIKO_AUTH`, which only the protected-ref rule sets.
+- **`built_at` is `$CI_JOB_STARTED_AT`, and `$(date -u …)` is the obvious implementation
+  and is broken twice over.** GitLab performs `os.Expand`-style VARIABLE substitution on
+  `variables:` values and never shell command substitution, so `$(` is not a variable
+  name and stays literal; and `$UZI_BUILD_ARGS` is expanded UNQUOTED in `.publish_image`'s
+  shared script — deliberately, because word-splitting is how one job passes several
+  `--build-arg` flags — which field-splits the RESULT without expanding it further.
+  kaniko would receive three literal words. Computing it with `$(date)` inside a `RUN`
+  instead, which `agent/templates/base/Dockerfile` does for its `BUILD_INFO`, reports the
+  CACHED layer's date when the layer is reused: for a field named `built_at` that is a
+  lie, so it arrives as a build ARG.
+  - Established from GitLab's implementation (`build.rb`'s `started_at&.iso8601`), not
+    from the docs page, whose "ISO 8601, UTC by default" carries a caveat this line
+    depends on. Ruby's `#iso8601` emits NO whitespace in any timezone, so the
+    word-splitting hazard is closed structurally rather than by the value happening to be
+    UTC; a non-UTC render is the `+02:00` offset form, still valid RFC3339, which the
+    server re-formats to `Z`; and `&.` means a nil `started_at` yields an EMPTY variable
+    rather than a crash, which the server omits.
+- **The commit count is computed in `publish:assert-changelog` and delivered as an
+  `artifacts: reports: dotenv`.** That job already sets `GIT_DEPTH: 0`, already runs a
+  golang image carrying git, and is already in the `.publish_needs` anchor `publish:api`
+  consumes — the edge and the full-history clone are both already paid for. The
+  alternative (compute it in `publish:api`) is DEAD rather than merely worse: that job's
+  image is `kaniko-debug`, busybox plus kaniko, with no git and no apk to add one.
+  - **Validated at the PRODUCER, because that is the only enforcement point that
+    exists.** The value crosses into `UZI_BUILD_ARGS`, expanded unquoted, so any
+    whitespace in it becomes extra flags on the kaniko command line. `git rev-list
+    --count` is numeric in practice; that makes the guard cheap, not unnecessary.
+  - **Named `UZI_COMMIT_COUNT`, never something generic.** Dotenv-report variables rank
+    below project and group variables, so a same-named project variable would silently
+    shadow the computed count. They DO outrank job-level `variables:`, which is what
+    makes the delivery work at all.
+  - **No `UZI_COMMIT_COUNT: ""` default is declared in `publish:api`.** A default would
+    work, but it puts two definitions of one name in play and makes a future reader
+    re-derive which is in force. With none there is exactly one, and an absent dotenv
+    degrades to an empty `--build-arg`, which the server treats as unstamped.
+- **The `echo "ARGS=[$UZI_BUILD_ARGS]"` in `publish:api`'s `before_script` is a PERMANENT
+  observation point, not a spent probe.** It asserts nothing and cannot fail the job. Both
+  expansions it records are performed by machinery this repo cannot exercise locally, and
+  both fail SILENTLY into an omitted field, so a regression there has no other symptom.
+  It runs on TAGS ONLY (`.publish_image`'s rules gate on `$CI_COMMIT_TAG`), so it is a
+  post-merge observation and can never serve as a pre-merge proof of either expansion.
+- **`UZI_VERSION` is deliberately OUTSIDE the "degrades to absent, never to wrong"
+  claim.** `SetVersion` rejects only the empty string and `${UZI_VERSION#v}` strips
+  nothing from a value that does not begin with `v`, so an unexpanded version arg is
+  served VERBATIM — wrong, not absent. Pre-existing and out of this PRD's scope; named so
+  the omission reads as a boundary rather than an oversight. A fifth stamp needs its own
+  gate, or the claim needs widening.
+- **The version stamp is BARE on the server and carries a `v` on the CLI, and both are
+  correct.** `api/Dockerfile` stamps `${UZI_VERSION#v}` (Model B: served value == image
+  tag == chart `appVersion`), while `Formula/uzi-cli.rb` stamps `-X main.version=v#{version}`.
+  The two binaries genuinely differ; do not "fix" one to match the other. Root
+  `CLAUDE.md`'s `semver.Compare` warning is entirely about which side of this line a
+  string sits on.
+
+## 451. PRD #175 M2 — one promise, two hooks, a popover that takes its data as a PROP, and a CLOSED panel that is still the description
+
+- **Two hooks over ONE module-scope promise: `useBuildInfo` for the object, `useAppVersion`
+  for the release coordinate.** One request, two shapes, and the release coordinate's
+  state machine is §454's — that hook no longer projects over `useBuildInfo` at all, and
+  the fold this bullet used to describe is gone.
+  > **SUPERSEDED 2026-07-28 as to MECHANISM, by the tri-state fix (§454), on the owner's
+  > authority.** What stood here was accurate when written and is now false in four ways,
+  > kept in outline because the seam's INTENT outlived all four: `useAppVersion` was a
+  > `.version` projection over `useBuildInfo` (it now reads the snapshot directly, because
+  > it needs a discriminant `useBuildInfo` deliberately discards); it emitted TWO states
+  > (now three); both failure modes landed on `null` (a failed fetch is now `""`); and
+  > `AppShell.hooks.empty.test.tsx` pinned the FOLD (it now pins the pass-through, its
+  > assertion inverted with the contract rather than deleted with it). This is the second
+  > time this seam kept its shape while its justification was replaced, which is the
+  > durable observation about it.
+  - **What the split buys, and the one thing that survived both rewrites:** ONE place owns
+    the mapping, so every consumer sees the same value instead of reimplementing it at its
+    own call site — which is exactly how the two failure modes got conflated in the first
+    place.
+  - **`useBuildInfo` has ZERO production callers, and that is recorded rather than
+    resolved.** `SidebarContent` needs `fetchedAtMs` so it takes the private snapshot
+    hook; `useAppVersion` needs the discriminant so it does too. It is kept because it is
+    the seam the PRD specifies and its intended consumers are that PRD's named follow-ups
+    (an `/about` page, the CLI's `server` block), both of which want the whole object.
+    Deleting it would delete the contract, not an unused function — and if those
+    follow-ups are abandoned, this goes with them.
+  - **The chain's POSITIVE arm had no coverage at all until it was given its own file,
+    and the hole was proven by mutation rather than argued.** `GET /api/version` →
+    `useBuildInfoSnapshot` → `useAppVersion` → `WorkersSettings` `cpVersion` →
+    `FleetUpgradePanel` was tested at both ends and nowhere in between:
+    `WorkerUpgradeBadge.test.tsx` passes `cpVersion` as a PROP so no hook runs and its
+    only target-release assertion is an ABSENCE, and `WorkersSettings.test.tsx` resolves
+    `{version: ""}`, which is a different arm either way — the PENDING one when that file
+    was written, the SETTLED-UNKNOWN one since §454. Measured: hard-wiring `cpVersion` to
+    null — the page ignoring the endpoint this PRD widened, completely — left the suite
+    green at 1373/1373.
+    - **The fixture is a VERBATIM live wire body, and its field values must stay DISTINCT
+      FROM ONE ANOTHER.** That distinctness is the whole discriminating power: projecting
+      the wrong field (`?.version` → `?.founded`) has to yield a visibly wrong string. A
+      later tidy-up aligning `founded` with `version` would disarm the test while leaving
+      it green — the same silent-disarm shape as a mutation applied to a file that does
+      not execute.
+    - It also asserts the NEGATIVE: none of the widened body's other coordinates reach
+      the fleet panel. That panel is a classification surface, not a build-info surface;
+      the rest of the set belongs to the footer popover.
+- **The shared value is a SNAPSHOT (`{info, fetchedAtMs}`), not the payload.**
+  `uptime_seconds` is a reading taken at the fetch, so the popover re-bases it against
+  the wall clock; a session left open for hours would otherwise keep reporting the uptime
+  the API had at mount. The instant is sampled ONCE, where the shared promise settles,
+  which is what keeps the desktop rail and the mobile drawer agreeing. Accepted cost: an
+  API restart is invisible until reload, so this OVERSTATES where the raw value
+  understated — same direction, and bounded by the session's own length.
+- **Age is computed by the CONSUMER from `founded`, and `founded` is served by the API
+  rather than hardcoded in the bundle.** Sending both `founded` and an age creates two
+  sources of truth that disagree the moment a long-lived session crosses midnight;
+  sending `founded` alone means the age stays correct without a release. The trade is a
+  dependency on the client clock, acceptable at day granularity. A web-side const would
+  have deleted the server work entirely and was declined because the CLI needs the same
+  fact, and two hardcoded copies of a project's birth date is exactly the duplication
+  that survives long enough to disagree.
+- **`BuildInfoPopover` is presentational: it takes `info` as a prop and fetches nothing.**
+  Not a style preference. The promise is memoised at module scope with NO reset seam and
+  vitest isolates per FILE, so a component reading it directly could not be exercised with
+  more than one response shape in one file — the second would reuse the first's resolved
+  promise and pass or fail for the wrong reason. Taking the data as a prop removes the
+  hazard instead of working around it. It is also why the tests that DO drive the promise
+  are one file per response shape rather than organised by subject: a per-file split is
+  the only isolation vitest offers here, so the file count is a consequence of the missing
+  reset seam and not a taste.
+  - **THREE fixtures, because "degraded" is not one shape, and the first attempt got the
+    common one backwards.** A laptop `docker compose` build omits the three ldflags fields
+    but KEEPS `uptime_seconds`, because `handler.New` always sets `startedAt` — three keys,
+    not two. The two-key body is a struct-literal `Handler`, a test construction no server
+    ever serves, and the comment had labelled that one "the COMMON case". Each fixture
+    names the situation that produces it for exactly this reason.
+  - `mockApi` serves the STAMPED fixture, so every `VITE_UZI_MOCK=1` browser pass sees
+    that shape unless the line is pointed at another one. Deliberate — a `dev` build in
+    the demo would hide the three fields this PRD exists to add — and stated so it is not
+    rediscovered as a gap.
+- **🔴 AN OMITTED FIELD IS A CONTRACT ONLY AS FAR AS THE LAST CONSUMER THAT HONOURS IT.**
+  `*int64` + `omitempty` makes absence EXPRESSIBLE on the wire; nothing makes a consumer
+  REPRESENT it. Measured at the render boundary: `uptime_seconds: null` passes
+  `=== undefined`, reaches the formatter, and renders a climbing "Uptime 2s" for a value
+  the server explicitly declined to state — re-introducing at this end of the wire exactly
+  the absent-versus-zero conflation M1 spent a pointer to prevent. And `commits: null`
+  THROWS in `.toLocaleString`; there is no `ErrorBoundary` anywhere in `web/src`, so a
+  render throw unmounts the shell. So every optional field is guarded with `typeof` plus
+  `Number.isFinite` at the render boundary, not inside the formatters, which keep honest
+  `number` signatures. Same boundary as the commit-SHA validity gate living server-side
+  (§448): the wire is not a place where either end can assume the other.
+- **The failed fetch resolves to `null`, never a throw** — a 401 or a 500 on this endpoint
+  must not take the chrome down with it. The popover's optional rows are simply absent,
+  so an unstamped build shows a SHORTER panel rather than rows reading "unknown".
+- **The display ABBREVIATES; the DOM carries the full value.** `commit` renders the 7-char
+  short SHA and carries all 40 on the row's `title` and a `data-full` attribute; `built_at`
+  renders minute-granular and carries the raw RFC3339, seconds and all. Until the row
+  carried the full form it never reached the DOM at all, so selecting the row copied
+  `366a282` and the operator was back to prefix-matching by hand — which is most of what
+  this PRD set out to delete. The server's `isFullSHA` gate (§448) exists to make the
+  stored value greppable, and that property dies at the render boundary if the renderer is
+  the last place the full string exists.
+  - **`built_at` renders the TIME, not the day alone.** Two images can ship the same day,
+    which is precisely when someone opens this panel, so a day-granular stamp is silent in
+    the case it was added for. UTC is spelled out in the string rather than implied, and
+    the hour is `hourCycle: "h23"` rather than `hour12: false` — the latter maps to h24
+    under some locale/ICU combinations and renders midnight as "24:05".
+  - `founded` stays day-only: it is a calendar fact, and rendering 00:00 UTC on it would
+    invent a precision the value does not carry.
+- **🔴 THE PANEL STAYS MOUNTED WHEN CLOSED (`opacity-0` + `pointer-events-none`, never
+  `hidden`), AND THAT IS THE MECHANISM RATHER THAN AN OVERSIGHT.** Measured against
+  Chrome's own accessibility tree over CDP, not reasoned from the markup: with the popover
+  CLOSED, the trigger computes name `v0.4.2` and a DESCRIPTION carrying every coordinate,
+  so a screen-reader user who never hovers and never focuses still gets the whole set.
+  Unmounting when closed — the obvious way to tidy this DOM — deletes that description
+  silently, and neither the markup nor the suite would look wrong afterwards; `hidden`,
+  `display:none` and `visibility:hidden` all do the same. Re-measure the AX tree if you
+  change how it hides.
+  - The same measurement BOUNDS the row `title`s: a `dd` with text contributes its TEXT
+    and not its title, while an EMPTY `dd` with a title injects the TITLE into the
+    description. So the 40-char SHA stays out of what a screen reader announces only
+    because that row renders the 7-char form as its content — a future empty-but-titled
+    row would not. The thing to re-measure is the trigger's computed description, not the
+    presence of a `title` attribute, and a screenshot settles none of it: native tooltips
+    are drawn by the platform widget layer, outside what a page screenshot composites.
+  - **The `title` ban applies to the TRIGGER, not to the rows, and the difference is
+    mechanism rather than attribute.** The badge's native tooltip fired on the same hover
+    that opened this panel — two surfaces, involuntarily, every time — and duplicated its
+    heading with strictly less information. A row title needs a second deliberate hover,
+    shows the UN-abbreviated form, and cannot fire at all while the closed panel is
+    `pointer-events-none`. That last one is load-bearing: dropping that class puts a
+    mounted invisible title-bearing panel over the content area.
+- **Escape is handled on the DOCUMENT while open, not on the button.** On the button it
+  fired only while the badge had focus, so a mouse user who hovered the panel open pressed
+  Escape and nothing happened. The listener is attached only while open, so the second
+  (closed) mount costs nothing.
+- **Two `SidebarContent` mounts exist simultaneously**, so the popover's id is
+  instance-scoped (`useId`) or `aria-describedby` becomes ambiguous. It is anchored ABOVE
+  the trigger (the footer is the last row of a viewport-pinned rail) and its `z-10` is
+  LOCAL: it sits inside the desktop aside (`z-30`) and inside the mobile drawer (`z-40`)
+  and only has to beat its own siblings. Nothing above the footer sets `overflow-hidden`,
+  so it is not clipped.
+
+## 452. PRD #175 M4 — `uzi version` WRAPS rather than reshapes, and the SHARED DTO is the only thing that keeps "unknown" unknown
+
+Serves human: "`uzi version --json` gains a `server` key carrying the server's build
+info, with the CLI's own `version` unchanged at the top level" (`specs/human.md`,
+Feature #175) — **ratified 2026-07-28, after the fact rather than stated up front**.
+Both halves of that sentence are one requirement, and the wrapper below is what makes
+them true at the same time.
+
+- **The `--json` shape is `{version, server?}`: top-level `version` keeps its exact
+  meaning — the CLI's own ldflags stamp — and the server's coordinates nest under a new
+  key.** Every existing parser reading `.version` is untouched. It is a WRAPPER, not a
+  reshape.
+- **`Server` is a pointer to the shared `apitypes.BuildInfoDTO`, and a CLI-local copy
+  would have been the quiet failure.** Re-marshalling inherits the pointers and
+  `omitempty` tags verbatim, so an unstamped server's absent fields stay absent in
+  `uzi version --json`. A local struct with plain `int` fields would render a dev server
+  as `commits: 0` and `uptime: 0` — a build claiming to know things it does not, which is
+  the whole thing the server side spent a pointer to prevent. §448's dependency-closure
+  test is what makes the shared type reachable at all.
+  - **`founded` is the exception, and the boundary is worth stating.** It has no
+    `omitempty` — the server always sends it, and `TestBuildInfoDTOTags` pins
+    `version`+`founded` as the always-present pair. Against a PRE-#175 server the decode
+    leaves it `""` and re-marshalling emits `"founded": ""`: present-but-empty, the one
+    place this response conflates unknown with empty. Adding `omitempty` would fix a
+    rollout-window cosmetic by changing the server's contract, which is the wrong trade.
+    Confined to `--json`; the text path skips empty values.
+- **Best-effort, and it exits 0 whether or not any server is reachable.** Every failure
+  returns nil, not an error: no URL configured, an unresolvable config, a plain-http
+  remote refused by the credential guard, a connection failure, a server too old to
+  answer. The no-URL case is checked BEFORE a client is built, so the common standalone
+  invocation makes no network call at all. A 2s per-call context overrides the client's
+  30s default.
+- **Default stdout must BEGIN with `vX.Y.Z`, which is stricter than the constraint first
+  recorded.** `Formula/uzi-cli.rb`'s `assert_match` is a substring match, but
+  `scripts/brew-local-test.sh` uses a `case` pattern with only a trailing `*`, anchored at
+  the start of the WHOLE stdout. The script is the stricter gate: a header line, a `uzi `
+  label or a leading blank line passes the Formula and FAILS the script. So the CLI's own
+  version is line one, alone, and server rows follow.
+- **`credentialSafeBase` is NOT bypassed for this call, and the temptation to bypass it is
+  reasonable-sounding and wrong.** The ROUTE needs no credential; the REQUEST carries one
+  anyway, because `newRequest` attaches `Authorization: Bearer <token>` to every request
+  whose client holds a token and does not special-case this one. Measured on a loopback
+  server: the header is present. Skipping the https-or-loopback guard would therefore put
+  a real `uzc_` token in cleartext on the first `uzi version --url http://…`.
+  `TestBuildInfoIsGatedByCredentialSafeBase`'s third arm asserts the token IS attached —
+  the fact the guard's necessity rests on.
+- **The two consumers render `commit` differently ON PURPOSE.** `uzi version` prints all
+  40 characters, because a terminal is exactly where greppable matters; the SPA popover
+  shortens it for a footer with no room, and carries the full value on the row (§451).
+  What they must agree on is that the FULL value stays reachable — that is the property
+  asked for, not a display convention.
+- **Two files the file map must not forget.** `uzicli.FakeClient` implements the widened
+  `Client` interface, with a `BuildErr` SEPARATE from the blanket `Err` (a test needs to
+  fail this one call while the command still succeeds). And `SKILL.md` is a GATE, not a
+  nicety: `TestSkillMatchesCommandTree` asserts both directions between it and the command
+  tree.
+
+## 453. PRD #175 — what this increment does NOT deliver, and the one open item that CLOSED
+
+- **No signed-out popover and no `/about` page.** Both are named follow-ups and both
+  would widen this body's audience, so either one re-opens §449's uptime judgement rather
+  than inheriting it.
+- **~~`useAppVersion` cannot produce the `""` arm `FleetUpgradePanel` implements.~~
+  DELIVERED 2026-07-28 — see §454.** This was the single largest open item in the
+  increment and it is no longer open.
+  > **The entry is retired in place rather than deleted, and the distinction matters for
+  > a "what we did not deliver" section:** a list that quietly loses its own open items
+  > reads as though they were never there, which makes it useless as a record of what a
+  > rebuild inherits. What it said, so the supersession is legible: the panel implements
+  > a tri-state its only production caller could not supply, because a failed fetch and
+  > an in-flight one both arrived as `null`; the fix would have to reintroduce a distinct
+  > resolved-but-failed state in `BuildInfoSnapshot`; and it was a behaviour change, so
+  > the owner's call rather than this PRD's.
+  >
+  > **Every part of that held, including the prescription.** The fix is exactly the
+  > discriminated snapshot the entry named, and the two traps it recorded were both real:
+  > flipping `||` to `??` would not have fixed it (a failed fetch produced no `BuildInfo`
+  > for any operator to act on), and the fix had to land upstream of the projection. The
+  > owner authorised it 2026-07-28; the lead ruled it a FIX rather than a ratified
+  > requirement, so nothing about it is in `specs/human.md` — the panel already
+  > implemented and tested the arm, so this made an existing constraint reachable rather
+  > than adding a new one.
+- **`commits` is only ever present on a tagged release build.** It is independently
+  droppable by construction: nothing may depend on its presence, and every consumer must
+  render correctly without it. Neither the compose stack nor the e2e harness ever sees it.
+- **Neither CI expansion has a pre-merge proof, by construction.** `$CI_JOB_STARTED_AT`
+  and the dotenv both expand only in a tag pipeline, and both fail silently into an
+  omitted field. The permanent observation point in §450 is the only place a regression
+  would ever be visible, and it is post-merge. Also unmeasured: whether `started_at` is
+  populated at the moment the runner receives the payload — if it is not, released images
+  simply carry no `built_at`, and the first release is where that shows.
+- **Rejected, and worth not re-proposing: `debug.ReadBuildInfo()` in place of the ldflags.**
+  Go would hand over `vcs.revision` and `vcs.time` for free. It cannot work here —
+  `publish:api`'s kaniko context is `api/`, with no `.git` in it to stamp from — and
+  `-buildvcs=false` is additionally a deliberate reproducibility choice.
+
+## 454. PRD #175 / issue #16 — the failure gets a VALUE: three discriminated states, and the arm the panel already had
+
+Owner-authorised 2026-07-28, ruled a fix rather than a ratified requirement (`human.md`
+untouched: the consumer already implemented and tested the arm, so this made an existing
+constraint reachable rather than adding one). It closes §453's largest open item and
+supersedes §451's fold.
+
+- **A settled failure needs a VALUE, not an absence — that is the whole fix and it
+  generalises past this hook.** Resolving a failure to `null` and resolving a success to
+  an object are indistinguishable to a consumer holding only the result, so the shared
+  promise now resolves to a discriminated `BuildInfoSnapshot`:
+
+  | snapshot | meaning |
+  |---|---|
+  | `null` | IN FLIGHT — nothing has settled |
+  | `{status:"failed"}` | settled, and we will never know. Permanent |
+  | `{status:"ok",info,fetchedAtMs}` | settled with a body |
+
+  The swallow is **unchanged in strength** — nothing rethrows and the shell still renders
+  on a 401 or a 500. What changed is what the `catch` resolves TO.
+- **`useAppVersion` is where the tri-state is produced, and it reads the snapshot
+  DIRECTLY rather than through `useBuildInfo`**, because it needs a discriminant that
+  hook deliberately discards: `null` in flight, `""` settled-unknown (failed fetch OR an
+  empty `version` in the body), `"x"` settled and stamped. `useBuildInfo` stays
+  two-state on purpose — there is nothing to render for either non-`ok` case.
+- **`?? ""` rather than `|| ""` on the projection, and the two are behaviourally
+  identical here.** Only ABSENT becomes `""`; a server-sent `""` is already the
+  settled-unknown value to pass through. Chosen to state the intent, which is worth
+  noting precisely because it is the rare case where the operator choice is NOT
+  load-bearing — the previous `||` was, and a reader who remembers that would assume
+  this one is too.
+- **`""` HAS TWO UPSTREAM CAUSES and the panel cannot tell them apart** — an empty
+  `version` in the body, or a failed fetch. Whatever that arm says has to be true of
+  both, which is the constraint on its copy.
+  - **The two test files are each the SOLE guard on ONE of those causes, and neither
+    subsumes the other.** Proved by mutating each path separately: folding only the
+    FAILED path back to `null` reddens `WorkersSettings.cpversion.failed.test.tsx` and
+    leaves `AppShell.hooks.empty.test.tsx` GREEN; folding only the EMPTY-BODY path
+    reddens `hooks.empty` and leaves `cpversion.failed` GREEN. One pins the mapping, the
+    other pins that a consumer actually renders it.
+  - This replaces §451's "each blind to the other's property" pairing, which was true of
+    the old pair and is retired with the fold it described. The durable half is unchanged
+    and is why both are recorded: **a reader counting two tests over one hook is the
+    reader who deletes one.**
+- **🔴 THE COPY THE PANEL USED TO RENDER WAS FALSE, AND NOBODY HAD EVER READ IT.**
+  `no release stamp — classification off` claimed classification had stopped while the
+  panel rendered a fully classified fleet underneath it. It now reads **`control-plane
+  release unknown — targets unchecked`**, which names the two things actually degraded.
+  Unreachable code and false copy is a combination worth naming: the arm could not fire
+  until this fix, so the sentence had never been shown to anyone who could notice.
+  - **Everything except divergence is SERVER-computed**, which is what made the old copy
+    false: the counts, the bar and the attention line all come from each worker's own
+    `upgrade_status` and never consult `cpVersion`. A failed version fetch degrades
+    exactly one comparison, not the classification.
+  - **🔴 THE DIVERGENCE CHECK IS SKIPPED SILENTLY WHEN `cpVersion` IS FALSY.**
+    `fleetSummary`'s hosted-worker comparison is guarded by `… && cpVersion && …`, so
+    `divergentCount` is 0 exactly when the control-plane release is unknown — **the
+    ABSENCE of a divergence note in that state is not evidence of agreement.** That is
+    what "targets unchecked" exists to say. Invisible in the code and found only by
+    auditing the fix, which is why it is written down rather than left to the guard.
+- **The same self-contradiction, twice, by different routes.** The measured bug this seam
+  was built for (a full fleet bar under a heading saying classification was off, T+270ms
+  flipping at T+670ms) and this false copy are the same failure: a panel asserting its
+  own numbers are meaningless while rendering them. The first arrived through a race, the
+  second through unreachable copy. Worth pairing, because the next instance will arrive
+  through a third route and the shape is the recognisable part.

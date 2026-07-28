@@ -297,21 +297,112 @@ func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProject
 	})
 }
 
+// Marks is the pair of high-water marks the two sync fetches carry — ONE PER
+// FETCH (issue #177), not one shared between them. PRD bounds the PRD-labelled
+// fetch (state=all); Open bounds the additive open, no-label fetch. Each mark
+// advances only on its OWN fetch's evidence: to the max forge updated_at over
+// that fetch's RAW result, and never backwards. An empty result carries no
+// evidence and leaves its mark exactly where it was.
+//
+// The invariant is "never past the INSTANT ITS FETCH OBSERVED", which is not the
+// same as "never past that fetch's max". A mark routinely sits ABOVE the max of
+// the batch in front of it — Advance keeps 9000 over a fetch whose newest row is
+// 100, which is what monotonicity means and what
+// TestIncrementalSyncKeepsHWMWhenBatchOlder asserts. What must never happen is a
+// mark exceeding the read instant, because that is what skips a window.
+//
+// It replaces a single shared mark, and the reason that one could not work is
+// worth keeping, because folding these two fields back into one reads like a
+// simplification. The fetches are separate round trips: the PRD fetch observes
+// the forge at some instant tA, the open fetch at a later tB. A SHARED mark
+// therefore had to take the MINIMUM of the two maxima, never the maximum — a
+// PRD-labelled issue updated in (tA, tB) appears in NEITHER result (too late for
+// the first fetch, dropped by withoutLabel from the second), so a shared mark
+// taken from the later fetch steps straight over an update nobody observed, and
+// the next IncrementalSync asks only for what came after it. The row then sits
+// stale until the next full reconcile (Decision 11a).
+//
+// Separate marks DISSOLVE that race rather than working around it. prdMax <= tA
+// and openMax <= tB, since no issue can report an updated_at later than the
+// moment it was read. So the PRD mark stays bounded by tA and the next PRD fetch,
+// asking for updated_after = prdMax, still returns the issue updated in (tA, tB);
+// and the Open mark advancing to openMax skips nothing IT owns, because any open
+// issue updated before tB was in that fetch. min() existed ONLY because the open
+// fetch's later evidence could push the SHARED mark past tA. With a mark per
+// fetch it has nothing left to protect.
+//
+// What the shared mark cost — this is a fix, not a refactor (issue #177). The old
+// combine returned prdMax whenever EITHER input was zero, so a repo with open
+// issues but no PRD-labelled ones had prdMax zero on every pass: its mark never
+// advanced at all and every IncrementalSync re-read the whole open set from the
+// beginning, forever. PRD #102 M6 is precisely what makes a board useful for such
+// a repo, and it is also what doubled the traffic that stall costs.
+//
+// Label transitions still work, per mark. A transition bumps the issue's
+// updated_at to t1, and each mark is bounded by the instant its own last fetch
+// observed, so a mark below t1 means that fetch has not yet covered the change
+// and will return it.
+//
+//   - GAINS the PRD label at t1: PRD < t1 (the mark predates the change), so the
+//     PRD fetch returns it.
+//   - LOSES the label at t1: it cannot appear in the PRD fetch at all, but
+//     withoutLabel now KEEPS it, so the open fetch is what carries it — and if
+//     Open < t1 the very next open fetch does. Open >= t1 is possible when the
+//     loss predates the last open fetch, but then that fetch already returned the
+//     issue and it is already synced, so there is nothing left owing either way.
+//   - Loses the label AND closes: it appears in neither fetch; FullSync's
+//     eviction handles it, unchanged.
+//
+// NARROWING, seen and priced (auditor advisory, Low). A forge-supplied
+// FUTURE-dated updated_at now pins its own mark forward. The old shared min()
+// incidentally clamped such a value on one path against the other path's max;
+// per-fetch marks have nothing to clamp against, so one bad timestamp bounds one
+// fetch until it is repaired. This is not a regression in kind — the soundness
+// argument above always assumed updated_at <= the read instant, and a forge
+// violating that broke the old mark too, just less visibly. It is bounded:
+// FullSync takes no marks, so the next reconcile re-seeds both from its own
+// result, within FORGE_RECONCILE_EVERY × FORGE_POLL_INTERVAL (roughly ten
+// minutes at shipped defaults). Eviction is unaffected, since the keep-set is
+// built from what the fetches returned and never from a mark.
+type Marks struct {
+	PRD  time.Time // bounds the PRD-labelled fetch (state=all)
+	Open time.Time // bounds the additive open, no-label fetch
+}
+
+// Advance folds an observed pair into m FIELD-WISE, keeping the later of each.
+// Neither mark regresses, and neither is constrained by the other's value — the
+// zero time an empty fetch reports simply loses the comparison. Combining ACROSS
+// the fields is exactly what this type exists to stop; see Marks for why a shared
+// mark had to, and why a per-fetch one must not.
+func (m Marks) Advance(next Marks) Marks {
+	if next.PRD.After(m.PRD) {
+		m.PRD = next.PRD
+	}
+	if next.Open.After(m.Open) {
+		m.Open = next.Open
+	}
+	return m
+}
+
 // FullSync fetches the complete PRD-labeled set (state=all, no lower bound) and,
 // since PRD #102 M6, every OPEN issue regardless of label — an ADDITIVE second
 // fetch, not a widening of the first (Decision 9). It upserts both, then evicts
 // cache rows absent from the UNION of the two. This is the only path that
 // observes de-labeling and deletion, so it doubles as the reconcile pass and the
-// manual Refresh. Returns the high-water-mark a caller may advance to; see
-// advanceHWM for why that is not simply the later of the two fetches.
+// manual Refresh.
+//
+// It takes NO marks (it is unbounded by design) and returns the pair it OBSERVED,
+// one mark per fetch, for the caller to fold into its own with Marks.Advance. On
+// any error it returns the ZERO pair, which folds in as a no-op, so a failed
+// reconcile leaves the caller's marks exactly as they were.
 //
 // BOTH fetches must succeed before anything is deleted (Decision 11). A union
 // missing one half is not authoritative, and treating it as one wipes whatever
 // the failed half owns — the entire non-PRD backlog, every poll, on a transient
 // forge error. There is deliberately no "the extra fetch is best-effort, log and
-// continue" path: a soft-fail would also advance the shared high-water-mark past
-// a window nobody read (Decision 11a).
-func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (time.Time, error) {
+// continue" path: a soft-fail would also report a mark for a window nobody read
+// (Decision 11a).
+func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
 	prdLabel := s.prdLabel(ctx)
 	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{prdLabel}})
 	if err != nil {
@@ -319,20 +410,19 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		// treated as an authoritative empty set, or a transient forge error
 		// would wipe the cache. Eviction only runs below, after BOTH fetches
 		// have come back clean.
-		return time.Time{}, err
+		return Marks{}, err
 	}
 	openIssues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{State: forge.StateOpened})
 	if err != nil {
-		return time.Time{}, err
+		return Marks{}, err
 	}
 	extra := withoutLabel(openIssues, prdLabel)
 
-	maxUpdated, err := s.upsertIssues(ctx, repoID, issues)
-	if err != nil {
-		return time.Time{}, err
+	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+		return Marks{}, err
 	}
-	if _, err := s.upsertIssues(ctx, repoID, extra); err != nil {
-		return time.Time{}, err
+	if err := s.upsertIssues(ctx, repoID, extra); err != nil {
+		return Marks{}, err
 	}
 	// A clean PAIR of fetches that legitimately returns zero issues DOES evict
 	// everything — the forge is the source of truth (empty means empty).
@@ -344,49 +434,54 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		keep = append(keep, is.IID)
 	}
 	if _, err := s.q.DeleteIssuesNotIn(ctx, store.DeleteIssuesNotInParams{RepoID: repoID, KeepIids: keep}); err != nil {
-		return time.Time{}, err
+		return Marks{}, err
 	}
-	return advanceHWM(maxUpdated, maxUpdatedAt(openIssues)), nil
+	return Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues)}, nil
 }
 
-// IncrementalSync fetches only issues updated at/after hwm and upserts them —
-// the PRD-labeled set (state=all) plus the additive open, no-label set, the same
-// pair FullSync takes. It cannot see de-labeling or deletion (the filters
-// structurally exclude them) — that is FullSync's job. Returns the advanced
-// high-water-mark, never lower than the one it was given. The bound is inclusive
-// at second granularity, so the boundary row is re-fetched and deduped by upsert.
+// IncrementalSync fetches only the issues updated at/after each fetch's OWN mark
+// and upserts them — the PRD-labeled set (state=all) plus the additive open,
+// no-label set, the same pair FullSync takes. It cannot see de-labeling or
+// deletion (the filters structurally exclude them) — that is FullSync's job.
+// Returns m advanced field-wise, never lower than what it was given. The bound is
+// inclusive at second granularity, so the boundary row is re-fetched and deduped
+// by upsert.
 //
-// Either fetch failing returns the CALLER'S hwm unchanged, along with the error
-// (Decision 11a). Returning nil with an advanced mark after a half-failure is
-// what would make the next pass skip the failed path's window until the next
-// full reconcile, roughly ten minutes at shipped defaults.
-func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, hwm time.Time) (time.Time, error) {
+// The two lower bounds are guarded INDEPENDENTLY: a zero mark sends no
+// updated_after on its own fetch and leaves the other's bound alone. A single
+// shared guard would drop both bounds the moment either mark was zero, which is
+// the unbounded re-read issue #177 is about.
+//
+// Either fetch failing returns the CALLER'S pair unchanged, along with the error
+// (Decision 11a) — BOTH marks held, not just the failed one's. Both fetches
+// complete before any upsert runs, so a half-failure means neither path's rows
+// were written; advancing the successful path's mark would skip a window whose
+// rows never reached the cache.
+func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
 	prdLabel := s.prdLabel(ctx)
 	opts := forge.ListIssuesOptions{Labels: []string{prdLabel}}
+	if !m.PRD.IsZero() {
+		opts.UpdatedAfter = &m.PRD
+	}
 	openOpts := forge.ListIssuesOptions{State: forge.StateOpened}
-	if !hwm.IsZero() {
-		opts.UpdatedAfter = &hwm
-		openOpts.UpdatedAfter = &hwm
+	if !m.Open.IsZero() {
+		openOpts.UpdatedAfter = &m.Open
 	}
 	issues, err := f.ListIssues(ctx, forgeProjectID, opts)
 	if err != nil {
-		return hwm, err
+		return m, err
 	}
 	openIssues, err := f.ListIssues(ctx, forgeProjectID, openOpts)
 	if err != nil {
-		return hwm, err
+		return m, err
 	}
-	maxUpdated, err := s.upsertIssues(ctx, repoID, issues)
-	if err != nil {
-		return hwm, err
+	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+		return m, err
 	}
-	if _, err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, prdLabel)); err != nil {
-		return hwm, err
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, prdLabel)); err != nil {
+		return m, err
 	}
-	if advanced := advanceHWM(maxUpdated, maxUpdatedAt(openIssues)); advanced.After(hwm) {
-		return advanced, nil
-	}
-	return hwm, nil
+	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues)}), nil
 }
 
 // withoutLabel drops the issues carrying label from a fetch result. It is what
@@ -413,10 +508,21 @@ func withoutLabel(issues []forge.Issue, label string) []forge.Issue {
 }
 
 // maxUpdatedAt returns the largest forge updated_at in a fetch result, or the
-// zero time for an empty one. Unlike upsertIssues' return it is computed over the
-// RAW result, before withoutLabel drops the rows the PRD path owns: the value is
-// used only as a lower bound on WHEN the forge was read, and a row that was read
-// and then discarded witnesses that reading just as well as one that was kept.
+// zero time for an empty one. It is computed over the RAW result, before
+// withoutLabel drops the rows the PRD path owns: the value is used only as a
+// lower bound on WHEN the forge was read, and a row that was read and then
+// discarded witnesses that reading just as well as one that was kept.
+//
+// BOTH marks derive from it, and the symmetry is load-bearing rather than tidy.
+// upsertIssues substitutes time.Now() for a zero UpdatedAt because
+// issues.forge_updated_at is NOT NULL, so a mark read off what was WRITTEN would
+// jump to WALL-CLOCK NOW for any issue the forge reported without an updated_at —
+// later than the instant the fetch observed, which is the one thing a mark must
+// never be. (The single shared mark used to mask that: min() with the other
+// fetch's maximum usually clamped it back. Per-fetch marks have nothing to clamp
+// against, so the exposure would be complete.) Reading the raw result errs the
+// safe way instead: a mark that stays too small re-reads, it never skips. Do not
+// re-derive either mark from upsertIssues.
 func maxUpdatedAt(issues []forge.Issue) time.Time {
 	var max time.Time
 	for _, is := range issues {
@@ -427,74 +533,26 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 	return max
 }
 
-// advanceHWM combines the two fetches' max forge updated_at into the single
-// high-water-mark the poller carries per repo (Decision 11a). It takes the
-// MINIMUM of the two, never the maximum, and the reason is the gap between them.
-//
-// The fetches are separate round trips: the PRD fetch observes the forge at some
-// instant tA, the open fetch at a later tB. Everything the PAIR is known to have
-// seen is bounded by tA, the EARLIER of the two. An issue updated in (tA, tB)
-// that carries the PRD label appears in neither result — too late for the first
-// fetch, dropped by withoutLabel from the second — so a mark taken from the later
-// fetch steps straight over an update nobody observed, and the next
-// IncrementalSync asks only for what came after it. The row then sits stale until
-// the next full reconcile.
-//
-// prdMax and openMax are lower bounds on tA and tB respectively, since no issue
-// can report an updated_at later than the moment it was read. The smaller of the
-// two is therefore a lower bound on tA and safe to keep.
-//
-// The zero cases are NOT symmetric, and the asymmetry is the fetch order:
-//   - openMax zero constrains nothing. It says the window held no open issues,
-//     not that the window went unread, and the open fetch ran AFTER the PRD one,
-//     so prdMax <= tA < tB stands on its own.
-//   - prdMax zero is the pre-M6 "nothing to advance to" case and is preserved:
-//     the caller keeps the mark it already had. Advancing to openMax instead
-//     would be unsound for exactly the reason above, openMax being free to exceed
-//     tA.
-//
-// THE SECOND CASE HAS A STANDING COST, and it is worth knowing rather than fixing.
-// A repo with open issues but NO PRD issues has prdMax zero on every pass, so its
-// mark never advances at all and every IncrementalSync re-reads from the same
-// bound — now paying TWO unbounded fetches per poll rather than one. Correctness is
-// unaffected (the upserts are idempotent and the window only ever re-covers ground
-// already covered), and the pre-M6 code had the identical no-advance behaviour on
-// the PRD fetch; M6 doubles the traffic it costs.
-//
-// Not fixed here because every fix is worse: advancing on openMax alone is the
-// unsound case above, and a per-path mark is a wider change to the poller's state
-// than this milestone should carry. It is the same unboundedness the PRD's "M6
-// scale" open question names, and it wants the same answer — a cap or a per-repo
-// opt-in — not a change to this function.
-func advanceHWM(prdMax, openMax time.Time) time.Time {
-	if prdMax.IsZero() || openMax.IsZero() {
-		return prdMax
-	}
-	if openMax.Before(prdMax) {
-		return openMax
-	}
-	return prdMax
-}
-
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at
-// write time. Returns the max forge updated_at across the batch.
-func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) (time.Time, error) {
-	var maxUpdated time.Time
+// write time. It reports only an error: no high-water mark is read off this path,
+// deliberately, because the time.Now() substitution below would put one past the
+// instant its fetch observed (see maxUpdatedAt).
+func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) error {
 	for _, is := range issues {
 		labelsJSON, err := json.Marshal(is.Labels)
 		if err != nil {
-			return maxUpdated, err
+			return err
 		}
 		author := pgtype.Text{}
 		if is.Author != "" {
 			author = pgtype.Text{String: is.Author, Valid: true}
 		}
+		// forge_updated_at is NOT NULL (00002_forge.sql), so an issue the forge
+		// reported without an updated_at still needs a value in the COLUMN. This
+		// substitution is for the column and nothing else.
 		updated := is.UpdatedAt
 		if updated.IsZero() {
 			updated = time.Now()
-		}
-		if updated.After(maxUpdated) {
-			maxUpdated = updated
 		}
 		if _, err := s.q.UpsertIssue(ctx, store.UpsertIssueParams{
 			RepoID:         repoID,
@@ -507,8 +565,8 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			HasPrdLink:     HasPRDLink(is.Description),
 			ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
 		}); err != nil {
-			return maxUpdated, err
+			return err
 		}
 	}
-	return maxUpdated, nil
+	return nil
 }

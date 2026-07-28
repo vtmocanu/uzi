@@ -9,7 +9,7 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, MOCK_MODE, type Repo } from "../lib/api";
+import { api, MOCK_MODE, type BuildInfo, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
@@ -17,6 +17,7 @@ import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import { useFavicon } from "../lib/useFavicon";
 import { JudgeTodoContext, JudgeTodoValueContext } from "./JudgeTodoContext";
+import { BuildInfoPopover } from "./BuildInfoPopover";
 import {
   ActivityIcon,
   BellIcon,
@@ -49,33 +50,132 @@ const SIDEBAR_COLLAPSED_KEY = "uzi.sidebar.collapsed";
 // runs on every page for every logged-in user.
 const WORKERS_ATTENTION_POLL_MS = 60_000;
 
-// The server build version, fetched once and shared. Memoised at module scope so
-// the two SidebarContent mounts (desktop rail + mobile drawer) and any remount
-// reuse a single unauthenticated GET /api/version. A failed fetch resolves to ""
-// (rendered as nothing), never a thrown error in the shell.
-let versionPromise: Promise<string> | null = null;
-// Exported so the Workers page can state the fleet's target release from the SAME
-// coordinate the footer shows (PRD #113 M5). The promise is memoised at module scope, so
-// reusing this hook costs no extra request and — more importantly — makes it impossible
-// for the panel and the footer to disagree about what release the control plane is.
-export function useAppVersion(): string | null {
-  const [version, setVersion] = useState<string | null>(null);
+// The server build info, fetched once and shared. Memoised at module scope so the
+// two SidebarContent mounts (desktop rail + mobile drawer) and any remount reuse a
+// single unauthenticated GET /api/version. A failed fetch is SWALLOWED, never a
+// thrown error in the shell — a 401 or a 500 on this endpoint must not take the
+// chrome down with it.
+//
+// THREE STATES, DISCRIMINATED, and the discriminant is the point. `null` used to
+// mean both "still in flight" and "the fetch failed", which made
+// FleetUpgradePanel's third arm unreachable: a fleet page whose /api/version call
+// 500s showed a permanent blank "pending" instead of telling the operator that
+// upgrade classification was off. Resolving a failure to `null` and resolving a
+// success to an object are indistinguishable to a consumer holding only the
+// result, so the failure needs a value of its own rather than an absence.
+//
+//   snapshot === null   -> IN FLIGHT. Nothing has settled yet.
+//   { status: "failed" } -> settled, and we will never know. Permanent.
+//   { status: "ok", … }  -> settled with a body.
+//
+// fetchedAtMs rides along with the payload rather than being read at render time:
+// `uptime_seconds` is a reading taken at the fetch, and the popover re-bases it
+// against the wall clock so a session left open for hours does not keep reporting
+// the uptime the API had at mount. Sampling the instant HERE (once, when the
+// shared promise settles) rather than in each consumer is what keeps the two
+// mounts agreeing.
+type BuildInfoSnapshot =
+  | { status: "ok"; info: BuildInfo; fetchedAtMs: number }
+  | { status: "failed" };
+
+const BUILD_INFO_FAILED: BuildInfoSnapshot = { status: "failed" };
+
+let buildInfoPromise: Promise<BuildInfoSnapshot> | null = null;
+
+function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
+  const [snapshot, setSnapshot] = useState<BuildInfoSnapshot | null>(null);
   useEffect(() => {
-    if (!versionPromise) {
-      versionPromise = api
+    if (!buildInfoPromise) {
+      buildInfoPromise = api
         .version()
-        .then((r) => r.version)
-        .catch(() => "");
+        .then((info): BuildInfoSnapshot => ({ status: "ok", info, fetchedAtMs: Date.now() }))
+        // The swallow is unchanged in strength — nothing rethrows, and the shell
+        // renders on. What changed is that it now resolves to a VALUE saying the
+        // fetch failed, instead of to the same `null` an unsettled promise looks
+        // like.
+        .catch((): BuildInfoSnapshot => BUILD_INFO_FAILED);
     }
     let live = true;
-    versionPromise.then((v) => {
-      if (live) setVersion(v || null);
+    buildInfoPromise.then((s) => {
+      if (live) setSnapshot(s);
     });
     return () => {
       live = false;
     };
   }, []);
-  return version;
+  return snapshot;
+}
+
+// The whole build-info object (PRD #175). The seam the PRD's M2 bullet names.
+//
+// ⚠️ IT HAS ZERO PRODUCTION CALLERS, and that is a fact rather than an oversight —
+// stated because a grep for callers now returns only AppShell.hooks.empty.test.tsx
+// and the next reader deserves to know that was noticed. SidebarContent needs
+// `fetchedAtMs` so it uses the private snapshot hook; useAppVersion needs the
+// discriminant so it does too, and it was this hook's last caller until the
+// tri-state landed.
+//
+// KEPT ANYWAY, deliberately: it is the seam the PRD specifies, and its intended
+// consumers are that PRD's named follow-ups — an /about page and the CLI's
+// `server` block — both of which want the whole object rather than a projection.
+// Deleting it would delete the contract, not just an unused function. If those
+// follow-ups are ever abandoned, this is the thing to remove with them.
+//
+// DELIBERATELY two-state, and it does not gain the third: there is nothing to
+// render for a failed fetch and nothing to render while one is in flight, so both
+// are `null` here. The distinction lives in useAppVersion below, whose consumer
+// renders different copy for the two.
+export function useBuildInfo(): BuildInfo | null {
+  const s = useBuildInfoSnapshot();
+  return s?.status === "ok" ? s.info : null;
+}
+
+// Exported so the Workers page can state the fleet's target release from the SAME
+// coordinate the footer shows (PRD #113 M5). The promise is memoised at module scope, so
+// reusing this hook costs no extra request and — more importantly — makes it impossible
+// for the panel and the footer to disagree about what release the control plane is.
+//
+// THE TRI-STATE IS NOW REAL, and this hook is the only place it is produced:
+//
+//   null  -> IN FLIGHT.        FleetUpgradePanel renders &nbsp; — it asserts nothing
+//                              while the answer is still coming.
+//   ""    -> SETTLED, UNKNOWN. The fetch failed, or the body carried an empty
+//                              version. The panel says "control-plane release
+//                              unknown — targets unchecked", which is true and
+//                              actionable; a permanent blank is neither.
+//   "x"   -> SETTLED, STAMPED. The panel says "target release vx".
+//
+// Until this change the middle state was UNREACHABLE. `"" || null` is `null` and a
+// failed fetch resolved the shared promise to `null` too, so `versionPending` was
+// true both while the fetch was in flight AND forever after it had failed — the
+// third arm of a panel written for three could never fire. The conflation it was
+// written to prevent is a measured one: a full fleet bar rendered under a heading
+// saying classification was off, at T+270ms, flipping at T+670ms.
+//
+// FLIPPING `||` TO `??` WOULD NOT HAVE FIXED IT, and remains the obvious wrong
+// move if anyone revisits this: a failed fetch produced no BuildInfo at all, so no
+// operator on `.version` could distinguish it. The fix had to be the discriminated
+// snapshot above; this projection is downstream of it.
+//
+// `?? ""` rather than `|| ""` on the last line, and the difference is the whole
+// point: `||` would fold a resolved empty version back into the same bucket as…
+// itself, harmlessly, but `??` states the intent — only ABSENT becomes "", and a
+// server-sent "" is already the settled-unknown value we want to pass through.
+//
+// Reads the SNAPSHOT directly rather than going through useBuildInfo, because it
+// needs the discriminant and useBuildInfo deliberately discards it. (This comment
+// said "kept as a projection over useBuildInfo" until the tri-state landed and the
+// call moved; the INTENT below survived that change and the stated mechanism did
+// not.)
+//
+// The intent, unchanged and still the reason this hook exists at all: ONE place
+// owns the mapping, so every consumer sees the same three-state value instead of
+// reimplementing it at its own call site — which is exactly how the two failure
+// modes got conflated in the first place.
+export function useAppVersion(): string | null {
+  const s = useBuildInfoSnapshot();
+  if (s === null) return null;
+  return s.status === "ok" ? (s.info.version ?? "") : "";
 }
 
 function isNavActive(pathname: string, href: string): boolean {
@@ -246,7 +346,7 @@ function SidebarContent({
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const version = useAppVersion();
+  const build = useBuildInfoSnapshot();
   const [repos, setRepos] = useState<Repo[]>([]);
   // connection_id → forge_type, joined web-side so board entries can show a forge
   // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
@@ -493,28 +593,15 @@ function SidebarContent({
             </div>
           ))}
 
-        {/* Server build version (GET /api/version). The API returns the bare
-            Model-B coordinate (e.g. "0.6.0", == image tag / chart appVersion) or
-            "dev"/"demo"; we prefix a display "v" only for a numeric version so it
-            reads "v0.6.0" while "dev"/"demo" stay as-is (never "vdev"). aria-label
-            makes it self-describing for AT; title carries the full string when the
-            collapsed rail truncates it. */}
-        {version &&
-          (() => {
-            const label = /^\d/.test(version) ? `v${version}` : version;
-            return (
-              <div
-                title={`uzi ${label}`}
-                aria-label={`uzi version ${label}`}
-                className={cx(
-                  "border-t border-edge text-faint",
-                  collapsed ? "px-1 py-1.5 text-center text-[9px]" : "px-3 py-1.5 text-[10px]",
-                )}
-              >
-                <span className="block truncate">{label}</span>
-              </div>
-            );
-          })()}
+        {/* Server build info (GET /api/version, PRD #175). The badge still reads
+            "v0.6.0" / "dev"; hovering, focusing or tapping it opens the rest of the
+            coordinate set. The native `title` is GONE deliberately — a browser
+            tooltip firing alongside a custom popover is two overlapping panels
+            saying different things. Renders nothing at all until the fetch resolves
+            with a version, exactly as the old badge did. */}
+        {build?.status === "ok" && build.info.version && (
+          <BuildInfoPopover info={build.info} collapsed={collapsed} fetchedAtMs={build.fetchedAtMs} />
+        )}
       </div>
     </div>
   );

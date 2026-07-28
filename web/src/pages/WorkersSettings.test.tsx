@@ -15,6 +15,13 @@ vi.mock("../lib/api", async (importActual) => {
       // footer uses (PRD #113 M5), so mounting it now touches this. Resolving "" is the
       // honest default here: these tests assert on gauges and rows, and an unstamped
       // control plane is exactly what a local build looks like.
+      //
+      // What that renders CHANGED with the tri-state fix: "" used to fold to null and
+      // show the pending blank, and now reaches the panel as settled-unknown, so these
+      // mounts display "control-plane release unknown — targets unchecked". No
+      // assertion here depends on either, which is why the file stayed green — but the
+      // next person reading this fixture should not have to rediscover which arm it
+      // drives.
       version: vi.fn().mockResolvedValue({ version: "" }),
       // The page reads the user's tokens alongside the workers (PRD #104 M6) to
       // populate the per-row token picker.

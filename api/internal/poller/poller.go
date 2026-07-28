@@ -1,8 +1,9 @@
 // Package poller runs the background sync engine: on a fixed interval it pulls
 // forge changes into uzi's issue cache for every enabled repo. Most ticks are
-// cheap incremental pulls bounded by a per-repo high-water-mark; every Nth tick
-// is a full reconcile that also evicts issues deleted or de-labeled forge-side
-// (the incremental filter structurally cannot see those).
+// cheap incremental pulls, each of the sync's two fetches bounded by its own
+// per-repo high-water mark (forgesvc.Marks); every Nth tick is a full reconcile
+// that also evicts issues deleted or de-labeled forge-side (the incremental
+// filter structurally cannot see those).
 //
 // This is the ChangeSource seam: a webhook receiver could feed the same
 // FullSync/IncrementalSync methods later without touching the cache logic.
@@ -24,7 +25,7 @@ import (
 const defaultMaxConcurrency = 4
 
 // Engine polls all enabled repos. A single goroutine drives every repo each
-// tick, holding per-repo state (high-water-mark + poll counter) in memory. The
+// tick, holding per-repo state (high-water marks + poll counter) in memory. The
 // state map self-heals: repos that get disabled drop out of the enabled set and
 // their state is discarded; newly enabled repos start with a full reconcile.
 type Engine struct {
@@ -58,8 +59,15 @@ type Engine struct {
 	pipelineMaxRefs int
 }
 
+// repoState is one repo's in-memory sync state. marks holds a SEPARATE
+// high-water mark per sync fetch (issue #177): a single shared one stalled
+// permanently on any repo with open issues but no PRD-labelled ones, so every
+// incremental pull re-read that repo's whole open set. Process-local by design —
+// nothing persists it. On restart the map is empty and pollCount is 0, so the
+// first tick reconciles and FullSync re-seeds both marks from its own result;
+// there is no stale mark to migrate or misread.
 type repoState struct {
-	hwm       time.Time
+	marks     forgesvc.Marks
 	pollCount int
 }
 
@@ -216,21 +224,23 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	st.pollCount++
 
 	if reconcileDue(st.pollCount, e.reconcileEvery) {
-		maxUpdated, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
+		observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
 		if err != nil {
 			slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
 			return
 		}
-		if maxUpdated.After(st.hwm) {
-			st.hwm = maxUpdated
-		}
+		// FullSync is unbounded and reports what it observed, not an advance; the
+		// clamp is the caller's. Field-wise, so a fetch that legitimately came back
+		// empty leaves its own mark alone rather than dragging the other's down.
+		st.marks = st.marks.Advance(observed)
 	} else {
-		newHWM, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.hwm)
+		next, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.marks)
 		if err != nil {
 			slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
 			return
 		}
-		st.hwm = newHWM
+		// Already clamped inside, and held at the caller's pair on any fetch error.
+		st.marks = next
 	}
 
 	// MR-close watcher (PRD #24): after the issue cache is fresh, check each

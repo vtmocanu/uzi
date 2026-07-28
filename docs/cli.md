@@ -93,6 +93,16 @@ Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`.
 
 A few worth knowing:
 
+- **`version` reports two coordinates, not one.** It always prints the CLI's own
+  version (the `v*` release this binary was built from). When a server URL is
+  configured it additionally reports that server's build info — version, full
+  source commit, build time, commit count, founding date and uptime — because "what am I
+  running" and "what is deployed" are different questions and the answers drift.
+  The probe is best-effort with a short timeout, so `uzi version` exits 0 with or
+  without a reachable server. Under `--json` the CLI's version stays top-level
+  and the server's nests under `server`, leaving existing parsers untouched;
+  fields the server did not stamp are omitted rather than sent empty, so an
+  absent `server.commit` means "unknown", never "empty".
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
