@@ -39,6 +39,14 @@ Enumerated because the back-compat claim depends on it being complete, and becau
 
 **The `uzi` CLI is *not* a consumer** — `api/internal/uzicli/` contains no `/version` call at all; `uzi version` prints its own ldflags stamp. The two coordinates agree only because the same tag stamps both.
 
+> **SUPERSEDED 2026-07-28 by M4, which is this PRD's own milestone. Every clause of the sentence above is now false.** `api/internal/uzicli/client.go` issues `c.get(ctx, "/api/version", &out)` inside `(*HTTPClient).BuildInfo`, reached from `api/cmd/uzi/version.go`. The CLI is a real consumer, and the two coordinates no longer agree merely because one tag stamps both: `uzi version` reports the server's coordinate alongside its own.
+>
+> **Kept rather than rewritten, because the sentence is the PRD's founding premise.** The problem statement is built on the CLI *not* reading this endpoint — that is what made `handler.go`'s "so the SPA footer and the uzi CLI report one coordinate" a false claim worth a milestone. Deleting it would erase the reason M4 exists.
+>
+> **This is the fourth site of one claim, and the first three were caught while this one was missed.** `.claude/agent-team-tasks/prd-175-brief.md`'s "Cross-milestone: one owner for the doc end state" reasoned that an M1 replacement worded *"the CLI is not a consumer"* would ship wrong in the same MR, and assigned the end state for `handler.go`, `main.go` and `ARCHITECTURE.md`. Nobody applied that reasoning to the PRD's own table. A planning doc is exactly the artifact with no gate on it — nothing compiles it, no test reads it, and it is what the next person consults first.
+>
+> The line-number citations in the table above are **not** affected: they were verified accurate against `7bb07572`, the SHA this PRD anchors itself to, and their drift since is ordinary. Only this sentence is a content claim rather than a coordinate, and only it went stale.
+
 That matters more than a pedantic correction. `useAppVersion` feeds the **worker upgrade badge**, so this endpoint gates PRD #113's classification and is not merely cosmetic — see M2, where the tri-state that badge depends on is the single largest regression risk in this PRD.
 
 **Doc rot to fix in the same MR** (CLAUDE.md's fix-the-doc rule): `api/internal/handler/handler.go:99-100` and `api/cmd/server/main.go:51-54` both describe the single-string contract, and the former states the endpoint exists *"so the SPA footer and the uzi CLI report one coordinate"* — false today, and the likely source of the first draft's error. `ARCHITECTURE.md:34` calls it an *"unauthenticated build-version string"*.
