@@ -47,10 +47,19 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// version is stamped at build time via -ldflags "-X main.version=vX.Y.Z" (the api
-// Dockerfile does this from the release git tag; Model B == chart appVersion ==
-// image tag). Unset on a plain local `go build`, so it defaults to "dev" and is
-// served that way at GET /api/version — alongside the coordinates below.
+// version is stamped at build time via -ldflags "-X main.version=X.Y.Z" — BARE, with
+// no leading v. api/Dockerfile stamps ${UZI_VERSION#v} from the release git tag, and
+// that strip is the point of Model B rather than a detail: the served value equals the
+// image tag equals the chart appVersion, all bare, and the SPA re-adds a "v" only for
+// display. Unset on a plain local `go build`, so it defaults to "dev" and is served
+// that way at GET /api/version — alongside the coordinates below.
+//
+// api/cmd/uzi/root.go carries the IDENTICAL sentence and says vX.Y.Z, and it is
+// correct there: Formula/uzi-cli.rb stamps -X main.version=v#{version}, so the CLI
+// binary really does carry the v. The two binaries genuinely differ here. Do not
+// "fix" one to match the other — root CLAUDE.md's semver.Compare warning is entirely
+// about which side of this line a string sits on, and it cites this Dockerfile strip
+// as the reason every version this project ships is bare.
 var version = "dev"
 
 // commit, builtAt and commits are the rest of GET /api/version's build info (PRD

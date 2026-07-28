@@ -9,6 +9,13 @@
 # symlink untracked and one `git add -A` staged a link pointing outside the repo.
 # The bare pattern matches file, dir and symlink alike; agent/ and the bare form
 # are here because the same symlink trick is used for both other workspaces.
+#
+# The bare `node_modules` alone would cover all three -- a gitignore pattern with no
+# slash matches at ANY depth, so `git check-ignore -v` attributes both specific paths
+# to that last line rather than to the two above it. They are kept anyway: the two
+# named workspaces are the ones this repo actually has, and a reader scanning for
+# "is web/node_modules ignored?" should find the answer written down rather than have
+# to know the any-depth rule. Redundant, not wrong.
 web/node_modules
 agent/node_modules
 node_modules

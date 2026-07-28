@@ -166,13 +166,22 @@ func TestVersionEndpointBuiltAtCanonicalised(t *testing.T) {
 // CI failure modes described in .gitlab-ci.yml's publish:api comment safe by
 // construction.
 //
-// ALL THREE STAMPS ARE COVERED HERE, and the third was the point of adding it. An
-// earlier version of this table had no `commit` column at all while its first row was
-// named "unexpanded ci variables" and its doc comment claimed to cover the CI failure
-// modes — so the one field that did NOT degrade safely was the one field the table
-// structurally could not reach, and the subtest's name is what stopped the next reader
-// looking. `commit` had no validity gate then: it was served verbatim, so an
+// ALL THREE GATED STAMPS ARE COVERED HERE, and the third was the point of adding it.
+// An earlier version of this table had no `commit` column at all while its first row
+// was named "unexpanded ci variables" and its doc comment claimed to cover the CI
+// failure modes — so the one field that did NOT degrade safely was the one field the
+// table structurally could not reach, and the subtest's name is what stopped the next
+// reader looking. `commit` had no validity gate then: it was served verbatim, so an
 // unexpanded stamp put the literal "$CI_COMMIT_SHA" on the wire.
+//
+// `version` IS THE FOURTH LDFLAGS VALUE AND IS NOT COVERED, deliberately. It has no
+// gate: SetVersion rejects only the empty string, so an unexpanded UZI_VERSION would
+// be served verbatim — the exact failure the paragraph above describes for commit,
+// still open for version. It is pre-existing rather than introduced by PRD #175, and
+// widening this table would imply a gate that does not exist. Named because saying
+// "all three stamps" while four values ride the same ldflags line is how the previous
+// version of this comment went wrong, and reproducing that here of all places would
+// be a poor joke.
 func TestVersionEndpointGarbageStampsOmitted(t *testing.T) {
 	for _, tc := range []struct{ name, commit, builtAt, commits string }{
 		{"unexpanded ci variables", "$CI_COMMIT_SHA", "$CI_JOB_STARTED_AT", "$UZI_COMMIT_COUNT"},

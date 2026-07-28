@@ -319,7 +319,8 @@ as inert data.
 binary was built from — so it is the exact API version this binary matches.
 
 When a server URL is configured it also reports that server's build info:
-version, source commit (full 40-char SHA), build time, commit count and uptime.
+version, source commit (full 40-char SHA), build time, commit count, the
+project's founding date, and uptime.
 The two are separate coordinates and can differ — the CLI is whatever you have
 installed, the server is whatever is deployed. Under `--json` the CLI's own
 version stays at the top level and the server's nests under `server`, so a

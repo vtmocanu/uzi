@@ -48,7 +48,7 @@ func newVersionCmd(env Env, gf *globalFlags) *cobra.Command {
 		// the wording avoids it rather than registering it.
 		Long: "Print the uzi CLI version.\n\n" +
 			"When a server URL is configured, also reports that server's build info " +
-			"(version, source commit, build time, commit count, uptime). The server is " +
+			"(version, source commit, build time, commit count, founding date, uptime). The server is " +
 			"contacted best-effort with a short timeout: this command reports the CLI's " +
 			"own version and exits 0 whether or not any server is reachable.",
 		Args: cobra.NoArgs,
