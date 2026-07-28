@@ -286,6 +286,31 @@ describe("RunEventRow rendering", () => {
 
   // ── PRD #88: the clarification round-trip in the feed ──────────────────────
 
+  it("renders NO ordinal marker — a row cannot count what only the feed knows (D-R)", () => {
+    // The `#N` marker used to read `generation` off the payload. That field is gone
+    // (39cffd4c) because it was an inert display value carrying the name of a struck
+    // mechanism. The replacement counts `question` messages, which a single row holds
+    // none of, so the marker moved to the panel rather than being faked here. A stray
+    // `generation` from an older worker must not resurrect it.
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "question",
+          payload: {
+            question_id: "q-1",
+            generation: 4,
+            questions: [{ question: "Which backend?", header: "Storage" }],
+          },
+        })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("question for you");
+    expect(container.textContent).not.toContain("#4");
+    expect(container.textContent).not.toContain("4");
+  });
+
   it("renders a question row with its header, prose and option labels", () => {
     const { container } = render(
       <RunEventRow
@@ -294,7 +319,6 @@ describe("RunEventRow rendering", () => {
           kind: "question",
           payload: {
             question_id: "q-1",
-            generation: 2,
             questions: [
               {
                 question: "Which storage backend?",
@@ -311,9 +335,6 @@ describe("RunEventRow rendering", () => {
       />,
     );
     expect(container.textContent).toContain("question for you");
-    // generation > 1 is surfaced: a second question is a different question, and a
-    // reader scrolling a long feed needs to see which one an answer below belongs to.
-    expect(container.textContent).toContain("#2");
     expect(container.textContent).toContain("Storage");
     expect(container.textContent).toContain("Which storage backend?");
     expect(container.textContent).toContain("Postgres table");
@@ -330,7 +351,6 @@ describe("RunEventRow rendering", () => {
           kind: "question",
           payload: {
             question_id: "q-1",
-            generation: 1,
             questions: [
               {
                 question: "Use <script>alert(1)</script> or <img src=x onerror=alert(2)>?",
@@ -359,7 +379,6 @@ describe("RunEventRow rendering", () => {
           kind: "question",
           payload: {
             question_id: "q-1",
-            generation: 1,
             questions: [{ question: "Pick?", header: "H", options: [{ label, description: "d" }] }],
           },
         })}

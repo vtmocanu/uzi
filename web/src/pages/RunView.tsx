@@ -403,7 +403,7 @@ export function RunView() {
           alone would keep offering a composer after the run resumed. */}
       {run.status === "awaiting_input" && openQuestion && (
         <QuestionPanel
-          question={openQuestion}
+          open={openQuestion}
           busy={busy}
           onAnswer={(body) => act(() => submit("answer", body))}
           onCancel={() => act(() => submit("cancel"))}

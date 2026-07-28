@@ -935,8 +935,15 @@ export const RunEventRow = memo(function RunEventRow({
       if (!q) return <UnrenderableRow kind={msg.kind} rec={rec} />;
       return (
         <div className="rounded-md border border-warn/40 bg-warn/[0.08] px-2.5 py-1.5 text-sm">
+          {/* No "question N of M" marker here. The ordinal used to ride the payload as
+              `generation` and no longer does (D-R): it is now counted from the feed,
+              which a single row cannot do — it holds one message. The panel above shows
+              it, where "which round am I on" is the question a reader actually has; a
+              feed row is already in chronological position, so the marker bought little
+              and plumbing a seq-keyed lookup through the memo boundary to restore it
+              would buy less. */}
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-warn">
-            question for you{q.generation > 1 ? ` · #${q.generation}` : ""}
+            question for you
           </div>
           <ul className="space-y-2">
             {q.questions.map((item, i) => (

@@ -34,16 +34,22 @@ export interface AskQuestion {
   multiSelect: boolean;
 }
 
-/** Payload of a `question` run-message. */
+/** Payload of a `question` run-message: `{ question_id, questions }` as of `39cffd4c`
+ *  (D-R). It carried a third field, `generation`, which the design doc labelled "the
+ *  stale-answer discriminator" — a label that was false, since nothing ever read it
+ *  back. It has been removed from the wire; see questionOrdinal below for the display
+ *  ordinal that replaces it. */
 export interface QuestionPayload {
   /** The question's stable identity, minted at the first park and RE-USED verbatim
    *  when a resumed worker re-parks on the same question. The answer names it, and the
    *  api rejects an answer naming any other id — so it is not decorative, it is the
-   *  whole stale-answer guard and must round-trip byte-exact. */
+   *  whole stale-answer guard and must round-trip byte-exact.
+   *
+   *  It is the ONLY staleness key. Nothing in this file may add a second one keyed on a
+   *  clock or an arrival ordinal: a requeue re-parks the run, so every such key is
+   *  re-stamped by an event the user neither caused nor can see, and a conjunction is
+   *  only as strong as its weaker clause. */
   questionId: string;
-  /** 1-based ordinal within the run, for display. NOT the identity: it is not stable
-   *  across a requeue, which is exactly why the id exists separately. */
-  generation: number;
   questions: AskQuestion[];
 }
 
@@ -119,10 +125,7 @@ export function parseQuestionPayload(payload: unknown): QuestionPayload | null {
   if (questionId === "") return null;
   const questions = parseQuestions(rec["questions"]);
   if (questions.length === 0) return null;
-  const generation = typeof rec["generation"] === "number" && Number.isFinite(rec["generation"])
-    ? rec["generation"]
-    : 1;
-  return { questionId, generation, questions };
+  return { questionId, questions };
 }
 
 /** parseAnswerPayload reads an `answer` message's payload for the feed row. A payload
@@ -133,6 +136,16 @@ export function parseAnswerPayload(payload: unknown): AnswerPayload {
   const raw = rec?.["answers"];
   if (!Array.isArray(raw)) return { answers: [] };
   return { answers: raw.filter((a): a is string => typeof a === "string") };
+}
+
+/** The open question plus the facts about it that the feed — not the payload — knows.
+ *  Kept as a wrapper rather than folded into QuestionPayload so the wire shape stays
+ *  exactly the wire shape: `ordinal` is derived here and must never look like something
+ *  the worker sent. */
+export interface OpenQuestion {
+  question: QuestionPayload;
+  /** 1-based "question N of this run", counted from the feed. See questionOrdinal. */
+  ordinal: number;
 }
 
 /**
@@ -146,14 +159,40 @@ export function parseAnswerPayload(payload: unknown): AnswerPayload {
  * before that state report, so a question-only rule would keep offering a composer for
  * a question already resolved — and a second submit would 409 as stale.
  */
-export function deriveOpenQuestion(messages: RunMessage[]): QuestionPayload | null {
+export function deriveOpenQuestion(messages: RunMessage[]): OpenQuestion | null {
   let latest: RunMessage | undefined;
   for (const m of messages) {
     if (m.kind !== "question" && m.kind !== "answer") continue;
     if (!latest || m.seq > latest.seq) latest = m;
   }
   if (!latest || latest.kind !== "question") return null;
-  return parseQuestionPayload(latest.payload);
+  const question = parseQuestionPayload(latest.payload);
+  if (!question) return null;
+  return { question, ordinal: questionOrdinal(messages, latest.seq) };
+}
+
+/**
+ * questionOrdinal answers "which question of this run is this" — 1-based — by COUNTING
+ * `question` messages up to and including the given seq.
+ *
+ * This replaces the `generation` field the payload used to carry (D-R). The difference
+ * is not cosmetic: a counter minted worker-side is a CLAIM, restated on every park, and
+ * a worker-death requeue re-parks on the same question and would restate it wrongly. The
+ * feed is a durable, gapless log, so the count of `question` messages before this one is
+ * a FACT about the run and stays correct across a requeue for free.
+ *
+ * Returns 0 for a seq with no matching question, which callers render as no marker at
+ * all rather than guessing "1".
+ */
+export function questionOrdinal(messages: RunMessage[], seq: number): number {
+  let n = 0;
+  let found = false;
+  for (const m of messages) {
+    if (m.kind !== "question" || m.seq > seq) continue;
+    n += 1;
+    if (m.seq === seq) found = true;
+  }
+  return found ? n : 0;
 }
 
 /** The `answer` steering body. JSON, unlike every other kind, because an answer must

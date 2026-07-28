@@ -278,7 +278,6 @@ function askScript(runId: string): Timed[] {
       step: () => {
         appendMessage(runId, "question", "lead", {
           question_id: MOCK_QUESTION_ID,
-          generation: 1,
           questions: [
             {
               question:
@@ -315,8 +314,10 @@ function askScript(runId: string): Timed[] {
 }
 
 // askAgainScript is the SECOND park, reached after the first is answered. It exists so
-// the fixture covers a generation > 1 question — the stale-answer case in the real wire,
-// and the only way the "q2" chip and the `#2` feed marker are exercised at all.
+// the fixture covers a run on its second question — the stale-answer case in the real
+// wire, and the only thing that exercises the panel's "q2" marker, which is now COUNTED
+// from the feed rather than read off the payload (D-R). A one-question fixture cannot
+// tell a correct count from a hardcoded 1.
 function askAgainScript(runId: string): Timed[] {
   return [
     ...say(runId, "lead", "Thanks — one more before I start writing."),
@@ -325,7 +326,6 @@ function askAgainScript(runId: string): Timed[] {
       step: () => {
         appendMessage(runId, "question", "lead", {
           question_id: MOCK_QUESTION_ID_2,
-          generation: 2,
           questions: [
             {
               question: "Should the endpoint require admin, or is any authenticated user enough?",
@@ -559,7 +559,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       appendMessage(runId, "answer", "lead", { answers: parsed.answers });
       patchRun(runId, { status: "running" });
       appendMessage(runId, "status", null, { text: "answer received — resuming the session" });
-      // The first answer leads to a SECOND question (generation 2), the second to the
+      // The first answer leads to a SECOND question, the second to the
       // implementation. Keyed on which question was answered, not on a counter, so the
       // branch is readable from the fixture.
       schedule(runId, open === MOCK_QUESTION_ID ? askAgainScript(runId) : implementScript(runId));

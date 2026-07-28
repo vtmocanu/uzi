@@ -258,7 +258,6 @@ describe("ActivityFeed crew roster", () => {
         "question",
         {
           question_id: "q-1",
-          generation: 1,
           questions: [{ question: "Which <script>alert(1)</script> backend?", header: "H" }],
         },
         "lead",

@@ -2,7 +2,12 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { handleInput } from "./engine";
 import { listMessages, patchRun, state } from "./store";
-import { deriveOpenQuestion, encodeAnswerBody, parseQuestionPayload } from "../lib/runQuestion";
+import {
+  deriveOpenQuestion,
+  encodeAnswerBody,
+  parseQuestionPayload,
+  questionOrdinal,
+} from "../lib/runQuestion";
 import type { RunMessage } from "../lib/api";
 
 // PRD #88 D-N: THE MOCK ENGINE IS A CONTRACT, NOT A FIXTURE.
@@ -65,7 +70,8 @@ describe("mock engine: the clarification park (PRD #88)", () => {
     // composer and this is what catches it.
     const open = deriveOpenQuestion([...listMessages(RUN_ID)]);
     expect(open).not.toBeNull();
-    expect(open!.questions.length).toBeGreaterThan(0);
+    expect(open!.question.questions.length).toBeGreaterThan(0);
+    expect(open!.ordinal).toBe(1);
   });
 
   it("resumes to running on an answer that names the open question", () => {
@@ -109,10 +115,11 @@ describe("mock engine: the clarification park (PRD #88)", () => {
     expect(messagesOfKind("answer")).toHaveLength(0);
   });
 
-  it("asks a SECOND question (generation 2) after the first is answered", () => {
+  it("asks a SECOND question after the first is answered, and the feed COUNTS it as 2", () => {
     // The multi-round path is #88's designed path (QUESTION_MAX = 5), not its rare one —
-    // and generation > 1 is the only thing that exercises the panel's round marker and
-    // the feed's `#N`.
+    // and a run on its second question is the only thing that exercises the panel's
+    // round marker at all. The ordinal is counted here (D-R): no payload carries one, so
+    // a fixture with a single question could not tell a real count from a hardcoded 1.
     handleInput(RUN_ID, "approve_plan", "");
     drain();
     const first = latestQuestion()!;
@@ -120,7 +127,8 @@ describe("mock engine: the clarification park (PRD #88)", () => {
     drain();
     const second = latestQuestion()!;
     expect(second.questionId).not.toBe(first.questionId);
-    expect(second.generation).toBe(2);
+    expect(deriveOpenQuestion([...listMessages(RUN_ID)])!.ordinal).toBe(2);
+    expect(questionOrdinal([...listMessages(RUN_ID)], last("question")!.seq)).toBe(2);
     expect(state.runs.get(RUN_ID)!.status).toBe("awaiting_input");
   });
 

@@ -7,6 +7,7 @@ import {
   encodeAnswerBody,
   parseAnswerPayload,
   parseQuestionPayload,
+  questionOrdinal,
 } from "./runQuestion";
 
 function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunMessage {
@@ -20,23 +21,21 @@ function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunM
   };
 }
 
-function questionMsg(seq: number, questionId: string, generation = 1): RunMessage {
+function questionMsg(seq: number, questionId: string): RunMessage {
   return msg({
     kind: "question",
     seq,
     payload: {
       question_id: questionId,
-      generation,
       questions: [{ question: "Which backend?", header: "Storage" }],
     },
   });
 }
 
 describe("parseQuestionPayload", () => {
-  it("reads the frozen M1 payload, filling the optional fields", () => {
+  it("reads the payload shape M1 froze at 39cffd4c, filling the optional fields", () => {
     const p = parseQuestionPayload({
       question_id: "q-1",
-      generation: 3,
       questions: [
         { question: "Free text one?", header: "H1" },
         {
@@ -49,7 +48,6 @@ describe("parseQuestionPayload", () => {
     });
     expect(p).not.toBeNull();
     expect(p!.questionId).toBe("q-1");
-    expect(p!.generation).toBe(3);
     // Absent `options`/`multiSelect` normalize rather than staying undefined, so no
     // render site has to re-do the optionality check.
     expect(p!.questions[0]).toEqual({ question: "Free text one?", header: "H1", options: [], multiSelect: false });
@@ -57,10 +55,24 @@ describe("parseQuestionPayload", () => {
     expect(p!.questions[1].multiSelect).toBe(true);
   });
 
+  it("IGNORES a stray `generation`, which the wire no longer carries (D-R)", () => {
+    // The field was removed at 39cffd4c because the design doc called it "the
+    // stale-answer discriminator" and nothing ever read it back — an inert display value
+    // wearing the name of a struck mechanism. A payload from an older worker may still
+    // carry it; it must not become a second staleness key here by accident.
+    const p = parseQuestionPayload({
+      question_id: "q-1",
+      generation: 7,
+      questions: [{ question: "q", header: "h" }],
+    });
+    expect(p).toEqual({ questionId: "q-1", questions: [{ question: "q", header: "h", options: [], multiSelect: false }] });
+    expect("generation" in p!).toBe(false);
+  });
+
   it("returns null without a question_id — the one field with no safe default", () => {
     // The answer body must NAME the question and the api rejects an empty id, so a panel
     // rendered from an id-less payload would offer a composer whose every submit 400s.
-    expect(parseQuestionPayload({ generation: 1, questions: [{ question: "q", header: "h" }] })).toBeNull();
+    expect(parseQuestionPayload({ questions: [{ question: "q", header: "h" }] })).toBeNull();
     expect(parseQuestionPayload({ question_id: "   ", questions: [{ question: "q", header: "h" }] })).toBeNull();
   });
 
@@ -92,14 +104,6 @@ describe("parseQuestionPayload", () => {
     expect(p!.questions[0].options).toEqual([{ label: "ok", description: "d" }]);
   });
 
-  it("defaults a missing or non-numeric generation to 1 rather than dropping the payload", () => {
-    expect(parseQuestionPayload({ question_id: "q", questions: [{ question: "a", header: "" }] })!.generation).toBe(1);
-    expect(
-      parseQuestionPayload({ question_id: "q", generation: "2", questions: [{ question: "a", header: "" }] })!
-        .generation,
-    ).toBe(1);
-  });
-
   it("rejects a non-object payload", () => {
     expect(parseQuestionPayload(null)).toBeNull();
     expect(parseQuestionPayload("q")).toBeNull();
@@ -121,7 +125,8 @@ describe("parseAnswerPayload", () => {
 describe("deriveOpenQuestion", () => {
   it("returns the question when it is the latest of {question, answer} by seq", () => {
     const q = deriveOpenQuestion([msg({ kind: "text", seq: 1 }), questionMsg(2, "q-1")]);
-    expect(q!.questionId).toBe("q-1");
+    expect(q!.question.questionId).toBe("q-1");
+    expect(q!.ordinal).toBe(1);
   });
 
   it("closes on a LATER answer — the window that a question-only rule gets wrong", () => {
@@ -132,22 +137,25 @@ describe("deriveOpenQuestion", () => {
     expect(deriveOpenQuestion(messages)).toBeNull();
   });
 
-  it("re-opens on a question NEWER than the answer (the multi-round path)", () => {
+  it("re-opens on a question NEWER than the answer, and COUNTS it as the second", () => {
     const messages = [
       questionMsg(1, "q-1"),
       msg({ kind: "answer", seq: 2, payload: { answers: ["yes"] } }),
-      questionMsg(3, "q-2", 2),
+      questionMsg(3, "q-2"),
     ];
     const open = deriveOpenQuestion(messages);
-    expect(open!.questionId).toBe("q-2");
-    expect(open!.generation).toBe(2);
+    expect(open!.question.questionId).toBe("q-2");
+    // The ordinal is COUNTED from the feed, not read off the payload — no payload here
+    // carries one. That is D-R's point: the count is a fact about the run and survives a
+    // requeue re-park, where a worker-held counter would be restated wrongly.
+    expect(open!.ordinal).toBe(2);
   });
 
   it("orders by SEQ, not by array position", () => {
     // The feed merges a REST replay with live WS frames, so arrival order is not seq
     // order — deriving from `.at(-1)` would pick whichever landed last.
     const messages = [questionMsg(9, "q-late"), msg({ kind: "answer", seq: 3, payload: { answers: ["x"] } })];
-    expect(deriveOpenQuestion(messages)!.questionId).toBe("q-late");
+    expect(deriveOpenQuestion(messages)!.question.questionId).toBe("q-late");
   });
 
   it("returns null for a feed with no clarification messages at all", () => {
@@ -156,6 +164,46 @@ describe("deriveOpenQuestion", () => {
 
   it("returns null when the newest question is unusable", () => {
     expect(deriveOpenQuestion([msg({ kind: "question", seq: 1, payload: { questions: [] } })])).toBeNull();
+  });
+});
+
+describe("questionOrdinal (the display ordinal, counted not claimed — D-R)", () => {
+  const feed = [
+    questionMsg(2, "q-1"),
+    msg({ kind: "answer", seq: 3, payload: { answers: ["a"] } }),
+    questionMsg(5, "q-2"),
+    msg({ kind: "answer", seq: 6, payload: { answers: ["b"] } }),
+    questionMsg(9, "q-3"),
+  ];
+
+  it("counts question messages up to and including the given seq", () => {
+    expect(questionOrdinal(feed, 2)).toBe(1);
+    expect(questionOrdinal(feed, 5)).toBe(2);
+    expect(questionOrdinal(feed, 9)).toBe(3);
+  });
+
+  it("returns 0 for a seq that is not a question, so a caller renders no marker", () => {
+    // Never 1: guessing an ordinal is exactly the class of claim D-R removed from the
+    // wire, and it would be worse re-invented here.
+    expect(questionOrdinal(feed, 3)).toBe(0);
+    expect(questionOrdinal(feed, 99)).toBe(0);
+    expect(questionOrdinal([], 1)).toBe(0);
+  });
+
+  it("counts by SEQ, not by array position", () => {
+    // The feed merges a REST replay with live WS frames, so arrival order is not seq
+    // order. A positional count would number the questions by whichever landed first.
+    const shuffled = [feed[4], feed[0], feed[2], feed[1], feed[3]];
+    expect(questionOrdinal(shuffled, 5)).toBe(2);
+    expect(questionOrdinal(shuffled, 9)).toBe(3);
+  });
+
+  it("is UNAFFECTED by a re-park of the same question, unlike a worker-held counter", () => {
+    // The requeue case D-R names: a worker dies, the run re-queues, and the resumed
+    // worker re-parks on the SAME question. Only one `question` message exists in the
+    // durable feed, so the count stays 1 — where a counter restated at each park would
+    // have to be right by discipline rather than by construction.
+    expect(questionOrdinal([questionMsg(2, "q-1")], 2)).toBe(1);
   });
 });
 

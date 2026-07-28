@@ -1,12 +1,7 @@
 import { useMemo, useState } from "react";
 import { Button, Textarea, cx } from "./ui";
 import { Markdown } from "./Markdown";
-import {
-  answersReady,
-  composeAnswer,
-  encodeAnswerBody,
-  type QuestionPayload,
-} from "../lib/runQuestion";
+import { answersReady, composeAnswer, encodeAnswerBody, type OpenQuestion } from "../lib/runQuestion";
 
 // PRD #88 M2: the "Answer required" affordance — the run's THIRD human-in-the-loop
 // channel, beside the plan gate and user-initiated steering. It renders only while the
@@ -40,12 +35,15 @@ function selectionKey(qIndex: number, oIndex: number): string {
 }
 
 export function QuestionPanel({
-  question,
+  open,
   busy,
   onAnswer,
   onCancel,
 }: {
-  question: QuestionPayload;
+  /** The derived open question AND its feed-counted ordinal, taken as ONE object
+   *  because they are one derivation — passing them separately is how a caller ends up
+   *  showing question 2's round marker over question 3's text. */
+  open: OpenQuestion;
   busy: boolean;
   /** Submits the encoded `answer` steering body. The panel owns the encoding so the id
    *  and the answers can never be assembled apart from each other. */
@@ -54,6 +52,7 @@ export function QuestionPanel({
    *  offers, and the only alternative to waiting out the answer deadline. */
   onCancel?: () => void;
 }) {
+  const { question, ordinal } = open;
   // Chip selection is keyed by (question, option) rather than held per question, so a
   // multiSelect question and a single-select one share one state shape.
   const [picked, setPicked] = useState<Set<string>>(() => new Set());
@@ -100,9 +99,9 @@ export function QuestionPanel({
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">
             Answer required
-            {question.generation > 1 && (
+            {ordinal > 1 && (
               <span className="inline-flex items-center rounded-md border border-warn/40 bg-warn/[0.12] px-1.5 py-px font-mono text-[11px] font-semibold text-warn">
-                q{question.generation}
+                q{ordinal}
               </span>
             )}
           </h2>
