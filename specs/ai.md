@@ -14603,6 +14603,11 @@ not to any consumer of it.
   #113's worker upgrade classification, so renaming, reshaping or nesting it is a
   coordinated change across the SPA, the CLI, two route-classification tests and a
   feature that gates fleet upgrades.
+  - **This section owns the KEY's stability; the PATH from that key to `cpVersion` is
+    §450's.** They move independently — the chain between them has already been
+    reshaped once without this bullet changing — so a change to how the value travels
+    is not a reason to edit this one, and a reader who finds the two describing
+    different things is reading them correctly.
 - **Unknown is OMITTED, never zero-valued.** A `dev` build reporting `commit: ""` and
   `built_at: "0001-01-01T00:00:00Z"` claims to know things it does not; omission keeps
   "we don't know" distinguishable from "the value is empty". This is the rule the rest
