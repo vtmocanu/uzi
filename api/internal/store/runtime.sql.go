@@ -935,6 +935,12 @@ WHERE id = $2
   -- backstop and no failing test. This is that backstop, written where the guard is
   -- ENFORCED rather than where it is currently derived.
   AND status <> 'limit_wait'
+  -- awaiting_input (PRD #88) is the same shape of park and the argument above
+  -- transfers verbatim: equally excluded today by that one Go line, equally unmentioned
+  -- in that line's own comment, and equally exposed if someone relaxes it. Equally
+  -- inert today, and added for the same reason — a backstop belongs where the guard is
+  -- enforced, not where it currently happens to be derived.
+  AND status <> 'awaiting_input'
 `
 
 type FailRunAutoStopParams struct {

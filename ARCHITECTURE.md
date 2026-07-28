@@ -582,8 +582,11 @@ on answer, so the single edge above stands in for either occurrence.
   ("clarification timed out"); there is no configurable default action.
   **Autopilot never parks**: the same `claim.auto_approve` that
   short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
-  "no human available, proceed on your best judgment" answer and noting the
-  assumption in the feed instead. The question surfaces on every surface a
+  frozen `"no human available — proceed on your best judgment, and note the
+  assumption you made"` answer instead. The wording is quoted exactly because
+  it is a frozen constant (`AUTOPILOT_SENTINEL_ANSWER`) that a test asserts
+  byte-for-byte: an approximate quote here would read as the spec and send
+  someone "fixing" the constant to match the doc. The question surfaces on every surface a
   user might be watching — the run view (an "Answer required" composer), the
   owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
   and all three derive the open question from the run feed rather than a

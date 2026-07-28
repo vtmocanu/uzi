@@ -363,6 +363,25 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Cross-check the count against the QUESTION, not just against the server's
+			// upper bound. Answers are index-aligned, so a miscount does not fail — it
+			// silently pairs answer 2 with question 3 and hands the agent a confident
+			// mismatch. The server cannot catch this: maxAnswerCount bounds the top end
+			// but nothing server-side knows how many questions this id asked.
+			if len(answers) != len(q.Questions) {
+				return uzicli.Exitf(uzicli.ExitUsage,
+					"this question has %d part(s) but you gave %d answer(s) — answers are matched in order, so pass one -m per part",
+					len(q.Questions), len(answers))
+			}
+			// Reject a blank among several. A lone blank is already rejected above; a
+			// blank in the middle is worse, because it looks like an answer and reads to
+			// the agent as "(no answer given)" for a question the user believed they had
+			// answered.
+			for i, a := range answers {
+				if strings.TrimSpace(a) == "" {
+					return uzicli.Exitf(uzicli.ExitUsage, "answer %d is empty — every part needs text", i+1)
+				}
+			}
 			body, err := json.Marshal(answerBody{QuestionID: q.QuestionID, Answers: answers})
 			if err != nil {
 				return err
@@ -499,6 +518,14 @@ type questionPayload struct {
 // Derived from the FEED rather than a run field (PRD #88 D-L), so the CLI, the web UI
 // and Slack share one derivation rule instead of three. RunLogs returns messages in
 // seq order, so the last `question` is the open one.
+//
+// KNOWN COST, stated rather than hidden: this pulls the run's ENTIRE message history
+// to read one field. Nothing new is exposed — it is the same route and the same
+// authorization as `uzi run logs` — but `logs` is expected to be heavy and `answer` is
+// not, so a long run makes a one-line command download megabytes. Fixing it properly
+// needs a server-side "latest message of kind K" read that does not exist yet; adding
+// one for a single CLI verb was judged the wrong trade against D-L's one-derivation
+// rule, which is what keeps the CLI, web and Slack from drifting.
 func openQuestion(ctx context.Context, c uzicli.Client, runID string) (questionPayload, error) {
 	msgs, err := c.RunLogs(ctx, runID, 0)
 	if err != nil {
