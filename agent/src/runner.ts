@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { WorkerClient } from "./client.js";
@@ -7,7 +8,15 @@ import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
-import type { AgentSelection, AgentSource, AgentTemplate, ClaimResponse, StateRequest } from "./protocol.js";
+import type {
+  AgentSelection,
+  AgentSource,
+  AgentTemplate,
+  AskUserQuestion,
+  ClaimConfig,
+  ClaimResponse,
+  StateRequest,
+} from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
 import {
   describeRepoAgentNote,
@@ -17,7 +26,11 @@ import {
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import { rmTreeForce } from "./rmtree.js";
-import { SteeringChannel, type PlanVerdict } from "./steering.js";
+import {
+  SteeringChannel,
+  type AnswerVerdict,
+  type PlanVerdict,
+} from "./steering.js";
 import { GitLabClient, ForgejoClient, type ForgeClient } from "./forge.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
@@ -62,6 +75,9 @@ export interface RunnerOptions {
   pollMs?: number;
   /** Plan-approval gate cap; 0 disables (default 24h). */
   planApprovalTimeoutMs?: number;
+  /** PRD #88: fallback answer deadline in ms. The claim's question_timeout_seconds
+   *  takes precedence; this covers a server that does not send one. */
+  questionTimeoutMs?: number;
   /** Injected for tests; default opens real GitLab MRs. The worker picks between
    *  this and `forgejo` per claim (`repo.forge_type`, D9). */
   gitlab?: ForgeClient;
@@ -92,9 +108,14 @@ export interface RunnerOptions {
 export class RunRunner {
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
+  /** PRD #88 fallback answer deadline, used when the claim carries none (an older
+   *  server). The claim value wins when present — see questionTimeoutMs. */
+  private readonly questionTimeoutMs: number;
   private readonly gitlab: ForgeClient;
   private readonly forgejo: ForgeClient;
-  private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
+  private readonly detect: (
+    worktreePath: string,
+  ) => Promise<DetectedRepoAgents>;
   // Optional test override; production builds it per-run with the scrubbed check env
   // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
   private readonly checkRunner?: CheckRunner;
@@ -103,6 +124,21 @@ export class RunRunner {
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
    *  timeout) and, defensively, when the run reaches a terminal state. */
   private readonly gateDeadlines = new Map<string, number>();
+  /** PRD #88: per-run ABSOLUTE answer deadline, shaped exactly like gateDeadlines —
+   *  one budget for the run, not a fresh clock per question, so N questions cannot
+   *  extend a parked run indefinitely.
+   *
+   *  Not durable, and that is worth stating rather than implying: the map is worker
+   *  memory, so a worker death re-queues the run and the resuming worker starts a
+   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1). */
+  private readonly questionDeadlines = new Map<string, number>();
+  /** PRD #88: the question id a run is currently parked on. Seeded from the claim on a
+   *  resume so a re-park re-uses the SAME id rather than minting a new one — which is
+   *  what lets an answer submitted before a worker death still be honoured. */
+  private readonly openQuestionIds = new Map<string, string>();
+  /** PRD #88: how many times each run has parked, for QUESTION_MAX and for the
+   *  1-based `generation` the feed renders. */
+  private readonly questionCounts = new Map<string, number>();
   /** PRD #41 (Decision 3): the set of runs that have opened a plan gate at least once.
    *  It distinguishes the FIRST gate (epoch 0 — a verdict already queued when the gate
    *  opens still applies) from a RE-gate after a revision turn (where the epoch must be
@@ -126,6 +162,7 @@ export class RunRunner {
   ) {
     this.pollMs = opts.pollMs ?? 3_000;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
+    this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.forgejo = opts.forgejo ?? new ForgejoClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
@@ -141,7 +178,8 @@ export class RunRunner {
     // (removing chat's HOME + every run's HOME on terminal) and a separator/`..`
     // would escape it. Same guard provision-run.ts applies to the provisioning dir.
     // Content-free message: never echo the (rejected) id into a log/failure_reason.
-    if (!RUN_ID_RE.test(runId)) throw new Error("refusing to execute a run with an invalid run id");
+    if (!RUN_ID_RE.test(runId))
+      throw new Error("refusing to execute a run with an invalid run id");
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
     // per execution so nothing subprocess-scoped is shared with a concurrent run.
     const { executor, homeDir: runHome } = this.makeExecutor(runId);
@@ -150,23 +188,43 @@ export class RunRunner {
     // and evicted on terminal (Decision 7) so a completed run's PAT/token does not
     // linger in the process-lifetime scrub set; the registry is reference-counted,
     // so evicting these never un-scrubs a still-active sibling run that shares them.
-    const gitBasic = gitBasicCredential(claim.secrets.forge_pat, claim.secrets.forge_username);
+    const gitBasic = gitBasicCredential(
+      claim.secrets.forge_pat,
+      claim.secrets.forge_username,
+    );
     // Defense in depth for gitBasic: the git-over-HTTPS Basic credential
     // (base64(user:pat)) only ever lives in a GIT_CONFIG_VALUE (never argv/logs),
     // but register it too so a future leak through the git env would still be scrubbed.
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
-    if (claim.secrets.anthropic_oauth_token) runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    if (claim.secrets.anthropic_oauth_token)
+      runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
     for (const s of runScopedSecrets) this.log.addSecret(s);
 
-    const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
+    const runLog = this.log.child({
+      run_id: runId,
+      issue_iid: claim.issue_iid,
+    });
     // Same secret set for both redactors: the batcher scrubs run_message payloads;
     // redactText scrubs strings that reach the API outside a payload (failure_reason,
     // and the PRD #99 agent_label/agent_instance the batcher now carries alongside
     // the payload — `redact` walks inside a payload object and never sees them).
-    const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken, gitBasic];
+    const secrets = [
+      claim.secrets.forge_pat,
+      claim.secrets.anthropic_oauth_token,
+      this.joinToken,
+      gitBasic,
+    ];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText);
+    const batcher = new MessageBatcher(
+      this.client,
+      runId,
+      claim.last_seq,
+      this.batchMs,
+      runLog,
+      redact,
+      redactText,
+    );
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
     // steering channel, which the executor's ctx.signal watches.
@@ -174,15 +232,28 @@ export class RunRunner {
     // PRD #41: `notify` lets the steering channel post a feed notice when it discards a
     // verdict/revision written against a stale plan version — wired to the batcher here
     // so the channel never reaches into runner internals.
-    const steering = new SteeringChannel(this.client, runId, this.pollMs, runLog, cancel, {
-      notify: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
-    });
+    const steering = new SteeringChannel(
+      this.client,
+      runId,
+      this.pollMs,
+      runLog,
+      cancel,
+      {
+        notify: (text) =>
+          batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      },
+    );
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
     let observedSessionId: string | undefined;
-    const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): Promise<void> =>
-      this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
+    const reportState = (
+      body: Parameters<WorkerClient["reportState"]>[1],
+    ): Promise<void> =>
+      this.client.reportState(
+        runId,
+        observedSessionId ? { ...body, session_id: observedSessionId } : body,
+      );
 
     // PRD #108 M3: the batcher's breaker reports OUT OF BAND, never through itself —
     // `concat` is order-preserving, so an emitted explanation would queue behind the
@@ -192,22 +263,38 @@ export class RunRunner {
     // rather than a second, racing terminal report. Fire-and-forget: the batcher's
     // trip path must never block on the network.
     batcher.onPermanentFailureReport(({ reason }) => {
-      void reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
-        runLog.error("could not report the message-transport failure", { error: errMessage(e) }),
+      void reportState({
+        status: "failed",
+        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+      }).catch((e) =>
+        runLog.error("could not report the message-transport failure", {
+          error: errMessage(e),
+        }),
       );
     });
 
     let barePath: string | undefined;
     let worktreePath: string | undefined;
     try {
-      runLog.info("run claimed", { repo: claim.repo.url, branch: claim.branch ?? null });
+      runLog.info("run claimed", {
+        repo: claim.repo.url,
+        branch: claim.branch ?? null,
+      });
       await reportState({ status: "running" });
       steering.start();
 
-      barePath = await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
+      barePath = await this.git.ensureClone(
+        claim.repo.clone_url,
+        claim.secrets.forge_pat,
+        claim.secrets.forge_username,
+      );
       const runnerClone = await this.runnerCloneForClaim(barePath, claim);
       worktreePath = runnerClone.path;
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: `runner clone ready on ${runnerClone.branch}` } });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `runner clone ready on ${runnerClone.branch}` },
+      });
 
       // Resume preflight (issue #105). The claim carries the session id the run last
       // reported, but the transcript it names lives under the per-run HOME on the
@@ -228,14 +315,31 @@ export class RunRunner {
       // Only when this run HAS a private HOME: the stub executor has none (main.ts),
       // which is exactly the "no SDK session to resume" case, so the e2e stub flow is
       // untouched by construction rather than by an executor-kind check here.
+      // PRD #88: seed the open question id from the claim. The server re-delivers it
+      // from the runs row on every resume, so a worker that picks up a run parked
+      // before a death re-parks on the SAME question rather than minting a new id —
+      // which is what keeps an answer the user already submitted valid. Without this
+      // seeding the identity guard would still be keyed on identity, but the identity
+      // itself would change across the requeue, reproducing exactly the silent
+      // rejection the clock-based designs were rejected for.
+      if (claim.open_question_id)
+        this.openQuestionIds.set(runId, claim.open_question_id);
+
       let sessionId = claim.session_id ?? undefined;
       let resumeDropped = false;
-      if (sessionId && runHome && !(await sessionTranscriptResolvable(runHome, sessionId, runLog))) {
+      if (
+        sessionId &&
+        runHome &&
+        !(await sessionTranscriptResolvable(runHome, sessionId, runLog))
+      ) {
         resumeDropped = true;
         sessionId = undefined;
-        runLog.warn("resume session transcript is not resolvable here; starting a fresh SDK session", {
-          run_home: runHome,
-        });
+        runLog.warn(
+          "resume session transcript is not resolvable here; starting a fresh SDK session",
+          {
+            run_home: runHome,
+          },
+        );
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -255,14 +359,21 @@ export class RunRunner {
       // otherwise the honest degradation just becomes silently duplicated work, which
       // is the harder failure to notice. Both conditions required: a fresh run reading
       // its own first-attempt branch needs no such warning.
-      const priorWork = resumeDropped && runnerClone.priorCommits > 0 ? { commits: runnerClone.priorCommits } : undefined;
+      const priorWork =
+        resumeDropped && runnerClone.priorCommits > 0
+          ? { commits: runnerClone.priorCommits }
+          : undefined;
 
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report
       // rather than the gate so that an autopilot run — which never parks at
       // awaiting_approval — records what was detected just the same. The roster is
       // inert data: nothing is assembled until a selection picks the repo source.
-      const detection = await this.parseRepoAgents(runnerClone.path, batcher, runLog);
+      const detection = await this.parseRepoAgents(
+        runnerClone.path,
+        batcher,
+        runLog,
+      );
       const repoAgents = detection.agents;
       if (detection.ok) {
         // Non-fatal, and fire-and-forget (matching the session-id report below): an
@@ -272,8 +383,13 @@ export class RunRunner {
         // one over a field the run does not depend on. On a detection FAILURE we send
         // no roster at all, so the column stays NULL ("not reported") rather than `[]`
         // ("scanned, found none") — the two must stay distinguishable.
-        void reportState({ status: "running", repo_agents: repoAgentSummaries(repoAgents) }).catch((e) =>
-          runLog.warn("could not report repo agent roster", { error: errMessage(e) }),
+        void reportState({
+          status: "running",
+          repo_agents: repoAgentSummaries(repoAgents),
+        }).catch((e) =>
+          runLog.warn("could not report repo agent roster", {
+            error: errMessage(e),
+          }),
         );
       }
 
@@ -286,7 +402,9 @@ export class RunRunner {
       try {
         memory = await this.client.getMemory(runId);
       } catch (err) {
-        runLog.warn("could not fetch cross-run memory; continuing without it", { error: errMessage(err) });
+        runLog.warn("could not fetch cross-run memory; continuing without it", {
+          error: errMessage(err),
+        });
       }
 
       const ctx: RunContext = {
@@ -321,7 +439,9 @@ export class RunRunner {
         onSessionId: (sessionId) => {
           observedSessionId = sessionId;
           void reportState({ status: "running" }).catch((e) =>
-            runLog.warn("could not persist session id", { error: errMessage(e) }),
+            runLog.warn("could not persist session id", {
+              error: errMessage(e),
+            }),
           );
         },
         // The plan gate: surface the plan, post awaiting_approval, and return the
@@ -329,10 +449,36 @@ export class RunRunner {
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
         gatePlan: (planMd) =>
-          this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false, repoAgents),
+          this.gatePlan(
+            runId,
+            planMd,
+            batcher,
+            steering,
+            reportState,
+            runLog,
+            claim.auto_approve ?? false,
+            repoAgents,
+          ),
+        // PRD #88 clarification park: surface the question, post awaiting_input, and
+        // return the answer the steering channel resolves. An autopilot claim
+        // short-circuits to a sentinel answer (see askUser) — such a run never parks.
+        askUser: (questions) =>
+          this.askUser(
+            runId,
+            questions,
+            batcher,
+            steering,
+            reportState,
+            runLog,
+            claim.auto_approve ?? false,
+            claim.config ?? null,
+          ),
         pullFollowUp: () => steering.pullFollowUp(),
         reportIteration: (iteration) => {
-          void reportState({ status: "running", iteration_count: iteration }).catch((e) =>
+          void reportState({
+            status: "running",
+            iteration_count: iteration,
+          }).catch((e) =>
             runLog.warn("could not report iteration", { error: errMessage(e) }),
           );
         },
@@ -352,10 +498,18 @@ export class RunRunner {
       // with the diagnosis and NO push/MR — there is nothing to land.
       if (result.fixVerdict === "not_code") {
         executor.killAgentTree?.();
-        batcher.emit({ kind: "status", agent: "worker", payload: { text: "not a code problem: completing with the diagnosis, no merge request" } });
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "not a code problem: completing with the diagnosis, no merge request",
+          },
+        });
         await batcher.close();
         await reportState({ status: "completed", fix_verdict: "not_code" });
-        runLog.info("ci_fix run completed with not_code verdict", { run_id: runId });
+        runLog.info("ci_fix run completed with not_code verdict", {
+          run_id: runId,
+        });
         return;
       }
 
@@ -367,7 +521,11 @@ export class RunRunner {
       // and it brings the agent's objects into the worker bare so the push does not
       // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
       // changedFiles read; the runner clone is never a git source for either.
-      const trackingRef = await this.git.fetchAgentBranch(barePath, runnerClone.path, result.branch);
+      const trackingRef = await this.git.fetchAgentBranch(
+        barePath,
+        runnerClone.path,
+        result.branch,
+      );
 
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
       // repo, the worker itself runs the test suites and flags any guard-critical
@@ -376,7 +534,13 @@ export class RunRunner {
       // can't run is reported "skipped", never failing the run.
       let selfImproveSection: string | undefined;
       if (claim.kind === "self_improve") {
-        batcher.emit({ kind: "status", agent: "worker", payload: { text: "self-improvement: running the test suites for MR evidence" } });
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "self-improvement: running the test suites for MR evidence",
+          },
+        });
         // changedFiles returns null when the diff could not be computed → pass null
         // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
         // note) instead of silently suppressing the flag (M5 audit). Under (b) this is
@@ -398,8 +562,14 @@ export class RunRunner {
         // executor has already installed these once; re-running is deliberate, because
         // the agent may have edited a package.json or lockfile during the run and the
         // checks must test what it actually left behind.
-        const checkEnv = buildCheckEnv(process.env, runHome ?? os.tmpdir(), result.toolEnv);
-        const deps = await installJsDeps(runnerClone.path, checkEnv).catch(() => ({ results: [], truncated: false }));
+        const checkEnv = buildCheckEnv(
+          process.env,
+          runHome ?? os.tmpdir(),
+          result.toolEnv,
+        );
+        const deps = await installJsDeps(runnerClone.path, checkEnv).catch(
+          () => ({ results: [], truncated: false }),
+        );
         for (const note of deps.results) {
           runLog.info("self-improve: dependency install", { ...note });
         }
@@ -407,21 +577,44 @@ export class RunRunner {
         // check may be about to run somewhere provisioning never reached. Say so rather
         // than let the notes above read as full coverage.
         if (deps.truncated) {
-          runLog.warn("self-improve: dependency discovery hit its bound; some dirs were not installed", {
-            installed_dirs: deps.results.length,
-          });
+          runLog.warn(
+            "self-improve: dependency discovery hit its bound; some dirs were not installed",
+            {
+              installed_dirs: deps.results.length,
+            },
+          );
         }
         const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
-        const checks = await runSelfImproveChecks(runnerClone.path, checkRunner);
-        selfImproveSection = selfImproveMrSection(changed === null ? null : flagGuardPaths(changed), checks);
+        const checks = await runSelfImproveChecks(
+          runnerClone.path,
+          checkRunner,
+        );
+        selfImproveSection = selfImproveMrSection(
+          changed === null ? null : flagGuardPaths(changed),
+          checks,
+        );
       }
 
       // The agent signalled done. The WORKER now performs the authenticated push
       // + MR with the PAT — the agent never had a credential.
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: "work complete; pushing branch and opening merge request" } });
-      await this.git.pushBranch(barePath, result.branch, claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "work complete; pushing branch and opening merge request",
+        },
+      });
+      await this.git.pushBranch(
+        barePath,
+        result.branch,
+        claim.secrets.forge_pat,
+        claim.repo.clone_url,
+        claim.secrets.forge_username,
+      );
       const targetBranch =
-        claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main";
+        claim.repo.default_branch?.trim() ||
+        (await this.git.defaultBranchName(barePath)) ||
+        "main";
       // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
       // the worker opens an MR on GitLab and a PR on Forgejo from the same code path;
       // each client derives its own API base + project from repo.url (D9). createMergeRequest
@@ -429,16 +622,26 @@ export class RunRunner {
       // MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N or agent/issue-N
       // branch it opens one. Reporting its iid keeps the fix branch watched so the
       // verification sync can stamp the verdict.
-      const forge = claim.repo.forge_type === "forgejo" ? this.forgejo : this.gitlab;
+      const forge =
+        claim.repo.forge_type === "forgejo" ? this.forgejo : this.gitlab;
       const mr = await forge.createMergeRequest({
         repoUrl: claim.repo.url,
         pat: claim.secrets.forge_pat,
         sourceBranch: result.branch,
         targetBranch,
         title: mrTitle(claim),
-        description: mrDescription(claim, result.branch, result.agentSelection, selfImproveSection),
+        description: mrDescription(
+          claim,
+          result.branch,
+          result.agentSelection,
+          selfImproveSection,
+        ),
       });
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
+      });
 
       await batcher.close();
       // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
@@ -463,12 +666,21 @@ export class RunRunner {
       // path — so scrub it here with the run's own secret set. A plan rejection
       // carries the user's verbatim reason; scrubbing it too is harmless for plain
       // text and a safety net if the user pasted a secret.
-      const reason = redactText(err instanceof PlanRejectedError ? err.reason : errMessage(err));
+      const reason = redactText(
+        err instanceof PlanRejectedError ? err.reason : errMessage(err),
+      );
       runLog.error("run failed", { error: reason });
-      batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
+      batcher.emit({
+        kind: "error",
+        agent: "worker",
+        payload: { text: reason },
+      });
       await batcher.close().catch(() => undefined);
       // Cap what lands in the run row (matches the GitLab error-body cap).
-      await reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
+      await reportState({
+        status: "failed",
+        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+      }).catch((e) =>
         runLog.error("could not report failed state", { error: errMessage(e) }),
       );
     } finally {
@@ -478,15 +690,21 @@ export class RunRunner {
       // leak either).
       this.gateDeadlines.delete(runId);
       this.gatedRuns.delete(runId);
+      // PRD #88: same rule for the clarification park's per-run state.
+      this.questionDeadlines.delete(runId);
+      this.openQuestionIds.delete(runId);
+      this.questionCounts.delete(runId);
       // Evict this run's secrets from the logger now the run is terminal (Decision
       // 7). Reaching this finally means execute() ran to a terminal report; a
       // requeue (worker death) never returns here, so the evict/HOME-cleanup below
       // only ever fire for a run that will not resume.
       for (const s of runScopedSecrets) this.log.removeSecret(s);
       if (worktreePath) {
-        await this.git
-          .removeRunnerClone(worktreePath)
-          .catch((e) => runLog.warn("runner clone cleanup failed", { error: errMessage(e) }));
+        await this.git.removeRunnerClone(worktreePath).catch((e) =>
+          runLog.warn("runner clone cleanup failed", {
+            error: errMessage(e),
+          }),
+        );
       }
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
@@ -494,7 +712,11 @@ export class RunRunner {
       if (worktreePath) {
         await fs
           .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
-          .catch((e) => runLog.warn("skills plugin cleanup failed", { error: errMessage(e) }));
+          .catch((e) =>
+            runLog.warn("skills plugin cleanup failed", {
+              error: errMessage(e),
+            }),
+          );
       }
       // Remove this run's private HOME (agent-home/<runId>, Decision 5). The SDK
       // session transcript under it is only needed to resume, and a terminal run
@@ -508,7 +730,9 @@ export class RunRunner {
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
       if (runHome) {
-        await rmTreeForce(runHome).catch((e) => runLog.warn("run HOME cleanup failed", { error: errMessage(e) }));
+        await rmTreeForce(runHome).catch((e) =>
+          runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
+        );
       }
     }
   }
@@ -538,22 +762,33 @@ export class RunRunner {
       batcher.emit({
         kind: "status",
         agent: "worker",
-        payload: { text: "could not read the repo's .claude/agents/; continuing with your own agent templates" },
+        payload: {
+          text: "could not read the repo's .claude/agents/; continuing with your own agent templates",
+        },
       });
       return { agents: [], ok: false };
     }
     for (const note of detected.notes) {
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: describeRepoAgentNote(note) } });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: describeRepoAgentNote(note) },
+      });
     }
     if (detected.agents.length > 0) {
       const names = detected.agents.map((a) => a.name).join(", ");
       batcher.emit({
         kind: "status",
         agent: "worker",
-        payload: { text: `detected ${detected.agents.length} agent(s) in the repo's .claude/agents/: ${names}` },
+        payload: {
+          text: `detected ${detected.agents.length} agent(s) in the repo's .claude/agents/: ${names}`,
+        },
       });
     }
-    runLog.info("repo agents detected", { count: detected.agents.length, dropped: detected.notes.length });
+    runLog.info("repo agents detected", {
+      count: detected.agents.length,
+      dropped: detected.notes.length,
+    });
     return { agents: detected.agents, ok: true };
   }
 
@@ -572,15 +807,24 @@ export class RunRunner {
         defaultBranch && claim.pipeline.ref === defaultBranch
           ? `ci-fix/pipeline-${claim.pipeline.id}`
           : claim.pipeline.ref;
-      return this.git.runnerCloneForBranch(barePath, fixBranch, fixBranch.replace(/\//g, "-"));
+      return this.git.runnerCloneForBranch(
+        barePath,
+        fixBranch,
+        fixBranch.replace(/\//g, "-"),
+      );
     }
     if (claim.kind === "self_improve") {
       // The FIXED branch (PRD #46 Decision 10): reused every cycle so the worker's
       // idempotent createMergeRequest extends one open MR rather than opening a new
       // one, and successive cycles are tested together.
-      return this.git.runnerCloneForBranch(barePath, SELF_IMPROVE_BRANCH, SELF_IMPROVE_BRANCH.replace(/\//g, "-"));
+      return this.git.runnerCloneForBranch(
+        barePath,
+        SELF_IMPROVE_BRANCH,
+        SELF_IMPROVE_BRANCH.replace(/\//g, "-"),
+      );
     }
-    if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
+    if (claim.issue_iid == null)
+      throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid);
   }
 
@@ -623,7 +867,10 @@ export class RunRunner {
       // templates) is resolved here, persisted via the running report (the only
       // channel a no-input run has, Decision 6), and stated on the feed. The
       // executor re-resolves the SAME absent-parse to build the identical roster.
-      const selection = resolveAgentSelection({ status: "absent" }, repoAgents.length > 0).selection;
+      const selection = resolveAgentSelection(
+        { status: "absent" },
+        repoAgents.length > 0,
+      ).selection;
       // Make this report self-contained (F1): carry the roster alongside the selection
       // so both validate + persist atomically, even if the fire-and-forget running
       // roster report above failed and left the column NULL. Gated on length > 0 — on
@@ -631,13 +878,26 @@ export class RunRunner {
       // sending repo_agents: [] would flip NULL ("not reported") to [] ("detected
       // none") and break that deliberate distinction. rosterFor already prefers the
       // reported roster over the column, so this needs no wire change.
-      const autopilotState: StateRequest = { status: "running", agent_selection: selection };
-      if (repoAgents.length > 0) autopilotState.repo_agents = repoAgentSummaries(repoAgents);
+      const autopilotState: StateRequest = {
+        status: "running",
+        agent_selection: selection,
+      };
+      if (repoAgents.length > 0)
+        autopilotState.repo_agents = repoAgentSummaries(repoAgents);
       await reportState(autopilotState).catch((e) =>
-        runLog.warn("could not persist autopilot agent selection", { error: errMessage(e) }),
+        runLog.warn("could not persist autopilot agent selection", {
+          error: errMessage(e),
+        }),
       );
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: autopilotSelectionText(selection, repoAgents.length) } });
-      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId, agent_source: selection.source });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: autopilotSelectionText(selection, repoAgents.length) },
+      });
+      runLog.info("plan gate: auto-approved (autopilot)", {
+        run_id: runId,
+        agent_source: selection.source,
+      });
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
@@ -653,7 +913,10 @@ export class RunRunner {
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
     const epoch = steering.currentEpoch();
-    runLog.info("plan gate: awaiting approval", { run_id: runId, gate_epoch: epoch });
+    runLog.info("plan gate: awaiting approval", {
+      run_id: runId,
+      gate_epoch: epoch,
+    });
 
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
@@ -665,7 +928,8 @@ export class RunRunner {
       return v; // NOTE: no bump here — the awaiting_approval re-report bumps.
     };
 
-    if (this.planApprovalTimeoutMs <= 0) return settle(await steering.awaitGateEvent(epoch));
+    if (this.planApprovalTimeoutMs <= 0)
+      return settle(await steering.awaitGateEvent(epoch));
 
     // One absolute deadline across all revision rounds: set it on the first entry and
     // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
@@ -677,22 +941,158 @@ export class RunRunner {
     const remaining = Math.max(0, deadlineAt - Date.now());
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<PlanVerdict>((resolve) => {
-      timer = setTimeout(() => resolve({ kind: "reject", reason: "plan approval timed out" }), remaining);
+      timer = setTimeout(
+        () => resolve({ kind: "reject", reason: "plan approval timed out" }),
+        remaining,
+      );
       timer.unref?.();
     });
     try {
-      return settle(await Promise.race([steering.awaitGateEvent(epoch), timeout]));
+      return settle(
+        await Promise.race([steering.awaitGateEvent(epoch), timeout]),
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * PRD #88 M1 clarification park: emit the question, park the run at
+   * awaiting_input, and resolve with the human's answer.
+   *
+   * Structured to mirror gatePlan, including the ABSOLUTE deadline shared across all
+   * of a run's questions. Three things differ, each for a stated reason:
+   *
+   *  - The question id is minted ONCE per park and REUSED on a resume re-park (seeded
+   *    from the claim). Everything about the stale-answer guard rests on that
+   *    stability, on both sides of the wire.
+   *  - The question message is emitted and flushed BEFORE the state report, so the
+   *    question is durable before any surface learns the run parked. A surface that
+   *    saw awaiting_input with no question yet would render a park it cannot explain.
+   *  - Timeout FAILS the run ("clarification timed out") rather than resolving with a
+   *    verdict. The PRD puts a configurable default-action out of scope, so
+   *    fail-closed is the fixed choice.
+   */
+  private async askUser(
+    runId: string,
+    questions: AskUserQuestion[],
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: StateRequest) => Promise<void>,
+    runLog: Logger,
+    autoApprove: boolean,
+    config: ClaimConfig | null,
+  ): Promise<AnswerVerdict> {
+    if (autoApprove) {
+      // Autopilot is "no human in the loop" (PRD #19), so a park would wedge the run
+      // until its deadline with nobody to answer. Resolve immediately with a sentinel
+      // and DO NOT report awaiting_input — an autopilot run must never enter the
+      // parked state at all, which is what a test can actually observe.
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: AUTOPILOT_ANSWER_NOTICE },
+      });
+      runLog.info("clarification: auto-resolved (autopilot)", {
+        run_id: runId,
+        questions: questions.length,
+      });
+      return {
+        kind: "answer",
+        answers: questions.map(() => AUTOPILOT_SENTINEL_ANSWER),
+      };
+    }
+
+    const generation = (this.questionCounts.get(runId) ?? 0) + 1;
+    this.questionCounts.set(runId, generation);
+
+    // Reuse the id this run is already parked on (a resume re-parks on the SAME
+    // question); mint one only for a genuinely new question.
+    let questionId = this.openQuestionIds.get(runId);
+    if (questionId === undefined) {
+      questionId = randomUUID();
+      this.openQuestionIds.set(runId, questionId);
+    }
+
+    batcher.emit({
+      kind: "question",
+      agent: "lead",
+      payload: { question_id: questionId, generation, questions },
+    });
+    // Durable before the park is announced — see the doc comment.
+    await batcher.flush().catch(() => undefined);
+
+    await reportState({
+      status: "awaiting_input",
+      open_question_id: questionId,
+    });
+    runLog.info("clarification: awaiting answer", {
+      run_id: runId,
+      question_id: questionId,
+      generation,
+    });
+
+    const settle = (v: AnswerVerdict): AnswerVerdict => {
+      this.openQuestionIds.delete(runId);
+      return v;
+    };
+
+    const timeoutMs = questionTimeoutMs(config, this.questionTimeoutMs);
+    if (timeoutMs <= 0) return settle(await steering.awaitAnswer(questionId));
+
+    let deadlineAt = this.questionDeadlines.get(runId);
+    if (deadlineAt === undefined) {
+      deadlineAt = Date.now() + timeoutMs;
+      this.questionDeadlines.set(runId, deadlineAt);
+    }
+    const remaining = Math.max(0, deadlineAt - Date.now());
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(REASON_QUESTION_TIMEOUT)),
+        remaining,
+      );
+      timer.unref?.();
+    });
+    try {
+      return settle(
+        await Promise.race([steering.awaitAnswer(questionId), timeout]),
+      );
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 }
 
+/** The answer an AUTOPILOT run receives instead of parking (PRD #88 Decision 8).
+ *  Frozen wording: M5's test asserts it byte-exactly, and the lead is told to record
+ *  the assumption precisely so an unattended run's guesses stay auditable. */
+export const AUTOPILOT_SENTINEL_ANSWER =
+  "no human available — proceed on your best judgment, and note the assumption you made";
+
+const AUTOPILOT_ANSWER_NOTICE =
+  "The agent asked a clarifying question, but this is an autopilot run with no human in the loop — it was told to proceed on its best judgment and record the assumption.";
+
+/** Failure reason when a parked run's answer deadline expires (PRD #88 Decision 5a).
+ *  Fail-closed: the PRD puts a configurable default action out of scope. */
+export const REASON_QUESTION_TIMEOUT = "clarification timed out";
+
+/** The effective answer deadline: the server-configured claim value when it is
+ *  present and positive, else the worker default. An older server omits it (R8). */
+function questionTimeoutMs(
+  config: ClaimConfig | null,
+  fallbackMs: number,
+): number {
+  const secs = config?.question_timeout_seconds;
+  return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
+}
+
 /** MR title from the issue snapshot (never empty). */
 function mrTitle(claim: ClaimResponse): string {
   const t = claim.issue_title?.trim();
   if (t) return t;
-  if (claim.kind === "ci_fix" && claim.pipeline) return `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`;
+  if (claim.kind === "ci_fix" && claim.pipeline)
+    return `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`;
   return `Resolve issue #${claim.issue_iid}`;
 }
 
@@ -755,7 +1155,10 @@ function mrDescription(
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision
  *  6). Repo source names the count; own source names the fallback. */
-function autopilotSelectionText(selection: AgentSelection, repoCount: number): string {
+function autopilotSelectionText(
+  selection: AgentSelection,
+  repoCount: number,
+): string {
   return selection.source === "repo"
     ? `autopilot: using the ${repoCount} agent(s) from the repo's .claude/agents/`
     : "autopilot: using your own agent templates";

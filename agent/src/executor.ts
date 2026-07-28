@@ -3,8 +3,8 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
-import type { PlanVerdict } from "./steering.js";
+import type { AgentSource, AgentTemplate, AskUserQuestion, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
+import type { AnswerVerdict, PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
@@ -108,6 +108,18 @@ export interface RunContext {
    * verdict (approve/reject/cancel), polled from /inputs. Absent in M2/M3.
    */
   gatePlan?(planMd: string): Promise<PlanVerdict>;
+  /**
+   * PRD #88 M1 clarification park. Called by the executor after a turn that made an
+   * ask_user call: the runner emits the `question` run-message, posts /state
+   * awaiting_input, and returns the human's answer (polled from /inputs).
+   *
+   * Optional, and the executor FAILS OPEN when it is absent — a feed notice and the
+   * run continues on the lead's best judgment. That is the opposite of gatePlan,
+   * which fails closed, and the asymmetry is deliberate: an ungated plan would push
+   * unreviewed work, whereas an unaskable question is only a lost opportunity to
+   * clarify. Failing closed here would kill runs on any executor that did not wire it.
+   */
+  askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
   /** M4: report a running/iteration heartbeat (server persists via GREATEST). */

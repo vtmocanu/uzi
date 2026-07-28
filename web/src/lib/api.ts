@@ -735,6 +735,12 @@ export type RunStatus =
   | "claimed"
   | "running"
   | "awaiting_approval"
+  /** PRD #88: parked on an agent-initiated clarification question, awaiting the
+   *  owner's answer. A distinct status from awaiting_approval rather than a sub-state
+   *  of it, because the two resume through different guards and mean different things
+   *  to the person who owes the run an action. M1 lands the type; the badge, tone and
+   *  composer are M2. */
+  | "awaiting_input"
   | "completed"
   | "failed"
   | "cancelled";
@@ -1377,7 +1383,11 @@ export interface RunMessage {
   created_at: string;
 }
 
-export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "revise_plan" | "cancel";
+/** PRD #88 adds "answer": the reply to an ask_user question. Unlike every other kind
+ *  its body is JSON — `{ question_id, answers }` — because an answer has to name the
+ *  question it answers; the api rejects one that names a question which is no longer
+ *  open, and one submitted while the run is not parked at all. */
+export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "revise_plan" | "cancel" | "answer";
 
 // SteerInput is one follow_up steer-queue entry (PRD #95), from GET /api/runs/{id}/
 // inputs. Delivery status is derived client-side: consumed_at null ⇒ Queued (the worker
