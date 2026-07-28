@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 )
 
@@ -159,21 +161,40 @@ func TestVersionEndpointBuiltAtCanonicalised(t *testing.T) {
 }
 
 // TestVersionEndpointGarbageStampsOmitted: unknown beats wrong. An unexpanded CI
-// variable, a `date` default-format string, or a non-numeric commit count is dropped
-// rather than served half-decoded — which is what makes the two CI failure modes in
-// .gitlab-ci.yml's publish:api comment safe by construction.
+// variable, a `date` default-format string, a non-numeric count or a string that is
+// not a full SHA is dropped rather than served half-decoded — which is what makes the
+// CI failure modes described in .gitlab-ci.yml's publish:api comment safe by
+// construction.
+//
+// ALL THREE STAMPS ARE COVERED HERE, and the third was the point of adding it. An
+// earlier version of this table had no `commit` column at all while its first row was
+// named "unexpanded ci variables" and its doc comment claimed to cover the CI failure
+// modes — so the one field that did NOT degrade safely was the one field the table
+// structurally could not reach, and the subtest's name is what stopped the next reader
+// looking. `commit` had no validity gate then: it was served verbatim, so an
+// unexpanded stamp put the literal "$CI_COMMIT_SHA" on the wire.
 func TestVersionEndpointGarbageStampsOmitted(t *testing.T) {
-	for _, tc := range []struct{ name, builtAt, commits string }{
-		{"unexpanded ci variables", "$CI_JOB_STARTED_AT", "$UZI_COMMITS"},
-		{"date default format", "Mon Jul 27 21:12:38 UTC 2026", "two thousand"},
-		{"date only, no time", "2026-07-28", "2060.5"},
-		{"negative count", "", "-1"},
+	for _, tc := range []struct{ name, commit, builtAt, commits string }{
+		{"unexpanded ci variables", "$CI_COMMIT_SHA", "$CI_JOB_STARTED_AT", "$UZI_COMMIT_COUNT"},
+		{"date default format", "not-a-sha", "Mon Jul 27 21:12:38 UTC 2026", "two thousand"},
+		{"date only, no time", "", "2026-07-28", "2060.5"},
+		{"negative count", "", "", "-1"},
+		// A short SHA is the sharpest case: it is a real identifier, just not the one
+		// this field promises. Serving it would make BuildInfoDTO.Commit's "full
+		// 40-char" claim false and hand a consumer something safe to truncate again.
+		{"short sha", "366a282d", "", ""},
+		{"39 chars", "366a282d52095312f54b99698b241ac872e2028", "", ""},
+		{"41 chars", "366a282d52095312f54b99698b241ac872e202844", "", ""},
+		{"40 chars but not hex", "366a282d52095312f54b99698b241ac872e2028z", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
-			h.SetBuildInfo(BuildStamp{BuiltAt: tc.builtAt, Commits: tc.commits})
+			h.SetBuildInfo(BuildStamp{Commit: tc.commit, BuiltAt: tc.builtAt, Commits: tc.commits})
 
 			body := getVersion(t, h)
+			if _, ok := body["commit"]; ok {
+				t.Errorf("commit present for %q, want it omitted (raw=%s)", tc.commit, body["commit"])
+			}
 			if _, ok := body["built_at"]; ok {
 				t.Errorf("built_at present for %q, want it omitted (raw=%s)", tc.builtAt, body["built_at"])
 			}
@@ -187,15 +208,43 @@ func TestVersionEndpointGarbageStampsOmitted(t *testing.T) {
 // TestVersionEndpointWhitespaceStampsTrimmed: a stamp that arrived with surrounding
 // whitespace still parses. Belt-and-braces on a value that crosses a YAML string, a
 // shell word-split and a Docker build arg before it reaches the linker.
+//
+// The commit fixture is a full 40-char SHA and must stay one: trimming is what has to
+// happen BEFORE the length gate, so a padded-but-valid SHA is exactly the case that
+// proves the two steps compose. (This test previously used "abc123", which pinned
+// "any non-empty string is a valid commit" as behaviour.)
 func TestVersionEndpointWhitespaceStampsTrimmed(t *testing.T) {
 	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
-	h.SetBuildInfo(BuildStamp{Commit: " abc123 ", BuiltAt: " 2026-07-28T09:15:00Z\n", Commits: " 7 "})
+	h.SetBuildInfo(BuildStamp{
+		Commit:  " 366a282d52095312f54b99698b241ac872e20284 ",
+		BuiltAt: " 2026-07-28T09:15:00Z\n",
+		Commits: " 7 ",
+	})
 
 	body := getVersion(t, h)
-	wantString(t, body, "commit", "abc123")
+	wantString(t, body, "commit", "366a282d52095312f54b99698b241ac872e20284")
 	wantString(t, body, "built_at", "2026-07-28T09:15:00Z")
 	if string(body["commits"]) != "7" {
 		t.Fatalf("commits = %s, want 7", body["commits"])
+	}
+}
+
+// TestVersionEndpointZeroCommitsPresent: "0" renders as present-not-omitted, the same
+// property uptime_seconds is asserted for. Unreachable in practice — a repo with no
+// commits cannot build this binary — but Commits is a pointer for exactly this reason
+// and the assertion is what stops someone "simplifying" it to a bare int with
+// omitempty, which would silently drop the value.
+func TestVersionEndpointZeroCommitsPresent(t *testing.T) {
+	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
+	h.SetBuildInfo(BuildStamp{Commits: "0"})
+
+	body := getVersion(t, h)
+	raw, ok := body["commits"]
+	if !ok {
+		t.Fatalf("commits missing for a stamped \"0\", want it present (body=%v)", body)
+	}
+	if string(raw) != "0" {
+		t.Fatalf("commits = %s, want 0", raw)
 	}
 }
 
@@ -260,13 +309,91 @@ func TestVersionEndpointUptime(t *testing.T) {
 	}
 }
 
+// buildInfoJSONKeys returns every top-level JSON key apitypes.BuildInfoDTO can emit,
+// by walking its struct tags.
+//
+// Reading TAGS rather than a marshalled response is the entire point of this helper,
+// and the reason the guard below was rewritten. A rendered response contains only the
+// keys its fixture happened to populate, so an `omitempty` field left at its zero
+// value is INVISIBLE to any check over a response — and `omitempty` on an optional
+// field is not an unlucky choice a mutation would have to contrive, it is what this
+// endpoint's omit-never-zero rule REQUIRES of every new optional field. So the gap
+// pointed the same way the house style does. A walk over the type sees a field whether
+// or not anything set it.
+//
+// It recurses into embedded structs carrying no json name because encoding/json
+// PROMOTES their exported fields to the top level: an embedded type's `secret` tag
+// becomes a top-level `secret` key, while a flat field walk sees one field with an
+// empty tag and reports `""`. The flat walk does still fail — `""` is not on any
+// allowlist — but it fails naming the wrong thing, and a reader who sees a test
+// complaining about an empty string diagnoses a broken test. Recursing makes the gate
+// name the key that actually leaked. Not hypothetical in this package:
+// RunListItemDTO embeds RunDTO and AdminWorkerDTO embeds WorkerDTO, so composing an
+// authenticated shape into this public one is the idiomatic move here and therefore
+// the likeliest way a leak arrives.
+func buildInfoJSONKeys(t *testing.T, typ reflect.Type) []string {
+	t.Helper()
+	var keys []string
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue // explicitly off the wire (note: `json:"-,"` names a field "-")
+		}
+		name, _, _ := strings.Cut(tag, ",")
+
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+
+		// Embedded fields are handled BEFORE the unexported check, and that order is
+		// the whole correctness of this helper. encoding/json's typeFields skips an
+		// unexported field only when it is NOT an embedded struct — its own comment
+		// reads "Do not ignore embedded fields of unexported struct types since they
+		// may have exported fields". So `struct{ leaky }` promotes leaky's exported
+		// fields onto the wire even though `leaky` is unexported, and a walk that
+		// tests IsExported first skips the embed and reports nothing.
+		//
+		// Not a hypothetical ordering nit: the first version of this helper had the
+		// check the other way round and MISSED an embedded unexported struct carrying
+		// a `tls_cert_path`. The response-level pass in the caller is what caught it.
+		if f.Anonymous {
+			if name == "" && ft.Kind() == reflect.Struct {
+				keys = append(keys, buildInfoJSONKeys(t, ft)...)
+				continue
+			}
+			if !f.IsExported() && ft.Kind() != reflect.Struct {
+				continue // encoding/json ignores embedded unexported non-struct types
+			}
+			// A named embed, or an embedded exported non-struct type: one key, under
+			// the tag name or the type name. Reported even in the odd unexported-and-
+			// named case — over-reporting fails loudly, under-reporting hides a leak.
+			if name == "" {
+				name = f.Name
+			}
+			keys = append(keys, name)
+			continue
+		}
+
+		if !f.IsExported() {
+			continue // unexported and not embedded: encoding/json never emits it
+		}
+		if name == "" {
+			name = f.Name // untagged: encoding/json uses the Go field name verbatim
+		}
+		keys = append(keys, name)
+	}
+	return keys
+}
+
 // TestVersionEndpointCarriesNothingPrivate is the standing trust assertion, not a
 // value check. GET /api/version is unauthenticated AND unrate-limited, and in k8s it
-// is reachable through an ingress published at path `/` with no auth annotation, so
-// every key below is world-readable to anyone who can reach the deployment. Build-info
-// endpoints conventionally leak hostnames, environment, paths and dependency
-// inventories; this one carries none, so the key set is closed and adding to it is a
-// deliberate act rather than a slip.
+// is by default reachable through an ingress published at path `/` with no auth
+// annotation, so every key below is world-readable to anyone who can reach the
+// deployment. Build-info endpoints conventionally leak hostnames, environment, paths
+// and dependency inventories; this one carries none, so the key set is closed and
+// adding to it is a deliberate act rather than a slip.
 //
 // Read the map as two classes, because they are not the same claim. Most entries are
 // ALREADY public — the fact exists elsewhere in the open, and serving it here reveals
@@ -274,19 +401,59 @@ func TestVersionEndpointUptime(t *testing.T) {
 // process, published because it is worth real debugging time and discloses no
 // identity, topology or schedule. If you are adding a key, say which class it is in
 // and why; if it is neither, it does not belong in this response.
+//
+// The assertion runs over the TYPE's tags and not over a rendered response. The
+// earlier version ranged over one response's keys and could therefore only reject keys
+// that were PRESENT — three agents independently defeated it with an `omitempty` field
+// populated from config (`oidc_issuer`, `db_host`, `tls_cert_path`), each of which
+// rendered nothing under the `config.Config{}` every fixture here uses, and passed.
+// The response-level pass is kept below because it costs nothing and guards this
+// check's own premise: if the handler ever stops returning the DTO (a hand-built map,
+// say), the tag walk would pass vacuously while the response check would not.
 func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
-	public := map[string]bool{
-		"version":  true, // already public: == the image tag, which is in the chart
-		"founded":  true, // already public: a const date
-		"built_at": true, // already public: when a public image was built
-		"commit":   true, // already public: a SHA that is in the repo
-		"commits":  true, // already public: a count over that repo
-		// DISCLOSURE, not already-public. See the Version handler for the decision
-		// and for what would require re-deciding it (an /about page, a signed-out
-		// footer — any new surface widens the audience by default).
-		"uptime_seconds": true,
+	// One list, and the reason is the value rather than a comment so it cannot drift
+	// away from the key it justifies.
+	public := map[string]string{
+		"version":  "already public: == the image tag, which is in the chart",
+		"founded":  "already public: a const date",
+		"built_at": "already public: when a public image was built",
+		"commit":   "already public: a SHA that is in the repo",
+		"commits":  "already public: a count over that repo",
+		"uptime_seconds": "DISCLOSURE, not already-public: a runtime fact about this process. " +
+			"See the Version handler for the decision and for what would require re-deciding " +
+			"it (an /about page, a signed-out footer — any new surface widens the audience).",
 	}
 
+	got := buildInfoJSONKeys(t, reflect.TypeOf(apitypes.BuildInfoDTO{}))
+	if len(got) == 0 {
+		t.Fatal("tag walk found no keys — the guard would pass vacuously; fix the walk, not this line")
+	}
+
+	seen := make(map[string]bool, len(got))
+	for _, k := range got {
+		seen[k] = true
+		if _, ok := public[k]; !ok {
+			t.Errorf("BuildInfoDTO can emit %q, which is not on the public-by-construction list.\n"+
+				"GET /api/version is unauthenticated and unrate-limited, so this field would be "+
+				"world-readable. Either it is already public (the image tag, a commit in the repo) "+
+				"or a considered disclosure — in which case add it to the map WITH its reason and "+
+				"record that reason where it is enforced, in Version's doc comment — or it does not "+
+				"belong in this response at all.\n"+
+				"If %q is an empty string, the field is an embedded struct: encoding/json promotes "+
+				"its fields to the top level, so recurse into it or give it a json name.", k, k)
+		}
+	}
+
+	// The reverse direction: an allowlist entry with no field behind it is a stale
+	// reason, and a stale reason is what makes the next addition look pre-approved.
+	for k := range public {
+		if !seen[k] {
+			t.Errorf("the public list carries %q but BuildInfoDTO has no such key — remove the "+
+				"entry rather than leaving a reason for a field that no longer exists", k)
+		}
+	}
+
+	// Premise guard: the handler must still be returning that type.
 	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)
 	h.SetVersion("0.11.12")
 	h.SetBuildInfo(BuildStamp{
@@ -294,13 +461,11 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 		BuiltAt: "2026-07-28T09:15:00Z",
 		Commits: "2060",
 	})
-
 	for k := range getVersion(t, h) {
-		if !public[k] {
-			t.Errorf("GET /api/version carries %q, which is not on the public-by-construction list. "+
-				"This route is unauthenticated and unrate-limited: either the field is already public "+
-				"(image tag, repo commit) and belongs on the list with a reason, or it does not belong "+
-				"in this response at all.", k)
+		if _, ok := public[k]; !ok {
+			t.Errorf("the rendered response carries %q, which the tag walk did not report — the "+
+				"handler is no longer serving apitypes.BuildInfoDTO, so the walk above is not "+
+				"guarding what is actually on the wire", k)
 		}
 	}
 }

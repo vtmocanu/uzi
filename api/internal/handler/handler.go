@@ -325,6 +325,34 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // it, so the age stays correct without a release.
 const foundedDate = "2026-07-03"
 
+// isFullSHA reports whether s is a full 40-character hex commit SHA.
+//
+// It exists so `commit` degrades the same way `built_at` and `commits` do. Without it
+// commit was the one stamp with no validity gate — served verbatim, any non-empty
+// string — so an unexpanded CI variable reached the wire as the literal
+// "$CI_COMMIT_SHA". That is the one shape this endpoint must not produce: a value that
+// looks like an answer. It also makes BuildInfoDTO.Commit's "the full 40-char source
+// SHA" an enforced property rather than an aspiration, which matters once a consumer
+// truncates it for display — the first seven characters of "$CI_COMMIT_SHA" are
+// "$CI_COM", and that reads like a short SHA.
+//
+// Uppercase is accepted. git and $CI_COMMIT_SHA both emit lowercase, so this will not
+// come up; rejecting a hex SHA over its case would be a surprising failure with no
+// upside.
+func isFullSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Version reports this instance's build coordinates (PRD #175): the Model-B release
 // version, the project's founding date, this process's uptime, and — on a stamped
 // release image — the source commit, the build time and the commit count.
@@ -335,11 +363,13 @@ const foundedDate = "2026-07-03"
 // mounted directly under r.Route("/api") with nothing above it but Recoverer and
 // RequestID, route_limiter_mounts_test.go pins it as noLimiter, and in k8s
 // deploy/chart/templates/web-ingress.yaml publishes the SPA origin at path `/` with
-// no auth annotation. So this body is world-readable, credential-free and unmetered
+// no auth annotation BY DEFAULT (both the path and the annotations are values, so a
+// hardened override could narrow them — the enforced property is the route mount
+// above, not the chart). So this body is world-readable, credential-free and unmetered
 // to anyone who can reach the ingress.
 //
 // Most of what it carries is public by construction — the version is the chart's
-// image tag, the commit is already pushed as a Harbor tag, built_at is implied by the
+// image tag, the commit is in the repo, built_at is implied by the
 // release, founded and commits are consts. `uptime_seconds` is NOT in that class and
 // is the one field that needs a decision rather than an observation: it is a RUNTIME
 // fact about this process, not a build fact about this image. It is published
@@ -365,7 +395,9 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 	info := apitypes.BuildInfoDTO{
 		Version: h.version,
 		Founded: foundedDate,
-		Commit:  h.commit,
+	}
+	if isFullSHA(h.commit) {
+		info.Commit = h.commit
 	}
 	if t, err := time.Parse(time.RFC3339, h.builtAt); err == nil {
 		// Re-formatted from the parsed value, so the wire carries one canonical
@@ -406,6 +438,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
+		// unauthenticated by design — see Version's doc comment before moving this
+		// line or wrapping this group in middleware.
 		r.Get("/version", h.Version)
 
 		r.Route("/auth", func(r chi.Router) {

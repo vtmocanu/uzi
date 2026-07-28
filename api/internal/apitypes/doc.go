@@ -6,6 +6,15 @@
 // unauthenticated GET /api/version. The membership rule is "both ends of the wire
 // need the shape", not "the route is authenticated".
 //
+// That is a bigger change for a future author than it looks, so it is stated here
+// rather than only on the type. Until BuildInfoDTO, every type in this package sat
+// behind auth, so "is this field safe to expose?" had ONE package-level answer. It now
+// has two. Someone adding a field to BuildInfoDTO is warned by its own doc; someone
+// making a CROSS-CUTTING change — a shared Meta embed, a trace_id on every DTO, a
+// linter-driven sweep — reads this page and would not be. One type here is served on
+// an UNAUTHENTICATED route, so a change touching every type in this package touches a
+// world-readable one.
+//
 // It is a LEAF: it imports only the standard library. That is the whole point —
 // the CLI links these types without dragging pgx, chi, or any handler/service
 // dependency into the binary (Success Criterion 8, enforced by a go list -deps
