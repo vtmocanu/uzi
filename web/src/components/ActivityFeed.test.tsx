@@ -191,6 +191,16 @@ describe("ActivityFeed crew roster", () => {
     expect(getByTitle("worker: waiting")).toBeTruthy();
   });
 
+  // PRD #88: a clarification park stops the lead BETWEEN turns, so nothing else can
+  // proceed either — the same crew-wide block the plan gate is. Without this arm the
+  // status falls to the recency split and every lane ages to `idle` after 45s while a
+  // human is simply thinking, which reads as a dead run rather than a parked one.
+  it("every agent reads `waiting` at a clarification park", () => {
+    const { getByTitle } = renderFeed(leadWorkerLead(), { status: "awaiting_input", health: "ok" });
+    expect(getByTitle("lead: waiting")).toBeTruthy();
+    expect(getByTitle("worker: waiting")).toBeTruthy();
+  });
+
   it("every agent reads `waiting` when the worker is gone (waiting_worker)", () => {
     const { getByTitle } = renderFeed(leadWorkerLead(), { status: "running", health: "waiting_worker" });
     expect(getByTitle("lead: waiting")).toBeTruthy();
@@ -232,6 +242,39 @@ describe("ActivityFeed crew roster", () => {
     expect(getByTitle("lead: idle")).toBeTruthy();
     // …so its header one-liner must NOT echo a state word — a tool_result reads "Ran a tool".
     expect(getByText("Ran a tool")).toBeTruthy();
+  });
+
+  it("summarizes the clarification round-trip WITHOUT echoing the question text", () => {
+    // PRD #88. The header one-liner is a short phrase, and the question is untrusted
+    // model output that would render here as a plain string, OUTSIDE the <Markdown> sink
+    // the feed row routes it through. So the summary is a fixed phrase by design, not by
+    // omission — the row below carries the content.
+    const now = Date.now();
+    const fresh = new Date(now - 500).toISOString();
+    const msgs = [
+      m(1, "text", { text: "planning" }, "lead", fresh),
+      m(
+        2,
+        "question",
+        {
+          question_id: "q-1",
+          generation: 1,
+          questions: [{ question: "Which <script>alert(1)</script> backend?", header: "H" }],
+        },
+        "lead",
+        fresh,
+      ),
+    ];
+    const { getByText, container } = renderFeed(msgs, { status: "awaiting_input", health: "ok" });
+    expect(getByText("Asked you a question")).toBeTruthy();
+    expect(container.querySelector("script")).toBeNull();
+
+    cleanup();
+    const answered = [
+      ...msgs,
+      m(3, "answer", { answers: ["Postgres"] }, "lead", fresh),
+    ];
+    expect(renderFeed(answered, { status: "running", health: "ok" }).getByText("Received your answer")).toBeTruthy();
   });
 
   it("a terminal run reads every agent `done`", () => {

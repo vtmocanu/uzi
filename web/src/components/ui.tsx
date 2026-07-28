@@ -208,6 +208,11 @@ const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
+  // PRD #88: parked on a clarification question. Deliberately IDENTICAL to
+  // awaiting_approval — same shape of debt (a human owes the run an action while a
+  // worker is held), and the PRD frames it as the third human-in-the-loop channel
+  // alongside the plan gate (D-O #4). The label distinguishes them; the tone must not.
+  awaiting_input: { tone: "warning", pulse: true },
   completed: { tone: "ok" },
   failed: { tone: "danger" },
   cancelled: { tone: "neutral" },

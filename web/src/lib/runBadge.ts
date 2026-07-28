@@ -94,7 +94,7 @@ export function isStoppedRun(status: string, stopKind: StopKind | null | undefin
 // calm neutral, awaiting-approval is amber, a genuine failure is rose, completed
 // is green, claimed/running are sky. Shared by the issue-view history rows.
 export function runStatusTone(status: string, stopKind: StopKind | null | undefined): BadgeTone {
-  if (status === "awaiting_approval") return "warning";
+  if (status === "awaiting_approval" || status === "awaiting_input") return "warning";
   if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
@@ -240,6 +240,13 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     }
     case "awaiting_approval":
       return { kind: "badge", label: "awaiting approval", tone: "warning", pulse: false };
+    // PRD #88. The default arm below would already produce a warning-toned "awaiting
+    // input" via runStatusTone… except it does not: the default hardcodes `neutral`.
+    // So this case is what stops a parked question rendering as a calm grey chip
+    // indistinguishable from `cancelled`. The label says "answer" rather than echoing
+    // the enum, because "awaiting input" reads as machine waiting for machine.
+    case "awaiting_input":
+      return { kind: "badge", label: "needs your answer", tone: "warning", pulse: false };
     case "failed":
       return {
         kind: "badge",
@@ -288,4 +295,23 @@ export function retryHint(runCount: number): string | null {
 // a human is the blocker while a worker is held busy.
 export function isAwaitingApproval(status: string): boolean {
   return status === "awaiting_approval";
+}
+
+// isAwaitingInput is its PRD #88 SIBLING, deliberately not a widening of it. The two
+// human-in-the-loop reasons are a distinct run status precisely so a surface can tell
+// "approve my plan" from "answer my question" (PRD Decision 3); folding them into one
+// predicate would put back exactly what the status split removed, and the board strip
+// would then tell a user to approve a plan that does not exist.
+//
+// What they SHARE is the treatment: same warn tone, same loud card ring, same strip
+// (D-O #4). needsHumanAttention below is where that sharing is expressed, once.
+export function isAwaitingInput(status: string): boolean {
+  return status === "awaiting_input";
+}
+
+// needsHumanAttention is the union: a run parked on ANY human decision. Use it for
+// presentation that is identical for both (the card ring, the favicon dot); use the two
+// predicates above wherever the WORDING differs, which is anywhere a human reads it.
+export function needsHumanAttention(status: string): boolean {
+  return isAwaitingApproval(status) || isAwaitingInput(status);
 }

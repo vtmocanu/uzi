@@ -233,7 +233,12 @@ function crewStateFor(
 ): CrewState {
   if (isTerminalStatus(run.status)) return "done";
   // Gate / no-live-worker dominates the whole crew: everyone is blocked.
-  if (run.status === "awaiting_approval" || run.health === "waiting_worker") return "waiting";
+  // PRD #88: a clarification park blocks the whole crew the same way the plan gate
+  // does — the lead is stopped between turns and nothing else can proceed — so it joins
+  // the gate arm rather than falling through to the recency split, which would age every
+  // lane to `idle` while a human is simply thinking.
+  if (run.status === "awaiting_approval" || run.status === "awaiting_input" || run.health === "waiting_worker")
+    return "waiting";
   if (actor === activeActor) {
     return STALLED_HEALTH.has(run.health) ? "stalled" : "working";
   }
@@ -304,6 +309,14 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return "Revising the plan";
     case "plan_feedback":
       return "Sent revision feedback";
+    // PRD #88. Deliberately NOT the question text: this line is the header summary for a
+    // whole lane, so it must stay one short phrase, and the text is untrusted
+    // model output that would render here as a plain string outside the <Markdown> sink
+    // the feed row uses.
+    case "question":
+      return "Asked you a question";
+    case "answer":
+      return "Received your answer";
     default:
       return "";
   }

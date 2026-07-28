@@ -19,6 +19,12 @@ describe("deriveFaviconState — the four states in isolation", () => {
   it("attention for a run awaiting approval", () => {
     expect(deriveFaviconState([run("awaiting_approval")], 0, NONE)).toBe("attention");
   });
+  // PRD #88. The tab dot cannot say WHICH action is owed and does not need to — it says
+  // "you are the blocker", and a run parked on a question is exactly that. Leaving it
+  // out would make the one status designed to be noticed the only one the tab ignores.
+  it("attention for a run awaiting the user's ANSWER too", () => {
+    expect(deriveFaviconState([run("awaiting_input")], 0, NONE)).toBe("attention");
+  });
   it("running for a run in flight", () => {
     expect(deriveFaviconState([run("running")], 0, NONE)).toBe("running");
   });
