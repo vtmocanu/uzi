@@ -14590,3 +14590,217 @@ because of that, and none of them said so out loud except one SQL comment.
     cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
+
+# PRD #88 — Ask-user clarification: agent-initiated questions before and during a run
+
+Serves human Feature #88. Numbers start at 455 because 447 is `origin/main`'s
+(issue #177) and 448–454 are held by the in-flight PRD #175 branch; re-derive above
+the live head at landing, per the goose-style renumber rule.
+
+## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
+
+- **A new status, not a reuse.** The obvious economy — park a question in
+  `awaiting_approval` and let the plan gate's plumbing carry it — is structurally
+  impossible, not merely untidy. `SetRunRunning`'s resume gate requires a **consumed
+  `approve_plan`** before it will un-park an `awaiting_approval` run, and an `answer`
+  can never satisfy that predicate. A question parked in the approval status would be
+  answerable and unresumable.
+- **The guard is TWO independent conjuncts, never one merged predicate.**
+  `AND (status <> 'awaiting_approval' OR EXISTS(… kind='approve_plan' …))` and
+  `AND (status <> 'awaiting_input' OR EXISTS(… kind='answer' …))`. A merged
+  `status NOT IN (…) OR kind IN (…)` would let a consumed `answer` satisfy the *plan*
+  gate and a consumed `approve_plan` satisfy the *question* gate — re-opening PRD
+  #44's F2 sideways. Consequence for tests: on a fixture where a run has **both**
+  inputs consumed, either half alone is sufficient, so no such fixture can observe
+  one clause being deleted. The discriminating fixture holds **exactly one**.
+- **A new status inherits nothing.** Every `status IN (…)` site that lists
+  `awaiting_approval` had to be enumerated and extended by hand: the DB CHECK, the
+  worker-death and register-time sweeps, `statusLabel` in the Slack notifier,
+  `knownRunStatuses` in the CLI, the web `RunStatus` union, the board's attention
+  treatment. The cost of the status IS that enumeration, and an enumeration is a
+  measurement with a shelf life — see §456's invariant for the same shape one level in.
+- **Deliberately NOT added: a health arm.** `awaiting_input` stays out of
+  `ListActiveRunsForHealth` and no `input_idle` reason exists. `SetRunAwaitingInput`
+  clears health on entry the way `SetRunAwaitingApproval` does, so there is no stale
+  flag to sweep; and the user is already told (Slack DM, board badge, CLI, run view),
+  so an idle nudge is a reminder layered on an existing notification rather than the
+  notification itself. Adding the status to the sweep **without** a matching arm is
+  the one combination that is pure cost: a per-tick self-clear that evaluates nothing.
+- **`awaiting_input` also had to be added to the register-time and stale-heartbeat
+  sweeps**, or a worker that restarts faster than `WORKER_HEARTBEAT_STALE` leaves the
+  run parked forever pointed at an execution that no longer exists, with the deadline
+  (worker-in-memory) gone and no user-visible signal. The requeue predicates are a
+  status enumeration, so they are exactly the sites a new status silently misses.
+- **The status domain is nine values**, and the migration that declares it carries the
+  **union** with the sibling PRD's `limit_wait`. A `DROP CONSTRAINT`+`ADD CONSTRAINT`
+  is absolute, so the last-running migration's list is the whole domain; ours runs
+  last because it is the only editable one (the sibling's is applied history). A
+  rebuild only needs the domain; the ordering argument is recorded because it is the
+  general rule for two branches widening the same CHECK.
+
+## 456. PRD #88 — staleness is keyed on question IDENTITY; every clock- and ordinal-based design died to ONE mechanism
+
+- **The problem.** A run may ask up to `QUESTION_MAX` questions. An answer written
+  against Q1 must never resolve Q2. Three mechanisms were proposed — `created_at >
+  awaiting_input_since`, `consumed_at > awaiting_input_since`, and a worker-side
+  generation counter — and **all three key the answer to WHEN it arrived relative to a
+  park**.
+- **All three are refuted by the requeue re-park.** A worker death re-queues the run;
+  the resume consumes the pending answer within one poll of starting (steering starts
+  before the checkout) and only then re-parks. So the honest answer arrives *before*
+  the new park and every when-based key rejects it: the user answered correctly, got a
+  success response and a Slack ✅, and the answer evaporated. The invalidating event is
+  one the user neither caused nor can see.
+- **Ruling: key on identity, which survives by construction.** `runs.open_question_id`
+  is stamped at park and **re-stamped to the same value** on a resume re-park;
+  `run_user_inputs.question_id` carries the answer's target. The resume guard is *a
+  consumed `answer` whose question id equals the run's current open question id*, so
+  the predicate is a no-op across a requeue. A NULL `open_question_id` makes the
+  equality NULL and the guard blocks — fail-closed. Identity also subsumes the
+  premature-answer case for free: an answer submitted when nothing is parked names no
+  open question.
+- **Do not build a counter BESIDE identity.** A conjunction is only as good as its
+  weaker clause: an arrival counter bumped at park with no grandfathering discards
+  exactly the pre-death answer identity exists to honour. One waiter, no counter,
+  identity as the only staleness key. The worker's `answerWaiter`/`answerBuffer` stay
+  distinct from the gate's slots, and the question path never touches `gateEpoch` —
+  `gatePlan` decides "first gate does not bump" from `gatedRuns`, so a bump from the
+  question path would shift the first plan gate off epoch 0.
+- **🔴 THE INVARIANT THAT KEEPS IDENTITY HONEST: no run-state setter may leave a
+  RESOLVED `open_question_id` behind.** Carried by two call sites (`SetRunRunning` and
+  `SetRunAwaitingApproval`) and by nothing else. It is not decorative: on the pre-run
+  path a park goes `awaiting_input → awaiting_approval` with **no intervening
+  `running` report**, so without the second clear the run reaches the plan gate still
+  carrying the resolved id; a requeue re-delivers it in the claim, the worker seeds
+  from that snapshot, and a **new** question reuses the id — at which point the
+  already-consumed `answer` satisfies the guard and the design degenerates to
+  has-ever-been-answered. Sufficient by enumeration: from `awaiting_input` the only
+  non-terminal destinations are `running` and `awaiting_approval`. **A third
+  non-terminal destination added later re-opens this and nothing would catch it**,
+  which is why the invariant is stated in the query comment rather than left implicit.
+- **The server-side clear is the ONLY defence**, because the worker seeds its map from
+  a claim snapshot taken before its own `running` report. A worker-side fix cannot
+  reach it.
+
+## 457. PRD #88 — the answer wire: a JSON body that NAMES its question, and Slack deriving that name from the card the reply FOLLOWS
+
+- **The `answer` steering body is JSON `{question_id, answers}`**, not a bare string.
+  Identity keying makes a plain-text body impossible, and `approve_plan` already
+  carries parsed JSON, so the shape is in-idiom. A **malformed body is rejected, never
+  defaulted** — the opposite of `parseAgentSelection`'s "malformed → own" fallback,
+  because there a fallback picks a safe default while here accepting an unidentifiable
+  answer is the exact harm the guard exists to prevent.
+- **The id is stored in a COLUMN, not extracted from the body in SQL.**
+  `body::jsonb ->> 'question_id'` is unsafe: `body` is bare `text` shared with prose
+  `follow_up` bodies, and the planner may evaluate the cast before the `kind='answer'`
+  filter that would make it well-formed, erroring the whole statement. The server
+  parses and validates, then persists to `run_user_inputs.question_id`.
+- **Web and CLI are safe for a reason Slack does not have: they ECHO BACK the id they
+  were shown.** Slack free text carries no id, so it must be **derived** — and
+  "whatever question is open at arrival time" is an arrival-time key wearing
+  identity's clothes, which re-admits precisely the Q1-reply-after-Q2-park case.
+- **Correct derivation: resolve to the question the reply FOLLOWS, by `ts`.** The
+  Slack anchor records the posted question's `question_id` **and** its `ts`. A reply
+  whose `ts` is after the current question's card answers the current question; a reply
+  before it answers a superseded one and is **rejected as stale** through an explicit
+  error, not dropped. `MessageTS` returns for this one job — deciding *which question
+  free text belongs to* — and is still not the staleness key. **The wire shape is
+  unchanged**: Slack submits the same JSON, so Slack is not a second contract.
+- **A `ts` comparison must validate the VALUE, not just the parse.**
+  `strconv.ParseFloat` returns `+Inf` with a **nil error** for five case-insensitive
+  spellings (`Inf`, `+Inf`, `Infinity`, …), and `+Inf` is after every real card, so an
+  error-only guard accepts a crafted timestamp and defeats the ordering entirely.
+  Meanwhile a genuine parse failure returns `0`, which the comparison already rejects —
+  so the error check on its own decided nothing. Require **finite on both sides**.
+- **Answer bodies are scrubbed and bounded server-side, inside `SubmitInput`**, so
+  every surface inherits it. Slack's reply path already scrubbed; the web and CLI paths
+  did not, and #88 changes the risk in kind because the agent now *asks the user for
+  information* — the prompt that elicits a credential paste — from question text that
+  is attacker-influenceable via the repo. The prompt separately forbids the lead from
+  ever asking for a credential, token or password. `ScrubSecrets` moved down into its
+  own package rather than importing `slacksvc` into the core service, which is
+  deliberately outside that import graph.
+- **Escape per field, never the assembled message.** Slack reuses PRD #41's
+  `ScrubSecrets → EscapeMrkdwn → truncate-on-rune-boundary → deep link as a separate
+  block` pipeline: escape the whole **untrusted** blob (which carries no trusted markup
+  of its own), then append trusted markup as its own block.
+- **`ask_user` is a SIGNAL tool, and it is extracted INSIDE the subagent guard.** If
+  `isSignalToolName` does not learn it, the model-authored question JSON also persists
+  as an ordinary `tool_use` message — a second, unpinned sink for attacker-influenceable
+  text that an escaped-render test on `kind=question` would not see. And a
+  prompt-injected **subagent** reaching `ask_user` posts attacker-chosen text into the
+  owner's Slack DM under uzi's bot identity: a phishing primitive, not a spurious park.
+
+## 458. PRD #88 — `ctx.askUser` fails OPEN, the caps ride the CLAIM CONFIG, and the honest ceilings multiply by the requeue budget
+
+- **`ctx.askUser` fails OPEN when unwired** — feed notice, run continues — which is
+  the **opposite** of `ctx.gatePlan`, which fails closed. A question the worker cannot
+  surface must not kill the run; a plan that cannot be gated must not proceed. The
+  asymmetry is the decision, and it is why the two must not be refactored into one
+  optional-callback helper.
+- **Bounds are worker-ENFORCED but claim-config-SUPPLIED.** `question_max` and
+  `question_timeout_seconds` ride the claim config like `plan_max_revisions`, **not** a
+  worker env var: the k8s worker renderer puts exactly one tuning var into a hosted
+  pod, so a worker-env knob would be unconfigurable on the runtime CLAUDE.md names
+  primary. "Worker-side" describes where the cap is *enforced* and says nothing about
+  where it is *configured*. Defaults 5 and 86400; a worker that receives neither falls
+  back to the same numbers, so an older server degrades to 5 rather than to unbounded.
+- **🔴 THE DOCUMENTED CEILINGS ARE PER-EXECUTION, AND THE HONEST ONES MULTIPLY.** Both
+  the counter and the deadline are worker-in-memory locals of `execute()`, so a requeue
+  restarts them. The true bounds are `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` and
+  `QUESTION_TIMEOUT × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults, not five.
+  **Both caveats must be stated wherever either is**: documenting the timeout's and not
+  the cap's is worse than documenting neither, because a reader who finds one
+  reasonably infers the other has none.
+- **The two failures are asymmetric, deliberately.** Deadline expiry fails **CLOSED**
+  (the run fails, "clarification timed out"); a configurable default-action is out of
+  scope. Cap exhaustion does **NOT** fail — the lead is told the question could not be
+  asked and proceeds on best judgment, which is pre-#88 behaviour. Parking a run
+  because it asked too many questions would convert an assistance mechanism into a
+  guardrail, which it is not: `ask_user` is not one of the four `main`-protection
+  layers, so "don't weaken a layer" does not apply to it.
+- **Mixed-fleet skew is accepted and documented, not gated.** A run resumed onto a
+  pre-#88 worker degrades mid-run to *the agent proceeds on a guess* — exactly what the
+  tree did before this PRD, so not a regression against `main` — and pre-run to a
+  `REASON_NO_PLAN` failure whose text is misleading for whoever debugs it. Gating the
+  resume on `workers.version` was rejected on a second, independent ground: that field
+  is self-reported and sanitized as untrusted. **Accepted, documented cost:** the Slack
+  ✅ fires when `SubmitInput` returns, i.e. when the row was enqueued, so on a skewed
+  worker the user gets a checkmark for an answer destroyed in transit.
+
+## 459. PRD #88 — autopilot AUTO-RESOLVES and never parks; the open question is DERIVED from the feed, never carried on the wire
+
+- **An autopilot run must never enter `awaiting_input`.** The short-circuit sits in the
+  worker's ask path the way the auto-approve short-circuit sits in `gatePlan`: fed by
+  `claim.auto_approve`, it resolves immediately with a sentinel answer telling the lead
+  to proceed on its best judgment and record the assumption.
+- **And it must emit no `question` message.** The park and the message are separate
+  properties, and the second is the security-shaped one: a `question` in the feed of an
+  unattended run implies a human was consulted when none was. The short-circuit emits a
+  `status` message instead. Recorded because the two properties fail together under the
+  obvious mutation and separately under a targeted one — an assert-based test that
+  checks the park first aborts before ever evaluating the message property.
+- **No new DTO field and no new column for the open question.** It is derived from the
+  run feed by `seq` — latest of `{question, answer}` — exactly as the run view already
+  derives the gate state from the latest of `{plan, plan_revising}`. Web, Slack and CLI
+  share one derivation rule instead of three, and no surface reads a DTO field that
+  was never going to exist.
+- **The ordinal ("question 2 of this run") is COUNTED from `question` messages, not
+  carried.** A `generation` field was on the wire briefly, was never read back, and was
+  removed: it was a correctly-inert display value wearing the name of the mechanism
+  identity-keying had struck, blessed by a design doc calling it "the stale-answer
+  discriminator". The next person to "restore the missing check" would have
+  reintroduced the requeue rejection. In the feed the ordinal is a **fact** and, unlike
+  a worker-held counter, stays correct across a requeue.
+- **The live region for a new question is ALWAYS MOUNTED in the run view; only its
+  content changes, keyed on question identity.** Assistive tech announces *changes* to
+  a region that already existed, so a `role="status"` created in the same tick as its
+  first content is typically silent — it browser-tests as present and reaches no one.
+  The question panel itself therefore carries **no** `aria-live` and no `role="status"`,
+  pinned by an **absence test**, so that a later tidy-up moving the region "closer to
+  where it belongs" cannot silently reintroduce the bug.
+- **The mock engine is a CONTRACT, not a fixture.** `handleInput` had no `default` and
+  no exhaustiveness check, so `revise_plan` already fell through silently; `answer`
+  would have reproduced that exactly. It gained a `never` guard, and the mock parks
+  **twice**, because a one-question fixture cannot tell a real ordinal from a
+  hardcoded 1.

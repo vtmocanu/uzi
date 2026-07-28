@@ -567,6 +567,16 @@ ADR at `adr/0035-run-limit-retry.md`.
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 
+## Feature #88 — Ask-user clarification: the agent can ask the human a question
+
+Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/88-ask-user-clarification.md`.
+
+- An agent can ask the user a clarifying question and wait for the answer, before
+  and during a run. [user, the originating ask on #88]
+- One PRD owns the whole mechanism — pre-run and mid-run both. [user 2026-07-19]
+- PRD #84 only *emits* pre-run spec questions into this mechanism; it does not build
+  the surface. [user 2026-07-19]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
