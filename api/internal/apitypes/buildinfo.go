@@ -3,12 +3,16 @@ package apitypes
 // BuildInfoDTO is the unauthenticated GET /api/version response (PRD #175): the set
 // of coordinates a deployed instance can state about itself.
 //
-// The route stays unauthenticated and unrate-limited because every field here is
-// ALREADY public — the image tag is in the chart, the commit is in the repo. That is
-// a standing constraint on this type, not a description of it: no field may be added
-// that is not already public. Hostnames, environment, filesystem paths and dependency
-// inventories are exactly what a build-info endpoint conventionally leaks, and this
-// response carries none of them.
+// The route is unauthenticated and unrate-limited, so this struct's fields are
+// world-readable to anyone who can reach the ingress. Most are public by construction
+// — the image tag is in the chart, the commit is in the repo. UptimeSeconds is the
+// exception and is a deliberate disclosure rather than an already-public fact; the
+// reasoning lives with the handler that enforces it, in internal/handler's Version.
+//
+// That is a standing constraint on this type, not a description of it: a new field is
+// either already public, or a considered disclosure recorded where it is enforced.
+// Hostnames, environment, filesystem paths and dependency inventories are exactly what
+// a build-info endpoint conventionally leaks, and this response carries none of them.
 //
 // Version and Founded are always present. Everything else is OMITTED when unknown
 // rather than zero-valued: a `dev` build reporting commit "" and built_at
@@ -43,7 +47,10 @@ type BuildInfoDTO struct {
 	// it is independently droppable: nothing may depend on its presence, and every
 	// consumer must render correctly without it.
 	Commits *int `json:"commits,omitempty"`
-	// UptimeSeconds is how long this process has been serving.
+	// UptimeSeconds is how long this process has been serving. The only RUNTIME fact
+	// in this struct, and the only field that is a decision rather than an already-
+	// public value — see the Version handler for why it is published and what would
+	// require re-deciding it.
 	//
 	// A POINTER for correctness, not tidiness: 0 is a legitimate uptime during a
 	// process's first second, so `omitempty` on a bare int64 would conflate it with

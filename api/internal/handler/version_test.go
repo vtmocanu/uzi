@@ -261,18 +261,30 @@ func TestVersionEndpointUptime(t *testing.T) {
 }
 
 // TestVersionEndpointCarriesNothingPrivate is the standing trust assertion, not a
-// value check: GET /api/version is unauthenticated and unrate-limited, which is only
-// defensible while every field it carries is already public. Build-info endpoints
-// conventionally leak hostnames, environment, paths and dependency inventories; this
-// one must carry none, so the key set is closed and adding to it is a deliberate act.
+// value check. GET /api/version is unauthenticated AND unrate-limited, and in k8s it
+// is reachable through an ingress published at path `/` with no auth annotation, so
+// every key below is world-readable to anyone who can reach the deployment. Build-info
+// endpoints conventionally leak hostnames, environment, paths and dependency
+// inventories; this one carries none, so the key set is closed and adding to it is a
+// deliberate act rather than a slip.
+//
+// Read the map as two classes, because they are not the same claim. Most entries are
+// ALREADY public — the fact exists elsewhere in the open, and serving it here reveals
+// nothing new. `uptime_seconds` is a considered DISCLOSURE: a runtime fact about this
+// process, published because it is worth real debugging time and discloses no
+// identity, topology or schedule. If you are adding a key, say which class it is in
+// and why; if it is neither, it does not belong in this response.
 func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 	public := map[string]bool{
-		"version":        true, // == the image tag, which is in the chart
-		"founded":        true, // a const date
-		"built_at":       true, // when a public image was built
-		"commit":         true, // a SHA that is in the repo
-		"commits":        true, // a count over that repo
-		"uptime_seconds": true, // how long this process has served; no identity in it
+		"version":  true, // already public: == the image tag, which is in the chart
+		"founded":  true, // already public: a const date
+		"built_at": true, // already public: when a public image was built
+		"commit":   true, // already public: a SHA that is in the repo
+		"commits":  true, // already public: a count over that repo
+		// DISCLOSURE, not already-public. See the Version handler for the decision
+		// and for what would require re-deciding it (an /about page, a signed-out
+		// footer — any new surface widens the audience by default).
+		"uptime_seconds": true,
 	}
 
 	h := New(nil, nil, config.Config{}, nil, nil, nil, nil, nil, nil)

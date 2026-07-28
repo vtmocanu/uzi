@@ -98,14 +98,17 @@ type Handler struct {
 	usagePoker UsagePoker
 	// version is the server build version, stamped into cmd/server via ldflags
 	// (Model B: == the release git tag) and served unauthenticated at GET
-	// /api/version, where the SPA reads it for the footer badge and for PRD #113's
-	// worker upgrade classification. Defaults to "dev" on an un-stamped local/compose
-	// build. Set via SetVersion.
+	// /api/version. Two consumers read it: the SPA, for the footer badge and for PRD
+	// #113's worker upgrade classification, and the uzi CLI, which reports it
+	// alongside its own ldflags stamp (PRD #175 M4). Defaults to "dev" on an
+	// un-stamped local/compose build. Set via SetVersion.
 	//
-	// (This comment used to claim the endpoint existed "so the SPA footer and the uzi
-	// CLI report one coordinate". The uzi CLI was never a consumer — api/internal/uzicli
-	// contains no /version call; `uzi version` prints its own ldflags stamp, and the two
-	// agree only because the same tag stamps both. Corrected 2026-07-28 with PRD #175.)
+	// (Before PRD #175 this comment said the endpoint existed "so the SPA footer and
+	// the uzi CLI report one coordinate", which was false as written: the CLI was not
+	// a consumer at all — api/internal/uzicli held no /version call, `uzi version`
+	// printed only its own stamp, and the two agreed solely because the same tag
+	// stamps both. #175 M4 makes the shared coordinate real rather than assumed. If
+	// M4 is ever dropped, this comment goes back to naming one consumer.)
 	version string
 	// commit / builtAt / commits are the rest of GET /api/version's build coordinates
 	// (PRD #175), stamped into cmd/server by the same ldflags line as version and
@@ -327,11 +330,34 @@ const foundedDate = "2026-07-03"
 // release image — the source commit, the build time and the commit count.
 //
 // Unauthenticated and unrate-limited like Health, and that is a deliberate standing
-// property rather than an oversight: every field is already public (the image tag is
-// in the chart, the commit is in the repo). A field that is NOT — a hostname, an env
-// var, a filesystem path, a dependency inventory — would change the route's trust
-// properties, and this is precisely the endpoint class where that conventionally goes
-// wrong. Check any addition against that before adding it.
+// property rather than an oversight. It is also where the property is ENFORCED, which
+// is why the rest of this comment is here and not only in the PRD: the route is
+// mounted directly under r.Route("/api") with nothing above it but Recoverer and
+// RequestID, route_limiter_mounts_test.go pins it as noLimiter, and in k8s
+// deploy/chart/templates/web-ingress.yaml publishes the SPA origin at path `/` with
+// no auth annotation. So this body is world-readable, credential-free and unmetered
+// to anyone who can reach the ingress.
+//
+// Most of what it carries is public by construction — the version is the chart's
+// image tag, the commit is already pushed as a Harbor tag, built_at is implied by the
+// release, founded and commits are consts. `uptime_seconds` is NOT in that class and
+// is the one field that needs a decision rather than an observation: it is a RUNTIME
+// fact about this process, not a build fact about this image. It is published
+// DELIBERATELY (PRD #175, severity Low) because process age is worth real debugging
+// time and reveals no identity, no topology and no schedule.
+//
+// Two consequences worth stating where a reader will hit them. First, "it carries no
+// secret" is no longer the whole test — a field can be secret-free and still be a
+// runtime disclosure, so weigh both. Second, any NEW surface for this body
+// republishes uptime to a wider audience by default: the PRD's own named follow-ups,
+// an /about page and a signed-out footer, would both do it, and nothing in the code
+// would notice. If either ships, re-decide uptime rather than inheriting this one.
+//
+// A field that is neither public nor a considered disclosure — a hostname, an env
+// var, a filesystem path, a dependency inventory — does not belong here at all. This
+// is precisely the endpoint class where that conventionally goes wrong;
+// TestVersionEndpointCarriesNothingPrivate pins the key set closed so an addition is
+// a deliberate act.
 //
 // Unknown beats wrong throughout: a stamp that is absent or does not parse is omitted
 // rather than half-decoded into a plausible-looking value. See apitypes.BuildInfoDTO.
