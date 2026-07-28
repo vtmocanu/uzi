@@ -8,6 +8,7 @@ import type {
   AdminWorker,
   AgentTemplate,
   Board,
+  BuildInfo,
   CliAuthRequestMeta,
   CliToken,
   Disposition,
@@ -2652,4 +2653,32 @@ export const mockCliAuthRequest: CliAuthRequestMeta & { user_code: string } = {
   status: "pending",
   expires_at: minsAgo(-5), // ~5 minutes out
   user_code: "ABCD2345",
+};
+
+// ── Build info (PRD #175) ───────────────────────────────────────────────────
+// TWO fixtures, because the two shapes exercise different code and only one of
+// them is type-enforced. `api: typeof realApi` typechecks mockApi against the real
+// client, but every field below except version and founded is OPTIONAL — so a mock
+// returning `{version}` alone compiles clean, and the degraded render has no type
+// safety at all. It is also the COMMON case: every local `docker compose` stack
+// builds without ldflags and reports exactly mockBuildInfoUnstamped.
+//
+// The commit is this repo's real, public first commit rather than an invented
+// 40-char hex string: a fixture should not carry a high-entropy literal that reads
+// like a credential to a secret scanner, and a published SHA cannot be one.
+export const mockBuildInfo: BuildInfo = {
+  version: "0.4.2", // matches the worker fleet's target release in this demo
+  founded: "2026-07-03",
+  built_at: daysAgo(2),
+  commit: "366a282d52095312f54b99698b241ac872e20284",
+  commits: 2105,
+  uptime_seconds: 3 * 86_400 + 4 * 3_600 + 12 * 60, // 3d 4h 12m
+};
+
+// An un-stamped local build: `-X main.version` never ran, nothing else was
+// stamped, and the server OMITS rather than zero-fills. The popover must render a
+// shorter panel here, never a row reading "unknown" or a built date of year 1.
+export const mockBuildInfoUnstamped: BuildInfo = {
+  version: "dev",
+  founded: "2026-07-03",
 };
