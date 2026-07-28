@@ -38,7 +38,7 @@ import { stripUnsafeChars } from "./safeText";
  *
  * Mirrors `rateLimitTypes` in `api/internal/workersvc/limitwait.go`, which is the
  * authority — an SDK pin bump that adds a member moves that list (and migration
- * 00090's CHECK) first, and this map follows. Being behind is SAFE by construction
+ * 00091's CHECK) first, and this map follows. Being behind is SAFE by construction
  * on both paths: the DTO path falls back to the raw value, the feed path to no
  * clause at all.
  *

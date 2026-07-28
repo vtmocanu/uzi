@@ -810,7 +810,7 @@ func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
 	}
 }
 
-// The enum is allowlisted server-side and 00090's CHECK backstops it, so this can
+// The enum is allowlisted server-side and 00091's CHECK backstops it, so this can
 // only fire for a writer that bypassed both — a backfill, an admin tool, a later
 // refactor. That is exactly the population the CHECK exists for, so the renderer
 // escapes rather than trusting.

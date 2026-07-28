@@ -457,6 +457,28 @@ before SENDING, not before COMPOSING** — three of five crossings on PRD #108 w
 a lead verifying at SHA `N`, writing a long dispatch, and sending it after the
 worker reached `N+1`.
 
+**And when the send is a RE-SEND, name the tip you verified against and what you saw**
+— *"verified before sending: tip `X`, clean tree, no `Y` started."* That is the
+recipient-side half, and it is a different mechanism from the rule above, aimed at a
+different moment: verify-before-sending tries to PREVENT the crossing, this makes a
+crossing **cheap when it happens anyway**. Both are needed, because the sender-side rule
+demonstrably does not eliminate the problem. Measured on PRD #102: **five of the coder's
+last six messages crossed one of the lead's**, with the lead following the
+verify-before-sending rule throughout — the gap between verifying and sending is not zero
+when the dispatch is long, and a long dispatch is exactly when it matters.
+
+Every one of those five resolved the same way: the recipient re-derived against HEAD and
+answered "already done, tip `Z`". That works, and it costs a full round-trip each time. A
+named tip converts an ambiguous re-dispatch into a **checkable claim** — one `git rev-parse`
+tells the recipient whether the message is stale or new, with no round-trip at all.
+
+**The asymmetry is what makes it worth stating rather than leaving to judgement: a recycled
+or cold-started agent CANNOT tell a re-dispatch from new scope.** It has no memory of the
+first send. To it, an instruction to do work it already did is indistinguishable from an
+instruction to do work it has not started, and the only thing that separates them is the
+tip the sender claims to have seen. (The same run had the mirror case: a `TaskUpdate`
+setting `owner` on a completed task woke the idle agent and read as new scope. Same fix.)
+
 Two lead-side failures worth naming because neither is a stale-read:
 - **Asserting a completed action from having INSTRUCTED it.** The lead told a
   validator "the coder restaged the outage test" — it had only told the coder to.
@@ -745,6 +767,122 @@ When a claim is about to be *written down* as an invariant — in a comment, a s
 re-derive it yourself, however well-sourced it is. That is the moment it stops being a finding
 and starts being something the next reader will trust without checking.
 
+## An instrument that cannot produce the disconfirming answer is not evidence
+
+**This is the fold of the section above and nine separate incidents from PRD #102.** Each
+was a different tool failing a different way; the shape underneath is one. Before believing a
+result, ask what answer the instrument *could not have returned*. If that answer is the one
+that would have proved you wrong, the run measured your setup, not the code.
+
+The nine, each measured, so nobody has to take the abstraction on faith:
+
+| the instrument | what it could not return |
+|---|---|
+| `grep -F` with a `\|` alternation | anything, ever: `-F` makes the pipe a literal character, so the pattern matched a string nobody had written |
+| `git show $c:path` under zsh | the file: zsh's `:a` history modifier ate the path, and the error read as a missing file |
+| `comm` over two path lists | any overlap: one side carried a `./` prefix and the other did not, so two identical sets compared as disjoint |
+| `cut -d=` under zsh | a whole field: word-splitting differences silently truncated the value being compared |
+| file mtimes, to prove a run happened | the distinction between reading and idling, which was the entire question |
+| a mutation that failed to compile | a red for the stated reason; vitest printed `Tests  no tests` and it read as "unguarded" |
+| a mutation reddening on `SQLSTATE 42P18` | a red for the stated reason: Postgres rejected the *parameter typing*, not the predicate, so the run proved nothing about the predicate |
+| a direction inversion that made the action a no-op | a red at all: the assertion never ran, so green meant "nothing happened", not "the behaviour holds" |
+| a test that aborts before its own assertions | the disconfirming answer: a `t.Fatalf` on a status **identical in both configurations** fired before the row checks, so the checks that could have discriminated never executed |
+
+**The operational form, for mutation testing specifically: a mutation is verified by the tests
+going red FOR THE REASON THE MUTATION NAMES.** Read the failure text, never the count. Two
+agents on this branch shipped mutations that reddened for unrelated reasons and read the red as
+confirmation.
+
+CLAUDE.md's **"compile the mutation before you believe it"** is necessary and **not
+sufficient** — it eliminates only row 6. Rows 7 and 8 compile perfectly and still say nothing,
+and row 9 is not about mutation at all: **the test aborted before reaching the assertions that
+would have discriminated**, so the guard has to be ordering, not compilation. Put the checks
+that can only fail in one configuration BEFORE any check that fails identically in both.
+
+**Two more from M6, added because they are the shapes a green looks most trustworthy in:**
+
+- **An interrupted long run.** `./e2e/run-e2e.sh` printed `[cleanup] EXIT trap entered (code 0)`
+  with **zero FAIL lines**, having reached **4 of the harness's 54 phases**. A zero exit code and
+  an absent-failure grep are *both* satisfiable by a run that stopped early. The tell is the
+  phase count, or better, that the run reached its terminal teardown phase.
+- **A silently-dropped Tailwind arbitrary variant.** A mistyped variant is discarded at build
+  with no error, leaving a green class-token test asserting a class that has **no CSS behind
+  it**. The test cannot distinguish "shipped" from "typo'd"; only reading the built stylesheet
+  can (`npm run build && grep -c 'hover:none' dist/assets/*.css`). Note the same trap one level
+  down: the first grep for it used a pattern that could not match minified output and returned
+  nothing, which read as "the rule is missing".
+
+**A null result is an observation of your instrument, not of the world.** Before believing a
+zero, run the pattern against a string you know is present.
+
+## A right measurement with the wrong gesture attached to it
+
+**A number can be correct and still be about something else, and that is harder to catch than a
+wrong number** — because the number reproduces, so checking it confirms the wrong claim.
+
+Measured 2026-07-28. A finding reached me as: *"a drop on the dragged card itself is not a
+no-op; end-of-bucket sends it to the bottom; measured `[30,10] -> [10,30]` for the FIRST card
+of a lane, unchanged for the LAST, which is why the natural fixture hides it."* I was asked to
+correct `prd-102-m5-design.md` accordingly. **The design doc was already right and I did not
+change it.** All four combinations, through `dropIntent`:
+
+```
+lane displayed [30, 10]
+  ANCHOR NULL  drag 30 (FIRST) -> [10,30]      <- the reported change
+  ANCHOR NULL  drag 10 (LAST)  -> [30,10]      <- the reported no-change
+  SELF-ANCHOR  drag 30 (FIRST) -> [30,10]
+  SELF-ANCHOR  drag 10 (LAST)  -> [30,10]      <- a self-drop is a no-op in BOTH positions
+```
+
+The `[30,10] -> [10,30]` measurement is **exactly right**. It belongs to the `anchor: null`
+gesture — a drop on **lane whitespace** — which the design doc documents correctly as
+*"reposition to end of column"*. A drop on the dragged card itself self-anchors and **is** a
+no-op, which the design doc also documents correctly. Two adjacent rows of the same table, two
+different gestures, and the finding swapped them. Editing the doc as instructed would have
+replaced two true rows with one false one.
+
+**What made the mix-up survive is the fixture, and it is the same defect the finding itself
+names:** drop the LAST card of a lane and both gestures return `[30,10]`. The only fixture that
+separates them drags the FIRST card. A fixture where the two candidate explanations agree
+cannot choose between them — which is why "the natural fixture hides it" was the right
+instinct pointed at the wrong pair.
+
+**Transferable:** when a finding arrives as *measurement + explanation*, the measurement
+reproducing does not confirm the explanation. Vary the thing the explanation names — here, the
+gesture — and check that the number moves with it. And when told to correct a doc, read the doc
+first: this one was right, and the instruction to change it was the error.
+
+## A rule nobody is keeping is a different failure from a rule that is wrong
+
+**And it needs the opposite fix.** Most of the entries in this file are *stated mechanisms that
+were not the operative ones*: the doc said X protects you, X did not, and the remedy is to
+re-derive and rewrite it. This one is the mirror: a **correct** rule that nobody was running.
+
+Measured on PRD #102: the lead ran **three concurrent writers** in one shared worktree (coder in
+`web/` + `docs/`, spec-keeper in `specs/ai.md`, documenter in `CHANGELOG.md`) while
+`prd-102-context.md` said *"exactly one teammate writes at a time"*. Nothing was lost, and that
+is the point: it held **by luck as much as by design**, because a single `git add -A` or
+`git commit -a` from any of the three would have swept the other two's in-flight work into one
+commit — and the natural instinct after a doc sweep is exactly `git add docs/ specs/`. What
+protected the tree was three agents independently choosing explicit paths, which is discipline,
+not a gate.
+
+**Writing the rule more clearly would not have helped; the rule was already clear.** What was
+missing is the relaxation being *visible at the moment it was taken*. So if you deliberately
+relax a rule in this file:
+
+1. the relaxed constraint must be **provably** satisfied, not merely expected to be (here: file
+   sets provably disjoint);
+2. every participant must be **told explicitly** what replaces it (here: stage by path, never
+   `-A`, never `-a`, never a directory);
+3. **say so in the doc, at the time.** Not afterwards, and not only in the dispatch messages —
+   the next reader gets the doc, not your outbox.
+
+The lead met (1) and (2) and skipped (3), which is why this entry exists rather than a cleaner
+one. **When you find a rule being violated, establish which kind it is before fixing it** —
+weakening a correct rule to match what people were actually doing is the failure that looks
+most like tidying up.
+
 ## TYPECHECK the mutated tree before reading the test result
 
 **A mutation that does not compile produces a run that says nothing, and "nothing" is one
@@ -971,15 +1109,24 @@ pre-commit     none (gap)
 long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
 
-**The `~30 min` above is left as written, deliberately, and here is the one measurement
-against it.** *(Measured 2026-07-26 on one machine at `53d0f222`: **7m55s** wall clock,
-reaching the final `All E2E checks passed.` banner and the `down -v` teardown, so not a
-truncated run. Roughly 4× faster than the figure recorded here, most likely because the
-image build was largely cached. **One sample, not a correction** — replacing a figure on
-one sample is how the stale-tally problem starts over, in the file that documents it.
-Worth re-deriving deliberately, because the answer changes what the gate costs: if the
-real number is ~8 min then the exemption from the tester's 5-minute wait bound is
-unnecessary, and the gate is cheap enough to run far more often than it is.)*
+**The `~30 min` above is left as written, deliberately, and here are the measurements
+against it.** *(Two samples, both on one machine, both reaching the final banner and the
+`down -v` teardown, so neither is a truncated run: **7m55s** at `53d0f222` 2026-07-26, and
+**8m40s** at `30ab9e32` 2026-07-27 with 204 PASS / 0 FAIL. Roughly 4× faster than the
+figure recorded here, most likely because the image build was largely cached.*
+
+***Both ran `executor=stub` with no `--profile agent-docker`**, which is the caveat that
+stops these being a replacement figure: they do not measure the configuration that spends
+real agent time, and the `~30 min` may well be right for one that does. **Two samples are
+still not a correction** — replacing a figure because the runs you happened to take were
+faster is how the stale-tally problem starts over, in the file that documents it.*
+
+***The direction of the error is why this matters more than a tidy number.*** *`~30 min` is
+what makes an agent abandon the run against the tester's 5-minute wait bound, which is the
+exact failure the long-gate exception exists to prevent — so an over-estimate here is not
+conservative, it is the thing that stops the gate being run at all. If a deliberate
+re-derivation confirms ~8 min for the stub configuration, say so per configuration rather
+than overwriting one figure with another.)*
 
 Every gap above is what PRD #103 exists to close; re-derive this block when its
 milestones land rather than trusting these lines.

@@ -22,6 +22,18 @@ type fakeForge struct {
 	listErr   error
 	listCalls []forge.ListIssuesOptions
 
+	// PRD #102 M6 Decision 9 made both sync paths issue TWO ListIssues calls: the
+	// PRD-labelled one (state=all) and an additive open, no-label one. openIssues /
+	// openErr script the SECOND; issues / listErr keep scripting the first, so every
+	// pre-M6 test reads as "the open fetch returned nothing", which is a legitimate
+	// forge answer and leaves those tests' expectations intact.
+	//
+	// Kept as two independent pairs on purpose: Decision 11's failure modes are
+	// asymmetric, and a fake that can only fail both at once cannot express the one
+	// that deletes the backlog.
+	openIssues []forge.Issue
+	openErr    error
+
 	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
 	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
 	mr          forge.MergeRequest
@@ -99,10 +111,32 @@ func (f *fakeForge) EnsureLabels(_ context.Context, _ int64, labels []forge.Labe
 }
 func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.listCalls = append(f.listCalls, opts)
+	// The additive fetch is the one that asks for open issues and names no label;
+	// routing on that shape rather than on call ORDER means a test still discriminates
+	// if the two calls are ever swapped.
+	if opts.State == forge.StateOpened && len(opts.Labels) == 0 {
+		if f.openErr != nil {
+			return nil, f.openErr
+		}
+		return f.openIssues, nil
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return f.issues, nil
+}
+
+// prdListCalls returns just the PRD-labelled ListIssues calls, so an assertion about
+// the PRD fetch's options is not disturbed by the additive open fetch sitting next to
+// it in listCalls.
+func (f *fakeForge) prdListCalls() []forge.ListIssuesOptions {
+	var out []forge.ListIssuesOptions
+	for _, c := range f.listCalls {
+		if len(c.Labels) > 0 {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.Issue, error) {
 	f.getIssueCalls = append(f.getIssueCalls, issueIID)
@@ -402,13 +436,18 @@ func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 		t.Fatalf("HWM = %v, want max updated_at %v", got, t2)
 	}
 	// A non-zero HWM must be sent as updated_after (server-clock boundary).
-	if len(f.listCalls) != 1 || f.listCalls[0].UpdatedAfter == nil || !f.listCalls[0].UpdatedAfter.Equal(start) {
-		t.Fatalf("expected updated_after=%v, got %+v", start, f.listCalls[0].UpdatedAfter)
+	prd := f.prdListCalls()
+	if len(prd) != 1 || prd[0].UpdatedAfter == nil || !prd[0].UpdatedAfter.Equal(start) {
+		t.Fatalf("expected updated_after=%v, got %+v", start, prd)
 	}
-	// It never queries incrementally without state=all being enforced by the
-	// driver; here we only assert the PRD label filter is applied.
-	if len(f.listCalls[0].Labels) != 1 || f.listCalls[0].Labels[0] != settings.DefaultPRDLabel {
-		t.Fatalf("expected PRD label filter, got %v", f.listCalls[0].Labels)
+	// The PRD fetch leaves State at its zero value, which is StateAll: the Closed
+	// column depends on seeing closed PRD issues, and M6's additive fetch is a
+	// SECOND call rather than a narrowing of this one.
+	if prd[0].State != forge.StateAll {
+		t.Fatalf("PRD fetch state = %q, want StateAll", prd[0].State)
+	}
+	if len(prd[0].Labels) != 1 || prd[0].Labels[0] != settings.DefaultPRDLabel {
+		t.Fatalf("expected PRD label filter, got %v", prd[0].Labels)
 	}
 }
 
@@ -423,16 +462,16 @@ func TestSyncFiltersOnConfiguredLabel(t *testing.T) {
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, full); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
-	if len(full.listCalls) != 1 || len(full.listCalls[0].Labels) != 1 || full.listCalls[0].Labels[0] != custom {
-		t.Fatalf("FullSync label filter = %v, want [%s]", full.listCalls[0].Labels, custom)
+	if fc := full.prdListCalls(); len(fc) != 1 || len(fc[0].Labels) != 1 || fc[0].Labels[0] != custom {
+		t.Fatalf("FullSync label filter = %+v, want one call with [%s]", fc, custom)
 	}
 
 	inc := &fakeForge{}
 	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, inc, time.Time{}); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if len(inc.listCalls) != 1 || len(inc.listCalls[0].Labels) != 1 || inc.listCalls[0].Labels[0] != custom {
-		t.Fatalf("IncrementalSync label filter = %v, want [%s]", inc.listCalls[0].Labels, custom)
+	if ic := inc.prdListCalls(); len(ic) != 1 || len(ic[0].Labels) != 1 || ic[0].Labels[0] != custom {
+		t.Fatalf("IncrementalSync label filter = %+v, want one call with [%s]", ic, custom)
 	}
 }
 
@@ -444,8 +483,8 @@ func TestSyncFallsBackToDefaultLabel(t *testing.T) {
 	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
-	if len(f.listCalls) != 1 || len(f.listCalls[0].Labels) != 1 || f.listCalls[0].Labels[0] != settings.DefaultPRDLabel {
-		t.Fatalf("nil resolver label filter = %v, want [%s]", f.listCalls[0].Labels, settings.DefaultPRDLabel)
+	if fc := f.prdListCalls(); len(fc) != 1 || len(fc[0].Labels) != 1 || fc[0].Labels[0] != settings.DefaultPRDLabel {
+		t.Fatalf("nil resolver label filter = %+v, want one call with [%s]", fc, settings.DefaultPRDLabel)
 	}
 }
 

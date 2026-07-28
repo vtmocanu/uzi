@@ -60,7 +60,7 @@ import { RUN_ID_RE } from "./util.js";
  *
  * The `runs.status` CHECK now holds EIGHT values — queued / claimed / running /
  * awaiting_approval / limit_wait / completed / failed / cancelled — after migration
- * `00090` widened migration `00020`'s original seven with `limit_wait` (PRD #35).
+ * `00091` widened migration `00020`'s original seven with `limit_wait` (PRD #35).
  *
  * 🔴 `limit_wait` IS NOT TERMINAL AND MUST NEVER BE ADDED TO THIS SET. Read the
  * DEFAULT_RECLAIM_MIN_AGE_MS comment below before touching it: a parked run's HOME

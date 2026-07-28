@@ -860,7 +860,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 
 	t.Run("CreateRun inherits the owner default", func(t *testing.T) {
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
@@ -878,7 +878,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 	t.Run("CreateRun honours an explicit false over an opted-in default", func(t *testing.T) {
 		no := false
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
@@ -895,7 +895,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 	t.Run("CreateRun honours an explicit true over an opted-out default", func(t *testing.T) {
 		yes := true
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        store.User{ID: optedIn.ID}, // default false
 		}
@@ -912,7 +912,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 		// The path the dropped start-run modal could never have reached: no human is in
 		// the loop, so the default is the ONLY thing that can opt it in.
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByID:        optedIn,
 		}
@@ -927,7 +927,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 
 	t.Run("a torn user read resolves false rather than failing the creation", func(t *testing.T) {
 		fs := &fakeStore{
-			issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+			issueByID:       store.Issue{Title: "T", Labels: prdLabels(), HasPrdLink: true},
 			createRunResult: store.Run{ID: uuid.New()},
 			userByIDErr:     errors.New("boom"),
 		}

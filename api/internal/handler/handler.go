@@ -287,7 +287,7 @@ func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
 // Decision 8) — hosted provision and worker delete; cliPollLimiter is a dedicated
 // per-(path,IP) budget on POST /api/auth/cli/poll (PRD #64 M5), sized to exceed the
 // server-returned poll cadence so uzi login cannot trip its own rate limit.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter *mw.Limiter) http.Handler {
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -736,6 +736,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
+				// Manual card order (PRD #102 M5). The other whole-board replace, so it
+				// sits beside the columns route and is a PUT for the same reason.
+				//
+				// Its OWN limiter, not forgeLimiter and not none. Not the forge budget
+				// because this endpoint makes ZERO forge calls, and charging a drag there
+				// would let a burst of reordering starve the user's actual forge
+				// operations (move, sync, issue create) — the thing that budget protects.
+				// Not bare either: every request is a whole-board renumber in a
+				// transaction plus a full board rebuild, which makes it the most
+				// write-amplifying authenticated route on the board. "Give it its own" is
+				// the answer this codebase has already reached five times.
+				r.With(boardOrderLimiter.PerUserMiddleware).Put("/{id}/board/order", h.SetBoardOrder)
 				// The in-app issue view fetches the issue (with its description) live
 				// from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issues/{iid}", h.GetIssueDetail)
@@ -744,6 +756,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Apply/remove the PRDLESS label from the UI (PRD #22 M4): a forge
 				// label write, so it rides the per-user budget like move.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/prdless", h.SetIssuePrdless)
+				// Promote (PRD #102 Decision 15): add the PRD label to a non-PRD card,
+				// forge-first. Same limiter as the other forge-writing issue routes — it is
+				// one EnsureLabels plus one UpdateIssueLabels, exactly like the prdless
+				// toggle beside it.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/promote", h.PromoteIssue)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 				// Create a PRD issue on the forge (source of truth) → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)

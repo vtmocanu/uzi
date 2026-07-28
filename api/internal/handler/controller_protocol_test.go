@@ -69,7 +69,7 @@ func (p *pollStore) MarkHostedWorkerTokenDelivered(_ context.Context, arg store.
 // middleware, not a hand-wired handler.
 func controllerRoutes(h *Handler) http.Handler {
 	noLimit := mw.NewLimiter(1000, time.Minute, nil)
-	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
 }
 
 // The zero-behavior-change criterion at the router: with hosting off the

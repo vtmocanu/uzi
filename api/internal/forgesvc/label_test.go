@@ -50,7 +50,7 @@ func TestSetIssueLabelApplyCreatesLabelAndCaches(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, false, "PRD", "In Progress")
 
-	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", true)
+	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true)
 	if err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestSetIssueLabelApplyIdempotentSkipsForge(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, true, "PRD", "PRDLESS")
 
-	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", true)
+	got, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true)
 	if err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestSetIssueLabelRemovePreservesOtherLabels(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, true, "PRD", "PRDLESS", "In Progress")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", false); err != nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, false); err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
 	// Remove never creates a label.
@@ -128,7 +128,7 @@ func TestSetIssueLabelRemoveIdempotentSkipsForge(t *testing.T) {
 	f := &fakeForge{}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", false); err != nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, false); err != nil {
 		t.Fatalf("SetIssueLabel: %v", err)
 	}
 	if len(f.updateCalls) != 0 || len(st.upserts) != 0 {
@@ -142,7 +142,7 @@ func TestSetIssueLabelForgeFailureLeavesCacheUntouched(t *testing.T) {
 	f := &fakeForge{updateErr: errors.New("forge down")}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", true); err == nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true); err == nil {
 		t.Fatal("expected the forge error to propagate")
 	}
 	if len(st.upserts) != 0 {
@@ -156,7 +156,7 @@ func TestSetIssueLabelEnsureFailureAbortsBeforeUpdate(t *testing.T) {
 	f := &fakeForge{ensureErr: errors.New("cannot create label")}
 	issue := labeledIssue(4, false, "PRD")
 
-	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", true); err == nil {
+	if _, err := svc.SetIssueLabel(context.Background(), f, 7, issue, "PRDLESS", PrdlessLabelColor, true); err == nil {
 		t.Fatal("expected the EnsureLabels error to propagate")
 	}
 	if len(f.updateCalls) != 0 {

@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -35,6 +36,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
@@ -52,11 +54,20 @@ var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cance
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrRunNotFound         = errors.New("run not found")
-	ErrRunNotOwned         = errors.New("run not owned by worker")
-	ErrRepoNotFound        = errors.New("repo not found")
-	ErrIssueNotFound       = errors.New("issue not found")
-	ErrNoPRDLink           = errors.New("issue has no PRD link")
+	ErrRunNotFound   = errors.New("run not found")
+	ErrRunNotOwned   = errors.New("run not owned by worker")
+	ErrRepoNotFound  = errors.New("repo not found")
+	ErrIssueNotFound = errors.New("issue not found")
+	ErrNoPRDLink     = errors.New("issue has no PRD link")
+	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
+	// PRD label (PRD #102 Decision 14) → 422.
+	//
+	// Before M6 every cached issue carried it by construction — the sync filter was
+	// the gate — so the PRD-LINK check above was sufficient on its own. The additive
+	// non-PRD fetch ends that: a stranger's issue that happens to mention a
+	// prds/*.md path would otherwise satisfy HasPrdLink and become runnable by
+	// accident, from the board or unattended from autopilot.
+	ErrNotPRDIssue         = errors.New("issue does not carry the PRD label")
 	ErrDescriptionTooLarge = errors.New("issue description is too large to run")
 	ErrActiveRunExists     = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal         = errors.New("run has already finished")
@@ -499,6 +510,16 @@ type RunLifecycle interface {
 type SettingsReader interface {
 	JudgeEnabled(ctx context.Context) (bool, error)
 	JudgeModel(ctx context.Context) (string, error)
+	// PRDLabel is the label an issue must carry to be runnable (PRD #102 Decision
+	// 14). It is read here rather than passed in by each caller because the gate is
+	// shared: the board handler and the poller's autopilot must be answering the same
+	// question, and an operator renaming prd_label must move both at once.
+	//
+	// It rides this interface rather than a new one despite the judge scope of its
+	// two siblings, because a deployment that wires settings at all wires *Cache,
+	// which serves all three. A nil reader falls back to the compiled-in default and
+	// the gate still runs — "settings unavailable" must not mean "unguarded".
+	PRDLabel(ctx context.Context) (string, error)
 }
 
 // DockerAllowlistReader is the narrow settings view the claim gate reads for the
@@ -2733,6 +2754,24 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
+	// The PRD-LABEL gate (PRD #102 Decision 14). Checked BEFORE the PRD-link gate
+	// because it is the coarser question — "is this issue uzi's work at all" comes
+	// before "is this issue ready to run" — and because its rejection must not be
+	// reported as a missing PRD link, which would send a user off to add one.
+	//
+	// PRDLESS does NOT bypass this. It is the escape hatch for a PRD issue with no
+	// prds/*.md file yet (PRD #22 Decision 3); it was never a claim about issues
+	// that are not uzi's, and letting it through here would restore exactly the
+	// accident this gate exists to stop.
+	//
+	// Derived from the cached labels rather than a fresh forge read (Decision 12):
+	// the same jsonb the board renders the card from, so the button a user sees and
+	// the gate the server applies cannot disagree. Promote (Decision 15) writes the
+	// label forge-first AND updates this cache row in the same request, so the
+	// promote-then-run sequence is not racing the poller.
+	if !isPRDIssue(issue.Labels, s.prdLabel(ctx)) {
+		return store.Run{}, ErrNotPRDIssue
+	}
 	// The PRD-link gate (PRD invariant) with the PRDLESS exception (PRD #22):
 	// allowWithoutPRD is the caller's bypass decision, computed from the fresh
 	// forge snapshot's labels and the prdless settings. This is the single
@@ -2778,6 +2817,40 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// in the CreateRun statement; Notify performs the move.
 	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// prdLabel resolves the configured PRD label for the run-eligibility gate,
+// falling back to the compiled-in default when settings are unwired or a read
+// fails. Same shape as forgesvc.prdLabel, and deliberately so: the label the sync
+// filters on and the label a run is gated by must be the same string, or an
+// operator's rename would make the board and the gate disagree about which cards
+// are runnable.
+//
+// Note the fallback direction. An unavailable settings read degrades to enforcing
+// the gate on "PRD", never to skipping it — the accessor already returns the
+// default alongside a cold error, so this stays best-effort by design without
+// ever failing open.
+func (s *Service) prdLabel(ctx context.Context) string {
+	if s.settings != nil {
+		if l, _ := s.settings.PRDLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultPRDLabel
+}
+
+// isPRDIssue reports whether a cached issue's labels jsonb carries label. A row
+// whose labels cannot be decoded is NOT a PRD issue: the gate has no basis for
+// letting it through, and a corrupt or absent value must not read as consent.
+//
+// Matching is exact, like the forge-side label filter the sync applies and like
+// every other label comparison in this codebase.
+func isPRDIssue(labelsJSON []byte, label string) bool {
+	var labels []string
+	if err := json.Unmarshal(labelsJSON, &labels); err != nil {
+		return false
+	}
+	return slices.Contains(labels, label)
 }
 
 // originColumn resolves the issue's current column to snapshot onto the run, so a

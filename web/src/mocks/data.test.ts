@@ -194,3 +194,53 @@ describe("the parked-run fixture can actually discriminate (PRD #35)", () => {
     expect(new Set(resets).size).toBe(resets.length);
   });
 });
+
+// The demo board is the one build most people click, so a feature that is invisible
+// there is a feature nobody sees (web-ux S7). Each of these pinned a fixture that was
+// silently arguing against a shipped decision.
+describe("the demo board exercises the board's features (PRD #102, web-ux S7)", () => {
+  const boards = Object.entries(mockBoards);
+
+  it("renders in ascending issue number, like a board nobody has dragged", () => {
+    // The fixtures were authored DESCENDING, so `Manual` mode visibly was not issue
+    // order on the demo board — contradicting on screen the safety argument Decision
+    // 7a makes for shipping Manual as the default. The real server's untouched-board
+    // clause is `board_position ASC NULLS LAST, forge_issue_iid ASC` with every
+    // position NULL, which is exactly ascending iid.
+    for (const [id, board] of boards) {
+      const iids = board.cards.map((c) => c.iid);
+      expect(iids, `${id} renders out of issue order`).toEqual([...iids].sort((a, b) => a - b));
+    }
+  });
+
+  it("gives some card a content label, so the chips render on more than zero cards", () => {
+    // Not one mock card carried a content label, so M4's label chips rendered nowhere
+    // in the demo build. Workflow labels do not count — chipLabels excludes them, and
+    // a fixture full of those would satisfy a naive "has labels" check while showing
+    // no chip.
+    //
+    // Scoped to PRD cards ON PURPOSE. The non-PRD fixtures added for M6 carry content
+    // labels too, so counting every card would let this pass while the DEFAULT board
+    // — toggle off — still showed no chip anywhere. That weaker version passed against
+    // the unfixed fixtures when it was first written.
+    const workflow = new Set(["PRD", "PRDLESS", "autopilot", "uzi-self-improve"]);
+    const chipworthy = boards.flatMap(([, b]) => {
+      const columns = new Set(b.columns.map((col) => col.label_name));
+      return b.cards
+        .filter((c) => c.labels.includes("PRD"))
+        .flatMap((c) => c.labels.filter((l) => !workflow.has(l) && !columns.has(l)));
+    });
+    expect(chipworthy.length).toBeGreaterThan(0);
+  });
+
+  it("ships open non-PRD cards, so the M6 toggle demonstrates something", () => {
+    // Default-off plus no non-PRD cards is a control that visibly does nothing.
+    const nonPRD = boards.flatMap(([, b]) =>
+      b.cards.filter((c) => !c.closed && !c.labels.includes("PRD") && !c.labels.includes("uzi-self-improve")),
+    );
+    expect(nonPRD.length).toBeGreaterThan(0);
+    // At least one with NO labels at all: the ordinary shape of a freshly filed issue,
+    // and the shape whose labels used to reach the wire as JSON null.
+    expect(nonPRD.some((c) => c.labels.length === 0)).toBe(true);
+  });
+});

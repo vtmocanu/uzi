@@ -7,23 +7,40 @@ audience: user
 # Board
 
 Each enabled repo gets a board in the sidebar: a kanban view of its GitLab
-issues, kept in sync with the forge in both directions. Cards also carry
+issues, kept in sync with the forge in both directions. By default it shows
+the repo's `PRD`-labeled issues, the ones uzi works; **Show other issues**
+brings in the repo's other issues alongside them. Cards also carry
 their latest agent run, so the board doubles as a run tracker: it moves
 issues automatically as a run progresses and refreshes itself, without a
 manual reload.
 
 ## Columns
 
-- **Open** (implicit): issues carrying none of the configured column labels.
-- One column per configured label (seeded on first open: `In Progress`,
-  `Human Review`, `Upcoming`, `Later`); reconfigure any time from the
-  board's column settings.
+- **Backlog** (implicit): issues carrying none of the configured column
+  labels. There is no `Backlog` label behind it, so nothing is written to
+  GitLab when a card sits here; GitLab's own board lists these issues in its
+  built-in **Open** list instead, and the two names cannot be reconciled
+  (GitLab's built-in list can't be renamed).
+- One column per configured label, seeded on first open in this order:
+  `Planned`, `In Progress`, `Human Review`, `Later`. Reconfigure any time
+  from the board's column settings.
 - **Closed** (implicit): the issue's GitLab state, not a label; cards here
   aren't draggable.
 
+A fresh board therefore reads **Backlog · Planned · In Progress · Human
+Review · Later · Closed**, left to right in the order work moves: nobody has
+decided yet, someone picked it, an agent has it, its merge request is waiting
+on you, or it was looked at and deliberately deferred.
+
 `In Progress` and `Human Review` are also the two columns the run automation
-below moves cards through; `Upcoming`/`Later` are plain backlog buckets it
+below moves cards through; `Planned`/`Later` are plain backlog buckets it
 never touches except to restore a card to one.
+
+**Existing boards keep the columns they already have.** A board seeded before
+`Planned` existed still shows `Upcoming`, in its old position: uzi will not
+rename a real GitLab label out from under you, and there's no undo for that
+from inside uzi. To adopt the new name by hand, see
+[Configuration](./configuration.md).
 
 **Hide empty columns.** The board toolbar has a **Hide empty** tick box: turn
 it on and any column with no cards drops out, with a **`N hidden`** count next
@@ -49,13 +66,73 @@ and board views.
 
 ![Dragging a card between board columns, relabeling the underlying GitLab issue](img/board-move-card.png)
 
+## Ordering and sorting
+
+The **Sort** control in the board toolbar chooses how cards are ordered inside
+every column:
+
+- **Manual** (the default): your own order, the one you set by moving cards
+  around. On a board nobody has ever reordered this is exactly issue-number
+  order, so the board looks the same as it always did until you decide
+  otherwise.
+- **Issue number**: plain numeric order. This is the way back once you have
+  reordered something and want to ignore your own order for a moment.
+- **Recent run activity**: cards whose latest agent run was touched most
+  recently come first. Cards that have never run go last.
+- **Last updated**: most recently changed on GitLab first.
+- **Title**: alphabetical.
+
+The sort choice is remembered per board, on this browser. The order itself is
+different: it is stored with your account, so it follows you to any browser or
+device you sign in from. It is yours, not the team's; another person looking at
+the same GitLab project sees their own board and their own order.
+
+### Two ways to reorder a card
+
+Both do exactly the same thing, so use whichever suits you.
+
+**With the keyboard.** Focus a card, or hover it, and use the small **up** and
+**down** buttons next to the issue number. Each press moves the card one place
+within its column. The **up** button is disabled on the top card and **down** on
+the bottom one; a card that is alone in its column shows no buttons at all,
+since there is nowhere for it to go. They are reachable by tabbing, and each one
+is announced with the card and the direction ("Move issue #42 down in Planned"),
+so this works without a mouse.
+
+**By dragging.** Pick a card up and drop it where you want it. A line appears on
+the edge of the card you are hovering to show where it will land. Dropping onto
+another column moves it there and changes its label on GitLab, exactly as
+before; dropping within a column only changes the order and writes nothing to
+GitLab.
+
+### What a reorder records
+
+Moving one card records the order of the **whole board**, exactly as it looks to
+you at that moment, and switches the board to **Manual**. That is deliberate:
+if only the moved card were recorded, every other card would fall back to
+issue-number order the moment the board switched to Manual, and a single drag
+would look like it had scrambled everything.
+
+Two consequences worth knowing:
+
+- Reordering one card while sorted by, say, **Last updated** freezes that
+  Last-updated arrangement as your manual order. It is the arrangement you were
+  looking at, which is usually what you meant, but it does replace whatever
+  order you had recorded before.
+- Issues that arrive after you last reordered appear at the **bottom** of their
+  column rather than jumping to the top, in issue-number order among
+  themselves.
+- Closed issues drop out of the recorded order the next time you reorder
+  anything, so an issue that reopens after that comes back at the bottom of its
+  column. Reopened before then, it returns to the place it used to hold.
+
 ## Automatic moves
 
 Starting a run moves its issue for you: **Start run** puts the card in **In
 Progress**; when the run completes, it moves to **Human Review** (with or
 without a merge request); a failed or cancelled run moves it back to
-wherever it started (Open,
-Upcoming, Later) rather than a hardcoded column, so a backlog placement is
+wherever it started (Backlog,
+Planned, Later) rather than a hardcoded column, so a backlog placement is
 never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is
@@ -100,6 +177,17 @@ any chip for "as of last sync". A stale **closed** is the case to watch for
 practice, since merging an MR closes its issue and the card leaves the
 board before the state would ever go stale.
 
+## Card labels
+
+Each card also shows its other GitLab labels as small chips, so `bug` or
+`security` is visible without opening the issue. Workflow markers are left
+off: the `PRD` label, the `PRDLESS` escape hatch and the `autopilot` label
+(whatever your admin has configured those to be), plus every configured
+column label, since a column already has its own lane. A card carrying many
+labels shows the first few and a **`+N`** count, with the rest available by
+hovering or by tabbing to the count, so one heavily-labelled issue can't
+stretch its column.
+
 ## Attention strip
 
 When any of your runs on this board is **awaiting approval**, or the
@@ -125,14 +213,46 @@ without a manual **Refresh** — a brief toast ("#42 → Human Review")
 announces each one. **Refresh** still triggers an immediate full sync if you
 don't want to wait.
 
-## Why only some issues show up
+One exception, and it looks like a bug if you do not know about it. Issues
+without the `PRD` label are synced **open-only**, so closing one on the forge
+is not something the frequent poll can see. The card keeps looking open until
+the next reconcile pass (about 10 minutes at the shipped defaults), and then
+it disappears rather than sliding into **Closed**. `PRD` cards are unaffected:
+they animate into **Closed** as they always have.
 
-The board lists only issues carrying the **`PRD`** label (uzi works PRDs,
-not arbitrary tickets). Each card also needs its issue description to link a
+## Which issues show up
+
+The board always shows issues carrying the **`PRD`** label: those are the
+ones uzi works, and only they can start a run. Everything else about a card
+follows from that. A `PRD` card also needs its issue description to link a
 `prds/*.md` file; a card missing that link shows a warning badge and is
 excluded from agent pickup until the link is added. A card carrying more
 than one column label (edited outside uzi) shows a conflict badge and
 displays in its highest-positioned column until the next move normalizes it.
+
+### Show other issues
+
+**Show other issues** adds the repo's other issues to the board, so
+you can triage the whole backlog in one place instead of switching to GitLab
+to see what else is filed. It is off by default, it is remembered per board
+and per browser, and it changes only what you see: nobody else's board moves,
+and no label is written.
+
+These cards are drawn with a **dashed border** and no background fill, and
+they behave differently in two ways:
+
+- **They cannot start a run.** uzi works `PRD` issues, and that stays true
+  whether or not a card is on screen. A stray `prds/*.md` link in an
+  unrelated issue does not make it runnable.
+- **They offer Promote instead.** One click adds the `PRD` label on the forge
+  and the card becomes an ordinary board citizen: run controls, chips and all.
+  There is no un-promote in uzi; remove the label in GitLab if you change your
+  mind.
+
+Issues without the `PRD` label are only ever synced while they are **open**, so
+they never reach the **Closed** column: one that closes on the forge keeps
+looking open until the reconcile pass removes it, as described above. uzi's own
+self-improvement tracking issue is always hidden.
 
 A run that finishes a PRD is asked to move the file to `prds/done/` in its own
 merge request (see [Agent skills](./skills.md)). Once that merge request

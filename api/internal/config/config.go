@@ -169,6 +169,22 @@ type Config struct {
 	// a cheap indexed endpoint.
 	CLIPollRateLimitMax    int
 	CLIPollRateLimitWindow time.Duration
+	// BoardOrderRateLimitMax/Window is the dedicated per-user budget for
+	// PUT /api/repos/{id}/board/order (PRD #102 M5). It is dedicated rather than
+	// shared for the reason that route is deliberately off the FORGE budget: a reorder
+	// makes zero forge calls, so charging it there would let a burst of dragging
+	// starve the user's real forge operations (move, sync, issue create). "Give it its
+	// own" is the answer this codebase has already reached five times (slackDM, chat,
+	// proposal, hosted, cliPoll), and "no limiter at all" was the odd one out.
+	//
+	// Each request is a whole-board renumber inside a transaction plus a full board
+	// rebuild, so it is the most write-amplifying authenticated route on the board.
+	// The default (120/min) is generous against human dragging — a fast drag is ~1/s
+	// and the board itself polls only every 10s — while still bounding a scripted
+	// burst. Sized above the plausible interaction rate on purpose: a limiter that
+	// trips a user reordering their own backlog is a bug, not protection.
+	BoardOrderRateLimitMax    int
+	BoardOrderRateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -589,6 +605,8 @@ func Load() (Config, error) {
 	// interval are one decision.
 	cfg.CLIPollRateLimitMax = parseInt("CLI_POLL_RATE_LIMIT_MAX", 60)
 	cfg.CLIPollRateLimitWindow = parseDuration("CLI_POLL_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.BoardOrderRateLimitMax = parseInt("BOARD_ORDER_RATE_LIMIT_MAX", 120)
+	cfg.BoardOrderRateLimitWindow = parseDuration("BOARD_ORDER_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)

@@ -289,7 +289,7 @@ func TestLimitWaitLineSanitizesTheRateLimitType(t *testing.T) {
 	// By this test's own stated standard, the DB CHECK is not the answer here: a
 	// constraint forbidding an oversized value is a guarantee made in ANOTHER package,
 	// and rate_limit_type carries no CHECK at all by design (the vocabulary is the SDK's,
-	// so 00090 deliberately left it open and put the guard in Go). The renderer must
+	// so 00091 deliberately left it open and put the guard in Go). The renderer must
 	// bound what it is handed.
 	oversized := parkedRun(now)
 	long := strings.Repeat("x", 250)

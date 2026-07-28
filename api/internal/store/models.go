@@ -143,6 +143,7 @@ type Issue struct {
 	HasPrdLink     bool               `json:"has_prd_link"`
 	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
+	BoardPosition  pgtype.Int8        `json:"board_position"`
 }
 
 type IssueProposal struct {

@@ -54,17 +54,17 @@ import (
 // enumeration.
 
 // RateLimitTypeUnknown is what every unrecognised report becomes. It is a real
-// member of the stored vocabulary (migration 00090's CHECK admits it), not a NULL:
+// member of the stored vocabulary (migration 00091's CHECK admits it), not a NULL:
 // "the run was rejected by a window we could not name" and "the run never parked"
 // are different facts and a support query must be able to tell them apart.
 const RateLimitTypeUnknown = "unknown"
 
-// rateLimitTypes is the closed set migration 00090's CHECK enforces: the six
+// rateLimitTypes is the closed set migration 00091's CHECK enforces: the six
 // members of SDKRateLimitInfo.rateLimitType at the pinned
 // @anthropic-ai/claude-agent-sdk (sdk.d.ts), plus RateLimitTypeUnknown.
 //
 // An SDK pin bump adding a seventh member is the ONE thing that moves this list,
-// and it must move 00090 in the same commit — TestRateLimitTypeVocabularyMatchesCheck
+// and it must move 00091 in the same commit — TestRateLimitTypeVocabularyMatchesCheck
 // parses the CHECK out of the migration file and compares, so forgetting either
 // half reddens at `go test` instead of raising 23514 on a user's run.
 var rateLimitTypes = []string{

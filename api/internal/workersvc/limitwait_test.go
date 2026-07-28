@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestRateLimitTypeVocabularyMatchesCheck is the instrument migration 00090's
+// TestRateLimitTypeVocabularyMatchesCheck is the instrument migration 00091's
 // comment promises, copied from TestSelectReasonVocabularyMatchesCheck (00089's) for
 // the same reason it exists there.
 //
@@ -25,7 +25,7 @@ import (
 // MUTATION THIS CATCHES: adding or removing a member on either side without the
 // other. Measured in both directions.
 func TestRateLimitTypeVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00090_run_limit_wait.sql"
+	const path = "../store/migrations/00091_run_limit_wait.sql"
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -45,7 +45,7 @@ func TestRateLimitTypeVocabularyMatchesCheck(t *testing.T) {
 	body := stripped.String()
 
 	// Then scope to THIS constraint's statement. Unlike 00089, whose file holds one
-	// CHECK, 00090 also widens runs_status_check — twice, counting the Down section —
+	// CHECK, 00091 also widens runs_status_check — twice, counting the Down section —
 	// so a whole-file regex would collect eight status values and eleven more from the
 	// rollback. Cut from the constraint name to the terminating semicolon.
 	start := strings.Index(body, "ADD CONSTRAINT runs_rate_limit_type_check")
@@ -73,7 +73,7 @@ func TestRateLimitTypeVocabularyMatchesCheck(t *testing.T) {
 	sort.Strings(fromGo)
 	if strings.Join(fromSQL, ",") != strings.Join(fromGo, ",") {
 		t.Fatalf("the rate_limit_type vocabulary has drifted.\n  Go:  %v\n  SQL: %v\n"+
-			"A value Go writes and 00090's CHECK rejects is a constraint violation at park "+
+			"A value Go writes and 00091's CHECK rejects is a constraint violation at park "+
 			"time — i.e. a failed run instead of a parked one — and nothing else reads this "+
 			"column, so nothing else would notice.", fromGo, fromSQL)
 	}
@@ -138,7 +138,7 @@ func TestCoerceRateLimitType(t *testing.T) {
 	})
 
 	t.Run("unknown is itself in the stored vocabulary", func(t *testing.T) {
-		// Otherwise the coercion's own output would violate 00090's CHECK, which is a
+		// Otherwise the coercion's own output would violate 00091's CHECK, which is a
 		// failure mode with no other test position to catch it.
 		for _, v := range AllRateLimitTypes() {
 			if v == RateLimitTypeUnknown {
@@ -154,7 +154,7 @@ func TestCoerceRateLimitType(t *testing.T) {
 // PRODUCER side — 00089 shipped two tests and this is the analogue of its
 // TestEveryProducedReasonIsInTheVocabulary, which the first cut of this file omitted.
 //
-// The comment on 00090's CHECK claims "the CHECK is strictly WEAKER than the Go
+// The comment on 00091's CHECK claims "the CHECK is strictly WEAKER than the Go
 // allowlist, so on the shipped path it can never fire". That holds ONLY IF every
 // write goes through CoerceRateLimitType. If SetRunLimitWait ever passed
 // req.RateLimitType into the params struct directly, the CHECK would become the only
@@ -202,7 +202,7 @@ func TestEveryStoredRateLimitTypeGoesThroughTheAllowlist(t *testing.T) {
 				"coerced if need be — NULL means 'the worker said nothing'", in)
 		}
 		if !legal[got.String] {
-			t.Fatalf("%q reached store.SetRunLimitWaitParams as %q, which 00090's CHECK "+
+			t.Fatalf("%q reached store.SetRunLimitWaitParams as %q, which 00091's CHECK "+
 				"rejects. The migration's 'the CHECK is strictly weaker than the Go allowlist' "+
 				"claim holds only while every write goes through CoerceRateLimitType; this "+
 				"write does not, so the CHECK is now the only guard and this value 23514s the "+

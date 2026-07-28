@@ -323,12 +323,22 @@ Serves human: "repo list + picker"; "board on labels"; "forge as source of truth
 - **`repos`** — projects from the bot's membership list, keyed by the forge's
   **stable numeric project id** (not the renamable path). Upserted `enabled=false`
   on every listing call so enable/disable always has a row id to target.
-- **`board_columns`** — ordered label names per repo. The implicit **Open**
+- **`board_columns`** — ordered label names per repo. The implicit **Backlog**
   (no column label) and **Closed** (issue `state`) columns are never stored.
-- **`issues`** — a **cache, never authoritative**. uzi's only owned board state is
-  column config; every issue field is overwritten from the forge each sync.
-  `has_prd_link` is stored as a bool computed at fetch time; the description itself
-  is never persisted.
+  `Backlog` was displayed as `Open` until PRD #102 M1; the rename is display-only
+  and the column key is still `""` with the move wire string still `"open"` (§439).
+- **`issues`** — a forge **cache with exactly one uzi-owned column**. Every
+  *forge-derived* field (title, state, labels, web_url, author, has_prd_link,
+  forge_updated_at) is overwritten from the forge on every sync; `board_position`
+  (PRD #102 M5, §441) is deliberately absent from `UpsertIssue`'s column lists and
+  survives. `has_prd_link` is stored as a bool computed at fetch time; the
+  description itself is never persisted.
+  - This read *"a cache, never authoritative. uzi's only owned board state is
+    column config; every issue field is overwritten from the forge each sync"*
+    until 2026-07-28. M5 falsified the ownership half — but the "every field"
+    half was **already** imprecise before it: `synced_at` comes from `now()`, and
+    `id`/`repo_id` are never overwritten at all. Recorded because the corrected
+    sentence has to be defensible on its own, not merely less wrong.
 - All four tables cascade-delete from `forge_connections.user_id`, so every
   repo/board/issue row is scoped to one user's bot world.
   - Why keyed by forge id + explicit `(repo_id, forge_issue_iid)` FK: beats both
@@ -339,13 +349,19 @@ Serves human: "repo list + picker"; "board on labels"; "forge as source of truth
 
 Serves human: "per-repo kanban board based on GitLab labels, two-way synced".
 
-- **Columns = labels.** Per repo: implicit **Open** (no column label) + ordered
-  label columns (default seeded `In Progress`, `Upcoming`, `Later` =
-  `forgesvc.DefaultColumns`) + implicit **Closed**. A card is in a column iff the
+- **Columns = labels.** Per repo: implicit **Backlog** (no column label) + ordered
+  label columns (default seeded `Planned`, `In Progress`, `Human Review`, `Later`
+  = `forgesvc.DefaultColumns`) + implicit **Closed**. A card is in a column iff the
   issue carries that label (GitLab board-list semantics).
+  - This list said `In Progress, Upcoming, Later` until 2026-07-28 and was
+    **stale in two independent ways**: it had been missing `Human Review` since
+    PRD #12 seeded it (the same defect PRD #102 M3 fixed in
+    `docs/configuration.md`), and PRD #102 M2 then renamed `Upcoming` → `Planned`
+    and moved it to position 0 (§439).
 - **Single column label enforced.** A move issues one atomic
-  `UpdateIssueLabels(add=[target], remove=[other column labels])`. Move-to-**Open**
-  removes all column labels. Move-to-**Closed** is **unsupported** (returns 400;
+  `UpdateIssueLabels(add=[target], remove=[other column labels])`.
+  Move-to-**Backlog** removes all column labels — the wire string for that move is
+  still `"open"` (§439). Move-to-**Closed** is **unsupported** (returns 400;
   closing/reopening stays on the forge — the card links out).
 - **Conflict handling**: an issue arriving with multiple column labels renders in
   the highest-positioned column with a **conflict badge**; the next uzi-side move
@@ -358,9 +374,17 @@ Serves human: "per-repo kanban board based on GitLab labels, two-way synced".
 ## 21. PRD-label filter + PRD-link sanity check
 
 Serves human: "board/agents work only PRD-labeled issues, sanity-checked to contain
-a link to the PRD file".
+a link to the PRD file" — as narrowed by the user 2026-07-20 (`specs/human.md`): the
+board may also DISPLAY open non-`PRD` issues, opt-in and off by default, while agents
+still work only `PRD`-labelled ones.
 
-- Board shows **only `PRD`-labeled issues** (`ListIssues(labels=["PRD"], …)`).
+- **The board and the agents no longer answer the same question, and since PRD #102
+  M6 that is the point.** The board's payload carries every cached issue and the
+  `PRD` filter is a *client-side render* filter behind a per-browser toggle (§443,
+  §444); run eligibility is an explicit server-side `PRD`-label predicate (§445).
+  Until M6 one mechanism did both jobs — the sync filter — and the equivalence was
+  an accident of that, not a design. This bullet read *"Board shows **only**
+  `PRD`-labeled issues (`ListIssues(labels=["PRD"], …)`)"* until 2026-07-28.
 - **PRD-link check** computed at fetch time from the issue description: must contain
   a relative path or absolute URL to a PRD file. Regex:
   `(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/(?:[\w.-]+/)*[\w.-]+\.md(?:[#?][^\s)]*)?` — matches
@@ -391,6 +415,10 @@ Serves human: "kept in sync two-way between uzi and GitLab".
   returns**. Eviction is the only way to see de-labeling/close-with-label-removed/
   deletion, which an `updated_after` filter structurally cannot report. Manual
   `POST /api/repos/:id/sync` and the Refresh button run the same full sync.
+- **Since PRD #102 M6 both paths issue TWO fetches**, not one: the PRD-labelled
+  one above plus an additive `state=opened`, no-label one, with the keep-set the
+  union and the HWM the *minimum* of the two. Both paths fail closed. See §444 —
+  it changes the eviction and HWM rules stated in this section.
 - **Push is forge-first**: a move calls `UpdateIssueLabels` before touching the
   cache and updates the cache only on success — a failed forge write leaves the
   card put (**snap-back**), never an optimistic divergence. Conflicts resolve
@@ -1525,9 +1553,12 @@ not a persisted move queue" (2026-07-04 user review).
 
 Serves human: "the MR opening moves the issue to a review column".
 
-- **Board order everywhere: In Progress, Human Review, Upcoming, Later** (the two
-  workflow columns lead, backlog buckets follow). Fresh boards get it from
-  `DefaultColumns`.
+- **Board order everywhere: Planned, In Progress, Human Review, Later.** Fresh
+  boards get it from `DefaultColumns`. This read `In Progress, Human Review,
+  Upcoming, Later` — *"the two workflow columns lead, backlog buckets follow"* —
+  until PRD #102 M2 replaced that convention with reading order = flow order and
+  renamed `Upcoming` to `Planned` (§439). The retrofit below is unaffected because
+  it anchors on In Progress's position, never on an absolute index.
 - **Idempotent board-load retrofit** (`GetBoard`): a repo with columns but no Human
   Review gets the label ensured and the column inserted at In Progress's position + 1.
   Because `board_columns.position` is not unique and `InsertBoardColumn` neither shifts
@@ -2088,8 +2119,11 @@ that auto-runs every PRD issue; best-practice (concurrent-write safety on Postgr
   `prd_label != autopilot_label` — equal values would make every PRD issue also an
   autopilot issue. Changing a label **never creates it on the forge** (users create
   labels in GitLab themselves, as with columns §20); an autopilot label without the
-  PRD label is invisible to uzi (the sync filter only sees PRD issues) — no run, no
-  comment.
+  PRD label is invisible to uzi — no run, no comment. That invisibility used to be
+  a *consequence* of the sync filter ("the cache only holds PRD issues"); since PRD
+  #102 M6 the cache holds every open issue and the property is carried by two
+  explicit predicates instead — `ListAutopilotCandidateIssues` and the
+  `ErrNotPRDIssue` run gate (§445). Same guarantee, deliberately re-founded.
 - **The cross-key check is authoritative inside the write tx**, against the two rows
   read `FOR UPDATE` (`ListAppSettingsForUpdate` → `settings.Effective(rows)` builds
   the committed effective map, merged with the pending writes, then `ValidateMerged`).
@@ -9865,8 +9899,10 @@ appeared in. Design record: `prds/done/98-judge-menu.md`.
   edges). Batch-bounded per repo; leftovers ride the next tick.
 - **Two preconditions inherited from the poller, both user-visible when tripped**
   (documented in `docs/judge-menu.md`): the repo must still be **enabled** (a
-  disabled repo is not polled), and the issue must still carry the **PRD label**
-  (the issue cache is filtered by `prdLabel`). Filed issues get the label
+  disabled repo is not polled), and the issue must still carry the **PRD label**.
+  (That was enforced by the sync filter until PRD #102 M6 made the issue cache hold
+  every open issue too — §444; the requirement is unchanged, the mechanism behind it
+  is now the render/eligibility predicates of §445.) Filed issues get the label
   automatically, so only removing it breaks the sync.
 
 ## 363. `/runs` per-row badge — one grammar, verdict-first; an unjudged run renders NOTHING (D7)
@@ -14078,12 +14114,479 @@ because it is read as a work queue.)*
   that matters most against the fallback schedule above: the e2e overlay disables the usage poller,
   which is precisely the configuration under which the exponential fallback becomes the *usual*
   path, so the suite would exercise that branch by construction — and does not yet.
-- **The migration number is a draft.** It must be renumbered above the live head on the landing
-  rebase; the boot runner is strict, so landing below an already-applied head makes every upgraded
-  instance refuse to boot.
+- **The migration number was a draft, and the rule earned its keep here.** Drafted `00090` against a
+  live head of `00089_run_select_reason_check.sql`; PRD #102 merged to `main` first and took
+  `00090_issue_board_position.sql`, so this landed as **`00091_run_limit_wait.sql`** on the landing
+  rebase. The boot runner is strict, so landing below an already-applied head would have made every
+  upgraded instance refuse to boot — the collision was not hypothetical, it was one merge away.
 - **The rollback narrows the status domain and therefore FAILS LOUDLY if any run is parked. That is
   correct and must not be "fixed" with a pre-emptive UPDATE**, which would silently rewrite a user's
   parked run and lose work the up-migration promised to resume. That fail-loud property is entirely
   load-bearing on the migration running inside a transaction, so the no-transaction annotation must
   never be added to that file — run without it, the drops commit around the failing constraint and
   the table is left with **no status CHECK at all**.
+
+## 439. PRD #102 M1/M2 — `Backlog` and `Planned` are DIFFERENT KINDS of object, and one of the two renames must not reach the wire
+
+PRD #102 renames two board columns. They read as one change and are not: one is a
+display string over a structural lane, the other is a real forge label whose seed
+position also moved. Conflating them is the mistake the PRD names as easiest.
+
+| Column | Backed by | uzi writes it to the forge? | Visible in GitLab? |
+|---|---|---|---|
+| `Backlog` | nothing — the implicit lane, `column == ""` | never | no |
+| `Planned` | a real project label | yes, on every drag (forge-first) | yes |
+
+- **`Open` → `Backlog` is display-only, and the wire constant is the trap.** The
+  implicit column's key is still `OPEN_KEY = ""` and `move()` still sends the
+  literal string `"open"`, matched server-side with `EqualFold`. A blanket
+  `Open`→`Backlog` replace breaks drag-to-`Backlog` and nothing else notices,
+  because the failure is one string in one request body. A real `Backlog` *label*
+  was rejected for a structural reason rather than a cosmetic one: anything created
+  outside uzi, or stripped of its labels, still has to render somewhere, so the
+  implicit lane cannot be removed and the repo would end up with both.
+- **`Upcoming` → `Planned` seeds at position 0**, ahead of `In Progress`,
+  deliberately breaking `service.go`'s stated "the two workflow columns lead, the
+  backlog buckets follow" convention. Reading order is now flow order: intake →
+  selected → working → review → deferred. `Planned` keeps `Upcoming`'s color
+  (`#6699cc`) so an operator's palette does not shift under them.
+- **The Human Review retrofit survives the reorder for a reason that predates it.**
+  `humanReviewPlacement` anchors the column at In Progress's position + 1, never at
+  an absolute index, so a board seeded before Human Review existed still gets it in
+  the right place now that In Progress is no longer first.
+- **No retrofit, and that is a decision rather than an omission.** A *rename* is
+  not the same act as `ensureHumanReviewColumn`'s back-fill: it would either orphan
+  an operator's existing `Upcoming` label or rename a real GitLab label out from
+  under them. Both destructive, neither undoable from uzi. Existing boards keep
+  `Upcoming`; the manual procedure is in `docs/configuration.md`, and its **order is
+  load-bearing** — rename the label in GitLab *first*, then repoint the uzi column,
+  because the reverse orphans the label and drops its cards into `Backlog`.
+- **Go test fixtures keep the string `Upcoming` on purpose.** It appears across six
+  test files as an arbitrary operator-defined column name, chosen to prove nothing
+  outside `ColumnInProgress`/`ColumnHumanReview` is special-cased. Renaming them
+  would weaken that signal for no gain; no test asserts on `DefaultColumns`'
+  contents.
+- Falsified `specs/ai.md` §19, §20 and §70, all corrected 2026-07-28. §20's seeded
+  list was **already** wrong before this PRD in a second, independent way: it had
+  been missing `Human Review` since PRD #12, the same defect M3 fixed in
+  `docs/configuration.md`.
+
+## 440. PRD #102 M4 — one chip predicate for two surfaces, and the surface it deliberately removed
+
+Cards render their labels as chips. Four kinds are excluded, and all four are
+operator-configurable, so every one arrives as a parameter and none is hardcoded:
+the PRD label, the PRDLESS label, the autopilot label, and the configured column
+labels (a card in `Planned` must not also wear a `Planned` chip).
+
+- **The exclusion sets are PARAMETERS because the two callers legitimately differ.**
+  The board's chip renderer excludes the *saved* columns; `ColumnSettings`' label
+  suggester excludes the columns being *edited*, which already hold unsaved adds and
+  removals. Reaching for one module-level source would make the suggester re-offer a
+  label the user had just added. This is why `chipLabels` takes
+  `LabelChipExclusions` rather than reading settings itself.
+- **`IssueView` adopts the same predicate unnarrowed**, so `PRD`/`autopilot`/
+  `PRDLESS` chips stopped rendering there. The justification first given for this —
+  "nothing becomes unobservable" — was **measured false**: `autopilot` had no other
+  surface in `web/`. The ruling stands on M4's own text ("so board and issue view
+  agree"), and the lost surface was restored as a dedicated `autopilot` badge
+  mirroring RunView's, so one fact reads one way in both places. Recorded because
+  the ruling and its stated reason are separable, and only the ruling survived.
+- **Chips are bounded at 4 with a `+N` overflow**, hidden labels reachable via the
+  overflow element's `title`. A board lane is a fixed `w-72`, so an issue carrying a
+  dozen labels would push its card several rows taller than its neighbours and bury
+  the run badges. The cap bounds HEIGHT; per-chip truncation bounds width.
+- **Label text passes through `stripUnsafeChars` on both surfaces** (the issue-#124
+  class). The exclusion compares the RAW label while the display strips it —
+  deliberately that way round, because strip-then-compare would let a crafted label
+  disguise itself as an excluded one and vanish.
+
+## 441. PRD #102 M5 — `issues.board_position`, the first uzi-owned column on a forge cache
+
+`board_position bigint NULL` (goose `00090` on this branch; renumbered at landing)
+is the schema half of manual ordering. Every design property of it is chosen against
+the fact that it sits on a table whose every other column is overwritten from the
+forge once a minute.
+
+- **The order is uzi-owned, not forge-derived** — the alternative was evaluated and
+  rejected. GitLab supports reordering natively and it round-trips; **Forgejo cannot**
+  (its ordering lives on project boards, a separate entity, and that API is
+  unreleased). A forge-synced order would therefore be GitLab-only, which is exactly
+  the driver-specific behaviour the neutral `Forge` interface exists to prevent, and
+  on Forgejo it would need a shadow project mirrored onto the label columns — a
+  second source of truth with two writes per drag that can diverge.
+- **What protects it is an OMISSION, which is why it is stated in three places.**
+  `UpsertIssue`'s `ON CONFLICT DO UPDATE` names its columns explicitly rather than
+  using `EXCLUDED.*`, so `board_position` is excluded by *not appearing*. Adding one
+  line there would silently reset every user's manual order once a minute, and
+  nothing would fail. Guarded behaviourally by a live-DB test, because a comment
+  cannot catch an edit.
+- **NULLABLE with no default and no backfill, and that is the design.** NULL means
+  "never frozen, or synced since the last freeze". `ORDER BY board_position ASC
+  NULLS LAST, forge_issue_iid ASC` therefore makes an untouched board render
+  byte-for-byte the `forge_issue_iid ASC` order it rendered before M5, and lands a
+  newly synced issue at the *bottom* of its column rather than the top. Because
+  positions are board-global and the client buckets by column preserving relative
+  order, globally-last is within-column-last.
+- **No index, no unique constraint.** The only read is one repo's rows, already
+  served by `idx_issues_repo`; every write is a full renumber, so an index would be
+  pure write amplification. A non-deferrable unique index would make a bulk renumber
+  fail on transient intra-statement collisions (the `UPDATE t SET x = x + 1`
+  footgun), and uniqueness is unnecessary because the ORDER BY tiebreaks on
+  `forge_issue_iid`, already unique per repo.
+- **`board_position` deliberately does NOT ride `cardDTO`.** The order is expressed
+  by the query's ORDER BY, never as a number the client reasons about — which is
+  what lets the web client's `Manual` mode be the identity function (§443).
+- **`cardDTO` gains `forge_updated_at` instead**, the one API read change M5 makes.
+  It must be set by **all three** card builders (`assembleCards`, `issueToCard`, and
+  the create path in `handler/issues.go`); missing it in the single-card path is
+  silent — only the just-dragged card carries the zero time and sinks to the bottom
+  in `Last updated` mode while every other card looks right.
+
+## 442. PRD #102 M5 — the freeze: unconditional, board-wide, computed from the PAYLOAD set, and numbered by a server that decides nothing
+
+A drop does not write one card's position. It **materializes the currently displayed
+order of every non-closed card, then applies the move** — freeze, then move.
+
+- **Why it cannot be one write.** Sorted by `Last updated`, drag card #7 to the top:
+  if the drop writes only #7 and flips the mode to `Manual`, every *other* card falls
+  back to the iid tiebreak and the whole board re-sorts under the user's hand. The
+  drag reads as having scrambled the board rather than moved one card.
+- **The freeze fires on EVERY drop, including one already in `Manual` mode. Gating
+  it on "mode != Manual" reintroduces the exact bug it exists to prevent.** On an
+  untouched board every position is NULL and the default mode is already `Manual`,
+  so a mode-gated freeze would not fire; the single written position then sorts ahead
+  of every NULL under `NULLS LAST`, and **a card dragged to the bottom of its column
+  renders at the top**. Once every card is non-NULL the freeze changes no ordering,
+  so making it unconditional removes the only state in which the gate is wrong at no
+  cost to the result. This is the discriminating case: the criteria either side of it
+  pass against the defective implementation.
+- **THE PAYLOAD-SET RULE IS IN THE SIGNATURE.** `dropIntent` takes `payloadCards`
+  (`board.cards`, unfiltered), never the rendered or sorted list. "Currently
+  displayed" is the wrong scope once a card-level render filter exists (§444's
+  toggle): a viewer with it off would freeze only the cards they can see, leaving
+  every hidden card NULL and therefore relocated to the bottom of its column on the
+  same user's *other* browser, where the toggle is on. Board.tsx names the two sets
+  `payloadCards` / `renderCards` for this reason alone, and the filter was the
+  identity function in M5 so the rule could be expressed and tested before M6 gave
+  it teeth.
+- **Closed cards are excluded and keep a NULL order.** Closed is not a drop target,
+  so a position there is unreachable by drag — but a frozen one would ride an issue
+  that later reopens on the forge and drop it at an arbitrary rank in its new column.
+- **Positions are ONE board-global gapped sequence** (`ordinal * 1000`), not a
+  per-column sequence restarting at each lane. Global is what makes a cross-column
+  drag well-defined: the card carries a number that still means something in its
+  destination, where a per-column sequence would hand it a colliding one. The gap is
+  unused today (every write is a full renumber) and is kept because dense→gapped
+  later is a data migration while gapped→dense is free.
+- **The client sends the whole order; the server only numbers it.** The sort mode
+  lives in `localStorage` and two modes are client-derived, so a "put #7 after #12,
+  you work out the rest" contract would need a Go reimplementation of the TypeScript
+  sort — two implementations of one ordering, requiring a differential test, for no
+  benefit. `PUT /repos/{id}/board/order` returns `{board}` rather than 204, matching
+  `ConfigureColumns` and `SyncRepo`, and the client adopts it wholesale.
+- **Both statements run in ONE transaction.** Between `SetBoardOrderPositions` and
+  `ClearBoardOrderExcept` the board is torn — some rows renumbered, others still
+  holding old numbers — and the board polls every 10s from possibly more than one
+  tab, so a GET landing in that window would render a scrambled order. The
+  transaction deliberately does NOT span the forge label write a cross-column drag
+  performs first: that is a separate HTTP call to another system.
+- **Cross-column drop runs `move()` BEFORE the reorder**, refining "freeze, then
+  move" for a case its worked example (a within-column drag) does not cover. Reorder
+  returns the authoritative board and the client adopts it, so freeze-first would
+  renumber a board the subsequent move then invalidates, and a *failed* move must
+  leave the card put (the existing snap-back contract).
+- **Two rules are enforced by SQL shape rather than by a code path**, which is what
+  makes them unforgettable: an iid the client listed but the server no longer holds
+  (evicted between render and submit) simply fails to join and updates zero rows — a
+  per-iid no-op, never a 404, so one stale card cannot fail a whole freeze. And
+  `<> ALL('{}')` is TRUE for every row, so an **empty** iids array would wipe every
+  position on the board; the handler guards `len(iids) == 0` by running neither
+  statement.
+- **The size cap is checked on the RAW request, before the dedupe**, and the order
+  is the whole point: checking after would size the allocations off the decoded body
+  rather than off the cap. Measured — a maximal 1 MiB body decodes to 524,283 iids
+  that dedupe down to 1, having already cost ~22 MiB of pre-allocation. Accepted
+  consequence: a body over the cap *only* because it repeats iids is rejected rather
+  than deduped down to something legal.
+- **The route gets its OWN limiter.** Not the forge budget, because this endpoint
+  makes zero forge calls and charging a drag there would let a burst of reordering
+  starve the user's actual forge operations. Not bare either: every request is a
+  whole-board renumber in a transaction plus a full board rebuild, making it the most
+  write-amplifying authenticated route on the board.
+- **Concurrency is last-writer-wins across the owner's own tabs and devices,
+  accepted.** A draft specified a board-version check that 409s a stale write; it was
+  dropped because `boardDTO` carries no version, etag or generation field for a
+  client to send (adding one is the API read change M5 forbids), and because per §446
+  the conflict is one person's two tabs rather than two people, which the existing
+  10s refetch already resolves.
+
+## 443. PRD #102 M5 — five sort modes, per-browser, with `Manual` as the IDENTITY function
+
+- **The modes**: `Manual` (default), `Issue number`, `Recent run activity`,
+  `Last updated`, `Title`. Board-wide, never per-column, and stored in `prefs`
+  (localStorage) keyed per repo like Hide-empty — the *order* is durable, the choice
+  of whether to honour it is a view preference.
+- **`Manual` is the identity function, and that is the load-bearing design.** The
+  payload already arrives in `ORDER BY board_position ASC NULLS LAST,
+  forge_issue_iid ASC`, so "render what the server sent" *is* the manual order, and
+  on an untouched board that is exactly `forge_issue_iid ASC`. This is what makes it
+  safe as the default: today's behaviour is what you get without choosing anything,
+  rather than something you have to go and pick. The cost is a coupling to a SQL
+  clause in another language, pinned by a live-DB test and named in both files.
+- **`Issue number` is therefore not redundant with `Manual`.** It is the escape
+  hatch that ignores the stored order entirely — the only way back to plain
+  issue-number order once someone has dragged.
+- **Every non-manual comparator falls through to `iid`.** A comparator that can
+  return 0 leaves the render at the mercy of the engine's sort, and "stable relative
+  to an order that itself came from somewhere else" is not a property worth
+  depending on. `forge_issue_iid` is unique per repo, so the tiebreak is total.
+- **Null placement mirrors the SQL's `NULLS LAST`**, so the two halves of the
+  feature agree about where a card with nothing to sort on belongs. `latest_run` is
+  a pointer and is null on every card that has never run — on a real board, most of
+  them; the key is `latest_run.updated_at`, and note that the chosen row is the
+  *newest* run rather than the max across the issue's runs (`ListLatestRunsForRepo`
+  picks by `created_at DESC`). Intended, recorded so nobody "fixes" it.
+- **Timestamps parse to instants, not strings.** Go marshals `time.Time` with
+  trailing zeros trimmed from fractional seconds, so `…T10:00:00Z` and
+  `…T10:00:00.5Z` order correctly as instants and incorrectly as strings.
+- **`Title` sorts the DISPLAYED string** (`stripUnsafeChars(title)`), because
+  sorting the raw one puts a title beginning with a bidi or zero-width character in a
+  visibly wrong place. The locale is passed **explicitly** — the default is
+  environment-dependent, which would make an exact-order assertion a latent
+  cross-environment flake.
+- **Keyboard reorder is a deliverable, and the PRD is silent on it.** Native HTML5
+  drag-and-drop has no keyboard initiation path, so the drag affordance is
+  unreachable without one and the residual is a WCAG 2.1.1 Level A failure. Per-card
+  up/down buttons reuse `ColumnSettings`' existing `aria-label` precedent, and are
+  constrained to share **one** `reorderBoard` call and **one** unconditional freeze
+  with the drop path via `neighbourAnchor` → `dropIntent`. There must be no second
+  order-computing path: two paths that agree today and drift later is the failure
+  that constraint exists to prevent.
+- **A drop on the dragged card itself is an explicit no-op arm, and it is
+  reachable.** The design said it falls through to "end of bucket" and called that
+  harmless; measured, end-of-bucket moves the card to the *bottom*. It looks right
+  only when the card was already last, which is exactly the fixture someone would
+  reach for. `onCardDrop` is attached to every card with no self-check and
+  `onCardDragOver` calls `preventDefault()` before its self early-return, so the
+  browser permits the drop.
+
+## 444. PRD #102 M6 — the additive fetch: a second request, a union that fails closed, and an HWM that takes the MINIMUM
+
+Serves `specs/human.md` (user, 2026-07-20): the board may DISPLAY open issues
+without the `PRD` label, opt-in and off by default.
+
+- **Additive, not a widening.** Today's PRD sync is untouched, including `state=all`
+  so closed PRD cards still reach the Closed column. The second fetch is
+  `state=opened` with no label filter, discarding rows that carry the PRD label —
+  those belong to the first path, whose semantics (eviction on de-labelling) are
+  defined against *its* snapshot. The discard matches the label exactly, like the
+  filter the forge itself applied to the first fetch: a looser match would classify
+  an issue differently from the way the forge did, and those two are the one pair
+  that must not disagree, since an issue in both halves is written twice and an issue
+  in neither is evicted.
+- **`State` goes on `ListIssuesOptions`, not on the interface signature.** The
+  driver hardcoded `state=all`; the additive fetch wants open-only, and without the
+  option it would pull the entire closed history on every reconcile purely to discard
+  it. Default is today's `all`, so every existing caller is unaffected. **Adding a
+  field to an options struct is not a signature change, so no `Forge` fake needed a
+  new method and none failed to compile** — three of the five fake-holding files
+  (`handler/forge_test.go`, `seed/seed_test.go`, `privcheck/checker_test.go`) are
+  untouched by this PRD entirely. The other two changed for reasons that are *not*
+  the option: `forgesvc`'s fake gained behavioural scripting so it can answer two
+  differently-shaped calls (a consequence of the additive fetch), and `poller`'s
+  changed for a different interface — `poller.SettingsReader` and
+  `workersvc.SettingsReader` each gained a real `PRDLabel` method, which did force
+  their fakes. Recorded at this precision because the repo rule "a change to the
+  `Forge` interface touches both drivers plus five fakes" is one category over and
+  misapplies here.
+- **THE TWO DRIVERS' REQUEST VOCABULARIES DIFFER, AND GITLAB'S HAPPENS TO MATCH
+  UZI'S.** uzi's neutral vocabulary is `opened`/`closed`/`all`; GitLab's request
+  vocabulary is identical, so its mapping is a genuine pass-through. **Forgejo says
+  `open`**, so passing the neutral `opened` through sends an invalid state and the
+  filter is *silently ignored* — an over-fetch that no assertion about returned rows
+  can see. Nothing else in the codebase notices the divergence because
+  `forgejoIssueState` already normalizes the RESPONSE the other way. The consequence
+  for testing is structural: **a GitLab-shaped fake cannot catch a driver that fails
+  to translate**, so the e2e fake's two handlers each recognise only their own
+  forge's spelling, and accepting the other's would re-hide exactly this bug. Both
+  drivers fall back to `all` on an unrecognised value — over-fetch, never under-fetch.
+- **Eviction becomes a union and MUST fail closed.** `DeleteIssuesNotIn` drops
+  everything absent from its keep-set; built from the PRD fetch alone it would wipe
+  the non-PRD rows the second fetch just wrote, every poll. If **either** fetch
+  fails, nothing is deleted and the whole sync returns an error — there is
+  deliberately no "the extra fetch is best-effort, log and continue" path. This is
+  the highest-risk change in the PRD.
+- **The shared high-water-mark takes the MINIMUM of the two fetches, never the
+  maximum.** The poller holds one `hwm` per repo and both paths feed it. The fetches
+  are separate round trips: the PRD fetch observes the forge at tA, the open fetch at
+  a later tB, so everything the *pair* is known to have seen is bounded by tA. A PRD
+  issue updated in (tA, tB) appears in neither result — too late for the first fetch,
+  discarded from the second — so a mark taken from the later fetch steps over an
+  update nobody observed and the row sits stale until the next reconcile. The zero
+  cases are **not symmetric**, and the asymmetry is the fetch order: `openMax` zero
+  constrains nothing (the open fetch ran second), while `prdMax` zero is the pre-M6
+  "nothing to advance to" case and preserves the caller's existing mark.
+  - **That second case carries a standing cost, knowingly unfixed.** A repo with open
+    issues but NO PRD issues has `prdMax` zero on every pass, so its mark never
+    advances and every `IncrementalSync` re-reads from the same bound — now paying
+    **two** unbounded fetches per poll rather than one. Correctness is unaffected
+    (upserts are idempotent; the window only re-covers covered ground) and the pre-M6
+    code had the identical no-advance behaviour on the PRD fetch, so M6 doubles the
+    traffic rather than introducing the defect. Not fixed because every fix is worse:
+    advancing on `openMax` alone is the unsound case above, and a per-path mark is a
+    wider change to the poller's state than this milestone should carry. It is the
+    same unboundedness the PRD's "M6 scale" open question names and wants the same
+    answer — a cap or a per-repo opt-in.
+- **A soft-fail would have been worse than losing one fetch's rows**: returning nil
+  with an advanced mark makes the next `IncrementalSync` permanently skip the failed
+  path's window until the next full reconcile — roughly ten minutes at shipped
+  defaults.
+- **A label-less issue is the first thing that ever made `labels` empty**, and it
+  exposed a latent null: GitLab returns no labels array at all for such an issue, so
+  the nil `[]string` cached as the jsonb scalar `null`, which the column's `NOT NULL`
+  does not exclude and which `json.Unmarshal` decodes back to nil **without error**.
+  It marshals to the web as JSON `null`, where `.filter`/`.includes` are called on
+  it. Fixed on the **read** side (`decodeLabels`) as the load-bearing half, because
+  fixing only the driver mapping would leave every already-stored row broken; the
+  driver mapping is fixed too, as the belt.
+- **Closed non-PRD issues are out of scope, with a documented consequence.** The
+  additive fetch is open-only, so a non-PRD card closed on the forge is invisible to
+  `IncrementalSync` and lingers open-looking until the next full reconcile (~10 min
+  at shipped defaults) evicts it. It never animates into Closed the way a PRD card
+  does. Stated in `docs/board.md` so it does not read as a bug.
+
+## 445. PRD #102 M6 — the invariant M6 DELETES, and the four things that were resting on it
+
+Until M6 the sync filter was the only way into the issue cache, so *every cached
+issue carried the PRD label*. Four separate pieces of behaviour were correct only
+because of that, and none of them said so out loud except one SQL comment.
+
+- **Run eligibility.** Start-run checked for a PRD *link* or `PRDLESS`, never the
+  PRD *label*. A non-PRD issue that happens to mention a `prds/*.md` path would have
+  become runnable by accident. `ErrNotPRDIssue` is now an explicit gate in the shared
+  `workersvc` run-create path, so the board handler, autopilot and the CLI (which
+  starts runs through the same endpoint, so it needs no CLI change) are all covered
+  by one check. It is ordered **before** the PRD-link gate deliberately: "is this
+  issue uzi's work at all" precedes "is it ready to run", and reporting the coarser
+  rejection as a missing link sends a user off to fix the wrong thing. **`PRDLESS`
+  does not bypass it** — that is the escape hatch for a PRD issue with no `prds/*.md`
+  file yet, never a claim about issues that are not uzi's.
+- **Autopilot's candidate query.** `ListAutopilotCandidateIssues` selected on
+  `state='opened' AND jsonb_exists(labels, @label)` only, and its own comment stated
+  the assumption M6 falsifies. Without a PRD predicate, a stranger's issue carrying
+  the autopilot label becomes a candidate and the detector then reads its label
+  events over the forge **every tick**, and either starts an unattended run on it or
+  posts a comment on someone else's issue. The predicate is what stops the detector
+  doing forge work; the run gate above is the enforcement point. The SQL comment was
+  rewritten in the same change.
+- **Autopilot's error switch.** `ErrNotPRDIssue` needed its own case: falling to
+  `default:` records nothing and re-evaluates every tick — one `ListIssueLabelEvents`
+  forge call per issue per minute, forever. It **records and stays silent**;
+  recording stops the re-evaluation, and silence is the point, because a comment
+  there is an outward-facing write on an issue that was never uzi's.
+- **The label resolution's fallback direction, in all three places.** An unresolvable
+  `prd_label` degrades to the compiled-in default, never to an empty string or no
+  filter. Empty would make `jsonb_exists` match nothing and quietly disable
+  autopilot; no filter would let autopilot fire on issues that are not uzi's. Neither
+  direction can *widen* the candidate set, which is the property that makes this safe
+  to get wrong.
+- **"Is this a PRD card" is DERIVED, never stored**, and one predicate serves the
+  render filter, the run gate, the Promote affordance and the PRDLESS toggle's
+  visibility. `prd_label` is operator-configurable, so a stored boolean goes stale
+  the moment someone renames it. The web mirrors it in `boardCards.ts` so the board
+  and the issue view give the same answer.
+- **Non-PRD cards flow through columns normally.** `ResolveColumn` is untouched and
+  knows nothing about `PRD`; a non-PRD card carrying `In Progress` renders there and
+  dragging one writes the column label forge-first like any other card. Simpler and
+  more honest than pinning them to `Backlog`.
+- **`PRD` and `PRDLESS` stack; they do not substitute.** `PRD` is board membership,
+  `PRDLESS` is the escape hatch for the PRD-*link* requirement. Promoting a raw issue
+  adds `PRD`; it still needs a `prds/*.md` link **or** `PRDLESS` before a run starts.
+
+## 446. PRD #102 M6 — the non-PRD card's affordances, and the shared-board premise that turned out to be false
+
+- **The toggle is per-browser, per repo** (`prefs`, like Hide-empty), filtering at
+  **render** and never at fetch. The rows are in the cache either way, and a
+  fetch-time filter would make the toggle a sync setting with a poll-cycle delay
+  instead of an instant view preference. Default off, so today's behaviour is what
+  you get without choosing anything. Accepted cost: `In Progress` can show a
+  different card count in two browsers, so "how many are in flight" stops being a
+  shared number.
+- **uzi's own self-improvement tracking issue is excluded even with the toggle ON.**
+  It carries `selfimprove.TrackingLabel` deliberately *instead of* a PRD or autopilot
+  label, is open on uzi's own repo, and the additive fetch is the first thing that
+  ever put it on a board. That is not the toggle being partial: the toggle means
+  "show me the repo's other issues", and uzi's own bookkeeping is not one of them.
+  (Deliberately not "other **open** issues" — that is only true up to one reconcile,
+  since a closed non-PRD row lingers open-looking until eviction, §444.) **Enforced
+  server-side on Promote as well**, not only by hiding the button —
+  the endpoint is reachable regardless, and the blast radius is a PRD label on
+  internal machinery plus a hand-startable self-improve run.
+- **Promote is apply-only and pins its own color.** No demote: removing a label in
+  the forge's UI is easy and nobody asked. The color is a **parameter** on
+  `SetIssueLabel` rather than the PRDLESS constant it used to be, because naive reuse
+  would auto-create a missing `PRD` label in the escape hatch's amber. `PrdLabelColor`
+  is green — distinct from both the column palette (blues/purple/grey) and the
+  PRDLESS amber, because the PRD label marks work uzi owns, which is neither a column
+  nor an exception.
+- **The PRDLESS toggle is gated to PRD cards.** On a non-PRD card it grants nothing
+  (run eligibility also requires the PRD label), and a button that looks like it does
+  something and does not is worse than no button.
+- **THE DASHED-BORDER TOKEN IS `border-faint`, AND THE FIRST ANSWER FAILED
+  MEASUREMENT.** Dashed rather than dimmed, because `opacity-40` already means "being
+  dragged right now" and the warn ring is `loud`, reserved for `awaiting_approval` —
+  a non-PRD card is the least urgent thing on the board and ring treatment inverts
+  the hierarchy. But the originally-specified `border-dashed border-edge` measured
+  **1.39:1 (ember) / 1.35:1 (mission)** against WCAG 1.4.11's 3:1 for a non-text
+  indicator, because an ordinary card's border is *already* `border-edge`, making
+  dashed-versus-solid the entire distinction. `border-faint` measures **5.16:1 /
+  5.09:1** and ships.
+  - **The stated fallback was refuted too.** `bg-transparent` was chosen as a second
+    cue on the reasoning that it is how the Closed *lane* earns its separation; that
+    lane's own background separation measures **1.03:1 / 1.04:1**, weaker than the
+    border it was supposed to be supplementing. What distinguishes that lane is its
+    header text. `bg-transparent` is kept as a real if minor cue, but it is not what
+    carries this.
+  - The second cue is the **button**: "Promote to PRD" where a PRD card reads "Start
+    run". It is present on **every** non-PRD card the sync can produce, including one
+    that has closed on the forge and not yet been evicted — during that window the row
+    is never re-upserted (the PRD fetch is label-filtered, the additive fetch is
+    open-only), so `issues.state` stays `opened` and the card renders Promote exactly
+    as before. A card with `closed=true` **and** no PRD label is real but is *not
+    reachable through the sync*: it needs a row cached while closed, which only the
+    `state=all` PRD fetch writes, that later stops matching `prd_label` — an operator
+    rename while closed PRD cards are cached. Left untested deliberately rather than
+    asserted.
+  - Recorded because the first version of this bullet, and of the code comment it came
+    from, asserted the opposite ("no button at all"). It **cited `docs/board.md` as
+    corroboration while `docs/board.md` contradicted it**, which is how it passed three
+    readers: it read as sourced. The lesson generalises past this card — a citation is
+    only evidence if someone opens it.
+  - **One border-color class per branch, never two.** Tailwind utilities of equal
+    specificity resolve by their order in the generated stylesheet, not by their
+    order in the class string, so listing `border-edge` and `border-faint` together
+    picks a winner nobody chose.
+- **🔴 THE ORDER IS PER-OWNER, NOT SHARED, AND TWO DESIGN CHOICES WERE ARGUED FROM
+  THE WRONG PREMISE.** The PRD was written believing a manual order would be a
+  team-visible priority statement. **There is no second viewer of a uzi board today**:
+  `issues.repo_id → repos.connection_id → forge_connections.user_id`, so two people
+  who each connect the same project get two independent caches under different
+  `repo_id`s, and every board route resolves through `GetRepoForUser`. The `IsMine` /
+  "must not leak another user's email" language on `cardDTO` is PRD #33 designing
+  *defensively* for a shared board, not evidence of one — `assembleCards` passes
+  `repo.UserID` as the viewer, which is the connection owner by construction. (The one
+  genuine cross-user `repos` path, admin `PatchRepo`, writes two opt-in booleans and
+  reads no board, card, issue or ordering state.)
+  - So what M5 ships is **"arrange *your* board how you like it, durably, on every
+    device"**, not a team statement. The board-wide freeze and the `Manual` default
+    survive on other grounds (§442, §443) — the freeze because a mode-gated one is
+    outright wrong on an untouched board, the default because `Manual` on an
+    untouched board *is* `forge_issue_iid ASC`. Same decisions, sound reasons.
+  - **The accepted cost changes with the premise**: dragging one card while sorted by
+    `Title` rewrites your own stored order for the whole board, on every device you
+    use. Within one person's own board that is a defensible read of "I want it to look
+    like this"; it would not have been if boards were shared. **If cross-user boards
+    ever ship, revisit the board-wide freeze before they do**, and do not bolt a
+    cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
+    row per project rather than per connection, touching run ownership, PAT selection
+    and every `*ForUser` query.

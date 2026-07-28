@@ -611,7 +611,7 @@ func limitWaitLabel(rc store.GetSlackRunContextRow) string {
 	s := "⏸ paused: usage limit"
 	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
 		// EscapeMrkdwn even though workersvc has already allowlisted this to a
-		// seven-member enum and 00090's CHECK backstops it. The escape costs nothing and
+		// seven-member enum and 00091's CHECK backstops it. The escape costs nothing and
 		// covers the exact population the CHECK exists for: a backfill, an admin tool, or
 		// a later writer that bypassed the coercion. Per-field, never on the assembled
 		// line, so the emoji and separators this function owns are not escaped.

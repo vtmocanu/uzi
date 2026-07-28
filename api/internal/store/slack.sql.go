@@ -172,10 +172,10 @@ type GetSlackRunContextRow struct {
 // other way to reach them: the "paused: usage limit (five_hour); resumes ~<t>" line
 // cannot be built from a run_messages payload, which this query never joins. That
 // is the whole reason rate_limit_type is a column on `runs` rather than living only
-// in the feed message (see 00090's comment).
+// in the feed message (see 00091's comment).
 //
 // rate_limit_type arrives here ALREADY ALLOWLISTED — workersvc coerces anything
-// outside the seven-member vocabulary to 'unknown' before it is stored, and 00090's
+// outside the seven-member vocabulary to 'unknown' before it is stored, and 00091's
 // CHECK is the backstop. The renderer escapes it anyway; that is defence in depth
 // against a writer that bypassed both, which is precisely the population the CHECK
 // exists for.

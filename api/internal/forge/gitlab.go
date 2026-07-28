@@ -246,9 +246,16 @@ func (g *gitLab) EnsureLabels(ctx context.Context, projectID int64, labels []Lab
 func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error) {
 	opt := &gitlab.ListProjectIssuesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
-		// state=all is mandatory: the Closed column and de-label/close eviction
-		// both depend on seeing closed issues.
-		State: gitlab.Ptr("all"),
+		// state=all remains the DEFAULT (opts.State's zero value): the Closed column
+		// and de-label/close eviction both depend on seeing closed issues, so every
+		// pre-M6 caller must keep getting it.
+		//
+		// GitLab's REQUEST vocabulary is opened/closed/all, which happens to be
+		// identical to uzi's neutral vocabulary — so this driver needs no translation
+		// and the mapping below is a pass-through. That coincidence is exactly why a
+		// GitLab-shaped fake cannot catch a driver that fails to translate; see the
+		// Forgejo driver, where the vocabularies differ.
+		State: gitlab.Ptr(gitlabIssueStateParam(opts.State)),
 	}
 	if len(opts.Labels) > 0 {
 		labels := gitlab.LabelOptions(opts.Labels)
@@ -527,12 +534,26 @@ func toMergeRequest(mr *gitlab.MergeRequest) MergeRequest {
 // toIssue maps a client-go issue to the neutral domain type. A nil author (rare
 // but possible for system issues) yields an empty Author; a nil UpdatedAt
 // yields the zero time, which the sync engine treats as "no HWM advance".
+//
+// Labels is normalized to a non-nil slice. GitLab returns no labels array at all
+// for an issue carrying none, so []string(i.Labels) is nil, which json.Marshal
+// writes into the cache as the jsonb scalar `null` rather than `[]` — a value the
+// column's NOT NULL does not exclude and that decodes back to nil without error.
+// This is the belt; handler.decodeLabels is the braces, and it is the one that
+// matters for rows already stored.
+//
+// Unreachable until PRD #102 M6, whose additive fetch is the first thing that
+// caches an issue with no labels at all.
 func toIssue(i *gitlab.Issue) Issue {
+	labels := []string(i.Labels)
+	if labels == nil {
+		labels = []string{}
+	}
 	issue := Issue{
 		IID:         i.IID,
 		Title:       i.Title,
 		State:       i.State,
-		Labels:      []string(i.Labels),
+		Labels:      labels,
 		Description: i.Description,
 		WebURL:      i.WebURL,
 	}
@@ -543,4 +564,20 @@ func toIssue(i *gitlab.Issue) Issue {
 		issue.UpdatedAt = *i.UpdatedAt
 	}
 	return issue
+}
+
+// gitlabIssueStateParam maps the neutral state onto GitLab's `state` query
+// parameter. The two vocabularies coincide (opened/closed/all), so this is a
+// pass-through with an explicit default — written out rather than inlined so the
+// Forgejo driver's genuine translation has a visible counterpart, and so an
+// unrecognised value can never reach the API as a silent filter.
+func gitlabIssueStateParam(s IssueState) string {
+	switch s {
+	case StateOpened:
+		return "opened"
+	case StateClosed:
+		return "closed"
+	default:
+		return "all"
+	}
 }

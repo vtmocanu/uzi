@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -60,6 +62,21 @@ type cardDTO struct {
 	// Conflict flags an issue that arrived carrying more than one column label;
 	// it is shown in the highest-positioned one until the next move normalizes it.
 	Conflict bool `json:"conflict"`
+	// ForgeUpdatedAt is the issue's forge-side updated_at (issues.forge_updated_at,
+	// NOT NULL), for the board's "Last updated" sort mode (PRD #102 M5).
+	//
+	// It must be set by BOTH card builders — assembleCards AND issueToCard. Missing
+	// it in issueToCard (the single-card path, behind MoveIssue, SetIssuePrdless AND
+	// CreateIssue in handler/issues.go — three call sites, not the two this comment
+	// named until 2026-07-27) is silent: the card comes back with the zero time,
+	// marshals as "0001-01-01T00:00:00Z", and instantly sinks to the bottom in Last
+	// updated mode while every other card is fine. The typechecker cannot see it; only
+	// a test that drags in that mode can.
+	//
+	// board_position deliberately does NOT ride the card. The order is expressed by
+	// ListIssuesByRepo's ORDER BY, never as a number the client reasons about, which
+	// is what lets the web client's Manual mode be the identity function.
+	ForgeUpdatedAt time.Time `json:"forge_updated_at"`
 	// LatestRun is the newest run for this issue, or null when it has never run.
 	// It carries only display state (no secrets); the run-view link is owner-only,
 	// so IsMine tells the client whether the viewer may open it.
@@ -180,11 +197,16 @@ type boardDTO struct {
 
 // ── Board ───────────────────────────────────────────────────────────────────
 
-// GetBoard returns a repo's kanban board: its configured columns plus the
-// cached PRD-labeled issues as cards, each resolved to a column. The first time
-// a board is opened (no columns yet) it seeds the default columns as labels on
-// the forge and imports the current PRD issues — a deliberate, documented side
-// effect.
+// GetBoard returns a repo's kanban board: its configured columns plus the cached
+// issues as cards, each resolved to a column. The first time a board is opened (no
+// columns yet) it seeds the default columns as labels on the forge and imports the
+// current issues — a deliberate, documented side effect.
+//
+// The payload carries every cached issue, PRD-labelled or not (PRD #102 M6). The
+// non-PRD ones are filtered CLIENT-side, at render, behind a per-browser toggle:
+// they have to be in the payload regardless, because the board freeze is computed
+// from the whole set and dropping the hidden cards from it would null their stored
+// order (Decision 7b's payload-set rule).
 func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
@@ -244,10 +266,13 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
 		return true // non-fatal: render with existing columns, retry next load
 	}
-	// Bump the columns Human Review displaces (the backlog buckets) up one so the
-	// new column lands right after In Progress with a distinct position — the same
-	// order fresh boards seed (In Progress, Human Review, then the rest). The shift
-	// is a no-op when appending (In Progress absent).
+	// Bump the columns Human Review displaces up one so the new column lands right
+	// after In Progress with a distinct position — the same RELATIVE placement fresh
+	// boards seed. (PRD #102 Decision 2 moved Planned ahead of In Progress, so a
+	// fresh board no longer leads with In Progress; humanReviewPlacement anchors off
+	// In Progress's position rather than an absolute index, which is what keeps this
+	// retrofit correct either way.) The shift is a no-op when appending (In Progress
+	// absent).
 	if err := h.q.ShiftBoardColumnsFrom(r.Context(), store.ShiftBoardColumnsFromParams{
 		RepoID:       repo.ID,
 		FromPosition: int32(pos),
@@ -410,6 +435,44 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*ap
 	return out
 }
 
+// decodeLabels turns a cached issue's labels jsonb into the slice every card DTO
+// ships. It GUARANTEES a non-nil result, which is the whole reason it exists as a
+// function rather than two inline unmarshals.
+//
+// The column is `jsonb NOT NULL DEFAULT '[]'`, and SQL NOT NULL does not exclude
+// the jsonb scalar `null` — a distinct value that json.Unmarshal decodes into a
+// nil slice with NO error, so the error branch below never sees it. A nil slice
+// marshals as JSON `null`, not `[]`, and the web then calls .filter and .includes
+// on it.
+//
+// Unreachable before PRD #102 M6: the sync filter guaranteed every cached issue
+// carried the PRD label, so labels was never empty. The additive fetch caches open
+// issues regardless of label, and an issue with NO labels at all is the ordinary
+// shape of a freshly filed one.
+//
+// Fixed on the READ side deliberately. The driver mapping is fixed too (a nil
+// []string for a label-less issue is where the null originates), but that alone
+// would leave every row already stored as jsonb null broken, because the nil
+// survives the round trip without ever erroring.
+func decodeLabels(raw []byte) []string {
+	var labels []string
+	if err := json.Unmarshal(raw, &labels); err != nil {
+		return []string{}
+	}
+	return nonNilLabels(labels)
+}
+
+// nonNilLabels is decodeLabels' guarantee on its own, for the card builder that
+// takes labels straight from a forge response rather than from the cache
+// (handler/issues.go's create path). Same reason: a nil []string marshals as JSON
+// null and the web calls .filter on it.
+func nonNilLabels(labels []string) []string {
+	if labels == nil {
+		return []string{}
+	}
+	return labels
+}
+
 // assembleCards builds the board's cards from the cached issues, the newest run
 // per issue (runRows, one row per issue that has run), the column position map,
 // and the board viewer. It is the pure, DB-free core of the board payload: it
@@ -425,10 +488,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 
 	cards := make([]cardDTO, 0, len(issues))
 	for _, is := range issues {
-		var labels []string
-		if err := json.Unmarshal(is.Labels, &labels); err != nil {
-			labels = []string{}
-		}
+		labels := decodeLabels(is.Labels)
 		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 		card := cardDTO{
 			IID:        is.ForgeIssueIid,
@@ -441,8 +501,10 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			Column:     col,
 			Closed:     closed,
 			Conflict:   conflict,
-			LatestRun:  latestByIID[is.ForgeIssueIid],
-			Pipeline:   cardPipelines[is.ForgeIssueIid],
+			// Sibling of issueToCard's — keep the two in step (see cardDTO.ForgeUpdatedAt).
+			ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
+			LatestRun:      latestByIID[is.ForgeIssueIid],
+			Pipeline:       cardPipelines[is.ForgeIssueIid],
 		}
 		if is.Author.Valid {
 			a := is.Author.String
@@ -527,6 +589,136 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	b, ok := h.buildBoard(w, r, repo)
+	if !ok {
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// ── Manual order ────────────────────────────────────────────────────────────
+
+// maxBoardOrderIids caps how many iids one freeze may carry. Far above the PRD's
+// own scale expectation (boards here are hundreds of cards); it exists because an
+// array-accepting endpoint must not be handable an unbounded one, not because any
+// real board approaches it. Mirrors maxBoardColumns' shape.
+const maxBoardOrderIids = 5000
+
+type setBoardOrderRequest struct {
+	IIDs []int64 `json:"iids"`
+}
+
+// SetBoardOrder replaces the repo's manual card order wholesale (PRD #102 M5,
+// Decision 7b). The client sends the WHOLE intended order as a board-global iid
+// list and the server's only job is to number it.
+//
+// Why the client owns the order and not the server: the sort mode lives in the
+// browser's localStorage (Decision 8) and two of the five modes are computed from
+// data the server would have to re-derive, so any "put #7 after #12, you work out
+// the rest" contract would need a Go reimplementation of the TypeScript sort. Two
+// implementations of one ordering is a contract needing a differential test, for no
+// benefit.
+//
+// The freeze is board-wide and unconditional on every drop, including one already in
+// Manual mode. Gating it on "the mode is not Manual" reintroduces the exact bug
+// Decision 7b exists to prevent: on an untouched board every position is NULL, so a
+// single written position sorts ahead of every NULL under NULLS LAST and a card
+// dragged to the BOTTOM of its column renders at the TOP.
+//
+// Both statements run in ONE transaction. Between them the board is torn (some rows
+// renumbered, others still holding old numbers and not yet cleared), and the board
+// polls every 10s from possibly more than one tab, so a GET landing in that window
+// would render a scrambled order. The transaction also makes a failure of the second
+// statement roll the first back rather than persist half a freeze. It deliberately
+// does NOT span the forge label write a cross-column drag performs first: that is a
+// separate HTTP call to another system.
+//
+// Concurrency is last-writer-wins across the owner's own tabs and devices, accepted
+// in Decision 7b: boardDTO carries no version or etag for a client to send, and the
+// existing 10s refetch resolves it. There is no second user (issues are per-owner via
+// repos -> forge_connections.user_id), which is what makes that acceptable.
+func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	var req setBoardOrderRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// THE CAP IS CHECKED ON THE RAW REQUEST, BEFORE THE DEDUPE, and the order is the
+	// whole point. Checking it after would size the two allocations below off the
+	// decoded body rather than off the cap: measured, a maximal 1 MiB body decodes to
+	// 524,283 iids that dedupe down to 1, having already cost ~22 MiB of
+	// pre-allocation — on a route that deliberately carries no forge limiter. Reject
+	// first, then allocate against a bounded length.
+	//
+	// Consequence, stated because it is a real behaviour choice: a body that is over
+	// the cap only because it repeats iids is now rejected rather than deduped down to
+	// something legal. No client produces one (the board sends each card once), and
+	// bounding the allocation is worth more than accepting a malformed body.
+	if len(req.IIDs) > maxBoardOrderIids {
+		httpx.Error(w, http.StatusBadRequest, "too many issues (max "+strconv.Itoa(maxBoardOrderIids)+")")
+		return
+	}
+
+	// Dedupe preserving first occurrence, the precedent ConfigureColumns sets for its
+	// column names. A duplicate iid is a client bug and must not 400 somebody's drag;
+	// left in, it would consume an ordinal and shift every card after it.
+	seen := make(map[int64]struct{}, len(req.IIDs))
+	iids := make([]int64, 0, len(req.IIDs))
+	for _, iid := range req.IIDs {
+		if _, dup := seen[iid]; dup {
+			continue
+		}
+		seen[iid] = struct{}{}
+		iids = append(iids, iid)
+	}
+
+	// THE EMPTY-LIST GUARD IS LOAD-BEARING, NOT DEFENSIVE TIDINESS. ClearBoardOrderExcept
+	// filters on `forge_issue_iid <> ALL(@iids)`, and `<> ALL('{}')` is TRUE for every
+	// row, so running it with an empty array wipes every position on the board. Same
+	// trap DeleteIssuesNotIn's comment documents for its keep-set. Running neither
+	// statement is also the right answer semantically: an empty submit expresses no
+	// order, so there is nothing to record.
+	if len(iids) > 0 {
+		tx, err := h.pool.Begin(r.Context())
+		if err != nil {
+			slog.Error("begin board order tx", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer tx.Rollback(r.Context())
+		qtx := h.q.WithTx(tx)
+
+		if err := qtx.SetBoardOrderPositions(r.Context(), store.SetBoardOrderPositionsParams{
+			RepoID: repo.ID,
+			Iids:   iids,
+		}); err != nil {
+			slog.Error("set board order positions", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := qtx.ClearBoardOrderExcept(r.Context(), store.ClearBoardOrderExceptParams{
+			RepoID: repo.ID,
+			Iids:   iids,
+		}); err != nil {
+			slog.Error("clear board order", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			slog.Error("commit board order tx", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	// The full board, matching ConfigureColumns and SyncRepo. The client adopts it
+	// wholesale, which is what makes Manual mode "render the payload order" work with
+	// no client-side bookkeeping.
 	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
@@ -710,7 +902,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// Forge-first single-label add/remove + incremental cache update
 	// (forgesvc.SetIssueLabel). On failure the cache is untouched and the client
 	// keeps showing the pre-toggle state (no optimistic update on the web side).
-	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, req.Apply)
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdlessLabelColor, req.Apply)
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
 		return
@@ -739,13 +931,116 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
+// promotable reports whether an issue may be given the PRD label from the board
+// (PRD #102 Decision 13a). The one exclusion is uzi's own self-improvement
+// tracking issue, which carries selfimprove.TrackingLabel deliberately INSTEAD of
+// a PRD or autopilot label, is open on uzi's own repo, and is therefore cached and
+// rendered by M6's additive fetch like any other non-PRD card.
+//
+// A pure predicate rather than an inline check because the handler cannot be unit
+// tested (h.q is a concrete *store.Queries) and this is the part worth testing.
+func promotable(labels []string) bool {
+	return !slices.Contains(labels, selfimprove.TrackingLabel)
+}
+
+// PromoteIssue applies the configured PRD label to a non-PRD issue, forge-first
+// (PRD #102 Decision 15). One click makes a card uzi's work: it becomes runnable
+// (the Decision 14 gate reads the same label), it stops depending on the toggle to
+// be visible, and it loses the dashed treatment.
+//
+// Mechanically the PRDLESS toggle's shape, with three differences that are not
+// incidental:
+//
+//   - It is apply-only. There is no demote (Decision 15): removing a label in the
+//     forge's own UI is easy and nobody has asked for the button.
+//   - The auto-created label is pinned to PrdLabelColor, not the PRDLESS amber.
+//     Naive reuse of SetIssueLabel would create a missing PRD label in the escape
+//     hatch's color, which is the trap Decision 15 names.
+//   - It refuses the self-improvement tracking issue (Decision 13a). That issue is
+//     open on uzi's own repo, carries TrackingLabel deliberately INSTEAD of a PRD
+//     or autopilot label, and the additive fetch is what makes it visible on the
+//     board at all. Promoting it would slap the PRD label onto internal machinery
+//     and let a self-improve run be started by hand from a card.
+//
+// Returns the refreshed card with its latest_run re-hydrated, exactly like
+// MoveIssue and SetIssuePrdless, so a single-card replace never blanks the run
+// badge.
+func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	iid, err := parseInt64(chi.URLParam(r, "iid"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
+		return
+	}
+
+	// PRDLabel already falls back to the compiled-in default when unset, so label is
+	// never empty here.
+	label, _ := h.settings.PRDLabel(r.Context())
+
+	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "issue not found")
+			return
+		}
+		slog.Error("promote: get issue", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Decision 13a, enforced SERVER-side and not only by hiding the button: the web
+	// hides Promote on this card, but the endpoint is reachable regardless and the
+	// blast radius is a PRD label on uzi's own internal tracking issue.
+	if !promotable(decodeLabels(issue.Labels)) {
+		httpx.Error(w, http.StatusUnprocessableEntity, "this issue is uzi's own self-improvement tracker and cannot be promoted")
+		return
+	}
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// Forge-first, then the incremental cache update (forgesvc.SetIssueLabel). On
+	// failure the cache is untouched and the client keeps showing the pre-promote
+	// state. Applying a label the issue already carries is a local no-op success
+	// with no forge call, so a double click costs nothing.
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, forgesvc.PrdLabelColor, true)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
+		return
+	}
+
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	position := make(map[string]int, len(cols))
+	for _, c := range cols {
+		position[c.LabelName] = int(c.Position)
+	}
+	card := issueToCard(updated, position, repo.ForgeType)
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid, lr.MrWebUrl,
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("latest run for promoted card", "error", err)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
+}
+
 // issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
+// Three production callers: MoveIssue, SetIssuePrdless and CreateIssue (issues.go).
 func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
-	var labels []string
-	if err := json.Unmarshal(is.Labels, &labels); err != nil {
-		labels = []string{}
-	}
+	labels := decodeLabels(is.Labels)
 	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 	card := cardDTO{
 		IID:        is.ForgeIssueIid,
@@ -758,6 +1053,11 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		Column:     col,
 		Closed:     closed,
 		Conflict:   conflict,
+		// Sibling of assembleCards' — this is the single-card path (MoveIssue,
+		// SetIssuePrdless), and omitting it here is the silent half of the bug
+		// cardDTO.ForgeUpdatedAt describes: only a just-dragged card would carry the
+		// zero time, so every other card looks right.
+		ForgeUpdatedAt: is.ForgeUpdatedAt.Time,
 	}
 	if is.Author.Valid {
 		a := is.Author.String

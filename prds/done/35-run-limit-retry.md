@@ -889,8 +889,9 @@ this PRD supersedes that stance for sustained limits.
   stale-rejected + error_max_turns NOT classified, transient api_retry NOT
   classified, seconds-vs-ms normalization, **and a carve-out test that asserts a
   parked run's `skillsPluginDir` and run HOME both still exist on disk**).
-- [x] **M2 — Schema + server park machinery**: migration (Decision 13, renumbered
-  00090+), `SetRunLimitWait` transition (source-guarded `running`-only, idempotent on
+- [x] **M2 — Schema + server park machinery**: migration (Decision 13; drafted 00090,
+  **landed as `00091_run_limit_wait.sql`** — PRD #102 merged first and took 00090),
+  `SetRunLimitWait` transition (source-guarded `running`-only, idempotent on
   re-delivery, allowlists `rate_limit_type`, computes/clamps `retry_not_before`,
   bumps `limit_wait_count`, enforces `RUN_LIMIT_MAX_WAITS` / `RUN_LIMIT_MAX_PARK`
   fail-instead-of-park, PRD #47 health exit contract per Decision 4), optional
@@ -1103,7 +1104,10 @@ this PRD supersedes that stance for sustained limits.
   delta (PRD #102 is rewriting it; `runBadge.ts` is untouched by it and is where the
   mapping belongs) and must not widen `LatestRun`, so the countdown is run-view only.
   Migration `00090` confirmed free across all sibling worktrees, still to be
-  re-verified at the landing rebase. Six citation nits corrected, of which one
+  re-verified at the landing rebase. **↳landing: it was not free.** PRD #102 merged
+  to `main` first and took `00090_issue_board_position.sql`, so this renumbered to
+  `00091_run_limit_wait.sql` — the sibling-worktree sweep sees unmerged branches, not
+  merge order, which is exactly why the number is assigned at landing and not before. Six citation nits corrected, of which one
   mattered: `RUN_STATUS_TONES` is in **`web/src/components/ui.tsx`**, and the PRD's
   bare `ui.tsx` read as a sibling of `web/src/lib/runBadge.ts`.
 

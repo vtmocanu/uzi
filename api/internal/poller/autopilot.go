@@ -28,12 +28,19 @@ type RunStarter interface {
 }
 
 // SettingsReader resolves the instance settings the autopilot detector needs: the
-// autopilot label it filters on, and the PRDLESS gate-bypass state (PRD #22).
+// autopilot label it filters on, the PRD label it filters on alongside it (PRD
+// #102 M6 Decision 11b), and the PRDLESS gate-bypass state (PRD #22).
 // *settings.Cache satisfies it; a nil reader or an empty/errored read falls back
 // to compiled-in defaults, so a settings blip degrades gracefully rather than
 // filtering on an empty label or mis-resolving the bypass.
+//
+// For the PRD label specifically, "degrades gracefully" means degrading to the
+// DEFAULT label, never to no filter: an unresolvable prd_label leaves the
+// candidate query narrower than intended, which surfaces as autopilot not firing.
+// The other direction would be autopilot firing on issues that are not uzi's.
 type SettingsReader interface {
 	AutopilotLabel(ctx context.Context) (string, error)
+	PRDLabel(ctx context.Context) (string, error)
 	PrdlessEnabled(ctx context.Context) (bool, error)
 	PrdlessLabel(ctx context.Context) (string, error)
 }
@@ -78,9 +85,16 @@ func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopi
 func (a *Autopilot) detect(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, f forge.Forge) {
 	label := a.autopilotLabel(ctx)
 
+	// BOTH labels (Decision 11b). Filtering on the autopilot label alone was safe
+	// only while the sync filter guaranteed every cached issue carried the PRD label;
+	// M6's additive fetch caches every open issue, so without the PRD predicate a
+	// stranger's issue carrying the autopilot label reaches detectOne — which reads
+	// its label events over the forge every tick, and either runs it or comments on
+	// it.
 	issues, err := a.q.ListAutopilotCandidateIssues(ctx, store.ListAutopilotCandidateIssuesParams{
-		RepoID: r.ID,
-		Label:  label,
+		RepoID:   r.ID,
+		Label:    label,
+		PrdLabel: a.prdLabel(ctx),
 	})
 	if err != nil {
 		slog.Error("poller: list autopilot candidates", "repo", r.PathWithNamespace, "error", err)
@@ -211,6 +225,20 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	case errors.Is(err, workersvc.ErrActiveRunExists):
 		// A run appeared between the pre-check and here: swallow, same as an active run.
 		a.record(ctx, r, iid, eventID)
+	case errors.Is(err, workersvc.ErrNotPRDIssue):
+		// The run gate says this issue is not uzi's (PRD #102 Decision 14). The
+		// candidate query already filters on the PRD label, so reaching here means the
+		// label was removed between that query and this create — rare, and permanent
+		// for THIS label application.
+		//
+		// Record and stay silent. Recording is what stops the every-tick re-evaluation
+		// the default branch below would produce, one ListIssueLabelEvents call per
+		// issue per minute for as long as the label sits there. Silence is the point of
+		// Decision 11b: a comment here is an outward-facing write on an issue that was
+		// never uzi's, which is the outcome the whole decision exists to prevent. The
+		// person who added the autopilot label sees nothing, and that is correct — uzi
+		// has no standing on that issue to explain itself.
+		a.record(ctx, r, iid, eventID)
 	default:
 		// ErrRepoNotFound/ErrIssueNotFound should not happen (the owner owns the repo
 		// and the issue is cached) and a transient DB error should retry: leave the
@@ -260,6 +288,26 @@ func (a *Autopilot) autopilotLabel(ctx context.Context) string {
 		}
 	}
 	return settings.DefaultAutopilotLabel
+}
+
+// prdLabel resolves the configured PRD label the candidate query filters on
+// alongside the autopilot label (Decision 11b), falling back to the compiled-in
+// default when unconfigured or on a settings read error — the same shape as
+// autopilotLabel above and as workersvc.prdLabel, which gates the run this
+// detector goes on to create.
+//
+// The fallback direction matters more here than for autopilotLabel. Returning an
+// empty string would make the jsonb_exists predicate match nothing and quietly
+// disable autopilot; returning the default keeps the filter meaningful on the
+// overwhelmingly common configuration. Neither direction can widen the candidate
+// set, which is the property that makes this safe to get wrong.
+func (a *Autopilot) prdLabel(ctx context.Context) string {
+	if a.set != nil {
+		if l, _ := a.set.PRDLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultPRDLabel
 }
 
 // allowWithoutPRD reports whether the PRDLESS gate bypass applies to this fresh

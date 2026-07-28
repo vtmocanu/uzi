@@ -125,7 +125,7 @@ func TestRunLimitWaitQueriesLiveDB(t *testing.T) {
 			//  * SQLSTATE 42P08 — sqlc's type deduction is not Postgres's, so a query
 			//    sqlc accepts can be rejected the first time it is PREPARED.
 			//
-			//  * SQLSTATE 23514 — the status CHECK in 00090 does not spell 'limit_wait'
+			//  * SQLSTATE 23514 — the status CHECK in 00091 does not spell 'limit_wait'
 			//    the way this statement does. Measured: a migration widening the CHECK
 			//    to 'limit-wait' instead migrates cleanly, passes `sqlc generate` (which
 			//    reads the schema but not CHECK VALUES), and passes all 43 api packages.
@@ -134,7 +134,7 @@ func TestRunLimitWaitQueriesLiveDB(t *testing.T) {
 			//    matters most at the landing rebase, when the migration is renumbered
 			//    and retyped.
 			t.Fatalf("SetRunLimitWait(%s): %v\n"+
-				"  23514 here means 00090's status CHECK does not spell 'limit_wait' as this "+
+				"  23514 here means 00091's status CHECK does not spell 'limit_wait' as this "+
 				"query does (check the renumbered migration); 42P08 means sqlc accepted a "+
 				"statement Postgres will not prepare.", id, err)
 		}

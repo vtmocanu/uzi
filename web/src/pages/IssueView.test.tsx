@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
       setIssuePrdless: vi.fn(),
+      promoteIssue: vi.fn(),
     },
   };
 });
@@ -71,6 +72,7 @@ function aCard(labels: string[]): Card {
     column: "",
     closed: false,
     conflict: false,
+    forge_updated_at: "2026-01-01T00:00:00Z",
     latest_run: null,
     pipeline: null,
   };
@@ -182,8 +184,12 @@ describe("IssueView PRDLESS toggle (PRD #22 M4)", () => {
 });
 
 describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
-  // The badge is queried by its distinctive title, since the issue also renders a
-  // label chip named "PRDLESS" — the title disambiguates the badge from the chip.
+  // The badge is queried by its distinctive title rather than its text. That used to
+  // be necessary because the issue ALSO rendered a label chip named "PRDLESS" and the
+  // title was the only thing telling the two apart; since PRD #102 M4 the shared
+  // chipLabels predicate excludes PRDLESS unconditionally, so there is no chip to
+  // collide with. Kept as the query anyway: it is the assertion that does not move
+  // when the label is renamed in settings.
   const BADGE_TITLE = "PRD-link gate bypassed by label";
 
   it("shows the PRDLESS badge, not 'no PRD link', when enabled and labeled", async () => {
@@ -211,6 +217,120 @@ describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
     await screen.findByText("A small typo fix");
     expect(screen.getByText("no PRD link")).toBeTruthy();
     expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+  });
+});
+
+// PRD #102 M4. The issue view had its own ad-hoc chip filter (column, plus PRDLESS only
+// while its badge showed), so PRD and autopilot chips rendered here. Not "and not on the
+// board", which is how this read until the fact-check: before a02e3184 the board
+// rendered no chips AT ALL, so there was no predicate divergence to describe — M4 gave
+// the board chips and gave both surfaces one predicate in the same change.
+describe("IssueView label chips (PRD #102 M4)", () => {
+  it("chips content labels and drops every workflow marker", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({
+        labels: ["PRD", "autopilot", "PRDLESS", "In Progress", "bug"],
+        column: "In Progress",
+        has_prd_link: true,
+      }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("bug")).toBeTruthy();
+    expect(screen.queryByText("PRD")).toBeNull();
+    // autopilot is excluded from the CHIPS and always was. Since review M-1 it renders
+    // as a BADGE instead, which is a different element with a different meaning — so
+    // the assertion is that exactly one element carries the name and it is the badge,
+    // not that the name is absent. Asserting absence here would forbid the badge.
+    const autopilotEls = screen.getAllByText("autopilot");
+    expect(autopilotEls).toHaveLength(1);
+    expect(autopilotEls[0].getAttribute("title")).toMatch(/Autopilot/);
+    // The issue's own column already names the header badge; a second copy of it as
+    // a chip is the duplication Decision 6's column exclusion exists to prevent.
+    expect(screen.getAllByText("In Progress")).toHaveLength(1);
+  });
+
+  // m-2. The strip on this page had NO test: folding stripUnsafeChars(l) to a raw {l}
+  // left nine tests green, because nothing here rendered a label carrying one.
+  it("strips format characters out of a chip (#124)", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
+    });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
+    expect(screen.getByText("security")).toBeTruthy();
+  });
+
+  // m-3. The ATTRIBUTE channel, on this surface too. container.textContent cannot see
+  // a title=, so the strip there was ungated on both pages at once.
+  it("strips the chip's title ATTRIBUTE, not only its text (#124)", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "se\u202Ecurity"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    const chip = screen.getByText("security");
+    expect(chip.getAttribute("title")).toBe("security");
+  });
+});
+
+// M-1. The autopilot label lost its only user-visible surface in web/ when M4 removed
+// it from the chip list. Removing it from the CHIPS was right — it is a workflow
+// marker, not content — but the consequence was that an issue armed for an unattended
+// run showed nothing at all until a run existed to carry RunView's badge.
+//
+// A badge is not a chip, so Decision 6 is untouched: the chip row still excludes the
+// label, and this says the distinct thing the chip never did.
+describe("IssueView autopilot badge (PRD #102 review M-1)", () => {
+  it("shows an autopilot badge when the label is applied", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByTitle(/Autopilot/)).toBeTruthy();
+    expect(screen.getByText("autopilot")).toBeTruthy();
+  });
+
+  it("shows nothing when the label is absent", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"], has_prd_link: true }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByTitle(/Autopilot/)).toBeNull();
+  });
+
+  it("reads the CONFIGURED label name, never the literal 'autopilot'", async () => {
+    // The label is operator-configurable, like the other three. A hardcoded name would
+    // silently stop marking armed issues the moment an admin renames it.
+    vi.mocked(useAuth).mockReturnValue({
+      ...vi.mocked(useAuth)(),
+      autopilotLabel: "robot",
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "robot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("robot")).toBeTruthy();
+  });
+
+  it("does NOT put autopilot back in the chip row (Decision 6 stays intact)", async () => {
+    // The badge must not become a second route for a label the chip predicate excludes:
+    // exactly one element carries the name, and it is the badge.
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({
+      issue: anIssue({ labels: ["PRD", "autopilot"], has_prd_link: true }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getAllByText("autopilot")).toHaveLength(1);
+    expect(screen.getByText("autopilot").getAttribute("title")).toMatch(/Autopilot/);
   });
 });
 
@@ -270,5 +390,106 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     fireEvent.click(screen.getByText("Mark PRDLESS"));
     // Once the label lands, the bypass enables Start.
     await waitFor(() => expect(startBtn().disabled).toBe(false));
+  });
+});
+
+// PRD #102 M6. M4 removed the PRD chip from this page — correctly, since every
+// cached issue carried the label by construction and the chip carried no
+// information. M6 is what gives it information again: without an indicator here, a
+// non-PRD issue opened from the board is indistinguishable from a PRD one on the
+// page where a user decides what to do with it, and which offers the run controls
+// the server-side gate now refuses.
+describe("IssueView — non-PRD issues (PRD #102 M6)", () => {
+  it("marks a non-PRD issue and offers Promote in place of Start run", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    expect(screen.getByText("not PRD")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Promote to PRD/ })).toBeTruthy();
+    // Hidden, not disabled: the server refuses the run and Promote is the one-click
+    // answer, so a gated button explaining a resolvable rule would be noise.
+    expect(screen.queryByRole("button", { name: /start run/i })).toBeNull();
+  });
+
+  it("shows neither on an ordinary PRD issue", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    expect(screen.queryByText("not PRD")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("does not offer the PRDLESS toggle on a non-PRD issue (Decision 16)", async () => {
+    // prdlessEnabled AND has_prd_link false — the exact shape that WOULD show the
+    // toggle on a PRD issue. It grants nothing here: run eligibility also requires
+    // the PRD label now.
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByText("Mark PRDLESS")).toBeNull();
+  });
+
+  it("promotes forge-first and adopts the returned labels", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["bug"] }) });
+    mockApi.promoteIssue.mockResolvedValue({ card: aCard(["PRD", "bug"]) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    fireEvent.click(screen.getByRole("button", { name: /Promote to PRD/ }));
+    await waitFor(() => expect(mockApi.promoteIssue).toHaveBeenCalledWith("repo-1", 7));
+    // The page re-reads as an ordinary PRD issue: the marker goes, Start run appears.
+    await waitFor(() => expect(screen.queryByText("not PRD")).toBeNull());
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+  });
+
+  it("does not offer Promote on the self-improve tracker (Decision 13a)", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi-self-improve"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    // Still MARKED as not-PRD (it is not uzi's board work), but not promotable — the
+    // server refuses it too, so an offered button would be a 422 waiting to happen.
+    expect(screen.getByText("not PRD")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Promote to PRD/ })).toBeNull();
+  });
+});
+
+// web-ux S3. A column name is user-supplied and effectively unbounded: the Columns
+// editor applies no maxlength and GitLab allows 255 characters. Measured at 375x812,
+// a 105-char name rendered a 594px badge in a 375px viewport and pushed
+// document.scrollWidth to 610 — the whole page scrolled sideways.
+//
+// jsdom has no layout, so this CANNOT assert the width. It asserts the mechanism
+// instead: the badge must not be whitespace-nowrap, which is what forced the
+// overflow. Stated plainly because a passing test here is weaker evidence than the
+// browser measurement that found it.
+describe("IssueView — a long column name does not overflow the page (web-ux S3)", () => {
+  it("renders the column badge wrapping rather than nowrap", async () => {
+    setAuth(false);
+    const long = "Waiting on the upstream vendor to confirm the migration window and sign off";
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: long }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+
+    const badge = screen.getByText(long).closest("span[class*='rounded-md']") as HTMLElement;
+    expect(badge).toBeTruthy();
+    expect(badge.classList.contains("whitespace-nowrap")).toBe(false);
+    expect(badge.classList.contains("whitespace-normal")).toBe(true);
+  });
+
+  it("still renders an ordinary column name", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ column: "In Progress" }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("In Progress")).toBeTruthy();
   });
 });

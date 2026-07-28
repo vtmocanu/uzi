@@ -14,7 +14,7 @@ default theme, the run judge, and the self-improvement job.
 
 | Setting | Default | Controls |
 |---|---|---|
-| PRD label | `PRD` | Which GitLab label marks an issue as factory work; only issues carrying it appear on any board. |
+| PRD label | `PRD` | Which GitLab label marks an issue as factory work. Only issues carrying it can start a run, and only they appear on a board by default; a board's **Show other issues** toggle reveals the repo's other open issues. |
 | Autopilot label | `autopilot` | Which GitLab label, added alongside the PRD label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
 | PRDLESS label | `PRDLESS` | Which GitLab label lets an issue start a run with no `prds/*.md` link, when the toggle below is on. See [PRDLESS label](./prdless.md). |
 

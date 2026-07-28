@@ -80,7 +80,7 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 		hub:      hub.New(),
 	}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim)
 	return h, router, pool
 }
 

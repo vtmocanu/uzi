@@ -60,6 +60,7 @@ var limiterNames = [...]string{
 	limJudge,
 	limHosted,
 	limCLIPoll,
+	limBoardOrder,
 }
 
 // The limiter names, as constants so a typo in the 142-row table below is a compile
@@ -85,6 +86,10 @@ const (
 	limJudge    = "judgeLimiter"
 	limHosted   = "hostedLimiter"
 	limCLIPoll  = "cliPollLimiter"
+	// PRD #102 M5. Dedicated rather than shared with limForge: a reorder makes zero
+	// forge calls, so charging it to the forge budget would let a burst of dragging
+	// starve the user's real forge operations.
+	limBoardOrder = "boardOrderLimiter"
 )
 
 type routeMount struct {
@@ -255,6 +260,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/repos/{id}/issues", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/move", limForge},
 	{"POST", "/api/repos/{id}/issues/{iid}/prdless", limForge},
+	// Promote (PRD #102 Decision 15) writes one label to the forge, the same shape
+	// and the same cost as the prdless toggle above it.
+	{"POST", "/api/repos/{id}/issues/{iid}/promote", limForge},
 	{"POST", "/api/repos/{id}/runs", limForge},
 	{"POST", "/api/repos/{id}/sync", limForge},
 	{"POST", "/api/runs/{id}/inputs", noLimiter},
@@ -297,6 +305,18 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/me/slack/override", limSlackDM},
 	{"PUT", "/api/repos/{id}", noLimiter},
 	{"PUT", "/api/repos/{id}/board/columns", noLimiter},
+	// Its OWN limiter (PRD #102 M5), not limForge and not none. The route makes zero
+	// forge calls, so the forge budget would be the wrong pocket; but it renumbers a
+	// whole board in a transaction and rebuilds the board on every request, so bare
+	// was the wrong answer too — and "give it its own" is what this codebase has
+	// already decided five times over.
+	//
+	// An earlier version of this comment justified it with "every other board WRITE
+	// route carries limForge". That is false in both directions and was struck: the row
+	// directly above is PUT board/columns with noLimiter, and ConfigureColumns DOES make
+	// forge calls (ForgeForConnection then EnsureLabels). The decision stands on its own
+	// merits above; it never needed that claim.
+	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,
@@ -473,7 +493,7 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	// Hosting on, so the controller routes exist and the table is unconditional.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
 
 	routes, ok := router.(chi.Routes)
 	if !ok {
@@ -780,14 +800,15 @@ func TestRoutesCallSitePassesLimitersInLimiterNamesOrder(t *testing.T) {
 // (RateLimitMax, no stem), and a convention with a permanent exception is one rename
 // away from needing a second.
 var limiterConfigFields = map[string]string{
-	limAuth:     "RateLimitMax",
-	limForge:    "ForgeRateLimitMax",
-	limSlackDM:  "SlackDMRateLimitMax",
-	limChat:     "ChatRateLimitMax",
-	limProposal: "ProposalRateLimitMax",
-	limJudge:    "JudgeRateLimitMax",
-	limHosted:   "HostedRateLimitMax",
-	limCLIPoll:  "CLIPollRateLimitMax",
+	limAuth:       "RateLimitMax",
+	limForge:      "ForgeRateLimitMax",
+	limSlackDM:    "SlackDMRateLimitMax",
+	limChat:       "ChatRateLimitMax",
+	limProposal:   "ProposalRateLimitMax",
+	limJudge:      "JudgeRateLimitMax",
+	limHosted:     "HostedRateLimitMax",
+	limCLIPoll:    "CLIPollRateLimitMax",
+	limBoardOrder: "BoardOrderRateLimitMax",
 }
 
 // limiterConstruction is one `x := mw.NewLimiter(cfg.Y, …)` found in main.

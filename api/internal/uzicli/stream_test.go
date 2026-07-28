@@ -831,8 +831,8 @@ func TestStreamRunCloseWhileConsumerIsNotReading(t *testing.T) {
 func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 	// Same relative depth as internal/workersvc, whose auto_select_test.go established
 	// this path literal. Glob rather than a pinned filename because goose numbers are
-	// DRAFTS until merge (CLAUDE.md): 00090 is renamed to the next free number above
-	// the live head on the landing rebase, and a hardcoded name would break there.
+	// DRAFTS until merge (CLAUDE.md): this migration was drafted 00090 and landed as
+	// 00091 once PRD #102 took 00090, and a hardcoded name would have broken there.
 	paths, err := filepath.Glob(filepath.Join("..", "store", "migrations", "*.sql"))
 	if err != nil {
 		t.Fatalf("glob migrations: %v", err)

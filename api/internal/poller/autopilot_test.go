@@ -42,10 +42,18 @@ type apStore struct {
 	active    map[int64]bool
 	activeErr error
 
+	candParams []store.ListAutopilotCandidateIssuesParams
+
 	ops *[]string // shared op-order log across store + forge + runs
 }
 
-func (s *apStore) ListAutopilotCandidateIssues(context.Context, store.ListAutopilotCandidateIssuesParams) ([]store.ListAutopilotCandidateIssuesRow, error) {
+// ListAutopilotCandidateIssues returns the scripted candidates and CAPTURES its
+// params. The capture is not decoration: this fake cannot filter (the predicate is
+// SQL), so the only thing a unit test can check about Decision 11b's PRD predicate
+// is that the resolved label is actually handed to the query. The filtering itself
+// is covered live, in store/autopilot_candidates_integration_test.go.
+func (s *apStore) ListAutopilotCandidateIssues(_ context.Context, arg store.ListAutopilotCandidateIssuesParams) ([]store.ListAutopilotCandidateIssuesRow, error) {
+	s.candParams = append(s.candParams, arg)
 	return s.candidates, s.candErr
 }
 func (s *apStore) GetAutopilotConnectionContext(context.Context, uuid.UUID) (store.GetAutopilotConnectionContextRow, error) {
@@ -106,12 +114,18 @@ func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID,
 }
 
 type apLabeler struct {
-	label          string
+	label string
+	// prdLabel is the PRD label the candidate query filters on alongside the
+	// autopilot one (PRD #102 M6 Decision 11b). Left zero by most cases, which is
+	// the "unconfigured" path Autopilot.prdLabel resolves to the compiled-in
+	// default.
+	prdLabel       string
 	prdlessEnabled bool
 	prdlessLabel   string
 }
 
 func (l apLabeler) AutopilotLabel(context.Context) (string, error) { return l.label, nil }
+func (l apLabeler) PRDLabel(context.Context) (string, error)       { return l.prdLabel, nil }
 func (l apLabeler) PrdlessEnabled(context.Context) (bool, error)   { return l.prdlessEnabled, nil }
 func (l apLabeler) PrdlessLabel(context.Context) (string, error)   { return l.prdlessLabel, nil }
 

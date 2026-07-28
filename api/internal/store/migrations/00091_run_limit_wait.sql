@@ -5,11 +5,13 @@
 -- domain; NOTHING reads or writes any of it yet. The worker-side detection (M1)
 -- and the server park machinery (M2) land on top.
 --
--- DRAFT NUMBER. Live head at authoring is 00089_run_select_reason_check.sql.
--- Per CLAUDE.md, renumber to the next free number above the live head on the
--- landing rebase: the boot runner is strict goose (no allow-missing,
--- store/migrate.go), so landing a version BELOW an already-applied head makes
--- every upgraded instance refuse to boot.
+-- NUMBER ASSIGNED AT LANDING. Drafted as 00090 against a live head of
+-- 00089_run_select_reason_check.sql; PRD #102 merged to main first and took
+-- 00090_issue_board_position.sql, so this renumbered to 00091 on the landing
+-- rebase. Per CLAUDE.md that renumber is mandatory rather than tidy: the boot
+-- runner is strict goose (no allow-missing, store/migrate.go), so landing a
+-- version BELOW an already-applied head makes every upgraded instance refuse
+-- to boot.
 
 -- runs ---------------------------------------------------------------------
 --
