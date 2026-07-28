@@ -14698,15 +14698,55 @@ Supersedes the HWM half of §444; the eviction/union half of §444 is untouched.
   must bound the fetch and the eviction together. Recording the exclusion because an
   unstated one reads as an oversight, and the next person to reach for a cap needs
   the eviction coupling before they start.
-- **UNVERIFIED ASSUMPTION, recorded as one rather than asserted: that GitLab and
-  Forgejo bump an issue's `updated_at` when a label is added or removed.** The
-  per-mark label-transition argument in the `Marks` doc rests on it, and as of
-  2026-07-28 it had been checked against neither forge's documentation (a
-  verification was in flight when this section was written). If it is FALSE the
-  design has a real problem — a de-labelled issue would enter neither fetch's
-  incremental window and would wait for the reconcile tier. Do not promote this to a
-  fact without a citation; a spec asserting it would be the artifact that hides the
-  problem.
+- **The load-bearing premise — that GitLab and Forgejo bump an issue's `updated_at`
+  when a label is added or removed — is CONFIRMED (2026-07-28), and the strength of
+  the evidence DIFFERS BY FORGE AND BY DIRECTION.** The per-mark label-transition
+  argument in the `Marks` doc rests on it; if it were false a de-labelled issue would
+  enter neither fetch's incremental window and would wait for the reconcile tier.
+  *(This bullet was written the same day as an explicitly UNVERIFIED assumption,
+  checked against neither forge's documentation, and promoted here once measured. The
+  promotion is dated because a reader has to be able to tell a verified premise from
+  an inherited one.)*
+  - **GitLab, both directions: MEASURED.** `toIssue` reads `updated_at` and the
+    request side bounds on the same field. Observed read-only against
+    `vtmocanu/uzi` via `resource_label_events` — no issue was mutated — over 178
+    issues / 320 label events, filtered to cases where a label change is provably the
+    last activity: **10 clean pure-adds and 4 clean pure-removes**, `updated_at`
+    landing 7-19ms before the event row (issue stamped, then event inserted, one
+    request).
+  - **Forgejo, add: MEASURED** (5 clean cases on codeberg.org over 898 label events).
+    **Forgejo, remove: SOURCE-DERIVED, NOT MEASURED.** `toForgejoIssue` reads
+    `updated_at`; `since` traces through `UpdatedAfterUnix` to
+    `builder.Gte{"issue.updated_unix"}`, the column `updated_at` serialises from, so
+    the loop closes. Both label directions funnel through one terminal
+    `UpdateIssueCols(ctx, opts.Issue, "updated_unix")` in `updateCommentInfos`, which
+    sits OUTSIDE the type switch, so `CommentTypeLabel` reaches it with no case of its
+    own — add and remove hit the identical line. Remove could not be isolated
+    empirically because removes are essentially always paired with an add in one PUT,
+    and the paired cases were deliberately not presented as isolated ones. A
+    refutation sweep over all 898 events found zero violations, which **rules
+    refutation out without positively confirming remove**.
+  - **🔴 ONE UNEXPLAINED GITLAB NON-BUMP IN 320 EVENTS, recorded because a systematic
+    version of it is a silent-skip bug.** Issue #1: a label added (which did bump),
+    then removed by the same actor 2.25s later, with `updated_at` never moving. Every
+    testable hypothesis was killed — snapshot skew, the label being deleted from the
+    project, a concurrent note or state change, "only bumps when the actor changes"
+    (refuted by issue #78, identical shape, which did bump), and "the issue was closed
+    at the time" (refuted by #93). Reported as unexplained rather than given an
+    invented mechanism. It is a synthetic test label on the project's first issue, so
+    it may be a one-off script artifact, but that was **not** established. Settling it
+    needs a deliberate mutation on a scratch issue, which no read-only observation can
+    substitute for.
+- **GitLab's `updated_at` means "the issue RECORD changed", not "last activity" —
+  cross-reference system notes ("mentioned in commit/MR/issue") do NOT bump it.**
+  Recorded because the natural assumption runs the other way, and the direction of the
+  error matters: this is *less* poller churn than a reader would expect, not a source
+  of missed updates.
+- **Forgejo's `since` bound is INCLUSIVE** (`Gte`), so a boundary issue re-returns
+  rather than being skipped — the same safe direction as the inclusive-at-second-
+  granularity behaviour §22 already records for the incremental path. A mark that
+  re-reads costs a duplicate upsert, which is idempotent; a mark that skips loses a
+  row until the reconcile tier.
 - **A test that passes ONE value to both marks certifies a single-mark
   implementation.** A constraint on any rebuild, not test narration: fixtures must
   use `prdMax != openMax` and caller pairs with `PRD != Open`, and must assert BOTH
