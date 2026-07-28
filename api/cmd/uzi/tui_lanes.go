@@ -237,7 +237,10 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 		return crewDone
 	}
 	// A gate or a missing worker blocks the WHOLE crew, so it dominates every lane.
-	if runStatus == "awaiting_approval" || runHealth == "waiting_worker" {
+	// awaiting_input (PRD #88) is the same shape of block — a human owes the run an
+	// action and nothing proceeds until they take it — so it belongs here rather than
+	// in atPlanGate, which is specifically the PLAN gate.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

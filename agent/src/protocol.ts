@@ -92,14 +92,16 @@ export interface AskUserQuestion {
 export interface QuestionPayload {
   /** The question's stable identity, minted by the worker at the first park and
    *  RE-USED verbatim when a resumed worker re-parks on the same question. This is
-   *  what the answer names, and what SetRunRunning's resume guard compares. It must
-   *  not be derived from a clock or an arrival ordinal: a requeue re-parks the run,
-   *  which would invalidate any such key and silently reject an answer the user
-   *  submitted correctly before the worker died. */
+   *  what the answer names, and what SetRunRunning's resume guard compares.
+   *
+   *  It is the ONLY staleness key in this feature, deliberately. There is no
+   *  generation counter, no epoch and no timestamp anywhere on the answer path: every
+   *  such key is bumped by a requeue re-park, which would silently reject an answer
+   *  the user submitted correctly against the live question before the worker died.
+   *  Do not add one alongside this — a conjunction is only as good as its weaker
+   *  clause, so an arrival-ordinal check sitting next to identity would re-introduce
+   *  exactly the rejection identity exists to prevent. */
   question_id: string;
-  /** 1-based ordinal of this question within the run, for display and the cap. NOT
-   *  the identity — it is not stable across a requeue. */
-  generation: number;
   questions: AskUserQuestion[];
 }
 

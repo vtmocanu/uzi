@@ -136,8 +136,15 @@ export class RunRunner {
    *  resume so a re-park re-uses the SAME id rather than minting a new one — which is
    *  what lets an answer submitted before a worker death still be honoured. */
   private readonly openQuestionIds = new Map<string, string>();
-  /** PRD #88: how many times each run has parked, for QUESTION_MAX and for the
-   *  1-based `generation` the feed renders. */
+  /** PRD #88: how many times each run has parked, for the LOG LINE only.
+   *
+   *  Not a guard and not the cap. QUESTION_MAX is enforced in sdk-executor against
+   *  its own per-execute counter, and the staleness key is the question id — this
+   *  ordinal is never compared to anything. It is deliberately kept off the wire:
+   *  a field named for an arrival ordinal, sitting in the question payload, reads as
+   *  a staleness discriminator to the next person, and this feature has exactly one
+   *  of those. A surface that wants "question 2 of this run" can count `question`
+   *  messages in the feed, where the ordinal is a fact rather than a claim. */
   private readonly questionCounts = new Map<string, number>();
   /** PRD #41 (Decision 3): the set of runs that have opened a plan gate at least once.
    *  It distinguishes the FIRST gate (epoch 0 — a verdict already queued when the gate
@@ -1003,8 +1010,8 @@ export class RunRunner {
       };
     }
 
-    const generation = (this.questionCounts.get(runId) ?? 0) + 1;
-    this.questionCounts.set(runId, generation);
+    const ordinal = (this.questionCounts.get(runId) ?? 0) + 1;
+    this.questionCounts.set(runId, ordinal);
 
     // Reuse the id this run is already parked on (a resume re-parks on the SAME
     // question); mint one only for a genuinely new question.
@@ -1017,7 +1024,7 @@ export class RunRunner {
     batcher.emit({
       kind: "question",
       agent: "lead",
-      payload: { question_id: questionId, generation, questions },
+      payload: { question_id: questionId, questions },
     });
     // Durable before the park is announced — see the doc comment.
     await batcher.flush().catch(() => undefined);
@@ -1029,7 +1036,7 @@ export class RunRunner {
     runLog.info("clarification: awaiting answer", {
       run_id: runId,
       question_id: questionId,
-      generation,
+      question_ordinal: ordinal,
     });
 
     const settle = (v: AnswerVerdict): AnswerVerdict => {

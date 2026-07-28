@@ -47,6 +47,7 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  private readonly stateHooks = new Map<string, (body: StateRequest) => void>();
   private readonly messagesByRun = new Map<string, OutgoingMessage[]>();
   private readonly seenSeqByRun = new Map<string, Set<number>>();
 
@@ -55,8 +56,15 @@ export class FakeApi {
   private readonly chatRunDetails = new Map<string, WorkerRunDetail>();
   private readonly chatMessagesByRun = new Map<string, WorkerRunMessage[]>();
   readonly chatListLimits: (string | null)[] = [];
-  readonly chatMessageQueries: Array<{ runId: string; after: string | null; limit: string | null }> = [];
-  readonly proposalRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  readonly chatMessageQueries: Array<{
+    runId: string;
+    after: string | null;
+    limit: string | null;
+  }> = [];
+  readonly proposalRequests: Array<{
+    runId: string;
+    body: Record<string, unknown>;
+  }> = [];
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -68,7 +76,9 @@ export class FakeApi {
   }
 
   async listen(): Promise<string> {
-    await new Promise<void>((resolve) => this.server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) =>
+      this.server.listen(0, "127.0.0.1", resolve),
+    );
     // unref the listening handle so it never keeps the test PROCESS alive on its own.
     // Every test drives this server through an awaited client call, so the run's own
     // pending work holds the loop open while a test is in flight; once the tests
@@ -114,6 +124,14 @@ export class FakeApi {
     this.inputsByRun.set(runId, inputs);
   }
 
+  /** Observe each /state report as it lands, so a test can react to a value the
+   *  WORKER minted rather than one the test guessed. PRD #88 needs this: the answer
+   *  to a clarification must name the question id the runner generated at the park,
+   *  and that id is only knowable from the report itself. */
+  onState(runId: string, fn: (body: StateRequest) => void): void {
+    this.stateHooks.set(runId, fn);
+  }
+
   setChatRuns(runs: WorkerRunListItem[]): void {
     this.chatRunsList = runs;
   }
@@ -129,7 +147,10 @@ export class FakeApi {
   }
 
   // --- routing -------------------------------------------------------------
-  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private async handle(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
     if (req.headers.authorization !== `Bearer ${this.token}`) {
       this.unauthorized++;
       return send(res, 401, { error: "unauthorized" });
@@ -140,13 +161,18 @@ export class FakeApi {
     const p = url.pathname;
 
     if (req.method === "POST" && p === "/api/worker/register") {
-      const rec: RecordedRegister = { name: String(json.name), version: String(json.version), authorized: true };
+      const rec: RecordedRegister = {
+        name: String(json.name),
+        version: String(json.version),
+        authorized: true,
+      };
       // Only record the key when the worker actually sent one, so an old-style
       // {name,version} register stays byte-for-byte that shape (PRD #18).
       if (json.template !== undefined) rec.template = String(json.template);
       // Capabilities (PRD #83 Q1): recorded only when present, so a daemon-less worker's
       // register wire stays byte-identical. Mirrors the api's accept-and-ignore.
-      if (json.capabilities !== undefined) rec.capabilities = (json.capabilities as unknown[]).map(String);
+      if (json.capabilities !== undefined)
+        rec.capabilities = (json.capabilities as unknown[]).map(String);
       this.registers.push(rec);
       return send(res, 200, { worker_id: randomUUID() });
     }
@@ -169,7 +195,11 @@ export class FakeApi {
     const chatMsgs = /^\/api\/worker\/chat\/runs\/([^/]+)\/messages$/.exec(p);
     if (req.method === "GET" && chatMsgs) {
       const id = chatMsgs[1] as string;
-      this.chatMessageQueries.push({ runId: id, after: url.searchParams.get("after"), limit: url.searchParams.get("limit") });
+      this.chatMessageQueries.push({
+        runId: id,
+        after: url.searchParams.get("after"),
+        limit: url.searchParams.get("limit"),
+      });
       return send(res, 200, { messages: this.chatMessagesByRun.get(id) ?? [] });
     }
     const chatDetail = /^\/api\/worker\/chat\/runs\/([^/]+)$/.exec(p);
@@ -182,7 +212,9 @@ export class FakeApi {
     if (req.method === "POST" && propMatch) {
       const runId = propMatch[1] as string;
       this.proposalRequests.push({ runId, body: json });
-      const labels = Array.isArray(json.labels) ? (json.labels as string[]) : [];
+      const labels = Array.isArray(json.labels)
+        ? (json.labels as string[])
+        : [];
       return send(res, 201, {
         proposal: {
           id: "prop-1",
@@ -196,12 +228,15 @@ export class FakeApi {
       });
     }
 
-    const runMatch = /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
+    const runMatch =
+      /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
       const runId = runMatch[1] as string;
       const kind = runMatch[2] as string;
-      if (req.method === "POST" && kind === "messages") return this.handleMessages(res, runId, json);
-      if (req.method === "POST" && kind === "state") return this.handleState(res, runId, json);
+      if (req.method === "POST" && kind === "messages")
+        return this.handleMessages(res, runId, json);
+      if (req.method === "POST" && kind === "state")
+        return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
         // Consume-on-read, FIFO — matches M1's ConsumeInputs (each GET returns
         // then clears the pending inputs; there is no separate ack).
@@ -213,7 +248,11 @@ export class FakeApi {
     return send(res, 404, { error: "not found", path: p });
   }
 
-  private handleMessages(res: http.ServerResponse, runId: string, json: Record<string, unknown>): void {
+  private handleMessages(
+    res: http.ServerResponse,
+    runId: string,
+    json: Record<string, unknown>,
+  ): void {
     if (this.msgFailRemaining > 0) {
       this.msgFailRemaining--;
       return send(res, this.msgFailStatus, { error: "injected failure" });
@@ -231,7 +270,11 @@ export class FakeApi {
     send(res, 200, { accepted: incoming.length });
   }
 
-  private handleState(res: http.ServerResponse, runId: string, json: Record<string, unknown>): void {
+  private handleState(
+    res: http.ServerResponse,
+    runId: string,
+    json: Record<string, unknown>,
+  ): void {
     this.stateAttempts++;
     if (this.stateFailRemaining > 0) {
       this.stateFailRemaining--;
@@ -243,6 +286,7 @@ export class FakeApi {
       return send(res, 409, { error: "run already terminal" });
     }
     this.states.push({ runId, body });
+    this.stateHooks.get(runId)?.(body);
     send(res, 200, {});
   }
 }
