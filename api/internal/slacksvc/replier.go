@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -219,6 +220,19 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	case isTerminalStatus(run.Status):
 		r.coalescedEphemeral(ctx, m, "finished", "That run has already finished.")
 
+	case run.Status == "awaiting_input":
+		// The run is parked on a clarification question and the reply IS the answer (PRD
+		// #88 M3). This case MUST precede the default arm: the default submits a follow_up,
+		// which the worker queues for the NEXT implement turn — a turn that never arrives,
+		// because the run is parked waiting for the answer that just became a follow-up.
+		// The run would then sit until its deadline having visibly ignored the user.
+		//
+		// Unlike both awaiting_approval cases above this is a BARE status check: those are
+		// compound because a plan revision keeps the run at awaiting_approval, so the
+		// status alone cannot tell an open gate from a reject/revise-pending one. A
+		// question has no such sub-state — awaiting_input means exactly one thing.
+		r.answer(ctx, m, user.ID, anchor.RunID, run, text)
+
 	default:
 		// Live run, no gate → follow_up for the next implement turn.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {
@@ -228,6 +242,61 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		r.ack(ctx, m)
 	}
 }
+
+// answer submits a threaded reply as the answer to the question the run is parked on
+// (PRD #88 M3). The binding is server-side and identity-keyed: Slack free text carries
+// no id, so the id comes from the RUN ROW the thread anchor resolved to, never from
+// anything the reply could influence.
+//
+// It is bound to the run's CURRENTLY open question, which is the only thing a Slack
+// thread can express: every reply in a run's DM arrives with thread_ts == the root ts,
+// so a reply typed under the first question card is indistinguishable from one typed
+// under the second. A reply while question N is open therefore answers question N.
+//
+// Two replies racing before the worker consumes the first are BOTH accepted (they name
+// the same open question, and the run is still parked) and the worker takes the first —
+// first-wins worker-side, deliberately not a compare-and-swap: unlike a plan revision,
+// the loser is harmless, being one more consumed input the worker discards.
+func (r *Replier) answer(ctx context.Context, m MessageReply, userID, runID uuid.UUID, run store.Run, text string) {
+	qid := strings.TrimSpace(run.OpenQuestionID.String)
+	if !run.OpenQuestionID.Valid || qid == "" {
+		// A parked run with no open question id cannot be resumed by any answer, from any
+		// surface — the resume guard is unsatisfiable. workersvc.SetState rejects an empty
+		// id at the park, so this is unreachable; it is handled because "unreachable" is a
+		// claim about another package, and a silent drop here would look like Slack losing
+		// the user's answer.
+		r.logf("resolve open question", errNoOpenQuestion)
+		r.ephemeral(ctx, m, "Couldn't record your answer — open the run in uzi and answer there.")
+		return
+	}
+	if text == "" {
+		// Empty after trim/scrub (a file-only or emoji-only message). Submitting it would
+		// resolve the question with no content and let the run continue on nothing.
+		r.coalescedEphemeral(ctx, m, "empty-answer",
+			"That reply had no text — answer in words and I'll pass it to the run.")
+		return
+	}
+	body, err := answerInputBody(qid, text)
+	if err != nil {
+		r.logf("encode answer", err)
+		return
+	}
+	if err := r.svc.SubmitInput(ctx, userID, runID, "answer", body); err != nil {
+		// Includes losing a race to another surface: the run can leave awaiting_input
+		// between the read above and this submit, and the server then rejects the answer as
+		// not-parked or stale. Tell the user either way — an unacked reply with no notice
+		// reads as uzi ignoring them.
+		r.logf("submit answer", err)
+		r.ephemeral(ctx, m, "Couldn't record your answer — the run may have moved on. Open it in uzi to check.")
+		return
+	}
+	r.ack(ctx, m)
+}
+
+// errNoOpenQuestion is the log subject for a run parked at awaiting_input carrying no
+// open question id — a state the server refuses to create, kept observable rather than
+// assumed away.
+var errNoOpenQuestion = errors.New("run is awaiting_input with no open question id")
 
 // resolveGate edits the gate message button-free and clears the anchor, so a later
 // stale click / the notifier's transition consumer is a no-op. Best-effort.

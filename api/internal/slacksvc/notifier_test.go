@@ -28,6 +28,12 @@ type fakeNotifStore struct {
 	gateSetGen   []store.SetSlackRunGateGenParams
 	planCount    int64
 	planCountErr error
+	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
+	// which question the thread already carries. A nil question with no error models
+	// "no row" the way the generated :one query surfaces it.
+	question    []byte
+	questionErr error
+	questionSet []store.SetSlackRunQuestionParams
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -53,6 +59,19 @@ func (f *fakeNotifStore) SetSlackRunGateGen(_ context.Context, arg store.SetSlac
 }
 func (f *fakeNotifStore) CountRunPlanMessages(context.Context, uuid.UUID) (int64, error) {
 	return f.planCount, f.planCountErr
+}
+func (f *fakeNotifStore) GetLatestRunQuestion(context.Context, uuid.UUID) ([]byte, error) {
+	if f.questionErr != nil {
+		return nil, f.questionErr
+	}
+	if f.question == nil {
+		return nil, pgx.ErrNoRows
+	}
+	return f.question, nil
+}
+func (f *fakeNotifStore) SetSlackRunQuestion(_ context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error) {
+	f.questionSet = append(f.questionSet, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, QuestionID: arg.QuestionID}, nil
 }
 
 type postCall struct{ channel, thread, text string }

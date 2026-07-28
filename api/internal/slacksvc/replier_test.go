@@ -2,6 +2,8 @@ package slacksvc
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -401,5 +403,134 @@ func TestReplierBoundsReplyLength(t *testing.T) {
 
 	if len(sub.submitted) != 1 || len([]rune(sub.submitted[0].body)) != maxReplyRunes {
 		t.Fatalf("an over-long reply must be capped to %d runes, got %d", maxReplyRunes, len([]rune(sub.submitted[0].body)))
+	}
+}
+
+// parkedRun is a run stopped on a clarification question (PRD #88 M3), carrying the
+// open question's identity the replier binds the answer to.
+func parkedRun(runID, userID uuid.UUID, questionID string) store.Run {
+	r := liveRun(runID, userID, "awaiting_input")
+	if questionID != "" {
+		r.OpenQuestionID = pgtype.Text{String: questionID, Valid: true}
+	}
+	return r
+}
+
+// A reply to a parked run IS the answer: it submits kind `answer` — never a follow_up,
+// which is what the default arm would have made of it — with the run's OWN open
+// question id, and gets the ✅ ack.
+//
+// The kind assertion is the discriminating one: a follow_up on a parked run is queued
+// for an implement turn that never arrives, because the run is parked waiting for the
+// answer that just became a follow-up.
+func TestReplierAwaitingInputSubmitsAnswer(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("use redis, not memcached"))
+
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "answer" {
+		t.Fatalf("a reply to a parked run must submit an answer, not a follow_up: %+v", sub.submitted)
+	}
+	if sub.submitted[0].userID != user.ID || sub.submitted[0].runID != runID {
+		t.Fatalf("answer must be submitted for the resolved user + anchored run: %+v", sub.submitted[0])
+	}
+	var got struct {
+		QuestionID string   `json:"question_id"`
+		Answers    []string `json:"answers"`
+	}
+	if err := json.Unmarshal([]byte(sub.submitted[0].body), &got); err != nil {
+		t.Fatalf("answer body must be the JSON wire shape: %v (%q)", err, sub.submitted[0].body)
+	}
+	if got.QuestionID != "q-9" {
+		t.Fatalf("the answer must name the run's open question, server-resolved: %+v", got)
+	}
+	if len(got.Answers) != 1 || got.Answers[0] != "use redis, not memcached" {
+		t.Fatalf("the reply text must ride as the answer: %+v", got)
+	}
+	if len(fp.reactions) != 1 || fp.reactions[0].emoji != ackReaction {
+		t.Fatalf("an accepted answer must be acked: %+v", fp.reactions)
+	}
+}
+
+// An empty reply (a file- or emoji-only message) must not resolve the question with
+// nothing — the run would continue on no information at all.
+func TestReplierAwaitingInputIgnoresEmptyReply(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("   "))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("an empty reply must not be submitted as an answer: %+v", sub.submitted)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "no text") {
+		t.Fatalf("the user must be told the reply was empty: %+v", fp.ephemerals)
+	}
+	if len(fp.reactions) != 0 {
+		t.Fatalf("nothing was accepted, so nothing is acked: %+v", fp.reactions)
+	}
+}
+
+// A run parked with no open question id cannot be resumed by any answer, from any
+// surface. Say so rather than dropping the reply silently, which would read as uzi
+// ignoring the user.
+func TestReplierAwaitingInputWithoutQuestionIDTellsTheUser(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("use redis"))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("no question id ⇒ no answer to submit: %+v", sub.submitted)
+	}
+	if len(fp.ephemerals) != 1 || len(fp.reactions) != 0 {
+		t.Fatalf("want one notice and no ack: eph=%+v acks=%+v", fp.ephemerals, fp.reactions)
+	}
+}
+
+// The run can leave awaiting_input between the status read and the submit (another
+// surface answered first), and the server then refuses the answer. The user gets a
+// notice and NO ✅ — an ack for an answer the server rejected would be a lie.
+func TestReplierAwaitingInputSubmitFailureIsSurfaced(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9"), submitErr: errors.New("run is not waiting for an answer")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("use redis"))
+
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "moved on") {
+		t.Fatalf("a rejected answer must be surfaced to the replier: %+v", fp.ephemerals)
+	}
+	if len(fp.reactions) != 0 {
+		t.Fatalf("a rejected answer must NOT be acked: %+v", fp.reactions)
+	}
+}
+
+// A credential pasted into an answer is scrubbed on the Slack path before it reaches
+// the wire body, the same as every other accepted reply. (workersvc scrubs again on
+// the server for the web/CLI paths — this pins the Slack half.)
+func TestReplierAwaitingInputScrubsAnswer(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("use glpat-supersecretvalue for it"))
+
+	if len(sub.submitted) != 1 || strings.Contains(sub.submitted[0].body, "glpat-supersecretvalue") {
+		t.Fatalf("a credential in an answer must be scrubbed before it leaves Slack: %+v", sub.submitted)
 	}
 }
