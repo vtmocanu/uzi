@@ -210,7 +210,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 }
 
 const getSlackRunMessage = `-- name: GetSlackRunMessage :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id FROM slack_run_messages WHERE run_id = $1
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts FROM slack_run_messages WHERE run_id = $1
 `
 
 // The DM anchor for a run (threading + edit target). Absent = not yet notified.
@@ -226,12 +226,13 @@ func (q *Queries) GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (Slac
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
 
 const getSlackRunMessageByRoot = `-- name: GetSlackRunMessageByRoot :one
-SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
 `
 
 type GetSlackRunMessageByRootParams struct {
@@ -254,6 +255,7 @@ func (q *Queries) GetSlackRunMessageByRoot(ctx context.Context, arg GetSlackRunM
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
@@ -363,7 +365,7 @@ const setSlackRunGate = `-- name: SetSlackRunGate :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts
 `
 
 type SetSlackRunGateParams struct {
@@ -389,6 +391,7 @@ func (q *Queries) SetSlackRunGate(ctx context.Context, arg SetSlackRunGateParams
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
@@ -397,7 +400,7 @@ const setSlackRunGateGen = `-- name: SetSlackRunGateGen :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, gate_generation = $3, updated_at = now()
 WHERE run_id = $4 AND (gate_generation IS NULL OR gate_generation < $3)
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts
 `
 
 type SetSlackRunGateGenParams struct {
@@ -429,6 +432,7 @@ func (q *Queries) SetSlackRunGateGen(ctx context.Context, arg SetSlackRunGateGen
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
@@ -437,7 +441,7 @@ const setSlackRunGateIf = `-- name: SetSlackRunGateIf :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()
 WHERE run_id = $3 AND gate_ts = $4 AND gate_state = $5
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts
 `
 
 type SetSlackRunGateIfParams struct {
@@ -472,29 +476,39 @@ func (q *Queries) SetSlackRunGateIf(ctx context.Context, arg SetSlackRunGateIfPa
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
 
 const setSlackRunQuestion = `-- name: SetSlackRunQuestion :one
 UPDATE slack_run_messages
-SET question_id = $1, updated_at = now()
-WHERE run_id = $2
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id
+SET question_id = $1, question_ts = $2, updated_at = now()
+WHERE run_id = $3
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts
 `
 
 type SetSlackRunQuestionParams struct {
 	QuestionID pgtype.Text `json:"question_id"`
+	QuestionTs pgtype.Text `json:"question_ts"`
 	RunID      uuid.UUID   `json:"run_id"`
 }
 
-// Record which question the run's thread already carries (PRD #88 M3), so a re-park —
-// a worker death re-queues the run and the resumed worker parks again on the SAME
-// question id — does not post the card a second time. Unguarded on purpose: the
-// notifier drains its queue in ONE goroutine, so there is no concurrent writer to
-// compare against, unlike the gate's cross-surface button clicks.
+// Record which question the run's thread already carries, and the ts of the message
+// that carried it (PRD #88 M3). The two are written together because they are one
+// fact — "this question, on that card" — and either alone is a defect: the id without
+// the ts leaves an inbound reply unbindable, and the ts without the id leaves the
+// notifier unable to tell a re-park from a new question.
+//
+// The id makes a re-park a no-op: a worker death re-queues the run and the resumed
+// worker parks again on the SAME question id, so without this the card posts twice.
+// The ts is what an inbound reply is ordered against — see the 00092 migration for why
+// "whichever question is open right now" is the wrong derivation.
+//
+// Unguarded on purpose: the notifier drains its queue in ONE goroutine, so there is no
+// concurrent writer to compare against, unlike the gate's cross-surface button clicks.
 func (q *Queries) SetSlackRunQuestion(ctx context.Context, arg SetSlackRunQuestionParams) (SlackRunMessage, error) {
-	row := q.db.QueryRow(ctx, setSlackRunQuestion, arg.QuestionID, arg.RunID)
+	row := q.db.QueryRow(ctx, setSlackRunQuestion, arg.QuestionID, arg.QuestionTs, arg.RunID)
 	var i SlackRunMessage
 	err := row.Scan(
 		&i.RunID,
@@ -505,6 +519,7 @@ func (q *Queries) SetSlackRunQuestion(ctx context.Context, arg SetSlackRunQuesti
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }
@@ -621,7 +636,7 @@ ON CONFLICT (run_id) DO UPDATE
     SET channel_id = EXCLUDED.channel_id,
         root_ts    = EXCLUDED.root_ts,
         updated_at = now()
-RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id
+RETURNING run_id, channel_id, root_ts, gate_ts, gate_state, updated_at, gate_generation, question_id, question_ts
 `
 
 type UpsertSlackRunMessageParams struct {
@@ -644,6 +659,7 @@ func (q *Queries) UpsertSlackRunMessage(ctx context.Context, arg UpsertSlackRunM
 		&i.UpdatedAt,
 		&i.GateGeneration,
 		&i.QuestionID,
+		&i.QuestionTs,
 	)
 	return i, err
 }

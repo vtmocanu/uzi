@@ -19,11 +19,15 @@ import (
 type questionPayload struct {
 	// QuestionID is the question's stable identity: what the answer names, what the
 	// resume guard compares, and what the DM anchor records so a re-park does not
-	// post the same card twice.
-	QuestionID string `json:"question_id"`
-	// Generation is the 1-based ordinal of this question within the run. Display
-	// only — it is NOT stable across a requeue, which is why it is never the key.
-	Generation int            `json:"generation"`
+	// post the same card twice. It is the ONLY staleness key in this feature.
+	//
+	// The payload deliberately carries no ordinal beside it (D-R): one existed, was
+	// never read back, and was labelled "the stale-answer discriminator" by a design
+	// doc — an inert display value wearing the name of a struck mechanism, which is
+	// the shape a later reader "restores" into a real requeue-rejection bug. A surface
+	// wanting "question 2 of this run" counts `question` messages in the feed, where
+	// the ordinal is a fact rather than a claim. Slack wants no such thing.
+	QuestionID string         `json:"question_id"`
 	Questions  []questionItem `json:"questions"`
 }
 
@@ -113,37 +117,6 @@ func questionBody(p questionPayload) string {
 		}
 	}
 	return b.String()
-}
-
-// answerInputBody encodes a Slack reply as the `answer` steering-input body.
-//
-// Slack's inbound is free text and carries no id, so the replier resolves the thread
-// anchor to the run and reads the run's OWN open_question_id server-side, then builds
-// the SAME JSON body the web and CLI submit (D-P C2): there is one wire shape, and
-// Slack is not a second contract. The server re-validates the id against the run row
-// and re-encodes from its own scrubbed values, so this is a request, never a trusted
-// record.
-//
-// The shape mirrors workersvc.AnswerBody, declared there and repeated here because
-// slacksvc is deliberately kept OUT of the core service's import graph (the same
-// boundary that moved the secret patterns down into internal/secretscrub). It is a
-// two-field object with no behaviour; a diverging field name would fail the round-trip
-// test in this package immediately.
-//
-// One reply answers the card, so the text lands at index 0 and any further question in
-// the payload reads as unanswered to the lead. That is deliberate: repeating the prose
-// under every question would assert it answers each of them, which is a stronger claim
-// than a single message supports, and a lead that re-asks is a visible failure where a
-// wrong assumption is a silent one.
-func answerInputBody(questionID, text string) (string, error) {
-	b, err := json.Marshal(struct {
-		QuestionID string   `json:"question_id"`
-		Answers    []string `json:"answers"`
-	}{QuestionID: questionID, Answers: []string{text}})
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
 // questionThreadBlocks renders a clarification question into the run's DM thread

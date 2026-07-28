@@ -192,12 +192,20 @@ WHERE run_id = @run_id AND kind = 'question'
 ORDER BY seq DESC LIMIT 1;
 
 -- name: SetSlackRunQuestion :one
--- Record which question the run's thread already carries (PRD #88 M3), so a re-park —
--- a worker death re-queues the run and the resumed worker parks again on the SAME
--- question id — does not post the card a second time. Unguarded on purpose: the
--- notifier drains its queue in ONE goroutine, so there is no concurrent writer to
--- compare against, unlike the gate's cross-surface button clicks.
+-- Record which question the run's thread already carries, and the ts of the message
+-- that carried it (PRD #88 M3). The two are written together because they are one
+-- fact — "this question, on that card" — and either alone is a defect: the id without
+-- the ts leaves an inbound reply unbindable, and the ts without the id leaves the
+-- notifier unable to tell a re-park from a new question.
+--
+-- The id makes a re-park a no-op: a worker death re-queues the run and the resumed
+-- worker parks again on the SAME question id, so without this the card posts twice.
+-- The ts is what an inbound reply is ordered against — see the 00092 migration for why
+-- "whichever question is open right now" is the wrong derivation.
+--
+-- Unguarded on purpose: the notifier drains its queue in ONE goroutine, so there is no
+-- concurrent writer to compare against, unlike the gate's cross-surface button clicks.
 UPDATE slack_run_messages
-SET question_id = @question_id, updated_at = now()
+SET question_id = @question_id, question_ts = @question_ts, updated_at = now()
 WHERE run_id = @run_id
 RETURNING *;

@@ -378,6 +378,7 @@ type SlackRunMessage struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	GateGeneration pgtype.Int4        `json:"gate_generation"`
 	QuestionID     pgtype.Text        `json:"question_id"`
+	QuestionTs     pgtype.Text        `json:"question_ts"`
 }
 
 type ToolAllowlist struct {

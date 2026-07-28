@@ -50,6 +50,23 @@ var ErrSelectionRejected = errors.New("slack: agent selection rejected by the se
 // adapter in main translates it, keeping slacksvc free of a workersvc import.
 var ErrReviseCapReached = errors.New("slack: plan revision limit reached")
 
+// ErrAnswerStale and ErrNotAwaitingInput are the replier-facing translations of
+// workersvc's ErrStaleAnswer / ErrRunNotAwaitingInput (PRD #88 M3). Both mean the run
+// left the question the reply was written against, between the replier reading its
+// status and the submit landing — another surface answered, the deadline fired, or the
+// run was cancelled. The adapter in main translates them, keeping slacksvc free of a
+// workersvc import.
+//
+// They exist so a lost race is SURFACED rather than dropped. That matters more here
+// than at the plan gate: the Slack ✅ is already a false confirmation in the
+// mixed-fleet case (it fires when the row is enqueued, not when the worker acts on
+// it), so an unacked, unexplained reply would widen a gap this feature is meant to
+// keep narrow.
+var (
+	ErrAnswerStale      = errors.New("slack: the run moved on from that question")
+	ErrNotAwaitingInput = errors.New("slack: the run is no longer waiting for an answer")
+)
+
 // maxGateAgentNames bounds how many repo agent names the gate lists (Slack's
 // section text caps at 3000 chars; the roster caps at 16). Extra names collapse to
 // "+N more" so the message stays scannable.

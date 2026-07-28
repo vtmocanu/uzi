@@ -384,13 +384,22 @@ func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunConte
 	if anchor.QuestionID.Valid && anchor.QuestionID.String == q.QuestionID {
 		return // already on screen in this thread — a re-park, not a new question
 	}
-	if _, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs,
-		"The run needs your answer", questionThreadBlocks(rc.ID, q, base)); err != nil {
+	ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs,
+		"The run needs your answer", questionThreadBlocks(rc.ID, q, base))
+	if err != nil {
 		n.logf("post question in thread", err)
 		return // do not record it as posted; a later event retries
 	}
+	// The ts is recorded with the id because the replier orders inbound replies against
+	// it — a reply before this card answers a superseded question. A post whose ts came
+	// back empty is therefore worse than not recording at all: it would satisfy the
+	// notifier's dedupe (never re-posting) while leaving every reply unbindable.
+	if ts == "" {
+		n.logf("record question", fmt.Errorf("run %s: question posted with no ts", rc.ID))
+		return
+	}
 	if _, err := n.store.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
-		RunID: rc.ID, QuestionID: pgText(q.QuestionID),
+		RunID: rc.ID, QuestionID: pgText(q.QuestionID), QuestionTs: pgText(ts),
 	}); err != nil {
 		n.logf("record question", err)
 	}

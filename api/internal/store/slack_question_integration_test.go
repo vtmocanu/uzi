@@ -30,7 +30,6 @@ func insertQuestionMessage(ctx context.Context, t *testing.T, q *store.Queries, 
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"question_id": questionID,
-		"generation":  seq,
 		"questions":   []map[string]any{{"question": text, "header": "h"}},
 	})
 	if err != nil {
@@ -98,10 +97,11 @@ func TestGetLatestRunQuestionLiveDB(t *testing.T) {
 	}
 }
 
-// The anchor write the dedupe reads. Its whole job is to make a re-park on the SAME
-// question a no-op, so what matters is that the value persists and is legible on a
-// later read — and that a run with no anchor row updates nothing rather than erroring
-// into a silent skip of the post.
+// The anchor write both the dedupe and the inbound binding read. It carries two
+// values that are one fact — the question, and the ts of the card that delivered it —
+// so this pins that BOTH persist together and are legible on a later read. The id
+// alone would dedupe correctly and leave every reply unbindable; the ts alone would
+// leave the notifier unable to tell a re-park from a new question.
 func TestSetSlackRunQuestionLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -113,7 +113,7 @@ func TestSetSlackRunQuestionLiveDB(t *testing.T) {
 
 	// No anchor yet: the UPDATE matches nothing and reports no row.
 	if _, err := f.q.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
-		RunID: f.runID, QuestionID: pgT("q-1"),
+		RunID: f.runID, QuestionID: pgT("q-1"), QuestionTs: pgT("1700000100.000200"),
 	}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("no anchor row ⇒ no row updated, got err=%v", err)
 	}
@@ -124,12 +124,12 @@ func TestSetSlackRunQuestionLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertSlackRunMessage: %v", err)
 	}
-	if anchor.QuestionID.Valid {
-		t.Fatalf("a fresh anchor carries no question yet: %+v", anchor.QuestionID)
+	if anchor.QuestionID.Valid || anchor.QuestionTs.Valid {
+		t.Fatalf("a fresh anchor carries no question yet: %+v", anchor)
 	}
 
 	if _, err := f.q.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
-		RunID: f.runID, QuestionID: pgT("q-1"),
+		RunID: f.runID, QuestionID: pgT("q-1"), QuestionTs: pgT("1700000100.000200"),
 	}); err != nil {
 		t.Fatalf("SetSlackRunQuestion: %v", err)
 	}
@@ -140,16 +140,21 @@ func TestSetSlackRunQuestionLiveDB(t *testing.T) {
 	if !reread.QuestionID.Valid || reread.QuestionID.String != "q-1" {
 		t.Fatalf("the posted question must be legible on the anchor: %+v", reread.QuestionID)
 	}
+	if !reread.QuestionTs.Valid || reread.QuestionTs.String != "1700000100.000200" {
+		t.Fatalf("the card's ts must persist beside it — it is what inbound replies are ordered against: %+v", reread.QuestionTs)
+	}
 	// The gate anchor is a separate concern and must not be disturbed: a question
 	// posted mid-run cannot be allowed to clear or advance an approval gate's state.
 	if reread.GateTs.Valid || reread.GateState.Valid || reread.GateGeneration.Valid {
 		t.Fatalf("recording a question must not touch the gate anchor: %+v", reread)
 	}
 
-	// Advancing to a second question overwrites, so the dedupe compares against the
-	// question actually on screen rather than the first one ever posted.
+	// Advancing to a second question overwrites BOTH values, so the dedupe compares
+	// against the question actually on screen and replies are ordered against the card
+	// actually carrying it. A stale ts left behind would make every reply to question 2
+	// look like it followed question 1's card.
 	if _, err := f.q.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
-		RunID: f.runID, QuestionID: pgT("q-2"),
+		RunID: f.runID, QuestionID: pgT("q-2"), QuestionTs: pgT("1700000200.000300"),
 	}); err != nil {
 		t.Fatalf("SetSlackRunQuestion (second): %v", err)
 	}
@@ -157,7 +162,7 @@ func TestSetSlackRunQuestionLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSlackRunMessage (second): %v", err)
 	}
-	if reread.QuestionID.String != "q-2" {
-		t.Fatalf("anchor must advance to the newest posted question, got %q", reread.QuestionID.String)
+	if reread.QuestionID.String != "q-2" || reread.QuestionTs.String != "1700000200.000300" {
+		t.Fatalf("anchor must advance to the newest posted question AND its card: %+v", reread)
 	}
 }

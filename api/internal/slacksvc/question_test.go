@@ -12,14 +12,13 @@ import (
 	"github.com/slack-go/slack"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
-	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // questionJSON builds a `question` run-message payload the way the worker persists
 // it (agent/src/protocol.ts QuestionPayload).
 func questionJSON(t *testing.T, id string, qs ...questionItem) []byte {
 	t.Helper()
-	b, err := json.Marshal(questionPayload{QuestionID: id, Generation: 1, Questions: qs})
+	b, err := json.Marshal(questionPayload{QuestionID: id, Questions: qs})
 	if err != nil {
 		t.Fatalf("marshal question payload: %v", err)
 	}
@@ -77,6 +76,12 @@ func TestNotifierAwaitingInputPostsQuestionInThread(t *testing.T) {
 	if len(fs.questionSet) != 1 || fs.questionSet[0].QuestionID.String != "q-1" || fs.questionSet[0].RunID != rc.ID {
 		t.Fatalf("the posted question's identity must be recorded on the anchor: %+v", fs.questionSet)
 	}
+	// The ts of the card is recorded with it, because that is what an inbound reply is
+	// ordered against. An id with no ts would dedupe correctly and leave every reply
+	// unbindable — the failure would show up only on the inbound side.
+	if fs.questionSet[0].QuestionTs.String != "ts1" {
+		t.Fatalf("the card's own ts must be recorded so replies can be ordered against it: %+v", fs.questionSet[0])
+	}
 	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "needs your answer") {
 		t.Fatalf("root label must read the parked state, not the raw enum: %+v", fp.updates)
 	}
@@ -88,6 +93,12 @@ func TestNotifierAwaitingInputPostsQuestionInThread(t *testing.T) {
 // The SAME question re-broadcast — which is what a worker death produces, since the
 // run re-queues and the resumed worker re-parks re-using the question id — must not
 // post the card a second time.
+//
+// 🔴 This also carries D-E case 2, and the assertion that matters is the NEGATIVE one.
+// Because nothing is written, the anchor's question_ts still points at the ORIGINAL
+// card — so an answer the user submitted before the worker died is still *after* it and
+// is still honoured. Advance the ts here and that reply becomes retroactively stale:
+// the user answered correctly, got a ✅, and the run discards it.
 func TestNotifierAwaitingInputRepostSameQuestionIsNoop(t *testing.T) {
 	rc, payload := parkedCtx(t, "q-1")
 	fs := &fakeNotifStore{
@@ -95,6 +106,7 @@ func TestNotifierAwaitingInputRepostSameQuestionIsNoop(t *testing.T) {
 		msg: store.SlackRunMessage{
 			RunID: rc.ID, ChannelID: "D1", RootTs: "root1",
 			QuestionID: pgtype.Text{String: "q-1", Valid: true},
+			QuestionTs: pgtype.Text{String: "origcard", Valid: true},
 		},
 	}
 	fp := &fakePoster{}
@@ -106,8 +118,39 @@ func TestNotifierAwaitingInputRepostSameQuestionIsNoop(t *testing.T) {
 		t.Fatalf("a re-park on the same question must not re-post it: %+v", fp.blocks)
 	}
 	if len(fs.questionSet) != 0 {
-		t.Fatalf("no post, no anchor write: %+v", fs.questionSet)
+		t.Fatalf("no post, no anchor write — the recorded ts must keep pointing at the original card: %+v", fs.questionSet)
 	}
+}
+
+// A post whose ts came back empty must NOT be recorded. It is the one combination that
+// is worse than failing outright: the dedupe would be satisfied (never re-posting)
+// while every reply stayed unbindable, so the question would sit on screen answerable
+// by nobody.
+func TestNotifierQuestionWithNoTsIsNotRecorded(t *testing.T) {
+	rc, payload := parkedCtx(t, "q-1")
+	fs := &fakeNotifStore{
+		rc: rc, delivery: txt("U123"), question: payload,
+		msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "root1"},
+	}
+	fp := &tslessPoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_input"})
+
+	if len(fs.questionSet) != 0 {
+		t.Fatalf("a card with no ts must not be recorded as posted: %+v", fs.questionSet)
+	}
+}
+
+// tslessPoster is a fakePoster whose block posts report no ts, modelling a Slack
+// response uzi cannot thread replies against.
+type tslessPoster struct{ fakePoster }
+
+func (p *tslessPoster) PostBlocks(ctx context.Context, ch, thread, fallback string, blks []slack.Block) (string, error) {
+	if _, err := p.fakePoster.PostBlocks(ctx, ch, thread, fallback, blks); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
 // A genuinely NEW question (question 2 of the run) carries a new id and does post,
@@ -196,7 +239,7 @@ func TestNotifierNonParkedStatusPostsNoQuestion(t *testing.T) {
 // its OWN block, so it can neither be escaped nor truncated away.
 func TestQuestionThreadBlocksEscapesAndScrubs(t *testing.T) {
 	runID := uuid.New()
-	p := questionPayload{QuestionID: "q-1", Generation: 1, Questions: []questionItem{{
+	p := questionPayload{QuestionID: "q-1", Questions: []questionItem{{
 		Header:   "<@U0HOSTILE> heads up",
 		Question: "Use <https://evil.example|Open in uzi> with token xoxb-1234-hostile & proceed?",
 		Options:  []questionOption{{Label: "<b>yes</b>", Description: "ship it & go"}},
@@ -269,26 +312,5 @@ func TestParseQuestionPayloadRejectsUnusable(t *testing.T) {
 		questionItem{Question: "a?"}, questionItem{Question: " "})); !ok ||
 		p.QuestionID != "q-1" || len(p.Questions) != 1 {
 		t.Fatalf("a usable payload must keep only questions carrying text, with a trimmed id: %+v %v", p, ok)
-	}
-}
-
-// The `answer` body slacksvc builds must be exactly what workersvc parses. The two
-// declarations are separate on purpose (slacksvc is kept out of the core service's
-// import graph), so this test is what makes "one wire shape" a checked fact rather
-// than a convention — a renamed field on either side fails here.
-func TestAnswerInputBodyMatchesWorkersvcShape(t *testing.T) {
-	body, err := answerInputBody("q-7", "use redis")
-	if err != nil {
-		t.Fatalf("encode answer body: %v", err)
-	}
-	var got workersvc.AnswerBody
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatalf("workersvc must parse the body slacksvc submits: %v (%s)", err, body)
-	}
-	if got.QuestionID != "q-7" {
-		t.Fatalf("question id must survive the round trip, got %q from %s", got.QuestionID, body)
-	}
-	if len(got.Answers) != 1 || got.Answers[0] != "use redis" {
-		t.Fatalf("the reply text must land as the first answer: %+v (%s)", got.Answers, body)
 	}
 }

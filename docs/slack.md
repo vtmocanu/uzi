@@ -145,11 +145,12 @@ Open **Settings → Notifications**:
   run picks up where it left off. There are no buttons: free text is the whole
   affordance on Slack, so you can answer a suggestion by naming it, or ignore
   the suggestions entirely. A few things worth knowing:
-  - **Your reply answers whatever question is open right now.** Every reply in
-    a run's DM lands in the same thread, so uzi can't tell a reply typed under
-    the first question card from one typed under the second — it binds your
-    reply to the question the run is currently waiting on. If the agent has
-    moved on to a second question, answer that one.
+  - **Your reply answers the question it comes after.** uzi orders your reply
+    against the question message above it, so a reply that landed before the
+    latest question is treated as answering an older one and is **refused**,
+    with a note telling you to scroll down and answer the current question.
+    That is deliberate: it is the only way to stop a reply you wrote against an
+    earlier question from being silently applied to a newer one you never read.
   - **One reply answers the whole card.** When the agent batches several
     questions into one message, cover them in a single reply; the agent reads
     it in full. It may re-ask anything you left unaddressed.

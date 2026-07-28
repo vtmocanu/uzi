@@ -2,7 +2,7 @@ package slacksvc
 
 import (
 	"context"
-	"encoding/json"
+
 	"errors"
 	"strings"
 	"sync"
@@ -406,53 +406,172 @@ func TestReplierBoundsReplyLength(t *testing.T) {
 	}
 }
 
-// parkedRun is a run stopped on a clarification question (PRD #88 M3), carrying the
-// open question's identity the replier binds the answer to.
-func parkedRun(runID, userID uuid.UUID, questionID string) store.Run {
-	r := liveRun(runID, userID, "awaiting_input")
+// --- PRD #88 M3: answering a clarification question from Slack ----------------
+
+// Slack ts values are "<epoch-seconds>.<microseconds>". These are ordered around one
+// question card so the tests read as "before" / "after" rather than as digits.
+const (
+	questionCardTS = "1700000100.000200"
+	beforeCardTS   = "1700000099.999999"
+	afterCardTS    = "1700000100.000201"
+)
+
+// questionAnchor is a run's DM anchor carrying a posted question card: the question's
+// identity and the ts of the message that delivered it. Both are needed — the id is
+// what the answer names, the ts is what an inbound reply is ordered against.
+func questionAnchor(runID uuid.UUID, questionID, questionTS string) store.SlackRunMessage {
+	m := anchorRow(runID, "")
 	if questionID != "" {
-		r.OpenQuestionID = pgtype.Text{String: questionID, Valid: true}
+		m.QuestionID = pgtype.Text{String: questionID, Valid: true}
 	}
-	return r
+	if questionTS != "" {
+		m.QuestionTs = pgtype.Text{String: questionTS, Valid: true}
+	}
+	return m
 }
 
-// A reply to a parked run IS the answer: it submits kind `answer` — never a follow_up,
-// which is what the default arm would have made of it — with the run's OWN open
-// question id, and gets the ✅ ack.
+func replyAt(text, ts string) MessageReply {
+	m := reply(text)
+	m.MessageTS = ts
+	return m
+}
+
+func parkedRun(runID, userID uuid.UUID) store.Run {
+	return liveRun(runID, userID, "awaiting_input")
+}
+
+// A reply that FOLLOWS the question card is the answer to that question: it submits
+// through SubmitAnswer naming the id the user was actually shown, and is acked.
 //
-// The kind assertion is the discriminating one: a follow_up on a parked run is queued
-// for an implement turn that never arrives, because the run is parked waiting for the
-// answer that just became a follow-up.
+// The kind is the discriminating half — the default arm would have made this a
+// follow_up, which the worker queues for an implement turn that never arrives, because
+// the run is parked waiting for the answer that just became a follow-up.
 func TestReplierAwaitingInputSubmitsAnswer(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
-	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
-	r.HandleMessage(context.Background(), reply("use redis, not memcached"))
+	r.HandleMessage(context.Background(), replyAt("use redis, not memcached", afterCardTS))
 
-	if len(sub.submitted) != 1 || sub.submitted[0].kind != "answer" {
-		t.Fatalf("a reply to a parked run must submit an answer, not a follow_up: %+v", sub.submitted)
+	if len(sub.answers) != 1 {
+		t.Fatalf("a reply to a parked run must submit an answer: answers=%+v inputs=%+v", sub.answers, sub.submitted)
 	}
-	if sub.submitted[0].userID != user.ID || sub.submitted[0].runID != runID {
-		t.Fatalf("answer must be submitted for the resolved user + anchored run: %+v", sub.submitted[0])
+	if len(sub.submitted) != 0 {
+		t.Fatalf("it must NOT fall through to the default follow_up arm: %+v", sub.submitted)
 	}
-	var got struct {
-		QuestionID string   `json:"question_id"`
-		Answers    []string `json:"answers"`
+	got := sub.answers[0]
+	if got.questionID != "q-9" {
+		t.Fatalf("the answer must name the question the user was shown: %+v", got)
 	}
-	if err := json.Unmarshal([]byte(sub.submitted[0].body), &got); err != nil {
-		t.Fatalf("answer body must be the JSON wire shape: %v (%q)", err, sub.submitted[0].body)
-	}
-	if got.QuestionID != "q-9" {
-		t.Fatalf("the answer must name the run's open question, server-resolved: %+v", got)
-	}
-	if len(got.Answers) != 1 || got.Answers[0] != "use redis, not memcached" {
-		t.Fatalf("the reply text must ride as the answer: %+v", got)
+	if got.text != "use redis, not memcached" || got.userID != user.ID || got.runID != runID {
+		t.Fatalf("answer must carry the reply text for the resolved user + anchored run: %+v", got)
 	}
 	if len(fp.reactions) != 1 || fp.reactions[0].emoji != ackReaction {
 		t.Fatalf("an accepted answer must be acked: %+v", fp.reactions)
+	}
+}
+
+// 🔴 D-E case 1, the race identity keying exists to close. A reply written against an
+// EARLIER question — recognisable only by arriving before the current card — must be
+// DISCARDED. The refuted derivation ("whichever question is open now") would have
+// stamped it with the live question's id server-side, and it would then have passed
+// every downstream equality check precisely because the server supplied the id.
+//
+// The boundary is pinned rather than sampled: equal ts is also refused, since a message
+// cannot follow itself, and that is what discriminates `>` from `>=`.
+func TestReplierAwaitingInputOrdersReplyAgainstTheQuestionCard(t *testing.T) {
+	cases := []struct {
+		name     string
+		replyTS  string
+		accepted bool
+	}{
+		{"after the card answers it", afterCardTS, true},
+		{"before the card is a superseded question", beforeCardTS, false},
+		{"the card's own ts is not after itself", questionCardTS, false},
+		{"an unparseable reply ts cannot be ordered", "not-a-ts", false},
+		// ParseFloat accepts these with a NIL error, and +Inf beats every card ts — an
+		// error-only guard would let them through.
+		{"an infinite reply ts cannot be ordered", "Inf", false},
+		{"a NaN reply ts cannot be ordered", "NaN", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+			sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), replyAt("use redis", tc.replyTS))
+
+			if tc.accepted {
+				if len(sub.answers) != 1 || len(fp.reactions) != 1 {
+					t.Fatalf("want the answer submitted and acked: answers=%+v acks=%+v", sub.answers, fp.reactions)
+				}
+				return
+			}
+			if len(sub.answers) != 0 || len(sub.submitted) != 0 {
+				t.Fatalf("a reply that does not follow the card must not be submitted at all: answers=%+v inputs=%+v",
+					sub.answers, sub.submitted)
+			}
+			if len(fp.reactions) != 0 {
+				t.Fatalf("a discarded reply must NOT be acked — the ✅ would claim it was recorded: %+v", fp.reactions)
+			}
+			if len(fp.ephemerals) != 1 {
+				t.Fatalf("the user must be told their reply was not taken as the answer: %+v", fp.ephemerals)
+			}
+		})
+	}
+}
+
+// An unparseable ts on the ANCHOR side fails closed too. Same rule, stated separately
+// because it is the half a reader is likely to assume is impossible: the ordering is
+// what binds an answer to a question, so an ordering that cannot be established must
+// refuse rather than default to accepting.
+func TestReplierAwaitingInputFailsClosedOnUnorderableCard(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", "garbage")}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), replyAt("use redis", afterCardTS))
+
+	if len(sub.answers) != 0 || len(fp.reactions) != 0 {
+		t.Fatalf("an unorderable card must refuse: answers=%+v acks=%+v", sub.answers, fp.reactions)
+	}
+}
+
+// No question card recorded on this thread — the post failed, or the state report
+// outran the question message. There is nothing to bind the reply to, and the one
+// thing this path must never do is guess.
+func TestReplierAwaitingInputWithNoPostedQuestionTellsTheUser(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		qid, qts string
+	}{
+		{"nothing recorded", "", ""},
+		{"id without a ts", "q-9", ""},
+		{"ts without an id", "", questionCardTS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, tc.qid, tc.qts)}
+			sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), replyAt("use redis", afterCardTS))
+
+			if len(sub.answers) != 0 || len(sub.submitted) != 0 {
+				t.Fatalf("no card ⇒ nothing to answer: answers=%+v inputs=%+v", sub.answers, sub.submitted)
+			}
+			if len(fp.ephemerals) != 1 || len(fp.reactions) != 0 {
+				t.Fatalf("want one notice and no ack: eph=%+v acks=%+v", fp.ephemerals, fp.reactions)
+			}
+		})
 	}
 }
 
@@ -460,15 +579,15 @@ func TestReplierAwaitingInputSubmitsAnswer(t *testing.T) {
 // nothing — the run would continue on no information at all.
 func TestReplierAwaitingInputIgnoresEmptyReply(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
-	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
-	r.HandleMessage(context.Background(), reply("   "))
+	r.HandleMessage(context.Background(), replyAt("   ", afterCardTS))
 
-	if len(sub.submitted) != 0 {
-		t.Fatalf("an empty reply must not be submitted as an answer: %+v", sub.submitted)
+	if len(sub.answers) != 0 {
+		t.Fatalf("an empty reply must not be submitted as an answer: %+v", sub.answers)
 	}
 	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "no text") {
 		t.Fatalf("the user must be told the reply was empty: %+v", fp.ephemerals)
@@ -478,59 +597,67 @@ func TestReplierAwaitingInputIgnoresEmptyReply(t *testing.T) {
 	}
 }
 
-// A run parked with no open question id cannot be resumed by any answer, from any
-// surface. Say so rather than dropping the reply silently, which would read as uzi
-// ignoring the user.
-func TestReplierAwaitingInputWithoutQuestionIDTellsTheUser(t *testing.T) {
+// The run can leave the question between the status read and the submit — another
+// surface answered, the deadline fired, the run was cancelled. The server's sentinels
+// are translated so the user gets an accurate notice and NO ✅: a checkmark for an
+// answer the server rejected would be a lie, and this feature already carries one
+// documented false confirmation (the mixed-fleet case) without adding a second.
+func TestReplierAwaitingInputSurfacesALostRace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"another surface answered first", ErrAnswerStale},
+		{"the run stopped waiting", ErrNotAwaitingInput},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+			sub := &fakeSubmitter{run: parkedRun(runID, user.ID), answerErr: tc.err}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), replyAt("use redis", afterCardTS))
+
+			if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "moved on") {
+				t.Fatalf("a lost race must be surfaced, not dropped: %+v", fp.ephemerals)
+			}
+			if len(fp.reactions) != 0 {
+				t.Fatalf("a rejected answer must NOT be acked: %+v", fp.reactions)
+			}
+		})
+	}
+}
+
+// Any other submit failure still gets a notice and no ack, so a reply is never dropped
+// in silence.
+func TestReplierAwaitingInputSurfacesAGenericFailure(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
-	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "")}
+	fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID), answerErr: errors.New("boom")}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
-	r.HandleMessage(context.Background(), reply("use redis"))
+	r.HandleMessage(context.Background(), replyAt("use redis", afterCardTS))
 
-	if len(sub.submitted) != 0 {
-		t.Fatalf("no question id ⇒ no answer to submit: %+v", sub.submitted)
-	}
 	if len(fp.ephemerals) != 1 || len(fp.reactions) != 0 {
 		t.Fatalf("want one notice and no ack: eph=%+v acks=%+v", fp.ephemerals, fp.reactions)
 	}
 }
 
-// The run can leave awaiting_input between the status read and the submit (another
-// surface answered first), and the server then refuses the answer. The user gets a
-// notice and NO ✅ — an ack for an answer the server rejected would be a lie.
-func TestReplierAwaitingInputSubmitFailureIsSurfaced(t *testing.T) {
-	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
-	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9"), submitErr: errors.New("run is not waiting for an answer")}
-	fp := &fakePoster{}
-	r := NewReplier(fs, sub, fp, nil)
-
-	r.HandleMessage(context.Background(), reply("use redis"))
-
-	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "moved on") {
-		t.Fatalf("a rejected answer must be surfaced to the replier: %+v", fp.ephemerals)
-	}
-	if len(fp.reactions) != 0 {
-		t.Fatalf("a rejected answer must NOT be acked: %+v", fp.reactions)
-	}
-}
-
 // A credential pasted into an answer is scrubbed on the Slack path before it reaches
-// the wire body, the same as every other accepted reply. (workersvc scrubs again on
-// the server for the web/CLI paths — this pins the Slack half.)
+// the submitter, the same as every other accepted reply. (workersvc scrubs again for
+// the web/CLI paths — this pins the Slack half.)
 func TestReplierAwaitingInputScrubsAnswer(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
-	sub := &fakeSubmitter{run: parkedRun(runID, user.ID, "q-9")}
+	fs := &fakeReplierStore{user: user, anchor: questionAnchor(runID, "q-9", questionCardTS)}
+	sub := &fakeSubmitter{run: parkedRun(runID, user.ID)}
 	fp := &fakePoster{}
 	r := NewReplier(fs, sub, fp, nil)
 
-	r.HandleMessage(context.Background(), reply("use glpat-supersecretvalue for it"))
+	r.HandleMessage(context.Background(), replyAt("use glpat-supersecretvalue for it", afterCardTS))
 
-	if len(sub.submitted) != 1 || strings.Contains(sub.submitted[0].body, "glpat-supersecretvalue") {
-		t.Fatalf("a credential in an answer must be scrubbed before it leaves Slack: %+v", sub.submitted)
+	if len(sub.answers) != 1 || strings.Contains(sub.answers[0].text, "glpat-supersecretvalue") {
+		t.Fatalf("a credential in an answer must be scrubbed before it leaves Slack: %+v", sub.answers)
 	}
 }

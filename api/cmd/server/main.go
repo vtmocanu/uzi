@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -735,6 +736,34 @@ func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UU
 		&workersvc.AgentSelection{Source: source, Exclusions: []string{}})
 	if errors.Is(err, workersvc.ErrInvalidSelection) {
 		return slacksvc.ErrSelectionRejected
+	}
+	return err
+}
+
+// SubmitAnswer adapts the Slack clarification reply (PRD #88 M3): the replier passes
+// the question id it derived from the thread plus the reply text, and the JSON body is
+// built HERE from workersvc.AnswerBody — the same type the web and CLI paths marshal.
+//
+// That is the point of routing it through main rather than letting slacksvc marshal
+// its own struct: the wire shape is declared exactly once, so Slack cannot drift into
+// a second contract for the same input kind. It is the same trade SubmitApproval makes
+// above, for the same reason — keeping the translation here keeps slacksvc free of a
+// workersvc import.
+//
+// The two sentinels are translated for the same reason ErrInvalidSelection is: the run
+// can leave the question between the replier reading its status and this call landing,
+// and a silent drop would leave the user with neither a ✅ nor an explanation.
+func (g gateSubmitter) SubmitAnswer(ctx context.Context, userID, runID uuid.UUID, questionID, text string) error {
+	body, err := json.Marshal(workersvc.AnswerBody{QuestionID: questionID, Answers: []string{text}})
+	if err != nil {
+		return err
+	}
+	_, err = g.svc.SubmitInput(ctx, userID, runID, "answer", string(body), nil)
+	switch {
+	case errors.Is(err, workersvc.ErrStaleAnswer):
+		return slacksvc.ErrAnswerStale
+	case errors.Is(err, workersvc.ErrRunNotAwaitingInput):
+		return slacksvc.ErrNotAwaitingInput
 	}
 	return err
 }
