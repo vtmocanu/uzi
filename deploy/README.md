@@ -103,13 +103,17 @@ Cutting a release is three steps; only the tag push publishes anything.
    > a bare `glab ci status` reports `main`'s own pipeline, not the tag's,
    > and it too reads `skipped` (same commit, same marker), the right word
    > for the wrong ref with no way to tell them apart. Check `glab ci
-   > status --branch v0.1.0` specifically. The only reliable check is to
-   > look afterward for the images and chart that should have published,
-   > not to trust the push output or an unscoped status.
+   > status --branch v0.1.0` instead, but that only confirms a pipeline
+   > exists for the tag and what it reports; a pipeline can run and still
+   > fail a publish job partway through, so it cannot tell you the images
+   > and chart actually landed in Harbor. Check both, in order: the scoped
+   > status tells you whether a pipeline ran at all, the images and chart
+   > in Harbor tell you whether it published.
    >
    > If it happens, do not move the tag. A skip-CI marker suppresses only
    > push-triggered pipelines; a manually created one runs regardless:
-   > `glab ci run --branch v0.1.0` recovers the release with the tag left in
+   > `glab ci run --branch v0.1.0` (`--branch` takes any ref, a tag
+   > included, despite the name) recovers the release with the tag left in
    > place.
 
 3. **Point ArgoCD at the new version (a second MR, to `argo-apps`).**

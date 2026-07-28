@@ -17,6 +17,7 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   it used to be folded into, names `glab ci status --branch <tag>` as the check that
   actually looks at the right ref, and covers the recovery: trigger the pipeline
   manually with `glab ci run --branch <tag>` rather than moving the tag (issue #178).
+- A repo with open issues but none carrying the PRD label no longer re-reads its entire open issue set on every poll: the PRD-labelled and additive open, no-label fetches (PRD #102 M6) now advance separate high-water marks instead of sharing one that could never move past zero when the PRD-labelled fetch came back empty (issue #177).
 
 ## [0.12.0] - 2026-07-28
 
