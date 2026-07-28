@@ -567,6 +567,22 @@ ADR at `adr/0035-run-limit-retry.md`.
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 
+## Feature #175 — Build info in the UI: version badge popover, endpoint and CLI parity
+
+Tracked as GitLab issue vtmocanu/uzi#175; PRD at `prds/175-build-info-popover.md`.
+
+**Ratified [user 2026-07-28].** The user asked for the feature and stated no design
+requirement; the team decided its shape. The two below were put to the owner because
+they are durable product constraints rather than implementation choices. Every other
+decision on this feature is the team's and lives in `specs/ai.md` §447-§452.
+
+- `GET /api/version` publishes `uptime_seconds` on an unauthenticated, unrate-limited,
+  ingress-reachable endpoint. Uptime is accepted as public; severity Low.
+  [user 2026-07-28]
+- `uzi version --json` gains a `server` key carrying the server's build info, with the
+  CLI's own `version` unchanged at the top level. A CLI output-contract change.
+  [user 2026-07-28]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
