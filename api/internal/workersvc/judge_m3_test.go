@@ -12,15 +12,20 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeSettings is a SettingsReader stub for the judge gate/claim tests.
+// fakeSettings is a SettingsReader stub for the judge gate/claim tests, and since
+// PRD #102 M6 for the run-eligibility PRD-label gate too. prdLabel is left zero by
+// the judge tests, which is the "unconfigured" case Service.prdLabel resolves to
+// the compiled-in default — the same thing a real Cache does.
 type fakeSettings struct {
-	enabled bool
-	model   string
-	err     error
+	enabled  bool
+	model    string
+	prdLabel string
+	err      error
 }
 
 func (f fakeSettings) JudgeEnabled(context.Context) (bool, error) { return f.enabled, f.err }
 func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
+func (f fakeSettings) PRDLabel(context.Context) (string, error)   { return f.prdLabel, f.err }
 
 // -------------------------------------------------------------------------
 // command-not-found scan (Decision 4)

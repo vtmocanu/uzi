@@ -797,7 +797,10 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
   };
 }
 
-export const mockBoards: Record<string, Board> = {
+// boardFixtures is authored in whatever order reads well while editing. What the
+// demo board RENDERS in is fixed below, once, rather than depending on the order
+// somebody happened to paste a card in.
+const boardFixtures: Record<string, Board> = {
   "repo-uzi": {
     repo_id: "repo-uzi",
     path_with_namespace: "vtmocanu/uzi",
@@ -821,6 +824,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(5),
         latest_run: null,
         pipeline: null,
       },
@@ -836,6 +840,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(90),
         latest_run: null,
         // "canceled" → the neutral tone (also covers skipped / no-CI).
         pipeline: {
@@ -850,7 +855,12 @@ export const mockBoards: Record<string, Board> = {
         iid: 27,
         title: "Dark-mode toggle for the docs section",
         state: "opened",
-        labels: ["PRD", "Ready"],
+        // A CONTENT label alongside the workflow ones. Before this, not one mock card
+        // carried one, so M4's label chips rendered on exactly zero cards in the build
+        // most people click (web-ux S7). "Ready" is this card's own column and is
+        // correctly chipless — which is why a naive "the fixture has labels" check
+        // would not have caught it.
+        labels: ["PRD", "Ready", "enhancement"],
         web_url: uziUrl(27),
         author: "vlad",
         forge_type: "gitlab",
@@ -858,6 +868,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(20),
         latest_run: null,
         // "manual" → the attention tone (a human must click play in GitLab).
         pipeline: {
@@ -882,6 +893,7 @@ export const mockBoards: Record<string, Board> = {
         conflict: false,
         // Freshly queued, not yet claimed by a worker: renders the "queued" badge
         // (violet under the mission theme, gray under ember) on the board card.
+        forge_updated_at: minsAgo(240),
         latest_run: latestRun({
           id: "run-queued",
           status: "queued",
@@ -902,6 +914,7 @@ export const mockBoards: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(45),
         latest_run: latestRun({
           id: LIVE_RUN_ID,
           status: "running",
@@ -922,7 +935,7 @@ export const mockBoards: Record<string, Board> = {
         iid: 22,
         title: "Per-run cost budget with hard stop",
         state: "opened",
-        labels: ["PRD", "In progress", "Review"],
+        labels: ["PRD", "In progress", "Review", "bug"],
         web_url: uziUrl(22),
         author: "mira",
         forge_type: "gitlab",
@@ -930,6 +943,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: true,
+        forge_updated_at: minsAgo(1500),
         latest_run: null,
         // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
         pipeline: {
@@ -952,6 +966,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Review",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(8),
         latest_run: latestRun({
           id: "run-awaiting",
           status: "awaiting_approval",
@@ -973,6 +988,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(3000),
         latest_run: latestRun({
           id: "run-done",
           status: "completed",
@@ -999,6 +1015,7 @@ export const mockBoards: Record<string, Board> = {
         column: "In progress",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(130),
         latest_run: latestRun({
           id: "run-closed",
           status: "completed",
@@ -1022,6 +1039,64 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(4200),
+        latest_run: null,
+        pipeline: null,
+      },
+      // ── Non-PRD issues (PRD #102 M6) ────────────────────────────────────────
+      // The toggle is default-off, so without these the demo build ships a control
+      // that visibly does nothing. They are ordinary open issues of the kind any repo
+      // has: one carrying a content label, one carrying none at all — the shape a
+      // freshly filed issue takes, and the shape whose labels used to marshal as JSON
+      // null.
+      {
+        iid: 33,
+        title: "Typo in the worker setup docs",
+        state: "opened",
+        labels: ["documentation"],
+        web_url: uziUrl(33),
+        author: "mira",
+        forge_type: "gitlab",
+        has_prd_link: false,
+        column: "",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(20),
+        latest_run: null,
+        pipeline: null,
+      },
+      {
+        iid: 34,
+        title: "Sidebar scrolls twice on a narrow window",
+        state: "opened",
+        labels: [],
+        web_url: uziUrl(34),
+        author: "vlad",
+        forge_type: "gitlab",
+        has_prd_link: false,
+        column: "",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(200),
+        latest_run: null,
+        pipeline: null,
+      },
+      // Decision 13a: uzi's own tracking issue is cached and is NEVER rendered, with
+      // the toggle on or off. It sits here so the exclusion is exercised by the build
+      // people click rather than only by a unit test.
+      {
+        iid: 35,
+        title: "uzi self-improvement",
+        state: "opened",
+        labels: ["uzi-self-improve"],
+        web_url: uziUrl(35),
+        author: "uzi-bot",
+        forge_type: "gitlab",
+        has_prd_link: false,
+        column: "",
+        closed: false,
+        conflict: false,
+        forge_updated_at: minsAgo(45),
         latest_run: null,
         pipeline: null,
       },
@@ -1056,6 +1131,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(60),
         latest_run: null,
         pipeline: null,
       },
@@ -1071,6 +1147,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(12),
         latest_run: null,
         pipeline: null,
       },
@@ -1086,6 +1163,7 @@ export const mockBoards: Record<string, Board> = {
         column: "Doing",
         closed: false,
         conflict: false,
+        forge_updated_at: minsAgo(700),
         latest_run: latestRun({
           id: "run-failed",
           status: "failed",
@@ -1109,6 +1187,7 @@ export const mockBoards: Record<string, Board> = {
         column: "",
         closed: true,
         conflict: false,
+        forge_updated_at: minsAgo(5400),
         latest_run: latestRun({
           id: "run-cancelled",
           status: "cancelled",
@@ -1121,6 +1200,20 @@ export const mockBoards: Record<string, Board> = {
     pipeline: null,
   },
 };
+
+// The demo board renders in ASCENDING issue number, which is what the real server
+// serves for a board nobody has dragged: `ORDER BY board_position ASC NULLS LAST,
+// forge_issue_iid ASC` with every position NULL. The fixtures used to be authored
+// DESCENDING, so the one build anyone actually clicks showed `Manual` mode visibly
+// not in issue order — contradicting, on screen, the safety argument Decision 7a
+// makes for shipping Manual as the default (web-ux S7).
+//
+// Sorted globally rather than per lane: the client buckets by column while
+// preserving relative order, so globally-ascending IS ascending within each column,
+// by the same reasoning the SQL comment gives for its board-global positions.
+export const mockBoards: Record<string, Board> = Object.fromEntries(
+  Object.entries(boardFixtures).map(([id, b]) => [id, { ...b, cards: [...b.cards].sort((x, y) => x.iid - y.iid) }]),
+);
 
 // ── Workers ──────────────────────────────────────────────────────────────────
 

@@ -279,9 +279,33 @@ type Job struct {
 	WebURL string
 }
 
-// ListIssuesOptions filters ListIssues. State is always queried as "all" by the
-// driver (the Closed column requires it), so it is not exposed here. Labels is
-// ANDed; an empty UpdatedAfter means "no lower bound" (full fetch).
+// IssueState is the neutral issue-state vocabulary, matching the values the
+// drivers already normalize their RESPONSES to and the values the issue cache
+// stores in issues.state.
+//
+// The neutral spelling is GitLab's, not Forgejo's, for the historical reason that
+// GitLab was the only driver when the cache's state='opened' filter was written.
+// Forgejo says "open"; forgejoIssueState maps that INBOUND, and
+// forgejoIssueStateParam maps it OUTBOUND — that function's comment is where the
+// asymmetry is explained, and it is the one that matters, since an untranslated
+// neutral value is not rejected on the Forgejo lane, it is silently ignored.
+//
+// (This used to point at StateAll's note for the outbound explanation. StateAll's
+// note says nothing about it — it documents the zero value.)
+type IssueState string
+
+const (
+	// StateAll is the default and reproduces pre-M6 behaviour exactly: every
+	// caller that leaves ListIssuesOptions.State zero gets "all".
+	StateAll IssueState = ""
+	// StateOpened restricts to open issues.
+	StateOpened IssueState = "opened"
+	// StateClosed restricts to closed issues.
+	StateClosed IssueState = "closed"
+)
+
+// ListIssuesOptions filters ListIssues. Labels is ANDed; an empty UpdatedAfter
+// means "no lower bound" (full fetch).
 type ListIssuesOptions struct {
 	// Labels each issue must carry (AND semantics). Typically []string{"PRD"}.
 	Labels []string
@@ -289,6 +313,14 @@ type ListIssuesOptions struct {
 	// bound is inclusive at second granularity on GitLab; callers dedupe the
 	// boundary by upsert.
 	UpdatedAfter *time.Time
+	// State restricts by issue state. The ZERO VALUE IS StateAll, which is what
+	// every pre-M6 caller relied on: the Closed column and de-label/close eviction
+	// both need to see closed issues, and the drivers used to hardcode it.
+	//
+	// Added by PRD #102 Decision 10 for M6's additive non-PRD fetch, which wants
+	// open-only — without it that fetch would pull the entire closed history on
+	// every reconcile purely to discard it.
+	State IssueState
 }
 
 // Forge is the driver contract. Every method takes a context and surfaces
@@ -305,7 +337,9 @@ type Forge interface {
 	// EnsureLabels creates any of the given labels that do not already exist on
 	// the project (by name). Existing labels are left untouched.
 	EnsureLabels(ctx context.Context, projectID int64, labels []Label) error
-	// ListIssues returns issues matching opts, always across state=all.
+	// ListIssues returns issues matching opts. State defaults to StateAll (the
+	// zero value), which is what every pre-M6 caller relies on; each driver
+	// translates it into its own request vocabulary.
 	ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error)
 	// GetIssue returns one issue by its project-scoped IID. Its Description is
 	// populated (the run-create path snapshots it), unlike the cached list rows.

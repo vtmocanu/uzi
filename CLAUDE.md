@@ -17,13 +17,19 @@ docker compose up                    # web on http://127.0.0.1:8080
 docker compose --profile agent up    # additionally start a worker (needs join token)
 ```
 
-**Testing the stack: never run a bare `docker compose up` for smoke/test purposes.** It autoloads the real `./.env` and touches the real admin/forge data. **`--env-file` with dummy secrets is NOT sufficient on its own**: the developer's shell profile exports the real vars (`UZI_SEED_*`, `JWT_SECRET`, `UZI_SECRET_KEY`, `POSTGRES_PASSWORD`, …) and Compose ranks shell environment ABOVE `--env-file`, silently overriding the dummies (observed 2026-07-05: an "isolated" stack seeded the real admin + credentials). Use an empty base env plus a unique project name:
+**Testing the stack: never run a bare `docker compose up` for smoke/test purposes.** The reason is the SHELL, not a dotfile: the developer's profile exports the real vars (`UZI_SEED_EMAIL`, `UZI_SEED_PASSWORD`, `UZI_SEED_NAME`, `JWT_SECRET`, `UZI_SECRET_KEY`, `POSTGRES_PASSWORD`, …) and Compose ranks shell environment ABOVE `--env-file`, silently overriding the dummies. That is what did the damage on 2026-07-05, when an "isolated" stack seeded the real admin + credentials. **`--env-file` with dummy secrets is NOT sufficient on its own.** Use an empty base env plus a unique project name:
 
 ```sh
 env -i HOME=$HOME PATH=$PATH docker compose --env-file <dummy.env> -p <unique> up
 ```
 
 and verify with `... compose config` that the dummy admin is what will seed. Each git worktree already gets its own compose project + `pgdata` volume.
+
+> **This sentence used to open "It autoloads the real `./.env`", and that half is FALSE on this host** (measured 2026-07-28). There is no `.env` in `main/`, in any PRD worktree, or at the bare-clone root. The running stack's own labels say `project=uzi`, `working_dir=<bare-clone parent>`, `config_files=<parent>/docker-compose.yml`, and **that file does not exist**: the 2026-07-20 bare-clone conversion moved everything into `main/`, and the stack has been up longer than that. The precaution is right; only its stated mechanism was wrong, which is the failure mode this file spends most of its length warning about. The seed vars are spelled out above for the same reason: writing only the `UZI_SEED_*` glob is an under-specification that let a plausible-but-wrong guess (`UZI_SEED_ADMIN_*`) through.
+
+**🔴 THE COMMAND THAT DESTROYS REAL DATA IS `docker compose -p uzi down -v`, FROM ANY DIRECTORY HOLDING A COMPOSE FILE.** It removes `uzi_pgdata` and `uzi_agentdata`, which carry the real admin and forge data. The stack can be brought back with `cd main && docker compose -p uzi up`, but **the volumes do not come back**. Never pass `-p uzi` to a `down`, and never add `-v` to one.
+
+The standing "never `docker compose down` from a worktree" rule below is now belt-and-braces rather than load-bearing, and it is worth knowing which it is: because the recorded `config_files` path no longer exists, config-file discovery **cannot reach project `uzi` from anywhere**, so a bare `docker compose down` in a worktree resolves that worktree's own project and cannot touch the real one. It stays as a rule because the discovery path could be restored by anyone re-creating that file, and because the explicit-project form above is not hypothetical at all.
 
 **🔴 NEVER GLOB `uzi-` WHEN TEARING DOWN CONTAINERS.** The dev stack (`uzi-web-1`, `uzi-api-1`, `uzi-agent-1`, `uzi-db-1`) runs on the same Docker daemon that tests and agents start throwaway Postgres containers on, and `uzi-db-1` shares `postgres:17` with them. Observed 2026-07-21, live:
 
@@ -143,8 +149,98 @@ node --import tsx --test test/worker.test.ts   # single file
 
 ```sh
 ./e2e/run-e2e.sh        # isolated stack, dummy creds, stub executor; KEEP_STACK=1 to inspect
-./scripts/smoke.sh      # auth-API smoke; expects a FRESH stack (docker compose down -v first)
+./scripts/smoke.sh      # auth-API smoke; expects a FRESH stack. Tear down with
+                        # `docker compose -p <your-project> down -v`, NEVER a bare
+                        # `down -v` and never `-p uzi` (see below).
 ```
+
+**🔴 `smoke.sh` HAS NO ISOLATION OF ITS OWN, AND THE OBVIOUS WAY TO GIVE IT SOME REACHES THE REAL STACK.** Unlike `run-e2e.sh`, it never inherited the overlay treatment.
+
+**Run exactly this.** Every earlier version of this entry stated the constraints correctly and left the assembly to the reader, and every defect found in it since has been an assembly step rather than a wrong fact:
+
+```yaml
+# overlay.yml
+services:
+  web:
+    ports: !override                             # on the ports KEY, not on the list item
+      - "127.0.0.1:${SMOKE_WEB_PORT}:8080"
+```
+
+```sh
+# dummy.env  (JWT_SECRET and UZI_SECRET_KEY use DIFFERENT generators, see item 3)
+SMOKE_WEB_PORT=27072
+JWT_SECRET=$(openssl rand -hex 64)
+UZI_SECRET_KEY=$(openssl rand -base64 32)
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+# UZI_SEED_* deliberately ABSENT: smoke.sh needs no seeded admin (item 4)
+```
+
+```sh
+# 1. Render and CHECK: only the remapped port, and nothing seeds.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml config
+
+# 2. Start detached. A foreground `up` blocks forever and you never get a shell.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml up -d --wait db api web
+
+# 3. PROVE the port is yours before writing anything. If this 404s or connects to
+#    something you did not start, STOP: 8080 is the real stack.
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:27072/api/health
+
+# 4. BASE must match the overlay's published port. Without it smoke.sh writes to :8080.
+BASE="http://127.0.0.1:27072" bash scripts/smoke.sh
+
+# 5. Tear down YOUR project by name. Also required between retries: a failed first
+#    `up` leaves pgdata initialised with the old password and SASL auth then fails.
+env -i HOME=$HOME PATH=$PATH docker compose --env-file dummy.env -p smk-$$ \
+  -f docker-compose.yml -f overlay.yml down -v
+```
+
+**The compose prefix is written out at every step on purpose.** Do not factor it into `C="env -i …"`: zsh does not word-split an unquoted variable in command position, so `$C config` tries to exec a command whose name is the whole string. That trap is documented in this very file, and introducing it inside the fix for a different trap would be its own joke. A shell function is fine; a string variable is not.
+
+**Why each piece is there.** These are the constraints, and they are what stops someone simplifying the block above back into something broken:
+
+1. **`docker-compose.yml` hardcodes `"127.0.0.1:8080:8080"`** with no `${VAR:-}` (line 200), and **Compose APPENDS override ports rather than replacing them**. Measured 2026-07-28 by rendering, not by starting:
+
+   ```
+   naive override      ['127.0.0.1:8080->8080', '127.0.0.1:29080->8080']   <- still publishes 8080
+   ports: !override    ['127.0.0.1:29080->8080']                           <- only the remapped one
+   ```
+
+2. **`scripts/smoke.sh:11` defaults `BASE` to `http://127.0.0.1:8080`.** And smoke.sh is not read-only: it POSTs a registration, PATCHes a user to disabled, and changes a password.
+
+So `env -i … --env-file <dummy.env> -p smk-<unique> up` is **NOT isolated**, and `ports: !override` alone is the **worse** of the two half-fixes, because it is the one that succeeds silently: the throwaway stack comes up on 29080 while smoke.sh writes to whatever is on 8080, which is the real stack. The naive form at least fails loudly on a port conflict while the real stack holds 8080.
+
+**Both halves are required:** a `ports: !override` overlay **and** an explicit `BASE=http://127.0.0.1:<port>`. `e2e/docker-compose.e2e.yml` is the precedent and exists for exactly this reason.
+
+**Found by RUNNING it, and neither guessable from reading:**
+
+3. **Both secrets must be GENERATED, and THE TWO FORMATS DIFFER.** Neither is optional and neither accepts a made-up string:
+
+   ```sh
+   JWT_SECRET=$(openssl rand -hex 64)        # 128 hex chars
+   UZI_SECRET_KEY=$(openssl rand -base64 32) # 44 base64 chars
+   ```
+
+   `UZI_SECRET_KEY` refuses to boot on anything that is not valid base64 (`secretbox: UZI_SECRET_KEY is not valid base64`, `api/internal/secretbox/secretbox.go:130`). `JWT_SECRET` is `${JWT_SECRET:?...}` in `docker-compose.yml:33`, so it is not merely unset-at-boot but **required at `compose config` time**: omit it and the very first step this entry tells you to run exits 1 with `required variable JWT_SECRET is missing a value`.
+
+   **The required set is exactly three, and that is established by ENUMERATION, not by the render going quiet.** `docker-compose.yml` has three variables with no default (`${VAR:?…}` or bare `${VAR}`): `JWT_SECRET`, `POSTGRES_PASSWORD`, `UZI_SECRET_KEY`. All three are in the `dummy.env` above. This matters because **compose reports missing variables ONE AT A TIME**, so a `config` that stops complaining cannot distinguish *"the set is complete"* from *"the next one has not surfaced yet"*: you learn one name per run, and each run costs a fix-and-retry. Grepping the compose file for those two forms settles it in a single pass, and it is how the third variable was found after two runs had each revealed one.
+
+   **Using `-base64 32` for BOTH is the natural mistake, and it is a SILENT one.** `validateSecret` (`config.go:1278`) rejects empty, placeholder, and shorter than `minSecretLen = 16`; a 44-char base64 string passes all three, so the stack boots normally on a 256-bit HS256 key where the documented generator gives 512. Adequate for HS256 and not a vulnerability, but it is a deviation nothing will tell you about. *(Determined by reading the guard, not by booting with a base64 JWT secret.)*
+
+4. **smoke.sh needs NO seeded admin, which INVERTS the general rule above for this one script.** Its first assertion is a concurrent first-registration race expecting exactly one admin to win (`scripts/smoke.sh:31`), so a seeded admin makes it fail with `expected exactly 1 admin from the race, got 0`. So:
+
+   - **general isolated stack:** set the seed vars and verify with `compose config` that **the dummy admin is what seeds**;
+   - **smoke.sh:** leave `UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME` **empty**, and verify that **nothing seeds**.
+
+   Naming the exact seed vars above makes it *more* likely someone sets them, which is why this case is spelled out rather than left implied.
+
+**Operational, between attempts:** a failed first `up` leaves a `pgdata` volume initialised with the OLD password, so a retry after changing `POSTGRES_PASSWORD` fails SASL auth. Run `docker compose -p <your-project> down -v` **by explicit project name** between attempts, never a bare `down -v`.
+
+> **Items 3 and 4 exist because this recipe was written into the doc without being executed, and the `JWT_SECRET` half of item 3 exists because the corrected version was not executed EITHER.** The three layers found what the previous could not: item 1-2 by *measuring the mechanism*, items 3-4 by *running the recipe*, and `JWT_SECRET` by running the recipe **as written on this page** rather than the working version already in someone's head. The last is the strictest test and the only one that catches an omission, because a missing line is invisible to a reader who knows to supply it.
+>
+> The closing sentence below was, at the moment it was first written, one revision short of true about itself. **A procedure is not documented until someone has run what is written down**, and "what is written down" means the page, not your memory of the page. A runbook is the worst place for this gap, because the reader executes it against real infrastructure instead of merely believing it.
 
 CI (`.gitlab-ci.yml`, PRD #52) now runs the real gates on every MR + `main`: validate/test across all three toolchains + `helm lint`/`template`, plus kaniko validation builds of the api/web images. `v*` tags additionally publish the images + OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the tag), and k8s deploy is GitOps via ArgoCD to dev-cluster — see `deploy/` (the chart + `deploy/README.md` release runbook). **The compose e2e harness (`./e2e/run-e2e.sh`) is NOT in CI** — it needs docker compose on the runner — so it stays a purely local gate. **`./scripts/smoke.sh` is a different story and the old wording here was wrong about it:** `e2e:kind-smoke` (`.gitlab-ci.yml:730`) stands up a KinD cluster, `helm install`s the chart and runs `bash scripts/smoke.sh` against it. So smoke.sh *does* run in CI. **But only on PROTECTED refs** (`rules: if $CI_COMMIT_REF_PROTECTED == "true"`), i.e. `main` and tags — never on an MR pipeline. So it is a POST-merge gate in CI and still a PRE-merge gate only locally, which is the distinction the previous sentence collapsed. Run both locally before merging; do not read a green MR pipeline as smoke having passed. *(Corrected 2026-07-25: the line read "e2e is deliberately NOT in CI … `./scripts/smoke.sh` stays the local pre-merge gate", which was true when written and became false when PRD #52 M8 added `e2e:kind-smoke` in `67e64972`.)*
 

@@ -712,6 +712,14 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
 		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
+		case errors.Is(err, workersvc.ErrNotPRDIssue):
+			// PRD #102 Decision 14. Named separately from ErrNoPRDLink and BEFORE it
+			// for the same reason the gate is ordered that way in createRun: telling
+			// someone to add a prds/*.md link to an issue that is not uzi's work sends
+			// them to fix the wrong thing. Promote is the action this hint names.
+			prdLabel, _ := h.settings.PRDLabel(r.Context())
+			httpx.Error(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("this issue does not carry the %s label; promote it before starting a run", prdLabel))
 		case errors.Is(err, workersvc.ErrNoPRDLink):
 			// Extend the hint with the escape-hatch label only when the feature is
 			// enabled instance-wide, so a strict-regime instance never advertises it.

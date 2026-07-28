@@ -177,7 +177,7 @@ dead code      none (gap)
 coverage       none (gap)
 security scan  none (gap)          # auditor's slot regardless
 pre-commit     none (gap)          # only Entire's session-logging hooks exist
-long-running   ./e2e/run-e2e.sh    # ~30 min, see the exception below
+long-running   ./e2e/run-e2e.sh    # ~30 min (but see the samples below), exception applies
 ```
 
 In linked worktrees a bare `go build`/`go test` can fail on VCS stamping; use
@@ -205,8 +205,24 @@ only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates but NOT e
 (it needs docker compose on the runner), so e2e + smoke stay the local pre-merge gate.
 
 **Long-gate exception to the generic `<5min` live-wait bound:** `./e2e/run-e2e.sh` runs
-~30 minutes end to end (it cycles the whole stack and drives real stub-agent scenarios),
-far past the `<5min` bound in the generic body above. For a full e2e run, coordinate with
-the lead and let it finish (the lead watches the process to completion) — do NOT abandon it
-at 5 minutes. The `<5min` bound still governs individual polls against a live run/API, not
-the e2e gate itself.
+far past the `<5min` bound in the generic body above (it cycles the whole stack and drives
+real stub-agent scenarios). For a full e2e run, coordinate with the lead and let it finish
+(the lead watches the process to completion) — do NOT abandon it at 5 minutes. The `<5min`
+bound still governs individual polls against a live run/API, not the e2e gate itself.
+
+**On the `~30 min` figure: treat it as the budget, not the expectation.** Two samples
+measured 2026-07-27/28, both reaching the final banner and the `down -v` teardown so
+neither was truncated: **7m55s** at `53d0f222` and **8m40s** at `30ab9e32` (204 PASS /
+0 FAIL). **Both ran `executor=stub` with no `--profile agent-docker`**, so they do not
+measure the configuration that spends real agent time, and `~30 min` may well be right for
+one that does. Two samples are not a correction and `~30 min` stays as the number you plan
+against.
+
+**The direction of the error is the point, and it is why this note exists in the role file
+and not only in the manifest.** `~30 min` is exactly the figure that makes an agent abandon
+the run against the `<5min` bound — the failure this whole exception exists to prevent. So
+an over-estimate here is not the conservative choice. If a run passes 10 minutes, that is
+normal and not a hang; if it passes 30, then you are either in a non-stub configuration or
+something is wrong, and the phase count is what tells you which (see the interrupted-run
+trap in `.claude/agent-team.md`: a zero exit code and an absent-FAIL grep are both
+satisfiable by a run that stopped early).

@@ -112,7 +112,7 @@ func wsGuardRouter(t *testing.T) (http.Handler, *wsGuardDB, uuid.UUID) {
 		hub:  hub.New(),
 	}
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
-	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit), db, runID
+	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit), db, runID
 }
 
 // -------------------------------------------------------------------------

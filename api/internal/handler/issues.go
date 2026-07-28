@@ -96,7 +96,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		// next sync will pick it up, so report success with the forge facts.
 		slog.Warn("cache new issue after create", "repo", repo.PathWithNamespace, "error", err)
 		httpx.JSON(w, http.StatusCreated, map[string]any{
-			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: created.Labels, WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
+			// nonNilLabels, not created.Labels: this is the THIRD card builder (the two
+			// in board.go go through decodeLabels) and it hands the forge's slice
+			// straight to the DTO, where a nil marshals as JSON null.
+			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: nonNilLabels(created.Labels), WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
 		})
 		return
 	}
@@ -143,10 +146,11 @@ type issueDetailDTO struct {
 // be, since h.q is a concrete *store.Queries.
 func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType string) issueDetailDTO {
 	col, closed, conflict := board.ResolveColumn(issue.Labels, issue.State, position)
-	labels := issue.Labels
-	if labels == nil {
-		labels = []string{}
-	}
+	// nonNilLabels, not a local nil check: this is the same JSON-null guarantee the
+	// two card builders make, and three hand-rolled copies is how one of them ends up
+	// missing it. The guard here predates the helper (PRD #102 M6) — it was already
+	// right, and now it is right for a reason a reader can follow to the others.
+	labels := nonNilLabels(issue.Labels)
 	dto := issueDetailDTO{
 		IID:         issue.IID,
 		Title:       issue.Title,

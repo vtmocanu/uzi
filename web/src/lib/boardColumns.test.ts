@@ -1,13 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { visibleColumns, type BoardColumn } from "./boardColumns";
 
+// The implicit column keeps its key ("") and gains the display label "Backlog"
+// (PRD #102 M1). visibleColumns keys off `key`, never `label`, so the rename is
+// inert here — the fixture tracks the real board so a reader is not told the
+// first lane is still called Open.
 const cols: BoardColumn[] = [
-  { key: "", label: "Open", droppable: true, accent: "bg-faint" },
+  { key: "", label: "Backlog", droppable: true, accent: "bg-faint" },
   { key: "review", label: "review", droppable: true, accent: "bg-info" },
   { key: "__closed__", label: "Closed", droppable: false, accent: "bg-edge-strong" },
 ];
 
-// Open holds 2 cards, review is empty, Closed holds 1.
+// Backlog holds 2 cards, review is empty, Closed holds 1.
 const counts: Record<string, number> = { "": 2, review: 0, __closed__: 1 };
 const count = (key: string) => counts[key] ?? 0;
 
@@ -20,7 +24,7 @@ describe("visibleColumns", () => {
     expect(visibleColumns(cols, count, true, false).map((c) => c.key)).toEqual(["", "__closed__"]);
   });
 
-  it("exempts no column — an empty Open or Closed lane hides too", () => {
+  it("exempts no column — an empty Backlog or Closed lane hides too", () => {
     const allEmpty = () => 0;
     expect(visibleColumns(cols, allEmpty, true, false)).toEqual([]);
   });
