@@ -734,6 +734,90 @@ describe("RunRunner — plan gate + steering end to end", () => {
     );
   });
 
+  // B2, WORKER half — and the honest version of it.
+  //
+  // The reported chain was: answered park -> worker restart -> the claim still
+  // carries the resolved id -> the worker re-uses it for a new question. Clearing
+  // open_question_id in SetRunRunning breaks that chain at its THIRD step, so the
+  // worker never receives a resolved id in the first place. There is deliberately no
+  // worker-side guard against one: the worker cannot tell a resolved id from a live
+  // one (a claim reports status "claimed", never "awaiting_input", because ClaimRun
+  // is what set it), so any such guard would be a guess. The store test
+  // TestSetRunRunningClearsOpenQuestionLiveDB is what pins the fix.
+  //
+  // What the worker layer CAN pin, and must, is the property the fix has to leave
+  // intact — the two halves of the id lifecycle:
+  it("mints a fresh question id when the claim carries none", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(34, {
+      issue_description: `clarify first: ${STUB_ASK_SENTINEL}`,
+    });
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          input(
+            "answer",
+            JSON.stringify({
+              question_id: body.open_question_id,
+              answers: ["proceed"],
+            }),
+          ),
+          input("approve_plan"),
+        ]);
+      }
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const park = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_input",
+    );
+    assert.ok(
+      park?.body.open_question_id,
+      "a park must always report a question id — the api rejects one without",
+    );
+  });
+
+  // The requeue-survival half: a run re-claimed while genuinely still parked re-parks
+  // on the SAME id. This is what makes an answer the user submitted before the worker
+  // died still valid, and it is the property every clock-based design failed.
+  it("re-parks on the SAME question id the claim delivered", async () => {
+    const { gitlab } = fakeGitlab();
+    const liveID = "question-the-run-is-still-parked-on";
+    const claim = gitlabClaim(35, {
+      issue_description: `clarify first: ${STUB_ASK_SENTINEL}`,
+      open_question_id: liveID,
+    });
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          input(
+            "answer",
+            JSON.stringify({
+              question_id: body.open_question_id,
+              answers: ["proceed"],
+            }),
+          ),
+          input("approve_plan"),
+        ]);
+      }
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const park = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_input",
+    );
+    assert.strictEqual(
+      park?.body.open_question_id,
+      liveID,
+      "a resumed worker must re-park on the id the claim delivered — minting a new one silently " +
+        "invalidates an answer the user already submitted against the live question",
+    );
+  });
+
   it("still halts a NON-autopilot claim at the gate (auto_approve absent)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(27); // no auto_approve

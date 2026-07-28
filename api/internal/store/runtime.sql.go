@@ -992,7 +992,7 @@ UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = $2
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count >= $3
 RETURNING id
 `
@@ -2948,7 +2948,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = $1
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count < $2
 `
 
@@ -3353,6 +3353,19 @@ func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (i
 const setRunRunning = `-- name: SetRunRunning :execrows
 UPDATE runs SET
     status           = 'running',
+    -- PRD #88: the run is leaving the clarification park, so the question it was
+    -- parked on is RESOLVED and its id must not survive. Nothing else clears it, and
+    -- a stale id is not inert: the claim payload re-delivers open_question_id on a
+    -- resume, so a worker that restarts after an answered park would seed its map
+    -- with the OLD id and then re-use it for a genuinely new question. That
+    -- degenerates the guard below to "has ever been answered" (PRD #44 F2 again) and
+    -- lets the stale answer to the old question satisfy the new one — the two things
+    -- identity keying exists to prevent.
+    --
+    -- Safe to assign here even though the guard below reads the same column: Postgres
+    -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
+    -- the same mechanism the health CASE arms below already rely on.
+    open_question_id = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, $1),
     session_id       = COALESCE($2, session_id),

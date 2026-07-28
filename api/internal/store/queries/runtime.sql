@@ -569,6 +569,19 @@ WHERE id = @id AND user_id = @user_id;
 -- consumed round-1 input lets a stale round-2 pre-gate report through.
 UPDATE runs SET
     status           = 'running',
+    -- PRD #88: the run is leaving the clarification park, so the question it was
+    -- parked on is RESOLVED and its id must not survive. Nothing else clears it, and
+    -- a stale id is not inert: the claim payload re-delivers open_question_id on a
+    -- resume, so a worker that restarts after an answered park would seed its map
+    -- with the OLD id and then re-use it for a genuinely new question. That
+    -- degenerates the guard below to "has ever been answered" (PRD #44 F2 again) and
+    -- lets the stale answer to the old question satisfy the new one — the two things
+    -- identity keying exists to prevent.
+    --
+    -- Safe to assign here even though the guard below reads the same column: Postgres
+    -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
+    -- the same mechanism the health CASE arms below already rely on.
+    open_question_id = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -893,7 +906,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pendin
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count >= @max_requeues
 RETURNING id;
 
@@ -906,7 +919,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count < @max_requeues;
 
 -- Messages -----------------------------------------------------------------
