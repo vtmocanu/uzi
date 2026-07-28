@@ -67,6 +67,7 @@ import {
   mockAdminRateLimits,
   mockAdminWorkers,
   mockAllocations,
+  mockBuildInfo,
   mockCliAuthRequest,
   mockCliTokens,
   mockMemories,
@@ -972,7 +973,11 @@ export const mockApi = {
     return delay({ attention, target_release: "0.4.2" });
   },
 
-  version: async () => delay({ version: "0.4.2" }),
+  // The FULLY-STAMPED fixture (PRD #175), so the demo shows the popover with every
+  // row present. mockBuildInfoUnstamped is the other half of the pair and is
+  // exercised by the popover's own tests — the degraded shape is what a laptop
+  // build actually produces, and it is the one `typeof realApi` cannot enforce.
+  version: async () => delay(mockBuildInfo),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
