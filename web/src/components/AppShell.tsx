@@ -134,8 +134,8 @@ export function useBuildInfo(): BuildInfo | null {
 //   null  -> IN FLIGHT.        FleetUpgradePanel renders &nbsp; — it asserts nothing
 //                              while the answer is still coming.
 //   ""    -> SETTLED, UNKNOWN. The fetch failed, or the body carried an empty
-//                              version. The panel says "no release stamp —
-//                              classification off", which is the truth and is
+//                              version. The panel says "control-plane release
+//                              unknown — targets unchecked", which is true and
 //                              actionable; a permanent blank is neither.
 //   "x"   -> SETTLED, STAMPED. The panel says "target release vx".
 //

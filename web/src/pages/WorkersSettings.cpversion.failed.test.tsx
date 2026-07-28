@@ -90,7 +90,7 @@ afterEach(() => {
 });
 
 describe("a FAILED /api/version reaches the fleet panel as settled-unknown", () => {
-  it("says classification is off instead of pending forever", async () => {
+  it("names the degraded reading instead of pending forever", async () => {
     render(
       <MemoryRouter>
         <WorkersSettings />
@@ -99,7 +99,14 @@ describe("a FAILED /api/version reaches the fleet panel as settled-unknown", () 
 
     // The third arm, which no production code path could reach before the
     // discriminated snapshot.
-    expect(await screen.findByText(/no release stamp — classification off/)).toBeTruthy();
+    expect(await screen.findByText(/control-plane release unknown — targets unchecked/)).toBeTruthy();
+
+    // …and it must NOT claim classification stopped. It did not: every count, the
+    // bar and the attention line below come from each worker's server-computed
+    // upgrade_status and are unaffected by this fetch failing. The copy said
+    // "classification off" while that arm was unreachable, so nobody had ever read
+    // it against the panel it renders in.
+    expect(screen.queryByText(/classification off/)).toBeNull();
 
     // NOT the pending arm and NOT the stamped arm. Asserting the absence of the
     // stamped copy matters because the fixture's worker DOES carry 0.11.99 in its

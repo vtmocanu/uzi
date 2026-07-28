@@ -197,9 +197,32 @@ describe("FleetUpgradePanel — B-1, the target divergence", () => {
     expect(screen.getByText("2 workers need attention.")).toBeTruthy();
   });
 
-  it("says classification is off rather than inventing a target when the api is unstamped", () => {
+  it("names what is degraded rather than inventing a target when the api is unstamped", () => {
     render(<FleetUpgradePanel workers={[aWorker({ upgrade_status: "unknown" })]} cpVersion="" />);
-    expect(screen.getByText(/classification off/)).toBeTruthy();
+    expect(screen.getByText(/control-plane release unknown — targets unchecked/)).toBeTruthy();
+  });
+
+  it("does NOT claim classification stopped while rendering a classified fleet", () => {
+    // The copy this replaced said "classification off". It was false — the counts,
+    // the bar and the attention line all come from each worker's server-computed
+    // upgrade_status and never consult cpVersion — and it was unreachable in
+    // production until PRD #175 gave the failed fetch a distinct state, so nobody
+    // had ever read it against the panel it renders in.
+    render(
+      <FleetUpgradePanel
+        workers={[
+          aWorker({ id: "a", upgrade_status: "up_to_date" }),
+          aWorker({ id: "b", upgrade_status: "outdated" }),
+        ]}
+        cpVersion=""
+      />,
+    );
+    expect(screen.queryByText(/classification off/)).toBeNull();
+    // The classification the panel is simultaneously rendering, which is what made
+    // the old sentence self-contradictory.
+    expect(screen.getByText("1 up to date")).toBeTruthy();
+    expect(screen.getByText("1 outdated")).toBeTruthy();
+    expect(screen.getByText("1 worker needs attention.")).toBeTruthy();
   });
 });
 
