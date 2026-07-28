@@ -151,6 +151,10 @@ Open **Settings → Notifications**:
     with a note telling you to scroll down and answer the current question.
     That is deliberate: it is the only way to stop a reply you wrote against an
     earlier question from being silently applied to a newer one you never read.
+    What uzi still cannot tell is *intent* — if a newer question is already on
+    screen and you reply meaning the older one, your words go to the newer
+    question, because both replies land in the same thread and look identical.
+    Answer the question at the bottom of the thread.
   - **One reply answers the whole card.** When the agent batches several
     questions into one message, cover them in a single reply; the agent reads
     it in full. It may re-ask anything you left unaddressed.

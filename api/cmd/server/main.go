@@ -754,7 +754,7 @@ func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UU
 // can leave the question between the replier reading its status and this call landing,
 // and a silent drop would leave the user with neither a ✅ nor an explanation.
 func (g gateSubmitter) SubmitAnswer(ctx context.Context, userID, runID uuid.UUID, questionID, text string) error {
-	body, err := json.Marshal(workersvc.AnswerBody{QuestionID: questionID, Answers: []string{text}})
+	body, err := answerInputBody(questionID, text)
 	if err != nil {
 		return err
 	}
@@ -766,6 +766,21 @@ func (g gateSubmitter) SubmitAnswer(ctx context.Context, userID, runID uuid.UUID
 		return slacksvc.ErrNotAwaitingInput
 	}
 	return err
+}
+
+// answerInputBody encodes a Slack reply as the `answer` steering-input body. Split out
+// of SubmitAnswer so the two claims it makes are testable without a run service:
+//
+//   - the reply lands as EXACTLY ONE answer, at index 0. The worker aligns answers with
+//     the question payload's `questions` array, so a card carrying several questions
+//     shows the rest as unanswered to the lead. That is deliberate — repeating one
+//     message's prose under every question would assert it answers each of them, and a
+//     lead that re-asks is a visible failure where a wrong assumption is a silent one.
+//   - the question id passes through UNMODIFIED. It is compared for equality against
+//     runs.open_question_id and never parsed for meaning, so anything that trimmed,
+//     normalised or defaulted it here would break the identity guard silently.
+func answerInputBody(questionID, text string) ([]byte, error) {
+	return json.Marshal(workersvc.AnswerBody{QuestionID: questionID, Answers: []string{text}})
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no
