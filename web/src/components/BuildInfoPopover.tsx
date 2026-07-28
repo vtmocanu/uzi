@@ -3,7 +3,11 @@
 // a button that opens the full coordinate set on hover, focus AND tap.
 //
 // PRESENTATIONAL ON PURPOSE — it takes `info` as a prop and calls no hook that
-// fetches. AppShell owns `useBuildInfo()` and the module-scope promise behind it.
+// fetches. AppShell owns the fetch: SidebarContent reads the module-scope promise
+// through the private `useBuildInfoSnapshot()`, because it needs `fetchedAtMs` to
+// keep the uptime honest, and passes the body down here. NOT through the exported
+// `useBuildInfo()` — that hook discards the snapshot's discriminant and its
+// timestamp, so this component's data has never flowed through it.
 // That split is what makes this testable: the promise is memoised at module scope
 // with no reset seam, and vitest isolates per FILE, so a component reading it
 // directly could not be exercised with two fixtures (fully-stamped and unstamped

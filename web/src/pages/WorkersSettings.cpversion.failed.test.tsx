@@ -18,6 +18,12 @@
 //
 // Own file: the promise is memoised at module scope with no reset seam, and vitest
 // isolates per FILE — a file that resolved it cannot reject it.
+//
+// It is also the SOLE guard on the failed-fetch cause of "". AppShell.hooks.empty
+// covers the other cause (a resolved empty body) and the two are not
+// interchangeable: folding the failed fetch back to null reddens THIS file and
+// leaves that one green, and folding the empty body back reddens that one and
+// leaves this green. Its header carries the same table.
 
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";

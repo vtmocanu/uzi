@@ -106,14 +106,20 @@ function useBuildInfoSnapshot(): BuildInfoSnapshot | null {
   return snapshot;
 }
 
-// The whole build-info object (PRD #175). The seam the PRD's M2 bullet names, and
-// deliberately still exported even though NOTHING OUTSIDE THIS MODULE CALLS IT
-// today: SidebarContent needs `fetchedAtMs` to keep the uptime honest, so it uses
-// the private snapshot hook, and useAppVersion fifteen lines below is the only
-// caller. The intended external consumers are the PRD's named follow-ups — an
-// /about page and the CLI's `server` block (M4) — both of which want the whole
-// object rather than a projection. Recorded rather than dropped so the next reader
-// does not have to guess whether this is dead surface or a contract.
+// The whole build-info object (PRD #175). The seam the PRD's M2 bullet names.
+//
+// ⚠️ IT HAS ZERO PRODUCTION CALLERS, and that is a fact rather than an oversight —
+// stated because a grep for callers now returns only AppShell.hooks.empty.test.tsx
+// and the next reader deserves to know that was noticed. SidebarContent needs
+// `fetchedAtMs` so it uses the private snapshot hook; useAppVersion needs the
+// discriminant so it does too, and it was this hook's last caller until the
+// tri-state landed.
+//
+// KEPT ANYWAY, deliberately: it is the seam the PRD specifies, and its intended
+// consumers are that PRD's named follow-ups — an /about page and the CLI's
+// `server` block — both of which want the whole object rather than a projection.
+// Deleting it would delete the contract, not just an unused function. If those
+// follow-ups are ever abandoned, this is the thing to remove with them.
 //
 // DELIBERATELY two-state, and it does not gain the third: there is nothing to
 // render for a failed fetch and nothing to render while one is in flight, so both
@@ -156,11 +162,16 @@ export function useBuildInfo(): BuildInfo | null {
 // itself, harmlessly, but `??` states the intent — only ABSENT becomes "", and a
 // server-sent "" is already the settled-unknown value we want to pass through.
 //
-// Kept as a projection over useBuildInfo rather than collapsed into it (PRD #175
-// Decision Log): this is the ONE place the mapping happens, so every consumer sees
-// the same three-state value instead of each reimplementing it at its own call
-// site — which is exactly how the two failure modes got conflated in the first
-// place.
+// Reads the SNAPSHOT directly rather than going through useBuildInfo, because it
+// needs the discriminant and useBuildInfo deliberately discards it. (This comment
+// said "kept as a projection over useBuildInfo" until the tri-state landed and the
+// call moved; the INTENT below survived that change and the stated mechanism did
+// not.)
+//
+// The intent, unchanged and still the reason this hook exists at all: ONE place
+// owns the mapping, so every consumer sees the same three-state value instead of
+// reimplementing it at its own call site — which is exactly how the two failure
+// modes got conflated in the first place.
 export function useAppVersion(): string | null {
   const s = useBuildInfoSnapshot();
   if (s === null) return null;

@@ -12,9 +12,20 @@ import { api } from "../lib/api";
 //
 // WHAT IT NOW GUARDS: the SETTLED-BUT-UNKNOWN state, `""`, reached here by a body
 // carrying an empty `version`. It is the middle of useAppVersion's three states and
-// the one that is invisible from every other test — the panel copy it drives ("no
-// release stamp — classification off") is identical whether the fetch failed or
-// resolved empty, so only this file can tell you WHICH input produced it.
+// the one that is invisible from every other test — the panel copy it drives
+// ("control-plane release unknown — targets unchecked") is identical whether the
+// fetch failed or resolved empty, so only this file can tell you WHICH input
+// produced it.
+//
+// THAT IS NOT A STYLISTIC SPLIT. Mutating each upstream cause separately shows the
+// two files are each the SOLE guard on one of them:
+//
+//   revert useAppVersion wholesale    this RED    cpversion.failed RED
+//   failed fetch folds back to null   this GREEN  cpversion.failed RED
+//   empty body folds back to null     this RED    cpversion.failed GREEN
+//
+// So deleting either file leaves one cause of "" unguarded, silently, with the
+// other file still green and looking like coverage.
 //
 // This file previously asserted the OPPOSITE: that `""` folded to `null`. That was
 // the correct pin while the fold existed, and it is why flipping `||` to `??` used

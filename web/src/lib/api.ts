@@ -706,7 +706,14 @@ export interface Worker {
   upgrade_detail: string | null;
   // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
   // hosted worker with a fresh report, otherwise the control plane's own version. "" when
-  // the control plane has no version stamp (classification off).
+  // the control plane has no version stamp — SERVER-SIDE classification is genuinely off
+  // in that case, and this field is the api's own, so the phrase is accurate here.
+  //
+  // Not to be confused with the Fleet panel's arm for a cpVersion the SPA could not
+  // fetch, which used to say the same words and no longer does (PRD #175): there,
+  // classification had already happened server-side and only the SPA's copy of the
+  // release was missing. Same phrase, opposite situation — a grep for the retired
+  // wording lands here first.
   //
   // Rendered by the Fleet panel when it differs from the control-plane version. That
   // divergence is a supported operation — values.yaml may pin the worker image — and it is

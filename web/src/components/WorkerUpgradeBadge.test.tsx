@@ -208,6 +208,13 @@ describe("FleetUpgradePanel — B-1, the target divergence", () => {
     // upgrade_status and never consult cpVersion — and it was unreachable in
     // production until PRD #175 gave the failed fetch a distinct state, so nobody
     // had ever read it against the panel it renders in.
+    //
+    // THIS TEST AND THE ONE ABOVE BRACKET THE PROPERTY; NEITHER IS COMPLETE ALONE.
+    // The negative regex here would stay green against a REWORDED version of the
+    // same false claim, and the positive assertion above would stay green if the
+    // panel gained a second sentence contradicting it. Together they say: the true
+    // sentence is present, the false claim is absent, and the classification the
+    // panel is simultaneously rendering is real. Change one, look at the other.
     render(
       <FleetUpgradePanel
         workers={[
@@ -456,7 +463,12 @@ describe("the divergence line on a MIXED fleet (BLK-2)", () => {
     // Previously the panel rendered a full bar and badges under "classification off",
     // because the version fetch loses the race with the workers load by ~400ms.
     render(<FleetUpgradePanel workers={[hosted("a", "0.11.0")]} cpVersion={null} />);
-    expect(screen.queryByText(/classification off/)).toBeNull();
+    // Neither of the two SETTLED arms may appear while the answer is still coming.
+    // The first regex tracks the settled-unknown copy: it used to read
+    // "classification off", and leaving it that way after PRD #175 retired that
+    // string would have left a VACUOUS assertion — absence of something that can no
+    // longer render anywhere, passing forever regardless of this arm's behaviour.
+    expect(screen.queryByText(/control-plane release unknown/)).toBeNull();
     expect(screen.queryByText(/target release/)).toBeNull();
   });
 });
