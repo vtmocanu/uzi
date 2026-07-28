@@ -138,6 +138,20 @@ func (f *fakeForge) prdListCalls() []forge.ListIssuesOptions {
 	}
 	return out
 }
+
+// openListCalls is prdListCalls' sibling for the additive fetch. Both route on the
+// call's SHAPE rather than its index, matching ListIssues above: a per-fetch mark
+// assertion has to name which fetch it means, and an index would silently follow
+// the wrong one if the two calls were ever reordered.
+func (f *fakeForge) openListCalls() []forge.ListIssuesOptions {
+	var out []forge.ListIssuesOptions
+	for _, c := range f.listCalls {
+		if c.State == forge.StateOpened && len(c.Labels) == 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.Issue, error) {
 	f.getIssueCalls = append(f.getIssueCalls, issueIID)
 	if err := f.getIssueErrByIID[issueIID]; err != nil {
@@ -420,6 +434,10 @@ func TestFullSyncEmptySuccessEvictsAll(t *testing.T) {
 	}
 }
 
+// TestIncrementalSyncAdvancesHWM: the PRD fetch's mark advances to its own batch
+// max. The caller's two marks DIFFER, and the open fetch returns nothing, so what
+// is proven is per-field: PRD moves to 2000 while Open stays at the 900 it was
+// given. With one shared mark, or with the open half folded in, Open would move too.
 func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
@@ -427,18 +445,21 @@ func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 	t2 := time.Unix(2000, 0)
 	f := &fakeForge{issues: []forge.Issue{issueAt(1, t1), issueAt(2, t2)}}
 
-	start := time.Unix(500, 0)
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)}
 	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
 	if err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if !got.Equal(t2) {
-		t.Fatalf("HWM = %v, want max updated_at %v", got, t2)
+	if !got.PRD.Equal(t2) {
+		t.Fatalf("PRD mark = %v, want max updated_at %v", got.PRD, t2)
 	}
-	// A non-zero HWM must be sent as updated_after (server-clock boundary).
+	if !got.Open.Equal(start.Open) {
+		t.Fatalf("Open mark = %v, want it held at %v — an empty fetch is no evidence", got.Open, start.Open)
+	}
+	// A non-zero mark must be sent as updated_after (server-clock boundary).
 	prd := f.prdListCalls()
-	if len(prd) != 1 || prd[0].UpdatedAfter == nil || !prd[0].UpdatedAfter.Equal(start) {
-		t.Fatalf("expected updated_after=%v, got %+v", start, prd)
+	if len(prd) != 1 || prd[0].UpdatedAfter == nil || !prd[0].UpdatedAfter.Equal(start.PRD) {
+		t.Fatalf("expected updated_after=%v, got %+v", start.PRD, prd)
 	}
 	// The PRD fetch leaves State at its zero value, which is StateAll: the Closed
 	// column depends on seeing closed PRD issues, and M6's additive fetch is a
@@ -467,7 +488,7 @@ func TestSyncFiltersOnConfiguredLabel(t *testing.T) {
 	}
 
 	inc := &fakeForge{}
-	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, inc, time.Time{}); err != nil {
+	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, inc, Marks{}); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
 	if ic := inc.prdListCalls(); len(ic) != 1 || len(ic[0].Labels) != 1 || ic[0].Labels[0] != custom {
@@ -488,30 +509,45 @@ func TestSyncFallsBackToDefaultLabel(t *testing.T) {
 	}
 }
 
+// TestIncrementalSyncKeepsHWMWhenBatchOlder: monotonicity, per field. The two
+// caller marks differ so a returned pair that collapsed them (either direction)
+// fails here rather than reading as "no regression".
 func TestIncrementalSyncKeepsHWMWhenBatchOlder(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{issues: []forge.Issue{issueAt(1, time.Unix(100, 0))}}
 
-	start := time.Unix(9000, 0) // newer than anything returned
+	start := Marks{PRD: time.Unix(9000, 0), Open: time.Unix(8000, 0)} // newer than anything returned
 	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
 	if err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if !got.Equal(start) {
-		t.Fatalf("HWM should not regress: got %v, want %v", got, start)
+	if !got.PRD.Equal(start.PRD) || !got.Open.Equal(start.Open) {
+		t.Fatalf("marks should not regress: got %+v, want %+v", got, start)
 	}
 }
 
+// TestIncrementalSyncZeroHWMSendsNoLowerBound: the zero guard is PER FIELD. The
+// fixture is deliberately the mixed one — PRD zero, Open set — because that is the
+// case a single shared `if !hwm.IsZero()` gets wrong: it would drop BOTH bounds and
+// re-read the entire open set, which is issue #177's cost in the other direction.
 func TestIncrementalSyncZeroHWMSendsNoLowerBound(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{issues: []forge.Issue{issueAt(1, time.Unix(100, 0))}}
 
-	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, time.Time{}); err != nil {
+	openStart := time.Unix(900, 0)
+	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, Marks{Open: openStart}); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if f.listCalls[0].UpdatedAfter != nil {
-		t.Fatalf("zero HWM must send no updated_after, got %v", f.listCalls[0].UpdatedAfter)
+	prd, open := f.prdListCalls(), f.openListCalls()
+	if len(prd) != 1 || len(open) != 1 {
+		t.Fatalf("expected one PRD and one open fetch, got %d/%d: %+v", len(prd), len(open), f.listCalls)
+	}
+	if prd[0].UpdatedAfter != nil {
+		t.Errorf("a zero PRD mark must send no updated_after on the PRD fetch, got %v", prd[0].UpdatedAfter)
+	}
+	if open[0].UpdatedAfter == nil || !open[0].UpdatedAfter.Equal(openStart) {
+		t.Errorf("open fetch updated_after = %v, want %v — the other field's zero must not unbound this one", open[0].UpdatedAfter, openStart)
 	}
 }

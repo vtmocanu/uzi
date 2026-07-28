@@ -153,15 +153,20 @@ func TestFullSyncEvictsNothingWhenEitherFetchFails(t *testing.T) {
 			st := &fakeStore{}
 			svc := newTestService(st)
 
-			hwm, err := svc.FullSync(context.Background(), uuid.New(), 7, tc.fake)
+			marks, err := svc.FullSync(context.Background(), uuid.New(), 7, tc.fake)
 			if !errors.Is(err, boom) {
 				t.Fatalf("err = %v, want the forge error surfaced (no soft-fail, no log-and-continue)", err)
 			}
 			if len(st.deleteCalls) != 0 {
 				t.Errorf("a half-failed fetch must evict NOTHING, got %+v", st.deleteCalls)
 			}
-			if !hwm.IsZero() {
-				t.Errorf("hwm = %v, want the zero time so the poller keeps the mark it had", hwm)
+			// BOTH fields, including the half that succeeded: FullSync reports
+			// observations for the poller to Advance into its own pair, and the zero
+			// pair is what makes that fold a no-op. Reporting the successful fetch's
+			// mark would advance the caller past a window whose rows were never
+			// written, since neither half's upserts ran.
+			if !marks.PRD.IsZero() || !marks.Open.IsZero() {
+				t.Errorf("marks = %+v, want the zero pair so the poller keeps the marks it had", marks)
 			}
 		})
 	}
@@ -170,10 +175,16 @@ func TestFullSyncEvictsNothingWhenEitherFetchFails(t *testing.T) {
 // TestIncrementalSyncFailsClosedOnEitherFetch is Decision 11a's asymmetric-failure
 // rule. Returning nil with an advanced mark after one fetch failed is what makes
 // the next pass skip the failed path's window until the next full reconcile, so
-// the assertion is on the RETURNED MARK, not only on the error.
+// the assertion is on the RETURNED MARKS, not only on the error.
+//
+// The caller's two marks DIFFER deliberately, and BOTH are asserted. With per-path
+// marks the tempting half-measure is to hold only the failed fetch's mark and let
+// the successful one advance; that is unsound, because both fetches complete before
+// any upsert runs, so a half-failure means NEITHER path's rows were written. A pair
+// of equal caller marks would also let a `Marks{hwm, hwm}` collapse pass.
 func TestIncrementalSyncFailsClosedOnEitherFetch(t *testing.T) {
 	boom := errors.New("forge is down")
-	start := time.Unix(500, 0)
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)}
 	cases := []struct {
 		name string
 		fake *fakeForge
@@ -196,21 +207,24 @@ func TestIncrementalSyncFailsClosedOnEitherFetch(t *testing.T) {
 			if !errors.Is(err, boom) {
 				t.Fatalf("err = %v, want the forge error surfaced", err)
 			}
-			if !got.Equal(start) {
-				t.Fatalf("hwm = %v, want it held at %v — advancing past a window one fetch never read makes the skip permanent until the reconcile", got, start)
+			if !got.PRD.Equal(start.PRD) || !got.Open.Equal(start.Open) {
+				t.Fatalf("marks = %+v, want the WHOLE pair held at %+v — advancing past a window whose rows were never written makes the skip permanent until the reconcile", got, start)
 			}
 		})
 	}
 }
 
-// TestSyncBoundsBothFetchesByTheHWM: the additive fetch is unbounded only on a
-// FullSync. On the incremental path it must carry the same lower bound as the PRD
-// fetch, or every poll re-reads the repo's entire open set.
-func TestSyncBoundsBothFetchesByTheHWM(t *testing.T) {
+// TestEachFetchCarriesItsOwnMark is the wire-level half of issue #177: on the
+// incremental path each fetch's lower bound comes from ITS OWN mark. The caller's
+// two marks DIFFER, which is the whole point — the test this replaced passed one
+// `start` to both and so certified a single-mark implementation just as happily as
+// a correct one. It also catches a field swap, which no assertion on the returned
+// pair can see.
+func TestEachFetchCarriesItsOwnMark(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	f := &fakeForge{}
-	start := time.Unix(500, 0)
+	start := Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)}
 
 	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
@@ -218,99 +232,154 @@ func TestSyncBoundsBothFetchesByTheHWM(t *testing.T) {
 	if len(f.listCalls) != 2 {
 		t.Fatalf("expected 2 ListIssues calls, got %d", len(f.listCalls))
 	}
-	for i, c := range f.listCalls {
-		if c.UpdatedAfter == nil || !c.UpdatedAfter.Equal(start) {
-			t.Errorf("call %d updated_after = %v, want %v", i, c.UpdatedAfter, start)
-		}
+	prd, open := f.prdListCalls(), f.openListCalls()
+	if len(prd) != 1 || len(open) != 1 {
+		t.Fatalf("expected one PRD and one open fetch, got %d/%d: %+v", len(prd), len(open), f.listCalls)
+	}
+	if prd[0].UpdatedAfter == nil || !prd[0].UpdatedAfter.Equal(start.PRD) {
+		t.Errorf("PRD fetch updated_after = %v, want %v (its OWN mark)", prd[0].UpdatedAfter, start.PRD)
+	}
+	if open[0].UpdatedAfter == nil || !open[0].UpdatedAfter.Equal(start.Open) {
+		t.Errorf("open fetch updated_after = %v, want %v (its OWN mark)", open[0].UpdatedAfter, start.Open)
 	}
 }
 
-// TestSyncAdvancesHWMByTheEarlierFetch is Decision 11a's two-fetch window race,
-// both fetches succeeding. The fixture is deliberately one where the two maxima
-// DIFFER and the later fetch's is the larger — with equal maxima, min and max
-// return the same value and a broken implementation passes.
-func TestSyncAdvancesHWMByTheEarlierFetch(t *testing.T) {
+// TestPerPathMarksAdvanceIndependently is the core of issue #177, on both sync
+// paths. The two fetches' maxima DIFFER and the later fetch's is the larger, which
+// is what discriminates every broken shape at once: the old shared min returns
+// {1000, 1000}, a naive shared max returns {5000, 5000}, and any single-mark
+// implementation returns two equal fields whatever it picks.
+//
+// The soundness the old min() protected is not lost, it is dissolved: the PRD mark
+// stays at 1000 <= tA, so a PRD issue updated between the two calls is still
+// returned by the next PRD fetch. Only the OPEN mark takes the later fetch's
+// evidence, and it owns nothing that fetch did not see.
+func TestPerPathMarksAdvanceIndependently(t *testing.T) {
 	prdMax := time.Unix(1000, 0)
 	openMax := time.Unix(5000, 0)
-
-	t.Run("FullSync", func(t *testing.T) {
-		st := &fakeStore{}
-		svc := newTestService(st)
-		f := &fakeForge{
+	newFake := func() *fakeForge {
+		return &fakeForge{
 			issues:     []forge.Issue{labelled(1, prdMax, prdLabel)},
 			openIssues: []forge.Issue{labelled(2, openMax, "bug")},
 		}
-		got, err := svc.FullSync(context.Background(), uuid.New(), 7, f)
+	}
+	assert := func(t *testing.T, got Marks) {
+		t.Helper()
+		if !got.PRD.Equal(prdMax) {
+			t.Errorf("PRD mark = %v, want %v (its OWN fetch's max) — taking the open fetch's later evidence steps past a PRD issue updated between the two calls", got.PRD, prdMax)
+		}
+		if !got.Open.Equal(openMax) {
+			t.Errorf("Open mark = %v, want %v (its OWN fetch's max) — clamping it to the PRD fetch is the shared-mark stall issue #177 is about", got.Open, openMax)
+		}
+	}
+
+	t.Run("FullSync", func(t *testing.T) {
+		got, err := newTestService(&fakeStore{}).FullSync(context.Background(), uuid.New(), 7, newFake())
 		if err != nil {
 			t.Fatalf("FullSync: %v", err)
 		}
-		if !got.Equal(prdMax) {
-			t.Fatalf("hwm = %v, want %v (the EARLIER fetch's max) — max() here steps past a PRD issue updated between the two calls", got, prdMax)
-		}
+		assert(t, got)
 	})
 
 	t.Run("IncrementalSync", func(t *testing.T) {
-		st := &fakeStore{}
-		svc := newTestService(st)
-		f := &fakeForge{
-			issues:     []forge.Issue{labelled(1, prdMax, prdLabel)},
-			openIssues: []forge.Issue{labelled(2, openMax, "bug")},
-		}
-		got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, time.Unix(1, 0))
+		// Caller marks differ so a returned pair that collapsed onto one field
+		// cannot pass by coincidence.
+		start := Marks{PRD: time.Unix(1, 0), Open: time.Unix(2, 0)}
+		got, err := newTestService(&fakeStore{}).IncrementalSync(context.Background(), uuid.New(), 7, newFake(), start)
 		if err != nil {
 			t.Fatalf("IncrementalSync: %v", err)
 		}
-		if !got.Equal(prdMax) {
-			t.Fatalf("hwm = %v, want %v (the EARLIER fetch's max)", got, prdMax)
-		}
+		assert(t, got)
 	})
 }
 
-// TestSyncCountsDiscardedRowsTowardsTheHWM: the open fetch's contribution is read
-// off its RAW result, before the PRD-labelled rows are dropped. Those rows still
-// witness when the forge was read, and computing the bound after the discard would
-// stall the mark on any repo whose only open issues carry the PRD label.
-func TestSyncCountsDiscardedRowsTowardsTheHWM(t *testing.T) {
+// TestSyncCountsDiscardedRowsTowardsTheOpenMark: the open fetch's mark is read off
+// its RAW result, before the PRD-labelled rows are dropped. Those rows still witness
+// when the forge was read, and computing the bound after the discard would stall the
+// Open mark on any repo whose only open issues carry the PRD label — which is the
+// same permanent stall issue #177 fixes, arriving through the other door.
+func TestSyncCountsDiscardedRowsTowardsTheOpenMark(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)
 	prdMax := time.Unix(5000, 0)
+	openMax := time.Unix(3000, 0)
 	f := &fakeForge{
 		issues: []forge.Issue{labelled(1, prdMax, prdLabel)},
 		// Every row here is discarded by the PRD filter, so the FILTERED max is zero
 		// while the raw one is not.
-		openIssues: []forge.Issue{labelled(1, time.Unix(3000, 0), prdLabel)},
+		openIssues: []forge.Issue{labelled(1, openMax, prdLabel)},
 	}
 
-	want := time.Unix(3000, 0)
-	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, time.Unix(1, 0))
+	// The caller's Open mark differs from openMax, so "advanced to 3000" and "left
+	// alone" are distinguishable outcomes.
+	start := Marks{PRD: time.Unix(1, 0), Open: time.Unix(2, 0)}
+	got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, start)
 	if err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}
-	if !got.Equal(want) {
-		t.Fatalf("hwm = %v, want %v — the discarded row is still evidence of when the open fetch ran", got, want)
+	if !got.Open.Equal(openMax) {
+		t.Fatalf("Open mark = %v, want %v — the discarded row is still evidence of when the open fetch ran; a post-withoutLabel max gives zero and never advances", got.Open, openMax)
+	}
+	if !got.PRD.Equal(prdMax) {
+		t.Fatalf("PRD mark = %v, want %v — its own fetch is untouched by what the open one discarded", got.PRD, prdMax)
 	}
 }
 
-// TestAdvanceHWMZeroCases pins the asymmetry the fetch ORDER creates, which is the
-// part of advanceHWM a reader is most likely to "simplify" into a symmetric min.
-func TestAdvanceHWMZeroCases(t *testing.T) {
-	early := time.Unix(1000, 0)
-	late := time.Unix(5000, 0)
+// TestPerPathMarksZeroCases pins what an EMPTY fetch means, at the Sync level where
+// the semantics now live — its predecessor unit-tested the shared-mark combine
+// helper, which this change deletes outright. An empty result is not evidence: it
+// moves its own mark not at all, and constrains the other mark not at all.
+//
+// The first row IS issue #177. Against the old shared mark the whole pair stays at
+// 500, because the combine returned prdMax whenever either input was zero — so a
+// repo with open issues and no PRD-labelled ones re-read its entire open set every
+// single poll, forever.
+func TestPerPathMarksZeroCases(t *testing.T) {
 	cases := []struct {
-		name                  string
-		prdMax, openMax, want time.Time
+		name        string
+		prd, open   []forge.Issue
+		start, want Marks
 	}{
-		{"both empty: no advance", time.Time{}, time.Time{}, time.Time{}},
-		{"open fetch empty constrains nothing", early, time.Time{}, early},
-		{"PRD fetch empty means no advance at all", time.Time{}, late, time.Time{}},
-		{"both present: the smaller wins", late, early, early},
-		{"both present, PRD smaller", early, late, early},
-		{"equal", early, early, early},
+		{
+			// Equal caller marks are deliberate HERE and nowhere else in this table:
+			// they make "PRD did not move, Open did" readable as a single pair. A
+			// field swap still fails, since the wanted fields differ.
+			name:  "#177: an empty PRD fetch must not stall the open mark",
+			prd:   nil,
+			open:  []forge.Issue{labelled(2, time.Unix(5000, 0), "bug")},
+			start: Marks{PRD: time.Unix(500, 0), Open: time.Unix(500, 0)},
+			want:  Marks{PRD: time.Unix(500, 0), Open: time.Unix(5000, 0)},
+		},
+		{
+			name:  "both fetches empty: neither mark moves",
+			prd:   nil,
+			open:  nil,
+			start: Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)},
+			want:  Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)},
+		},
+		{
+			name:  "an empty open fetch must not stall the PRD mark",
+			prd:   []forge.Issue{labelled(1, time.Unix(1000, 0), prdLabel)},
+			open:  nil,
+			start: Marks{PRD: time.Unix(500, 0), Open: time.Unix(900, 0)},
+			want:  Marks{PRD: time.Unix(1000, 0), Open: time.Unix(900, 0)},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := advanceHWM(tc.prdMax, tc.openMax); !got.Equal(tc.want) {
-				t.Fatalf("advanceHWM(%v, %v) = %v, want %v", tc.prdMax, tc.openMax, got, tc.want)
+			st := &fakeStore{}
+			svc := newTestService(st)
+			f := &fakeForge{issues: tc.prd, openIssues: tc.open}
+
+			got, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, tc.start)
+			if err != nil {
+				t.Fatalf("IncrementalSync: %v", err)
+			}
+			if !got.PRD.Equal(tc.want.PRD) {
+				t.Errorf("PRD mark = %v, want %v", got.PRD, tc.want.PRD)
+			}
+			if !got.Open.Equal(tc.want.Open) {
+				t.Errorf("Open mark = %v, want %v", got.Open, tc.want.Open)
 			}
 		})
 	}
