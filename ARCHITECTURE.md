@@ -479,8 +479,13 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
 
 `running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
 planning turn with a question instead of a plan, and again **mid-run**, at any
-point in the implement ⇄ review loop after approval — both return to `running`
-on answer, so the single edge above stands in for either occurrence.
+point in the implement ⇄ review loop after approval — and the two resolve
+differently, so the single edge above is a simplification. **Mid-run**
+explicitly re-reports `running` (the next implement/review iteration does
+so) before continuing the loop it paused. **Pre-run** does not: nothing is
+reported between the answer and the planning turn's next move, and if that
+move is a plan, the run goes straight to `awaiting_approval` — the literal
+chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
@@ -578,8 +583,12 @@ on answer, so the single edge above stands in for either occurrence.
   (`QUESTION_MAX`, default 5), both enforced worker-side and both
   **worker-in-memory** — a requeue resets both counters, so the honest
   worst case over a run's life is each value **× (RUN_MAX_REQUEUES + 1)**,
-  not the configured value flat. Either overrun **fails the run closed**
+  not the configured value flat. **Only the deadline fails the run closed**
   ("clarification timed out"); there is no configurable default action.
+  Exhausting the question cap does **not** fail the run — it emits a feed
+  notice and the lead proceeds on its own best judgment instead. (The one
+  cap-adjacent failure, a distinct message, is pre-run-only: looping on
+  questions without ever reaching a plan.)
   **Autopilot never parks**: the same `claim.auto_approve` that
   short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
   frozen `"no human available — proceed on your best judgment, and note the
@@ -590,7 +599,7 @@ on answer, so the single edge above stands in for either occurrence.
   user might be watching — the run view (an "Answer required" composer), the
   owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
   and all three derive the open question from the run feed rather than a
-  dedicated field, so none of them can show something the others don't. See
+  dedicated field, so no surface invents a question the others don't have. See
   the PRD's Decision Log for the full mechanism (including the accepted
   mixed-fleet-rollout residual: a run resumed onto a pre-#88 worker degrades
   to guessing rather than asking, mid-run, and a pending answer in transit is

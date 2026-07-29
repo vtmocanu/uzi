@@ -14,7 +14,7 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   question lands in the run feed with any suggested options, and you answer
   from the run view's composer, a reply in the run's Slack thread, or `uzi
   run answer <id>` — all three read the same open question off the feed, so
-  none can show something the others don't. Left unanswered, the run fails
+  no surface invents a question the others don't have. Left unanswered, the run fails
   closed ("clarification timed out") rather than hanging forever; both the
   answer deadline and the per-run question cap are held in worker memory and
   reset on a worker-death requeue, so the honest worst case over a run's

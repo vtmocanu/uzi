@@ -108,14 +108,23 @@ A few worth knowing:
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open
-  question from the run's own feed rather than a dedicated field, the same
-  way the web UI and Slack do, so `run get` first to see what's actually
-  being asked. Pass `-m`/`--message` once per question when the agent asked
-  several (matched in order), or pipe a single answer on stdin. The answer
-  names the question it answers, so one written against a question the
-  agent has already moved past is rejected rather than applied to the
-  current one, and calling it against a run that isn't currently parked
-  fails outright instead of queuing.
+  question from the run's own feed rather than a dedicated field (no DTO
+  field exists), so `run get` first to see what's actually being asked. Pass
+  `-m`/`--message` once per question when the agent asked several (matched
+  in order), or pipe a single answer on stdin. The answer names the question
+  it answers, so one written against a question the agent has already moved
+  past is rejected rather than applied to the current one, and calling it
+  against a run that isn't currently parked fails outright instead of
+  queuing.
+  **The CLI's derivation is narrower than the web's**: it always answers the
+  *newest* question message in the feed, where the web additionally checks
+  whether a newer `answer` has already closed it. That gap is real for one
+  short window — between you answering (on any surface) and the run
+  reporting its next state — where the web has already hidden its composer
+  but a `run answer` invoked in that window still finds a question to
+  target, submits, and gets back a 409: the question it read was already
+  answered. Re-run `run get` if that happens; it isn't a sign anything went
+  wrong with your first answer.
 - **`review show <id>`** (formerly `run review <id>`, still around as a
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see

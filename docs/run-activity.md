@@ -56,8 +56,8 @@ gate offers.
 a reply in the run's Slack thread if you've linked your account (see
 [Slack notifications](./slack.md#using-it)), or `uzi run answer <id>` from
 the terminal (see [the CLI docs](./cli.md#commands)) — all three read the
-same open question off the run's feed, so none of them can show something
-the others don't.
+same open question off the run's feed, so no surface invents a question the
+others don't have.
 
 A few things worth knowing:
 
