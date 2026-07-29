@@ -252,10 +252,19 @@ func TestCreateRunReviseInputIfUnderCapAtomicLiveDB(t *testing.T) {
 // equal is a contract rather than an accident. One case per way they can drift apart.
 //
 // The load-bearing case is the REFUSED insert. Writing the cap predicate on the INSERT
-// instead of the UPDATE is the single most likely miswrite of this query, it passes every
-// other test in this file, and it leaks budget SILENTLY: the counter runs away while the
-// rows sit at cap, so each rejected attempt quietly shrinks the run's remaining budget.
-// Nothing else in the suite would see it.
+// instead of the UPDATE is the single most likely miswrite of this query, and it leaks
+// budget SILENTLY: the counter runs away while the rows sit at cap, so each rejected
+// attempt quietly shrinks the run's remaining budget.
+//
+// It is caught HERE first and most legibly — this test names the divergence
+// ("revise_count = 4, revise_plan rows = 3") where the others report a symptom.
+// TestCreateRunReviseInputIfUnderCapAtomicLiveDB also reddens under that miswrite, and
+// deterministically: its concurrent fan-out produces at least one refusal, each of which
+// bumps the counter under that fold, so its runs.revise_count assertion fires. An earlier
+// version of this paragraph said nothing else in the suite would see it, which understated
+// the coverage — corrected after both were measured. The forced-interleave test and the
+// sequential control DO stay green under it, so the miswrite is genuinely invisible to the
+// concurrency gates.
 //
 // Every case asserts that the fixture actually REACHED the state it names — the refusal
 // really returned pgx.ErrNoRows, the consume really stamped rows, the interleave really

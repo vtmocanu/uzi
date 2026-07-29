@@ -33,12 +33,17 @@ package store_test
 //
 // # WHAT A RED HERE MEANS NOW
 //
-// The cap predicate has been moved back off the `runs` row, or a second writer of
-// revise_plan rows has been added that does not go through
-// CreateRunReviseInputIfUnderCap. Read the query's comment in queries/runtime.sql before
-// touching anything here: the rule it states — the cap predicate must reference only
-// columns of the `runs` row itself, and any subquery in that WHERE reintroduces the bug —
-// is what this test measures.
+// The cap predicate has been moved back off the `runs` row. That is the ONE thing a red
+// here means. Read the query's comment in queries/runtime.sql before touching anything:
+// the rule it states — the cap predicate must reference only columns of the `runs` row
+// itself, and any subquery in that WHERE reintroduces the bug — is what this test
+// measures, and it is all it measures.
+//
+// It does NOT detect a second writer of revise_plan rows. An earlier version of this
+// paragraph said it did, which was wrong in the direction that matters: this test seeds
+// its own run and writes only through CreateRunReviseInputIfUnderCap, so a writer added
+// anywhere else is invisible to it and it would stay green. The layers that do cover
+// parts of that are named in workersvc/service.go's revise_plan branch.
 //
 // # WHAT MAKES THIS A PROOF RATHER THAN A REPRODUCTION
 //

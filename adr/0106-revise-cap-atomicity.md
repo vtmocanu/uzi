@@ -120,9 +120,15 @@ They cannot diverge, structurally:
 - `run_user_inputs` has **exactly one** foreign key — `run_id → runs ON DELETE CASCADE`
   (`00020_workers_runs.sql`), never altered since (the two later migrations touching the
   table widen the `kind` CHECK).
-- There is **no `DELETE FROM run_user_inputs` anywhere in the repo**, and **no
-  `DELETE FROM runs`** either, in sqlc queries or in raw Go SQL. `runs` rows die only by
-  cascade from `users`, `repos`, or self-referentially from `runs.target_run_id`.
+- There is **no `DELETE FROM run_user_inputs` anywhere in the repo**, in sqlc queries or
+  in raw Go SQL.
+- Deletes of whole `runs` rows **do** exist, and they are the safe case: no sqlc query has
+  one, but `e2e/run-e2e.sh:4053` deletes runs directly as a PRD #98 fixture teardown, and
+  `runs` rows also die by cascade from `users`, `repos`, or self-referentially from
+  `runs.target_run_id`. *(Corrected 2026-07-29: this bullet read "and **no `DELETE FROM
+  runs`** either", which is false. The invariant is unaffected — deleting a whole row
+  deletes the counter with it — but the paragraph's value is that a reader can re-derive
+  it, and a false line in an enumeration discredits the lines beside it.)*
 
 So the only path that deletes a counted row is the cascade fired by deleting its `runs`
 row — which deletes the counter in the same statement, because the counter is a column of
@@ -293,9 +299,22 @@ inherited as a measurement.
   change, *any* writer of a `revise_plan` row was counted by construction. Now only writers
   that go through `CreateRunReviseInputIfUnderCap` are. A second writer added later would
   defeat the cap **silently**, and no type checks it. Today there is exactly one writer
-  (measured), the two entry points both funnel through `SubmitInput`'s dedicated branch,
-  and `TestReviseCountMatchesRowCountLiveDB` pins counter against `count(*)`. That test is
-  the guard, and D2 records the measurement showing it is the *only* guard. This is a real
+  (measured) and the two entry points both funnel through `SubmitInput`'s dedicated branch.
+  **What guards that is partial, and the parts were measured 2026-07-29 rather than
+  reasoned about** — an earlier version of this bullet named
+  `TestReviseCountMatchesRowCountLiveDB` as "the guard", which it cannot be: it lives in
+  `store_test`, never imports `workersvc`, and writes only through the capped query, so a
+  writer added in `workersvc` or `handler` is structurally invisible to it.
+
+  | second-writer shape | caught by |
+  |---|---|
+  | added inside `SubmitInput`'s `revise_plan` branch, or replacing the capped call | `workersvc.TestSubmitInputRevisePlanEnqueuesPlain` (pre-existing; measured catching it) |
+  | a new SQL query inserting a `'revise_plan'` literal | `store.TestOnlyOneQueryInsertsRevisePlanRows` (added with this fix; positive control measured) |
+  | added elsewhere in Go, reusing the generic `CreateRunInput` query | **nothing** — measured leaving `go test -count=1 ./...` fully green (43 packages ok, 0 FAIL) |
+
+  The third row is a genuine hole, recorded rather than papered over: `00074`'s CHECK
+  permits `'revise_plan'` through `CreateRunInput`, whose `kind` is a bare parameter, so
+  the only thing between the two writers is a Go `if` with an early return. This is a real
   cost of this option and it is the price of not needing a transaction seam.
 - **`store.Run` grows a field; no REST contract changes** — every runs DTO is hand-built.
 - **`approval_idle` behaviour is unchanged**, deliberately (D4). A run whose gate has been

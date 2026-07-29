@@ -729,11 +729,26 @@ type CreateRunReviseInputIfUnderCapParams struct {
 // while the rows sit at cap, silently shrinking the run's remaining budget on every
 // rejected attempt.
 //
-// Every column reference in the UPDATE is qualified with `runs.`, which the plain
-// shape does not require of Postgres but sqlc does: unqualified, its resolver sees
-// `id` in scope from both `runs` and the INSERT's target `run_user_inputs` and fails
-// the whole file with "column reference \"id\" is ambiguous" — attributed, confusingly,
-// to the NEXT query in the file rather than to this one.
+// OWNERSHIP IS ENFORCED ONE CALL UPSTREAM, NOT HERE. The qual is `runs.id = @run_id`
+// with no user_id, so this statement will bump any run's counter it is handed. The
+// tenant check is workersvc.SubmitInput's `GetRun(ctx, userID, runID)`, which resolves
+// the run owner-scoped before reaching this branch — the house pattern, and identical
+// before the #106 fix. Stated so that dropping that GetRun is visibly load-bearing
+// rather than a tidy-up. Safe today additionally because runs.user_id is never updated
+// anywhere, so a resolved run cannot change owner underneath the write.
+//
+// @max_revisions crosses from Go as int32 and PLAN_MAX_REVISIONS is unvalidated at the
+// top end; a configured value at or above 2^31 wraps negative and refuses every revise.
+// Fail-closed, and unchanged by the #106 fix — recorded, not guarded.
+//
+// Every column reference in the WHERE and RETURNING is qualified with `runs.`, which
+// the plain shape does not require of Postgres but sqlc does: unqualified, its resolver
+// sees `id` in scope from both `runs` and the INSERT's target `run_user_inputs` and
+// fails the whole file with "column reference \"id\" is ambiguous" — attributed,
+// confusingly, to the NEXT query in the file rather than to this one. The SET target is
+// necessarily bare: Postgres rejects a qualified one outright (`UPDATE t SET t.n = ...`
+// gives `column "t" of relation "t" does not exist`), so "every reference in the UPDATE"
+// is not a rule anyone could follow — it was the wording here until it was measured.
 func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg CreateRunReviseInputIfUnderCapParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap, arg.Body, arg.RunID, arg.MaxRevisions)
 	var i RunUserInput

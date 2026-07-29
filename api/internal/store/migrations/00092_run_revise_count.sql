@@ -63,10 +63,17 @@ WHERE r.id = c.run_id;
 --
 -- run_user_inputs has exactly ONE foreign key: run_id REFERENCES runs ON DELETE
 -- CASCADE (00020_workers_runs.sql). There is no DELETE FROM run_user_inputs anywhere
--- in the repo and no DELETE FROM runs either — runs rows go only by cascade from
--- users, repos, or runs.target_run_id. So the only way a revise_plan row dies is the
--- cascade from deleting its runs row, which takes this column with it in the same
--- statement, because the counter IS a column of that row.
+-- in the repo, so the only way a revise_plan row dies is the cascade from deleting its
+-- runs row, which takes this column with it in the same statement, because the counter
+-- IS a column of that row.
+--
+-- Deletes of whole `runs` rows DO exist and are precisely the safe case: no sqlc query
+-- has one, but e2e/run-e2e.sh:4053 deletes runs directly as a PRD #98 fixture teardown,
+-- and runs rows also go by cascade from users, repos, or runs.target_run_id. Every one
+-- of those removes the counter along with the rows it counts. (An earlier version of
+-- this paragraph claimed there was "no DELETE FROM runs either", which is false — and
+-- since this paragraph's whole value is being an enumeration someone can re-derive, a
+-- false line in it discredits the rest.)
 --
 -- If a retention/pruning DELETE FROM run_user_inputs is added later it would
 -- decrement count(*) and not this counter, and THAT DIVERGENCE WOULD BE CORRECT: a

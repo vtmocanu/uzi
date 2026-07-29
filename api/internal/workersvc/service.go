@@ -3087,9 +3087,27 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// interleave forced. They now cannot. No row = the cap is already reached. The
 	// terminal-run guard above already blocks a revise on a finished run.
 	//
-	// This function is the SOLE writer of revise_plan rows, which is what keeps the
-	// counter and the rows in step; a second writer added later would defeat the cap
-	// silently. TestReviseCountMatchesRowCountLiveDB is the guard against that.
+	// This branch is the SOLE writer of revise_plan rows, which is what keeps the counter
+	// and the rows in step; a second writer added later would defeat the cap silently —
+	// rows the counter never sees, with nothing going red.
+	//
+	// 🔴 THAT INVARIANT IS ONLY PARTLY GUARDED, and the parts are worth naming exactly,
+	// because an earlier version of this comment credited a test that cannot see it at
+	// all. Measured 2026-07-29:
+	//
+	//   - a second writer added INSIDE this branch, or replacing the capped call, is
+	//     caught by TestSubmitInputRevisePlanEnqueuesPlain (service_test.go) — it asserts
+	//     CreateRunInput was not called for a revise_plan;
+	//   - a NEW SQL query that inserts a 'revise_plan' literal is caught by
+	//     store.TestOnlyOneQueryInsertsRevisePlanRows;
+	//   - a writer added ELSEWHERE IN GO, reusing the generic CreateRunInput query, is
+	//     caught by NOTHING. Adding one left the whole `go test -count=1 ./...` gate green
+	//     (43 packages ok, 0 FAIL). Note 00074's CHECK permits 'revise_plan' through
+	//     CreateRunInput, whose kind is a bare parameter, so the only thing between the
+	//     two writers is the early return below.
+	//
+	// If you are adding a revise_plan write anywhere else: bump runs.revise_count in the
+	// same statement, or the cap stops meaning anything.
 	if kind == "revise_plan" {
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
 			RunID: runID, Body: pgText(body), MaxRevisions: int32(s.p.PlanMaxRevisions),
