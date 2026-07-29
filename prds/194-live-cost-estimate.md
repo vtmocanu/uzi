@@ -1,12 +1,16 @@
 # PRD #194 — Live cost estimate on the run page (cost is frozen between SDK phases)
 
 **Issue**: [#194](https://gitlab.example.com/vtmocanu/uzi/-/issues/194) · **Label**: PRD · **Priority**: Medium
-**Area**: `web/src/lib/runUsage.ts` + `web/src/components/RunUsage.tsx` + `web/src/pages/RunView.tsx` (client-derived, PRD #40 lineage) + a new price table module. No API change, no migration.
+**Area**: `web/src/lib/runUsage.ts` + `web/src/components/RunUsage.tsx` + `web/src/pages/RunView.tsx` (client-derived, PRD #40 lineage) + a new price table module + one nullable `bills_usage` column on the Anthropic token row (M2, open question 1).
 **Line references** are against `28d7238e`.
-**Status**: **Not settled. M0 is a go/no-go gate**, and it reduces to one
-question: can per-call `output_tokens` be made whole? With them the estimate
-lands within 3.9% of billed; without them the honest ceiling is −33%. Two
-[open questions](#open-questions) additionally need a product answer before M2.
+**Status**: **M0 is a go/no-go gate**, and it reduces to one question: can
+per-call `output_tokens` be made whole? With them the estimate lands within 3.9%
+of billed; without them the cost is −33% low *and* the panel contradicts itself
+in public (estimated tokens-out for the whole run reads lower than confirmed
+tokens-out for one phase). Both [open questions](#open-questions) are now
+answered: the headline estimate is approved, and uzi cannot distinguish a
+subscription token today, so M2 gains one storage change to remember it.
+**M3 is blocked on [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**
 
 ## Problem
 
@@ -213,6 +217,38 @@ a load-bearing contract. Plus a second price table in Go, plus immutability.
 history per request. Named only to be dismissed; the ingest-time fold above is
 the version worth arguing with.
 
+### The panel already shows three populations, and that shapes the design
+
+Captured from the live run page at 10:57Z on run `84b6a933`, all three visible in
+one screen at one moment:
+
+| Surface in the panel | Tokens in | Reads |
+|---|---|---|
+| Stat strip + per-phase table | **725.2k** | result frame's top-level `usage` |
+| Board / `uzi run list` / admin (not in the panel) | **2.32M** | `modelUsage` |
+| Per-agent breakdown | **78.15M** | raw assistant frames, whole run |
+
+108x between smallest and largest. The strip-vs-board gap is
+[#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195); the per-agent
+inflation is the frame-vs-call duplication M0 identified. The existing footnote
+("may not sum to the run total") attributes all of it to attribution, which is
+only partly true.
+
+**The design consequence: each dollar figure owns a table.** Rather than one
+blended total, the panel pairs each figure with the breakdown that derives it —
+**Confirmed** with the per-phase table (result frames), **Estimate** with the
+per-agent table (assistant frames). The gap between them is then legible as work
+in flight since the last phase boundary, rather than as an unexplained
+discrepancy. Priced against live data that is $3.53 confirmed beside $45.11
+estimated, which is coherent when labelled and absurd when not.
+
+**Sequencing follows from this**, and it is why M3 is blocked: land #195 so the
+top of the panel stops disagreeing with the board, then dedupe so the per-agent
+rows count calls rather than frames, then add the cost column. Adding money
+first would ship a $45 next to a $3.53 with a footnote between them. A token
+discrepancy reads as attribution noise, which is how that footnote survived; a
+dollar discrepancy reads as a billing error, and no footnote absorbs one.
+
 ## User journey
 
 Today, on a run past its first phase: the user sees one dollar figure with no
@@ -237,7 +273,53 @@ the confirmed one says so, and the estimate carries a tilde and a band.
 
 ## Open questions
 
-Both must be answered before M2. Either can change the design.
+Both answered 2026-07-29. Recorded with their resolutions rather than deleted,
+because the reasoning constrains M2 and M3.
+
+### 1. Can uzi distinguish a billed token from a subscription one? **No, by design.**
+
+Investigated 2026-07-29. Three independent confirmations that uzi does not, and
+deliberately does not:
+
+- `api/internal/handler/secrets.go:766` — `validateAnthropicToken`'s own comment:
+  it "makes no assumption about the token's prefix or format (**Anthropic
+  prefixes are not a documented contract**)". It checks non-empty, length bound,
+  no whitespace or control characters. Nothing else.
+- `docs/anthropic-token.md:27` says it to users: *"Both paste into the same
+  field; uzi doesn't check for a particular prefix, so either kind is accepted."*
+- `user_secrets.kind` is `CHECK (kind IN ('anthropic_token'))` (migration
+  `00010`) — one kind. The label (`subscription`, `console-key`) is user-chosen
+  free text, suggested in the docs, never read by uzi.
+
+And this is not an edge case: `docs/anthropic-token.md:23` calls the
+subscription OAuth token the **recommended** option, and both `docs/judge.md:30`
+and `web/src/pages/Settings.tsx:375` actively encourage holding one of each
+(subscription for runs, console key for retrospectives).
+
+**Resolution — remember it per token, do not inspect it.** Three options were
+weighed:
+
+| | Approach | Verdict |
+|---|---|---|
+| a | Prefix inspection (`sk-ant-api03-` vs `sk-ant-oat01-`) | **Rejected.** Contradicts a documented decision, and the validator's comment gives the reason: prefixes are not a contract, so a format change silently misclassifies. Misclassifying puts a dollar figure on a free run. |
+| b | `total_cost_usd > 0` on the first result frame | **Correct but too late.** Already what #40 Decision 8 and `RunUsage.tsx:142` use. Only available after the first phase — the window this PRD exists to fill. |
+| c | **Persist the outcome of (b) on the token row** | **Chosen.** |
+
+(c): the first time a run on token X reports a nonzero `total_cost_usd`, record
+`bills_usage` on that token. Every later run on X headlines an estimate from the
+first model call; the first run on a new token shows tokens only and degrades to
+(b). No format assumptions, self-correcting, one nullable boolean written from
+the fold that already parses `total_cost_usd`. **This is the one storage change
+in the PRD** and it lands in M2.
+
+### 2. Is a headline dollar estimate acceptable? **Yes — approved 2026-07-29.**
+
+Confirmed by the user. #40 Decision 8's tokens-lead principle is superseded for
+the run page, conditional on (1)'s resolution being implemented so a subscription
+run never headlines a price. The `hasEstimate` gate is therefore
+`hasEstimate && token.bills_usage`.
+
+### Superseded framing, kept for the record
 
 1. **Can uzi distinguish a billed token from a subscription one, at claim time?**
    `SdkEnv` (`agent/src/sdk-env.ts`) hands the SDK `CLAUDE_CODE_OAUTH_TOKEN` and
@@ -380,6 +462,18 @@ above).
   target accuracy is single-digit. If no, the honest ceiling is either +17% by
   luck or −33% by construction, and the PRD should be closed.
 
+  **It is a coherence gate, not just an accuracy one — and that is the finding
+  that raises its priority.** Rendering the proposal against live data at 10:57Z
+  exposed something the percentages hide: the strip's estimated **Tokens out**
+  reads **~18.1k for the whole run** while the confirmed figure for the **Plan
+  phase alone** reads **41.8k**. A live number covering strictly more work cannot
+  legitimately be smaller than a settled number covering less. So an unresolved
+  output count does not merely make the cost wrong by a third — it makes the
+  panel **visibly self-contradictory to a user who knows nothing about our data
+  paths**. The first question would not be "is this estimate accurate", it would
+  be "why does your own panel disagree with itself". That is unshippable in a way
+  a −33% cost error is not.
+
   Secondary, only if output is solvable: bound the residual across at least three
   completed runs of different shapes, using PRD #40 Decision 11 caveat (a)'s four
   named mechanisms (signal-only frames, unmapped-block frames,
@@ -402,7 +496,13 @@ above).
   across models; (b) an unknown model returns `null`, not zero; (c) a date before
   and after 2026-09-01 returns different Sonnet 5 rates; (d) a dated model id
   (`claude-haiku-4-5-20251001`) resolves. `npm test` + `npm run typecheck` green.
-- [ ] **M2 — Cost in the usage reduction.** Five-bucket-plus-residual reader;
+- [ ] **M2 — Cost in the usage reduction, plus the `bills_usage` flag.** The one
+  storage change in this PRD: a nullable `bills_usage boolean` on the Anthropic
+  token row, set the first time a run on that token reports a nonzero
+  `total_cost_usd`, written from the existing `foldRunUsage` path. The headline
+  estimate gates on `hasEstimate && token.bills_usage`, so a subscription run
+  never headlines a price and a new token shows tokens only until its first
+  phase reports (open question 1). Then: five-bucket-plus-residual reader;
   **dedupe by `(agent_instance, usage)` per M0**; non-standard-rate guard;
   per-model and per-agent `estCostUsd`; `unpricedModels`; `hasUsage` split. Pure
   reduction, no accumulator, per PRD #40 Decision 11 — and note the dedupe is
@@ -535,6 +635,19 @@ phases.
 - **2026-07-29 — M0 is allowed to kill the PRD**, and nothing runs beside it.
 - **2026-07-29 — Supersedes #40 Decision 8 (conditionally) and Decision 11
   caveat (b).** Named above rather than left implicit.
+- **2026-07-29 — Headline estimate approved** by the user, conditional on the
+  `bills_usage` gate so a subscription run never headlines a price.
+- **2026-07-29 — Do not inspect token format; remember the outcome instead.**
+  uzi's non-inspection is deliberate and documented in two places; a prefix check
+  would trade a documented contract for an undocumented one, and misclassifying
+  puts a price on a free run.
+- **2026-07-29 — Each dollar figure owns a table.** Confirmed pairs with the
+  per-phase breakdown, estimate with the per-agent one. The gap between them is
+  then legible as work in flight rather than as a discrepancy, which is what lets
+  $3.53 and $45.11 coexist in one panel.
+- **2026-07-29 — M0 is a coherence gate, not only an accuracy gate.** Estimated
+  tokens-out for the whole run currently reads lower than confirmed tokens-out
+  for one phase. That is visible without any knowledge of our data paths.
 
 ## Review
 
