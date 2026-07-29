@@ -291,7 +291,10 @@ func TestRunReviewPendingJudgePhrases(t *testing.T) {
 func TestRunReviewPendingJudgeOverExistingReview(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		Reviews: map[string]*apitypes.ReviewDTO{
-			"r1": {Verdict: "needs_work", Status: "failed", SummaryMd: "partial"},
+			// "issues" is a real workersvc.ReviewVerdicts value (ideal/ok/issues) — the
+			// fake would accept anything, but a fixture staging a verdict the server
+			// cannot send teaches the next reader the wrong enum.
+			"r1": {Verdict: "issues", Status: "failed", SummaryMd: "partial"},
 		},
 		PendingJudges: map[string]*apitypes.PendingJudgeDTO{"r1": {State: "running"}},
 	}
@@ -299,7 +302,7 @@ func TestRunReviewPendingJudgeOverExistingReview(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "needs_work") {
+	if !strings.Contains(out, "verdict: issues") {
 		t.Errorf("the existing verdict disappeared behind the pending judge:\n%s", out)
 	}
 	if !strings.Contains(out, "note: judge in progress") {

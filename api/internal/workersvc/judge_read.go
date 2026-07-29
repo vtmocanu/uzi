@@ -63,7 +63,7 @@ type PendingJudge struct {
 	EnqueuedAt time.Time
 }
 
-// GetReviewForTarget returns the judge's review of a run for the run-page panel
+// GetReviewForTarget returns the judge's review of a run
 // (PRD #46 M4, Decision 5/6). Visibility reuses the owner-or-admin GetRunForViewer
 // rule (audit M2 / M3 carry-forward): a run the viewer can't see is ErrRunNotFound,
 // exactly as an unknown id. A visible run that has NOT been judged yet returns

@@ -870,6 +870,143 @@ describe("JudgePanel (PRD #46 M4)", () => {
     }
   });
 
+  // ── The 150-try cap (#119) ────────────────────────────────────────────────────────────
+  // The cap is the LAST stop condition: a judge that neither produces a verdict nor leaves
+  // the active set would otherwise be polled every 4s for the life of the tab. 150 × 4s ≈
+  // 10 minutes, chosen because the old 15-try (~1 min) cap gave up on judges that were
+  // still running. Both tests below assert the exact bound — 1 mount fetch + 150 ticks =
+  // 151 — rather than "eventually stops", because an off-by-a-lot cap still "stops".
+  it("stops after the 150-try cap when a pending judge never clears (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // ONE object, reused for every response: setPendingJudge with an identical reference
+      // lets React bail out of the re-render, so this is 150 ticks of poll, not 150 renders.
+      const stuck = { review: null, pending_judge: pending("running") };
+      mockApi.getRunReview.mockResolvedValue(stuck);
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The mount fetch, and nothing else yet.
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+
+      // One tick short of the cap: still polling.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(149 * 4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+
+      // The 150th tick trips the cap.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+
+      // And it is really over — half an hour of ticks adds nothing. Without the cap the
+      // interval would keep firing, because `polling` stays true while pendingJudge holds
+      // its last non-null value: the effect never re-runs, so its cleanup never runs.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The same bound on the FETCH-FAILURE path, which is a separate `clearInterval` in the
+  // `!next` branch — and one that could not have existed before #119. The effect used to
+  // key on `queued` alone, so `setQueued(false)` re-ran the effect and the cleanup stopped
+  // the timer. Now it keys on `polling = queued || pendingJudge !== null`, which stays TRUE
+  // over a permanently-failing endpoint (pendingJudge keeps its last non-null value and no
+  // response ever arrives to change it). The explicit clearInterval there is the ONLY thing
+  // that ever stops a /review that fails forever.
+  it("stops after the same 150-try cap when every poll tick FAILS (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // The mount fetch must SUCCEED and report a pending judge, or the poll never arms.
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        .mockRejectedValue(new Error("network down"));
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(1);
+      // The in-flight state the panel is showing while the endpoint is dead — the reason
+      // the failure is swallowed rather than banner-ed.
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(149 * 4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(150);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+
+      // 🔴 This is the assertion that reddens if the `clearInterval` in the `!next` branch
+      // is dropped: setQueued(false) alone does not stop this timer.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(151);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The rollout-skew normalization has TWO sites, and this is the POLL one. The mount-fetch
+  // site is covered by "treats an absent pending_judge…" below; this covers the case where
+  // the panel mounts against an api that HAS the key (so the poll arms) and a later tick is
+  // served by a pod that does NOT — exactly what a rolling api deploy produces mid-poll.
+  // Without `next.pending_judge ?? null` the poll writes `undefined` into state, and
+  // `pendingJudge !== null` is true for undefined, so the button label walks into
+  // `pendingJudge.state` and throws during render — AND the poll never stops, because
+  // `nextPending === null` is false too.
+  it("normalizes an absent pending_judge on a POLL tick, not just on the mount fetch (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.getRunReview.mockResolvedValueOnce({
+        review: review({ updated_at: "2026-03-01T00:00:00Z", summary_md: "The old verdict." }),
+        pending_judge: pending("running"),
+      });
+      render(<JudgePanel run={run({ status: "completed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // The mid-poll response from the OLDER api: the key is absent entirely.
+      mockApi.getRunReview.mockResolvedValue({
+        review: review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." }),
+      } as unknown as Awaited<ReturnType<typeof api.getRunReview>>);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+
+      // It converged instead of throwing: verdict swapped, pending treated as cleared.
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      expect(screen.queryByText("The old verdict.")).toBeNull();
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+
+      // …and an absent key is a CLEARED pending, so the poll stopped on it.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // Rollout skew: api and web are separate Deployments, so a web pod can talk to an api
   // that predates the pending_judge key. The key is then ABSENT, destructuring to
   // undefined — and `undefined !== null` is true, so every `pendingJudge !== null` guard

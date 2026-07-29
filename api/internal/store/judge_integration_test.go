@@ -187,8 +187,9 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	}
 
 	// ── the pending-judge signal (PRD #119 M1): GetActiveJudgeRunForTarget ──
-	// This subtest is the pin for the load-bearing invariant: the query's predicate is a
-	// verbatim copy of uq_runs_one_active_judge_per_target, so "the panel shows pending"
+	// This subtest is the pin for the load-bearing invariant: the query's predicate is
+	// uq_runs_one_active_judge_per_target's partial WHERE with the indexed column
+	// (target_run_id) spelled out as an equality, so "the panel shows pending"
 	// and "a manual re-judge click 23505s" must be the SAME set of states. It is asserted
 	// one status at a time rather than by inspection, because the two can only be proven
 	// equal by exercising the boundary: every terminal status individually absent, and a

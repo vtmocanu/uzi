@@ -205,7 +205,8 @@ type Store interface {
 	GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.RunReview, error)
 	// The ACTIVE judge run for a target (PRD #119 M1): the panel's pending-judge signal,
 	// on the same owner-or-admin gate as the review read. Its predicate is the
-	// one-active-judge-per-target index verbatim, so "pending" and "a click would 23505"
+	// one-active-judge-per-target index's partial WHERE with the indexed column
+	// (target_run_id) spelled out as an equality, so "pending" and "a click would 23505"
 	// are the same set of states.
 	GetActiveJudgeRunForTarget(ctx context.Context, targetRunID pgtype.UUID) (store.GetActiveJudgeRunForTargetRow, error)
 	ListRecommendationsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.ReviewRecommendation, error)

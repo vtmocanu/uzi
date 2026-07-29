@@ -55,31 +55,39 @@ func (j judgeSwitch) JudgeEnabled(context.Context) (bool, error) { return j.enab
 func (j judgeSwitch) JudgeModel(context.Context) (string, error) { return "", nil }
 func (j judgeSwitch) PRDLabel(context.Context) (string, error)   { return "", nil }
 
-// rerunReq builds POST /runs/{id}/judge authenticated as user.
+// rerunReq builds POST /api/runs/{id}/rejudge authenticated as user. The path is inert
+// (chi params are injected by hand below, and RerunJudge is called directly), but it is
+// the real route — see handler.go's /runs group — so nobody greps for one that never
+// existed.
 func rerunReq(user store.User, runID uuid.UUID) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/api/runs/x/judge", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runs/"+runID.String()+"/rejudge", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID.String())
 	return req.WithContext(context.WithValue(mw.ContextWithUser(req.Context(), user), chi.RouteCtxKey, rctx))
 }
 
 // clientConflictMatch is a Go transcription of the ONE regex the web client uses to tell
-// this route's two 409s apart: web/src/pages/RunView.tsx:1396,
+// this route's two 409s apart — the 409 branch of the `rerun` handler inside JudgePanel
+// (web/src/pages/RunView.tsx):
 //
 //	if (e instanceof ApiError && e.status === 409 && /already in progress/i.test(e.message))
+//
+// Cited by symbol and by the regex literal, never by line number: the line moves every
+// time a comment lands above it, and a stale citation sends the next reader to the wrong
+// place.
 //
 // It is duplicated here on purpose. The assertion below is not "the strings are these
 // strings" for its own sake — it is "the client's discriminator still sorts the two 409s
 // the way the client assumes", which is the property that breaks.
 var clientConflictMatch = regexp.MustCompile(`(?i)already in progress`)
 
-// TestRerunJudgeConflictMessages pins BOTH 409s POST /api/runs/{id}/judge can return —
+// TestRerunJudgeConflictMessages pins BOTH 409s POST /api/runs/{id}/rejudge can return —
 // status AND exact body — because the web client discriminates between them BY MESSAGE
 // TEXT and nothing else.
 //
 // 🔴 THE ALREADY-ACTIVE MESSAGE IS LOAD-BEARING WIRE CONTRACT, NOT PROSE. httpx.Error
 // emits {"error": "<message>"} with NO machine-readable code, so the two conflicts are
-// indistinguishable on the wire except by their text. web/src/pages/RunView.tsx:1396
+// indistinguishable on the wire except by their text. JudgePanel's `rerun` handler
 // matches /already in progress/i to decide whether to ABSORB the 409 (re-fetch, converge
 // on the pending-judge state, no banner — the TOCTOU race a judge enqueued between the
 // panel's fetch and the click) or to SHOW it (the kill-switch 409, which a user who
@@ -89,8 +97,8 @@ var clientConflictMatch = regexp.MustCompile(`(?i)already in progress`)
 // stayed green through the rewording and the only other copy of the string is
 // web/src/mocks/mockApi.ts:2500, maintained by whoever did the rewording.
 //
-// If a machine-readable error code ever lands on httpx.Error, change RunView.tsx to
-// discriminate on THAT first; this test is then free to relax.
+// If a machine-readable error code ever lands on httpx.Error, change JudgePanel's rerun
+// handler to discriminate on THAT first; this test is then free to relax.
 func TestRerunJudgeConflictMessages(t *testing.T) {
 	const (
 		disabledMsg = "run judging is disabled"
@@ -122,7 +130,8 @@ func TestRerunJudgeConflictMessages(t *testing.T) {
 		}
 		if clientConflictMatch.MatchString(errorMessage(t, rec)) {
 			t.Fatalf("the DISABLED message %q matches the client's /already in progress/i "+
-				"absorb-the-409 test (RunView.tsx:1396) — a user who turned judging off would "+
+				"absorb-the-409 test (the 409 branch of JudgePanel's `rerun` handler in "+
+				"web/src/pages/RunView.tsx) — a user who turned judging off would "+
 				"get silence instead of the reason", errorMessage(t, rec))
 		}
 		if st.created != 0 {
@@ -152,14 +161,16 @@ func TestRerunJudgeConflictMessages(t *testing.T) {
 		}
 		got := errorMessage(t, rec)
 		if got != activeMsg {
-			t.Fatalf("error = %q, want EXACTLY %q — web/src/pages/RunView.tsx:1396 matches this "+
-				"text to absorb the TOCTOU 409; reword it there first (and in "+
-				"web/src/mocks/mockApi.ts) or the click starts showing an error banner for a "+
-				"judge that is genuinely running", got, activeMsg)
+			t.Fatalf("error = %q, want EXACTLY %q — the 409 branch of JudgePanel's `rerun` "+
+				"handler (web/src/pages/RunView.tsx) matches this text with "+
+				"/already in progress/i to absorb the TOCTOU 409; reword it there first "+
+				"(and in web/src/mocks/mockApi.ts) or the click starts showing an error "+
+				"banner for a judge that is genuinely running", got, activeMsg)
 		}
 		if !clientConflictMatch.MatchString(got) {
 			t.Fatalf("%q does not match the client's /already in progress/i test "+
-				"(RunView.tsx:1396), so the re-fetch-and-converge path is unreachable", got)
+				"(the 409 branch of JudgePanel's `rerun` handler in web/src/pages/RunView.tsx), "+
+				"so the re-fetch-and-converge path is unreachable", got)
 		}
 	})
 }
