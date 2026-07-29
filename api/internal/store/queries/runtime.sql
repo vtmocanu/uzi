@@ -749,6 +749,19 @@ WHERE id = @id AND worker_id = @worker_id
   -- admits limit_wait, and a re-delivered gate report must not un-park a run. Kept
   -- even though the current worker cannot reach this ordering, because "the caller
   -- never does that today" is what SetRunRunning's own history disproves.
+  --
+  -- awaiting_input DELIBERATELY GETS NO SUCH GUARD, and this is the row most likely
+  -- to be re-litigated: the two parked statuses are protected by OPPOSITE mechanisms
+  -- at this one statement, so an audit for consistency reads the asymmetry as a gap.
+  -- It is not. limit_wait's only exit is a server-side promotion, so blocking the
+  -- transition is right for it. awaiting_input -> awaiting_approval IS the PRD #88 M4
+  -- pre-run path (park -> answer -> re-plan -> submit_plan -> gate) and is legitimate,
+  -- so we ALLOW the transition and clear the resolved id above instead.
+  --
+  -- Measured, not argued: adding `AND status <> 'awaiting_input'` here reddens
+  -- TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB, because the pre-run park can
+  -- then never reach the plan gate at all — it wedges every pre-run clarification
+  -- permanently. Do not add it.
   AND status <> 'limit_wait';
 
 -- name: SetRunLimitWait :execrows
