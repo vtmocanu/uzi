@@ -535,8 +535,10 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   loop is entirely worker-internal (`plan → gate → (revise → resume → new
   plan → re-gate)* → approve/reject/cancel`, fail-closed on any other exit).
   Rounds are bounded by `PLAN_MAX_REVISIONS` (default 3, enforced both
-  server- and worker-side), and the whole loop shares **one absolute
-  `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** computed at first gate entry, not
+  server- and worker-side; the server half is a counter on the run row, for
+  the concurrency reason in [ADR-106](adr/0106-revise-cap-atomicity.md)), and
+  the whole loop shares **one absolute `WORKER_PLAN_APPROVAL_TIMEOUT`
+  deadline** computed at first gate entry, not
   a fresh one per round. A monotonic **gate epoch**, bumped at each
   `awaiting_approval` re-report, ties every verdict to the plan version the
   user actually saw — an approve or reject arriving mid-revision is
