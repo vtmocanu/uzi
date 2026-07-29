@@ -1784,6 +1784,64 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    // run-unreadable-question is parked on a clarification question whose payload the
+    // UI CANNOT render (PRD #88): the `question` message carries no `question_id`.
+    //
+    // It exists because the empty state was inferred from code and could not be produced
+    // by the demo — which is the D-N complaint one surface over: a state nothing can
+    // reach is a state nobody has looked at, and it is the state a user meets when a
+    // worker is mid-rollout or a payload is truncated. The run cannot be answered (the
+    // api rejects an answer that names no question) so the panel must say so rather than
+    // rendering nothing until the 24h deadline fails the run.
+    id: "run-unreadable-question",
+    repo_id: "repo-uzi",
+    issue_iid: 33,
+    issue_title: "Cache the forge issue list between polls",
+    issue_description: "Reduce forge calls on the board poll. See prds/33-issue-cache.md.",
+    kind: "issue",
+    title: null,
+    resume_of_run_id: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
+    status: "awaiting_input",
+    requeue_count: 0,
+    iteration_count: 1,
+    auto_approve: false,
+    worker_id: "w-laptop",
+    branch: null,
+    forge_type: "gitlab",
+    mr_web_url: null,
+    mr_iid: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    // PRD #35: this run is parked on a QUESTION, not on a usage limit. The two parks
+    // are independent, so a clarification park carries no limit state at all.
+    wait_on_limit: false,
+    limit_resets_at: null,
+    retry_not_before: null,
+    limit_wait_count: 0,
+    rate_limit_type: null,
+    plan_md: null,
+    repo_agents: null,
+    agent_source: "own",
+    agent_exclusions: null,
+    own_agents: null,
+    anthropic_secret_id: "sec-default",
+    anthropic_secret_label: "default",
+    anthropic_select_reason: "default",
+    anthropic_headroom_pct: null,
+    claimed_at: minsAgo(20),
+    started_at: minsAgo(20),
+    finished_at: null,
+    created_at: minsAgo(21),
+    updated_at: minsAgo(14),
+  },
+  {
     id: "run-done",
     repo_id: "repo-uzi",
     issue_iid: 18,
@@ -2283,6 +2341,34 @@ export const mockAwaitingMessages: RunMessage[] = [
   am("tool_result", "lead", { tool_use_id: "aw-1", content: "# PRD 9 — Plan-approval notifications\n\nEmail the run owner when a plan parks…" }, 8),
   am("plan", "lead", { text: SAMPLE_PLAN() }, 6),
   am("status", null, { text: "plan submitted — awaiting approval" }, 6),
+];
+
+// ── Unreadable-question history (PRD #88) ────────────────────────────────────
+
+let unreadableSeq = 0;
+const um = (kind: string, agent: string | null, payload: unknown, minAgo: number): RunMessage => ({
+  seq: ++unreadableSeq,
+  kind,
+  agent,
+  agent_instance: null,
+  agent_label: null,
+  payload,
+  created_at: minsAgo(minAgo),
+});
+
+// The `question` message here is DELIBERATELY UNRENDERABLE: it carries no `question_id`.
+// That is not a hypothetical shape — it is what a surface sees from a truncated payload,
+// or from a worker mid-rollout that emits a question the current parse cannot use. The
+// api rejects an answer that names no question, so the run genuinely cannot be answered;
+// the panel's job is to SAY that instead of leaving the run at "needs your answer" with
+// nothing on screen until the deadline fails it.
+//
+// Keep the field ABSENT rather than empty-string: both are unusable, and absent is the
+// shape a producer change actually yields.
+export const mockUnreadableQuestionMessages: RunMessage[] = [
+  um("status", null, { event: "init", model: "claude-sonnet-4-6" }, 20),
+  um("text", "lead", { text: "Mapping the poll path before I propose a caching strategy." }, 19),
+  um("question", "lead", { questions: [{ question: "Which cache TTL?", header: "TTL" }] }, 14),
 ];
 
 // ── Failed-run history (short) ───────────────────────────────────────────────

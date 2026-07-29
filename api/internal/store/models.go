@@ -303,6 +303,7 @@ type Run struct {
 	RetryNotBefore        pgtype.Timestamptz `json:"retry_not_before"`
 	LimitWaitCount        int32              `json:"limit_wait_count"`
 	RateLimitType         pgtype.Text        `json:"rate_limit_type"`
+	OpenQuestionID        pgtype.Text        `json:"open_question_id"`
 }
 
 type RunMessage struct {
@@ -358,6 +359,7 @@ type RunUserInput struct {
 	Body       pgtype.Text        `json:"body"`
 	ConsumedAt pgtype.Timestamptz `json:"consumed_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	QuestionID pgtype.Text        `json:"question_id"`
 }
 
 type Skill struct {
@@ -380,6 +382,8 @@ type SlackRunMessage struct {
 	GateState      pgtype.Text        `json:"gate_state"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	GateGeneration pgtype.Int4        `json:"gate_generation"`
+	QuestionID     pgtype.Text        `json:"question_id"`
+	QuestionTs     pgtype.Text        `json:"question_ts"`
 }
 
 type ToolAllowlist struct {

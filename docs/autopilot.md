@@ -52,6 +52,11 @@ manual **Start run** button doesn't have.
 - **Eligible**: the issue moves to In Progress, a run starts unattended
   (never shows "awaiting approval"), the plan is recorded, and on success a
   comment lands on the issue with the merge request link.
+- **The agent never stops to ask you something, either.** If it would
+  otherwise pause for a clarifying question (see [Answering a
+  question](./run-activity.md#answering-a-question)), an autopilot run
+  auto-resolves instead — "proceed on your best judgment" — and notes the
+  assumption it made in the run feed rather than parking.
 - **No eligible user**: one comment explaining why, and no run — never
   repeats on later polls, even across a full resync.
 - **No PRD link in the issue description**: one comment, no run.

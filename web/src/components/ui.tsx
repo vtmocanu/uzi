@@ -5,7 +5,15 @@
 // (common/unicode-spinner.tsx), and a unified PageHeader
 // (views/layout/page-header.tsx + breadcrumb-header.tsx).
 
-import { useEffect, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from "react";
+import {
+  useEffect,
+  useState,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type ReactNode,
+  type SelectHTMLAttributes,
+  type TextareaHTMLAttributes,
+} from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeftIcon } from "./icons";
 
@@ -15,16 +23,37 @@ export function cx(...parts: (string | false | null | undefined)[]): string {
 
 // ── Surfaces ─────────────────────────────────────────────────────────────────
 
-export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function Card({
+  children,
+  className = "",
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <div className={cx("rounded-xl border border-edge bg-surface p-5", className)}>{children}</div>
+    <div
+      className={cx("rounded-xl border border-edge bg-surface p-5", className)}
+    >
+      {children}
+    </div>
   );
 }
 
 // SectionTitle is the small-caps card heading used across settings/detail pages.
-export function SectionTitle({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function SectionTitle({
+  children,
+  className = "",
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <h2 className={cx("text-xs font-semibold uppercase tracking-wider text-faint", className)}>
+    <h2
+      className={cx(
+        "text-xs font-semibold uppercase tracking-wider text-faint",
+        className,
+      )}
+    >
       {children}
     </h2>
   );
@@ -32,7 +61,8 @@ export function SectionTitle({ children, className = "" }: { children: ReactNode
 
 // ── Buttons ──────────────────────────────────────────────────────────────────
 
-type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "dangerSolid";
+type ButtonVariant =
+  "primary" | "secondary" | "ghost" | "danger" | "dangerSolid";
 type ButtonSize = "sm" | "md";
 
 // Variant language follows multica's ui/button.tsx: a single loud primary, a
@@ -60,7 +90,10 @@ export function Button({
   size = "md",
   className = "",
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant; size?: ButtonSize }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+}) {
   return (
     <button
       className={cx(
@@ -95,7 +128,10 @@ export function Field({
   if (htmlFor) {
     return (
       <div className="space-y-1.5">
-        <label htmlFor={htmlFor} className="block text-sm font-medium text-muted">
+        <label
+          htmlFor={htmlFor}
+          className="block text-sm font-medium text-muted"
+        >
           {label}
         </label>
         {children}
@@ -115,15 +151,24 @@ export function Field({
 const INPUT_CLASS =
   "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-none focus:border-brand/70";
 
-export function Input({ className = "", ...props }: InputHTMLAttributes<HTMLInputElement>) {
+export function Input({
+  className = "",
+  ...props
+}: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
-export function Select({ className = "", ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
+export function Select({
+  className = "",
+  ...props
+}: SelectHTMLAttributes<HTMLSelectElement>) {
   return <select className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
-export function Textarea({ className = "", ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+export function Textarea({
+  className = "",
+  ...props
+}: TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return <textarea className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
@@ -138,15 +183,25 @@ const ALERT_TONES: Record<AlertTone, string> = {
   info: "border-info/40 bg-info/10 text-info",
 };
 
-export function Alert({ message, tone = "danger" }: { message: string; tone?: AlertTone }) {
+export function Alert({
+  message,
+  tone = "danger",
+}: {
+  message: string;
+  tone?: AlertTone;
+}) {
   return (
-    <div role={tone === "danger" ? "alert" : "status"} className={cx("rounded-lg border px-3 py-2 text-sm", ALERT_TONES[tone])}>
+    <div
+      role={tone === "danger" ? "alert" : "status"}
+      className={cx("rounded-lg border px-3 py-2 text-sm", ALERT_TONES[tone])}
+    >
       {message}
     </div>
   );
 }
 
-export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand";
+export type BadgeTone =
+  "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand";
 
 // neutral and queue carry a border/surface/fg triple (theme tokens set all
 // three), so ember renders its solid gray pill while a theme can retint just
@@ -194,7 +249,15 @@ export function Badge({
         BADGE_TONES[tone],
       )}
     >
-      {dot && <span aria-hidden="true" className={cx("h-1.5 w-1.5 rounded-full bg-current", pulse && "animate-pulse")} />}
+      {dot && (
+        <span
+          aria-hidden="true"
+          className={cx(
+            "h-1.5 w-1.5 rounded-full bg-current",
+            pulse && "animate-pulse",
+          )}
+        />
+      )}
       {children}
     </span>
   );
@@ -209,11 +272,19 @@ export function Badge({
 // StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one color
 // everywhere") — a claim that was, until PRD #35, enforced by nothing but that
 // sentence. Exporting the map is what lets a test fail when the two drift.
-export const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
+export const RUN_STATUS_TONES: Record<
+  string,
+  { tone: BadgeTone; pulse?: boolean }
+> = {
   queued: { tone: "queue" },
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },
+  // PRD #88: parked on a clarification question. Deliberately IDENTICAL to
+  // awaiting_approval — same shape of debt (a human owes the run an action while a
+  // worker is held), and the PRD frames it as the third human-in-the-loop channel
+  // alongside the plan gate (D-O #4). The label distinguishes them; the tone must not.
+  awaiting_input: { tone: "warning", pulse: true },
   /** PRD #35: parked until the owner's Anthropic usage window reopens. Warn-toned
    *  like the other "blocked on something outside the run" state, and deliberately
    *  NOT pulsing: a pulse reads as live work, and a parked run does nothing at all
@@ -226,8 +297,22 @@ export const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean
   cancelled: { tone: "neutral" },
 };
 
+// RUN_STATUS_LABELS overrides the default `status.replace(/_/g," ")` where the raw enum
+// makes a poor sentence. It exists because that fallback and runBadge's label switch are
+// two independent renderings of one status, and they had silently diverged: runBadge
+// deliberately says "needs your answer" for awaiting_input on the reasoning that
+// "awaiting input" reads as machine-waiting-for-machine, while this pill printed exactly
+// the phrasing that reasoning rejects — on the run header and every Runs-list row.
+//
+// The divergence was free until now only because `awaiting_approval` happens to read
+// fine de-underscored. Keep the two in step for any status added here.
+const RUN_STATUS_LABELS: Record<string, string> = {
+  awaiting_input: "needs your answer",
+};
+
 export function StatusPill({ status }: { status: string }) {
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
+  const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   return (
     <span
       className={cx(
@@ -237,9 +322,12 @@ export function StatusPill({ status }: { status: string }) {
     >
       <span
         aria-hidden="true"
-        className={cx("h-1.5 w-1.5 rounded-full bg-current", cfg.pulse && "animate-pulse")}
+        className={cx(
+          "h-1.5 w-1.5 rounded-full bg-current",
+          cfg.pulse && "animate-pulse",
+        )}
       />
-      {status.replace(/_/g, " ")}
+      {label}
     </span>
   );
 }
@@ -252,13 +340,19 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export function Spinner({ className = "" }: { className?: string }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 80);
+    const id = setInterval(
+      () => setFrame((f) => (f + 1) % SPINNER_FRAMES.length),
+      80,
+    );
     return () => clearInterval(id);
   }, []);
   return (
     <span
       aria-hidden="true"
-      className={cx("inline-block min-w-[1ch] text-center font-mono", className)}
+      className={cx(
+        "inline-block min-w-[1ch] text-center font-mono",
+        className,
+      )}
     >
       {SPINNER_FRAMES[frame]}
     </span>
@@ -268,7 +362,12 @@ export function Spinner({ className = "" }: { className?: string }) {
 // ── Loading & empty states ───────────────────────────────────────────────────
 
 export function Skeleton({ className = "" }: { className?: string }) {
-  return <div aria-hidden="true" className={cx("animate-pulse rounded-md bg-raised", className)} />;
+  return (
+    <div
+      aria-hidden="true"
+      className={cx("animate-pulse rounded-md bg-raised", className)}
+    />
+  );
 }
 
 // ListSkeleton: a card of shimmering rows — the standard page-loading state.
@@ -349,10 +448,16 @@ export function PageHeader({
       )}
       <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
         <div className="min-w-0">
-          {titleNode ?? <h1 className="text-xl font-semibold tracking-tight">{title}</h1>}
-          {description && <p className="mt-1 max-w-2xl text-sm text-muted">{description}</p>}
+          {titleNode ?? (
+            <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
+          )}
+          {description && (
+            <p className="mt-1 max-w-2xl text-sm text-muted">{description}</p>
+          )}
         </div>
-        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+        {actions && (
+          <div className="flex flex-wrap items-center gap-2">{actions}</div>
+        )}
       </div>
     </div>
   );
@@ -372,8 +477,12 @@ export function StatTile({
 }) {
   const body = (
     <div className="rounded-xl border border-edge bg-surface p-4 transition-colors hover:border-edge-strong">
-      <p className="text-xs font-medium uppercase tracking-wider text-faint">{label}</p>
-      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-fg">{value}</p>
+      <p className="text-xs font-medium uppercase tracking-wider text-faint">
+        {label}
+      </p>
+      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-fg">
+        {value}
+      </p>
       {hint && <p className="mt-0.5 text-xs text-faint">{hint}</p>}
     </div>
   );

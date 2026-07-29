@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import {
   PlanPanel,
   AgentRosterSummary,
@@ -17,7 +24,16 @@ import {
 // and workerSizes.test.ts. Vite inlines it at build time, so the assertion runs
 // against the real file under both tsc and vitest.
 import runViewSource from "./RunView.tsx?raw";
-import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunMessage, type RunReview } from "../lib/api";
+import questionPanelSource from "../components/QuestionPanel.tsx?raw";
+import {
+  api,
+  type IssueDraft,
+  type Repo,
+  type RepoAgent,
+  type Run,
+  type RunMessage,
+  type RunReview,
+} from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
 // run's own_agents instead). listAgentTemplates is mocked only so a test can assert
@@ -118,7 +134,9 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
       />,
     );
     // The button label reflects the default repo selection.
-    const approve = await screen.findByRole("button", { name: /Approve plan · 2 repo agents/ });
+    const approve = await screen.findByRole("button", {
+      name: /Approve plan · 2 repo agents/,
+    });
     fireEvent.click(approve);
     expect(onApprove).toHaveBeenCalledWith({ source: "repo", exclusions: [] });
   });
@@ -137,29 +155,45 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
     );
     await screen.findByRole("button", { name: /Approve plan · 3 repo agents/ });
     fireEvent.click(screen.getByRole("button", { name: /^●?\s*tester/i }));
-    const approve = screen.getByRole("button", { name: /Approve plan · 2 repo agents/ });
+    const approve = screen.getByRole("button", {
+      name: /Approve plan · 2 repo agents/,
+    });
     fireEvent.click(approve);
-    expect(onApprove).toHaveBeenCalledWith({ source: "repo", exclusions: ["tester"] });
+    expect(onApprove).toHaveBeenCalledWith({
+      source: "repo",
+      exclusions: ["tester"],
+    });
   });
 
   it("State B: no repo agents → own templates from run.own_agents (lead already stripped server-side)", async () => {
     const onApprove = vi.fn();
     render(
       <PlanPanel
-        run={run({ repo_agents: [], own_agents: [agent("coder"), agent("reviewer")] })}
+        run={run({
+          repo_agents: [],
+          own_agents: [agent("coder"), agent("reviewer")],
+        })}
         busy={false}
         onApprove={onApprove}
         onReject={() => {}}
       />,
     );
     // Own is default: label counts the 2 own agents the server delivered.
-    await screen.findByRole("button", { name: /Approve plan · 2 of your templates/ });
+    await screen.findByRole("button", {
+      name: /Approve plan · 2 of your templates/,
+    });
     // The own chips are the two the run carries — the lead never appears (the server
     // strips it before own_agents), and there was no global fetch.
     expect(screen.getByRole("button", { name: /^●?\s*coder/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^●?\s*reviewer/i })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /^●?\s*reviewer/i }),
+    ).toBeTruthy();
     expect(screen.queryByRole("button", { name: /^●?\s*lead/i })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /Approve plan · 2 of your templates/ }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /Approve plan · 2 of your templates/,
+      }),
+    );
     expect(onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] });
     // M4-fix: the picker must NOT reach for the global template list anymore.
     expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
@@ -176,13 +210,22 @@ describe("PlanPanel agent picker (PRD #37 M4)", () => {
       />,
     );
     // No selectable agents on either source → the button drops the count suffix.
-    const approve = await screen.findByRole("button", { name: /^Approve plan$/ });
+    const approve = await screen.findByRole("button", {
+      name: /^Approve plan$/,
+    });
     fireEvent.click(approve);
     expect(onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] });
   });
 
   it("the plan markdown still renders", async () => {
-    render(<PlanPanel run={run({ repo_agents: [], own_agents: [] })} busy={false} onApprove={() => {}} onReject={() => {}} />);
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [], own_agents: [] })}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
     expect(await screen.findByText("step one")).toBeTruthy();
   });
 });
@@ -247,7 +290,9 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
 describe("RunFailureReason — the worker-supplied failure reason (#124, text channel)", () => {
   it("strips bidi/zero-width characters out of the rendered reason", () => {
     const { container } = render(
-      <RunFailureReason run={run({ failure_reason: "the repo \u202Eapproved\u200B this" })} />,
+      <RunFailureReason
+        run={run({ failure_reason: "the repo \u202Eapproved\u200B this" })}
+      />,
     );
     // The rendered TEXT is the assertion — a `title` check here would be measuring what
     // 96ed275a already fixed, on a surface that carries no title at all.
@@ -263,7 +308,9 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
   });
 
   it("renders nothing when there is no reason", () => {
-    const { container } = render(<RunFailureReason run={run({ failure_reason: null })} />);
+    const { container } = render(
+      <RunFailureReason run={run({ failure_reason: null })} />,
+    );
     expect(container.textContent).toBe("");
   });
 });
@@ -271,7 +318,13 @@ describe("RunFailureReason — the worker-supplied failure reason (#124, text ch
 describe("HealthFlag — the health reason (#124, text channel)", () => {
   it("strips bidi/zero-width characters out of the rendered reason", () => {
     const { container } = render(
-      <HealthFlag run={run({ status: "running", health: "stalled", health_reason: "no output for \u202E20m\u200B" })} />,
+      <HealthFlag
+        run={run({
+          status: "running",
+          health: "stalled",
+          health_reason: "no output for \u202E20m\u200B",
+        })}
+      />,
     );
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     // Sharper here than in the sibling case: the pill DOES mount without a reason (it
@@ -287,7 +340,10 @@ describe("HealthFlag — the health reason (#124, text channel)", () => {
 describe("RunCompletedLine — the worker-supplied branch carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters out of run.branch", () => {
     const { container } = render(
-      <RunCompletedLine run={run({ branch: "agent/issue-\u202E7\u200B", mr_iid: null })} duration="2m" />,
+      <RunCompletedLine
+        run={run({ branch: "agent/issue-\u202E7\u200B", mr_iid: null })}
+        duration="2m"
+      />,
     );
     // Anchored on the duration, which the mutation cannot move.
     expect(container.textContent).toContain("Ran for 2m");
@@ -299,7 +355,12 @@ describe("RunCompletedLine — the worker-supplied branch carries no format char
 describe("RunHeading — the forge issue title carries no format characters (#124)", () => {
   it("strips bidi/zero-width characters, and keeps the iid beside them", () => {
     const { container } = render(
-      <RunHeading run={run({ issue_title: "Fix the \u202Eparser\u200B bug", issue_iid: 7 })} />,
+      <RunHeading
+        run={run({
+          issue_title: "Fix the \u202Eparser\u200B bug",
+          issue_iid: 7,
+        })}
+      />,
     );
     expect(container.textContent ?? "").not.toMatch(/[\p{Cf}]/u);
     expect(screen.getByText("Fix the parser bug")).toBeTruthy();
@@ -332,7 +393,14 @@ describe("JudgePanel (PRD #46 M4)", () => {
       // PRD #94: default to an untriaged review (every rec reads "To do"). The triage
       // bar reads these server counts directly — the panel never re-derives them.
       dispositions: [],
-      triage: { total: 1, todo: 1, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+      triage: {
+        total: 1,
+        todo: 1,
+        filed: 0,
+        done: 0,
+        dismissed: 0,
+        false_positives: 0,
+      },
       ...over,
     };
   }
@@ -358,9 +426,15 @@ describe("JudgePanel (PRD #46 M4)", () => {
         recommendations: [],
       }),
     });
-    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+    const { container } = render(
+      <JudgePanel run={run({ status: "completed" })} />,
+    );
 
-    expect(await screen.findByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
+    expect(
+      await screen.findByText(
+        /<img src=x onerror=alert\(1\)> \*\*not bold\*\*/,
+      ),
+    ).toBeTruthy();
     // The markup did not become a real element.
     expect(container.querySelector("img")).toBeNull();
   });
@@ -396,7 +470,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
         ],
       }),
     });
-    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+    const { container } = render(
+      <JudgePanel run={run({ status: "completed" })} />,
+    );
     // The await must resolve whether or not the strip works. Awaiting the CLEANED text
     // here would make a mutation red at a 5s findByText timeout instead of at the
     // assertion below — a red that looks like proof and measures something else. The
@@ -418,7 +494,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: null });
-    mockApi.rerunJudge.mockResolvedValue({ run: run({ id: "judge1", kind: "judge", status: "queued" }) });
+    mockApi.rerunJudge.mockResolvedValue({
+      run: run({ id: "judge1", kind: "judge", status: "queued" }),
+    });
     render(<JudgePanel run={run({ status: "failed" })} />);
 
     const btn = await screen.findByText("Run judge");
@@ -431,7 +509,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
   it("surfaces a re-run error", async () => {
     const { ApiError } = await import("../lib/api");
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.rerunJudge.mockRejectedValue(new ApiError(409, "a judge run is already in progress for this run"));
+    mockApi.rerunJudge.mockRejectedValue(
+      new ApiError(409, "a judge run is already in progress for this run"),
+    );
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Re-run judge"));
@@ -439,7 +519,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("renders nothing for an ineligible kind (chat) and never fetches a review", async () => {
-    const { container } = render(<JudgePanel run={run({ kind: "chat", status: "completed" })} />);
+    const { container } = render(
+      <JudgePanel run={run({ kind: "chat", status: "completed" })} />,
+    );
     expect(container.textContent).toBe("");
     expect(mockApi.getRunReview).not.toHaveBeenCalled();
   });
@@ -465,7 +547,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     const link = await screen.findByRole("link", { name: /#71/ });
-    expect(link.getAttribute("href")).toBe("https://gitlab.example/vtmocanu/uzi/-/issues/71");
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+    );
     // The idle affordance for this (now-filed) recommendation is gone.
     expect(screen.queryByText("File issue")).toBeNull();
   });
@@ -504,7 +588,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // body, and filtering the value would silently rewrite what the user typed.
   it("strips format characters from the SEEDED draft, before the user can edit it (#124)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
     mockApi.getIssueDraft.mockResolvedValue({
       draft: draftFixture({
         title: "Improve the \u202Ereviewer",
@@ -517,7 +603,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     // Read the CONTROL VALUES, not the rendered text: these are what a Create click posts.
     const title = screen.getByDisplayValue(/Improve the/) as HTMLInputElement;
-    const body = screen.getByDisplayValue(/What the judge found/) as HTMLTextAreaElement;
+    const body = screen.getByDisplayValue(
+      /What the judge found/,
+    ) as HTMLTextAreaElement;
     expect(title.value).not.toMatch(/[\p{Cf}]/u);
     expect(body.value).not.toMatch(/[\p{Cf}]/u);
     expect(title.value).toBe("Improve the reviewer");
@@ -529,7 +617,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("opens the draft with templated fields on File issue click (state B)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
     mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
@@ -541,15 +631,27 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(screen.getByText(/from vlad's worker, run 8f2c1d04/)).toBeTruthy();
     expect(screen.getByText("PRD")).toBeTruthy();
     expect(screen.getByText("PRDLESS")).toBeTruthy();
-    expect((screen.getByDisplayValue("Improve the reviewer: reviewer") as HTMLInputElement).tagName).toBe("INPUT");
+    expect(
+      (
+        screen.getByDisplayValue(
+          "Improve the reviewer: reviewer",
+        ) as HTMLInputElement
+      ).tagName,
+    ).toBe("INPUT");
   });
 
   it("files the issue and shows the created link (state C)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
     mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
     mockApi.fileIssue.mockResolvedValue({
-      issue: { iid: 71, web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71", title: "t" },
+      issue: {
+        iid: 71,
+        web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+        title: "t",
+      },
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
@@ -561,39 +663,58 @@ describe("JudgePanel (PRD #46 M4)", () => {
       description: draftFixture().description,
     });
     const link = await screen.findByRole("link", { name: /#71/ });
-    expect(link.getAttribute("href")).toBe("https://gitlab.example/vtmocanu/uzi/-/issues/71");
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+    );
   });
 
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
     mockApi.getIssueDraft.mockResolvedValue({
-      draft: draftFixture({ default_repo_id: "", default_note: "No uzi repo is configured." }),
+      draft: draftFixture({
+        default_repo_id: "",
+        default_note: "No uzi repo is configured.",
+      }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("File issue"));
-    const create = (await screen.findByText("Create issue")) as HTMLButtonElement;
+    const create = (await screen.findByText(
+      "Create issue",
+    )) as HTMLButtonElement;
     expect(create.disabled).toBe(true);
     expect(screen.getByText("No uzi repo is configured.")).toBeTruthy();
     // Picking a repo enables Create.
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "repo1" } });
-    expect((screen.getByText("Create issue") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.change(screen.getByRole("combobox"), {
+      target: { value: "repo1" },
+    });
+    expect(
+      (screen.getByText("Create issue") as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 
   it("keeps the draft open and shows the error when the forge rejects (state E)", async () => {
     const { ApiError } = await import("../lib/api");
     mockApi.getRunReview.mockResolvedValue({ review: review() });
-    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.listRepos.mockResolvedValue({
+      repos: [repoOpt("repo1", "vtmocanu/uzi")],
+    });
     mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
-    mockApi.fileIssue.mockRejectedValue(new ApiError(502, "the forge rejected the request (403)"));
+    mockApi.fileIssue.mockRejectedValue(
+      new ApiError(502, "the forge rejected the request (403)"),
+    );
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("File issue"));
     fireEvent.click(await screen.findByText("Create issue"));
     expect(await screen.findByText(/forge rejected the request/i)).toBeTruthy();
     // The draft stays open with its fields intact (not collapsed to the filed row).
-    expect(screen.getByDisplayValue("Improve the reviewer: reviewer")).toBeTruthy();
+    expect(
+      screen.getByDisplayValue("Improve the reviewer: reviewer"),
+    ).toBeTruthy();
   });
 
   it("flags a stale filed link (filed before the current review revision)", async () => {
@@ -612,7 +733,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
-    expect(await screen.findByText(/filed for an earlier version/i)).toBeTruthy();
+    expect(
+      await screen.findByText(/filed for an earlier version/i),
+    ).toBeTruthy();
   });
 
   it("recovers from a draft-load failure with Retry and Cancel (no dead end)", async () => {
@@ -666,11 +789,39 @@ describe("JudgePanel (PRD #46 M4)", () => {
           },
         ],
         dispositions: [
-          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
-          { category: "improve_agent", target: "reviewer", status: "dismissed", reason: "wont_do", set_at: "2026-01-01T00:00:00Z", stale: false },
-          { category: "improve_uzi", target: "timeout", status: "dismissed", reason: "not_an_issue", set_at: "2026-01-01T00:00:00Z", stale: false },
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            status: "done",
+            reason: "",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
+          {
+            category: "improve_agent",
+            target: "reviewer",
+            status: "dismissed",
+            reason: "wont_do",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
+          {
+            category: "improve_uzi",
+            target: "timeout",
+            status: "dismissed",
+            reason: "not_an_issue",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
         ],
-        triage: { total: 5, todo: 1, filed: 1, done: 1, dismissed: 2, false_positives: 1 },
+        triage: {
+          total: 5,
+          todo: 1,
+          filed: 1,
+          done: 1,
+          dismissed: 2,
+          false_positives: 1,
+        },
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -688,9 +839,13 @@ describe("JudgePanel (PRD #46 M4)", () => {
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Mark done"));
-    await waitFor(() => expect(mockApi.setDisposition).toHaveBeenCalledWith("r1", "rc1", "done"));
+    await waitFor(() =>
+      expect(mockApi.setDisposition).toHaveBeenCalledWith("r1", "rc1", "done"),
+    );
     // Refetch: getRunReview ran on mount AND again after the mutation.
-    await waitFor(() => expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() =>
+      expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
   });
 
   it("Dismiss → Not an issue sets a not_an_issue dismissal", async () => {
@@ -700,7 +855,12 @@ describe("JudgePanel (PRD #46 M4)", () => {
     fireEvent.click(await screen.findByText("Dismiss ▾"));
     fireEvent.click(await screen.findByText("Not an issue"));
     await waitFor(() =>
-      expect(mockApi.setDisposition).toHaveBeenCalledWith("r1", "rc1", "dismissed", "not_an_issue"),
+      expect(mockApi.setDisposition).toHaveBeenCalledWith(
+        "r1",
+        "rc1",
+        "dismissed",
+        "not_an_issue",
+      ),
     );
   });
 
@@ -708,42 +868,87 @@ describe("JudgePanel (PRD #46 M4)", () => {
     mockApi.getRunReview.mockResolvedValue({
       review: review({
         dispositions: [
-          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            status: "done",
+            reason: "",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
         ],
-        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+        triage: {
+          total: 1,
+          todo: 0,
+          filed: 0,
+          done: 1,
+          dismissed: 0,
+          false_positives: 0,
+        },
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Undo"));
-    await waitFor(() => expect(mockApi.deleteDisposition).toHaveBeenCalledWith("r1", "rc1"));
-    await waitFor(() => expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() =>
+      expect(mockApi.deleteDisposition).toHaveBeenCalledWith("r1", "rc1"),
+    );
+    await waitFor(() =>
+      expect(mockApi.getRunReview.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
   });
 
   it("renders the stale note straight from the DTO's stale flag", async () => {
     mockApi.getRunReview.mockResolvedValue({
       review: review({
         dispositions: [
-          { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: true },
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            status: "done",
+            reason: "",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: true,
+          },
         ],
-        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+        triage: {
+          total: 1,
+          todo: 0,
+          filed: 0,
+          done: 1,
+          dismissed: 0,
+          false_positives: 0,
+        },
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
-    expect(await screen.findByText(/recommendation changed since you resolved/i)).toBeTruthy();
+    expect(
+      await screen.findByText(/recommendation changed since you resolved/i),
+    ).toBeTruthy();
   });
 
   it("renders the triage bar from server counts, never re-derived from the on-screen rows", async () => {
     // ONE recommendation is rendered, but the server triage totals 5 — so the bar's
     // numbers can only come from review.triage, proving no TS re-derivation.
     mockApi.getRunReview.mockResolvedValue({
-      review: review({ triage: { total: 5, todo: 2, filed: 1, done: 1, dismissed: 1, false_positives: 1 } }),
+      review: review({
+        triage: {
+          total: 5,
+          todo: 2,
+          filed: 1,
+          done: 1,
+          dismissed: 1,
+          false_positives: 1,
+        },
+      }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     expect(await screen.findByText("3 of 5 handled")).toBeTruthy(); // filed+done+dismissed of total
     expect(screen.getByText("2")).toBeTruthy(); // the server todo count, though 1 row shows
-    expect(screen.getByText(/1 of 1 dismissed was a false positive/)).toBeTruthy();
+    expect(
+      screen.getByText(/1 of 1 dismissed was a false positive/),
+    ).toBeTruthy();
   });
 
   it("collapse-dismissed toggle hides the dismissed rows", async () => {
@@ -754,9 +959,23 @@ describe("JudgePanel (PRD #46 M4)", () => {
           rec("rc2", "improve_agent", "reviewer", "hide me"),
         ],
         dispositions: [
-          { category: "improve_agent", target: "reviewer", status: "dismissed", reason: "wont_do", set_at: "2026-01-01T00:00:00Z", stale: false },
+          {
+            category: "improve_agent",
+            target: "reviewer",
+            status: "dismissed",
+            reason: "wont_do",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
         ],
-        triage: { total: 2, todo: 1, filed: 0, done: 0, dismissed: 1, false_positives: 0 },
+        triage: {
+          total: 2,
+          todo: 1,
+          filed: 0,
+          done: 0,
+          dismissed: 1,
+          false_positives: 0,
+        },
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -784,9 +1003,23 @@ describe("JudgePanel (PRD #46 M4)", () => {
           },
         ],
         dispositions: [
-          { category: "add_agent", target: "deploy-agent", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+          {
+            category: "add_agent",
+            target: "deploy-agent",
+            status: "done",
+            reason: "",
+            set_at: "2026-01-01T00:00:00Z",
+            stale: false,
+          },
         ],
-        triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+        triage: {
+          total: 1,
+          todo: 0,
+          filed: 0,
+          done: 1,
+          dismissed: 0,
+          false_positives: 0,
+        },
       }),
     });
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -795,7 +1028,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(await screen.findByText("Done")).toBeTruthy();
     // …but the filed issue link survives the disposition (Resolved Q: file then done).
     const link = screen.getByRole("link", { name: /#72/ });
-    expect(link.getAttribute("href")).toBe("https://gitlab.example/x/-/issues/72");
+    expect(link.getAttribute("href")).toBe(
+      "https://gitlab.example/x/-/issues/72",
+    );
     // No way to file a second issue on a disposed row.
     expect(screen.queryByText("File issue")).toBeNull();
   });
@@ -821,9 +1056,23 @@ describe("JudgePanel (PRD #46 M4)", () => {
       .mockResolvedValue({
         review: review({
           dispositions: [
-            { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: "2026-01-01T00:00:00Z", stale: false },
+            {
+              category: "install_worker_tool",
+              target: "shellcheck",
+              status: "done",
+              reason: "",
+              set_at: "2026-01-01T00:00:00Z",
+              stale: false,
+            },
           ],
-          triage: { total: 1, todo: 0, filed: 0, done: 1, dismissed: 0, false_positives: 0 },
+          triage: {
+            total: 1,
+            todo: 0,
+            filed: 0,
+            done: 1,
+            dismissed: 0,
+            false_positives: 0,
+          },
         }),
       });
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -844,7 +1093,15 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
 // ── Plan revision at the gate (PRD #41) ────────────────────────────────────────
 function planMsg(seq: number, kind: string, payload: unknown): RunMessage {
-  return { seq, kind, agent: "lead", agent_instance: null, agent_label: null, payload, created_at: "2026-07-04T00:00:00.000Z" };
+  return {
+    seq,
+    kind,
+    agent: "lead",
+    agent_instance: null,
+    agent_label: null,
+    payload,
+    created_at: "2026-07-04T00:00:00.000Z",
+  };
 }
 
 describe("derivePlanRevision (PRD #41)", () => {
@@ -951,7 +1208,10 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
   it("Send & revise is disabled until the feedback is non-empty", () => {
     const { getByRole } = renderGate();
     fireEvent.click(getByRole("button", { name: /request changes/i }));
-    expect((getByRole("button", { name: /send & revise/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (getByRole("button", { name: /send & revise/i }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("renders the revising parked state when latest-by-seq is plan_revising", () => {
@@ -961,7 +1221,10 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
       planMsg(3, "plan_revising", { round: 1 }),
     ];
     const onCancel = vi.fn();
-    const { container, getByRole, queryByRole } = renderGate({ messages, onCancel });
+    const { container, getByRole, queryByRole } = renderGate({
+      messages,
+      onCancel,
+    });
     expect(container.textContent).toContain("Revising the plan");
     expect(container.textContent).toContain("rework the endpoint");
     expect(container.textContent).toContain("revision 1 of 3");
@@ -979,11 +1242,17 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
       planMsg(4, "plan", { plan_md: "v2 body" }),
     ];
     const { container, getByRole } = renderGate({
-      run: { repo_agents: [], own_agents: [], plan_md: "# Plan v2\n- new step" },
+      run: {
+        repo_agents: [],
+        own_agents: [],
+        plan_md: "# Plan v2\n- new step",
+      },
       messages,
     });
     expect(getByRole("button", { name: /approve plan/i })).toBeTruthy();
-    expect(container.textContent).toContain("Updated plan awaiting your approval");
+    expect(container.textContent).toContain(
+      "Updated plan awaiting your approval",
+    );
     expect(container.textContent).toContain("v2");
     expect(container.textContent).toContain("revision 1 of 3");
     // The superseded v1 is preserved in the collapsed history accordion.
@@ -1007,6 +1276,108 @@ describe("PlanPanel — three-action gate + revision (PRD #41)", () => {
 // EXISTS; RunCredential.test.tsx proves what it renders. Together they cover what a
 // single page-level render would, and this half reddens on exactly the mutation that
 // went undetected.
+describe("PlanPanel canSteer (PRE-EXISTING hole, fixed alongside PRD #88)", () => {
+  // POST /inputs is user-scoped, so a non-owner admin — who can legitimately OPEN this
+  // owner-or-admin run view — had an Approve button that 404s. useRunStream states the
+  // rule outright ("never a broken Send that 404s") and SteerQueueCard already obeyed it;
+  // this panel never did. Unrelated to #88 and fixed with it, because fixing only the
+  // newer question composer would have left the identical hole one panel over.
+  const gated = () =>
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [agent("coder")], own_agents: [agent("coder")] })}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+        onRequestChanges={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+
+  it("hides every verdict control from a non-owner", () => {
+    gated();
+    expect(screen.queryByRole("button", { name: /Approve plan/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Request changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("does not contradict itself: the HEADING follows canSteer like the subtitle", () => {
+    // Measured in the browser: a non-owner saw "Plan awaiting your approval" directly
+    // above "Only they can approve or reject it" — the subtitle was conditional and the
+    // heading was not. QuestionPanel's non-owner branch changes both; this is the older
+    // panel's half of the same fix, left incomplete.
+    gated();
+    expect(screen.getByText(/Plan awaiting the owner's approval/)).toBeTruthy();
+    expect(screen.queryByText(/awaiting your approval/)).toBeNull();
+  });
+
+  it("keeps the REVISED heading viewer-aware too", () => {
+    // A v2+ re-gate has its own heading string, so gating only the first would put the
+    // contradiction straight back for any run that was revised once.
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [], own_agents: [] })}
+        messages={[
+          { seq: 1, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "a" }, created_at: "2026-07-28T00:00:00Z" },
+          { seq: 2, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "b" }, created_at: "2026-07-28T00:00:02Z" },
+        ]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Updated plan awaiting the owner's approval/)).toBeTruthy();
+    expect(screen.queryByText(/awaiting your approval/)).toBeNull();
+  });
+
+  it("keeps the plan READABLE — the reason a non-owner admin opens this page", () => {
+    // Hiding the panel outright would turn a permissions boundary into a blank page.
+    gated();
+    expect(screen.getByText("step one")).toBeTruthy();
+    expect(screen.getByText(/Only they can approve or reject it/)).toBeTruthy();
+  });
+
+  it("hides the agent picker, which exists only to shape a verdict they cannot cast", () => {
+    gated();
+    expect(screen.queryByRole("button", { name: /^●?\s*coder/i })).toBeNull();
+  });
+
+  it("defaults to steerable, so an owner is never gated by an absent prop", async () => {
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [agent("coder")], own_agents: [agent("coder")] })}
+        busy={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(await screen.findByRole("button", { name: /Approve plan/ })).toBeTruthy();
+  });
+
+  it("hides Cancel run from a non-owner in the REVISING state too", () => {
+    // A second branch with its own controls; gating only the open gate would leave the
+    // revising panel offering a Cancel that 404s.
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [], own_agents: [] })}
+        messages={[
+          { seq: 1, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "p" }, created_at: "2026-07-28T00:00:00Z" },
+          { seq: 2, kind: "plan_revising", agent: "lead", agent_instance: null, agent_label: null, payload: { round: 1 }, created_at: "2026-07-28T00:00:01Z" },
+        ]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.getByText("Revising the plan")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).toBeNull();
+  });
+});
+
 describe("RunView ↔ RunCredential wiring (PRD #111 M1)", () => {
   // 🔴 A SOURCE-TEXT CONTROL IS SATISFIED BY DISABLED CODE, and the first version of
   // this guard was. `toContain` over raw file text does not know what a comment is,
@@ -1082,7 +1453,14 @@ describe("LimitWaitPanel (PRD #35)", () => {
   it("renders NOTHING for a terminal run — there is no future limit to opt into", () => {
     for (const status of ["completed", "failed", "cancelled"] as const) {
       cleanup();
-      const { container } = render(<LimitWaitPanel run={run({ status })} busy={false} onToggle={() => {}} onStop={() => {}} />);
+      const { container } = render(
+        <LimitWaitPanel
+          run={run({ status })}
+          busy={false}
+          onToggle={() => {}}
+          onStop={() => {}}
+        />,
+      );
       // Not "a disabled checkbox": a control that cannot do anything only invites the
       // question of why it is there.
       expect(container.textContent).toBe("");
@@ -1092,10 +1470,17 @@ describe("LimitWaitPanel (PRD #35)", () => {
 
   it("shows only the quiet toggle for a live, never-parked run", () => {
     const { container } = render(
-      <LimitWaitPanel run={run({ status: "running" })} busy={false} onToggle={() => {}} onStop={() => {}} />,
+      <LimitWaitPanel
+        run={run({ status: "running" })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
     );
     expect(container.querySelector("input[type=checkbox]")).not.toBeNull();
-    expect(container.textContent).toContain("Wait out future Anthropic usage limits");
+    expect(container.textContent).toContain(
+      "Wait out future Anthropic usage limits",
+    );
     // No park has happened, so nothing may claim one has.
     expect(container.textContent).not.toContain("Paused");
     expect(container.textContent).not.toContain("Resumes in");
@@ -1108,19 +1493,36 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // before the dead credential's window rolls over, so the stamp is routinely
     // EARLIER. A countdown wired to limit_resets_at would tell the user to wait 5h
     // for a run that comes back in 2h 14m, and would look entirely plausible.
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
     expect(container.textContent).toContain("2h 14m");
     expect(container.textContent).not.toContain("5h 0m");
   });
 
   it("renders limit_resets_at as CONTEXT, named as its window", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
     expect(container.textContent).toContain("5-hour window reopens");
     // Formatted WITHOUT seconds (web-ux nit): toLocaleString() renders "7:00:00 PM"
     // for an instant known only to within a poll interval, so the precision is a
     // lie as well as noise.
     expect(container.textContent).toContain(
-      new Date(ahead(5 * 3_600_000)).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
+      new Date(ahead(5 * 3_600_000)).toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }),
     );
     expect(container.textContent).not.toMatch(/\d:\d\d:\d\d/);
   });
@@ -1133,9 +1535,20 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // The claim is the RULE, not a cause: retry_not_before means "the earliest moment
     // this user could spend anything". Naming a second credential would be a guess —
     // no DTO field says which leg of the computation won.
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
-    expect(container.textContent).toMatch(/sooner than the 5-hour window reopens/);
-    expect(container.textContent).toMatch(/as soon as any of your tokens can pay for it/);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(container.textContent).toMatch(
+      /sooner than the 5-hour window reopens/,
+    );
+    expect(container.textContent).toMatch(
+      /as soon as any of your tokens can pay for it/,
+    );
   });
 
   it("does NOT explain a gap that does not exist — the ordering can go either way", () => {
@@ -1159,7 +1572,14 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // The first version joined window and attempt with " · " before composing, which
     // put "attempt 2" between "reopens <date>" and "because uzi resumes…" — one
     // sentence split around an unrelated fact.
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
     expect(container.textContent).toMatch(/pay for it\.\s*Attempt 2\./);
   });
 
@@ -1169,14 +1589,28 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // Meanwhile the page's one FILLED primary button was `Send follow-up`, which on a
     // parked run promises the opposite of what it does.
     const onStop = vi.fn();
-    render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={onStop} />);
+    render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={onStop}
+      />,
+    );
     const stop = screen.getByRole("button", { name: /stop run/i });
     fireEvent.click(stop);
     expect(onStop).toHaveBeenCalledTimes(1);
   });
 
   it("does not offer Stop on a live, never-parked run — the steer card owns that", () => {
-    render(<LimitWaitPanel run={run({ status: "running" })} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    render(
+      <LimitWaitPanel
+        run={run({ status: "running" })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
     expect(screen.queryByRole("button", { name: /stop run/i })).toBeNull();
   });
 
@@ -1184,7 +1618,12 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // The promotion pass runs on a ticker, so an expired stamp means "waiting on the
     // next sweep", not "late". Counting up would read as a fault where there is none.
     const { container } = render(
-      <LimitWaitPanel run={parked({ retry_not_before: ahead(-90_000) })} busy={false} onToggle={() => {}} onStop={() => {}} />,
+      <LimitWaitPanel
+        run={parked({ retry_not_before: ahead(-90_000) })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
     );
     expect(container.textContent).toContain("Resuming shortly");
     // Targeted at a NEGATIVE DURATION, not at the character: "5-hour window" and the
@@ -1193,12 +1632,19 @@ describe("LimitWaitPanel (PRD #35)", () => {
     expect(container.textContent).not.toMatch(/-\d+[smhd]\b/);
     expect(container.textContent).not.toContain("Resumes in");
     // Still a park, so the heading and the reassurance stay.
-    expect(container.textContent).toContain("Paused on an Anthropic usage limit");
+    expect(container.textContent).toContain(
+      "Paused on an Anthropic usage limit",
+    );
   });
 
   it("ticks the countdown down as time passes", () => {
     const { container } = render(
-      <LimitWaitPanel run={parked({ retry_not_before: ahead(65_000) })} busy={false} onToggle={() => {}} onStop={() => {}} />,
+      <LimitWaitPanel
+        run={parked({ retry_not_before: ahead(65_000) })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
     );
     expect(container.textContent).toContain("1m 05s");
     act(() => {
@@ -1208,13 +1654,25 @@ describe("LimitWaitPanel (PRD #35)", () => {
   });
 
   it("shows 'attempt N' only from the second park", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
     // Case-insensitive on the word, exact on the number: it is capitalised now that it
     // stands as its own sentence rather than riding a " · " join.
     expect(container.textContent).toMatch(/attempt 2/i);
     cleanup();
     const first = render(
-      <LimitWaitPanel run={parked({ limit_wait_count: 1 })} busy={false} onToggle={() => {}} onStop={() => {}} />,
+      <LimitWaitPanel
+        run={parked({ limit_wait_count: 1 })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
     );
     expect(first.container.textContent).not.toContain("attempt");
   });
@@ -1225,8 +1683,17 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // clock and the run still resumes. So the checkbox must be present, enabled, and
     // must hand the caller nothing but the new boolean.
     const onToggle = vi.fn();
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={onToggle} onStop={() => {}} />);
-    const box = container.querySelector("input[type=checkbox]") as HTMLInputElement;
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={onToggle}
+        onStop={() => {}}
+      />,
+    );
+    const box = container.querySelector(
+      "input[type=checkbox]",
+    ) as HTMLInputElement;
     expect(box).not.toBeNull();
     expect(box.disabled).toBe(false);
     expect(box.checked).toBe(true);
@@ -1243,21 +1710,49 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // Reachable: the owner turned it off mid-park. The box must follow the flag, not
     // the status, or the user cannot tell that their change landed.
     const { container } = render(
-      <LimitWaitPanel run={parked({ wait_on_limit: false })} busy={false} onToggle={() => {}} onStop={() => {}} />,
+      <LimitWaitPanel
+        run={parked({ wait_on_limit: false })}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
     );
-    const box = container.querySelector("input[type=checkbox]") as HTMLInputElement;
+    const box = container.querySelector(
+      "input[type=checkbox]",
+    ) as HTMLInputElement;
     expect(box.checked).toBe(false);
-    expect(container.textContent).toContain("Paused on an Anthropic usage limit");
+    expect(container.textContent).toContain(
+      "Paused on an Anthropic usage limit",
+    );
   });
 
   it("disables the box while a write is in flight", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy onToggle={() => {}} onStop={() => {}} />);
-    expect((container.querySelector("input[type=checkbox]") as HTMLInputElement).disabled).toBe(true);
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(
+      (container.querySelector("input[type=checkbox]") as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("announces the park politely rather than silently", () => {
-    const { container } = render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} />);
-    expect(container.querySelector('[role="status"]')?.textContent).toContain("Paused on an Anthropic usage limit");
+    const { container } = render(
+      <LimitWaitPanel
+        run={parked()}
+        busy={false}
+        onToggle={() => {}}
+        onStop={() => {}}
+      />,
+    );
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Paused on an Anthropic usage limit",
+    );
   });
 
   it("degrades honestly when the server sent no timestamps at all", () => {
@@ -1265,7 +1760,11 @@ describe("LimitWaitPanel (PRD #35)", () => {
     // "NaN", "Invalid Date", or a fabricated time.
     const { container } = render(
       <LimitWaitPanel
-        run={parked({ retry_not_before: null, limit_resets_at: null, rate_limit_type: null })}
+        run={parked({
+          retry_not_before: null,
+          limit_resets_at: null,
+          rate_limit_type: null,
+        })}
         busy={false}
         onToggle={() => {}}
         onStop={() => {}}
@@ -1300,5 +1799,91 @@ describe("RunView ↔ LimitWaitPanel wiring (PRD #35)", () => {
     // refetch the checkbox snaps back to the stale run on the next render, which
     // reads exactly like the write having failed.
     expect(live).toMatch(/setRunWaitOnLimit[\s\S]{0,200}refreshRun\(\)/);
+  });
+});
+
+describe("RunView ↔ QuestionPanel wiring (PRD #88 M2)", () => {
+  // Same instrument and the SAME acknowledged ceiling as the block above: this proves
+  // the text is present and not commented out, never that it runs. `{false && …}` still
+  // passes, and no comment-stripping reaches it. The panel's own behaviour — chips,
+  // index alignment, the escaped sinks — is covered by QuestionPanel.test.tsx against a
+  // real render; what cannot be reached from here is the PAGE, which needs a router, the
+  // auth context and a live WS stream to mount. Recorded so the next reader does not
+  // mistake four assertions for coverage of the journey.
+  const live = runViewSource
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("gates the panel on BOTH the parked status and a derived open question", () => {
+    // Either half alone is wrong in a real window: the status alone renders a composer
+    // with nothing to answer while the question message is still replaying, and the
+    // question alone keeps offering one after the run resumed (the `answer` message is
+    // emitted BEFORE the `running` state report).
+    const statusGate = live.indexOf('run.status === "awaiting_input" &&');
+    const questionGate = live.indexOf("openQuestion ? (");
+    const panel = live.indexOf("<QuestionPanel");
+    expect(statusGate).toBeGreaterThan(-1);
+    expect(questionGate).toBeGreaterThan(statusGate);
+    expect(panel).toBeGreaterThan(questionGate);
+  });
+
+  it("renders the UNREADABLE branch when the status is parked but the payload is not", () => {
+    // The else arm of that same conditional. Without it a parked run with an unusable
+    // payload renders nothing at all — no panel, no explanation — until the deadline.
+    const questionGate = live.indexOf("openQuestion ? (");
+    const fallback = live.indexOf("<UnreadableQuestion");
+    expect(fallback).toBeGreaterThan(questionGate);
+    expect(live).toContain('from "../components/QuestionPanel"');
+  });
+
+  it("passes canSteer to BOTH gate panels, so neither offers a Send that 404s", () => {
+    // PlanPanel's hole is PRE-EXISTING and unrelated to #88; fixing only the question
+    // composer would have left the identical hole one panel over.
+    const planPanel = live.indexOf("<PlanPanel");
+    const questionPanel = live.indexOf("<QuestionPanel");
+    expect(live.slice(planPanel, planPanel + 400)).toContain("canSteer={canSteer}");
+    expect(live.slice(questionPanel, questionPanel + 400)).toContain("canSteer={canSteer}");
+  });
+
+  it("derives the question from the feed rather than reading a DTO field", () => {
+    // PRD #88 D-L: no new column and no new DTO field. If this becomes `run.something`,
+    // web, Slack and the CLI stop sharing one derivation rule.
+    expect(live).toContain("deriveOpenQuestion(messages)");
+    expect(live).toContain('from "../lib/runQuestion"');
+  });
+
+  it("submits the answer under the `answer` steering kind", () => {
+    expect(live).toContain('submit("answer", body)');
+  });
+
+  it("announces the park from an ALWAYS-MOUNTED live region, outside the panel's gate", () => {
+    // The structural property is the whole fix and it is not the obvious shape: a region
+    // created in the same tick as its first message is typically silent, because
+    // assistive tech announces CHANGES to a region that already existed. Board.tsx's S5
+    // note records this and calls it "the worst kind of accessibility bug: the markup
+    // looks right". role="status" on QuestionPanel — which mounts WITH the park — would
+    // have been exactly that, and would have browser-tested as present.
+    //
+    // Same source-text instrument and same ceiling as above: it proves the text is there
+    // and uncommented, not that it runs. What it CAN prove structurally is placement, by
+    // where the region sits relative to the panel's conditional.
+    const region = live.indexOf('role="status" aria-live="polite"');
+    const panelGate = live.indexOf('run.status === "awaiting_input" &&');
+    expect(region).toBeGreaterThan(-1);
+    expect(panelGate).toBeGreaterThan(-1);
+    expect(region).toBeLessThan(panelGate);
+  });
+});
+
+describe("the park announcement does not live inside the panel (PRD #88 M2, a11y)", () => {
+  // An ABSENCE assertion, and deliberately on the OTHER file. It is the durable half of
+  // the pair above: someone tidying the announcement "closer to where it belongs" would
+  // move it into QuestionPanel, where it mounts with its own content and goes silent.
+  // Absence assertions are correct to ignore commented-out code (disabled code is not a
+  // second implementation), so this needs no comment-stripping.
+  it("QuestionPanel declares no live region of its own", () => {
+    expect(questionPanelSource).not.toContain("aria-live");
+    expect(questionPanelSource).not.toContain('role="status"');
   });
 });

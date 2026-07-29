@@ -701,7 +701,8 @@ func TestIsTerminalRunStatus(t *testing.T) {
 // map, and the count in its comment.
 func TestKnownRunStatusesMatchTheDocumentedCount(t *testing.T) {
 	// Bump BOTH this number and knownRunStatuses' comment when the CHECK widens.
-	const documented = 8
+	// 9 since PRD #88 added 'awaiting_input' alongside PRD #35's 'limit_wait'.
+	const documented = 9
 	if len(knownRunStatuses) != documented {
 		t.Errorf("len(knownRunStatuses) = %d, want %d — the map and the count its own comment states have drifted; one of the two was edited alone", len(knownRunStatuses), documented)
 	}

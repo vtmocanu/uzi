@@ -45,6 +45,11 @@ export type PlanVerdict =
   | { kind: "cancel" }
   | { kind: "revise"; feedback: string };
 
+/** The resolution of an ask_user park (PRD #88 M1). `cancel` is the same abort the
+ *  plan gate sees; it is question-identity-exempt and always wins. */
+export type AnswerVerdict =
+  { kind: "answer"; answers: string[] } | { kind: "cancel" };
+
 export interface SteeringOptions {
   /** Injectable sleep so tests can drive the poll loop deterministically. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -57,9 +62,47 @@ export interface SteeringOptions {
 
 /** Feed notices for events discarded because they were written against a plan version
  *  that has since been revised (PRD #41 Decision 3). */
-const STALE_APPROVE_NOTICE = "Approval ignored — the plan changed; re-send if you still want it.";
-const STALE_REJECT_NOTICE = "Rejection ignored — the plan changed; re-send if you still want it.";
-const STALE_REVISE_NOTICE = "Feedback ignored — it was written against an older plan version; re-send it.";
+const STALE_APPROVE_NOTICE =
+  "Approval ignored — the plan changed; re-send if you still want it.";
+const STALE_REJECT_NOTICE =
+  "Rejection ignored — the plan changed; re-send if you still want it.";
+const STALE_REVISE_NOTICE =
+  "Feedback ignored — it was written against an older plan version; re-send it.";
+/** PRD #88: an answer naming a question that is no longer the open one. The common
+ *  cause is benign — a Slack reply to question N arriving after the lead asked N+1. */
+const STALE_ANSWER_NOTICE =
+  "Answer ignored — it was written against an earlier question; re-send it.";
+
+/**
+ * Parse an `answer` input body (PRD #88 M1): JSON `{ question_id, answers }`.
+ *
+ * Rejects rather than defaulting, deliberately unlike parseAgentSelection's
+ * fallback-to-`own`. There, a fallback picks a genuinely safe default. Here the
+ * payload's entire job is to say WHICH question is being answered, so an
+ * unidentifiable answer has no safe reading — accepting one would resolve whatever
+ * question happened to be open with text written for a different one.
+ */
+function parseAnswerBody(
+  body: string | null | undefined,
+): { answers: string[]; questionId: string } | undefined {
+  if (!body || !body.trim()) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!raw || typeof raw !== "object") return undefined;
+  const rec = raw as Record<string, unknown>;
+  const questionId =
+    typeof rec["question_id"] === "string" ? rec["question_id"].trim() : "";
+  if (questionId === "") return undefined;
+  const rawAnswers = rec["answers"];
+  const answers = Array.isArray(rawAnswers)
+    ? rawAnswers.filter((a): a is string => typeof a === "string")
+    : [];
+  return { answers, questionId };
+}
 
 export class SteeringChannel {
   private stopped = false;
@@ -78,7 +121,24 @@ export class SteeringChannel {
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
   private readonly reviseQueue: { feedback: string; epoch: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. */
-  private gateWaiter: { epoch: number; resolve: (v: PlanVerdict) => void } | undefined;
+  private gateWaiter:
+    { epoch: number; resolve: (v: PlanVerdict) => void } | undefined;
+  /** An answer that arrived before the executor asked for one (no lost wakeup),
+   *  stamped with the QUESTION ID it named. Latest-wins if several land before a read.
+   *
+   *  Deliberately a SEPARATE slot from bufferedVerdict, and the waiter below is a
+   *  separate slot from gateWaiter (PRD #88). The plan gate and a mid-run question are
+   *  mutually exclusive today, but M4 puts a pre-run ask_user adjacent to the plan
+   *  gate, and one shared slot would then have two owners. Nothing about the answer
+   *  path touches gateEpoch either: Runner.gatePlan decides "first gate does not bump"
+   *  from its own gatedRuns set rather than from the epoch value, so a question that
+   *  bumped the gate epoch would shift the first plan gate off epoch 0 while that set
+   *  still said "first gate", and a verdict already queued when the gate opened would
+   *  go stale. */
+  private answerBuffer: { answers: string[]; questionId: string } | undefined;
+  /** The answer waiter parked on awaitAnswer, with the question id it is waiting for. */
+  private answerWaiter:
+    { questionId: string; resolve: (v: AnswerVerdict) => void } | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
 
@@ -161,6 +221,51 @@ export class SteeringChannel {
     return this.awaitGateEvent(this.gateEpoch);
   }
 
+  /**
+   * Resolve once the answer to question `questionId` is known (PRD #88 M1). If one
+   * already arrived it resolves immediately (buffered — the lost-wakeup case is real
+   * here, because `/inputs` is consume-on-read and the poll loop may consume the
+   * answer between the park being decided and this being called).
+   *
+   * Keyed on the question's IDENTITY, not on an epoch or an arrival ordinal, and that
+   * is the whole point rather than a detail. A worker death re-queues the run; the
+   * resumed worker re-parks on the same question with the same id, so an answer the
+   * user submitted before the death still matches and is honoured. Every
+   * when-based alternative rejects it — silently, and through an event the user
+   * neither caused nor can see.
+   */
+  awaitAnswer(questionId: string): Promise<AnswerVerdict> {
+    const v = this.takeAnswerEvent(questionId);
+    if (v) return Promise.resolve(v);
+    return new Promise<AnswerVerdict>((resolve) => {
+      this.answerWaiter = { questionId, resolve };
+    });
+  }
+
+  /** Consume the answer for `questionId` if one is due, discarding a buffered answer
+   *  that names a different question (with a feed notice). */
+  private takeAnswerEvent(questionId: string): AnswerVerdict | undefined {
+    // Cancel is sticky and question-exempt, exactly as it is for the plan gate.
+    if (this.cancelled) return { kind: "cancel" };
+    if (this.answerBuffer) {
+      const { answers, questionId: qid } = this.answerBuffer;
+      this.answerBuffer = undefined;
+      if (qid === questionId) return { kind: "answer", answers };
+      this.notify?.(STALE_ANSWER_NOTICE);
+    }
+    return undefined;
+  }
+
+  /** After routing an input, deliver to a parked answer waiter if one is now due. */
+  private serviceAnswer(): void {
+    if (!this.answerWaiter) return;
+    const v = this.takeAnswerEvent(this.answerWaiter.questionId);
+    if (!v) return;
+    const w = this.answerWaiter;
+    this.answerWaiter = undefined;
+    w.resolve(v);
+  }
+
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
   pullFollowUp(): string | undefined {
     return this.followUps.shift();
@@ -188,7 +293,9 @@ export class SteeringChannel {
       this.bufferedVerdict = undefined;
       if (e === epoch) return verdict;
       // Verdict-specific notice so the feed reads correctly for either kind.
-      this.notify?.(verdict.kind === "reject" ? STALE_REJECT_NOTICE : STALE_APPROVE_NOTICE);
+      this.notify?.(
+        verdict.kind === "reject" ? STALE_REJECT_NOTICE : STALE_APPROVE_NOTICE,
+      );
     }
     return undefined;
   }
@@ -209,10 +316,16 @@ export class SteeringChannel {
         // The body carries the JSON-encoded agent selection (PRD #37). Parse it
         // here; the executor resolves it against the detected roster. A malformed
         // body parses to `invalid`, which the executor sends to `own`, never repo.
-        this.bufferedVerdict = { verdict: { kind: "approve", selection: parseAgentSelection(body) }, epoch: this.gateEpoch };
+        this.bufferedVerdict = {
+          verdict: { kind: "approve", selection: parseAgentSelection(body) },
+          epoch: this.gateEpoch,
+        };
         break;
       case "reject_plan":
-        this.bufferedVerdict = { verdict: { kind: "reject", reason: body?.trim() || "plan rejected" }, epoch: this.gateEpoch };
+        this.bufferedVerdict = {
+          verdict: { kind: "reject", reason: body?.trim() || "plan rejected" },
+          epoch: this.gateEpoch,
+        };
         break;
       case "revise_plan":
         // PRD #41: enqueue the feedback for a revision round. Empty feedback is ignored
@@ -220,7 +333,11 @@ export class SteeringChannel {
         // inputs route, so precedence (a current-epoch revise beats a buffered approve) is
         // applied across the WHOLE batch — a [approve, revise] batch yields the revision
         // round, not a silent drop of the trailing revise.
-        if (body && body.trim()) this.reviseQueue.push({ feedback: body.trim(), epoch: this.gateEpoch });
+        if (body && body.trim())
+          this.reviseQueue.push({
+            feedback: body.trim(),
+            epoch: this.gateEpoch,
+          });
         break;
       case "cancel":
         if (!this.cancel.signal.aborted) this.cancel.abort();
@@ -229,6 +346,26 @@ export class SteeringChannel {
       case "follow_up":
         if (body && body.trim()) this.followUps.push(body.trim());
         break;
+      case "answer": {
+        // PRD #88. Reaching the default arm instead would DESTROY the answer: /inputs
+        // is consume-on-read, so the server has already marked this row consumed and
+        // will never return it again. There would be no error, no retry, and no
+        // symptom other than a run that appears to have been ignored by its user.
+        //
+        // The body is the JSON the API validated and re-encoded (it never stores the
+        // client's raw text), so a parse failure here means a wire-shape mismatch
+        // rather than user input — log it and drop, the same way a malformed
+        // approve_plan selection degrades rather than throwing inside the poll loop.
+        const parsed = parseAnswerBody(body);
+        if (!parsed) {
+          this.log.warn("steering: ignoring malformed answer body", {
+            run_id: this.runId,
+          });
+          break;
+        }
+        this.answerBuffer = parsed;
+        break;
+      }
       default:
         this.log.warn("steering: ignoring unknown input kind", { kind });
     }
@@ -245,8 +382,14 @@ export class SteeringChannel {
         // would then sit un-consumed (a silent drop that still burned a server cap slot).
         // One service call per batch evaluates full precedence (revise beats approve) once.
         this.serviceGate();
+        // Same batch-then-service-once position, for the same reason (PRD #88): an
+        // answer that lands in this batch may satisfy a parked question.
+        this.serviceAnswer();
       } catch (err) {
-        this.log.warn("steering: input poll failed", { run_id: this.runId, error: errMessage(err) });
+        this.log.warn("steering: input poll failed", {
+          run_id: this.runId,
+          error: errMessage(err),
+        });
       }
       if (this.stopped) break;
       await this.sleepFn(this.pollMs);
@@ -257,9 +400,7 @@ export class SteeringChannel {
 /** What the chat park loop should do next: answer a message, idle-complete, or end
  *  (an explicit End chat, or worker shutdown). */
 export type ChatInput =
-  | { kind: "message"; text: string }
-  | { kind: "idle" }
-  | { kind: "ended" };
+  { kind: "message"; text: string } | { kind: "idle" } | { kind: "ended" };
 
 /** The input source a ChatRunner parks on between turns (PRD #39 Decision 2). The
  *  real one is ChatSteering; tests inject a fake that yields scripted ChatInputs. */
@@ -297,7 +438,9 @@ export class ChatSteering implements ChatInputSource {
   private stopped = false;
   private loop: Promise<void> | undefined;
   private readonly followUps: string[] = [];
-  private waiter: { resolve: (i: ChatInput) => void; idleMs: number; parkedAt: number } | undefined;
+  private waiter:
+    | { resolve: (i: ChatInput) => void; idleMs: number; parkedAt: number }
+    | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
 
@@ -333,8 +476,13 @@ export class ChatSteering implements ChatInputSource {
    * parks exactly once per turn.
    */
   awaitFollowUp(idleMs: number): Promise<ChatInput> {
-    if (this.followUps.length) return Promise.resolve<ChatInput>({ kind: "message", text: this.followUps.shift()! });
-    if (this.cancel.signal.aborted || this.stopped) return Promise.resolve<ChatInput>({ kind: "ended" });
+    if (this.followUps.length)
+      return Promise.resolve<ChatInput>({
+        kind: "message",
+        text: this.followUps.shift()!,
+      });
+    if (this.cancel.signal.aborted || this.stopped)
+      return Promise.resolve<ChatInput>({ kind: "ended" });
     return new Promise<ChatInput>((resolve) => {
       this.waiter = { resolve, idleMs, parkedAt: this.now() };
     });
@@ -357,7 +505,9 @@ export class ChatSteering implements ChatInputSource {
         break;
       default:
         // approve_plan / reject_plan never occur for a chat (no plan gate).
-        this.log.warn("chat steering: ignoring unexpected input kind", { kind });
+        this.log.warn("chat steering: ignoring unexpected input kind", {
+          kind,
+        });
     }
   }
 
@@ -366,9 +516,12 @@ export class ChatSteering implements ChatInputSource {
    *  before idle can complete the chat. */
   private serviceWaiter(): void {
     if (!this.waiter) return;
-    if (this.cancel.signal.aborted || this.stopped) return this.settle({ kind: "ended" });
-    if (this.followUps.length) return this.settle({ kind: "message", text: this.followUps.shift()! });
-    if (this.now() - this.waiter.parkedAt >= this.waiter.idleMs) this.settle({ kind: "idle" });
+    if (this.cancel.signal.aborted || this.stopped)
+      return this.settle({ kind: "ended" });
+    if (this.followUps.length)
+      return this.settle({ kind: "message", text: this.followUps.shift()! });
+    if (this.now() - this.waiter.parkedAt >= this.waiter.idleMs)
+      this.settle({ kind: "idle" });
   }
 
   private async pollLoop(): Promise<void> {
@@ -377,7 +530,10 @@ export class ChatSteering implements ChatInputSource {
         const inputs = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
       } catch (err) {
-        this.log.warn("chat steering: input poll failed", { run_id: this.runId, error: errMessage(err) });
+        this.log.warn("chat steering: input poll failed", {
+          run_id: this.runId,
+          error: errMessage(err),
+        });
       }
       // Route THEN service: a follow_up consumed this cycle is buffered above and
       // delivered here, before idle is tested (task #8).

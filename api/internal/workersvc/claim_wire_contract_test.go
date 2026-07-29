@@ -104,11 +104,17 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			IdleTimeoutSeconds: 600,
 			MaxIterations:      5,
 			PlanMaxRevisions:   3, // PRD #41 plan-revision cap
-			DefaultModel:       strptr("sonnet"),
-			SkillMaxBytes:      65536,
-			SkillsMaxPerRun:    32,
-			ToolPackages:       []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
-			RepoDevboxOptIn:    false,                          // M5 wires the toggle; false until then
+			// PRD #88 clarification bounds. Pinned to the shipped defaults rather
+			// than left zero: the golden IS the wire contract, and a recorded 0
+			// would read as "this run may ask no questions and its answer deadline
+			// is already past" to anyone implementing against it.
+			QuestionMax:            5,
+			QuestionTimeoutSeconds: 86400,
+			DefaultModel:           strptr("sonnet"),
+			SkillMaxBytes:          65536,
+			SkillsMaxPerRun:        32,
+			ToolPackages:           []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
+			RepoDevboxOptIn:        false,                          // M5 wires the toggle; false until then
 		},
 	}
 }

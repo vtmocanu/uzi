@@ -42,11 +42,11 @@ var knownRunEventTypes = map[string]struct{}{
 }
 
 // knownRunStatuses is closed because the database enforces it: runs.status carries a
-// CHECK constraint over exactly these eight values (runs_status_check, declared
-// inline in 00020_workers_runs.sql and widened with 'limit_wait' by PRD #35's
-// migration). A value outside the set cannot be stored, so one arriving on the wire
-// means the server is newer than this binary — which is precisely when it must not be
-// trusted to mean "active".
+// CHECK constraint over exactly these NINE values (runs_status_check, declared inline
+// in 00020_workers_runs.sql, widened with 'limit_wait' by PRD #35 and with
+// 'awaiting_input' by PRD #88). A value outside the set cannot be stored, so one
+// arriving on the wire means the server is newer than this binary — which is precisely
+// when it must not be trusted to mean "active".
 //
 // THIS MAP MUST BE WIDENED IN THE SAME COMMIT AS THE CHECK. It is not a display
 // concern: NormalizeRunEvent rewrites any status outside it to RunStatusUnknown at the
@@ -78,15 +78,19 @@ var knownRunEventTypes = map[string]struct{}{
 var knownRunStatuses = map[string]struct{}{
 	"queued": {}, "claimed": {}, "running": {}, "awaiting_approval": {},
 	// limit_wait (PRD #35): parked until the owner's Anthropic usage window reopens.
-	// NON-terminal — it is deliberately absent from terminalRunStatuses below.
-	"limit_wait": {},
-	"completed":  {}, "failed": {}, "cancelled": {},
+	// awaiting_input (PRD #88): parked on a clarification question the owner must
+	// answer. BOTH are NON-terminal and both are deliberately absent from
+	// terminalRunStatuses below.
+	"limit_wait": {}, "awaiting_input": {},
+	"completed": {}, "failed": {}, "cancelled": {},
 }
 
 // terminalRunStatuses are the three a run never leaves. Verified against the requeue
-// path, which is scoped WHERE status IN ('claimed','running','awaiting_approval')
-// (store/queries/runtime.sql RequeueRunsOfStaleWorkers / RequeueWorkerRuns) — so a
-// terminal run is never returned to 'queued' and the reconcile below can stop.
+// path, which is scoped WHERE status IN ('claimed','running','awaiting_approval',
+// 'awaiting_input') (store/queries/runtime.sql RequeueRunsOfStaleWorkers /
+// RequeueWorkerRuns) — so a terminal run is never returned to 'queued' and the
+// reconcile below can stop. PRD #88 widened that predicate rather than narrowing it,
+// so the property this set relies on is unchanged.
 var terminalRunStatuses = map[string]struct{}{
 	"completed": {}, "failed": {}, "cancelled": {},
 }

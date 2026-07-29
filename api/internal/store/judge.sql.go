@@ -16,7 +16,7 @@ const createJudgeRun = `-- name: CreateJudgeRun :one
 
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status)
 VALUES ($1, 'judge', $2, $3, $4, 'queued')
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id
 `
 
 type CreateJudgeRunParams struct {
@@ -104,12 +104,13 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 		&i.RetryNotBefore,
 		&i.LimitWaitCount,
 		&i.RateLimitType,
+		&i.OpenQuestionID,
 	)
 	return i, err
 }
 
 const getActiveJudgeRunForWorkerTarget = `-- name: GetActiveJudgeRunForWorkerTarget :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id FROM runs
 WHERE worker_id = $1
   AND kind = 'judge'
   AND target_run_id = $2
@@ -187,6 +188,7 @@ func (q *Queries) GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg GetA
 		&i.RetryNotBefore,
 		&i.LimitWaitCount,
 		&i.RateLimitType,
+		&i.OpenQuestionID,
 	)
 	return i, err
 }
@@ -259,7 +261,7 @@ func (q *Queries) ListRecommendationsForReview(ctx context.Context, reviewID uui
 }
 
 const listRunInputsForRun = `-- name: ListRunInputsForRun :many
-SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id FROM run_user_inputs
 WHERE run_id = $1
 ORDER BY id ASC
 LIMIT $2
@@ -270,8 +272,13 @@ type ListRunInputsForRunParams struct {
 	Lim   int32     `json:"lim"`
 }
 
-// The steering log (follow-ups + plan verdicts + cancels) of a run, oldest first,
-// capped by @lim — part of the judge trace (Decision 3).
+// The steering log (follow-ups + plan verdicts + cancels + PRD #88 answers) of a run,
+// oldest first, capped by @lim — part of the judge trace (Decision 3).
+//
+// The column list is the table's FULL set (question_id, PRD #88, included), which is
+// what keeps sqlc returning the shared RunUserInput model rather than minting a
+// query-specific row type — dropping one re-types this query and breaks the
+// workersvc.Store interface and its fakes.
 func (q *Queries) ListRunInputsForRun(ctx context.Context, arg ListRunInputsForRunParams) ([]RunUserInput, error) {
 	rows, err := q.db.Query(ctx, listRunInputsForRun, arg.RunID, arg.Lim)
 	if err != nil {
@@ -288,6 +295,7 @@ func (q *Queries) ListRunInputsForRun(ctx context.Context, arg ListRunInputsForR
 			&i.Body,
 			&i.ConsumedAt,
 			&i.CreatedAt,
+			&i.QuestionID,
 		); err != nil {
 			return nil, err
 		}

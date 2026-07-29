@@ -23,6 +23,20 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ### Added
 
+- **An agent can now stop mid-run (or before planning) and ask you a
+  question**, instead of guessing or stalling on something it shouldn't
+  decide alone. The run parks with a **needs your answer** badge, the
+  question lands in the run feed with any suggested options, and you answer
+  from the run view's composer, a reply in the run's Slack thread, or `uzi
+  run answer <id>` — all three read the same open question off the feed, so
+  no surface invents a question the others don't have. Left unanswered, the run fails
+  closed ("clarification timed out") rather than hanging forever; both the
+  answer deadline and the per-run question cap are held in worker memory and
+  reset on a worker-death requeue, so the honest worst case over a run's
+  life is 48h and 10 questions on the defaults, not 24h and 5. Autopilot
+  runs never park on a question — they proceed on their own best judgment
+  and record the assumption in the feed instead (PRD #88).
+
 - **The footer version badge is now a build-info popover.** Hover, focus or tap it to see the
   release version, the project's founding date, age (computed client-side, so it stays correct
   between releases), and process uptime, plus, on a release image built in CI, the source commit,

@@ -47,6 +47,8 @@ import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
+import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
+import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
 import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
@@ -365,6 +367,33 @@ export function RunView() {
   // accumulator. Feeds the usage panel + the per-phase finish lines in the feed.
   const usage = useMemo(() => deriveRunUsage(messages), [messages]);
 
+  // PRD #88: the open clarification question, derived from the feed by seq exactly as
+  // derivePlanRevision derives the gate state — there is NO DTO field for it (D-L), so
+  // web, Slack and the CLI all read the same rule off the same messages.
+  const openQuestion = useMemo(() => deriveOpenQuestion(messages), [messages]);
+
+  // A parked run is announced to assistive tech. Measured in the browser: without this a
+  // screen-reader user reading the feed gets NO signal that the run stopped and is now
+  // waiting on them — it just goes quiet until the 24h deadline fails it.
+  //
+  // The region is rendered UNCONDITIONALLY below and only its CONTENT changes here. That
+  // is the whole fix and it is not the obvious shape: a region created in the same tick
+  // as its first message is typically silent, because assistive tech announces CHANGES to
+  // a region that already existed. Board.tsx's S5 note records this and calls it "the
+  // worst kind of accessibility bug: the markup looks right". Putting role="status" on
+  // the QuestionPanel itself — which mounts with the park — would have been exactly that.
+  const [parkAnnounce, setParkAnnounce] = useState("");
+  const parked = run?.status === "awaiting_input" ? (openQuestion?.question.questionId ?? "") : "";
+  useEffect(() => {
+    // Keyed on the question IDENTITY, so a second question re-announces while a re-render
+    // of the same park stays quiet.
+    if (parked === "") {
+      setParkAnnounce("");
+      return;
+    }
+    setParkAnnounce("The agent is asking you a question. The run is parked until you answer.");
+  }, [parked]);
+
   if (!run) {
     return (
       <div className="space-y-4">
@@ -497,6 +526,15 @@ export function RunView() {
         }
       />
 
+      {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
+          parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
+          because the panel below already carries the message for everyone else. The
+          effect fires after mount, so the region exists before its content changes even
+          on a page load that arrives at an already-parked run. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {parkAnnounce}
+      </div>
+
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
 
@@ -602,12 +640,38 @@ export function RunView() {
           run={run}
           messages={messages}
           busy={busy}
+          canSteer={canSteer}
           onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
           onReject={(reason) => act(() => submit("reject_plan", reason))}
           onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
           onCancel={() => act(() => submit("cancel"))}
         />
       )}
+
+      {/* PRD #88: the clarification park. Gated on BOTH the status and a derived open
+          question: the status alone would render a composer with nothing to answer in
+          the window before the `question` message replays (the worker flushes it first,
+          but a reconnecting client can read the status back first), and the question
+          alone would keep offering a composer after the run resumed. */}
+      {run.status === "awaiting_input" &&
+        (openQuestion ? (
+          <QuestionPanel
+            open={openQuestion}
+            busy={busy}
+            canSteer={canSteer}
+            onAnswer={(body) => act(() => submit("answer", body))}
+            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+          />
+        ) : (
+          // Parked, but the question is unusable — no question_id, or nothing renderable.
+          // Previously this rendered NOTHING: the run sat at "needs your answer" with no
+          // panel and no explanation until the deadline failed it, and an absent
+          // affordance reads as "not loaded yet", so the reasonable response was to wait.
+          <UnreadableQuestion
+            busy={busy}
+            onCancel={canSteer ? () => act(() => submit("cancel")) : undefined}
+          />
+        ))}
 
       {/* Read-only record of which agents the run used, once a selection is made
           (at the gate or by an autopilot default). Shown for a live/terminal run;
@@ -757,6 +821,7 @@ export function PlanPanel({
   run,
   messages = [],
   busy,
+  canSteer = true,
   onApprove,
   onReject,
   onRequestChanges,
@@ -768,6 +833,15 @@ export function PlanPanel({
   // can omit it — the derivation degrades to v1 / revision 0 of 3.
   messages?: RunMessage[];
   busy: boolean;
+  // False for a NON-OWNER viewer. PRE-EXISTING and unrelated to PRD #88: POST /inputs is
+  // user-scoped, so a non-owner admin — who can legitimately OPEN this owner-or-admin run
+  // view — got an Approve button that 404s. useRunStream states the rule ("never a broken
+  // Send that 404s") and SteerQueueCard already obeyed it; this panel never did. Fixed
+  // alongside the question composer because fixing only the newer one would have left the
+  // identical hole one panel over. Defaults true so an owner is never gated by an absent
+  // prop, and it hides the ACTIONS only — the plan body stays readable, which is the whole
+  // reason a non-owner admin opens this page.
+  canSteer?: boolean;
   onApprove: (selection: AgentSelectionInput) => void;
   onReject: (reason: string) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
@@ -833,9 +907,11 @@ export function PlanPanel({
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[11px] text-faint">{roundsLabel}</span>
-            <Button variant="danger" disabled={busy} onClick={() => onCancel?.()}>
-              Cancel run
-            </Button>
+            {canSteer && (
+              <Button variant="danger" disabled={busy} onClick={() => onCancel?.()}>
+                Cancel run
+              </Button>
+            )}
           </div>
         </div>
         <div className="p-4">
@@ -855,18 +931,31 @@ export function PlanPanel({
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">
-            {revised ? "Updated plan awaiting your approval" : "Plan awaiting your approval"}
+            {/* The HEADING is conditional on canSteer for the same reason the subtitle
+                below is. Leaving it unconditional put "Plan awaiting your approval"
+                directly above "Only they can approve or reject it" for a non-owner —
+                a card contradicting itself on adjacent lines. QuestionPanel's non-owner
+                branch changes both, and this is the older panel's half of that fix. */}
+            {!canSteer
+              ? revised
+                ? "Updated plan awaiting the owner's approval"
+                : "Plan awaiting the owner's approval"
+              : revised
+                ? "Updated plan awaiting your approval"
+                : "Plan awaiting your approval"}
             <VersionChip label={`v${currentVersion}`} />
           </h2>
           <p className="text-xs text-muted">
-            {requesting
-              ? "Describe what should change; the other actions return if you cancel."
-              : "The run is parked until you decide. Agent choice locks in on approval."}
+            {!canSteer
+              ? "The run is parked until its owner decides. Only they can approve or reject it."
+              : requesting
+                ? "Describe what should change; the other actions return if you cancel."
+                : "The run is parked until you decide. Agent choice locks in on approval."}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-faint">{roundsLabel}</span>
-          {!disclosing && (
+          {canSteer && !disclosing && (
             <div className="flex gap-2">
               <Button disabled={busy} onClick={() => onApprove(selection)}>
                 {approveLabel}
@@ -882,7 +971,12 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
-        <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+        {/* The picker exists to shape the approve verdict, so it is an action surface:
+            shown only to someone who can approve. The locked-in roster is a separate,
+            read-only card (AgentRosterSummary) once the run is past the gate. */}
+        {canSteer && (
+          <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+        )}
 
         {run.plan_md ? (
           <div className="max-h-96 overflow-auto rounded-lg border border-edge bg-surface p-3">
