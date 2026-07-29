@@ -303,6 +303,7 @@ type Run struct {
 	RetryNotBefore        pgtype.Timestamptz `json:"retry_not_before"`
 	LimitWaitCount        int32              `json:"limit_wait_count"`
 	RateLimitType         pgtype.Text        `json:"rate_limit_type"`
+	ReviseCount           int32              `json:"revise_count"`
 }
 
 type RunMessage struct {

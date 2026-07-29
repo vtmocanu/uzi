@@ -1271,25 +1271,64 @@ SELECT count(*) FROM run_user_inputs WHERE run_id = @run_id AND kind = 'revise_p
 
 -- name: CreateRunReviseInputIfUnderCap :one
 -- Atomic capped enqueue of a revise_plan (PRD #41): insert ONLY while the run is still
--- under its lifetime revision cap, collapsing the count and the insert into ONE
--- statement so two concurrent submits (e.g. web + Slack on the same single-owner gate)
--- cannot both read N-1 and both insert an N+1th row (a count-then-insert TOCTOU). The
--- run row is taken FOR UPDATE in a leading CTE and the cap count reads through it (the
--- count filters on the locked id), so callers serialize on the run: a second caller
--- blocks until the first commits, then counts including the first's row. NO consumed_at
--- filter — a consumed revise still counts (same lifetime semantics as
--- CountRunReviseInputs). No row returned = the cap is already reached (or the run row is
--- gone); the caller maps that to ErrReviseCapReached.
-WITH locked AS (
-    SELECT r.id AS run_id FROM runs r WHERE r.id = @run_id FOR UPDATE
+-- under its lifetime revision cap, so two concurrent submits (e.g. web + Slack on the
+-- same single-owner gate) cannot both read N-1 and both insert an N+1th row (a
+-- count-then-insert TOCTOU). NO consumed_at filter — a consumed revise still counts
+-- (same lifetime semantics as CountRunReviseInputs). No row returned = the cap is
+-- already reached (or the run row is gone); the caller maps that to
+-- ErrReviseCapReached.
+--
+-- 🔴 THE CAP PREDICATE MUST REFERENCE ONLY COLUMNS OF THE `runs` ROW ITSELF.
+-- ANY SUBQUERY IN THAT WHERE REINTRODUCES ISSUE #106.
+--
+-- That is the entire mechanism, so read it before simplifying this back. Under READ
+-- COMMITTED a statement's snapshot is taken when the statement starts. When an UPDATE
+-- unblocks on a row lock, EvalPlanQual re-evaluates the qual against the NEW VERSION
+-- OF THE LOCKED ROW — that is what makes `revise_count < @max_revisions` see the
+-- winner's bump — but a subquery inside that same qual still evaluates under the
+-- ORIGINAL statement snapshot. Postgres documents the updating command as seeing an
+-- inconsistent snapshot: the effects of concurrent commands on the rows it is
+-- updating, but not on other rows.
+--
+-- This query previously did exactly that: it took the `runs` row FOR UPDATE in a
+-- leading CTE and counted `run_user_inputs`, a DIFFERENT table, in the INSERT's WHERE.
+-- The lock did not cover the count at all, so a caller that blocked still counted N-1
+-- and inserted. Measured 100/100 over-cap with the interleave forced (#106), and the
+-- over-cap row is DURABLE. Swapping the FOR UPDATE for a real `UPDATE runs ...
+-- RETURNING id` does NOT fix it and was measured failing too: the snapshot is the
+-- problem, not the lock strength. Only moving the counted fact onto the locked row
+-- fixes it.
+--
+-- 🔴 AND IT MUST NOT SET updated_at, which is a deliberate deviation from the house
+-- style of CreateApprovePlanInput / CreateStopVerdictInput. ListActiveRunsForHealth
+-- includes awaiting_approval and selects updated_at; healthTargetFor
+-- (workersvc/health.go) times the approval_idle flag off it. A revise lands WHILE the
+-- run is awaiting_approval, so a bump here would silently move when a health flag
+-- fires. A stop verdict drives the run terminal, where healthTargetFor returns
+-- healthOK, so ITS bump cannot change a flag outcome; a revise's can.
+--
+-- runs.revise_count is the cap's source of truth (00092); count(*) of revise_plan rows
+-- is the same fact in its other representation, and CountRunReviseInputs still reads
+-- that one on purpose — a reporting view that read the counter would assert only that
+-- the counter equals itself. TestReviseCountMatchesRowCountLiveDB pins the two
+-- together, and its load-bearing case is that a REFUSED insert must move neither: put
+-- the cap predicate on the INSERT instead of the UPDATE and the counter runs away
+-- while the rows sit at cap, silently shrinking the run's remaining budget on every
+-- rejected attempt.
+--
+-- Every column reference in the UPDATE is qualified with `runs.`, which the plain
+-- shape does not require of Postgres but sqlc does: unqualified, its resolver sees
+-- `id` in scope from both `runs` and the INSERT's target `run_user_inputs` and fails
+-- the whole file with "column reference \"id\" is ambiguous" — attributed, confusingly,
+-- to the NEXT query in the file rather than to this one.
+WITH bumped AS (
+    UPDATE runs SET revise_count = runs.revise_count + 1
+    WHERE runs.id = @run_id AND runs.revise_count < @max_revisions::int
+    RETURNING runs.id AS run_id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
-SELECT locked.run_id, 'revise_plan', @body
-FROM locked
-WHERE (
-    SELECT count(*) FROM run_user_inputs rui
-    WHERE rui.run_id = locked.run_id AND rui.kind = 'revise_plan'
-) < @max_revisions::int
+SELECT bumped.run_id, 'revise_plan', @body
+FROM bumped
 RETURNING *;
 
 -- name: CreateApprovePlanInput :one

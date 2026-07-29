@@ -1,52 +1,44 @@
 package store_test
 
-// A DETERMINISTIC REPRODUCTION OF GITLAB ISSUE #106 — the plan-revision cap can be
-// breached by two concurrent submits, and the breach is DURABLE.
+// THE PERMANENT REGRESSION GATE FOR GITLAB ISSUE #106 — the plan-revision cap could be
+// breached by two concurrent submits, and the breach was DURABLE.
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────┐
-// │ TestReviseCapForcedInterleaveIssue106 IS EXPECTED TO FAIL until #106 is fixed.   │
-// │ A red from it is the artifact working, not a broken test.                        │
+// │ THESE TESTS MUST PASS. #106 is FIXED (2026-07-29). A red here is a REGRESSION,   │
+// │ not the artifact working — it means the cap is breachable again.                 │
 // └─────────────────────────────────────────────────────────────────────────────────┘
 //
-// How to run it:
+// This file was written while #106 was open, when the forced test was EXPECTED TO FAIL
+// and both names deliberately avoided the LiveDB suffix so it could not redden CI. The
+// fix inverted both of those, exactly as the file's own instructions said it should: the
+// tests are renamed to ...LiveDB and the UZI_REPRO_106 opt-in is gone, so they now run
+// in `test:api-store-it` on every pipeline and in `e2e/run-store-it.sh` locally. Not one
+// assertion changed — the forced test always asserted the CORRECT behaviour (`landed ==
+// 1`, `persisted <= cap`), so the fix turned it green on its own terms.
 //
-//	UZI_REPRO_106=1 UZI_TEST_DATABASE_URL=postgres://... \
-//	  go test -count=1 -v -p 1 -run 'Issue106$' ./internal/store/...
+// # WHY THIS FILE STILL EXISTS, WHICH IS THE WHOLE POINT
 //
-// Both tests skip unless UZI_REPRO_106 is set, so they never fire during an ordinary
-// `go test ./...` — including for someone who has exported UZI_TEST_DATABASE_URL, which
-// this repo documents as a hazard. Without that guard they would hand that person a
-// mystifying red from a test that is supposed to fail.
-//
-// # WHY THESE NAMES DO NOT END IN LiveDB
-//
-// That suffix is not decoration: it is the selector for both live-DB runners
-// (`e2e/run-store-it.sh` and CI's `test:api-store-it` both run `-run 'LiveDB$'`). CI
-// additionally asserts `if [ "$ran" -eq 0 ] || [ "$skipped" -gt 0 ]; then exit 1`, so a
-// LiveDB-suffixed name here would redden the pipeline BOTH ways — by skipping (the skip
-// assertion fires) or by running (it fails by design). Renaming these without reading
-// that job is how this file turns into a red pipeline.
-//
-// # WHEN #106 IS FIXED: RENAME THIS FILE'S TESTS. DO NOT DELETE THEM.
-//
-// Deleting it is the tempting move and it is the wrong one. The shipped
+// Deleting it after the fix is the tempting move and it is the wrong one. The shipped
 // TestCreateRunReviseInputIfUnderCapAtomicLiveDB hopes for the interleave instead of
 // forcing it, and it was measured catching this defect in roughly 1 run in 50 — so a
-// green from that test cannot verify a fix, while this file reproduces the breach on
-// every single run. It is the only thing in the repo that can tell a real fix from a
-// lucky one, and that is worth more AFTER the fix than before it.
+// green from THAT test cannot distinguish a fix from luck, while this file exercises the
+// racing interleave on every single run. Before the fix it reproduced the breach 100/100
+// with the interleave forced, where the shipped test caught it about 1 in 50. It is the
+// only thing in the repo that can tell a real fix from a lucky one, and it is worth more
+// AFTER the fix than it was before.
 //
-// Two edits promote it to the CI regression gate:
+// Keep BOTH assertions. They are not redundant: a fix that merely made the losing caller
+// retry could satisfy `landed == 1` while still leaving an over-cap row behind, and only
+// the `persisted` assertion sees that.
 //
-//  1. rename both tests to end in LiveDB (e.g. TestReviseCapForcedInterleaveLiveDB), and
-//  2. drop the UZI_REPRO_106 guard in repro106Open, leaving the ordinary
-//     UZI_TEST_DATABASE_URL skip that every other live-DB test uses.
+// # WHAT A RED HERE MEANS NOW
 //
-// Then invert the forced test's expectation: it currently asserts the CORRECT behaviour
-// (`landed == 1`, `persisted <= cap`) and fails, so a fix turns it green with no
-// assertion change. Keep BOTH assertions. They are not redundant: a fix that merely makes
-// the losing caller retry could satisfy `landed == 1` while still leaving an over-cap row
-// behind, and only the `persisted` assertion sees that.
+// The cap predicate has been moved back off the `runs` row, or a second writer of
+// revise_plan rows has been added that does not go through
+// CreateRunReviseInputIfUnderCap. Read the query's comment in queries/runtime.sql before
+// touching anything here: the rule it states — the cap predicate must reference only
+// columns of the `runs` row itself, and any subquery in that WHERE reintroduces the bug —
+// is what this test measures.
 //
 // # WHAT MAKES THIS A PROOF RATHER THAN A REPRODUCTION
 //
@@ -86,16 +78,13 @@ import (
 
 const repro106Cap = 3
 
-// repro106Open applies BOTH guards and explains itself in the skip message, so anyone who
-// trips it learns what this file is without opening it.
+// repro106Open takes the ordinary UZI_TEST_DATABASE_URL skip that every other live-DB
+// test uses. The extra UZI_REPRO_106 opt-in it used to carry existed only to keep an
+// expected-to-fail test from handing a mystifying red to anyone who had exported the DSN;
+// with #106 fixed these must run unconditionally, and CI asserts that a live-DB test
+// which skips is a failure.
 func repro106Open(ctx context.Context, t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	if os.Getenv("UZI_REPRO_106") == "" {
-		t.Skip("UZI_REPRO_106 not set: this file deliberately reproduces OPEN issue #106 " +
-			"(the plan-revision cap can be breached by two concurrent submits) and its forced " +
-			"test is EXPECTED TO FAIL until that is fixed. Set UZI_REPRO_106=1 with " +
-			"UZI_TEST_DATABASE_URL to run it. See this file's header before renaming anything.")
-	}
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; point it at a throwaway Postgres")
@@ -192,9 +181,11 @@ func repro106CallOnPool(ctx context.Context, q *store.Queries, runID uuid.UUID, 
 	return repro106Result{landed: err == nil, err: err}
 }
 
-// TestReviseCapForcedInterleaveIssue106 is the shipped atomicity test's assertion with the
-// luck removed. EXPECTED TO FAIL until #106 is fixed — see this file's header.
-func TestReviseCapForcedInterleaveIssue106(t *testing.T) {
+// TestReviseCapForcedInterleaveLiveDB is the shipped atomicity test's assertion with the
+// luck removed: B is confirmed parked on A's row lock before A commits, so the interleave
+// that breaches the cap is established rather than hoped for. It measured 100/100
+// over-cap against the pre-fix statement and passes against the fixed one.
+func TestReviseCapForcedInterleaveLiveDB(t *testing.T) {
 	ctx := context.Background()
 	pool := repro106Open(ctx, t)
 	defer pool.Close()
@@ -221,7 +212,9 @@ func TestReviseCapForcedInterleaveIssue106(t *testing.T) {
 	if _, err := q.WithTx(tx).CreateRunReviseInputIfUnderCap(ctx, repro106Params(runID, "A")); err != nil {
 		t.Fatalf("A's submit should have landed (it was at cap-1): %v", err)
 	}
-	// A now holds the runs row FOR UPDATE and has an INSERTED-BUT-UNCOMMITTED third row.
+	// A now holds a write lock on the runs row — taken by the query's own UPDATE, not by
+	// a FOR UPDATE any more — and has an INSERTED-BUT-UNCOMMITTED third row. B parks on
+	// that same lock either way, which is why the lock confirmation below still works.
 
 	// --- side B: the production caller shape, concurrently.
 	bCh := make(chan repro106Result, 1)
@@ -259,11 +252,12 @@ func TestReviseCapForcedInterleaveIssue106(t *testing.T) {
 	}
 }
 
-// TestReviseCapSequentialControlIssue106 is the INVERTED positive control: the identical
-// code path with the interleave removed (B starts only after A commits). It MUST PASS,
-// today and after the fix. Without it, a red from the forced test above is equally
-// consistent with a broken harness.
-func TestReviseCapSequentialControlIssue106(t *testing.T) {
+// TestReviseCapSequentialControlLiveDB is the positive control: the identical code path
+// with the interleave removed (B starts only after A commits). It MUST PASS — it did
+// before the fix and it does after. Without it, a red from the forced test above is
+// equally consistent with a broken harness, which is what makes it worth keeping now
+// that the forced test is no longer expected to fail.
+func TestReviseCapSequentialControlLiveDB(t *testing.T) {
 	ctx := context.Background()
 	pool := repro106Open(ctx, t)
 	defer pool.Close()

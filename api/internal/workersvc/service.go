@@ -267,8 +267,9 @@ type Store interface {
 	// revise still counts. Enforcement itself rides CreateRunReviseInputIfUnderCap.
 	CountRunReviseInputs(ctx context.Context, runID uuid.UUID) (int64, error)
 	// CreateRunReviseInputIfUnderCap atomically enqueues a revise_plan only while the
-	// run is under PlanMaxRevisions (PRD #41): the count and insert are one FOR UPDATE
-	// statement, so concurrent submits can't both exceed the cap. pgx.ErrNoRows = capped.
+	// run is under PlanMaxRevisions (PRD #41): the cap predicate rides the UPDATE that
+	// bumps runs.revise_count, so concurrent submits can't both exceed the cap (#106).
+	// pgx.ErrNoRows = capped.
 	CreateRunReviseInputIfUnderCap(ctx context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error)
 	// ListFollowUpInputsForRun backs the web/CLI steer queue (PRD #95): kind='follow_up'
 	// only, newest-first, uncapped. Owner-scoped by the run resolve, not the query.
@@ -3073,13 +3074,22 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 
 	// A revise_plan (PRD #41) is a plain enqueue like follow_up/approve_plan — no
 	// stop signal, no server-side transition — but it is capped: at most
-	// PlanMaxRevisions persisted revisions per run. The count spans ALL revise_plan
-	// rows (no consumed_at filter), so a consumed revision still counts toward the cap.
-	// The cap check and the enqueue are ONE atomic statement (the run row is locked
-	// FOR UPDATE and the count reads through the lock), so two concurrent submits — e.g.
-	// web + Slack on the same single-owner gate racing at N-1 — can never both slip past
-	// the limit and persist an N+1th row. No row = the cap is already reached. The
+	// PlanMaxRevisions persisted revisions per run. The cap spans ALL revise_plan rows
+	// (no consumed_at filter), so a consumed revision still counts toward it.
+	//
+	// The cap check and the enqueue are ONE statement, and — since #106 — the check is
+	// a predicate on runs.revise_count inside the UPDATE that bumps it, not a count of
+	// run_user_inputs. That distinction is the fix, not a detail: a lock on `runs` never
+	// covered a count of a DIFFERENT table, because READ COMMITTED gives the blocked
+	// caller a refreshed view of the LOCKED ROW only, not a refreshed snapshot. Two
+	// concurrent submits — e.g. web + Slack on the same single-owner gate racing at
+	// N-1 — could both slip past and persist an N+1th row, measured 100/100 with the
+	// interleave forced. They now cannot. No row = the cap is already reached. The
 	// terminal-run guard above already blocks a revise on a finished run.
+	//
+	// This function is the SOLE writer of revise_plan rows, which is what keeps the
+	// counter and the rows in step; a second writer added later would defeat the cap
+	// silently. TestReviseCountMatchesRowCountLiveDB is the guard against that.
 	if kind == "revise_plan" {
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
 			RunID: runID, Body: pgText(body), MaxRevisions: int32(s.p.PlanMaxRevisions),
