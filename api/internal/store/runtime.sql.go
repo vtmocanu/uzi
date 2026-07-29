@@ -3246,9 +3246,24 @@ type RunHasVerdictSinceGateOpenedParams struct {
 // predicate on the same snapshot as that guard, so the two cannot disagree about which
 // episode they are describing.
 //
-// Monotone within an episode by construction: it goes true when the human acts and stays
-// true until the gate re-opens, which clears health anyway. There is therefore no
-// waiting_worker → approval_idle edge and no flapping.
+// 🔴 NO FLAPPING — BUT NOT BECAUSE THE PREDICATE IS MONOTONE. It was first documented
+// here as "monotone within an episode by construction", and that is FALSE. FIVE
+// statements bump runs.updated_at without moving the run out of awaiting_approval:
+// SetRunWaitOnLimit (user-reachable at PUT /api/runs/{id}/wait-on-limit),
+// ClearIssueRunsMovePending (a card drag), RecordRunColumnMove, ClearRunMovePending and
+// SetRunMRState. Four of the five carry no status guard at all. So this predicate CAN go
+// true → false inside one gate episode.
+//
+// The no-flapping conclusion survives, for a different reason, and the reason is worth
+// knowing because it is what a future change could break: updated_at is ALSO the arm's
+// threshold clock. Any bump therefore makes olderThan(now, updated_at, th.approval) false
+// FIRST, so the next tick returns healthOK before this lookup is reached at all. There is
+// no direct waiting_worker → approval_idle edge; the reachable path is
+// waiting_worker → ok → (one full threshold later) approval_idle, at the far end of which
+// #182's symptom returns. That reachability is a separate issue, not this query's to fix.
+//
+// Whoever separates the clock from the episode boundary re-opens the flap this paragraph
+// says is closed. That is the load-bearing sentence, not "monotone".
 //
 // 🔴 `>=`, NOT `>`, IS LOAD-BEARING. CreateApprovePlanInput and CreateStopVerdictInput both
 // `SET updated_at = now()` in the SAME statement that inserts the row, and now() is the
@@ -3263,10 +3278,13 @@ type RunHasVerdictSinceGateOpenedParams struct {
 //
 //	follow_up is EXCLUDED because route() pushes it onto a buffer that never reaches
 //	serviceGate. It is a message, not an answer: the gate stays parked and the run IS still
-//	waiting on its human. Including it would be worse than a mistimed flag — because the
-//	predicate is monotone, once true it stays true until the gate re-opens, which requires
-//	someone to answer. A chatty owner would silently disable their own approval nudge
-//	indefinitely, through the normal UI.
+//	waiting on its human. Including it would be worse than a mistimed flag — a follow_up
+//	row never ages out of this predicate, so once true it stays true for as long as the
+//	gate stays open (nothing clears it but re-opening the gate, which requires someone to
+//	answer). A chatty owner would silently disable their own approval nudge indefinitely,
+//	through the normal UI. The updated_at bumps described above do not rescue this: they
+//	suppress the flag via the threshold clock rather than falsifying the predicate, so the
+//	run reports healthOK instead, which is equally silent.
 //
 //	answer is EXCLUDED as structurally unreachable here: submitAnswer
 //	(internal/workersvc/service.go) refuses unless the run is 'awaiting_input', and every
@@ -3278,7 +3296,8 @@ type RunHasVerdictSinceGateOpenedParams struct {
 // worker input route validates the kind and passes the body through unchecked, while
 // route() drops an empty body without servicing the gate. It already burns a revision-cap
 // slot, reaching it needs a hand-crafted API call, and a kind-specific emptiness clause
-// would cost the monotonicity the whole design rests on.
+// would put body parsing inside a predicate whose whole value is that it reads one
+// timestamp and one kind.
 //
 // NO INDEX AND NO MIGRATION, deliberately. run_user_inputs' only index is
 // idx_run_user_inputs_pending ON (run_id, id) WHERE consumed_at IS NULL (00020) — PARTIAL

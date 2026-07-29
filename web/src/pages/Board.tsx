@@ -228,8 +228,18 @@ export function Board() {
   // which is the whole reason awaiting_input is its own status.
   const [questionRuns, setQuestionRuns] = useState<RunListItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
-  // (PRD #47): any non-ok flag except approval_idle, which the awaiting bucket above
-  // already covers. Issue runs only (a ci_fix run has no board card to link to).
+  // (PRD #47): any non-ok flag on a run the two buckets above do not already carry.
+  // Issue runs only (a ci_fix run has no board card to link to).
+  //
+  // 🔴 THE EXCLUSION IS BY STATUS, NOT BY HEALTH ENUM, and that is the correction issue
+  // #182 forced. It used to read `health !== "approval_idle"`, which was a true
+  // statement of the same intent only while approval_idle was the ONLY flag an
+  // awaiting_approval run could carry. #182 made waiting_worker reachable there, so the
+  // enum form started admitting runs the awaiting bucket also holds: two chips, a
+  // DUPLICATE React key in the strip below (both arrays are spread into one .map keyed
+  // on r.id), and a summary reading "1 run needs approval · 1 run looks stuck" for one
+  // run. Keying on the status makes the exclusion mean what it always said it meant, and
+  // survives any future flag on these statuses.
   const [stuckRuns, setStuckRuns] = useState<RunListItem[]>([]);
 
   // Toasts announce auto-moves the poll observes ("#42 → Human Review").
@@ -307,7 +317,19 @@ export function Board() {
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
       setStuckRuns(
-        runs.filter((r) => r.health !== "ok" && r.health !== "approval_idle" && r.issue_iid != null),
+        runs.filter(
+          (r) =>
+            r.health !== "ok" &&
+            // Whatever the two buckets above already show, this one must not repeat.
+            !isAwaitingApproval(r.status) &&
+            !isAwaitingInput(r.status) &&
+            // Belt-and-braces for a STALE flag: the server's exit contract clears
+            // health on every status transition, so an approval_idle on some other
+            // status should not exist — but if one ever did, "looks stuck" would be
+            // the wrong words for it.
+            r.health !== "approval_idle" &&
+            r.issue_iid != null,
+        ),
       );
     } catch {
       // Non-fatal: the board still renders; Start-run stays gated conservatively.

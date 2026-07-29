@@ -177,6 +177,13 @@ func TestHealthGateVerdictReadErrorDegradesToApprovalIdle(t *testing.T) {
 }
 
 // ok → waiting_worker is a new episode: stamp health_since and nudge.
+//
+// The flag assertion is load-bearing and was MISSING when this test was first
+// written. Without it, every assertion here holds identically for the ok →
+// approval_idle transition you get with the fix removed, so the test passed under a
+// fold of the arm branch while its name claimed to be about waiting_worker. Nothing
+// in production had to be right for it to be green. (Its sibling
+// ...ReadErrorDegradesToApprovalIdle discriminates correctly and always did.)
 func TestHealthGateVerdictNudgesFromOK(t *testing.T) {
 	r := gateRunRow()
 	fs, svc := gateSvc(r, true)
@@ -184,11 +191,35 @@ func TestHealthGateVerdictNudgesFromOK(t *testing.T) {
 	svc.SetBroadcaster(b)
 
 	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthWaitingWorker {
+		t.Fatalf("health = %q, want waiting_worker — without this the whole test passes on an ok→approval_idle transition", w.Health)
+	}
 	if len(b.healthNudges) != 1 || !b.healthNudges[0] {
 		t.Fatalf("healthNudges = %v, want [true] on the first flag of this episode", b.healthNudges)
 	}
-	if w := lastWrite(t, fs, r.ID); !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
+	if len(b.healths) != 1 || b.healths[0] != healthWaitingWorker {
+		t.Fatalf("broadcast healths = %v, want [waiting_worker] — the DM and the live hub must agree on the flag", b.healths)
+	}
+	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
 		t.Fatalf("health_since = %v, want now on a raised flag", w.HealthSince)
+	}
+}
+
+// TestReasonVerdictUndeliveredIsMirroredBySlack is the workersvc half of issue #182's
+// mirror pin, the sibling of TestReasonPersistFailingIsMirroredBySlack in
+// persistfail_test.go.
+//
+// slacksvc deliberately holds NO workersvc import (stated in slacksvc/gate.go and
+// gatekeeper.go), which is why the string is mirrored rather than shared. Reword the
+// constant without updating the mirror and this reddens, naming the file to update. A
+// missed mirror degrades to the generic unclaimed-run head rather than breaking, so
+// the failure mode is a stale — and false — sentence, not an outage.
+func TestReasonVerdictUndeliveredIsMirroredBySlack(t *testing.T) {
+	const mirrored = "the worker hasn't picked up your response yet"
+	if reasonVerdictUndelivered != mirrored {
+		t.Fatalf("reasonVerdictUndelivered = %q, want %q.\nIf you meant to reword it, update the mirrored constant in internal/slacksvc/health.go in the SAME commit — otherwise the Slack nudge silently reverts to \"still waiting for a worker to pick it up\", which tells the owner their run is UNCLAIMED while its worker is holding it.",
+			reasonVerdictUndelivered, mirrored)
 	}
 }
 
@@ -221,9 +252,12 @@ func TestHealthGateApprovalIdleBecomesWaitingWorkerSilently(t *testing.T) {
 	}
 }
 
-// Monotone within an episode: once flagged waiting_worker with the verdict still standing,
-// the detector re-computes the same flag and writes nothing. There is no
-// waiting_worker → approval_idle edge to flap over.
+// Once flagged waiting_worker with the verdict still standing, the detector re-computes
+// the same flag and writes nothing, so health_since keeps counting from the original
+// flag. Note what this does NOT claim: the predicate is not monotone (five statements
+// bump runs.updated_at without leaving awaiting_approval — see the query's comment). What
+// closes the flap is that the same column is the threshold clock, so any such bump routes
+// through healthOK rather than back to approval_idle.
 func TestHealthGateWaitingWorkerIsStable(t *testing.T) {
 	r := gateRunRow()
 	r.Health = healthWaitingWorker
@@ -236,5 +270,34 @@ func TestHealthGateWaitingWorkerIsStable(t *testing.T) {
 	}
 	if len(fs.writes) != 0 {
 		t.Fatalf("wrote %d rows, want 0", len(fs.writes))
+	}
+}
+
+// The corrected transition from the paragraph above, pinned rather than only asserted in
+// a comment. A run already flagged waiting_worker whose updated_at is then bumped by one
+// of the five non-status writers (SetRunWaitOnLimit here, the user-reachable one) clears
+// to ok — NOT to approval_idle. The threshold guard rejects it before the lookup runs, so
+// no query is issued either, which is what proves the ordering rather than the outcome.
+func TestHealthGateUpdatedAtBumpClearsToOKNotApprovalIdle(t *testing.T) {
+	r := gateRunRow()
+	r.Health = healthWaitingWorker
+	r.HealthReason = pgText(reasonVerdictUndelivered)
+	r.HealthSince = ago(20 * time.Minute)
+	// The bump: still awaiting_approval, but updated_at is now fresh.
+	r.UpdatedAt = ago(1 * time.Minute)
+	fs, svc := gateSvc(r, true)
+
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1 (self-clear)", n)
+	}
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthOK {
+		t.Fatalf("health = %q, want ok — a bumped updated_at resets the threshold clock, so the arm returns before it can flag anything", w.Health)
+	}
+	if w.HealthReason.Valid || w.HealthSince.Valid {
+		t.Fatalf("self-clear wrote %+v, want NULL reason and NULL since", w)
+	}
+	if len(fs.verdictCalls) != 0 {
+		t.Fatalf("issued %d verdict lookups on a run the threshold guard rejects", len(fs.verdictCalls))
 	}
 }
