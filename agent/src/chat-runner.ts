@@ -12,7 +12,7 @@
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
-import type { ChatClaimResponse, StateRequest } from "./protocol.js";
+import type { ChatClaimResponse, StateAck, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
 import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
@@ -174,7 +174,9 @@ export class ChatRunner {
     // a lost report (§51, same as RunRunner). Seeded from the (preflighted) claim so a
     // resumed/continued chat reports its resume target even before the first turn.
     let observedSessionId = sessionId;
-    const reportState = (body: StateRequest): Promise<void> =>
+    // Widened for PRD #35's acknowledgement contract. Chat never parks (Decision 9),
+    // so this lane ignores the value; the annotation just tracks the client.
+    const reportState = (body: StateRequest): Promise<StateAck> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
 
     // PRD #108 M3: the chat lane builds the SAME MessageBatcher against the SAME

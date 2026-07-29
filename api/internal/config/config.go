@@ -301,6 +301,26 @@ type Config struct {
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 
+	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
+	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
+	// the worker asks to park, the server decides for how long and how often.
+	//
+	// RunLimitMaxWaits caps parks PER RUN (runs.limit_wait_count); the next limit
+	// failure past it fails the run with "usage-limit retry budget exhausted"
+	// instead of parking again. RunLimitMaxPark caps how far out ONE park may
+	// reach; a computed retry_not_before beyond it fails the run rather than
+	// parking, so a compromised or buggy worker cannot park a run for years.
+	//
+	// The default park ceiling is 8d rather than 7d because the longest window the
+	// SDK reports is seven_day and a reset stamped at the far edge of one needs
+	// headroom for jitter and clock skew.
+	//
+	// The two COMPOSE: a run can hold the one-active-per-issue lock for at most
+	// RunLimitMaxWaits × RunLimitMaxPark ≈ 40 days at the defaults. Recompute that
+	// figure if either default changes; cancel-while-parked is the escape hatch.
+	RunLimitMaxWaits int           // parks allowed per run before it fails
+	RunLimitMaxPark  time.Duration // furthest a single park may defer a run
+
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
 	// branch stays watched after it completes; CIWatchMaxRefs caps how many run
@@ -648,6 +668,13 @@ func Load() (Config, error) {
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+
+	// PRD #35. parseNonNegInt, so RUN_LIMIT_MAX_WAITS=0 is legal and means "never
+	// park" — the deliberate off switch for an operator who wants today's
+	// fail-immediately behaviour, matching how RUN_MAX_REQUEUES=0 means "never
+	// re-queue".
+	cfg.RunLimitMaxWaits = parseNonNegInt("RUN_LIMIT_MAX_WAITS", 5)
+	cfg.RunLimitMaxPark = parseDuration("RUN_LIMIT_MAX_PARK", 8*24*time.Hour)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)

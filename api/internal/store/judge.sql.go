@@ -16,7 +16,7 @@ const createJudgeRun = `-- name: CreateJudgeRun :one
 
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status)
 VALUES ($1, 'judge', $2, $3, $4, 'queued')
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, open_question_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id
 `
 
 type CreateJudgeRunParams struct {
@@ -30,6 +30,11 @@ type CreateJudgeRunParams struct {
 // finished run: the API enqueues it at the committed terminal transition, the worker
 // claims it through the normal queue, fetches the reviewed run's trace through a
 // judge-run-scoped endpoint, and posts back a verdict + recommendations.
+// wait_on_limit is deliberately NOT stamped here: a judge run NEVER parks
+// (PRD #35 Decision 14), and the column's DEFAULT false is the whole mechanism.
+// SetRunLimitWait additionally carries `AND kind <> 'judge'`, so this is the second
+// of two independent guards rather than the only one. Stated because an unstamped
+// column among three stamped siblings otherwise reads as the omission it is not.
 // Enqueue a judge run for a finished target run (Decision 2). Owned by the SAME user
 // as the target (never cross-user). issue_title/description are synthesized — a judge
 // has no issue. The one-active-judge-per-target partial unique index (00057) makes a
@@ -94,13 +99,18 @@ func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) 
 		&i.AnthropicSecretLabel,
 		&i.AnthropicSelectReason,
 		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
 		&i.OpenQuestionID,
 	)
 	return i, err
 }
 
 const getActiveJudgeRunForWorkerTarget = `-- name: GetActiveJudgeRunForWorkerTarget :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, open_question_id FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id FROM runs
 WHERE worker_id = $1
   AND kind = 'judge'
   AND target_run_id = $2
@@ -173,6 +183,11 @@ func (q *Queries) GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg GetA
 		&i.AnthropicSecretLabel,
 		&i.AnthropicSelectReason,
 		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
 		&i.OpenQuestionID,
 	)
 	return i, err

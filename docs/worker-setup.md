@@ -163,7 +163,9 @@ but the server never enforces it.
 A run parked at the plan-approval gate holds its slot for the whole wait, up to
 `WORKER_PLAN_APPROVAL_TIMEOUT` (default 24h) — approve your plans, since an
 unapproved one pins a slot until it times out. At the default cap of 1 that's
-already today's behavior.
+already today's behavior. A run parked on a clarifying question holds its slot
+the same way, up to `QUESTION_TIMEOUT_SECONDS` (default 24h) — see [Answering a
+question](./run-activity.md#answering-a-question).
 
 Raising the cap is an informed trade-off, not a free speedup:
 

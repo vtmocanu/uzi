@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "inputs"},
+		"run": {"list", "get", "logs", "review", "create", "approve", "reject", "cancel", "follow-up", "answer", "inputs"},
 		// backlog is the PRD #98 M7 read; there is deliberately no `file` verb —
 		// filing stays browser-only (#68's stance, Decision 10).
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats"},
@@ -1081,5 +1081,189 @@ func TestWorkerListShowsUpgradeStatus(t *testing.T) {
 	// ignore this column entirely.
 	if strings.Contains(out, "unknown") {
 		t.Errorf("the unknown state rendered as the word rather than \"-\":\n%s", out)
+	}
+}
+
+// parkFake walks a run through a scripted status sequence, one step per GetRun poll,
+// repeating the last entry forever. It exists because the park behaviour under test is
+// about TRANSITIONS — the notice fires on the edge into a park and again on the edge
+// out — and a fake with a single status cannot express an edge at all.
+type parkFake struct {
+	*uzicli.FakeClient
+	statuses []string
+	calls    int
+}
+
+func (f *parkFake) GetRun(_ context.Context, id string) (apitypes.RunDTO, error) {
+	i := f.calls
+	f.calls++
+	if i >= len(f.statuses) {
+		i = len(f.statuses) - 1
+	}
+	retry := time.Now().Add(90 * time.Minute)
+	rlt := "five_hour"
+	return apitypes.RunDTO{
+		ID: id, Status: f.statuses[i],
+		RetryNotBefore: &retry, RateLimitType: &rlt, LimitWaitCount: 1,
+	}, nil
+}
+
+// `uzi run logs --follow` must RIDE OUT a usage-limit park rather than exiting, and must
+// say why it has gone quiet (PRD #35).
+//
+// Three properties, and the reason each is here:
+//
+//   - It does not exit. limit_wait is absent from terminalRunStatuses, so the loop keeps
+//     polling. Exiting would truncate the capture mid-run on a run that completes
+//     normally hours later — the failure this milestone exists to prevent.
+//   - The notice fires ONCE per park, on the edge. The loop re-polls every 2s and a park
+//     lasts hours, so a notice keyed on the status rather than the transition would emit
+//     thousands of identical lines into an agent's stderr.
+//   - The notices go to STDERR. Stdout is the Printer's, and `--json` streams NDJSON
+//     there for an agent to parse line by line; a human-readable line on that stream
+//     would corrupt the contract.
+func TestRunLogsFollowRidesOutALimitWaitPark(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	defer func() { logsPollInterval = old }()
+
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"hi"}`)}},
+	}}
+	// 🔴 THE RESUMED STATUS CARRIES A NEWLINE, and the fake is the only place it can
+	// come from — which is the point. runs_status_check makes this unreachable through
+	// the API today, and the renderer's safety must not depend on a guarantee made in
+	// another package (the same argument the ANTHROPIC_TOKEN test makes at length).
+	// sanitizeTTY spares "\n"; only cellText folds it. With the weaker helper the
+	// injected text lands on its own stderr line.
+	pf := &parkFake{FakeClient: fc, statuses: []string{
+		"running",
+		"limit_wait", "limit_wait", "limit_wait", // one park, three polls
+		"running\nINJECTED",
+		"completed",
+	}}
+
+	var out, errBuf bytes.Buffer
+	env := fakeEnv(pf)
+	env.Stdout = &out
+	env.Stderr = &errBuf
+
+	done := make(chan int, 1)
+	go func() { done <- Main(env, []string{"run", "logs", "r1", "--follow"}) }()
+
+	select {
+	case code := <-done:
+		if code != uzicli.ExitOK {
+			t.Fatalf("--follow exit = %d, want 0", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run logs --follow hung; it must ride out a park and then terminate when the run completes")
+	}
+
+	// It got PAST the park rather than stopping in it: the completed status is only
+	// reachable at poll 6.
+	if pf.calls < 6 {
+		t.Errorf("GetRun polled %d times, want >= 6 — --follow exited during the park instead of riding it out", pf.calls)
+	}
+
+	stderr := errBuf.String()
+	if n := strings.Count(stderr, "paused"); n != 1 {
+		t.Errorf("park notice appeared %d times, want exactly 1 — it must fire on the EDGE into the park, not on every poll of a park that lasts hours:\n%s", n, stderr)
+	}
+	if !strings.Contains(stderr, "five_hour") || !strings.Contains(stderr, "resumes in") {
+		t.Errorf("the park notice must say which window and when it resumes, got:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "resumed") {
+		t.Errorf("no notice on the way OUT of the park; a user told the run paused must be told it restarted, got:\n%s", stderr)
+	}
+
+	// The discriminator for cellText over sanitizeTTY on the resumed branch.
+	if strings.Contains(stderr, "\nINJECTED") {
+		t.Errorf("a newline in the run status injected a line onto stderr — the resumed notice must fold it (cellText), not spare it (sanitizeTTY), got:\n%q", stderr)
+	}
+	if !strings.Contains(stderr, "running INJECTED") {
+		t.Errorf("the folded status lost its text entirely, got:\n%q", stderr)
+	}
+
+	// Stdout stays the message stream and nothing else.
+	if !strings.Contains(out.String(), "hi") {
+		t.Errorf("--follow dropped the message:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "paused") || strings.Contains(out.String(), "resumed") {
+		t.Errorf("a park notice reached STDOUT, which is the --json NDJSON stream an agent parses line by line:\n%s", out.String())
+	}
+}
+
+// TestRunCreateWaitOnLimitIsTriState is the whole point of the flag, and the case that
+// makes it more than a switch: OMITTING it must send NOTHING, so the server stamps the
+// run from the owner's Settings default (PRD #35 Decision 7, and the requirement
+// specs/human.md states as "wait_on_limit on run creation for CLI/API callers").
+//
+// The fake keeps the POINTER, so all three states are distinguishable here. A bool
+// capture would collapse the first two rows into one and the test would pass against
+// exactly the implementation it exists to reject.
+func TestRunCreateWaitOnLimitIsTriState(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "queued"}}
+		env := fakeEnv(fc)
+		env.Stdout = &bytes.Buffer{}
+		env.Stderr = &bytes.Buffer{}
+		args := append([]string{"run", "create", "--repo", "p1", "--issue", "42"}, extra...)
+		if code := Main(env, args); code != uzicli.ExitOK {
+			t.Fatalf("run create %v exit = %d, want 0", extra, code)
+		}
+		return fc
+	}
+
+	// 🔴 THE ROW THAT MATTERS. The flag is DEFINED with a default of false, so GetBool
+	// returns false here — identical to an explicit --wait-on-limit=false. Passing that
+	// through would send "wait_on_limit": false on every CLI-created run and silently
+	// override the user's own Settings default. Only Changed() separates them.
+	if got := run(t).LastCreateWaitOnLimit; got != nil {
+		t.Errorf("omitting --wait-on-limit sent %v, want nil — an absent flag must send NO key so the server inherits the user's Settings default; sending false here silently opts every CLI-created run out", *got)
+	}
+
+	if got := run(t, "--wait-on-limit").LastCreateWaitOnLimit; got == nil || !*got {
+		t.Errorf("--wait-on-limit sent %v, want an explicit true", got)
+	}
+
+	// Explicit false is a DIFFERENT statement from absent: "this run, specifically, must
+	// not park", overriding a default that is on.
+	if got := run(t, "--wait-on-limit=false").LastCreateWaitOnLimit; got == nil || *got {
+		t.Errorf("--wait-on-limit=false sent %v, want an explicit false — it must override a user default of true, not fall back to it", got)
+	}
+
+	// The repo/issue arguments still ride through unchanged.
+	fc := run(t, "--wait-on-limit")
+	if fc.LastCreateRepoID != "p1" || fc.LastCreateIssueIID != 42 {
+		t.Errorf("create sent repo=%q issue=%d, want p1/42", fc.LastCreateRepoID, fc.LastCreateIssueIID)
+	}
+}
+
+// `--wait-on-limit false` (a SPACE instead of `=`) must FAIL LOUDLY rather than
+// silently meaning true. pflag reads a bare bool flag as true and leaves "false" as a
+// positional argument; `create` is cobra.NoArgs, so the stray argument is a usage
+// error. This pins that it stays loud — if `create` ever gains positional arguments,
+// this inversion becomes silent and needs a guard of its own.
+func TestRunCreateWaitOnLimitSpaceFormIsAUsageError(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	fc := &uzicli.FakeClient{CreatedRun: apitypes.RunDTO{ID: "r1"}}
+	env := fakeEnv(fc)
+	env.Stdout = &bytes.Buffer{}
+	env.Stderr = &bytes.Buffer{}
+
+	code := Main(env, []string{"run", "create", "--repo", "p1", "--issue", "42", "--wait-on-limit", "false"})
+	if code != uzicli.ExitUsage {
+		t.Errorf("`--wait-on-limit false` exit = %d, want %d (usage) — the space form must not silently mean true", code, uzicli.ExitUsage)
+	}
+	if fc.LastCreateRepoID != "" {
+		t.Error("a usage error still created a run; the command must refuse before calling the API")
 	}
 }

@@ -8,6 +8,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Per-run agent selection (PRD #37).
@@ -240,4 +241,37 @@ func hasUnsafeChar(s string) bool {
 		}
 	}
 	return false
+}
+
+// persistedSelection lifts a run's stored subagent selection into the claim payload's
+// shape (PRD #35, the resume half of Decision 6b). Nil when the run has none.
+//
+// A run acquires agent_source only by reaching a plan gate — a human's approve_plan
+// verdict, or an autopilot run's self-resolved selection on its `running` report — so
+// a NULL column means "this run never made a selection", and the worker's
+// resolveAgentSelection absent-default is the right answer for it. Returning an empty
+// AgentSelection instead would pin every gate-less run to source="own" with no
+// exclusions, overriding a repo roster the worker legitimately detected.
+//
+// Malformed jsonb degrades to "no selection" rather than erroring the claim, matching
+// repoAgentNames' precedent above and for the same reason: the column is data a
+// previous write left behind, not an invariant of THIS request, and failing a claim
+// over it would strand a run no operator can unstick. The exclusions were validated
+// against the roster when they were written (validateSelection), so this is a decode
+// guard, not a re-validation.
+func persistedSelection(run store.Run) *AgentSelection {
+	if !run.AgentSource.Valid || run.AgentSource.String == "" {
+		return nil
+	}
+	exclusions, err := DecodeExclusions(run.AgentExclusions)
+	if err != nil {
+		return nil
+	}
+	if exclusions == nil {
+		// The wire type is a plain []string, and a nil slice marshals to `null` while
+		// the shape's contract is a list. An empty selection is a real, meaningful
+		// value here — "source chosen, nothing excluded" — so it must serialize as [].
+		exclusions = []string{}
+	}
+	return &AgentSelection{Source: run.AgentSource.String, Exclusions: exclusions}
 }

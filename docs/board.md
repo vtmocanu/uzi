@@ -151,7 +151,9 @@ unstick; automation keeps it in sync from then on.
 
 Each card shows its latest run at a glance: **queued**/**claimed** while
 waiting for a worker, **running Nm** (pulsing, worker name below), amber
-**awaiting approval** (the loudest treatment — see Attention strip), rose
+**awaiting approval** or amber **needs your answer** (a run parked on a
+clarifying question — see [Answering a question](./run-activity.md#answering-a-question);
+both get the loudest treatment — see Attention strip), rose
 **failed** with the reason on hover, and neutral **stopped** for a
 deliberate cancel or plan rejection — even one carrying your own free-text
 reason — never styled as a failure. The stopped/failed call is made
@@ -190,11 +192,13 @@ stretch its column.
 
 ## Attention strip
 
-When any of your runs on this board is **awaiting approval**, or the
-[run-health](./run-health.md) detector has flagged one as looking stuck, a
-banner appears above the columns naming both counts ("1 run needs approval ·
-2 runs look stuck") and linking straight to them — a human is the likely
-blocker, so this is designed to be impossible to miss.
+When any of your runs on this board is **awaiting approval**, **needs your
+answer**, or the [run-health](./run-health.md) detector has flagged one as
+looking stuck, a banner appears above the columns naming each count
+separately ("1 run needs approval · 2 runs need an answer · 3 runs look
+stuck") and linking straight to them — a human is the likely blocker, so
+this is designed to be impossible to miss. The counts stay separate rather
+than merging into one, so the banner always names the actual action owed.
 
 ## Opening an issue
 

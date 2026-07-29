@@ -309,6 +309,28 @@ apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/j
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 apipatch() { curl -fsS -b "$JAR" -X PATCH "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# db_psql SQL — a bare scalar out of the e2e db (PGPASSWORD from the env-file).
+#
+# Defined HERE with the other helpers rather than beside its first caller. It used to
+# live in the PRD #32 vault-helper block ~1400 lines down, which silently made it
+# unavailable to every phase above that point: bash resolves a function at CALL time,
+# so an earlier phase using it dies with `db_psql: command not found` (127) — and
+# inside a `X="$(db_psql ...)"` assignment `set -e` takes that as the assignment's own
+# status and aborts the run with no `fail` line and no diagnosis. Found 2026-07-28
+# moving the PRD #35 M6 block earlier. A helper's definition site is a constraint on
+# which phases may use it; keep them all up here so there is no such constraint.
+#
+# The password is read LAZILY, on first call, and that is the other half of hoisting
+# this: $ENVFILE is WRITTEN during setup, hundreds of lines below here, so the eager
+# `PGPW="$(grep ... "$ENVFILE")"` this replaced aborted the whole run at startup with a
+# bare `grep: …/e2e.env: No such file or directory` under `set -e` — before the trap
+# had its helpers, so the cleanup itself then died on `report_margins: command not
+# found` and the real cause was two errors up. Memoized, so repeat calls cost nothing.
+PGPW=""
+db_psql() {
+  [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
+  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'
+}
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
@@ -1369,6 +1391,180 @@ else
 fi
 
 # =============================================================================
+# PRD #35 M6: the usage-limit park, end to end
+# =============================================================================
+# The park path is unreachable here without a real exhausted subscription, so the
+# stub carries UZI_STUB_LIMIT (agent/src/executor.ts) and dies on a simulated limit.
+# It fires ONLY on the first attempt, keyed on plan_approved, which is what makes the
+# recovery half expressible rather than just the park.
+#
+# THE CLOCK IS THE SERVER'S, NOT THE TEST'S. retry_not_before is floored at
+# `now + jitter` with jitter 60-180s (limitwait.go), so a park here really does wait
+# out the server's own computed minimum. Nothing is stubbed away and no test knob
+# shortens it — the stub only reports a NEAR-FUTURE reset, which selects the
+# reported-reset branch instead of the 15m exponential fallback.
+#
+# 🔴 PLACEMENT IS LOAD-BEARING: this block needs the LIVE agent container, so it must
+# stay AHEAD of the PRD #104 binding phase, which `compose stop`s the agent and never
+# restarts it (see that phase's own note). Written at the END of the file first, and
+# every scenario died on its very first assertion — `wait_status "$RUN_LW"
+# awaiting_approval` timed out with the run still `queued`, because no worker was left
+# to claim it (measured 2026-07-28; the harness burned 579s reaching that point). The
+# symptom, a run sitting in `queued` forever, reads exactly like a credential fault
+# resetting it out of `claimed` — so it points away from its cause. It had never been
+# claimed at all.
+#
+# It also must not be the phase IMMEDIATELY BEFORE PRD #95's steer-queue leg (see the
+# PRD #97 M2 placement note below, which owns that constraint) — this block ends with
+# a freshly-freed warm worker, exactly the condition that phase is sensitive to. Here,
+# M2 sits between them and absorbs it.
+
+# secs_until RUN_JSON FIELD — whole seconds from now until .run.<FIELD>, floored.
+#
+# The `sub` is not defensive tidying, it is required. jq's `fromdate` is exactly
+# strptime("%Y-%m-%dT%H:%M:%SZ") and REJECTS fractional seconds — it does not truncate
+# them, it errors the whole filter out: `jq: error (at <stdin>:1): date
+# "2026-07-27T22:17:57.70053Z" does not match format "%Y-%m-%dT%H:%M:%SZ"`, observed
+# 2026-07-28 on this very field. And it fails INTERMITTENTLY by nature: Go marshals
+# RFC3339Nano with trailing zeros stripped, so a stamp landing on a whole second
+# carries no fraction and parses fine. A version of this that passed once proves
+# nothing. Same trap the PRD #95 steer-margin print documents ~500 lines below, which
+# needs sub-second resolution and so reassembles the milliseconds; here whole seconds
+# are the unit of every assertion, so dropping the fraction is exact enough.
+secs_until() {
+  printf '%s' "$1" \
+    | jq -r --arg f "$2" '((.run[$f] | sub("\\.[0-9]+";"") | fromdate) - now) | floor'
+}
+
+say "PRD #35: opt-in park -> sweeper promotes -> resume SKIPS the gate -> completes"
+apiput /api/me/wait-on-limit '{"enabled":true}' >/dev/null || fail "could not set the user's wait-on-limit default"
+IID_LW="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E limit park","description":"implements prds/4-agent-runtime-workers.md then hits UZI_STUB_LIMIT"}' | jq -r '.card.iid')"
+RUN_LW="$(create_run "$REPO_ID" "$IID_LW")" || fail "limit-park run-create failed"
+apiget "/api/runs/$RUN_LW" | jq -e '.run.wait_on_limit == true' >/dev/null \
+  || fail "the run did not inherit the user's wait_on_limit default"
+wait_status "$RUN_LW" awaiting_approval
+apipost "/api/runs/$RUN_LW/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+# The stub throws LimitReachedError after the gate, so the run parks rather than fails.
+wait_status "$RUN_LW" limit_wait 120
+PARKED="$(apiget "/api/runs/$RUN_LW")"
+echo "$PARKED" | jq -e '.run.rate_limit_type == "five_hour"' >/dev/null \
+  || fail "parked run did not carry the allowlisted rate_limit_type (got $(echo "$PARKED" | jq -c .run.rate_limit_type))"
+echo "$PARKED" | jq -e '.run.limit_wait_count == 1 and (.run.retry_not_before != null)' >/dev/null \
+  || fail "parked run did not stamp limit_wait_count / retry_not_before"
+# The server's own floor, observed rather than assumed: never sooner than 60s out.
+PARK_S="$(secs_until "$PARKED" retry_not_before)"
+[ "$PARK_S" -ge 55 ] || fail "retry_not_before is only ${PARK_S}s out; the 60s jitter floor did not apply"
+pass "run parked at limit_wait (five_hour, attempt 1), promotion gated ${PARK_S}s out by the server's own jitter floor"
+
+# The feed carries the STRUCTURED kind, not a status line with the facts in prose —
+# M4 maps rate_limit_type through a known-value lookup, which prose cannot support.
+apiget "/api/runs/$RUN_LW/messages" \
+  | jq -e '[.messages[] | select(.kind == "limit_wait")] | length >= 1' >/dev/null \
+  || fail "no structured limit_wait feed message"
+pass "feed carries the structured limit_wait message"
+
+# Now the recovery. The sweeper promotes once the clock passes; the resume must NOT
+# stop at the gate again, which is the PRD's headline criterion.
+wait_status "$RUN_LW" completed "$((PARK_S + 180))"
+FINAL_LW="$(apiget "/api/runs/$RUN_LW")"
+# 🔴 THE GATE-SKIP EVIDENCE. "It completed" is not evidence — a run that re-planned
+# and re-gated would also complete, since the harness has no second approver but the
+# stub self-approves nothing. What proves the skip is the worker's own feed line, and
+# that the plan entered the gate exactly ONCE for this run.
+apiget "/api/runs/$RUN_LW/messages" \
+  | jq -e '[.messages[] | select(.payload.text // "" | test("skipping the planning turn"))] | length == 1' >/dev/null \
+  || fail "the resume did not report skipping the planning turn and the gate"
+# COUNTS GATE ENTRIES VIA kind='plan'. `runner.ts` emits exactly one such message as the
+# FIRST line of gatePlan(), unconditionally and before any branch, so this count IS the
+# number of gatePlan invocations: 1 for the original attempt, 2 if the resume re-gated.
+#
+# 🔴 It used to read `payload::text LIKE '%awaiting_approval%'`, which is not a weaker
+# version of this — it is unmeasurable. `awaiting_approval` is a run STATUS, reported to
+# the runs table via /state; it never appears in a run_messages payload. That query
+# returned 0 on every run ever recorded here (7 of 7 checked), whether the run gated
+# once, twice or never, so it could not discriminate the thing the comment above claims.
+# It was also captured and never asserted, which is what hid it: the value only reached a
+# `pass` string, so a phase printing "gate markers: 0" read as evidence for two sessions.
+# Asserting the OLD query `= 1` would have reddened every green run; asserting it `= 0`
+# would have pinned a constant. Both halves had to be fixed together — wiring up an
+# assertion on the wrong column is how a vacuous check becomes a confidently wrong one.
+# WHAT THIS CATCHES, stated narrowly because the obvious claim is wrong: it is NOT what
+# catches a StubExecutor missing the Decision 6b branch. That defect strands the resume at
+# awaiting_approval with nobody to approve it, so `wait_status … completed` above times out
+# and this line is never reached (measured 2026-07-28). This closes the OTHER hole, the one
+# the comment at the top of this block describes: a re-gate that DOES complete — autopilot,
+# a future auto-approve, a verdict already queued — satisfies every other assertion here,
+# including the completion and `limit_wait_count == 1`. Only the count sees it.
+#
+# Non-vacuous, and measured rather than assumed: across one full run of this suite the
+# per-run `kind='plan'` counts were 0, 1 and 2 (the PRD #41 revise loop produces 2), so `= 1`
+# discriminates. The query it replaced returned 0 for EVERY run_messages row in the whole
+# database, not merely for this run.
+GATES="$(db_psql "SELECT count(*) FROM run_messages WHERE run_id = '$RUN_LW' AND kind = 'plan'")"
+[ "$GATES" = 1 ] \
+  || fail "the plan entered the gate $GATES time(s), want exactly 1 — the resume re-planned and re-gated instead of skipping past an approval that already happened"
+echo "$FINAL_LW" | jq -e '.run.limit_wait_count == 1' >/dev/null \
+  || fail "the resumed run parked again (limit_wait_count moved), so the sentinel is not first-attempt-only"
+pass "resume skipped the planning turn AND the gate, then completed with zero human intervention (gate entries: $GATES, asserted)"
+
+# --- the exponential fallback, which a poller-disabled deployment uses by default --
+say "PRD #35: a park with no reported reset uses the exponential fallback schedule"
+# UZI_USAGE_POLL_INTERVAL is 0 in this overlay, so every gauge row classifies stale and
+# neither the cross-check nor NextAvailable can contribute — the fallback is this
+# deployment's ORDINARY path. Observed by reading the stamp rather than by waiting it
+# out: the first-park fallback is 15m, which no one would run.
+IID_NR="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E limit noreset","description":"implements prds/4-agent-runtime-workers.md then hits UZI_STUB_LIMIT:noreset"}' | jq -r '.card.iid')"
+RUN_NR="$(create_run "$REPO_ID" "$IID_NR")" || fail "noreset run-create failed"
+wait_status "$RUN_NR" awaiting_approval
+apipost "/api/runs/$RUN_NR/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_NR" limit_wait 120
+NR="$(apiget "/api/runs/$RUN_NR")"
+echo "$NR" | jq -e '.run.limit_resets_at == null' >/dev/null \
+  || fail "the noreset park reported a reset it should not have"
+NR_S="$(secs_until "$NR" retry_not_before)"
+# 15m base + 60-180s jitter. Bounded on both sides so a silent switch to the
+# reported-reset branch (which would be ~60-180s) fails here.
+[ "$NR_S" -ge 840 ] && [ "$NR_S" -le 1140 ] \
+  || fail "fallback stamp is ${NR_S}s out; expected the 15m exponential base plus jitter"
+pass "unknown reset took the exponential fallback: promotion stamped ${NR_S}s out (15m base + jitter)"
+
+# --- cancel while parked ------------------------------------------------------
+say "PRD #35: cancelling a PARKED run takes effect immediately, server-side"
+# A parked run keeps its worker_id and that worker keeps heartbeating for other runs,
+# so hasLivePoller would have called it live and enqueued a cancel nothing consumes
+# until the promotion. server_side=true is the assertion that it did not.
+SS_LW="$(apipost "/api/runs/$RUN_NR/inputs" '{"kind":"cancel","body":""}' | jq -r '.server_side')"
+[ "$SS_LW" = true ] || fail "cancel of a PARKED run was not applied server-side (got server_side=$SS_LW)"
+[ "$(apiget "/api/runs/$RUN_NR" | jq -r '.run.status')" = cancelled ] \
+  || fail "parked run did not transition to cancelled immediately"
+pass "parked run cancelled immediately, server-side (not deferred to the promotion)"
+
+# --- opt-out gets a better death ----------------------------------------------
+say "PRD #35: an opted-out run FAILS with the server-composed explanatory reason"
+apiput /api/me/wait-on-limit '{"enabled":false}' >/dev/null || fail "could not clear the wait-on-limit default"
+IID_OO="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E limit optout","description":"implements prds/4-agent-runtime-workers.md then hits UZI_STUB_LIMIT"}' | jq -r '.card.iid')"
+RUN_OO="$(create_run "$REPO_ID" "$IID_OO")" || fail "opt-out run-create failed"
+apiget "/api/runs/$RUN_OO" | jq -e '.run.wait_on_limit == false' >/dev/null \
+  || fail "the opted-out run should not carry wait_on_limit"
+wait_status "$RUN_OO" awaiting_approval
+apipost "/api/runs/$RUN_OO/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_OO" failed 120
+OO="$(apiget "/api/runs/$RUN_OO")"
+# The reason is COMPOSED BY THE SERVER from its allowlisted enum (Decision 8). The
+# worker sends only the structured type + reset, so this text is the proof the server
+# composed it rather than echoing worker prose.
+echo "$OO" | jq -r '.run.failure_reason' | grep -qi 'usage limit' \
+  || fail "opt-out failure_reason does not name the usage limit (got: $(echo "$OO" | jq -r .run.failure_reason))"
+echo "$OO" | jq -r '.run.failure_reason' | grep -qF 'five_hour' \
+  || fail "opt-out failure_reason does not name the limit type"
+echo "$OO" | jq -e '.run.status == "failed" and .run.limit_wait_count == 0' >/dev/null \
+  || fail "an opted-out run must fail without parking"
+pass "opted-out run failed with the server-composed reason naming the limit type, and never parked"
+
+# =============================================================================
 # PRD #97 M2 — live /api/ws frame assertion + uzi CLI smoke. Two full-wire-only
 # consumers no lower layer reaches: the browser's primary real-time transport
 # (/api/ws — every OTHER stream assertion in this harness uses the REST ?after=<seq>
@@ -1933,20 +2129,90 @@ pass "steer queue survives terminal: the Delivered follow_up is still listed on 
 # If you are here to shrink the suite: shrink somewhere else.
 # =============================================================================
 say "secret-hygiene assertions"
-LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
 # POSITIVE CONTROL (PRD #97 M3): both scans below assert a secret is ABSENT, which passes
-# VACUOUSLY on an empty corpus (a `compose logs` that errored past the `|| true`, an /data
-# exec that returned nothing). Prove the corpus is real BEFORE asserting absence — mirror
-# the /proc control (:1312) that proves the cmdline is readable first, the Decision-3
-# control (:2943) that proves a container reads its own /etc/hostname, and the CI
-# test:api-store-it gate-on-the-gate. Here: postgres unconditionally logs this benign
-# banner on boot, so its presence proves the log corpus is the real, populated stream.
-printf '%s' "$LOGS" | grep -qF "database system is ready to accept connections" \
-  || fail "positive control: the container-log corpus is empty/unreadable (no db boot banner) — the secret-absence scan below would pass vacuously"
+# VACUOUSLY on an empty corpus (a `compose logs` that errored, an /data exec that returned
+# nothing). Prove the corpus is real BEFORE asserting absence — mirror the /proc control
+# (:1312) that proves the cmdline is readable first, the Decision-3 control (:2943) that
+# proves a container reads its own /etc/hostname, and the CI test:api-store-it
+# gate-on-the-gate. Here: postgres unconditionally logs this benign banner on boot, so its
+# presence proves the log corpus is the real, populated stream.
+#
+# 🔴 THE READ IS RETRIED, because a single `compose logs` CAN COME BACK SHORT — and it does
+# so with rc=0, which is what makes it worth writing down. Measured 2026-07-28 across three
+# consecutive runs after the PRD #35 M6 phase was moved above this one: rc=0, 128429 bytes,
+# 844 lines, every service present in the corpus INCLUDING db-1 — and no boot banner. The
+# same command against the same still-running stack seconds later returned it 8 times out
+# of 8 (db-1: 11 lines, banner every time). So the corpus was not empty, not unreadable and
+# not rotated; the fan-out over per-container streams simply returned before db's had been
+# drained, and only under the load left by the phase that now runs before this one.
+#
+# Retrying is not weakening the control: the control is exactly the thing that detects an
+# unusable corpus, so it is also the right thing to gate a re-read on. What WOULD weaken it
+# is dropping it, or scanning a corpus this never vouched for — note the scans below run on
+# the LAST corpus read, the one the control passed against.
+#
+# The failure message REPORTS WHAT IT MEASURED rather than naming a cause. The old wording
+# said "empty/unreadable", which is one hypothesis out of several — a compose error, a
+# partial read, a corpus missing one service, a rotated-out banner — and it sent this
+# session to check the wrong ones for three runs. Print the rc, the size, and which
+# services the corpus actually contains, so the next reader can tell them apart at a glance.
+#
+# 🔴 EVERY MATCH AGAINST $LOGS USES BASH PATTERN MATCHING, NEVER `printf … | grep -q`.
+# This is a CORRECTNESS fix, not a style preference, and it is the reason this phase began
+# failing when PRD #35 M6 moved above it.
+#
+# Under this file's `set -euo pipefail`, `printf '%s' "$BIG" | grep -q PAT` reports FAILURE
+# when PAT *matches*: `grep -q` exits the instant it finds the match, `printf` still has
+# data to write, and it dies of SIGPIPE (141) — which `pipefail` promotes to the pipeline's
+# status. The match was real; the exit code lies about it.
+#
+# 🔴 THE TRIGGER IS THE MATCH'S POSITION, NOT THE CORPUS SIZE. The condition is that MORE
+# THAN A PIPE BUFFER'S WORTH OF DATA FOLLOWS THE MATCH, so the writer still has to block
+# after the reader is gone. A LATE match is safe at ANY size, because `grep -q` reaches EOF
+# before `printf` ever blocks. Size is necessary, not sufficient. Measured 2026-07-28 on
+# this host (64 KiB pipe buffer), and the boundary is exactly that:
+#
+#   secret EARLY, 15 MB -> rc=141 DISARMED    secret EARLY, 64 KB -> rc=141 DISARMED
+#   secret LATE,  15 MB -> rc=0   fires       secret EARLY, 63 KB -> rc=0   fires
+#   secret EARLY, 15 KB -> rc=0   fires
+#
+# That is worse than "big corpora are unsafe", which is why the distinction is kept: a
+# secret logged EARLY — at worker boot, exactly when a join token or PAT surfaces — sat in
+# the blind spot, while one logged in the last few KB was caught. The scan was least
+# reliable precisely where a leak is most likely.
+#
+# It is invisible on small inputs and arrives the day some phase above makes the logs
+# bigger. The three failing runs printed `db boot banner: 1, agent uid-split banner: 1`
+# from `grep -c` in the very failure message saying the banners were absent — `-c` reads to
+# EOF, so it never triggers the bug that produced the failure.
+#
+# NOT the `set -e`/AND-list exemption documented ~1700 lines below (`echo hi | grep -qF
+# nope && fail`). That one is about a NON-match in an AND-list; this is a MATCH being
+# reported as a non-match. Opposite direction, different mechanism, and neither implies the
+# other — do not merge the two notes.
+#
+# 🔴 THE SAME BUG SILENTLY DISARMED THE LEAK SCAN ITSELF, which is the part that matters
+# beyond this control. `printf … | grep -qF "$sec" && fail "a secret leaked"` can only fire
+# when grep MATCHES — precisely the case that SIGPIPEs — so on a corpus this size a real
+# leaked token would have been scanned, found, and then silently passed over. The control
+# above existed to stop this scan passing vacuously and was defeated by the same mechanism
+# it was guarding. Rewritten below; keep it out of pipelines.
+LOGS_RC=0
+LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1)" || LOGS_RC=$?
+# Two markers, one per stream a later assertion depends on. The db banner alone was never
+# enough: the leak scan below is overwhelmingly about the AGENT (the process holding the
+# decrypted PAT and the join token), so a corpus vouched for only by postgres could omit the
+# agent stream entirely and still report "no secret leaked". The uid-split control ~60 lines
+# down reads this same $LOGS and needs the agent's boot line too.
+if [[ "$LOGS" != *"database system is ready to accept connections"* || "$LOGS" != *"A1 uid-split active"* ]]; then
+  fail "positive control: the container-log corpus is incomplete (db boot banner present: $([[ "$LOGS" == *"database system is ready to accept connections"* ]] && echo yes || echo NO), agent uid-split banner present: $([[ "$LOGS" == *"A1 uid-split active"* ]] && echo yes || echo NO)), so the secret-absence scan below would pass vacuously. compose-logs rc=$LOGS_RC bytes=${#LOGS}; services present: $(printf '%s' "$LOGS" | sed 's/ *|.*//' | sort -u | tr '\n' ' ')"
+fi
 for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do
-  printf '%s' "$LOGS" | grep -qF "$sec" && fail "a secret leaked into container logs"
+  # `$sec` is quoted inside the pattern, so it is matched LITERALLY (no globbing) — the
+  # `[[ ]]` equivalent of grep -F. See the SIGPIPE note above for why this is not a pipe.
+  if [[ "$LOGS" == *"$sec"* ]]; then fail "a secret leaked into container logs"; fi
 done
-pass "no PAT / Anthropic token / join token in any container log (corpus non-empty: db boot banner present)"
+pass "no PAT / Anthropic token / join token in any container log (corpus vouched for by BOTH the db and agent boot banners, and scanned without a pipe so a hit can actually fire)"
 
 # POSITIVE CONTROL (PRD #97 M3): prove /data has scannable files first, else a failed exec
 # or an empty /data makes the absence grep pass vacuously. By now the worker has cloned the
@@ -1995,8 +2261,13 @@ pass "/proc hardening (b): join token absent from every worker-readable process 
 #
 # First, the split must genuinely be active (a silent fallback to the #58 single-uid
 # branch would collapse both uids into one and make the negative read pass vacuously).
-printf '%s' "$LOGS" | grep -qF "A1 uid-split active" \
-  || fail "the agent never logged 'A1 uid-split active' — the uid split did not engage (single-uid fallback would make the boundary vacuous)"
+# Already gated at the top of the secret-hygiene phase (this marker is one of the two the
+# corpus must carry before anything is scanned). Kept as an assertion rather than deleted:
+# it states what THIS phase requires, so narrowing that gate fails here with the reason
+# attached. Bash matching, not a pipe — see the SIGPIPE note there.
+if [[ "$LOGS" != *"A1 uid-split active"* ]]; then
+  fail "the agent never logged 'A1 uid-split active' — the uid split did not engage (single-uid fallback would make the boundary vacuous)"
+fi
 [ "$("${COMPOSE[@]}" exec -T agent id -u worker | tr -d '\r')" = 10001 ] \
   && [ "$("${COMPOSE[@]}" exec -T agent id -u runner | tr -d '\r')" = 10002 ] \
   || fail "expected distinct worker(10001)/runner(10002) uids in the running agent"
@@ -2712,9 +2983,8 @@ say "PRD #32: per-user vault (dek sealing, claim gating, restart lock, lazy rewr
 login   # fresh admin session; login also unlocks the admin's vault
 
 # --- vault helpers -----------------------------------------------------------
-PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-# db_psql SQL — a bare scalar out of the e2e db (PGPASSWORD from the env-file).
-db_psql() { "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'; }
+# PGPW/db_psql moved up to the general helper block (see the note there) — they are not
+# vault-specific and phases above this line need them.
 # sealed_of EMAIL — the sealed_with of a user's anthropic_token row.
 sealed_of() { db_psql "SELECT s.sealed_with FROM user_secrets s JOIN users u ON u.id = s.user_id WHERE u.email = '$1' AND s.kind = 'anthropic_token'"; }
 # vault_status_jar JAR — GET /api/vault/status with JAR's cookie; a read that never unlocks.
@@ -4256,6 +4526,93 @@ git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/hea
   || fail "fake GitLab recorded no MR from agent/issue-$IID_RV"
 pass "revised plan approved → completed: branch=agent/issue-$IID_RV pushed, mr_iid=$RV_MR recorded on the fake GitLab"
 
+# PRD #88 — ask-user clarification: a run PARKS on an agent-initiated question,
+# the human answers over the real HTTP steering surface, and the SAME session
+# resumes. This is the milestone's own acceptance line ("provable end-to-end with
+# the stub executor"), and it is the only place the whole chain runs together:
+# signal -> question run-message -> awaiting_input state report -> answer input ->
+# SetRunRunning's identity guard -> resumed session -> plan gate -> MR.
+#
+# The stub asks BEFORE it plans (STUB_ASK_SENTINEL sits ahead of the plan gate in
+# executor.ts), so this also exercises M4's pre-run park — the path that used to
+# hard-fail on REASON_NO_PLAN, since a planning turn that asks ends with questions
+# and NO plan.
+#
+# Runs at the DEFAULT cap-1 worker, before the PRD #42 phase below reconfigures it.
+say "PRD #88: ask-user clarification (park -> answer -> resume -> approve -> MR)"
+IID_AU="$(apipost "/api/repos/$REPO_ID/issues" \
+  "$(jq -cn '{title:"E2E clarify", description:"implements prds/4-agent-runtime-workers.md — but first: UZI_STUB_ASK"}')" | jq -r '.card.iid')"
+RUN_AU="$(create_run "$REPO_ID" "$IID_AU")" || fail "ask-user run-create failed (non-transient; see stderr)"
+{ [ -n "$RUN_AU" ] && [ "$RUN_AU" != null ]; } || fail "ask-user run was not created"
+
+# The park. awaiting_input is a DISTINCT status from awaiting_approval — the whole
+# reason it exists is that an answer can never satisfy the plan gate's resume guard.
+wait_status "$RUN_AU" awaiting_input
+wait_msg_kind "$RUN_AU" question
+pass "run $RUN_AU parked at awaiting_input with a question on the feed"
+
+# The open question is derived from the FEED, not from a run field (D-L): web, CLI
+# and Slack all share this one derivation rule. Newest `question` message wins.
+QMSG="$(apiget "/api/runs/$RUN_AU/messages" | jq -c '[.messages[] | select(.kind=="question")] | last')"
+QID="$(echo "$QMSG" | jq -r '.payload.question_id // empty')"
+[ -n "$QID" ] || fail "the question message carries no question_id (payload: $QMSG)"
+[ "$(echo "$QMSG" | jq -r '.payload.questions | length')" -ge 1 ] \
+  || fail "the question message carries no questions (payload: $QMSG)"
+pass "question payload carries a question_id ($QID) and at least one question"
+
+# An answer naming a DIFFERENT question must be rejected. This is the stale-answer
+# guard — the case that actually happens is a Slack reply to question N landing
+# after the agent has moved on to N+1 — and asserting it here proves the identity
+# keying end to end over HTTP, not just in the store test.
+STALE_CODE="$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/runs/$RUN_AU/inputs" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+  -d "$(jq -cn '{kind:"answer", body:"{\"question_id\":\"not-the-open-question\",\"answers\":[\"nope\"]}"}')")"
+[ "$STALE_CODE" = 409 ] \
+  || fail "an answer naming a stale question must be rejected with 409, got $STALE_CODE"
+# ...and the run must still be parked: a rejected answer must not disturb the park.
+[ "$(apiget "/api/runs/$RUN_AU" | jq -r '.run.status')" = awaiting_input ] \
+  || fail "a rejected stale answer un-parked the run"
+pass "an answer naming a stale question is rejected (409) and leaves the run parked"
+
+# The real answer, naming the open question.
+SS_AU="$(apipost "/api/runs/$RUN_AU/inputs" \
+  "$(jq -cn --arg q "$QID" '{kind:"answer", body:({question_id:$q, answers:["proceed"]} | tojson)}')" | jq -r '.server_side')"
+[ "$SS_AU" = false ] || fail "an answer against a LIVE worker must be poller-consumed, not server-side (got server_side=$SS_AU)"
+
+# The worker echoes the answer to the feed, then the run leaves the park. Both are
+# asserted: the echo is what makes the round trip auditable, and the status change
+# is what proves SetRunRunning's identity guard was actually satisfied.
+wait_msg_kind "$RUN_AU" answer
+pass "answer accepted and echoed to the feed"
+
+# The run resumes and reaches the ordinary plan gate — the pre-run park does NOT
+# replace the gate, it precedes it.
+wait_status "$RUN_AU" awaiting_approval
+[ -n "$(apiget "/api/runs/$RUN_AU" | jq -r '.run.plan_md // empty')" ] \
+  || fail "the resumed run reached the plan gate with no plan_md"
+pass "run resumed from the park and reached the plan gate with a plan"
+
+# An answer submitted when nothing is being asked is rejected (D-F): SubmitInput
+# otherwise accepts any non-terminal run, so a pre-seeded answer would resolve the
+# next question the instant it opened, with the user never seeing it.
+NOTPARKED_CODE="$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/runs/$RUN_AU/inputs" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+  -d "$(jq -cn --arg q "$QID" '{kind:"answer", body:({question_id:$q, answers:["too late"]} | tojson)}')")"
+[ "$NOTPARKED_CODE" = 409 ] \
+  || fail "an answer to a run that is not parked must be rejected with 409, got $NOTPARKED_CODE"
+pass "an answer to a run that is not asking anything is rejected (409)"
+
+# Approve → implement → push → MR, mirroring the happy-path tail. Proves the park
+# left the run in a genuinely normal state rather than a special one.
+apipost "/api/runs/$RUN_AU/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_AU" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+AU_FINAL="$(apiget "/api/runs/$RUN_AU")"
+AU_MR="$(echo "$AU_FINAL" | jq -r '.run.mr_iid')"
+{ [ "$AU_MR" != null ] && [ "$AU_MR" -gt 0 ]; } || fail "ask-user run.mr_iid not set (got $AU_MR)"
+git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_AU" \
+  || fail "branch agent/issue-$IID_AU was not pushed after the clarification round trip"
+pass "clarified run completed: branch=agent/issue-$IID_AU pushed, mr_iid=$AU_MR"
+
 # =============================================================================
 # PRD #42 — bounded worker concurrency (cap 2). ADDITIVE + LAST: the entire suite
 # above ran the single worker at the DEFAULT cap (1 — the pre-#42 serial loop),
@@ -4840,14 +5197,44 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null 2>&1 \
     || fail "could not recreate the agent with UZI_DIND_SOCKET set"
   # Wait for the recreated worker to boot, probe (with the readiness wait), and log its wiring.
+  #
+  # 🔴 CAPTURE THEN MATCH IN BASH, never `compose logs agent | grep -q`. Same SIGPIPE defect
+  # documented at the secret-hygiene corpus gate: under `set -euo pipefail`, `grep -q` exits
+  # on the match, the writer upstream dies of SIGPIPE, and pipefail promotes that to the
+  # pipeline's status — so a MATCH is reported as a failure whenever more than a pipe
+  # buffer's worth of output FOLLOWS it (position, not total size; see that note).
+  #
+  # These sites sit squarely in the bad case, which is why they are not merely theoretical:
+  # `docker_wired:true` and the register line are BOOT lines, so everything the agent logs
+  # afterwards is data following the match — and the agent is the chattiest service here.
+  # The false-red probability therefore RISES the longer the worker has been up, which is
+  # the intermittency signature to expect if these ever regress.
+  #
+  # The CONSEQUENCE differs from the leak scan's, which is why it is worth spelling out
+  # rather than cross-referencing. These are positive assertions (`… || fail`), so the bug
+  # makes them fail SPURIOUSLY: the `&& break` below never fires, the loop burns its full 45s,
+  # and the `|| fail` then reports a worker that had in fact wired itself correctly. A false
+  # RED, and an intermittent one. The leak scan's `… && fail` failed the opposite way, silently
+  # passing. Same mechanism, opposite outcome — do not assume one implies the other.
+  #
+  # ⚠️ THIS PATH IS NOT EXERCISED BY ANY RUN IN THIS BRANCH. It is inside the
+  # `--profile agent-docker` block (PRD #83 M2), which is opt-in and off by default, so the
+  # green e2e that accompanies this change never entered it. Verified by `bash -n`, by the
+  # mechanism being identical to the one measured at the corpus gate, and by checking the
+  # patterns below match the same literals the greps did — not by execution.
   det_end=$((SECONDS + 45))
+  DIND_AGENT_LOGS=""
   while [ $SECONDS -lt $det_end ]; do
-    "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' && break
+    DIND_AGENT_LOGS="$("${COMPOSE[@]}" logs agent 2>&1)"
+    [[ "$DIND_AGENT_LOGS" == *'"docker_wired":true'* ]] && break
     sleep 1
   done
-  "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' \
+  # Quoted substrings are matched LITERALLY inside a `[[ == ]]` pattern, so the `[` and `]` of
+  # capabilities:["docker"] are ordinary characters here and need none of the ERE escaping the
+  # `grep -qE` form required.
+  [[ "$DIND_AGENT_LOGS" == *'"docker_wired":true'* ]] \
     || fail "the worker did not self-detect the sidecar (no docker_wired:true) via UZI_DIND_SOCKET"
-  "${COMPOSE[@]}" logs agent 2>&1 | grep -qE '"capabilities":\["docker"\]' \
+  [[ "$DIND_AGENT_LOGS" == *'"capabilities":["docker"]'* ]] \
     || fail 'the worker did not report capabilities:["docker"] at register'
   pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
@@ -4871,6 +5258,13 @@ fi
 #     is the property under test. A second container would test two workers instead.
 # The live agent is stopped first: it shares the admin's queue and would otherwise
 # claim these runs itself. Nothing follows this phase, so the stop is free.
+#
+# 🔴 THAT LAST SENTENCE IS A CONSTRAINT ON EVERY FUTURE PHASE, not a description. The
+# `stop agent` below is never undone, so ANY phase appended after this one runs against
+# a stack with no worker: its runs are created fine, sit in `queued`, and time out at
+# whatever it waits for. PRD #35 M6 was written here first and died exactly that way
+# (2026-07-28). Append below only what needs no worker — otherwise put the phase ahead
+# of this one, or restart the agent yourself.
 say "PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim"
 login
 "${COMPOSE[@]}" stop agent >/dev/null 2>&1 || true
@@ -5001,4 +5395,4 @@ pass "D5 live: deleting a bound token unbinds the worker and leaves workers.user
 # who did not watch the output learns what was in it — so a phase that lands without
 # being named here is invisible in exactly the summary people quote. PRD #98 was missing:
 # its M8c printed-instruction phase landed at 4b94f714 without touching this line.
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #41 plan-revision + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #98 judge menu + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue + PRD #104 token binding + PRD #88 ask-user + PRD #35 usage-limit park%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"

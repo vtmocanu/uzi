@@ -4,9 +4,23 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
-## [Unreleased]
+## [0.12.0] - 2026-07-28
 
 ### Added
+
+- **An agent can now stop mid-run (or before planning) and ask you a
+  question**, instead of guessing or stalling on something it shouldn't
+  decide alone. The run parks with a **needs your answer** badge, the
+  question lands in the run feed with any suggested options, and you answer
+  from the run view's composer, a reply in the run's Slack thread, or `uzi
+  run answer <id>` — all three read the same open question off the feed, so
+  none can show something the others don't. Left unanswered, the run fails
+  closed ("clarification timed out") rather than hanging forever; both the
+  answer deadline and the per-run question cap are held in worker memory and
+  reset on a worker-death requeue, so the honest worst case over a run's
+  life is 48h and 10 questions on the defaults, not 24h and 5. Autopilot
+  runs never park on a question — they proceed on their own best judgment
+  and record the assumption in the feed instead (PRD #88).
 
 - **Manual drag-to-reorder for board cards, a sort switcher, and a keyboard
   equivalent.** Drag a card within its column to set the board's order by
@@ -101,6 +115,19 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   pool is nearly out — and links to the same page. `uzi worker list` also gains a **TOKEN**
   column, so the three-way choice the CLI could already *set* is finally one it can *show*
   (PRD #111 M1 + M5).
+
+- **A run that hits your Anthropic usage limit can now pause instead of failing.** Opt in
+  per run from the run view, or set the default for every new run in Settings — off until
+  you turn it on, and the Settings default is the **only** way to reach an autopilot,
+  CI-fix, or self-improvement run, since none of those has a start button of its own. A
+  paused run keeps its branch, its history, and an already-approved plan: once your 5-hour
+  or 7-day window reopens it resumes on the same worker in the same session, without asking
+  you to re-approve a plan it already had. It can pause more than once if the limit keeps
+  recurring, backing off between attempts, up to a retry budget an operator can tune
+  alongside how long any one pause may last (`RUN_LIMIT_MAX_WAITS`, `RUN_LIMIT_MAX_PARK` —
+  see [docs/configuration.md](docs/configuration.md)). A run that stays opted out still
+  fails the moment it hits the limit, exactly as before, but now says which window and when
+  it resets instead of a bare `agent run failed: error_during_execution` (PRD #35).
 
 ### Changed
 

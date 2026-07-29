@@ -6,10 +6,11 @@ audience: user
 
 # Slack notifications
 
-uzi can DM you about runs you own: started, needs your approval, finished with
-a merge request, or failed — and you can **Approve**, **Reject**, or
-**Request changes** to a plan gate right from Slack, or reply in the thread
-to steer a live run. The bot is
+uzi can DM you about runs you own: started, needs your approval, needs your
+answer, finished with a merge request, or failed — and you can **Approve**,
+**Reject**, or **Request changes** to a plan gate right from Slack, answer a
+question an agent stopped to ask, or reply in the thread to steer a live run.
+The bot is
 **outbound-only** (Socket Mode): it opens a connection out to Slack, so there's
 no public URL or inbound port to expose. See
 [ARCHITECTURE.md](../ARCHITECTURE.md#slack-integration-outbound-only) for the
@@ -137,6 +138,40 @@ Open **Settings → Notifications**:
   to exclude individual agents, approve from the web UI instead. A repo with no
   `.claude/agents/` shows the single **Approve** button (your templates), exactly
   as before, and so do gate messages posted before this feature shipped.
+- **Answering a question**: an agent that hits a fork it shouldn't resolve
+  alone can stop and ask you. The run parks, its status reads **needs your
+  answer**, and the question is posted into the run thread with any suggested
+  answers listed. **Reply in the thread — that reply is the answer**, and the
+  run picks up where it left off. There are no buttons: free text is the whole
+  affordance on Slack, so you can answer a suggestion by naming it, or ignore
+  the suggestions entirely. A few things worth knowing:
+  - **Your reply answers the question it comes after.** uzi orders your reply
+    against the question message above it, so a reply that landed before the
+    latest question is treated as answering an older one and is **refused**,
+    with a note telling you to scroll down and answer the current question.
+    That is deliberate: it is the only way to stop a reply you wrote against an
+    earlier question from being silently applied to a newer one you never read.
+    What uzi still cannot tell is *intent* — if a newer question is already on
+    screen and you reply meaning the older one, your words go to the newer
+    question, because both replies land in the same thread and look identical.
+    Answer the question at the bottom of the thread.
+  - **One reply answers the whole card.** When the agent batches several
+    questions into one message, cover them in a single reply; the agent reads
+    it in full. It may re-ask anything you left unaddressed.
+  - **Nobody answers ⇒ the run fails** once the answer deadline passes (24
+    hours by default, `QUESTION_TIMEOUT_SECONDS`). The timer is held by the
+    worker, so if that worker dies and the run is picked up again the clock
+    restarts — the honest worst case is the timeout times one more than the
+    requeue limit, not the timeout flat. The per-run question cap
+    (`QUESTION_MAX`, 5 by default) resets the same way for the same reason,
+    so it has the identical caveat: a run may ask up to 10 questions over its
+    life, not 5, if a worker dies and it's requeued in between.
+  - **The ✅ means "recorded", not "delivered".** It is added once uzi has
+    stored your answer for the run to collect. In the narrow window of a
+    rolling worker upgrade, a run resumed onto a worker from before this
+    feature shipped will discard a pending answer without acting on it — so
+    you can get a checkmark for an answer that never reached the agent. If a
+    run you answered doesn't move, open it in uzi and answer there.
 - **Steering a live run**: reply in the thread outside a gate and it's
   submitted as a follow-up instruction, with a ✅ reaction as the ack.
 - Otherwise only status, repository path, issue number and title, MR link,
@@ -175,6 +210,18 @@ Open **Settings → Notifications**:
   `.claude/agents/`, the agent **names** (short kebab-case identifiers, at most
   16, ≤64 chars each) also appear in the gate DM so you can choose that roster;
   their **descriptions** are never sent.
+- **Question content also leaves the box, on the same terms as the plan.**
+  When an agent asks you something, the question text (and any suggested
+  answers) is posted into your run thread, with the same credential-pattern
+  scrub and the same limit: a secret quoted verbatim into a question is not
+  caught by any layer. Two things are specific to questions. The text is
+  written by the agent from repository and issue content, so a hostile file in
+  a repo can influence what you are asked — uzi instructs agents never to ask
+  for a credential, token or password, and **you should treat any such request
+  as a red flag and refuse it**, from Slack or anywhere else. And the widening
+  runs both ways: your answer is stored and replayed into the agent's context,
+  so it is scrubbed of known credential patterns and length-bounded before it
+  goes anywhere, whichever surface you answer from.
 - **Plan content also leaves the box, deliberately.** Every gated plan (and
   each revision from a Request-changes round) is posted into the run's
   Slack thread in full — a user-approved trade so a whole approval round can

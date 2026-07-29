@@ -216,6 +216,12 @@ func buildLanes(frames []laneFrame) []agentLane {
 // This is the trap D5 does not mention: the running-only variant exists too
 // (activeLane, :449) but drives the tool SPINNER, not the dot. Using running-only here
 // makes every lane of a claimed run read `idle`.
+//
+// statusLimitWait is deliberately NOT live: a parked run has no executing agent, so
+// naming one lane the active speaker would be a lie, and the `working` dot it earns on
+// the rung below would be a worse one. crewStateFor short-circuits a parked run to
+// `waiting` above this function's result ever being consulted; that is where the park
+// is rendered, not here.
 func activeLaneKey(runStatus string, frames []laneFrame) string {
 	if runStatus != "running" && runStatus != "claimed" {
 		return ""
@@ -227,7 +233,7 @@ func activeLaneKey(runStatus string, frames []laneFrame) string {
 }
 
 // crewStateFor is the D5 ladder (ActivityFeed.tsx:209-245). Precedence, in order:
-// terminal → gate/worker-wait → active speaker (health, NOT recency) → non-active
+// terminal → gate/park/worker-wait → active speaker (health, NOT recency) → non-active
 // recency split.
 //
 // actor is an OPAQUE identity compared only for equality against activeActor: a lane
@@ -236,8 +242,36 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	if isTerminalRunStatus(runStatus) {
 		return crewDone
 	}
-	// A gate or a missing worker blocks the WHOLE crew, so it dominates every lane.
-	if runStatus == "awaiting_approval" || runHealth == "waiting_worker" {
+	// A gate, a usage-limit park, a clarification park or a missing worker blocks the
+	// WHOLE crew, so it dominates every lane.
+	//
+	// statusLimitWait is on this rung rather than left to fall through, and BOTH of the
+	// rungs below get it wrong in a different direction — which is why one rung placed
+	// high fixes both at once instead of needing two patches:
+	//
+	//   - The recency split would answer `idle` for any park older than 45s, i.e. for
+	//     every real park (they run hours). "Nothing is happening and nobody is coming"
+	//     is the wrong reading of a run with a server-side promotion scheduled.
+	//   - The active-speaker rung would answer `stalled` off a FROZEN health flag.
+	//     ListActiveRunsForHealth is a POSITIVE allowlist (queued/running/
+	//     awaiting_approval), so the PRD #47 detector never revisits a parked run and
+	//     whatever flag was live at park time cannot be cleared by anything downstream.
+	//     A run parked while flagged `stalled` would read STALLED here for days.
+	//
+	// The server clears health on the park write and on the promotion (PRD #35 §7.6),
+	// so in a correct deployment the stale flag never arrives. This rung is deliberately
+	// NOT relying on that: PRD #35 Success Criterion 2 is "a parked run is visibly
+	// waiting, never stalled", and a criterion this file can satisfy locally must not be
+	// outsourced to another service getting its writes right. TestCrewStateForParkedRun
+	// pins it against exactly that stale value.
+	//
+	// awaiting_input (PRD #88) rides the same rung, and BOTH arguments above transfer
+	// verbatim: a clarification park routinely outlasts the recency window, and
+	// SetRunAwaitingInput clears health on entry for precisely the reason described
+	// above — awaiting_input is likewise absent from ListActiveRunsForHealth's
+	// allowlist, so nothing downstream could clear a flag frozen at park time. It is on
+	// this rung rather than in atPlanGate, which is specifically the PLAN gate.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

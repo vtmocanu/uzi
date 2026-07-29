@@ -22,6 +22,7 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { fenceNonce } from "./prompt.js";
 import { mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
+import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { rmTreeForce } from "./rmtree.js";
 import { errMessage } from "./util.js";
@@ -158,7 +159,7 @@ export class JudgeRunner {
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
     } catch (err) {
       this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
-      await this.safeReportFailed(judgeRunId, errMessage(err));
+      await this.safeReportFailed(judgeRunId, errMessage(err), err);
     }
   }
 
@@ -275,7 +276,18 @@ export class JudgeRunner {
     if (model) options.model = model;
 
     let text = "";
+    // PRD #35 Decision 14: a judge run NEVER parks. It is executed by this runner,
+    // not RunRunner, so it never reaches that cleanup carve-out at all — and parking
+    // it would mean duplicating detection, the park report and a second carve-out
+    // into this file for the cheapest run kind in the product. Its value also decays:
+    // maybeEnqueueJudge fires once on the reviewed run's terminal transition, so a
+    // judge parked for up to seven days would be reviewing a run nobody remembers,
+    // and losing it loses no user work. What it DOES get is Decision 8's better
+    // death — the structured limit facts on the failed report, so the server can say
+    // why instead of leaving "judge model call returned an error result".
+    const rateLimits = new RateLimitObserver();
     for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
+      rateLimits.observe(msg);
       for (const em of mapSdkMessage(msg)) {
         if (em.kind === "text") {
           const t = (em.payload as { text?: string }).text;
@@ -283,16 +295,29 @@ export class JudgeRunner {
         }
       }
       if (isResult(msg)) {
-        if (isErrorResult(msg)) throw new Error("judge model call returned an error result");
+        if (isErrorResult(msg)) {
+          const limit = classifyLimitFailure(msg, rateLimits.latest, Date.now());
+          if (limit) throw new LimitReachedError(limit);
+          throw new Error("judge model call returned an error result");
+        }
         break;
       }
     }
     return text;
   }
 
-  private async safeReportFailed(runId: string, reason: string): Promise<void> {
+  private async safeReportFailed(runId: string, reason: string, cause?: unknown): Promise<void> {
     try {
-      await this.client.reportState(runId, { status: "failed", failure_reason: reason.slice(0, 500) });
+      // PRD #35: on a usage-limit death report the STRUCTURED facts and let the
+      // server compose the sentence from its own allowlisted enum (Decision 8).
+      // failure_reason is omitted in that case rather than set to a worker-composed
+      // string — sending both would have the worker's text win and would carry an
+      // unvalidated rateLimitType into the run row by a second route.
+      const body =
+        cause instanceof LimitReachedError
+          ? { status: "failed" as const, rate_limit_type: cause.rateLimitType, limit_resets_at: cause.resetsAtMs }
+          : { status: "failed" as const, failure_reason: reason.slice(0, 500) };
+      await this.client.reportState(runId, body);
     } catch (err) {
       this.log.warn("judge failed-state report failed", { run_id: runId, error: errMessage(err) });
     }

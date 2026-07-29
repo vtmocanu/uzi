@@ -274,3 +274,89 @@ describe("StubExecutor — PRD #41 plan gate revision loop", () => {
     assert.equal(emitted.filter((m) => m.kind === "plan_revising").length, 0, "no plan_revising without a revise");
   });
 });
+
+describe("StubExecutor — PRD #35 Decision 6b pre-approved resume", () => {
+  const approve: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+  const skipText = "skipping the planning turn";
+
+  // gatePlan that RECORDS its calls, so "the gate was never entered" is assertable
+  // as a count rather than inferred from the absence of a message.
+  function countingGate(): { gatePlan: (planMd: string) => Promise<PlanVerdict>; calls: string[] } {
+    const calls: string[] = [];
+    return {
+      gatePlan: async (planMd: string) => {
+        calls.push(planMd);
+        return approve;
+      },
+      calls,
+    };
+  }
+
+  it("planApproved + approvedPlan: never enters the gate, says so once, and still implements", async () => {
+    const wt = makeWorktree();
+    const gate = countingGate();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      gatePlan: gate.gatePlan,
+      planApproved: true,
+      approvedPlan: "## An already-approved plan\n\n- do the thing",
+    });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    // The load-bearing one: a resumed run must not park a second time in front of a
+    // human who already approved. Counting the gate calls is what proves the skip;
+    // the feed line is a report OF the skip and could be emitted by code that gated
+    // anyway.
+    assert.equal(gate.calls.length, 0, "a pre-approved resume must never call gatePlan");
+    assert.equal(
+      emitted.filter((m) => String(m.payload.text ?? "").includes(skipText)).length,
+      1,
+      "the skip is reported exactly once (the M6 e2e asserts this exact count on the feed)",
+    );
+    assert.ok(
+      emitted.some((m) => m.kind === "text" && String(m.payload.text).includes("committed locally")),
+      "the run still implements after skipping the gate",
+    );
+  });
+
+  // Both halves of the condition, one test each. Without these the branch would pass
+  // its happy-path test while an implement loop with no instructions, or an ordinary
+  // first run, silently took the skip.
+  it("planApproved WITHOUT approvedPlan still gates (an empty plan has nothing to implement)", async () => {
+    const wt = makeWorktree();
+    const gate = countingGate();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      gatePlan: gate.gatePlan,
+      planApproved: true,
+      approvedPlan: "   ",
+    });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.equal(gate.calls.length, 1, "a whitespace-only approvedPlan must fall through to the gate");
+    assert.equal(emitted.filter((m) => String(m.payload.text ?? "").includes(skipText)).length, 0);
+  });
+
+  it("an ordinary first run (no planApproved) gates exactly as before", async () => {
+    const wt = makeWorktree();
+    const gate = countingGate();
+    const { ctx, emitted } = makeCtx({
+      worktreePath: wt.path,
+      gatePlan: gate.gatePlan,
+      approvedPlan: "## carried by the claim but not approved",
+    });
+    try {
+      await new StubExecutor(nullLogger(), { planGate: true }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.equal(gate.calls.length, 1, "approvedPlan alone must not skip the gate");
+    assert.equal(emitted.filter((m) => String(m.payload.text ?? "").includes(skipText)).length, 0);
+  });
+});

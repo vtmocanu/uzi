@@ -75,6 +75,7 @@ uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
+uzi run answer <id> [--message <text> ...]
 uzi run inputs <id> [--json]
 uzi review show <id> | backlog [--bucket todo|filed|done|dismissed|all]
 uzi review resolve <id> <rec> | --category <c> --target <t>
@@ -104,6 +105,17 @@ A few worth knowing:
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/`), and `--exclude-agents a,b` drops individual
   subagents from that source. `--exclude-agents` requires `--agent-source`.
+- **`run answer <id>`** answers the clarifying question a run is parked on
+  (`awaiting_input`) — see [Answering a
+  question](./run-activity.md#answering-a-question). It reads the open
+  question from the run's own feed rather than a dedicated field, the same
+  way the web UI and Slack do, so `run get` first to see what's actually
+  being asked. Pass `-m`/`--message` once per question when the agent asked
+  several (matched in order), or pipe a single answer on stdin. The answer
+  names the question it answers, so one written against a question the
+  agent has already moved past is rejected rather than applied to the
+  current one, and calling it against a run that isn't currently parked
+  fails outright instead of queuing.
 - **`review show <id>`** (formerly `run review <id>`, still around as a
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
@@ -241,6 +253,12 @@ early drafts of this feature used both, but `[a]` doubling as admin-toggle
 a live run, so approve/reject moved to `y`/`n` and `a` stayed admin-only.
 Quitting always asks first (`q` or `ctrl+c`); a second `ctrl+c` is the
 escape hatch when the confirm prompt itself is what's stuck.
+
+**A run parked on a clarifying question (`awaiting_input`) has no in-TUI
+composer** — it renders the same "blocked on a human" waiting treatment a
+plan gate gets, but `y`/`n` don't apply to it. Answer from another terminal
+with `uzi run answer <id>` (see [Commands](#commands)), from the web run
+view, or from Slack; the TUI picks the change up on its next refresh.
 
 ### Steering is run-level, not per-agent
 

@@ -46,6 +46,19 @@ UPDATE users SET last_login = now() WHERE id = $1;
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserWaitOnLimit :one
+-- Flip a user's usage-limit park default (PRD #35 Decision 7). Per-user consent to
+-- a run PARKING rather than failing when the owner's Anthropic window is exhausted;
+-- default false, set from the user's own Settings page.
+--
+-- It is the DEFAULT a new run inherits, never a retroactive switch: every run
+-- carries its own runs.wait_on_limit, stamped at creation, and flipping this changes
+-- nothing about a run that already exists (parked or otherwise). That is the same
+-- shape as autopilot_enabled above and is what makes the per-run toggle
+-- (SetRunWaitOnLimit) a separate write rather than a filter over this one.
+UPDATE users SET wait_on_limit = $2 WHERE id = $1
+RETURNING *;
+
 -- name: SetUserJudgeEnabled :one
 -- Flip a user's run-retrospective opt-in (PRD #46 Decision 7). Per-user consent to
 -- spend the user's own Anthropic tokens judging every finished run; default false.

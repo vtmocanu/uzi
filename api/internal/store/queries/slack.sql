@@ -107,9 +107,23 @@ RETURNING *;
 -- Slack. COALESCE collapses BOTH NULL (no worker report) and [] (scanned, found
 -- none) to an empty array — Slack renders them identically (single-approve shape).
 -- Names ride in roster order (WITH ORDINALITY).
+--
+-- rate_limit_type / retry_not_before / limit_wait_count (PRD #35 M5) are selected
+-- FROM THE RUNS ROW because this query is an explicit column list and there is no
+-- other way to reach them: the "paused: usage limit (five_hour); resumes ~<t>" line
+-- cannot be built from a run_messages payload, which this query never joins. That
+-- is the whole reason rate_limit_type is a column on `runs` rather than living only
+-- in the feed message (see 00091's comment).
+--
+-- rate_limit_type arrives here ALREADY ALLOWLISTED — workersvc coerces anything
+-- outside the seven-member vocabulary to 'unknown' before it is stored, and 00091's
+-- CHECK is the backstop. The renderer escapes it anyway; that is defence in depth
+-- against a writer that bypassed both, which is precisely the population the CHECK
+-- exists for.
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
        r.health, r.plan_md,
+       r.rate_limit_type, r.retry_not_before, r.limit_wait_count,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -174,3 +188,38 @@ RETURNING *;
 -- a genuinely new plan version (post a fresh gate + plan-in-thread) from a redundant
 -- re-broadcast of the same version (no-op, never spam).
 SELECT count(*) FROM run_messages WHERE run_id = @run_id AND kind = 'plan';
+
+-- name: GetLatestRunQuestion :one
+-- The clarification question a parked run is waiting on (PRD #88 M3): the payload of
+-- the newest kind='question' run_message. The worker flushes that message BEFORE it
+-- reports awaiting_input, so a run genuinely parked always has one; no row means the
+-- notifier saw the state first and should wait for a later event rather than post a
+-- park it cannot explain.
+--
+-- The raw payload is returned and parsed in Go, unlike GetSlackRunContext's
+-- repo_agent_names, which is projected in SQL specifically so repo-authored agent
+-- DESCRIPTIONS never leave the database toward Slack. That reason inverts here: the
+-- question text IS what M3 exists to deliver, so there is nothing to withhold, and
+-- building the render in SQL would put string formatting in a query for no gain.
+SELECT payload FROM run_messages
+WHERE run_id = @run_id AND kind = 'question'
+ORDER BY seq DESC LIMIT 1;
+
+-- name: SetSlackRunQuestion :one
+-- Record which question the run's thread already carries, and the ts of the message
+-- that carried it (PRD #88 M3). The two are written together because they are one
+-- fact — "this question, on that card" — and either alone is a defect: the id without
+-- the ts leaves an inbound reply unbindable, and the ts without the id leaves the
+-- notifier unable to tell a re-park from a new question.
+--
+-- The id makes a re-park a no-op: a worker death re-queues the run and the resumed
+-- worker parks again on the SAME question id, so without this the card posts twice.
+-- The ts is what an inbound reply is ordered against — see the 00092 migration for why
+-- "whichever question is open right now" is the wrong derivation.
+--
+-- Unguarded on purpose: the notifier drains its queue in ONE goroutine, so there is no
+-- concurrent writer to compare against, unlike the gate's cross-surface button clicks.
+UPDATE slack_run_messages
+SET question_id = @question_id, question_ts = @question_ts, updated_at = now()
+WHERE run_id = @run_id
+RETURNING *;

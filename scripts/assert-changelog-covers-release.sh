@@ -38,12 +38,21 @@ REF="${1:-HEAD}"
 PREV="${2:-}"
 VERSION="${3:-}"
 
+# MATCH ONLY RELEASE TAGS. `git describe --abbrev=0` returns the nearest tag by
+# ANCESTRY, not the nearest release, so any scratch tag between the last release and
+# HEAD silently narrows the window this gate checks. Measured 2026-07-28: with
+# `prd111-premerge-backup` sitting between v0.11.12 and main, the default run reported
+# "OK ... since prd111-premerge-backup" while the release actually spanned 15
+# first-parent commits from v0.11.12. It passed anyway that time, which is the point:
+# a gate that silently checks less than it claims fails open, and the failure is
+# invisible in its own output. `--match 'v[0-9]*'` binds it to the release tags Model B
+# defines. Pass $2 explicitly to override.
 if [ -z "$PREV" ]; then
-  exact="$(git describe --tags --exact-match "$REF" 2>/dev/null || echo '')"
+  exact="$(git describe --tags --exact-match --match 'v[0-9]*' "$REF" 2>/dev/null || echo '')"
   if [ -n "$exact" ]; then
-    PREV="$(git describe --tags --abbrev=0 --exclude="$exact" "$REF" 2>/dev/null || true)"
+    PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude="$exact" "$REF" 2>/dev/null || true)"
   else
-    PREV="$(git describe --tags --abbrev=0 "$REF" 2>/dev/null || true)"
+    PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$REF" 2>/dev/null || true)"
   fi
 fi
 

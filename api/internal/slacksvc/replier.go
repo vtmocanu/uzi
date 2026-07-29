@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -219,6 +222,19 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	case isTerminalStatus(run.Status):
 		r.coalescedEphemeral(ctx, m, "finished", "That run has already finished.")
 
+	case run.Status == "awaiting_input":
+		// The run is parked on a clarification question and the reply IS the answer (PRD
+		// #88 M3). This case MUST precede the default arm: the default submits a follow_up,
+		// which the worker queues for the NEXT implement turn — a turn that never arrives,
+		// because the run is parked waiting for the answer that just became a follow-up.
+		// The run would then sit until its deadline having visibly ignored the user.
+		//
+		// Unlike both awaiting_approval cases above this is a BARE status check: those are
+		// compound because a plan revision keeps the run at awaiting_approval, so the
+		// status alone cannot tell an open gate from a reject/revise-pending one. A
+		// question has no such sub-state — awaiting_input means exactly one thing.
+		r.answer(ctx, m, user.ID, anchor, text)
+
 	default:
 		// Live run, no gate → follow_up for the next implement turn.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "follow_up", text); err != nil {
@@ -227,6 +243,126 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		}
 		r.ack(ctx, m)
 	}
+}
+
+// answer submits a threaded reply as the answer to a clarification question (PRD #88
+// M3). Everything here turns on ONE decision: which question a piece of free text
+// answers.
+//
+// Web and CLI do not have this problem — they echo back the question id they were
+// shown, so the answer names itself. A Slack reply carries no id, so the id must be
+// DERIVED, and the obvious derivation is wrong. "Whichever question is open when the
+// reply arrives" is an ARRIVAL-TIME key wearing identity's clothes: a reply written
+// against Q1 that lands after Q2 opened would be stamped with Q2's id by the server,
+// and would then satisfy every equality check downstream precisely because the server
+// is what supplied the id. That is the race identity keying exists to close, re-opened
+// from the one direction the guard cannot see.
+//
+// The correct derivation is the question the reply FOLLOWS, ordered by ts against the
+// card the notifier posted:
+//
+//   - reply after the current question's message ⇒ it answers that question;
+//   - reply before it ⇒ it answers a superseded one ⇒ refuse, and say so.
+//
+// It survives a requeue for free, which is the property every clock-based scheme
+// failed: the re-park re-uses the question id, so the notifier's identity dedupe does
+// NOT re-post, so the recorded ts still points at the ORIGINAL card — and an answer
+// written before a worker death is still after it, and is still honoured.
+//
+// The id submitted is the ANCHOR's, i.e. the question the user actually saw, not the
+// run's currently-open one. The server then checks it against runs.open_question_id,
+// so the two facts stay independent: slacksvc says what was answered, workersvc says
+// whether that is still the open question. A reply to a card the run has already moved
+// past is rejected by the server rather than silently retargeted.
+//
+// Two replies racing before the worker consumes the first are BOTH accepted (same
+// question, run still parked) and the worker takes ONE of them, discarding the rest —
+// deliberately not a compare-and-swap: unlike a plan revision the loser is harmless,
+// being one more consumed input the worker drops.
+//
+// WHICH one it takes depends on whether they arrive in the same poll, and the precise
+// answer is worth having because "first-wins" (what this comment used to say) is only
+// half true. SteeringChannel.route assigns a SINGLE buffer slot per routed input, and
+// pollLoop routes an entire /inputs batch before servicing the waiter once. So within
+// one batch the LAST reply overwrites the earlier ones and wins; across batches the
+// first wins, because it has already resolved the park and the later reply arrives
+// with nothing waiting on it and no matching open question.
+//
+// Not a security property either way — same authenticated owner, same question, and
+// the server has already bound the reply to the anchor's question id. It is recorded
+// because it is a present-tense claim about a concurrency path, and the previous
+// wording would send someone debugging a "lost" reply looking for a bug that is
+// actually the documented behaviour.
+func (r *Replier) answer(ctx context.Context, m MessageReply, userID uuid.UUID, anchor store.SlackRunMessage, text string) {
+	qid := strings.TrimSpace(anchor.QuestionID.String)
+	qts := strings.TrimSpace(anchor.QuestionTs.String)
+	if qid == "" || qts == "" {
+		// The run is parked but no question card is recorded on this thread: the post
+		// failed, or the state report outran the question message and the notifier is still
+		// waiting. There is nothing to bind the reply to, and guessing is exactly what this
+		// function refuses to do.
+		r.ephemeral(ctx, m, "I haven't posted that question here yet — open the run in uzi to answer it.")
+		return
+	}
+	if !replyFollows(m.MessageTS, qts) {
+		// Written against an earlier question, or unorderable. Refusing is the whole point:
+		// this is the case a correct implementation must DISCARD, and the one the arrival-
+		// time derivation would have silently applied to the live question instead.
+		r.coalescedEphemeral(ctx, m, "stale-answer",
+			"That reply came before the question above it — scroll down to the latest question and answer there.")
+		return
+	}
+	if text == "" {
+		// Empty after trim/scrub (a file-only or emoji-only message). Submitting it would
+		// resolve the question with no content and let the run continue on nothing.
+		r.coalescedEphemeral(ctx, m, "empty-answer",
+			"That reply had no text — answer in words and I'll pass it to the run.")
+		return
+	}
+	err := r.svc.SubmitAnswer(ctx, userID, anchor.RunID, qid, text)
+	switch {
+	case err == nil:
+		r.ack(ctx, m)
+	case errors.Is(err, ErrAnswerStale), errors.Is(err, ErrNotAwaitingInput):
+		// Lost a race to another surface between the status read and this submit. Surfaced
+		// rather than dropped: no ✅, and a notice that says which way it went.
+		r.ephemeral(ctx, m, "The run already moved on from that question — open it in uzi to see where it is.")
+	default:
+		r.logf("submit answer", err)
+		r.ephemeral(ctx, m, "Couldn't record your answer — try again, or answer from uzi.")
+	}
+}
+
+// replyFollows reports whether a reply's ts comes strictly after the question card's.
+//
+// Slack ts values are "<epoch-seconds>.<microseconds>" and are compared NUMERICALLY,
+// not lexicographically: string ordering happens to agree only while the seconds part
+// has a fixed digit count, which is a property of the current decade rather than of the
+// format. Anything that cannot be ordered is treated as NOT following — the ordering is
+// what binds an answer to a question, so an ordering that cannot be established must
+// refuse rather than default to accepting.
+//
+// "Cannot be ordered" means unparseable OR non-finite, and the second half is the one
+// that is not decorative. Measured: a parse failure yields 0, which is already before
+// any real card, so the error check alone changes no outcome — but `strconv.ParseFloat`
+// accepts "Inf"/"+Inf"/"Infinity" with a NIL error, and +Inf is after every card ts, so
+// an error-only guard would ACCEPT it. A check that reads like a safety guard while
+// deciding nothing is exactly the shape D-R struck elsewhere in this PRD; finiteness is
+// what makes this one live.
+func replyFollows(replyTS, questionTS string) bool {
+	r, rok := parseSlackTS(replyTS)
+	q, qok := parseSlackTS(questionTS)
+	return rok && qok && r > q
+}
+
+// parseSlackTS parses a Slack message ts to an orderable number, reporting false for
+// anything that cannot participate in an ordering.
+func parseSlackTS(ts string) (float64, bool) {
+	v, err := strconv.ParseFloat(ts, 64)
+	if err != nil || math.IsInf(v, 0) || math.IsNaN(v) {
+		return 0, false
+	}
+	return v, true
 }
 
 // resolveGate edits the gate message button-free and clears the anchor, so a later

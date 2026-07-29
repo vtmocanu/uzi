@@ -54,16 +54,36 @@ import { RUN_ID_RE } from "./util.js";
  * is over", and a future reader must not upgrade that to "nothing is writing".
  */
 
-/** Run statuses a run never leaves (`runs.status` CHECK, created by migration
- *  `00020` and widened by `00091` for PRD #88's clarification park: queued/claimed/
- *  running/awaiting_approval/awaiting_input/completed/failed/cancelled). A run in one
- *  of these will never resume, so its HOME cannot be wanted again.
+/**
+ * Run statuses a run never leaves. A run in one of these will never resume, so its
+ * HOME cannot be wanted again.
  *
- *  The SET itself needed no change when the CHECK widened — it enumerates the
- *  terminal statuses, and awaiting_input is non-terminal, so a parked run is
- *  correctly skipped. Only this comment's enumeration was a present-tense claim about
- *  current code that had gone stale. */
-export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+ * The `runs.status` CHECK now holds NINE values — queued / claimed / running /
+ * awaiting_approval / limit_wait / awaiting_input / completed / failed / cancelled —
+ * after PRD #35 widened migration `00020`'s original seven with `limit_wait` and
+ * PRD #88 added `awaiting_input`.
+ *
+ * 🔴 NEITHER `limit_wait` NOR `awaiting_input` IS TERMINAL, AND NEITHER MAY EVER BE
+ * ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below before
+ * touching it: a parked run's HOME is past `minAgeMs` for essentially its whole park
+ * (the age filter is 3h, a limit park runs to RUN_LIMIT_MAX_PARK, default 8d, and a
+ * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h), so it
+ * becomes a candidate on EVERY sweep and survives only because the API answers a
+ * non-terminal status and that status is absent here. Adding either deletes the
+ * ~170 MB SDK transcript the entire resume depends on.
+ *
+ * This is the SECOND of two independent protections for a parked HOME. The first is
+ * the runner's cleanup carve-out, which skips the teardown deletion; this one skips
+ * the sweep deletion hours later. Losing EITHER loses the transcript, and the
+ * failure presents as "the resume started a fresh session" long after the fact, with
+ * nothing pointing back here — which is why the guard is asserted in
+ * home-reclaim.test.ts rather than left to this comment.
+ */
+export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 /**
  * How stale a directory must be before it is even a candidate.
@@ -171,7 +191,8 @@ export async function reclaimStrandedRunHomes(
 ): Promise<ReclaimSummary> {
   const minAgeMs = opts.minAgeMs ?? DEFAULT_RECLAIM_MIN_AGE_MS;
   const maxEntries = opts.maxEntries ?? DEFAULT_RECLAIM_MAX_ENTRIES;
-  const maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
+  const maxConsecutiveFailures =
+    opts.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
   const deadlineMs = opts.deadlineMs ?? DEFAULT_RECLAIM_DEADLINE_MS;
   const now = opts.now ?? Date.now;
   const startedAt = now();
@@ -194,14 +215,18 @@ export async function reclaimStrandedRunHomes(
     // A worker on a fresh volume has no agent-home yet — nothing to reclaim, and
     // nothing worth a warning.
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("run HOME reclaim could not read the HOME root", { home_root: homeRoot });
+      log.warn("run HOME reclaim could not read the HOME root", {
+        home_root: homeRoot,
+      });
     }
     return summary;
   }
 
   // Candidates first, so "how many did we not get to" is a subtraction from a list
   // that exists rather than a number nobody counted.
-  const candidates = entries.filter((e) => e.isDirectory() && RUN_ID_RE.test(e.name));
+  const candidates = entries.filter(
+    (e) => e.isDirectory() && RUN_ID_RE.test(e.name),
+  );
   summary.skippedNotRunDir = entries.length - candidates.length;
 
   for (const entry of candidates) {

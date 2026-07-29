@@ -11,7 +11,16 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
-import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
+import {
+  StubExecutor,
+  PlanRejectedError,
+  STUB_FAIL_SENTINEL,
+  STUB_ASK_SENTINEL,
+  type Executor,
+  type RunContext,
+  type ExecutorResult,
+} from "../src/executor.js";
+import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
@@ -19,6 +28,7 @@ import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { UserInput } from "../src/protocol.js";
+import { LimitReachedError } from "../src/limit.js";
 
 const TOKEN = "tkn-runner-123456";
 
@@ -50,7 +60,9 @@ afterEach(async () => {
 // PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a
 // linked worktree under worktrees/.
 function worktreeDirFor(iid: number): string {
-  const repoDir = path.basename(git.barePathFor(fx.originPath)).replace(/\.git$/, "");
+  const repoDir = path
+    .basename(git.barePathFor(fx.originPath))
+    .replace(/\.git$/, "");
   return path.join(fx.dataDir, "runner", repoDir, `issue-${iid}`);
 }
 
@@ -65,7 +77,8 @@ function isAlive(pid: number): boolean {
 
 async function waitDead(pid: number, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (isAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  while (isAlive(pid) && Date.now() < deadline)
+    await new Promise((r) => setTimeout(r, 10));
 }
 
 interface MrCall {
@@ -79,10 +92,19 @@ interface MrCall {
 function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
-    calls.push({ url, method: init.method, headers: init.headers, body: init.body });
+    calls.push({
+      url,
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+    });
     return {
       status: 201,
-      text: async () => JSON.stringify({ iid: 42, web_url: "https://gitlab.example.test/org/repo/-/merge_requests/42" }),
+      text: async () =>
+        JSON.stringify({
+          iid: 42,
+          web_url: "https://gitlab.example.test/org/repo/-/merge_requests/42",
+        }),
     };
   };
   return { gitlab: new GitLabClient({ fetchFn }), calls };
@@ -92,25 +114,56 @@ function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
 function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
   const calls: MrCall[] = [];
   const fetchFn: FetchFn = async (url, init) => {
-    calls.push({ url, method: init.method, headers: init.headers, body: init.body });
+    calls.push({
+      url,
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+    });
     return {
       status: 201,
-      text: async () => JSON.stringify({ number: 42, html_url: "https://forgejo.example.test/org/repo/pulls/42" }),
+      text: async () =>
+        JSON.stringify({
+          number: 42,
+          html_url: "https://forgejo.example.test/org/repo/pulls/42",
+        }),
     };
   };
   return { forgejo: new ForgejoClient({ fetchFn }), calls };
 }
 
-function runner(executor: Executor, gitlab: GitLabClient, joinToken?: string): RunRunner {
+function runner(
+  executor: Executor,
+  gitlab: GitLabClient,
+  joinToken?: string,
+): RunRunner {
   // Wrap the single executor as a factory (PRD #42): each execute() gets it back.
   // The per-run-executor tests below inject a real per-run factory instead.
   return runnerWith(() => ({ executor }), gitlab, joinToken);
 }
 
-function runnerWith(makeExecutor: ExecutorFactory, gitlab: GitLabClient, joinToken?: string, log: Logger = nullLogger()): RunRunner {
+function runnerWith(
+  makeExecutor: ExecutorFactory,
+  gitlab: GitLabClient,
+  joinToken?: string,
+  log: Logger = nullLogger(),
+): RunRunner {
   return new RunRunner(client, git, makeExecutor, log, 20, joinToken, {
     pollMs: 5,
     planApprovalTimeoutMs: 0, // disabled — the gate resolves from injected inputs
+    // PRD #88 D-W. NOT a speed knob, and deliberately NOT 0 (which disables the
+    // deadline the way planApprovalTimeoutMs above is disabled). A clarification park
+    // blocks by design, so every way of breaking it — an autopilot run that stops
+    // short-circuiting, an id that stops being re-used — makes the park never resolve.
+    // On the 24h production default that surfaces as a wall-clock TEST TIMEOUT, and
+    // `node --test` prints `ℹ fail 0` while timing out (CLAUDE.md, measured twice on
+    // PRD #121). So the mutation controls for the ask_user tests below would have
+    // "reddened" in exactly the shape this repo warns is unreadable. A bounded
+    // deadline turns each of those hangs into a NAMED failure: the run fails with
+    // REASON_QUESTION_TIMEOUT and the assertion that fires says which property broke.
+    // Generous relative to the 5ms poll, so it is never reached while an answer is
+    // actually being delivered.
+    questionTimeoutMs: 600,
     gitlab,
   });
 }
@@ -119,9 +172,16 @@ const gitlabClaim = (iid: number, overrides = {}) =>
   makeClaim({
     issue_iid: iid,
     issue_title: `Fix thing ${iid}`,
-    repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+    repo: {
+      id: "r1",
+      url: "https://gitlab.example.test/org/repo",
+      clone_url: fx.originPath,
+    },
     last_seq: 0,
-    secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+    secrets: {
+      forge_pat: "fixture-forge-pat-000000",
+      anthropic_oauth_token: "dummy-oauth-do-not-scan",
+    },
     ...overrides,
   });
 
@@ -131,16 +191,23 @@ describe("RunRunner — worker-performed push + MR", () => {
     const claim = gitlabClaim(7);
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
     // Two `running` reports: the claim→running transition, then the post-checkout
     // one carrying the repo's detected agent roster (PRD #37).
     assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
-    const completed = api.states.find((s) => s.body.status === "completed")!.body;
+    const completed = api.states.find(
+      (s) => s.body.status === "completed",
+    )!.body;
     assert.strictEqual(completed.branch, "agent/issue-7");
     assert.strictEqual(completed.mr_iid, 42);
     // The forge-reported MR web URL is persisted on completion (PRD #65 D8), so the
     // web links it directly instead of reconstructing it.
-    assert.strictEqual(completed.mr_web_url, "https://gitlab.example.test/org/repo/-/merge_requests/42");
+    assert.strictEqual(
+      completed.mr_web_url,
+      "https://gitlab.example.test/org/repo/-/merge_requests/42",
+    );
 
     // The MR was opened with the PAT in the PRIVATE-TOKEN header — never the URL
     // or the body (primary directive: the credential stays off argv/URL/logs).
@@ -148,9 +215,18 @@ describe("RunRunner — worker-performed push + MR", () => {
     const call = calls[0]!;
     assert.strictEqual(call.method, "POST");
     assert.match(call.url, /\/api\/v4\/projects\/org%2Frepo\/merge_requests$/);
-    assert.strictEqual(call.headers["PRIVATE-TOKEN"], "fixture-forge-pat-000000");
-    assert.ok(!call.url.includes("fixture-forge-pat"), "PAT must not be in the URL");
-    assert.ok(!(call.body ?? "").includes("fixture-forge-pat"), "PAT must not be in the body");
+    assert.strictEqual(
+      call.headers["PRIVATE-TOKEN"],
+      "fixture-forge-pat-000000",
+    );
+    assert.ok(
+      !call.url.includes("fixture-forge-pat"),
+      "PAT must not be in the URL",
+    );
+    assert.ok(
+      !(call.body ?? "").includes("fixture-forge-pat"),
+      "PAT must not be in the body",
+    );
     const body = JSON.parse(call.body ?? "{}");
     assert.strictEqual(body.source_branch, "agent/issue-7");
     assert.strictEqual(body.target_branch, "main");
@@ -158,7 +234,11 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(body.remove_source_branch, false);
 
     // The branch really landed on origin, and the worktree was torn down.
-    const log = execFileSync("git", ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
+    const log = execFileSync(
+      "git",
+      ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"],
+      { encoding: "utf8" },
+    );
     assert.ok(log.includes("uzi stub: work on issue #7"));
     assert.strictEqual(fs.existsSync(worktreeDirFor(7)), false);
   });
@@ -168,19 +248,37 @@ describe("RunRunner — worker-performed push + MR", () => {
     // A Forgejo run: same local clone_url (git is forge-agnostic), a Forgejo web url,
     // and forge_type=forgejo on the wire so the worker picks the Forgejo client.
     const claim = gitlabClaim(15, {
-      repo: { id: "r1", url: "https://forgejo.example.test/org/repo", clone_url: fx.originPath, forge_type: "forgejo" },
+      repo: {
+        id: "r1",
+        url: "https://forgejo.example.test/org/repo",
+        clone_url: fx.originPath,
+        forge_type: "forgejo",
+      },
     });
-    const r = new RunRunner(client, git, () => ({ executor: new StubExecutor(nullLogger()) }), nullLogger(), 20, undefined, {
-      pollMs: 5,
-      planApprovalTimeoutMs: 0,
-      forgejo,
-    });
+    const r = new RunRunner(
+      client,
+      git,
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      nullLogger(),
+      20,
+      undefined,
+      {
+        pollMs: 5,
+        planApprovalTimeoutMs: 0,
+        forgejo,
+      },
+    );
     await r.execute(claim);
 
-    const completed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "completed")!.body;
+    const completed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "completed",
+    )!.body;
     assert.strictEqual(completed.branch, "agent/issue-15");
     assert.strictEqual(completed.mr_iid, 42);
-    assert.strictEqual(completed.mr_web_url, "https://forgejo.example.test/org/repo/pulls/42");
+    assert.strictEqual(
+      completed.mr_web_url,
+      "https://forgejo.example.test/org/repo/pulls/42",
+    );
 
     // The PR was opened against Forgejo's /api/v1 pulls endpoint with the token header
     // — never the URL/body (primary directive).
@@ -188,9 +286,18 @@ describe("RunRunner — worker-performed push + MR", () => {
     const call = calls[0]!;
     assert.strictEqual(call.method, "POST");
     assert.match(call.url, /\/api\/v1\/repos\/org\/repo\/pulls$/);
-    assert.strictEqual(call.headers["Authorization"], "token fixture-forge-pat-000000");
-    assert.ok(!call.url.includes("fixture-forge-pat"), "PAT must not be in the URL");
-    assert.ok(!(call.body ?? "").includes("fixture-forge-pat"), "PAT must not be in the body");
+    assert.strictEqual(
+      call.headers["Authorization"],
+      "token fixture-forge-pat-000000",
+    );
+    assert.ok(
+      !call.url.includes("fixture-forge-pat"),
+      "PAT must not be in the URL",
+    );
+    assert.ok(
+      !(call.body ?? "").includes("fixture-forge-pat"),
+      "PAT must not be in the body",
+    );
     const body = JSON.parse(call.body ?? "{}");
     assert.strictEqual(body.head, "agent/issue-15");
     assert.strictEqual(body.base, "main");
@@ -211,21 +318,39 @@ describe("RunRunner — worker-performed push + MR", () => {
       },
     };
     await runner(exec, gitlab).execute(claim);
-    assert.strictEqual(fs.existsSync(pluginDir), false, "skills plugin dir must be cleaned up");
-    assert.strictEqual(fs.existsSync(worktreeDirFor(11)), false, "worktree still cleaned up");
+    assert.strictEqual(
+      fs.existsSync(pluginDir),
+      false,
+      "skills plugin dir must be cleaned up",
+    );
+    assert.strictEqual(
+      fs.existsSync(worktreeDirFor(11)),
+      false,
+      "worktree still cleaned up",
+    );
   });
 
   it("reports failed and opens NO merge request when the executor throws", async () => {
     const { gitlab, calls } = fakeGitlab();
-    const boom: Executor = { run: async () => { throw new Error("kaboom"); } };
+    const boom: Executor = {
+      run: async () => {
+        throw new Error("kaboom");
+      },
+    };
     const claim = gitlabClaim(9);
     await runner(boom, gitlab).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
     // The second `running` is the post-checkout roster report; the executor throws
     // after it.
     assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
-    assert.ok(api.states.find((s) => s.body.status === "failed")?.body.failure_reason?.includes("kaboom"));
+    assert.ok(
+      api.states
+        .find((s) => s.body.status === "failed")
+        ?.body.failure_reason?.includes("kaboom"),
+    );
     assert.strictEqual(calls.length, 0, "no MR on failure");
     assert.strictEqual(fs.existsSync(worktreeDirFor(9)), false);
   });
@@ -239,18 +364,36 @@ describe("RunRunner — worker-performed push + MR", () => {
     const { gitlab, calls } = fakeGitlab();
     const boom: Executor = {
       run: async () => {
-        throw new Error(`clone failed: oauth=${OAUTH} pat=${PAT} ${"x".repeat(1000)}`);
+        throw new Error(
+          `clone failed: oauth=${OAUTH} pat=${PAT} ${"x".repeat(1000)}`,
+        );
       },
     };
-    const claim = gitlabClaim(41, { secrets: { forge_pat: PAT, anthropic_oauth_token: OAUTH } });
+    const claim = gitlabClaim(41, {
+      secrets: { forge_pat: PAT, anthropic_oauth_token: OAUTH },
+    });
     await runner(boom, gitlab).execute(claim);
 
     const reason =
-      api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body.failure_reason ?? "";
-    assert.ok(!reason.includes(OAUTH), "the OAuth token must not reach reportState");
-    assert.ok(!reason.includes(PAT), "the forge PAT must not reach reportState");
-    assert.ok(reason.includes("***REDACTED***"), "the secret should be redacted in place");
-    assert.ok(reason.length <= 512, `failure_reason must be capped at 512 (got ${reason.length})`);
+      api.states.find(
+        (s) => s.runId === claim.run_id && s.body.status === "failed",
+      )!.body.failure_reason ?? "";
+    assert.ok(
+      !reason.includes(OAUTH),
+      "the OAuth token must not reach reportState",
+    );
+    assert.ok(
+      !reason.includes(PAT),
+      "the forge PAT must not reach reportState",
+    );
+    assert.ok(
+      reason.includes("***REDACTED***"),
+      "the secret should be redacted in place",
+    );
+    assert.ok(
+      reason.length <= 512,
+      `failure_reason must be capped at 512 (got ${reason.length})`,
+    );
     assert.strictEqual(calls.length, 0, "no MR on failure");
   });
 
@@ -260,41 +403,89 @@ describe("RunRunner — worker-performed push + MR", () => {
     const { gitlab } = fakeGitlab();
     const leaky: Executor = {
       run: async (ctx) => {
-        ctx.emit({ kind: "tool_result", agent: "coder", payload: { content: `oauth=${OAUTH} join=${JOIN_TOKEN}` } });
+        ctx.emit({
+          kind: "tool_result",
+          agent: "coder",
+          payload: { content: `oauth=${OAUTH} join=${JOIN_TOKEN}` },
+        });
         return { branch: ctx.branch };
       },
     };
-    const claim = gitlabClaim(11, { secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: OAUTH } });
+    const claim = gitlabClaim(11, {
+      secrets: {
+        forge_pat: "fixture-forge-pat-000000",
+        anthropic_oauth_token: OAUTH,
+      },
+    });
     await runner(leaky, gitlab, JOIN_TOKEN).execute(claim);
 
-    const tr = api.messages(claim.run_id).find((m) => m.kind === "tool_result")!;
+    const tr = api
+      .messages(claim.run_id)
+      .find((m) => m.kind === "tool_result")!;
     const serialized = JSON.stringify(tr.payload);
-    assert.ok(!serialized.includes(OAUTH), "the OAuth token must not reach the API");
-    assert.ok(!serialized.includes(JOIN_TOKEN), "the join token must not reach the API");
-    assert.ok(serialized.includes("***REDACTED***"), "secrets should be redacted in place");
+    assert.ok(
+      !serialized.includes(OAUTH),
+      "the OAuth token must not reach the API",
+    );
+    assert.ok(
+      !serialized.includes(JOIN_TOKEN),
+      "the join token must not reach the API",
+    );
+    assert.ok(
+      serialized.includes("***REDACTED***"),
+      "secrets should be redacted in place",
+    );
   });
 });
 
 // --- end-to-end: the real SdkExecutor driven through the runner --------------
 
 function assistant(content: unknown[], sessionId = "sess-e2e"): SDKMessage {
-  return { type: "assistant", session_id: sessionId, message: { content } } as unknown as SDKMessage;
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content },
+  } as unknown as SDKMessage;
 }
 function resultOk(sessionId = "sess-e2e"): SDKMessage {
-  return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    num_turns: 1,
+    session_id: sessionId,
+  } as unknown as SDKMessage;
 }
 /** A queryFn that yields the plan turn, then the done turn. */
 function planThenDoneQuery(): SdkQueryFn {
   const scripts: SDKMessage[][] = [
-    [assistant([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# PLAN\n- do it" } }]), resultOk()],
-    [assistant([{ type: "text", text: "done implementing" }, { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]), resultOk()],
+    [
+      assistant([
+        {
+          type: "tool_use",
+          id: "p",
+          name: "mcp__uzi__submit_plan",
+          input: { plan_md: "# PLAN\n- do it" },
+        },
+      ]),
+      resultOk(),
+    ],
+    [
+      assistant([
+        { type: "text", text: "done implementing" },
+        { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} },
+      ]),
+      resultOk(),
+    ],
   ];
   let i = 0;
   return (params) => {
     const script = scripts[Math.min(i, scripts.length - 1)]!;
     i++;
     return (async function* () {
-      for await (const _ of params.prompt) { /* drain */ }
+      for await (const _ of params.prompt) {
+        /* drain */
+      }
       for (const m of script) yield m;
     })();
   };
@@ -309,42 +500,75 @@ describe("RunRunner — plan gate + steering end to end", () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(21);
     api.setInputs(claim.run_id, [input("approve_plan")]);
-    await runner(new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }), gitlab).execute(claim);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }),
+      gitlab,
+    ).execute(claim);
 
-    const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+    const states = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body);
     const statuses = states.map((s) => s.status);
-    assert.ok(statuses.includes("awaiting_approval"), "run halted at the plan gate");
+    assert.ok(
+      statuses.includes("awaiting_approval"),
+      "run halted at the plan gate",
+    );
     assert.ok(statuses.includes("completed"), "run completed after approval");
     const gate = states.find((s) => s.status === "awaiting_approval")!;
     assert.match(gate.plan_md ?? "", /# PLAN/);
     // The plan was surfaced to the run stream as a `plan` message, once.
-    const planMsgs = api.messages(claim.run_id).filter((m) => m.kind === "plan");
+    const planMsgs = api
+      .messages(claim.run_id)
+      .filter((m) => m.kind === "plan");
     assert.strictEqual(planMsgs.length, 1);
     // Completed with an MR on the agent branch (never main).
     const completed = states.find((s) => s.status === "completed")!;
     assert.strictEqual(completed.branch, "agent/issue-21");
     assert.strictEqual(completed.mr_iid, 42);
-    assert.strictEqual(JSON.parse(calls[0]!.body ?? "{}").source_branch, "agent/issue-21");
+    assert.strictEqual(
+      JSON.parse(calls[0]!.body ?? "{}").source_branch,
+      "agent/issue-21",
+    );
     // An iteration heartbeat was reported.
-    assert.ok(states.some((s) => s.status === "running" && s.iteration_count === 1));
+    assert.ok(
+      states.some((s) => s.status === "running" && s.iteration_count === 1),
+    );
   });
 
   it("stub executor with planGate halts at awaiting_approval, then completes on approve", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(24);
     api.setInputs(claim.run_id, [input("approve_plan")]);
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "running", "awaiting_approval", "running", "completed"]);
-    const gate = api.states.find((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")!.body;
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, [
+      "running",
+      "running",
+      "awaiting_approval",
+      "running",
+      "completed",
+    ]);
+    const gate = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_approval",
+    )!.body;
     assert.match(gate.plan_md ?? "", /Stub plan for issue #24/);
-    const completed = api.states.find((s) => s.body.status === "completed")!.body;
+    const completed = api.states.find(
+      (s) => s.body.status === "completed",
+    )!.body;
     assert.strictEqual(completed.branch, "agent/issue-24");
     assert.strictEqual(completed.mr_iid, 42);
     assert.strictEqual(calls.length, 1, "one MR opened after approval");
     // The plan reached the run stream exactly once.
-    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "plan").length,
+      1,
+    );
   });
 
   it("auto-approves the plan gate for an autopilot claim: never awaiting_approval, plan still recorded", async () => {
@@ -352,14 +576,31 @@ describe("RunRunner — plan gate + steering end to end", () => {
     const claim = gitlabClaim(26, { auto_approve: true });
     // No inputs are set: an autopilot run must resolve the gate itself. If it
     // parked at awaiting_approval it would hang until the (disabled) timeout.
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.ok(!statuses.includes("awaiting_approval"), "autopilot run never enters awaiting_approval");
-    assert.strictEqual(statuses.at(-1), "completed", "autopilot run runs to completion");
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "autopilot run never enters awaiting_approval",
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "autopilot run runs to completion",
+    );
     // The plan is still recorded as an audit message even though no human saw it.
-    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
-    const completed = api.states.find((s) => s.body.status === "completed")!.body;
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "plan").length,
+      1,
+    );
+    const completed = api.states.find(
+      (s) => s.body.status === "completed",
+    )!.body;
     assert.strictEqual(completed.mr_iid, 42);
     assert.strictEqual(calls.length, 1, "one MR opened after auto-approval");
   });
@@ -370,34 +611,325 @@ describe("RunRunner — plan gate + steering end to end", () => {
       auto_approve: true,
       issue_description: `implement prds/x.md then ${STUB_FAIL_SENTINEL}`,
     });
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.ok(!statuses.includes("awaiting_approval"), "auto-approved before it fails");
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "auto-approved before it fails",
+    );
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.ok(failed, "sentinel run should fail");
     assert.match(failed!.body.failure_reason ?? "", /UZI_STUB_FAIL/);
     assert.strictEqual(calls.length, 0, "no MR when the run fails");
     // The plan is recorded before the failure (the throw is AFTER the gate).
-    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "plan").length,
+      1,
+    );
+  });
+
+  // PRD #88 M5 / Decision 8. Autopilot is "no human in the loop", so a park would
+  // wedge the run until its deadline with nobody able to answer. The observable
+  // property is that awaiting_input never appears in the reported states at all —
+  // not merely that the run finishes.
+  it("auto-resolves an ask_user for an autopilot claim: never awaiting_input", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(31, {
+      auto_approve: true,
+      issue_description: `clarify something first: ${STUB_ASK_SENTINEL}`,
+    });
+    // No inputs are set: nothing could ever answer this question.
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      !statuses.includes("awaiting_input"),
+      "an autopilot run must never park on a question",
+    );
+    assert.ok(
+      !statuses.includes("awaiting_approval"),
+      "and still never parks at the plan gate",
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "it runs to completion unattended",
+    );
+    assert.strictEqual(calls.length, 1, "one MR opened");
+    // The "no `question` message" half of Decision 8 deliberately lives in its OWN
+    // test below rather than as a fifth assertion here — see the comment there.
+  });
+
+  /**
+   * Decision 8's OTHER half, split out because as an assertion inside the test above
+   * it could not fail for the reason it exists.
+   *
+   * `assert` throws on the first failure, so any fold that makes an autopilot run
+   * park — the obvious one, disabling the short-circuit — reddens the FIRST assertion
+   * up there and every later one never evaluates. A control run using that fold
+   * therefore establishes only *the run does not park*, and establishes **nothing**
+   * about *no message claims a human was consulted*, even though both properties are
+   * "covered" by a test that goes red. That is the assert-shadowing class: a green
+   * suite and a red mutation can BOTH be true of a property nothing has measured.
+   *
+   * Discriminating fold, and it is not one anybody would reach for by accident:
+   * keep the short-circuit intact (no park, no `awaiting_input`, sentinel still
+   * returned) and change only the emitted message kind from `status` to `question`
+   * in `RunRunner.askUser`'s autopilot branch. Every assertion above still passes;
+   * this one reddens alone.
+   *
+   * The property is security-relevant rather than cosmetic: an unattended run that
+   * files a `question` message is claiming on the permanent feed — and, with Slack
+   * linked, in the owner's DM — that a human was consulted about a decision no human
+   * ever saw.
+   */
+  it("an autopilot run emits NO question message: nothing may claim a human was consulted", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(34, {
+      auto_approve: true,
+      issue_description: `clarify something first: ${STUB_ASK_SENTINEL}`,
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+
+    const kinds = api.messages(claim.run_id).map((m) => m.kind);
+    // Positive control FIRST, so this can never pass by the run having done nothing:
+    // the stub echoes an `answer` only on a path that actually reached ctx.askUser.
+    assert.ok(
+      kinds.includes("answer"),
+      "fixture is inert: the run never reached the clarification path at all",
+    );
+    assert.strictEqual(
+      kinds.filter((k) => k === "question").length,
+      0,
+      "an autopilot run was auto-resolved with a sentinel, so no `question` message " +
+        "may reach the feed — it would tell the owner, on the record and in Slack, " +
+        "that they were asked something they were never asked",
+    );
+  });
+
+  // The byte-exact sentinel answer (frozen: the lead is told to record the assumption
+  // it made, and an unattended run's guesses have to stay auditable).
+  it("hands the autopilot lead the frozen sentinel answer, verbatim", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(32, {
+      auto_approve: true,
+      issue_description: `clarify something first: ${STUB_ASK_SENTINEL}`,
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const answer = api.messages(claim.run_id).find((m) => m.kind === "answer");
+    assert.ok(answer, "the stub echoes the answer it received");
+    assert.deepStrictEqual(
+      (answer!.payload as { answers?: unknown }).answers,
+      [AUTOPILOT_SENTINEL_ANSWER],
+      "the sentinel wording is frozen — M5's test and the implementation must agree byte for byte",
+    );
+  });
+
+  // The human path through the SAME sentinel: the run parks, an answer resumes it.
+  // This is M4's pre-run park, which before the REASON_NO_PLAN fix would have failed
+  // the run outright rather than parking.
+  it("parks a NON-autopilot run on a pre-plan question and resumes it on the answer", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(33, {
+      issue_description: `clarify first: ${STUB_ASK_SENTINEL}`,
+    });
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    // The answer must name the open question, so it is supplied by the fake API's
+    // input queue once the park has stamped an id; the runner mints it, so the test
+    // reads it back off the state report rather than guessing.
+    const r = runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    );
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          input(
+            "answer",
+            JSON.stringify({
+              question_id: body.open_question_id,
+              answers: ["proceed"],
+            }),
+          ),
+          input("approve_plan"),
+        ]);
+      }
+    });
+    await r.execute(claim);
+
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.ok(
+      statuses.includes("awaiting_input"),
+      "the run must park on the pre-plan question",
+    );
+    assert.strictEqual(
+      statuses.at(-1),
+      "completed",
+      "and resume to completion on the answer",
+    );
+    assert.strictEqual(
+      api.messages(claim.run_id).filter((m) => m.kind === "question").length,
+      1,
+    );
+  });
+
+  // B2, WORKER half.
+  //
+  // ⚠️ THE RATIONALE THIS COMMENT USED TO CARRY WAS FALSIFIED, AND THE TESTS BELOW
+  // WERE NEVER WRONG — ONLY INSUFFICIENT. That combination is why nothing went red.
+  //
+  // It said: clearing open_question_id in SetRunRunning "breaks that chain at its
+  // THIRD step, so the worker never receives a resolved id in the first place", and
+  // concluded nothing more was needed. Measured false once M4 landed. M4 lets the
+  // lead ask BEFORE it plans, and a pre-run park reaches the plan gate with NO
+  // intervening `running` report — so SetRunRunning's clear is never reached and the
+  // resolved id survives to awaiting_approval (D-AG). The chain was not broken
+  // upstream; it had a second entrance that did not exist when this was written.
+  //
+  // The durable lesson, and the reason this is spelled out rather than quietly
+  // rewritten: a test comment asserting "the chain is broken upstream" has a
+  // dependency on upstream that NOTHING TRACKS. No gate fires when the premise stops
+  // holding, because the tests it justifies are still passing and still correct. The
+  // rationale rots while the code stays right.
+  //
+  // Both clears are now required, and the invariant they jointly carry is stated in
+  // runtime.sql: no setter may leave a resolved id behind. Pinned by
+  // TestSetRunRunningClearsOpenQuestionLiveDB and
+  // TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB — the second being the one
+  // these worker-layer tests structurally cannot express, since they cannot reach a
+  // plan gate without a running report.
+  //
+  // Still true and still the reason there is no worker-side guard: the worker cannot
+  // tell a resolved id from a live one (a claim reports status "claimed", never
+  // "awaiting_input", because ClaimRun is what set it), so any such guard would be a
+  // guess. The server-side clears are the only defence.
+  //
+  // What the worker layer CAN pin, and must, is the property the fix has to leave
+  // intact — the two halves of the id lifecycle:
+  it("mints a fresh question id when the claim carries none", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(34, {
+      issue_description: `clarify first: ${STUB_ASK_SENTINEL}`,
+    });
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          input(
+            "answer",
+            JSON.stringify({
+              question_id: body.open_question_id,
+              answers: ["proceed"],
+            }),
+          ),
+          input("approve_plan"),
+        ]);
+      }
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const park = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_input",
+    );
+    assert.ok(
+      park?.body.open_question_id,
+      "a park must always report a question id — the api rejects one without",
+    );
+  });
+
+  // The requeue-survival half: a run re-claimed while genuinely still parked re-parks
+  // on the SAME id. This is what makes an answer the user submitted before the worker
+  // died still valid, and it is the property every clock-based design failed.
+  it("re-parks on the SAME question id the claim delivered", async () => {
+    const { gitlab } = fakeGitlab();
+    const liveID = "question-the-run-is-still-parked-on";
+    const claim = gitlabClaim(35, {
+      issue_description: `clarify first: ${STUB_ASK_SENTINEL}`,
+      open_question_id: liveID,
+    });
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        api.setInputs(claim.run_id, [
+          input(
+            "answer",
+            JSON.stringify({
+              question_id: body.open_question_id,
+              answers: ["proceed"],
+            }),
+          ),
+          input("approve_plan"),
+        ]);
+      }
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const park = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "awaiting_input",
+    );
+    assert.strictEqual(
+      park?.body.open_question_id,
+      liveID,
+      "a resumed worker must re-park on the id the claim delivered — minting a new one silently " +
+        "invalidates an answer the user already submitted against the live question",
+    );
   });
 
   it("still halts a NON-autopilot claim at the gate (auto_approve absent)", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(27); // no auto_approve
     api.setInputs(claim.run_id, [input("approve_plan")]);
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
 
-    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "running", "awaiting_approval", "running", "completed"]);
+    const statuses = api.states
+      .filter((s) => s.runId === claim.run_id)
+      .map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, [
+      "running",
+      "running",
+      "awaiting_approval",
+      "running",
+      "completed",
+    ]);
   });
 
   it("stub executor with planGate fails verbatim when the plan is rejected", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(25);
     api.setInputs(claim.run_id, [input("reject_plan", "not this way")]);
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.strictEqual(failed!.body.failure_reason, "not this way");
     assert.strictEqual(calls.length, 0, "no MR on rejection");
   });
@@ -405,12 +937,22 @@ describe("RunRunner — plan gate + steering end to end", () => {
   it("fails with the rejection reason (verbatim) when the plan is rejected", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(22);
-    api.setInputs(claim.run_id, [input("reject_plan", "please rethink the approach")]);
-    await runner(new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }), gitlab).execute(claim);
+    api.setInputs(claim.run_id, [
+      input("reject_plan", "please rethink the approach"),
+    ]);
+    await runner(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneQuery() }),
+      gitlab,
+    ).execute(claim);
 
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.ok(failed, "run should have failed");
-    assert.strictEqual(failed!.body.failure_reason, "please rethink the approach");
+    assert.strictEqual(
+      failed!.body.failure_reason,
+      "please rethink the approach",
+    );
     assert.strictEqual(calls.length, 0, "no MR on rejection");
   });
 
@@ -426,7 +968,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
     const claim = gitlabClaim(23);
     api.setInputs(claim.run_id, [input("reject_plan", "no")]);
     await runner(rejectExec, gitlab).execute(claim);
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.strictEqual(failed!.body.failure_reason, "no");
   });
 
@@ -439,7 +983,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
     };
     const claim = gitlabClaim(31);
     const origPush = git.pushBranch.bind(git);
-    (git as unknown as { pushBranch: unknown }).pushBranch = async (...args: unknown[]) => {
+    (git as unknown as { pushBranch: unknown }).pushBranch = async (
+      ...args: unknown[]
+    ) => {
       events.push("push");
       return (origPush as (...a: unknown[]) => Promise<void>)(...args);
     };
@@ -449,7 +995,10 @@ describe("RunRunner — plan gate + steering end to end", () => {
       (git as unknown as { pushBranch: unknown }).pushBranch = origPush;
     }
     assert.ok(events.includes("kill") && events.includes("push"));
-    assert.ok(events.indexOf("kill") < events.indexOf("push"), "kill must precede push");
+    assert.ok(
+      events.indexOf("kill") < events.indexOf("push"),
+      "kill must precede push",
+    );
   });
 
   it("kills a real agent-backgrounded survivor before the run completes (B1)", async () => {
@@ -458,22 +1007,50 @@ describe("RunRunner — plan gate + steering end to end", () => {
     // Injected spawn stands in for the SDK CLI spawn, launching a real detached
     // `sleep` in its own group — the kind of survivor a `nohup … &` leaves behind.
     const spawn = (_opts: SpawnOptions): { pid?: number } => {
-      const p = spawnDetached({ command: "sleep", args: ["30"] } as SpawnOptions);
+      const p = spawnDetached({
+        command: "sleep",
+        args: ["30"],
+      } as SpawnOptions);
       if (p.pid) survivors.push(p.pid);
       return p;
     };
     // Real plan→done query that also triggers the spawn hook each turn.
     const scripts: SDKMessage[][] = [
-      [assistant([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# P" } }]), resultOk()],
-      [assistant([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]), resultOk()],
+      [
+        assistant([
+          {
+            type: "tool_use",
+            id: "p",
+            name: "mcp__uzi__submit_plan",
+            input: { plan_md: "# P" },
+          },
+        ]),
+        resultOk(),
+      ],
+      [
+        assistant([
+          {
+            type: "tool_use",
+            id: "d",
+            name: "mcp__uzi__signal_done",
+            input: {},
+          },
+        ]),
+        resultOk(),
+      ],
     ];
     let turn = 0;
     const queryFn: SdkQueryFn = (params) => {
       const script = scripts[Math.min(turn, scripts.length - 1)]!;
       turn++;
       return (async function* () {
-        params.options.spawnClaudeCodeProcess?.({ command: "x", args: [] } as never);
-        for await (const _ of params.prompt) { /* drain */ }
+        params.options.spawnClaudeCodeProcess?.({
+          command: "x",
+          args: [],
+        } as never);
+        for await (const _ of params.prompt) {
+          /* drain */
+        }
         for (const m of script) yield m;
       })();
     };
@@ -485,12 +1062,25 @@ describe("RunRunner — plan gate + steering end to end", () => {
       assert.ok(survivors.length >= 1, "at least one survivor was spawned");
       for (const pid of survivors) {
         await waitDead(pid);
-        assert.strictEqual(isAlive(pid), false, `survivor ${pid} must be dead after the run`);
+        assert.strictEqual(
+          isAlive(pid),
+          false,
+          `survivor ${pid} must be dead after the run`,
+        );
       }
       // The run still completed with an MR (the reap did not disturb the happy path).
-      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+      assert.ok(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "completed",
+        ),
+      );
     } finally {
-      for (const pid of survivors) try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      for (const pid of survivors)
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
     }
   });
 
@@ -509,7 +1099,9 @@ describe("RunRunner — plan gate + steering end to end", () => {
     api.setInputs(claim.run_id, [input("cancel")]);
     await runner(waiter, gitlab).execute(claim);
 
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.ok(failed, "cancelled run reports failed");
     assert.match(failed!.body.failure_reason ?? "", /run cancelled/);
     assert.strictEqual(calls.length, 0, "no MR on cancel");
@@ -522,15 +1114,24 @@ describe("RunRunner — plan gate + steering end to end", () => {
 // bumping the steering epoch AT the re-report (Decision 3) so a verdict written against
 // the previous plan version goes stale. All rounds share ONE approval budget.
 describe("RunRunner — plan revision at the gate (PRD #41)", () => {
-  const pollTick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms));
+  const pollTick = (ms = 5): Promise<void> =>
+    new Promise((r) => setTimeout(r, ms));
 
   /** Once the run has posted `n` awaiting_approval reports, submit `inputs`. The epoch is
    *  bumped right after each awaiting_approval RE-report (synchronously, before the gate
    *  awaits), so observing the n-th report proves the epoch has advanced to the round-n
    *  value — inputs set here are stamped at the new (current) epoch. */
-  function onGateRound(runId: string, n: number, inputs: UserInput[]): Promise<void> {
+  function onGateRound(
+    runId: string,
+    n: number,
+    inputs: UserInput[],
+  ): Promise<void> {
     return (async () => {
-      while (api.states.filter((s) => s.runId === runId && s.body.status === "awaiting_approval").length < n) {
+      while (
+        api.states.filter(
+          (s) => s.runId === runId && s.body.status === "awaiting_approval",
+        ).length < n
+      ) {
         await pollTick();
       }
       api.setInputs(runId, inputs);
@@ -546,10 +1147,14 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
         const v1 = await ctx.gatePlan!("# PLAN v1");
         seen.push(v1.kind);
         assert.strictEqual(v1.kind, "revise");
-        assert.strictEqual(v1.kind === "revise" ? v1.feedback : "", "tighten the scope");
+        assert.strictEqual(
+          v1.kind === "revise" ? v1.feedback : "",
+          "tighten the scope",
+        );
         const v2 = await ctx.gatePlan!("# PLAN v2");
         seen.push(v2.kind);
-        if (v2.kind !== "approve") throw new Error(`expected approve, got ${v2.kind}`);
+        if (v2.kind !== "approve")
+          throw new Error(`expected approve, got ${v2.kind}`);
         return { branch: ctx.branch };
       },
     };
@@ -560,12 +1165,21 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
 
     assert.deepStrictEqual(seen, ["revise", "approve"]);
     // The gate parked at awaiting_approval TWICE — once per plan version.
-    const gates = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval").map((s) => s.body);
+    const gates = api.states
+      .filter(
+        (s) =>
+          s.runId === claim.run_id && s.body.status === "awaiting_approval",
+      )
+      .map((s) => s.body);
     assert.strictEqual(gates.length, 2);
     assert.match(gates[0]!.plan_md ?? "", /PLAN v1/);
     assert.match(gates[1]!.plan_md ?? "", /PLAN v2/);
     // The run completed with an MR after the round-2 approval.
-    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    assert.ok(
+      api.states.some(
+        (s) => s.runId === claim.run_id && s.body.status === "completed",
+      ),
+    );
     assert.strictEqual(calls.length, 1);
   });
 
@@ -589,7 +1203,9 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
     // v1 epoch, so it must be stale at the v2 gate.
     const origGetInputs = client.getInputs.bind(client);
     let approveConsumed = false;
-    (client as unknown as { getInputs: (r: string) => Promise<UserInput[]> }).getInputs = async (runId: string) => {
+    (
+      client as unknown as { getInputs: (r: string) => Promise<UserInput[]> }
+    ).getInputs = async (runId: string) => {
       const inputs = await origGetInputs(runId);
       if (inputs.some((i) => i.kind === "approve_plan")) approveConsumed = true;
       return inputs;
@@ -608,7 +1224,8 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
         // Re-gate v2: the re-report bumps the epoch, so the buffered approve is now stale.
         const v2 = await ctx.gatePlan!("# PLAN v2");
         seen.push(v2.kind);
-        if (v2.kind !== "approve") throw new Error(`expected approve, got ${v2.kind}`);
+        if (v2.kind !== "approve")
+          throw new Error(`expected approve, got ${v2.kind}`);
         return { branch: ctx.branch };
       },
     };
@@ -625,15 +1242,30 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
       assert.deepStrictEqual(seen, ["revise", "approve"]);
       // The run RE-PARKED at v2 awaiting_approval (a 2nd report carrying the v2 plan_md) —
       // it did NOT proceed to implement on the strength of the mid-revision approve.
-      const gates = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval").map((s) => s.body);
+      const gates = api.states
+        .filter(
+          (s) =>
+            s.runId === claim.run_id && s.body.status === "awaiting_approval",
+        )
+        .map((s) => s.body);
       assert.strictEqual(gates.length, 2, "the run re-parked at the v2 gate");
       assert.match(gates[1]!.plan_md ?? "", /PLAN v2/);
       // The mid-revision approve was DISCARDED with a stale feed notice (the bug's tell:
       // under the old code this notice is absent because the approve was accepted at v2).
-      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      assert.ok(texts.some((t) => t.includes("Approval ignored")), texts.join("\n"));
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      assert.ok(
+        texts.some((t) => t.includes("Approval ignored")),
+        texts.join("\n"),
+      );
       // Only after the FRESH v2 approve did the run complete + open exactly one MR.
-      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+      assert.ok(
+        api.states.some(
+          (s) => s.runId === claim.run_id && s.body.status === "completed",
+        ),
+      );
       assert.strictEqual(calls.length, 1);
     } finally {
       (client as unknown as { getInputs: unknown }).getInputs = origGetInputs;
@@ -648,20 +1280,34 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
         const v1 = await ctx.gatePlan!("# PLAN v1");
         assert.strictEqual(v1.kind, "revise");
         const v2 = await ctx.gatePlan!("# PLAN v2");
-        if (v2.kind !== "approve") throw new Error(`expected approve, got ${v2.kind}`);
+        if (v2.kind !== "approve")
+          throw new Error(`expected approve, got ${v2.kind}`);
         return { branch: ctx.branch };
       },
     };
     // The user's approve rides the SAME batch as the revise, so it is stamped against the
     // pre-feedback plan (epoch 1). Round 2 must NOT approve on it.
-    api.setInputs(claim.run_id, [input("revise_plan", "rethink it"), input("approve_plan")]);
+    api.setInputs(claim.run_id, [
+      input("revise_plan", "rethink it"),
+      input("approve_plan"),
+    ]);
     const round2 = onGateRound(claim.run_id, 2, [input("approve_plan")]); // a fresh, round-2 approve
     await runner(reviseExec, gitlab).execute(claim);
     await round2;
 
-    const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-    assert.ok(texts.some((t) => t.includes("Approval ignored")), texts.join("\n"));
-    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    const texts = api
+      .messages(claim.run_id)
+      .filter((m) => m.kind === "status")
+      .map((m) => String(m.payload.text));
+    assert.ok(
+      texts.some((t) => t.includes("Approval ignored")),
+      texts.join("\n"),
+    );
+    assert.ok(
+      api.states.some(
+        (s) => s.runId === claim.run_id && s.body.status === "completed",
+      ),
+    );
   });
 
   it("shares ONE approval budget across rounds: a revise does not reset the deadline", async () => {
@@ -679,15 +1325,25 @@ describe("RunRunner — plan revision at the gate (PRD #41)", () => {
         return { branch: ctx.branch };
       },
     };
-    const r = new RunRunner(client, git, () => ({ executor: reviseExec }), nullLogger(), 20, undefined, {
-      pollMs: 5,
-      planApprovalTimeoutMs: 60, // small, shared across both rounds
-      gitlab,
-    });
+    const r = new RunRunner(
+      client,
+      git,
+      () => ({ executor: reviseExec }),
+      nullLogger(),
+      20,
+      undefined,
+      {
+        pollMs: 5,
+        planApprovalTimeoutMs: 60, // small, shared across both rounds
+        gitlab,
+      },
+    );
     api.setInputs(claim.run_id, [input("revise_plan", "one more pass")]);
     await r.execute(claim);
 
-    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    const failed = api.states.find(
+      (s) => s.runId === claim.run_id && s.body.status === "failed",
+    );
     assert.ok(failed, "run should fail on the shared-budget timeout");
     assert.match(failed!.body.failure_reason ?? "", /plan approval timed out/);
     assert.strictEqual(calls.length, 0, "no MR when the gate times out");
@@ -712,7 +1368,12 @@ function deferred(): Deferred {
 function barrier(n: number): { arrive: () => void; ready: Promise<void> } {
   let count = 0;
   const d = deferred();
-  return { arrive: () => { if (++count >= n) d.resolve(); }, ready: d.promise };
+  return {
+    arrive: () => {
+      if (++count >= n) d.resolve();
+    },
+    ready: d.promise,
+  };
 }
 
 /**
@@ -748,13 +1409,24 @@ class FakeReapExecutor implements Executor {
 }
 
 /** A logger that records every secret registered/evicted, for the eviction tests. */
-function secretRecordingLogger(): { logger: Logger; added: string[]; removed: string[] } {
+function secretRecordingLogger(): {
+  logger: Logger;
+  added: string[];
+  removed: string[];
+} {
   const added: string[] = [];
   const removed: string[] = [];
   const self: Logger = {
-    debug() {}, info() {}, warn() {}, error() {},
-    addSecret: (s) => { added.push(s); },
-    removeSecret: (s) => { removed.push(s); },
+    debug() {},
+    info() {},
+    warn() {},
+    error() {},
+    addSecret: (s) => {
+      added.push(s);
+    },
+    removeSecret: (s) => {
+      removed.push(s);
+    },
     child: () => self,
   };
   return { logger: self, added, removed };
@@ -779,7 +1451,13 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     const factoryCalls: string[] = [];
     const factory: ExecutorFactory = (runId) => {
       factoryCalls.push(runId);
-      const e = new FakeReapExecutor(runId, pidsByRun[runId]!, killLog, bothSpawned.arrive, gates[runId]!.promise);
+      const e = new FakeReapExecutor(
+        runId,
+        pidsByRun[runId]!,
+        killLog,
+        bothSpawned.arrive,
+        gates[runId]!.promise,
+      );
       execs.set(runId, e);
       return { executor: e };
     };
@@ -788,24 +1466,49 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     const errs: unknown[] = [];
     // If an execute rejects before reaching the executor, still trip the barrier so
     // the test asserts (and fails clearly) rather than hanging on bothSpawned.ready.
-    const pA = rnr.execute(claimA).catch((e) => { errs.push(e); bothSpawned.arrive(); });
-    const pB = rnr.execute(claimB).catch((e) => { errs.push(e); bothSpawned.arrive(); });
+    const pA = rnr.execute(claimA).catch((e) => {
+      errs.push(e);
+      bothSpawned.arrive();
+    });
+    const pB = rnr.execute(claimB).catch((e) => {
+      errs.push(e);
+      bothSpawned.arrive();
+    });
     try {
       await bothSpawned.ready;
-      assert.deepStrictEqual(errs, [], "both runs reached the executor without erroring");
+      assert.deepStrictEqual(
+        errs,
+        [],
+        "both runs reached the executor without erroring",
+      );
       // The factory built a DISTINCT executor per run (per-run construction).
-      assert.deepStrictEqual([...factoryCalls].sort(), [claimA.run_id, claimB.run_id].sort());
+      assert.deepStrictEqual(
+        [...factoryCalls].sort(),
+        [claimA.run_id, claimB.run_id].sort(),
+      );
       assert.notStrictEqual(execs.get(claimA.run_id), execs.get(claimB.run_id));
       // Both runs are mid-run with their own sets populated.
-      assert.deepStrictEqual(execs.get(claimA.run_id)!.livePids(), [7001, 7002]);
-      assert.deepStrictEqual(execs.get(claimB.run_id)!.livePids(), [8001, 8002]);
+      assert.deepStrictEqual(
+        execs.get(claimA.run_id)!.livePids(),
+        [7001, 7002],
+      );
+      assert.deepStrictEqual(
+        execs.get(claimB.run_id)!.livePids(),
+        [8001, 8002],
+      );
 
       // Release run A → its pre-push reap kills EXACTLY A's tree and clears A's set.
       gates[claimA.run_id]!.resolve();
       await pA;
-      assert.deepStrictEqual(killLog.map((k) => k.pid).sort((a, b) => a - b), [7001, 7002]);
+      assert.deepStrictEqual(
+        killLog.map((k) => k.pid).sort((a, b) => a - b),
+        [7001, 7002],
+      );
       // The SIBLING (B) is untouched: its set is intact, none of its pids reaped.
-      assert.deepStrictEqual(execs.get(claimB.run_id)!.livePids(), [8001, 8002]);
+      assert.deepStrictEqual(
+        execs.get(claimB.run_id)!.livePids(),
+        [8001, 8002],
+      );
       assert.deepStrictEqual(execs.get(claimA.run_id)!.livePids(), []);
 
       // Release run B → it now reaps exactly its own set.
@@ -819,15 +1522,24 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
 
     // End state: every reap targeted only its own run's pids — nothing crossed over.
     for (const k of killLog) {
-      assert.ok(pidsByRun[k.runId]!.includes(k.pid), `run ${k.runId} reaped foreign pid ${k.pid}`);
+      assert.ok(
+        pidsByRun[k.runId]!.includes(k.pid),
+        `run ${k.runId} reaped foreign pid ${k.pid}`,
+      );
     }
-    const grouped = (id: string) => killLog.filter((k) => k.runId === id).map((k) => k.pid).sort((a, b) => a - b);
+    const grouped = (id: string) =>
+      killLog
+        .filter((k) => k.runId === id)
+        .map((k) => k.pid)
+        .sort((a, b) => a - b);
     assert.deepStrictEqual(grouped(claimA.run_id), [7001, 7002]);
     assert.deepStrictEqual(grouped(claimB.run_id), [8001, 8002]);
     // Both runs completed with an MR (the reaps did not disturb the happy path).
     for (const c of [claimA, claimB]) {
       assert.ok(
-        api.states.some((s) => s.runId === c.run_id && s.body.status === "completed"),
+        api.states.some(
+          (s) => s.runId === c.run_id && s.body.status === "completed",
+        ),
         `run ${c.issue_iid} completed`,
       );
     }
@@ -844,7 +1556,11 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
           // Mirror SdkExecutor: create the HOME and write a run-private file in it.
           await fs.promises.mkdir(runHome, { recursive: true });
-          await fs.promises.writeFile(path.join(runHome, "session"), ctx.runId, "utf8");
+          await fs.promises.writeFile(
+            path.join(runHome, "session"),
+            ctx.runId,
+            "utf8",
+          );
           return { branch: ctx.branch };
         },
       };
@@ -853,7 +1569,10 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     const claimA = gitlabClaim(55);
     const claimB = gitlabClaim(56);
     try {
-      await Promise.all([runnerWith(factory, gitlab).execute(claimA), runnerWith(factory, gitlab).execute(claimB)]);
+      await Promise.all([
+        runnerWith(factory, gitlab).execute(claimA),
+        runnerWith(factory, gitlab).execute(claimB),
+      ]);
       // Two distinct, run-id-scoped HOMEs were built (no shared dir).
       assert.strictEqual(created.length, 2);
       assert.deepStrictEqual(
@@ -862,7 +1581,11 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
       );
       // Each was removed on terminal (the runner's finally cleaned every run's HOME).
       for (const h of created) {
-        assert.strictEqual(fs.existsSync(h), false, `HOME ${h} must be removed on terminal`);
+        assert.strictEqual(
+          fs.existsSync(h),
+          false,
+          `HOME ${h} must be removed on terminal`,
+        );
       }
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -883,7 +1606,9 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     // the assertion would hold against the UNFIXED runner too. Say so; do not
     // pass quietly.
     if (process.getuid?.() === 0) {
-      t.skip("running as uid 0 — root bypasses the 0555 fixture, so it proves nothing here");
+      t.skip(
+        "running as uid 0 — root bypasses the 0555 fixture, so it proves nothing here",
+      );
       return;
     }
     const { gitlab } = fakeGitlab();
@@ -896,12 +1621,22 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     let observedMode = "";
     const factory: ExecutorFactory = (runId) => {
       runHome = path.join(homeRoot, runId);
-      modDir = path.join(runHome, "go", "pkg", "mod", "gopkg.in", "inf.v0@v0.9.1");
+      modDir = path.join(
+        runHome,
+        "go",
+        "pkg",
+        "mod",
+        "gopkg.in",
+        "inf.v0@v0.9.1",
+      );
       const executor: Executor = {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
           // Mirror what a `go build` inside the run leaves behind.
           fs.mkdirSync(modDir, { recursive: true });
-          fs.writeFileSync(path.join(modDir, "benchmark_test.go"), "package inf\n");
+          fs.writeFileSync(
+            path.join(modDir, "benchmark_test.go"),
+            "package inf\n",
+          );
           fs.chmodSync(modDir, 0o555);
           observedMode = (fs.lstatSync(modDir).mode & 0o777).toString(8);
           return { branch: ctx.branch };
@@ -912,8 +1647,16 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     const claim = gitlabClaim(57);
     try {
       await runnerWith(factory, gitlab).execute(claim);
-      assert.strictEqual(observedMode, "555", "fixture directory was not actually read-only when the run ended");
-      assert.strictEqual(fs.existsSync(runHome), false, `HOME ${runHome} must be removed even with a 0555 dir inside`);
+      assert.strictEqual(
+        observedMode,
+        "555",
+        "fixture directory was not actually read-only when the run ended",
+      );
+      assert.strictEqual(
+        fs.existsSync(runHome),
+        false,
+        `HOME ${runHome} must be removed even with a 0555 dir inside`,
+      );
       // Cleanup is best-effort and lives in a `finally`; it must never turn a
       // completed run into a failed one.
       const state = api.states.filter((s) => s.runId === claim.run_id).at(-1);
@@ -931,32 +1674,64 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
     const PAT = "fixture-forge-pat-evict-001";
     const OAUTH = "dummy-oauth-evict-000000";
     const claim = gitlabClaim(60, {
-      secrets: { forge_pat: PAT, anthropic_oauth_token: OAUTH, forge_username: "bot" },
+      secrets: {
+        forge_pat: PAT,
+        anthropic_oauth_token: OAUTH,
+        forge_username: "bot",
+      },
     });
-    await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, logger).execute(claim);
+    await runnerWith(
+      () => ({ executor: new StubExecutor(nullLogger()) }),
+      gitlab,
+      undefined,
+      logger,
+    ).execute(claim);
 
     assert.ok(added.includes(PAT), "PAT registered");
     assert.ok(added.includes(OAUTH), "OAuth token registered");
     // Every registered run-secret (PAT, OAuth token, and the derived git Basic
     // credential) is evicted on terminal — nothing lingers in the process set.
     for (const s of added) {
-      assert.ok(removed.includes(s), `run secret ${JSON.stringify(s)} must be evicted on terminal`);
+      assert.ok(
+        removed.includes(s),
+        `run secret ${JSON.stringify(s)} must be evicted on terminal`,
+      );
     }
   });
 
   it("still evicts the run's secrets when the run FAILS (Decision 7 — finally path)", async () => {
     const { gitlab } = fakeGitlab();
     const { logger, added, removed } = secretRecordingLogger();
-    const boom: Executor = { run: async () => { throw new Error("kaboom"); } };
+    const boom: Executor = {
+      run: async () => {
+        throw new Error("kaboom");
+      },
+    };
     const claim = gitlabClaim(61, {
-      secrets: { forge_pat: "fixture-forge-pat-evict-002", anthropic_oauth_token: "dummy-oauth-evict-111111" },
+      secrets: {
+        forge_pat: "fixture-forge-pat-evict-002",
+        anthropic_oauth_token: "dummy-oauth-evict-111111",
+      },
     });
-    await runnerWith(() => ({ executor: boom }), gitlab, undefined, logger).execute(claim);
+    await runnerWith(
+      () => ({ executor: boom }),
+      gitlab,
+      undefined,
+      logger,
+    ).execute(claim);
 
-    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), "run failed");
+    assert.ok(
+      api.states.some(
+        (s) => s.runId === claim.run_id && s.body.status === "failed",
+      ),
+      "run failed",
+    );
     assert.ok(added.length > 0, "secrets were registered");
     for (const s of added) {
-      assert.ok(removed.includes(s), `failed run's secret ${JSON.stringify(s)} must still be evicted`);
+      assert.ok(
+        removed.includes(s),
+        `failed run's secret ${JSON.stringify(s)} must still be evicted`,
+      );
     }
   });
 
@@ -975,7 +1750,11 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
         /invalid run id/,
       );
     }
-    assert.strictEqual(factoryReached, false, "the executor factory must not be reached for an invalid run id");
+    assert.strictEqual(
+      factoryReached,
+      false,
+      "the executor factory must not be reached for an invalid run id",
+    );
   });
 });
 
@@ -989,19 +1768,39 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       const claim = makeClaim({
         issue_iid: 31,
         issue_title: "detect the roster",
-        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        repo: {
+          id: "r1",
+          url: "https://gitlab.example.test/org/repo",
+          clone_url: repoFx.originPath,
+        },
         last_seq: 0,
-        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+        secrets: {
+          forge_pat: "fixture-forge-pat-000000",
+          anthropic_oauth_token: "dummy-oauth-do-not-scan",
+        },
       });
-      const repoRunner = new RunRunner(client, new GitCache(repoFx.dataDir, nullLogger()), () => ({ executor: new StubExecutor(nullLogger()) }), nullLogger(), 20, undefined, {
-        pollMs: 5,
-        planApprovalTimeoutMs: 0,
-        gitlab,
-      });
+      const repoRunner = new RunRunner(
+        client,
+        new GitCache(repoFx.dataDir, nullLogger()),
+        () => ({ executor: new StubExecutor(nullLogger()) }),
+        nullLogger(),
+        20,
+        undefined,
+        {
+          pollMs: 5,
+          planApprovalTimeoutMs: 0,
+          gitlab,
+        },
+      );
       await repoRunner.execute(claim);
       return {
-        states: api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
-        texts: api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text)),
+        states: api.states
+          .filter((s) => s.runId === claim.run_id)
+          .map((s) => s.body),
+        texts: api
+          .messages(claim.run_id)
+          .filter((m) => m.kind === "status")
+          .map((m) => String(m.payload.text)),
       };
     } finally {
       repoFx.cleanup();
@@ -1010,8 +1809,10 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
 
   it("reports the parsed roster on a running report, noting every drop", async () => {
     const { states, texts } = await runAgainst({
-      ".claude/agents/coder.md": "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
-      ".claude/agents/reviewer.md": "---\nname: reviewer\ndescription: Reviews changes.\ntools: Read, WebFetch\n---\n\nReview it.\n",
+      ".claude/agents/coder.md":
+        "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
+      ".claude/agents/reviewer.md":
+        "---\nname: reviewer\ndescription: Reviews changes.\ntools: Read, WebFetch\n---\n\nReview it.\n",
       ".claude/agents/broken.md": "not an agent file\n",
       // Never loaded through this path: only .claude/agents/*.md is read.
       ".claude/settings.json": '{"permissions":{"allow":["Bash(rm -rf /)"]}}',
@@ -1019,7 +1820,11 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
 
     const report = states.find((s) => s.repo_agents !== undefined);
     assert.ok(report, "a state report carries the roster");
-    assert.strictEqual(report!.status, "running", "the roster rides a running report, not the gate");
+    assert.strictEqual(
+      report!.status,
+      "running",
+      "the roster rides a running report, not the gate",
+    );
     assert.deepStrictEqual(report!.repo_agents, [
       { name: "coder", description: "Implements changes." },
       { name: "reviewer", description: "Reviews changes." },
@@ -1027,10 +1832,19 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     // Prompt bodies stay worker-side; only names + descriptions travel.
     assert.ok(!JSON.stringify(report!.repo_agents).includes("Implement it."));
 
-    assert.ok(texts.some((t) => t.includes('repo agent "broken" was skipped')), texts.join("\n"));
+    assert.ok(
+      texts.some((t) => t.includes('repo agent "broken" was skipped')),
+      texts.join("\n"),
+    );
     // WebFetch is HONORED now — reviewer keeps it, so NO tools_filtered note fires.
-    assert.ok(!texts.some((t) => t.includes("removed WebFetch")), texts.join("\n"));
-    assert.ok(texts.some((t) => t.includes("detected 2 agent(s)")), texts.join("\n"));
+    assert.ok(
+      !texts.some((t) => t.includes("removed WebFetch")),
+      texts.join("\n"),
+    );
+    assert.ok(
+      texts.some((t) => t.includes("detected 2 agent(s)")),
+      texts.join("\n"),
+    );
   });
 
   it("reports an empty roster (not an absent one) for a repo with no .claude/agents", async () => {
@@ -1038,8 +1852,14 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     const report = states.find((s) => s.repo_agents !== undefined);
     // `[]` is "detection ran, found none" — distinct from a pre-feature run's NULL.
     assert.deepStrictEqual(report?.repo_agents, []);
-    assert.ok(!texts.some((t) => t.includes("repo agent")), "no notes when there is nothing to detect");
-    assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+    assert.ok(
+      !texts.some((t) => t.includes("repo agent")),
+      "no notes when there is nothing to detect",
+    );
+    assert.ok(
+      states.some((s) => s.status === "completed"),
+      "the run still completes",
+    );
   });
 
   it("keeps a detection FAILURE distinguishable from an empty roster (no repo_agents reported)", async () => {
@@ -1052,9 +1872,16 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       const claim = makeClaim({
         issue_iid: 32,
         issue_title: "detection fails",
-        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        repo: {
+          id: "r1",
+          url: "https://gitlab.example.test/org/repo",
+          clone_url: repoFx.originPath,
+        },
         last_seq: 0,
-        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+        secrets: {
+          forge_pat: "fixture-forge-pat-000000",
+          anthropic_oauth_token: "dummy-oauth-do-not-scan",
+        },
       });
       const runner = new RunRunner(
         client,
@@ -1074,12 +1901,28 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       );
       await runner.execute(claim);
 
-      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
-      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+      const states = api.states
+        .filter((s) => s.runId === claim.run_id)
+        .map((s) => s.body);
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
       // NO report carries repo_agents — not even `[]`. The column stays "not reported".
-      assert.ok(!states.some((s) => s.repo_agents !== undefined), "a detection failure reports no roster");
-      assert.ok(texts.some((t) => t.includes("could not read the repo's .claude/agents/")), texts.join("\n"));
-      assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+      assert.ok(
+        !states.some((s) => s.repo_agents !== undefined),
+        "a detection failure reports no roster",
+      );
+      assert.ok(
+        texts.some((t) =>
+          t.includes("could not read the repo's .claude/agents/"),
+        ),
+        texts.join("\n"),
+      );
+      assert.ok(
+        states.some((s) => s.status === "completed"),
+        "the run still completes",
+      );
     } finally {
       repoFx.cleanup();
     }
@@ -1091,23 +1934,34 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     // channel a no-input run has), and states it on the feed — never parking at the
     // gate.
     const repoFx = makeFixture({
-      ".claude/agents/coder.md": "---\nname: coder\ndescription: c.\n---\n\nbody\n",
-      ".claude/agents/reviewer.md": "---\nname: reviewer\ndescription: r.\n---\n\nbody\n",
+      ".claude/agents/coder.md":
+        "---\nname: coder\ndescription: c.\n---\n\nbody\n",
+      ".claude/agents/reviewer.md":
+        "---\nname: reviewer\ndescription: r.\n---\n\nbody\n",
     });
     try {
       const { gitlab } = fakeGitlab();
       const claim = makeClaim({
         issue_iid: 33,
         issue_title: "autopilot with repo agents",
-        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        repo: {
+          id: "r1",
+          url: "https://gitlab.example.test/org/repo",
+          clone_url: repoFx.originPath,
+        },
         last_seq: 0,
-        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+        secrets: {
+          forge_pat: "fixture-forge-pat-000000",
+          anthropic_oauth_token: "dummy-oauth-do-not-scan",
+        },
         auto_approve: true,
       });
       const r = new RunRunner(
         client,
         new GitCache(repoFx.dataDir, nullLogger()),
-        () => ({ executor: new StubExecutor(nullLogger(), { planGate: true }) }),
+        () => ({
+          executor: new StubExecutor(nullLogger(), { planGate: true }),
+        }),
         nullLogger(),
         20,
         undefined,
@@ -1115,10 +1969,21 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       );
       await r.execute(claim);
 
-      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
-      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      const selectionState = states.find((s) => s.agent_selection !== undefined);
-      assert.deepStrictEqual(selectionState?.agent_selection, { source: "repo", exclusions: [] }, "autopilot persisted the repo default");
+      const states = api.states
+        .filter((s) => s.runId === claim.run_id)
+        .map((s) => s.body);
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      const selectionState = states.find(
+        (s) => s.agent_selection !== undefined,
+      );
+      assert.deepStrictEqual(
+        selectionState?.agent_selection,
+        { source: "repo", exclusions: [] },
+        "autopilot persisted the repo default",
+      );
       // F1: the autopilot selection report is self-contained — it carries the roster
       // alongside the selection, so a failed fire-and-forget roster report above does
       // not cost the attribution. (The own-source case below carries NO repo_agents.)
@@ -1128,11 +1993,21 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         "the repo-source autopilot selection report carries repo_agents",
       );
       assert.ok(
-        texts.some((t) => t.includes("autopilot: using the 2 agent(s) from the repo's .claude/agents/")),
+        texts.some((t) =>
+          t.includes(
+            "autopilot: using the 2 agent(s) from the repo's .claude/agents/",
+          ),
+        ),
         texts.join("\n"),
       );
-      assert.ok(!states.some((s) => s.status === "awaiting_approval"), "autopilot never parks at the gate");
-      assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+      assert.ok(
+        !states.some((s) => s.status === "awaiting_approval"),
+        "autopilot never parks at the gate",
+      );
+      assert.ok(
+        states.some((s) => s.status === "completed"),
+        "the run still completes",
+      );
     } finally {
       repoFx.cleanup();
     }
@@ -1146,15 +2021,24 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         const claim = makeClaim({
           issue_iid: 36,
           issue_title: "autopilot no repo agents",
-          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+          repo: {
+            id: "r1",
+            url: "https://gitlab.example.test/org/repo",
+            clone_url: repoFx.originPath,
+          },
           last_seq: 0,
-          secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+          secrets: {
+            forge_pat: "fixture-forge-pat-000000",
+            anthropic_oauth_token: "dummy-oauth-do-not-scan",
+          },
           auto_approve: true,
         });
         const r = new RunRunner(
           client,
           new GitCache(repoFx.dataDir, nullLogger()),
-          () => ({ executor: new StubExecutor(nullLogger(), { planGate: true }) }),
+          () => ({
+            executor: new StubExecutor(nullLogger(), { planGate: true }),
+          }),
           nullLogger(),
           20,
           undefined,
@@ -1162,14 +2046,21 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         );
         await r.execute(claim);
         return {
-          states: api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
-          texts: api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text)),
+          states: api.states
+            .filter((s) => s.runId === claim.run_id)
+            .map((s) => s.body),
+          texts: api
+            .messages(claim.run_id)
+            .filter((m) => m.kind === "status")
+            .map((m) => String(m.payload.text)),
         };
       } finally {
         repoFx.cleanup();
       }
     })();
-    const ownSelectionState = states.find((s) => s.agent_selection !== undefined);
+    const ownSelectionState = states.find(
+      (s) => s.agent_selection !== undefined,
+    );
     assert.deepStrictEqual(ownSelectionState?.agent_selection, {
       source: "own",
       exclusions: [],
@@ -1177,30 +2068,56 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     // F1 guard: on the own default (no repo agents detected) the report must NOT carry
     // repo_agents — sending [] would flip the column from NULL ("not reported") to []
     // ("detected none") and erase that distinction.
-    assert.strictEqual(ownSelectionState?.repo_agents, undefined, "the own-source autopilot report carries no repo_agents");
-    assert.ok(texts.some((t) => t.includes("autopilot: using your own agent templates")), texts.join("\n"));
+    assert.strictEqual(
+      ownSelectionState?.repo_agents,
+      undefined,
+      "the own-source autopilot report carries no repo_agents",
+    );
+    assert.ok(
+      texts.some((t) =>
+        t.includes("autopilot: using your own agent templates"),
+      ),
+      texts.join("\n"),
+    );
   });
 
   it("the MR description carries the repo-agents marker only when the run used repo agents", async () => {
     // A fake executor that reports which roster the implement phase ran with — the
     // stub does not, so the marker is driven directly here (the SDK executor sets it).
     const repoExec: Executor = {
-      run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "repo", agents: ["coder", "auditor"] } }),
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "repo", agents: ["coder", "auditor"] },
+      }),
     };
     const ownExec: Executor = {
-      run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder"] } }),
+      run: async (ctx) => ({
+        branch: ctx.branch,
+        agentSelection: { source: "own", agents: ["coder"] },
+      }),
     };
 
     const repoGl = fakeGitlab();
     await runner(repoExec, repoGl.gitlab).execute(gitlabClaim(34));
     const repoBody = JSON.parse(repoGl.calls[0]!.body ?? "{}");
-    assert.match(repoBody.description, /repository's own `\.claude\/agents\/`/, "repo-source MR carries the marker");
-    assert.match(repoBody.description, /coder, auditor/, "the marker names the roster");
+    assert.match(
+      repoBody.description,
+      /repository's own `\.claude\/agents\/`/,
+      "repo-source MR carries the marker",
+    );
+    assert.match(
+      repoBody.description,
+      /coder, auditor/,
+      "the marker names the roster",
+    );
 
     const ownGl = fakeGitlab();
     await runner(ownExec, ownGl.gitlab).execute(gitlabClaim(35));
     const ownBody = JSON.parse(ownGl.calls[0]!.body ?? "{}");
-    assert.ok(!/repository's own/.test(ownBody.description), "an own-source MR has no repo marker");
+    assert.ok(
+      !/repository's own/.test(ownBody.description),
+      "an own-source MR has no repo marker",
+    );
   });
 });
 
@@ -1217,7 +2134,10 @@ describe("RunRunner — resume preflight (issue #105)", () => {
   const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
   /** A factory with a per-run HOME under `homeRoot`, capturing the RunContext. */
-  function capturingFactory(homeRoot: string, seen: RunContext[]): ExecutorFactory {
+  function capturingFactory(
+    homeRoot: string,
+    seen: RunContext[],
+  ): ExecutorFactory {
     return (runId) => ({
       executor: {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
@@ -1233,7 +2153,12 @@ describe("RunRunner — resume preflight (issue #105)", () => {
    *  dirs (sdk-session.ts), so the exact dir name does not matter — a per-run HOME holds
    *  only this run's own, so any project dir stands in for it. */
   function plantTranscript(runHome: string, sessionId: string): void {
-    const dir = path.join(runHome, ".claude", "projects", "-data-runner-repo-issue-x");
+    const dir = path.join(
+      runHome,
+      ".claude",
+      "projects",
+      "-data-runner-repo-issue-x",
+    );
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), "{}\n");
   }
@@ -1245,10 +2170,22 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     const claim = gitlabClaim(70, { session_id: SID });
     try {
       await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
-      assert.strictEqual(seen[0]?.sessionId, undefined, "the dead session id must not reach the executor");
-      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      const notice = texts.find((t) => /earlier session could not be found/.test(t));
-      assert.ok(notice, `expected an honest resume notice, got ${JSON.stringify(texts)}`);
+      assert.strictEqual(
+        seen[0]?.sessionId,
+        undefined,
+        "the dead session id must not reach the executor",
+      );
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      const notice = texts.find((t) =>
+        /earlier session could not be found/.test(t),
+      );
+      assert.ok(
+        notice,
+        `expected an honest resume notice, got ${JSON.stringify(texts)}`,
+      );
       // Both facts the user needs to make sense of the feed: context is gone, AND that
       // is why the agent may re-tread ground. A bare "session not found" is not enough.
       assert.match(notice, /WITHOUT its earlier context/);
@@ -1266,9 +2203,19 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     try {
       plantTranscript(path.join(homeRoot, claim.run_id), SID);
       await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
-      assert.strictEqual(seen[0]?.sessionId, SID, "a resolvable session must still resume");
-      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      assert.ok(!texts.some((t) => /earlier session could not be found/.test(t)), "must not cry wolf");
+      assert.strictEqual(
+        seen[0]?.sessionId,
+        SID,
+        "a resolvable session must still resume",
+      );
+      const texts = api
+        .messages(claim.run_id)
+        .filter((m) => m.kind === "status")
+        .map((m) => String(m.payload.text));
+      assert.ok(
+        !texts.some((t) => /earlier session could not be found/.test(t)),
+        "must not cry wolf",
+      );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -1281,19 +2228,37 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     const seen: RunContext[] = [];
     const claim = gitlabClaim(72, { session_id: SID });
     await runnerWith(
-      () => ({ executor: { run: async (ctx: RunContext) => { seen.push(ctx); return { branch: ctx.branch }; } } }),
+      () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            seen.push(ctx);
+            return { branch: ctx.branch };
+          },
+        },
+      }),
       gitlab,
     ).execute(claim);
-    assert.strictEqual(seen[0]?.sessionId, SID, "no HOME to check ⇒ the claim's id passes through unchanged");
+    assert.strictEqual(
+      seen[0]?.sessionId,
+      SID,
+      "no HOME to check ⇒ the claim's id passes through unchanged",
+    );
   });
 
   it("warns the amnesiac lead about prior commits on the branch — but ONLY when the resume was dropped", async () => {
     // The honest degradation must not become silently redone work: if the branch already
     // carries pushed work and the lead can no longer remember it, say so in the prompt.
     const { gitlab } = fakeGitlab();
-    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    };
     const gitFx = (args: string[]): void => {
-      execFileSync("git", ["-C", fx.originPath, ...args], { env, stdio: "pipe" });
+      execFileSync("git", ["-C", fx.originPath, ...args], {
+        env,
+        stdio: "pipe",
+      });
     };
     // A previous COMPLETED run's pushed work: two commits on the issue branch. (An
     // attempt requeued mid-flight leaves nothing — a run pushes once, at the end.)
@@ -1310,21 +2275,280 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     try {
       const dropped: RunContext[] = [];
       const droppedClaim = gitlabClaim(73, { session_id: SID });
-      await runnerWith(capturingFactory(homeRoot, dropped), gitlab).execute(droppedClaim);
-      assert.deepStrictEqual(dropped[0]?.priorWork, { commits: 2 }, "counted against the default branch");
+      await runnerWith(capturingFactory(homeRoot, dropped), gitlab).execute(
+        droppedClaim,
+      );
+      assert.deepStrictEqual(
+        dropped[0]?.priorWork,
+        { commits: 2 },
+        "counted against the default branch",
+      );
 
       // Same branch, same prior commits — but a resolvable session, so the lead
       // remembers its own work and needs no warning.
       const kept: RunContext[] = [];
       const keptClaim = gitlabClaim(73, { session_id: SID });
       plantTranscript(path.join(homeRoot, keptClaim.run_id), SID);
-      await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(keptClaim);
-      assert.strictEqual(kept[0]?.priorWork, undefined, "a live resume needs no prior-work warning");
+      await runnerWith(capturingFactory(homeRoot, kept), gitlab).execute(
+        keptClaim,
+      );
+      assert.strictEqual(
+        kept[0]?.priorWork,
+        undefined,
+        "a live resume needs no prior-work warning",
+      );
 
       // And a fresh run (no session at all) on a branch with no prior work gets none.
       const fresh: RunContext[] = [];
-      await runnerWith(capturingFactory(homeRoot, fresh), gitlab).execute(gitlabClaim(74));
+      await runnerWith(capturingFactory(homeRoot, fresh), gitlab).execute(
+        gitlabClaim(74),
+      );
       assert.strictEqual(fresh[0]?.priorWork, undefined);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── PRD #35: the usage-limit park and its cleanup carve-out ───────────────────
+//
+// Three cases, deliberately THREE SEPARATELY NAMED TESTS rather than one
+// table-driven list. Only the third fails against an implementation that keys the
+// carve-out on the acknowledgement's `applied` flag instead of on its `status`, so
+// it is the artifact that shows at review time whether the contract was understood
+// rather than merely satisfied — and a table row is much harder to find later.
+describe("RunRunner — usage-limit park (PRD #35)", () => {
+  // An executor that materializes everything a resume needs (worktree-sibling
+  // plugin dir + a per-run HOME holding the SDK transcript) and then dies on a
+  // usage limit, the way SdkExecutor does when a turn ends in a limit-classified
+  // error result.
+  function limitFactory(
+    homeRoot: string,
+    iid: number,
+  ): { factory: ExecutorFactory; paths: () => Paths } {
+    const pluginDir = skillsPluginDir(worktreeDirFor(iid));
+    let runHome = "";
+    const factory: ExecutorFactory = (runId) => {
+      runHome = path.join(homeRoot, runId);
+      return {
+        homeDir: runHome,
+        executor: {
+          run: async (): Promise<ExecutorResult> => {
+            fs.mkdirSync(pluginDir, { recursive: true });
+            fs.writeFileSync(path.join(pluginDir, "marker"), "x");
+            fs.mkdirSync(runHome, { recursive: true });
+            fs.writeFileSync(
+              path.join(runHome, "session"),
+              "transcript",
+              "utf8",
+            );
+            throw new LimitReachedError({
+              resetsAtMs: Date.now() + 5 * 3600_000,
+              rateLimitType: "five_hour",
+            });
+          },
+        },
+      };
+    };
+    return {
+      factory,
+      paths: () => ({ pluginDir, runHome, worktree: worktreeDirFor(iid) }),
+    };
+  }
+  interface Paths {
+    pluginDir: string;
+    runHome: string;
+    worktree: string;
+  }
+  const assertAllGone = (p: Paths) => {
+    assert.strictEqual(
+      fs.existsSync(p.worktree),
+      false,
+      "runner clone must be removed",
+    );
+    assert.strictEqual(
+      fs.existsSync(p.pluginDir),
+      false,
+      "skills plugin dir must be removed",
+    );
+    assert.strictEqual(
+      fs.existsSync(p.runHome),
+      false,
+      "run HOME must be removed",
+    );
+  };
+
+  it("preserves the clone, the plugin dir and the run HOME when the server parks the run", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-ok-"));
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 91);
+      await runnerWith(factory, gitlab).execute(
+        gitlabClaim(91, { wait_on_limit: true }),
+      );
+      const p = paths();
+      // All three survive: a resume needs the transcript, the worktree AND the
+      // plugin dir, and preserving only some of them resumes into a broken session.
+      assert.strictEqual(
+        fs.existsSync(p.worktree),
+        true,
+        "runner clone must survive a park",
+      );
+      assert.strictEqual(
+        fs.existsSync(p.pluginDir),
+        true,
+        "skills plugin dir must survive a park",
+      );
+      assert.strictEqual(
+        fs.existsSync(p.runHome),
+        true,
+        "run HOME must survive a park",
+      );
+      const parked = api.states.find((s) => s.body.status === "limit_wait");
+      assert.ok(parked, "the worker must have reported limit_wait");
+      assert.strictEqual(parked.body.rate_limit_type, "five_hour");
+      assert.strictEqual(typeof parked.body.limit_resets_at, "number");
+      // Decision 10's structured feed kind, not a status line with the facts baked
+      // into prose: M4 maps rate_limit_type through a known-value lookup, which is
+      // impossible against interpolated text.
+      const feed = api
+        .messages(parked.runId)
+        .find((m) => m.kind === "limit_wait");
+      assert.ok(feed, "a structured limit_wait feed message must be emitted");
+      assert.strictEqual(feed.payload?.rate_limit_type, "five_hour");
+      assert.strictEqual(
+        typeof feed.payload?.resets_at,
+        "string",
+        "resets_at is an ISO string",
+      );
+      assert.ok(
+        !("attempt" in (feed.payload ?? {})),
+        "attempt is server-owned and must not be guessed here",
+      );
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // 🔴 THE SECURITY HALF OF THE CARVE-OUT, and until this test it had no artifact
+  // behind it. Measured by the M1 reviewer: extending `!parked` to also guard the
+  // secret eviction and the two gate-map deletes passed typecheck AND all 41 runner
+  // tests with exit 0. So an implementation leaving a parked run's decrypted forge
+  // PAT and Anthropic token registered in the logger — for the days a seven-day
+  // window lasts, on a worker that goes on to run other runs — was green everywhere.
+  //
+  // The carve-out is three FILESYSTEM removals. The eviction is not one of them: the
+  // secrets are re-delivered on the next claim, so holding them buys nothing and
+  // costs a widened exposure window on a machine that keeps working.
+  it("still evicts the run-scoped secrets from the logger when the run parks", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "uzi-park-secrets-"),
+    );
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 95);
+      const { logger, added, removed } = secretRecordingLogger();
+      const claim = gitlabClaim(95, { wait_on_limit: true });
+      await runnerWith(factory, gitlab, undefined, logger).execute(claim);
+      // Precondition: the park actually happened, or this asserts nothing.
+      assert.strictEqual(
+        fs.existsSync(paths().runHome),
+        true,
+        "must have parked (else this test is vacuous)",
+      );
+      assert.ok(added.length > 0, "the run registered secrets");
+      for (const s of added) {
+        assert.ok(
+          removed.includes(s),
+          `secret registered at claim must be evicted on park: ${s}`,
+        );
+      }
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans up fully when the park is refused with a 409 (the run was cancelled under it)", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-409-"));
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 92);
+      const claim = gitlabClaim(92, { wait_on_limit: true });
+      api.refuseStateWith409(claim.run_id);
+      await runnerWith(factory, gitlab).execute(claim);
+      assertAllGone(paths());
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // 🔴 THE DISCRIMINATING CASE — the one an `applied`-keyed carve-out fails.
+  //
+  // The server DECLINED the park and failed the run instead. That is a DESIGNED
+  // outcome, not an error: it is what happens when RUN_LIMIT_MAX_WAITS is
+  // exhausted, when the computed retry_not_before exceeds RUN_LIMIT_MAX_PARK, or
+  // when wait_on_limit is false and the report is coerced. The server answers 200,
+  // because a transition WAS applied — just not the requested one — so `applied` is
+  // **true** while the run is emphatically not parked.
+  //
+  // Budget exhaustion is the ordinary end of a run that keeps hitting limits, i.e.
+  // the exact population this feature serves, so an `applied`-keyed branch would
+  // leak the clone, the plugin dir and up to ~170 MB of run HOME on the MOST COMMON
+  // cause of all, forever, for a run nothing will ever claim again.
+  it("cleans up fully when the server answers 200 but failed the run instead of parking it", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "uzi-park-declined-"),
+    );
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 93);
+      const claim = gitlabClaim(93, { wait_on_limit: true });
+      // 200 + "failed": applied is true, status is not limit_wait.
+      api.overrideStateStatus(claim.run_id, "failed");
+      await runnerWith(factory, gitlab).execute(claim);
+      assertAllGone(paths());
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails with the structured limit fields, and does not park, when the run is opted out", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-optout-"));
+    try {
+      const { factory, paths } = limitFactory(homeRoot, 94);
+      // wait_on_limit absent entirely — an older server, or a run created before the
+      // opt-in existed. Must behave as opted out.
+      await runnerWith(factory, gitlab).execute(gitlabClaim(94));
+      assertAllGone(paths());
+      const failed = api.states.find((s) => s.body.status === "failed");
+      assert.ok(failed, "an opted-out run must still report failed");
+      assert.strictEqual(
+        api.states.some((s) => s.body.status === "limit_wait"),
+        false,
+        "must not park",
+      );
+      // The worker reports the STRUCTURED facts and lets the server compose the
+      // sentence (Decision 8) — composing it here would carry an unvalidated
+      // rateLimitType into the run row as free text.
+      assert.strictEqual(failed.body.rate_limit_type, "five_hour");
+      assert.strictEqual(typeof failed.body.limit_resets_at, "number");
+      assert.strictEqual(
+        failed.body.failure_reason,
+        undefined,
+        "the SERVER composes the reason, not the worker",
+      );
+      // The opted-out counterpart kind. Distinct from limit_wait because the two mean
+      // opposite things to a reader: one resumes, one is over.
+      const hit = api
+        .messages(failed.runId)
+        .find((m) => m.kind === "limit_hit");
+      assert.ok(hit, "a structured limit_hit feed message must be emitted");
+      assert.strictEqual(hit.payload?.rate_limit_type, "five_hour");
+      assert.strictEqual(
+        api.messages(failed.runId).some((m) => m.kind === "limit_wait"),
+        false,
+      );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }

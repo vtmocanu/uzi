@@ -7,6 +7,7 @@ import { gitBasicCredential } from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
+import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type {
   AgentSelection,
@@ -15,6 +16,7 @@ import type {
   AskUserQuestion,
   ClaimConfig,
   ClaimResponse,
+  StateAck,
   StateRequest,
 } from "./protocol.js";
 import { resolveAgentSelection } from "./protocol.js";
@@ -254,9 +256,13 @@ export class RunRunner {
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
     let observedSessionId: string | undefined;
+    // Returns the server's acknowledgement (PRD #35), which every caller here still
+    // ignores. Widened from Promise<void> so the park branch can read it without
+    // re-plumbing this closure; the annotation is the only change, and awaiting a
+    // value nobody binds behaves exactly as before.
     const reportState = (
       body: Parameters<WorkerClient["reportState"]>[1],
-    ): Promise<void> =>
+    ): ReturnType<WorkerClient["reportState"]> =>
       this.client.reportState(
         runId,
         observedSessionId ? { ...body, session_id: observedSessionId } : body,
@@ -282,6 +288,11 @@ export class RunRunner {
 
     let barePath: string | undefined;
     let worktreePath: string | undefined;
+    // PRD #35: set ONLY by a park the server acknowledged as `limit_wait`. It gates
+    // the three filesystem removals in the finally and nothing else. Declared here
+    // rather than in the catch so the finally can see it; false is the safe default,
+    // so every path that never reaches the park logic cleans up exactly as before.
+    let parked = false;
     try {
       runLog.info("run claimed", {
         repo: claim.repo.url,
@@ -440,6 +451,20 @@ export class RunRunner {
         // on this worker (issue #105).
         sessionId,
         priorWork,
+        // PRD #35 Decision 6b. The RUNNER is the only layer that knows all three
+        // facts, which is why it resolves them here rather than the executor reading
+        // the claim: the server said the plan is approved, a session id arrived, and
+        // issue #105's transcript check did NOT drop it (`sessionId` is cleared above
+        // when it did). Passing plan_approved through unconditionally would make the
+        // executor skip planning for a run whose session is gone — the one case where
+        // it must plan.
+        planApproved: (claim.plan_approved ?? false) && !!sessionId,
+        approvedPlan: claim.plan_md ?? undefined,
+        // The persisted selection, replayed on the claim (PRD #35). Passed through
+        // unconditionally rather than gated on planApproved: it is the run's
+        // selection whether or not this particular resume skips the gate, and the
+        // executor only reads it on the path that has no verdict to supply one.
+        approvedSelection: claim.agent_selection,
         signal: cancel.signal,
         // Persist the SDK session id the moment the executor learns it, so a
         // re-queued run can resume it. Best-effort.
@@ -668,28 +693,45 @@ export class RunRunner {
       });
       runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {
-      // failure_reason goes straight to reportState, bypassing the batcher's
-      // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
-      // path — so scrub it here with the run's own secret set. A plan rejection
-      // carries the user's verbatim reason; scrubbing it too is harmless for plain
-      // text and a safety net if the user pasted a secret.
-      const reason = redactText(
-        err instanceof PlanRejectedError ? err.reason : errMessage(err),
-      );
-      runLog.error("run failed", { error: reason });
-      batcher.emit({
-        kind: "error",
-        agent: "worker",
-        payload: { text: reason },
-      });
-      await batcher.close().catch(() => undefined);
-      // Cap what lands in the run row (matches the GitLab error-body cap).
-      await reportState({
-        status: "failed",
-        failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
-      }).catch((e) =>
-        runLog.error("could not report failed state", { error: errMessage(e) }),
-      );
+      // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
+      // generic path below because that path is terminal in both senses — it reports
+      // `failed` and it lets the finally erase the session this run wants to resume from.
+      if (err instanceof LimitReachedError) {
+        parked = await this.handleLimitReached(
+          err,
+          claim,
+          batcher,
+          reportState,
+          runLog,
+        );
+        // parked === true is the ONLY thing that preserves on-disk state; see the
+        // carve-out in the finally.
+      } else {
+        // failure_reason goes straight to reportState, bypassing the batcher's
+        // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
+        // path — so scrub it here with the run's own secret set. A plan rejection
+        // carries the user's verbatim reason; scrubbing it too is harmless for plain
+        // text and a safety net if the user pasted a secret.
+        const reason = redactText(
+          err instanceof PlanRejectedError ? err.reason : errMessage(err),
+        );
+        runLog.error("run failed", { error: reason });
+        batcher.emit({
+          kind: "error",
+          agent: "worker",
+          payload: { text: reason },
+        });
+        await batcher.close().catch(() => undefined);
+        // Cap what lands in the run row (matches the GitLab error-body cap).
+        await reportState({
+          status: "failed",
+          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+        }).catch((e) =>
+          runLog.error("could not report failed state", {
+            error: errMessage(e),
+          }),
+        );
+      }
     } finally {
       await steering.stop().catch(() => undefined);
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
@@ -697,16 +739,56 @@ export class RunRunner {
       // leak either).
       this.gateDeadlines.delete(runId);
       this.gatedRuns.delete(runId);
-      // PRD #88: same rule for the clarification park's per-run state.
+      // PRD #88: the clarification park's per-run state follows the SAME rule as the
+      // gate maps above, and for the same reason main gives below — these are
+      // in-memory per-run entries that would otherwise be held for the whole length of
+      // a park. Correct on the resume path too: openQuestionIds is re-seeded from
+      // claim.open_question_id, so clearing it here loses nothing a resume needs.
       this.questionDeadlines.delete(runId);
       this.openQuestionIds.delete(runId);
       this.questionCounts.delete(runId);
-      // Evict this run's secrets from the logger now the run is terminal (Decision
-      // 7). Reaching this finally means execute() ran to a terminal report; a
-      // requeue (worker death) never returns here, so the evict/HOME-cleanup below
-      // only ever fire for a run that will not resume.
+      // Evict this run's secrets from the logger (Decision 7). Reaching this finally
+      // means execute() ran to a terminal report OR the run PARKED (PRD #35); a
+      // requeue (worker death) still never returns here.
+      //
+      // This eviction runs on BOTH paths and is deliberately outside the park
+      // carve-out below. The secrets are re-delivered on the next claim, and this
+      // worker goes on to run other runs in the meantime — leaving a parked run's
+      // decrypted PAT and Anthropic token registered in the logger for the days a
+      // seven-day window can last is not a cleanup nicety, it is the security half
+      // of the same decision.
+      //
+      // (This block used to assert "reaching this finally means execute() ran to a
+      // terminal report … the evict/HOME-cleanup below only ever fire for a run that
+      // will not resume". The park is the first path that reaches here and DOES
+      // resume, so both sentences are corrected above rather than left to mislead.)
       for (const s of runScopedSecrets) this.log.removeSecret(s);
-      if (worktreePath) {
+      // ── The park carve-out (PRD #35 Decision 6a) ──────────────────────────────
+      // EXACTLY the three filesystem removals below are skipped for a parked run,
+      // and nothing else in this finally is. The three are what a resume needs:
+      // the runner clone, the sibling skills plugin dir, and the per-run HOME that
+      // holds the resumable SDK transcript. Preserving only some of them would
+      // resume into a session missing its plugins or its worktree.
+      //
+      // The other four statements in this block — the steering poller stop, the two
+      // gate-map deletes, and the secret eviction above — MUST still run on a park.
+      // Guarding the whole block (or returning early) would leave a poller running
+      // and a gate deadline registered for what may be days.
+      //
+      // ⚠ HOW EACH ONE FAILS IF YOU WIDEN `!parked` TO COVER IT, because they do not
+      // fail alike and only one of them fails legibly:
+      //   - the SECRET EVICTION fails SILENTLY. Measured by the M1 reviewer: guarding
+      //     it passed typecheck and every runner test with exit 0, leaving a parked
+      //     run's decrypted PAT and Anthropic token in the logger for the length of
+      //     the window. There is now a test for exactly that ("still evicts the
+      //     run-scoped secrets ... when the run parks"); it is the only thing
+      //     standing between that mistake and a green build.
+      //   - `steering.stop()` fails as a PROCESS HANG, not a red assertion: the
+      //     poller keeps the event loop alive and the test file never exits. Read
+      //     CLAUDE.md before concluding flake — `node --test` prints `ℹ fail 0`
+      //     for a timeout, so the tally will say everything passed while the exit
+      //     code says otherwise. A hang here is this bug until proven otherwise.
+      if (worktreePath && !parked) {
         await this.git.removeRunnerClone(worktreePath).catch((e) =>
           runLog.warn("runner clone cleanup failed", {
             error: errMessage(e),
@@ -716,7 +798,7 @@ export class RunRunner {
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      if (worktreePath) {
+      if (worktreePath && !parked) {
         await fs
           .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
           .catch((e) =>
@@ -736,12 +818,150 @@ export class RunRunner {
       // measured for one run). Still best-effort and still swallowing its own
       // error: this is a `finally`, and a cleanup that threw would convert a
       // completed run into a failed one, which is strictly worse than a leak.
-      if (runHome) {
+      if (runHome && !parked) {
         await rmTreeForce(runHome).catch((e) =>
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }
+      if (parked) {
+        // ~170 MB of Go module cache was measured under a single run HOME, so say
+        // what is being held and why — an operator reading disk pressure needs to
+        // connect it to a parked run rather than to a leak.
+        runLog.info(
+          "run parked on a usage limit; preserving its clone, plugin dir and HOME for resume",
+          {
+            run_home: runHome,
+          },
+        );
+      }
     }
+  }
+
+  /**
+   * Handle a usage-limit death (PRD #35). Returns whether the run is PARKED, which
+   * is the sole input to the cleanup carve-out above.
+   *
+   * 🔴 THE ANSWER IS `status === "limit_wait"`, NEVER `applied`.
+   *
+   * "Not parked" has five causes, and three of them are DESIGNED outcomes rather
+   * than errors: the retry budget is exhausted, the computed retry_not_before
+   * exceeded RUN_LIMIT_MAX_PARK, or wait_on_limit is false and the server coerced
+   * the report. On all three the server FAILS THE RUN AND ANSWERS 200 — a
+   * transition was applied, just not the requested one — so `applied` is true while
+   * the run is emphatically not parked. Since budget exhaustion is the ordinary end
+   * of a run that keeps hitting limits, an `applied`-keyed branch would leak the
+   * clone, the plugin dir and up to ~170 MB of HOME on the most common cause of all.
+   *
+   * Testing one literal positively also makes the default arm "clean up", so an
+   * unforeseen cause, a future status, an older server that echoes nothing, and a
+   * parse failure all land on the safe side by construction. An enumeration of the
+   * five causes would go stale; this cannot.
+   *
+   * On not-parked the runner sends NO further state report. The server has already
+   * decided and recorded the outcome — a `failed` report on top of it would clobber
+   * a `cancelled`, and would overwrite the server-composed limit sentence with a
+   * worker-composed one.
+   *
+   * ── Why the feed payload omits Decision 10's `attempt` ───────────────────────
+   * The worker CANNOT KNOW IT, and a guess would be wrong by construction. The park
+   * count is `runs.limit_wait_count`, which the SERVER increments inside
+   * SetRunLimitWait — strictly AFTER this message is emitted, and after the batcher
+   * that carries it has been closed. The claim payload does not deliver the previous
+   * value either (it carries `requeue_count`, a different counter for worker deaths).
+   * So the best a worker could emit is a stale N-1 that disagrees with the run row.
+   *
+   * Nothing is lost: `limit_wait_count` is on RunDTO and on the web `Run` type, so a
+   * renderer showing "attempt N" reads the authoritative value it already has,
+   * rather than a snapshot frozen into a feed row that never updates when the run
+   * parks again.
+   */
+  private async handleLimitReached(
+    err: LimitReachedError,
+    claim: ClaimResponse,
+    batcher: MessageBatcher,
+    reportState: (body: StateRequest) => Promise<StateAck>,
+    runLog: Logger,
+  ): Promise<boolean> {
+    const detail = describeLimit(err);
+    // The structured fields ride BOTH the park and the opt-out failure report. The
+    // worker never composes the user-facing sentence from them (Decision 8): it
+    // reports the raw type and reset, and the server — which owns the allowlist —
+    // writes the reason. Composing it here would carry an unvalidated rateLimitType
+    // into the run row as free text by a different route.
+    const limitFields = {
+      rate_limit_type: err.rateLimitType,
+      limit_resets_at: err.resetsAtMs,
+    };
+    // The feed payload for the two structured kinds (PRD #35 Decision 10). Kept
+    // STRUCTURED rather than interpolated into a sentence because the renderer must
+    // map `rate_limit_type` through a known-value lookup with a neutral fallback: a
+    // feed payload is worker-authored and the server's enum allowlist does not reach
+    // it, and you cannot map a value that has been baked into prose without
+    // re-parsing the prose — which is worse than not structuring it at all.
+    //
+    // `resets_at` is an ISO string, matching every other timestamp the web renders
+    // and sidestepping the seconds-vs-milliseconds ambiguity that `resetsAt` itself
+    // carries. OMITTED ENTIRELY when the reset is unknown, never null, so "unknown"
+    // is one shape on the wire rather than two.
+    //
+    // `attempt` from Decision 10 is deliberately ABSENT — see the note in
+    // handleLimitReached's doc comment.
+    const feedPayload: Record<string, unknown> = {};
+    if (err.rateLimitType !== undefined)
+      feedPayload["rate_limit_type"] = err.rateLimitType;
+    if (err.resetsAtMs !== undefined)
+      feedPayload["resets_at"] = new Date(err.resetsAtMs).toISOString();
+
+    if (!claim.wait_on_limit) {
+      // Opted out: fail, but with the structured facts attached so the server can
+      // say WHY instead of leaving today's bare "agent run failed:
+      // error_during_execution".
+      runLog.info("run hit a usage limit and is not opted in to waiting", {
+        detail,
+      });
+      batcher.emit({
+        kind: "limit_hit",
+        agent: "worker",
+        payload: { ...feedPayload },
+      });
+      await batcher.close().catch(() => undefined);
+      await reportState({ status: "failed", ...limitFields }).catch((e) =>
+        runLog.error("could not report limit failure", {
+          error: errMessage(e),
+        }),
+      );
+      return false;
+    }
+
+    runLog.info("run hit a usage limit; requesting a park", { detail });
+    batcher.emit({
+      kind: "limit_wait",
+      agent: "worker",
+      payload: { ...feedPayload },
+    });
+    await batcher.close().catch(() => undefined);
+
+    let ack: StateAck;
+    try {
+      ack = await reportState({ status: "limit_wait", ...limitFields });
+    } catch (e) {
+      // The park request never landed. Clean up: this run is not parked, and a
+      // preserved HOME nothing will ever claim is an unbounded leak.
+      runLog.error(
+        "could not report the park; cleaning up as an unparked run",
+        { error: errMessage(e) },
+      );
+      return false;
+    }
+
+    if (ack.status !== "limit_wait") {
+      runLog.warn("the server did not park this run; cleaning up", {
+        applied: ack.applied,
+        server_status: ack.status ?? "unknown",
+      });
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -856,7 +1076,9 @@ export class RunRunner {
     planMd: string,
     batcher: MessageBatcher,
     steering: SteeringChannel,
-    reportState: (body: StateRequest) => Promise<void>,
+    // Ignored by the gate, but typed to match the client (PRD #35): a gate that
+    // narrowed the return would make the park branch unable to reuse this closure.
+    reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],
@@ -985,7 +1207,7 @@ export class RunRunner {
     questions: AskUserQuestion[],
     batcher: MessageBatcher,
     steering: SteeringChannel,
-    reportState: (body: StateRequest) => Promise<void>,
+    reportState: (body: StateRequest) => Promise<unknown>,
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
@@ -1029,16 +1251,51 @@ export class RunRunner {
     // Durable before the park is announced — see the doc comment.
     await batcher.flush().catch(() => undefined);
 
-    await reportState({
+    // Read the ACK, and read it the way PRD #35 established for its own park:
+    // `status === "awaiting_input"`, NEVER `applied`. A declined park can still have
+    // applied a different transition, so `applied` is true while the park did not
+    // happen — StateAck.applied's own doc says diagnostics only.
+    //
+    // Why this matters here and not before the merge: pre-#35 reportState returned
+    // void, so discarding it was correct. The information now exists, and without
+    // this check the two parks in this file would be asymmetric — the limit park
+    // verifies, the question park does not — which reads as an oversight rather than
+    // a decision.
+    //
+    // What the check buys: SetRunAwaitingInput matches nothing when the run went
+    // terminal under us or is no longer ours. Without it the worker would then await
+    // an answer NO SURFACE CAN PRODUCE — the status never changed, so no UI, Slack
+    // card or CLI ever shows a question — and the run would sit until
+    // QUESTION_TIMEOUT and die claiming a human ignored it. Failing here instead
+    // turns a silent 24h wait into an immediate, explained failure.
+    //
+    // A concurrent cancel is the one decline that resolves itself (the steering
+    // channel's sticky `cancelled` flag settles the wait independently), so this is
+    // belt-and-braces on that path and the only defence on the others.
+    const ack = await reportState({
       status: "awaiting_input",
       open_question_id: questionId,
     });
+    const parked = (ack as { status?: string } | undefined)?.status;
+    if (parked !== "awaiting_input") {
+      this.openQuestionIds.delete(runId);
+      throw new Error(
+        `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
+      );
+    }
     runLog.info("clarification: awaiting answer", {
       run_id: runId,
       question_id: questionId,
       question_ordinal: ordinal,
     });
 
+    // LOAD-BEARING, and it reads as incidental — hence this note. Dropping the open
+    // question id here is what makes each park mint a fresh randomUUID, and that in
+    // turn is the ONLY reason SubmitInput's "reject an answer unless the run is
+    // awaiting_input" check can be described as belt-and-braces rather than as the
+    // primary defence. Its server-side counterparts are the two clears in
+    // runtime.sql (SetRunRunning and SetRunAwaitingApproval); this is the worker's
+    // half of the same invariant — no resolved id is left behind anywhere.
     const settle = (v: AnswerVerdict): AnswerVerdict => {
       this.openQuestionIds.delete(runId);
       return v;
@@ -1083,6 +1340,13 @@ const AUTOPILOT_ANSWER_NOTICE =
 /** Failure reason when a parked run's answer deadline expires (PRD #88 Decision 5a).
  *  Fail-closed: the PRD puts a configurable default action out of scope. */
 export const REASON_QUESTION_TIMEOUT = "clarification timed out";
+
+/** The server declined the clarification park (PRD #88). Distinct from a timeout so
+ *  an operator can tell "nobody answered" from "the question was never askable" —
+ *  the second means the run went terminal or changed hands mid-ask, and no human ever
+ *  saw a question to answer. */
+export const REASON_QUESTION_NOT_PARKED =
+  "could not park the run to ask a question";
 
 /** The effective answer deadline: the server-configured claim value when it is
  *  present and positive, else the worker default. An older server omits it (R8). */

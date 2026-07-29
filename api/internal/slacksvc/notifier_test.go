@@ -28,6 +28,12 @@ type fakeNotifStore struct {
 	gateSetGen   []store.SetSlackRunGateGenParams
 	planCount    int64
 	planCountErr error
+	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
+	// which question the thread already carries. A nil question with no error models
+	// "no row" the way the generated :one query surfaces it.
+	question    []byte
+	questionErr error
+	questionSet []store.SetSlackRunQuestionParams
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -53,6 +59,19 @@ func (f *fakeNotifStore) SetSlackRunGateGen(_ context.Context, arg store.SetSlac
 }
 func (f *fakeNotifStore) CountRunPlanMessages(context.Context, uuid.UUID) (int64, error) {
 	return f.planCount, f.planCountErr
+}
+func (f *fakeNotifStore) GetLatestRunQuestion(context.Context, uuid.UUID) ([]byte, error) {
+	if f.questionErr != nil {
+		return nil, f.questionErr
+	}
+	if f.question == nil {
+		return nil, pgx.ErrNoRows
+	}
+	return f.question, nil
+}
+func (f *fakeNotifStore) SetSlackRunQuestion(_ context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error) {
+	f.questionSet = append(f.questionSet, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, QuestionID: arg.QuestionID}, nil
 }
 
 type postCall struct{ channel, thread, text string }
@@ -742,5 +761,81 @@ func TestNotifierHealthNeverBlocks(t *testing.T) {
 	// Overfill the queue well past capacity: PublishHealth must drop, never block.
 	for i := 0; i < notifierQueue*2; i++ {
 		n.PublishHealth(uuid.New(), "stalled", "x", true)
+	}
+}
+
+// --- PRD #35: the usage-limit park -----------------------------------------------
+
+func parkedCtx(rateLimitType string, resumesIn time.Duration, count int32) store.GetSlackRunContextRow {
+	rc := baseRun("limit_wait")
+	if rateLimitType != "" {
+		rc.RateLimitType = pgtype.Text{String: rateLimitType, Valid: true}
+	}
+	if resumesIn != 0 {
+		rc.RetryNotBefore = pgtype.Timestamptz{Time: time.Now().Add(resumesIn), Valid: true}
+	}
+	rc.LimitWaitCount = count
+	return rc
+}
+
+// TestParkedRunRendersAsPausedNotAsARawStatus is the gap this milestone closes: the
+// notifier has NO status filter, so before this a parked run reached statusLabel's
+// default arm and the user's DM read the literal database string "limit_wait".
+func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
+	got := renderRoot(parkedCtx("five_hour", 4*time.Hour, 1), "https://uzi.example")
+	if strings.Contains(got, "limit_wait") {
+		t.Fatalf("root = %q — the raw status string leaked to a user's DM", got)
+	}
+	if !strings.Contains(got, "paused: usage limit") || !strings.Contains(got, "(five_hour)") {
+		t.Fatalf("root = %q, want it to name the pause and the window", got)
+	}
+	if !strings.Contains(got, "<!date^") {
+		t.Fatalf("root = %q, want Slack's date markup so the time renders in the READER's "+
+			"timezone rather than the server's", got)
+	}
+}
+
+// A park is the ONE non-terminal transition that threads an event, and the reason is
+// mechanical rather than editorial: the root line is EDITED, and a Slack edit raises
+// no notification, so without this a user is never told their run paused.
+func TestParkThreadsAnEventWhileResumeDoesNot(t *testing.T) {
+	if evt := renderThread(parkedCtx("seven_day", time.Hour, 1), ""); evt == "" {
+		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
+			"the user would never learn the run paused")
+	}
+	// The promotion back to queued must NOT post — resuming is a return to normal and
+	// the edited root already shows it. A run that parks five times would otherwise
+	// produce ten posts.
+	if evt := renderThread(baseRun("queued"), ""); evt != "" {
+		t.Fatalf("the resume threaded %q; only the park is worth interrupting for", evt)
+	}
+}
+
+// Every part is omitted rather than defaulted when unknown, matching the server's own
+// failure-reason composition: the line must never claim a fact uzi does not have.
+func TestLimitWaitLabelOmitsWhatItDoesNotKnow(t *testing.T) {
+	bare := renderThread(parkedCtx("", 0, 1), "")
+	if bare != "⏸ paused: usage limit" {
+		t.Fatalf("a park with no window and no stamp rendered %q; it must degrade to the "+
+			"bare statement rather than inventing a window or a time", bare)
+	}
+	if strings.Contains(bare, "(pause") {
+		t.Fatalf("%q shows a pause counter on the FIRST park, which is noise — the counter "+
+			"is the signal that a run is burning its retry budget", bare)
+	}
+	if repeat := renderThread(parkedCtx("five_hour", time.Hour, 3), ""); !strings.Contains(repeat, "(pause 3)") {
+		t.Fatalf("%q — from the second park on, the rising count is the warning that this "+
+			"run may be about to fail for good", repeat)
+	}
+}
+
+// The enum is allowlisted server-side and 00091's CHECK backstops it, so this can
+// only fire for a writer that bypassed both — a backfill, an admin tool, a later
+// refactor. That is exactly the population the CHECK exists for, so the renderer
+// escapes rather than trusting.
+func TestLimitWaitLabelEscapesTheWindowField(t *testing.T) {
+	got := renderThread(parkedCtx("five_hour<https://evil|click>", time.Hour, 1), "")
+	if strings.Contains(got, "<https://evil|click>") {
+		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
 	}
 }

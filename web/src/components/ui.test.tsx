@@ -5,9 +5,34 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { Select, StatusPill } from "./ui";
+import { RUN_STATUS_TONES, Select, StatusPill } from "./ui";
 import { runBadge } from "../lib/runBadge";
-import type { RunStatus } from "../lib/api";
+import type { LatestRun, RunStatus } from "../lib/api";
+
+// A LatestRun carrying nothing but the status under test: no mr_iid (so `completed`
+// stays a plain badge rather than the MR chip) and no stop_kind (so the stopped overlay
+// never fires). NOW == created_at, so any elapsed suffix is deterministic.
+const NOW = Date.parse("2026-07-28T00:00:00Z");
+function latestRun(status: string): LatestRun {
+  return {
+    id: "r",
+    status: status as RunStatus,
+    mr_iid: null,
+    mr_web_url: null,
+    mr_state: null,
+    failure_reason: null,
+    stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
+    owner_name: "V",
+    worker_name: null,
+    is_mine: true,
+    run_count: 1,
+    created_at: "2026-07-28T00:00:00Z",
+    updated_at: "2026-07-28T00:00:00Z",
+  };
+}
 
 afterEach(cleanup);
 
@@ -48,37 +73,37 @@ describe("StatusPill", () => {
     expect(container.textContent).not.toContain("awaiting input");
   });
 
-  it("agrees with runBadge on the label for every status BOTH of them render", () => {
+  it("agrees with runBadge on the LABEL for every status both surfaces render", () => {
     // The real invariant, and the one that catches the NEXT divergence rather than this
-    // one: a status carried by both surfaces must read the same in both. Anchored on
-    // runBadge's own output, so adding a status to one and not the other reddens here.
-    for (const status of ["awaiting_input", "awaiting_approval", "queued", "completed"]) {
-      const badge = runBadge(
-        {
-          id: "r",
-          status: status as RunStatus,
-          mr_iid: null,
-          mr_web_url: null,
-          mr_state: null,
-          failure_reason: null,
-          stop_kind: null,
-          health: "ok",
-          health_reason: null,
-          health_since: null,
-          owner_name: "V",
-          worker_name: null,
-          is_mine: true,
-          run_count: 1,
-          created_at: "2026-07-28T00:00:00Z",
-          updated_at: "2026-07-28T00:00:00Z",
-        },
-        Date.parse("2026-07-28T00:00:00Z"),
-      );
+    // one. It iterates RUN_STATUS_TONES rather than a hardcoded list, so a status added
+    // to the app is covered WITHOUT anyone remembering to extend this test — which is how
+    // `limit_wait` (PRD #35, added on another branch) arrived already asserted.
+    //
+    // Complements runBadge.test.ts's TONE-agreement loop over the same map: that one pins
+    // the colour, this one pins the words, and a status can drift on either alone.
+    //
+    // The two skips are runBadge overlays with no StatusPill counterpart, carved out the
+    // same way that test carves out the stop_kind nuance:
+    //   running   — runBadge appends live elapsed ("running 4m"); a pill has no clock.
+    //   cancelled — isStoppedRun rewrites it to "stopped", and RunView passes the literal
+    //               "stopped" to the pill instead, so the two never meet on this key.
+    const OVERLAY_ONLY = new Set(["running", "cancelled"]);
+    const checked: string[] = [];
+    for (const status of Object.keys(RUN_STATUS_TONES)) {
+      if (OVERLAY_ONLY.has(status)) continue;
+      const badge = runBadge(latestRun(status), NOW);
       if (badge.kind !== "badge") continue;
       const { container, unmount } = render(<StatusPill status={status} />);
-      expect(container.textContent?.trim()).toBe(badge.label);
+      expect([status, container.textContent?.trim()]).toEqual([status, badge.label]);
       unmount();
+      checked.push(status);
     }
+    // An iterate-the-map loop passes vacuously if the map is empty or the skip set eats
+    // it, so assert the population it actually covered — the same weakness runBadge's own
+    // loop names about itself.
+    expect(checked).toContain("awaiting_input");
+    expect(checked).toContain("limit_wait");
+    expect(checked.length).toBeGreaterThanOrEqual(5);
   });
 });
 

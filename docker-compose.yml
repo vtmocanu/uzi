@@ -169,9 +169,15 @@ services:
       # PRD #88 clarification bounds. Read here and shipped in the claim (enforced
       # worker-side) for the same reason PLAN_MAX_REVISIONS is: a worker env var is
       # unreachable on hosted k8s, where the controller renders exactly one tuning var
-      # into a worker pod. QUESTION_TIMEOUT_SECONDS is the deadline for ONE park and
-      # the timer is worker-held, so a requeue restarts it — the honest worst case is
-      # this value x (RUN_MAX_REQUEUES + 1).
+      # into a worker pod.
+      #
+      # NEITHER bound is durable, and that applies to BOTH of them for one reason:
+      # each is held in worker memory (a park counter and a park timer), so a worker
+      # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
+      # park: questionDeadlines is set once on the first park and cleared only by the
+      # terminal finally, so N questions in one attempt SHARE one deadline. The lifetime
+      # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 10 questions
+      # and 48h of waiting, not 5 and 24h.
       QUESTION_MAX: ${QUESTION_MAX:-5}
       QUESTION_TIMEOUT_SECONDS: ${QUESTION_TIMEOUT_SECONDS:-86400}
       RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
@@ -184,6 +190,19 @@ services:
       # abort-on-malformed-value choice in config.go exists to prevent, arriving by
       # a different route.
       UZI_AUTOSTOP_ENABLED: ${UZI_AUTOSTOP_ENABLED:-true}
+      # PRD #35's usage-limit park caps. RUN_LIMIT_MAX_WAITS is how many times ONE run
+      # may park waiting for the owner's Anthropic window to reopen before it fails
+      # instead ("never park" at 0, which is the pre-feature behaviour); RUN_LIMIT_MAX_PARK
+      # is how far out a single park may reach, past which the run fails rather than
+      # waiting. They COMPOSE: a run can hold its issue's one-active lock for at most
+      # the product of the two, ~40 days at these defaults.
+      #
+      # Passed through for the same reason as UZI_AUTOSTOP_ENABLED above rather than as
+      # a tuning nicety: both bound how long uzi may sit on a user's issue and a
+      # worker's disk, so an operator who lowers either in .env and sees no effect has
+      # been silently overruled by config.go's default.
+      RUN_LIMIT_MAX_WAITS: ${RUN_LIMIT_MAX_WAITS:-5}
+      RUN_LIMIT_MAX_PARK: ${RUN_LIMIT_MAX_PARK:-192h}
       WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
       WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
     # Not published to the host: reached only by web over the compose network.

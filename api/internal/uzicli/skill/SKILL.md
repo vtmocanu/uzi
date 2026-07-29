@@ -83,11 +83,12 @@ uzi run list
 uzi run get <run-id>
 uzi run logs <run-id> [--follow] [--after <seq>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid>
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>]
 uzi run reject <run-id> [--message <text>]
 uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
+uzi run answer <run-id> [--message <text>]
 uzi run inputs <run-id>
 uzi tui [run-id]
 uzi review show <run-id>
@@ -144,6 +145,12 @@ uzi version
   mode each message is one JSON object per line (NDJSON), so `--follow` streams.
 - `uzi run create --repo <repo-id> --issue <issue-iid>` — queue a run on a repo's
   PRD issue. Get the repo id from `uzi repo list`.
+  `--wait-on-limit` is THREE-WAY, not a plain switch: omit it and the run inherits
+  your Settings default; pass `--wait-on-limit` to make this run park until your
+  Anthropic usage window reopens instead of failing; pass `--wait-on-limit=false`
+  (with the `=`, since a bare bool flag consumes no following word) to force it off
+  for this run only. A parked run holds its issue and its worker's disk until it
+  resumes, so it is opt-in rather than the default.
 - `uzi run approve <run-id>` — approve the plan gate. By default the run uses its
   own default subagent roster. To choose the roster explicitly, pass
   `--agent-source own|repo` (`own` = your template roster, `repo` = the agents
@@ -156,10 +163,21 @@ uzi version
 - `uzi run cancel <run-id>` — cancel a run.
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
+- `uzi run answer <run-id> [--message <text>]` — answer the clarifying question a
+  run asked with `ask_user`. Such a run sits in status `awaiting_input` and makes
+  no progress until it is answered; answering resumes the same agent session.
+  Repeat `--message` once per question when several were asked (answers are
+  matched in order), or pipe a single answer on stdin. The open question is read
+  from the run's own feed (`uzi run logs <run-id>` shows it as a `question`
+  message) rather than from a run field, so every surface derives it identically.
+  The answer names the question it answers, so a reply written against a question
+  the agent has already moved past is rejected rather than applied to the current
+  one. Exit 5 if the run is not waiting for an answer.
 - `uzi run inputs <run-id>` — the run's steer queue: the follow-ups sent to it
   (newest first) with a delivery state — `queued` (not yet drained by the worker)
   or `delivered` (handed to the worker for its next turn; at a plan gate it reads
-  `delivered (applies after approval)`, and an unconsumed input on a finished run
+  `delivered (applies after approval)`, at a clarification park
+  `delivered (applies after the question is answered)`, and an unconsumed input on a finished run
   reads `not delivered (run finished)`). Owner-only — a read-only admin token gets
   a 404 on another user's run. `--json` emits the raw `{id, body, created_at,
   consumed_at}` list (derive the state yourself: `consumed_at` null = queued,

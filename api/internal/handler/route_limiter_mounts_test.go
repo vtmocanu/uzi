@@ -292,6 +292,12 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/agent-templates/{id}/skills", noLimiter},
 	{"PUT", "/api/forge/connections/{id}", limForge},
 	{"PUT", "/api/me/autopilot", noLimiter},
+	// PRD #35 Decision 7. noLimiter, and the choice is deliberate rather than
+	// inherited from the neighbours: this is a single boolean UPDATE on the caller's
+	// own users row. It spends no Anthropic token, makes no forge call, sends no DM,
+	// and mints nothing — none of the three things the per-user limiters exist to
+	// bound. Cookie+CSRF already gates it, matching /me/autopilot beside it.
+	{"PUT", "/api/me/wait-on-limit", noLimiter},
 	{"PUT", "/api/me/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/me/secrets/anthropic_token", noLimiter},
 	{"PUT", "/api/me/settings/", noLimiter},
@@ -312,6 +318,11 @@ var wantRouteMounts = []routeMount{
 	// merits above; it never needed that claim.
 	{"PUT", "/api/repos/{id}/board/order", limBoardOrder},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
+	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
+	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,
+	// and it cannot even change the run's status. Contrast /runs/{id}/rejudge above,
+	// which carries limJudge precisely because it MINTS a token-spending run.
+	{"PUT", "/api/runs/{id}/wait-on-limit", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},
 	{"PUT", "/api/tool-allowlist/{id}", noLimiter},

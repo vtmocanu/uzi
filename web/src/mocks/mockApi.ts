@@ -5,6 +5,7 @@
 
 import {
   ApiError,
+  isTerminalRun,
   type AutoStatus,
   type BindMode,
   type AgentSelectionInput,
@@ -1091,6 +1092,18 @@ export const mockApi = {
     return delay({ user: { ...u } }, 200);
   },
 
+  // ── Usage-limit default (PRD #35 M3) ─────────────────────────────────────────
+  // 🔴 TOUCHES THE USER ROW ONLY. It must not walk `state.runs` "helpfully" applying
+  // the new default: the flag is copied onto a run at CREATION, so a sweep would
+  // silently undo every per-run override the user had made — including on the run
+  // they are looking at. The demo has to teach that these are two separate controls,
+  // because that is the thing about this feature people get wrong.
+  setWaitOnLimit: async (enabled: boolean) => {
+    const u = requireSession();
+    u.wait_on_limit = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
   // Own-user (session identity, never a body id, mirroring the server's audit H3).
   setJudgeEnabled: async (enabled: boolean, anthropicToken?: string | null) => {
@@ -2096,6 +2109,11 @@ export const mockApi = {
       anthropic_secret_label: null,
       anthropic_select_reason: null,
       anthropic_headroom_pct: null,
+      wait_on_limit: false,
+      limit_resets_at: null,
+      retry_not_before: null,
+      limit_wait_count: 0,
+      rate_limit_type: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -2149,6 +2167,11 @@ export const mockApi = {
       anthropic_secret_label: null,
       anthropic_select_reason: null,
       anthropic_headroom_pct: null,
+      wait_on_limit: false,
+      limit_resets_at: null,
+      retry_not_before: null,
+      limit_wait_count: 0,
+      rate_limit_type: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -2212,6 +2235,22 @@ export const mockApi = {
       .map((t) => ({ name: t.name, description: t.description }));
     return delay({ run: { ...run, own_agents } }, 60);
   },
+  // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
+  // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
+  // `limit_wait` is admitted for free.
+  //
+  // 🔴 IT MUST NOT TOUCH `status`. A parked run stays parked with its clock intact;
+  // this changes what happens at the NEXT limit. A mock that helpfully un-parked the
+  // run would teach the demo (and anyone testing against it) the one wrong thing
+  // about this control.
+  setRunWaitOnLimit: async (id: string, enabled: boolean) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (isTerminalRun(run.status)) throw new ApiError(409, "this run has already finished");
+    patchRun(id, { wait_on_limit: enabled });
+    return delay({ run: { ...getRun(id)! } }, 80);
+  },
+
   // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
   getRunReview: async (id: string) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
@@ -2510,6 +2549,11 @@ export const mockApi = {
       anthropic_secret_label: null,
       anthropic_select_reason: null,
       anthropic_headroom_pct: null,
+      wait_on_limit: false,
+      limit_resets_at: null,
+      retry_not_before: null,
+      limit_wait_count: 0,
+      rate_limit_type: null,
       claimed_at: now,
       started_at: now,
       finished_at: null,

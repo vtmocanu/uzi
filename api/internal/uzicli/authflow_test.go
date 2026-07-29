@@ -144,7 +144,7 @@ func TestCreateRunWireShape(t *testing.T) {
 		io.WriteString(w, `{"run":{"id":"run-1","status":"queued","kind":"issue"}}`)
 	}))
 	defer srv.Close()
-	run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42)
+	run, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

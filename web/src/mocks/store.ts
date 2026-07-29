@@ -4,7 +4,7 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, IssueProposal, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -19,6 +19,7 @@ import {
   mockFailedMessages,
   mockLaneMessages,
   mockLaneRuns,
+  mockLimitWaitMessages,
   mockProposals,
   mockRuns,
   mockUnreadableQuestionMessages,
@@ -66,6 +67,12 @@ function seed(): MockState {
   // scripted, so the empty state is reachable by URL without walking the journey.
   messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
+  // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows. The
+  // degraded-countdown fixture shares it — the rows are the same shape and it exists
+  // for the run-row states (expired stamp, 7-day window, suppressed attempt), not for
+  // a different feed.
+  messages.set("run-limit-wait", [...mockLimitWaitMessages]);
+  messages.set("run-limit-wait-due", mockLimitWaitMessages.map((m) => ({ ...m })));
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
@@ -149,6 +156,36 @@ const CARD_MIRRORED_FIELDS = [
   "health_reason",
   "health_since",
 ] as const;
+
+// The other half of the partition: fields a card carries that a RUN PATCH must never
+// write. `id` is the join key; `updated_at` is stamped by syncCards itself; the rest are
+// projections the server computes for the board and that no run row holds.
+const CARD_OWN_FIELDS = [
+  "id",
+  "updated_at",
+  "owner_name",
+  "worker_name",
+  "is_mine",
+  "run_count",
+  "created_at",
+] as const;
+
+// 🔴 COMPILE-TIME EXHAUSTIVENESS, and it is the point of splitting the list in two.
+//
+// The two arrays above must PARTITION `keyof LatestRun`. Without this line the
+// enumeration is correct only when written: a field added to LatestRun elsewhere
+// produces NO conflict in a merge, NO type error, and NO failing test — the card simply
+// stops mirroring it, silently. That is the same shape as an enumeration invalidated by
+// something that moved in another file, which this repo has been bitten by before.
+//
+// If this stops compiling, LatestRun gained (or lost) a field: put it in exactly one of
+// the two lists. Do NOT widen the type to make it build.
+type UnpartitionedCardField = Exclude<
+  keyof LatestRun,
+  (typeof CARD_MIRRORED_FIELDS)[number] | (typeof CARD_OWN_FIELDS)[number]
+>;
+const _cardFieldsArePartitioned: UnpartitionedCardField extends never ? true : never = true;
+void _cardFieldsArePartitioned;
 
 // syncCards propagates a run patch onto any board card whose latest_run IS this run.
 //

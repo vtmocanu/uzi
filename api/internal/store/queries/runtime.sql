@@ -286,8 +286,21 @@ WHERE status = 'online'
 -- the worker reads it to resolve the plan gate without a human.
 -- repo_id is nullable since PRD #39 (chat runs carry none); the ::uuid cast keeps
 -- this INSERT param a non-null uuid.UUID — an issue run always targets a repo.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
-VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
+--
+-- wait_on_limit is the PRD #35 opt-in, resolved in the SERVICE layer as
+-- COALESCE(explicit request, the owner's users.wait_on_limit default) and passed in
+-- explicitly, rather than defaulted in SQL. Naming the column here is what makes an
+-- unstamped creation path visible in a diff of THIS file.
+--
+-- 🔴 IT IS NOT VISIBLE TO THE COMPILER, THOUGH, AND ASSUMING OTHERWISE IS THE TRAP.
+-- sqlc generates a PARAMS STRUCT, and a Go struct literal that omits a field
+-- compiles happily and yields the zero value — which for a bool is false, i.e. every
+-- run from that path silently opted OUT. Measured while writing this: adding the
+-- column and regenerating left `go build ./...` fully green with all three call
+-- sites unstamped. So the guard here is a TEST that creates a run for an opted-in
+-- owner and asserts the flag arrives, per creation path — not the type system.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -483,6 +496,38 @@ RETURNING *;
 -- The repo + connection facts the claim payload needs, alongside the run. The
 -- bot PAT (token_ciphertext) is decrypted by the service, never selected in the
 -- clear from the DB.
+--
+-- human_plan_approved is the HUMAN half of the claim payload's plan_approved
+-- (PRD #35 Decision 6b); the service ORs it with the run's auto_approve. A resumed
+-- run whose plan a human already approved must skip the Phase-1 planning turn and
+-- the gate, replaying plan_md instead — otherwise a park-and-resume re-plans,
+-- re-parks at awaiting_approval in front of a human who already approved, and can
+-- fail with REASON_NO_PLAN when the resumed session declines to re-emit its plan.
+--
+-- ::boolean is not decoration: sqlc's inference is weaker on EXPRESSIONS than on
+-- columns, and an uncast EXISTS(...) types as interface{}, which is unusable as a
+-- Go bool (measured on PRD #113 M5's `IS NOT NULL` projection).
+--
+-- 🔴 THE INVARIANT THIS RELIES ON, WRITTEN HERE BECAUSE THIS IS WHERE IT IS READ.
+-- The predicate is SetRunRunning's, whose own comment records an accepted residual:
+-- a consumed round-1 approve_plan lets a stale round-2 pre-gate report through. For
+-- SetRunRunning that residual hides a gate. Here it would tell the worker to skip
+-- Phase 1 and IMPLEMENT AN UNREVIEWED plan_md — the same residual with a materially
+-- worse blast radius, which is why it is spelled out rather than inherited.
+--
+-- It is sound today, and the reason is structural rather than lucky, so it is a
+-- property of the QUERY PAIR and not of the worker's loop:
+--   * a park is running-only (SetRunLimitWait's positive source guard), and
+--   * a revise round sits at awaiting_approval, which SetRunRunning refuses to
+--     leave for 'running' unless a consumed approve_plan exists.
+-- So the ordinary multi-round revise flow cannot reach a park at all. The one
+-- surviving residual is the stale round-2 pre-gate report SetRunRunning's comment
+-- already names: if that admits a run to 'running' and it then parks, the resume
+-- skips the gate on an unreviewed plan_md. Required invariant, stated so a future
+-- change can be checked against it: NO awaiting_approval REPORT REWRITES plan_md
+-- AFTER THE CONSUMED approve_plan THAT MADE human_plan_approved TRUE. A tighter
+-- derivation is not cheaply available — runs carries no plan_md_set_at to compare
+-- consumed_at against, and inventing one is out of this PRD's scope.
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
@@ -491,7 +536,11 @@ SELECT rp.web_url             AS repo_web_url,
        c.forge_type,
        c.base_url,
        c.bot_username,
-       c.token_ciphertext
+       c.token_ciphertext,
+       (EXISTS (SELECT 1 FROM run_user_inputs i
+                WHERE i.run_id = r.id
+                  AND i.kind = 'approve_plan'
+                  AND i.consumed_at IS NOT NULL))::boolean AS human_plan_approved
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
@@ -569,6 +618,32 @@ WHERE id = @id AND user_id = @user_id;
 -- consumed round-1 input lets a stale round-2 pre-gate report through.
 UPDATE runs SET
     status           = 'running',
+    -- PRD #88: the run is leaving the clarification park, so the question it was
+    -- parked on is RESOLVED and its id must not survive.
+    --
+    -- 🔴 THIS IS ONE OF **TWO** CLEARS. The invariant they jointly carry:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling is
+    -- the matching clear in SetRunAwaitingApproval, which covers the
+    -- M4 PRE-RUN path — a run that parks before it plans reaches the gate with no
+    -- intervening `running` report, so this statement is never executed on it (D-AG).
+    -- Deleting either clear as redundant re-opens the defect on the path the other
+    -- one does not cover, and a third non-terminal destination added later needs its
+    -- own. The full argument lives at SetRunAwaitingApproval; this pointer exists so
+    -- the invariant is discoverable from EITHER end, which is the only version that
+    -- works — a reader who opens only this statement would otherwise learn it is the
+    -- sole clear.
+    --
+    -- A stale id is not inert: the claim payload re-delivers open_question_id on a
+    -- resume, so a worker that restarts after an answered park would seed its map
+    -- with the OLD id and then re-use it for a genuinely new question. That
+    -- degenerates the guard below to "has ever been answered" (PRD #44 F2 again) and
+    -- lets the stale answer to the old question satisfy the new one — the two things
+    -- identity keying exists to prevent.
+    --
+    -- Safe to assign here even though the guard below reads the same column: Postgres
+    -- evaluates the WHERE and every SET right-hand side against the OLD row, which is
+    -- the same mechanism the health CASE arms below already rely on.
+    open_question_id = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -587,6 +662,17 @@ UPDATE runs SET
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
+  -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
+  -- this clause a `running` heartbeat delivered AFTER the park report — the batcher
+  -- retries, and two pre-gate fire-and-forget reports already exist, so reordering
+  -- is not hypothetical — would flip limit_wait back to running under a worker whose
+  -- execution has already ended. The run would then sit `running` until RUN_TIMEOUT
+  -- failed it, with the park silently lost. The inversion is worth naming: the same
+  -- negative-guard shape that makes CancelRunServerSide cover a new status for free
+  -- is what makes THIS statement dangerous.
+  -- Resume is unaffected: a promoted run is 'claimed' when the worker reports running.
+  AND status <> 'limit_wait'
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
         WHERE run_user_inputs.run_id = @id
@@ -622,13 +708,188 @@ UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = @plan_md,
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    -- 🔴 INVARIANT, carried by TWO call sites and by nothing else:
+    -- NO SETTER MAY LEAVE A RESOLVED open_question_id BEHIND. The sibling clear is in
+    -- SetRunRunning, which covers the mid-run path; this one covers M4's pre-run park,
+    -- which reaches the gate without ever executing that statement. A third
+    -- non-terminal destination added later re-opens this a third time and nothing
+    -- would catch it.
+    --
+    -- Why this statement needs the clear at all (PRD #88 D-AG, measured): M4 lets the
+    -- lead ask BEFORE it plans, so a pre-run park goes awaiting_input →
+    -- awaiting_approval with no intervening `running` report — SetRunRunning's clear
+    -- is simply never reached on that path. The run then sits at the plan gate still
+    -- naming a question that was already answered; a worker death there re-delivers
+    -- the stale id on the claim, the worker re-uses it for a genuinely NEW question,
+    -- and the old consumed `answer` row satisfies the resume guard. That is the
+    -- has-ever-been-answered degeneration the identity keying exists to prevent,
+    -- reached through the path M4 added rather than the one B2 fixed.
+    --
+    -- The server-side clear is the ONLY defence available. The worker seeds its map
+    -- from the CLAIM, which is a snapshot taken before its own `running` report — so
+    -- even though that report clears the column, the worker is already holding the
+    -- stale value. No worker-side guard can distinguish a resolved id from a live one
+    -- (a claim reports status 'claimed', never the park).
+    --
+    -- Sufficient by enumeration: from awaiting_input the only non-terminal
+    -- destinations are `running` (cleared in SetRunRunning) and `awaiting_approval`
+    -- (here). The terminal three never resume, so a stale id there is inert.
+    --
+    -- Unlike SetRunRunning's clear there is no WHERE-clause interaction to get wrong:
+    -- this statement's WHERE never references open_question_id.
+    open_question_id = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'running' clears any running-run
     -- flag (stalled/looping/slow). The detector re-evaluates for approval_idle from
     -- this transition's fresh updated_at; health_notified_at is preserved.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- Symmetric with SetRunRunning's guard (PRD #35): the negative predicate above
+  -- admits limit_wait, and a re-delivered gate report must not un-park a run. Kept
+  -- even though the current worker cannot reach this ordering, because "the caller
+  -- never does that today" is what SetRunRunning's own history disproves.
+  --
+  -- awaiting_input DELIBERATELY GETS NO SUCH GUARD, and this is the row most likely
+  -- to be re-litigated: the two parked statuses are HANDLED by opposite mechanisms at
+  -- this one statement, so an audit for consistency reads the asymmetry as a gap.
+  -- It is not. limit_wait's only exit is a server-side promotion, so blocking the
+  -- transition is right for it. awaiting_input -> awaiting_approval IS the PRD #88 M4
+  -- pre-run path (park -> answer -> re-plan -> submit_plan -> gate) and is legitimate,
+  -- so we ALLOW the transition and clear the resolved id above instead.
+  --
+  -- And awaiting_input IS still protected, just not here: its guard is SetRunRunning's
+  -- consumed-answer identity predicate, which is where an un-park would actually have
+  -- to happen. Said explicitly because "handled by opposite mechanisms" otherwise
+  -- invites a reader to hunt for its protection in THIS statement, find none, and
+  -- conclude it has none.
+  --
+  -- Measured, not argued: adding `AND status <> 'awaiting_input'` here reddens
+  -- TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB, because the pre-run park can
+  -- then never reach the plan gate at all — it wedges every pre-run clarification
+  -- permanently. Do not add it.
+  AND status <> 'limit_wait';
+
+-- name: SetRunLimitWait :execrows
+-- Park a run until the owner's exhausted Anthropic usage window reopens (PRD #35
+-- M2). running → limit_wait, non-terminal: the run keeps its issue, its session,
+-- its worker affinity and its message history, and the sweeper promotes it back to
+-- queued once retry_not_before passes.
+--
+-- 🔴 THE SOURCE GUARD IS POSITIVE (status = 'running'), WHICH IS THE FIRST POSITIVE
+-- SOURCE GUARD IN THIS FILE'S WORKER-REPORT FAMILY — every sibling above is
+-- negative (status NOT IN (terminal)). Do NOT "normalize" it to match them.
+-- Negative here would admit three transitions that must never happen and one that
+-- would be actively unsafe:
+--   * queued/claimed → limit_wait: an affinity-queued run parked by a stale report
+--     would leave the sweeper's promotion pass owning a run no worker holds.
+--   * awaiting_approval → limit_wait: a run sitting at the plan gate is not
+--     spending tokens, so it cannot have hit a limit; parking one would swallow the
+--     human's pending approval.
+--   * limit_wait → limit_wait: a re-delivered park report would bump
+--     limit_wait_count a second time and burn RUN_LIMIT_MAX_WAITS on one event.
+-- With the positive guard, every one of those is a 0-row no-op, which the service
+-- surfaces to the worker as 409 / applied=false. Re-delivery is therefore
+-- idempotent, and the worker's cleanup carve-out keys off the RETURNED STATUS
+-- rather than off applied, so a refused park cleans up rather than leaking.
+--
+-- kind <> 'judge' is Decision 14: a judge run is executed by a different runner
+-- with its own error path, its value decays (a judge parked for days is reviewing a
+-- run nobody remembers), and it is never re-enqueued. It dies with an explanatory
+-- reason instead. The guard lives HERE, in SQL, rather than only in Go, because the
+-- Go side is what composes that better death and a bypass would silently park.
+-- 'chat' needs no clause: a chat run never reaches SetState's run lane at all.
+--
+-- retry_not_before is computed in GO and passed in — never derived here from
+-- limit_resets_at. It carries the Decision 4 cross-check against this user's own
+-- gauge, Decision 6e's pool awareness, jitter, and the RUN_LIMIT_MAX_PARK clamp,
+-- none of which SQL is positioned to do. limit_resets_at is the WORKER'S REPORT,
+-- kept for display and the M5 Slack line; it is deliberately not the gate, so a
+-- compromised worker cannot park a run for years.
+--
+-- limit_wait_count bumps here rather than in Go so the increment and the transition
+-- are one statement: a run cannot end up parked without its budget being spent.
+-- It is distinct from requeue_count on purpose (Decision 5) — requeue_count counts
+-- worker deaths, this counts limit parks, and a shared counter would let one
+-- exhaust the other's budget.
+--
+-- 🔴 THE HEALTH RESET IS MANDATORY HERE, NOT THE STYLE CHOICE THE PRD CALLED IT.
+-- ListActiveRunsForHealth is a POSITIVE allowlist ('queued','running',
+-- 'awaiting_approval'), so the PRD #47 detector never revisits a parked run. That
+-- is listed as a free win — a park can never read "stalled" — and it cuts the other
+-- way too: whatever flag was live at park time would FREEZE for the entire park,
+-- because nothing will ever revisit the row to clear it. A run parked while flagged
+-- stalled would stay stalled for days, and it is user-visible rather than cosmetic
+-- (cmd/uzi's crewStateFor reads health AFTER the terminal and gate checks, so a
+-- parked run falls straight into crewStalled). That is Success Criterion 2 failing
+-- through the health column instead of the status column. Do NOT "fix" it by adding
+-- limit_wait to ListActiveRunsForHealth: stalled/looping/slow all describe a
+-- RUNNING agent, and making a park flaggable re-introduces the false alarm
+-- Decision 3 banks on avoiding. health_notified_at is NOT reset, matching every
+-- other exit contract in this file.
+UPDATE runs SET
+    status           = 'limit_wait',
+    limit_resets_at  = sqlc.narg('limit_resets_at'),
+    rate_limit_type  = sqlc.narg('rate_limit_type'),
+    retry_not_before = @retry_not_before,
+    limit_wait_count = limit_wait_count + 1,
+    session_id       = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at       = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge';
+
+-- name: PromoteLimitWaitRuns :many
+-- The sweeper's promotion pass (PRD #35 M2): limit_wait → queued once the clock
+-- passes retry_not_before. Backed by idx_runs_limit_wait_retry, a partial index on
+-- exactly this predicate, so the pass costs an index scan over a set that is empty
+-- on a healthy instance rather than a seq scan of runs.
+--
+-- 🔴 THIS IS A SINGLE UPDATE THAT RELEASES EVERY ELIGIBLE ROW IN ONE TICK. Nothing
+-- here staggers a wave, so "the sweeper tick already spreads them out" is exactly
+-- backwards — this statement is what makes the staggering necessary. The ONLY
+-- mechanism spreading a promoted wave across a user's credential pool is the 60-180s
+-- jitter baked into retry_not_before at PARK time (workersvc/limitwait.go's
+-- limitParkJitter, ADR-35 D4). That is written here as well as there because this is
+-- where someone reasons about promotion timing, and removing the jitter as
+-- redundant-with-the-tick is the specific mistake available from this file.
+--
+-- started_at = NULL so the resumed run gets a FRESH RUN_TIMEOUT wall (Decision 6d).
+-- Without it, SweepRunningTimeout measures the resumed run against a started_at
+-- from before a park that may have lasted days, and the run is failed on its first
+-- tick back — the feature would deliver a run that resumes and immediately dies.
+--
+-- requeue_count is deliberately NOT bumped (Decision 5): it counts worker deaths
+-- and this is not one. limit_wait_count already recorded the park, and letting a
+-- park consume re-queue budget would fail a run for a reason that never happened.
+--
+-- session_id, last_seq and worker_id are untouched, exactly as in every other
+-- requeue query here: the session is what makes the resume a resume rather than a
+-- restart, and worker_id is affinity, so the same disk reclaims the run and its
+-- clone if that worker is still alive.
+--
+-- limit_resets_at / retry_not_before / rate_limit_type are LEFT IN PLACE as
+-- history — the run view renders "attempt N, last paused on <window>" from them
+-- after the resume. A stale retry_not_before cannot re-fire this statement because
+-- the status predicate has already moved.
+--
+-- Health reset for the same reason SetRunLimitWait carries one, from the other
+-- side: the detector's allowlist DOES include 'queued', so it re-evaluates the
+-- queued signal from this transition's fresh updated_at rather than inheriting
+-- anything.
+--
+-- RETURNING id, user_id, status matches every other sweep transition in this file,
+-- so the caller can publish each promotion through the broadcaster/notifier
+-- fan-out; a promotion to 'queued' moves the board card to In Progress exactly like
+-- a requeue.
+UPDATE runs SET
+    status     = 'queued',
+    started_at = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE status = 'limit_wait' AND retry_not_before <= @now
+RETURNING id, user_id, status;
 
 -- name: SetRunAwaitingInput :execrows
 -- PRD #88 M1: the clarification park. Sibling of SetRunAwaitingApproval, and it
@@ -776,7 +1037,30 @@ UPDATE runs SET status = 'failed',
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id
-  AND status NOT IN ('completed', 'failed', 'cancelled');
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  -- limit_wait excluded EXPLICITLY (PRD #35) — the third statement in this file to
+  -- need it, for the same reason as SetRunRunning and SetRunAwaitingApproval above:
+  -- the negative predicate on the line above ADMITS a parked run. Auto-stopping one
+  -- would be wrong on the merits, not merely unreachable: its message writes are not
+  -- in a permanent-failure loop, they have simply STOPPED, because the worker went
+  -- away by design and the server owns the resume.
+  --
+  -- The reason to spend a clause on an unreachable case is that the invariant is
+  -- currently stated in a DIFFERENT PACKAGE from the one that enforces it.
+  -- workersvc/autostop.go's `if run.Status != "running"` is the only thing excluding
+  -- a park today, and that line's own comment justifies itself entirely in terms of
+  -- `queued` and PRD #108's requeue streak — parking is not mentioned there, because
+  -- it did not exist when it was written. Someone relaxing that Go line later (to
+  -- cover awaiting_approval, say) would make parked runs auto-stoppable with no SQL
+  -- backstop and no failing test. This is that backstop, written where the guard is
+  -- ENFORCED rather than where it is currently derived.
+  AND status <> 'limit_wait'
+  -- awaiting_input (PRD #88) is the same shape of park and the argument above
+  -- transfers verbatim: equally excluded today by that one Go line, equally unmentioned
+  -- in that line's own comment, and equally exposed if someone relaxes it. Equally
+  -- inert today, and added for the same reason — a backstop belongs where the guard is
+  -- enforced, not where it currently happens to be derived.
+  AND status <> 'awaiting_input';
 
 -- name: RejectRunServerSide :execrows
 -- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
@@ -893,7 +1177,7 @@ UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pendin
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count >= @max_requeues
 RETURNING id;
 
@@ -906,7 +1190,7 @@ UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
-  AND status IN ('claimed', 'running', 'awaiting_approval')
+  AND status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input')
   AND requeue_count < @max_requeues;
 
 -- Messages -----------------------------------------------------------------
@@ -1398,3 +1682,28 @@ WHERE id = @id AND status = @status;
 -- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
 -- for a queued run already past its threshold, so it is off the hot path.
 SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';
+
+-- name: SetRunWaitOnLimit :execrows
+-- Flip ONE run's usage-limit opt-in after the fact (PRD #35 Decision 7, the per-run
+-- surface the user ruled for on 2026-07-27 in place of a start-run modal).
+--
+-- Owner-scoped: a run is toggled by the person whose credentials it spends, and the
+-- predicate is the write's own authorization rather than a fact maintained
+-- elsewhere. A foreign run returns 0 rows, which the handler maps to 404 — never
+-- 403, which would confirm the run exists.
+--
+-- The status guard is CancelRunServerSide's, deliberately reused verbatim: negative,
+-- so it covers limit_wait for free and needs no edit for any future non-terminal
+-- status. A terminal run is a no-op rather than an error — the toggle changes FUTURE
+-- limit behaviour, and a finished run has none.
+--
+-- 🔴 IT DOES NOT TOUCH status, AND MUST NOT. Flipping the flag OFF on a parked run
+-- does not un-park it: Decision 11's cancel is that control, and silently failing a
+-- user's run because they changed a preference would destroy work they never asked
+-- to lose. Flipping it ON while parked is likewise inert — the run is already
+-- parked. The flag is read at the NEXT limit event and at the next claim (the worker
+-- re-reads it from the row every time), which is what makes a mid-flight change take
+-- effect without this statement needing to reach into the state machine.
+UPDATE runs SET wait_on_limit = @wait_on_limit, updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');

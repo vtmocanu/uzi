@@ -35,6 +35,14 @@ type NotifierStore interface {
 	// the monotonic plan generation the notifier uses to tell a new plan version from a
 	// redundant awaiting_approval re-broadcast (PRD #41 Decision 10a/e).
 	CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (int64, error)
+	// GetLatestRunQuestion returns the newest kind='question' run_message payload —
+	// the clarification question a parked run is waiting on (PRD #88 M3). No row = the
+	// question is not flushed yet; the notifier waits rather than posting a park it
+	// cannot explain.
+	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
+	// SetSlackRunQuestion records which question the run's thread already carries, so a
+	// re-park on the SAME question after a worker death does not post it twice.
+	SetSlackRunQuestion(ctx context.Context, arg store.SetSlackRunQuestionParams) (store.SlackRunMessage, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and
@@ -337,6 +345,64 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	}
 
 	n.handleGate(ctx, rc, anchor, base)
+	n.handleQuestion(ctx, rc, anchor, base)
+}
+
+// handleQuestion posts a clarification question into the run's DM thread when the run
+// parks at awaiting_input (PRD #88 M3). It is the question's counterpart to
+// handleGate, and deliberately much smaller: there is no button, no anchor state
+// machine and no compare-and-swap, because the distinct awaiting_input status is
+// itself the routing signal the replier reads (D5) — the plan gate needed gate_state
+// only because a revision keeps the run at awaiting_approval.
+//
+// Dedupe is by question IDENTITY, not by a count and not by "is the run parked":
+// awaiting_input is re-broadcast for the SAME question after a worker death (the run
+// re-queues, the resumed worker re-parks re-using the question id), so a count-based
+// key would post the card a second time while an identity comparison is a no-op across
+// the requeue by construction. A genuinely new question carries a new id and posts.
+//
+// All best-effort: a failure is logged (redacted) and never affects the run.
+func (n *Notifier) handleQuestion(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, base string) {
+	if rc.Status != "awaiting_input" {
+		return
+	}
+	raw, err := n.store.GetLatestRunQuestion(ctx, rc.ID)
+	if err != nil {
+		// No row: the state report reached us before the question message was durable.
+		// Waiting is correct — a later event re-drives this with the question present, and
+		// posting "the run needs your answer" with no question would be worse than late.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("load question", err)
+		}
+		return
+	}
+	q, ok := parseQuestionPayload(raw)
+	if !ok {
+		n.logf("parse question payload", fmt.Errorf("run %s: unusable question payload", rc.ID))
+		return
+	}
+	if anchor.QuestionID.Valid && anchor.QuestionID.String == q.QuestionID {
+		return // already on screen in this thread — a re-park, not a new question
+	}
+	ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs,
+		"The run needs your answer", questionThreadBlocks(rc.ID, q, base))
+	if err != nil {
+		n.logf("post question in thread", err)
+		return // do not record it as posted; a later event retries
+	}
+	// The ts is recorded with the id because the replier orders inbound replies against
+	// it — a reply before this card answers a superseded question. A post whose ts came
+	// back empty is therefore worse than not recording at all: it would satisfy the
+	// notifier's dedupe (never re-posting) while leaving every reply unbindable.
+	if ts == "" {
+		n.logf("record question", fmt.Errorf("run %s: question posted with no ts", rc.ID))
+		return
+	}
+	if _, err := n.store.SetSlackRunQuestion(ctx, store.SetSlackRunQuestionParams{
+		RunID: rc.ID, QuestionID: pgText(q.QuestionID), QuestionTs: pgText(ts),
+	}); err != nil {
+		n.logf("record question", err)
+	}
 }
 
 // handleGate manages the approval-gate message's lifecycle on the notifier's
@@ -542,10 +608,33 @@ func renderRoot(rc store.GetSlackRunContextRow, base string) string {
 	return head
 }
 
-// renderThread returns the threaded outcome event for a terminal transition, or
-// "" for a non-terminal one. Completed carries the MR link; failed the reason. The
-// worker-originated failure reason is length-bounded and mrkdwn-escaped before it
-// goes out (it is untrusted free text with no source-side length bound).
+// renderThread returns the threaded event for a transition, or "" when the
+// transition is not worth interrupting the owner for. Completed carries the MR link;
+// failed the reason. The worker-originated failure reason is length-bounded and
+// mrkdwn-escaped before it goes out (it is untrusted free text with no source-side
+// length bound).
+//
+// 🔴 THIS USED TO READ "for a terminal transition, or "" for a NON-TERMINAL one",
+// and PRD #35 made that false: `limit_wait` is non-terminal and posts. Stated as a
+// RULING rather than left to be rediscovered, because the old sentence is exactly
+// what would make the next reader file the park case as a violation and delete it.
+//
+// The rule is "worth interrupting for", and terminality was only ever a proxy for
+// it. What broke the proxy is a status that lasts HOURS BY DESIGN — the contract was
+// written before one existed. The mechanism that forces the widening: the root line
+// is EDITED, and a Slack edit raises no notification, so a park with no threaded post
+// is never communicated at all. The user learns their run is idle by happening to
+// look, having lost the window in which they might have cancelled it.
+//
+// TWO PROPERTIES BOUND THE WIDENING, and they are what make it safe rather than
+// merely better — check any future non-terminal case against both:
+//
+//  1. It is bounded by construction. RUN_LIMIT_MAX_WAITS caps parks per run
+//     (default 5), so a run can post this at most that many times over its life.
+//  2. The RESUME posts nothing. `queued` falls to the default arm, which is right —
+//     resuming is a return to normal and the edited root already shows it. Without
+//     this half, a run that parks five times would produce ten posts and the feature
+//     would read as a notification stream.
 func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	switch rc.Status {
 	case "completed":
@@ -564,9 +653,51 @@ func renderThread(rc store.GetSlackRunContextRow, base string) string {
 		return "❌ failed"
 	case "cancelled":
 		return "🚫 cancelled"
+	case "limit_wait":
+		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
+		// two properties that bound it live on this function's doc comment above, in one
+		// place, so they cannot drift from the contract they amend.
+		return limitWaitLabel(rc)
 	default:
 		return ""
 	}
+}
+
+// limitWaitLabel renders a park for both the root line and the threaded event.
+//
+// ONE function for both on purpose: the two would otherwise drift into describing
+// the same state differently in the same DM, which is the failure the reader
+// notices and cannot explain.
+//
+// Every part is omitted when unknown rather than defaulted, exactly as the server's
+// own failure-reason composition does — the line never claims a fact uzi does not
+// have. A park with neither a window nor a stamp still renders honestly as
+// "⏸ paused: usage limit".
+func limitWaitLabel(rc store.GetSlackRunContextRow) string {
+	s := "⏸ paused: usage limit"
+	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
+		// EscapeMrkdwn even though workersvc has already allowlisted this to a
+		// seven-member enum and 00091's CHECK backstops it. The escape costs nothing and
+		// covers the exact population the CHECK exists for: a backfill, an admin tool, or
+		// a later writer that bypassed the coercion. Per-field, never on the assembled
+		// line, so the emoji and separators this function owns are not escaped.
+		s += " (" + EscapeMrkdwn(rc.RateLimitType.String) + ")"
+	}
+	if rc.RetryNotBefore.Valid {
+		// Slack's own date markup, so the timestamp renders in the READER's timezone
+		// rather than the server's. The fallback after `|` is what Slack shows when it
+		// cannot render the token, and it is UTC-explicit so a fallback is never
+		// ambiguous about which zone it means.
+		s += fmt.Sprintf("; resumes <!date^%d^{time}|%s>",
+			rc.RetryNotBefore.Time.Unix(), rc.RetryNotBefore.Time.UTC().Format("15:04 MST"))
+	}
+	if rc.LimitWaitCount > 1 {
+		// Only from the SECOND park. "attempt 1" on a first park is noise; a rising
+		// count is the signal that this run is burning its retry budget and may be about
+		// to fail for good.
+		s += fmt.Sprintf(" (pause %d)", rc.LimitWaitCount)
+	}
+	return s
 }
 
 // maxFailureReason bounds the worker-originated failure reason before it reaches
@@ -593,6 +724,13 @@ func statusLabel(rc store.GetSlackRunContextRow) string {
 		return "▶ running"
 	case "awaiting_approval":
 		return "⏸ needs your approval"
+	case "awaiting_input":
+		// Without this case the default arm below renders the raw enum `awaiting_input`
+		// on the root line of a user-facing DM — the web has a replace(/_/g," ") fallback,
+		// Slack has none (PRD #88 M3).
+		return "⏸ needs your answer"
+	case "limit_wait":
+		return limitWaitLabel(rc)
 	case "completed":
 		if rc.MrIid.Valid {
 			return fmt.Sprintf("✅ completed (%s %s%d)", forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)

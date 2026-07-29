@@ -13465,6 +13465,667 @@ have ONE answer per language, and a second helper is justified only by a predica
 deliberately mirroring** — otherwise the site that picked the narrower one is a hole nobody sees,
 because both spellings look sanitized.
 
+## 432. PRD #35 — the park is a STATUS the server times and clamps; the worker asks, it never decides
+
+Serves human: "when a run hits the Anthropic usage limit, retry after a delay — back off until the
+limit resets" (Feature #35).
+
+**`limit_wait` is a new NON-TERMINAL run status, not a reuse of `queued` and not a worker-held
+pause.** Reusing `queued` gives no not-before gate and hides the state from the user; holding the
+worker slot the way `awaiting_approval` does would pin a slot for up to days *and* still get reaped,
+because the server fails `running` runs past `RUN_TIMEOUT` (2h) and a five-hour or seven-day window
+outlasts that. So the park **ends the execution and frees the slot**, and the run is brought back by
+a sweeper pass — `limit_wait → queued` once `retry_not_before` has elapsed, `started_at = NULL` so
+the resumed run gets a fresh `RUN_TIMEOUT` wall, `session_id` / `last_seq` / `worker_id` untouched
+so the resume is a resume and affinity still points at the disk holding the transcript.
+
+**The division of labour is the point, and it is a security property rather than a layering
+preference.** The worker reports *what it saw* (`limit_resets_at`, `rate_limit_type`); the server
+decides *what happens*: whether to park at all, until when, and how many times. `limit_resets_at` is
+stored as reported data for display and is deliberately **not** the gate. `retry_not_before` is
+computed server-side, jittered, cross-checked and clamped. A compromised worker therefore cannot
+park a run for years, and cannot spend more than its own owner's retry budget.
+
+- `RUN_LIMIT_MAX_WAITS` (default **5**) caps parks per run via `runs.limit_wait_count`; the next
+  limit past it fails the run with "usage-limit retry budget exhausted". Read with a non-negative
+  int parser so **`0` is legal and means "never park"** — the operator's off switch back to today's
+  behaviour, mirroring how `RUN_MAX_REQUEUES=0` reads.
+- `RUN_LIMIT_MAX_PARK` (default **8d**, not 7d: the longest SDK window is seven days and a reset
+  stamped at its far edge needs room for jitter and clock skew) caps how far one park may reach; a
+  computed stamp beyond it **fails the run instead of parking**.
+- **🔴 THE TWO CAPS ARE NOT SYMMETRIC IN HOW THEY READ THEIR ENV, AND THE ASYMMETRY IS DELIBERATE.**
+  The budget uses a non-negative int parser, so `0` is accepted and honoured. The ceiling uses the
+  duration parser, which accepts only a **strictly positive** value and silently falls back to the
+  default otherwise — so `RUN_LIMIT_MAX_PARK=0` does **not** remove the clamp, and there is no env
+  spelling that does. That is correct and must not be "fixed" into symmetry: the budget is a policy
+  knob an operator may legitimately zero to get today's behaviour back, while the ceiling is the
+  security bound that stops a compromised worker parking a run for years, and a bound with an off
+  switch is not a bound. (The in-process zero value *does* fail every park — a params struct that
+  omits the ceiling makes every computed stamp exceed it — but that is a construction error, not a
+  reachable configuration.)
+- The two **compose**: a run can hold the one-active-per-issue lock for at most
+  `MAX_WAITS × MAX_PARK` ≈ **40 days** at the defaults. That figure must be recomputed if either
+  default moves; cancel-while-parked is the escape hatch.
+- `limit_wait_count` is deliberately **not** `requeue_count` (mirroring §139's vault lock-race
+  precedent). They count different failures — worker deaths versus limit parks — and a shared
+  counter lets one exhaust the other's budget.
+
+**When nothing says when the window reopens, the wait is an EXPONENTIAL schedule doubling from a
+15-minute base and capped at 4h** — the worker reported no usable reset, the gauge has none, and no
+pooled alternative contributes. Base and cap are **constants, not env knobs**: this is the answer to
+"we know nothing", and an operator with something to say about their limits has the two caps above
+to say it with.
+
+```
+priorParks:  0     1     2    3    4    5+
+wait:       15m   30m   1h   2h   4h   4h (capped)
+```
+
+Across the default 5-park budget that is **~7h45m** of parking before the run fails honestly. **The
+4h cap does not bind at the default budget** — the fifth park is exactly 4h — so it constrains
+nothing today and exists for an operator who *raises* the budget.
+
+**🔴 THE PRD's LITERAL FORMULA SHIPS A BUG, AND A SPEC RECORDING ONLY THE FORMULA WOULD REPRODUCE
+IT.** Decision 4 writes `15m × 2^(limit_wait_count−1)`, which assumes a **1-based attempt number**.
+But the count is incremented **in the same statement as the transition**, so the computation reads
+the value *before* the park — **0 on the first one** (the budget guard reads `>= MaxWaits` for the
+same reason). Applied literally to that 0-based field the formula yields `2^(−1)`, i.e. a
+**7.5-minute first park**. The implementation is therefore a **shift by the prior count**, and the
+invariant to check any future change against is the one both readings agree on: **the first park
+waits 15 minutes.**
+
+**🔴 THE SHIFT IS BOUNDED, AND THE GUARD IS NOT DECORATION.** A duration here is an int64 of
+**nanoseconds**, so an unguarded `15m << 64` is **negative** — a `retry_not_before` in the past,
+which is exactly the immediate-repromotion loop this whole computation exists to prevent. The bound
+is operator-reachable through the retry budget, i.e. by the same operator the 4h cap exists for, so
+it is a real path and not a theoretical one. A test asserts the result stays positive at an absurd
+prior count.
+
+**This branch is not a corner case, and that is the strongest argument for getting it right.** Two
+independent reasons it is ordinary: the classifier's **primary** signal names the cause outright and
+carries **no timestamp of its own**, so a limit death with no reset is a normal outcome rather than
+a malformed report; and on any deployment with the usage poller disabled nothing refreshes the
+gauge's sync timestamp, so every candidate classifies stale, `Measured` is false, and **the worker
+report, the gauge cross-check and the pool leg all go silent together** — the fallback becomes that
+deployment's *usual* path rather than its exception. uzi's own e2e overlay sets exactly that, so the
+end-to-end suite exercises this branch **by construction**.
+
+*(Recorded history, because this was got wrong once and the wrong version was endorsed before anyone
+checked it against the PRD: a flat 15m constant shipped first and was ruled a regression, not an
+alternative. The paragraph below is why.)*
+
+**The reasoning generalises past this knob and is the reason to prefer a schedule over a constant
+anywhere a retry clock is guessed: an exponential schedule's error is recoverable in one direction
+and fatal in the other, and it errs on the recoverable side.** If the window had actually reopened
+early, the first resume succeeds and the schedule never advances — so the pessimism costs nothing.
+If the window is genuinely long, the schedule buys the hours. A flat constant inverts that: it
+cannot buy the hours, so it burns the whole retry budget in ~75 minutes and fails a run that would
+have succeeded later — putting the **unrecoverable** failure on the **likely** side for precisely
+the case this feature is named after. The flat constant's defence (a bounded ~75-minute ceiling for
+a no-information case, with two env knobs for an operator who knows better) answers the wrong
+question: the ceiling only binds when the guess is *too pessimistic*, which is the direction that
+was already safe.
+
+**Almost every guard the new status needed already existed, and the two that did not are the ones a
+rebuild will miss.** The asymmetry is worth stating as a rule because it decides the work:
+
+- **Negative guards (`status NOT IN (terminal)`) cover a new non-terminal status FOR FREE** — the
+  one-active-per-issue index counts a parked run as active (intended: no second run on the issue
+  while one is parked), and server-side cancel keeps working with no edit.
+- **Positive allowlists EXCLUDE it for free**, which is usually the win: the PRD #47 health detector
+  never sees a parked run, so a park can never read "stalled". Three hand-written mirrors of that
+  set (the SQL, the web badge gate, the Slack root's variant) are all positive, all already correct,
+  and **none may gain `limit_wait`** — the detector's signals all describe a *running* agent.
+- **🔴 THE INVERSION IS WHERE THE BUGS ARE.** The same negative shape that makes cancel free makes
+  three worker-report statements *dangerous*, because `NOT IN (terminal)` **admits** a parked run.
+  `SetRunRunning` needed an explicit `AND status <> 'limit_wait'` or a late `running` heartbeat —
+  the batcher retries, and pre-gate fire-and-forget reports already exist — would silently un-park
+  the run under a worker whose execution had ended, leaving it to rot until `RUN_TIMEOUT` with the
+  park lost and no signal anywhere. `SetRunAwaitingApproval` took the same clause for symmetry.
+  PRD #108's auto-stop took it as a **backstop written where the guard is enforced rather than where
+  it is currently derived**: the only thing excluding a park today is a Go line in another package
+  whose own comment never mentions parking. Terminal setters stay unguarded — "terminal always
+  wins" is the existing invariant and cancel depends on it.
+- Two sites genuinely needed *positive* wiring: the board reconciler maps `limit_wait → In Progress`
+  with `act:true` (the default arm leaves a pending move marker unhealed and trips a 30m give-up
+  warn, and a park routinely outlasts 30 minutes **by design**), and `hasLivePoller` treats a parked
+  run as pollerless so a cancel takes effect server-side instead of queueing for a poller that will
+  never read it again.
+
+**The park transition's source guard is POSITIVE (`status = 'running'`), the first positive source
+guard in its family, and normalizing it to match its negative siblings would admit three
+transitions that must never happen**: parking an affinity-`queued` run (the promotion pass would own
+a run no worker holds), parking a run at the plan gate (it is not spending tokens, so it cannot have
+hit a limit, and the park would swallow a pending human approval), and `limit_wait → limit_wait` (a
+re-delivered report would double-bump the counter and burn the budget on one event). With the
+positive guard each is a 0-row no-op, which makes re-delivery idempotent for free.
+
+## 433. PRD #35 — detection pins to STRUCTURED SDK signals, never text; one pure classifier, three executors, and two kinds that deliberately do not park
+
+**The `"Claude AI usage limit reached|<epoch>"` string is a Claude Code PRODUCT string and does not
+exist in the agent SDK.** multica classifies provider limits by matching error text; uzi
+deliberately diverges and reads declared fields only, so a provider rewording a message cannot
+silently disable the feature. Precedence on a **terminated** turn's result frame:
+
+1. `terminal_reason ∈ {blocking_limit, rapid_refill_breaker}` — PRIMARY. The SDK is naming the
+   cause outright, so no corroboration is required and a missing reset costs only a fallback
+   schedule.
+2. otherwise, the latest `rate_limit_event` with `status: 'rejected'`, **and only when corroborated
+   by a reset still in the future**.
+
+**The transient/sustained boundary is the SDK's own retry budget, and uzi adds no retry loop inside
+a turn.** The SDK absorbs transient 429s with bounded internal retries honouring `retry-after`;
+those never reach us as a death and must never classify. The classifier looks only at frames from a
+turn that terminated.
+
+**🔴 A SUCCESS RESULT NEVER PARKS, even carrying `blocking_limit`.** `terminal_reason` is declared
+on the success variant too, so the combination is representable. The reading taken is that a turn
+which produced a result is not a failure whatever it says, and parking one would discard completed
+work to wait out a window. It is **asserted by a test** rather than left implicit, so changing the
+reading is a failing test and not a silent behaviour change — which is the design principle of the
+whole module.
+
+**⚠ ONE SPECIFIED RESIDUAL, recorded so it is not "fixed" into a different feature.** The
+corroboration is a future reset **and nothing else**; the death's subtype is not consulted. So
+`rejected + past reset + error_max_turns` does not park while `rejected + future reset +
+error_max_turns` **does**. What prevents the first is the *elapsed reset*, not the unrelatedness of
+the death — and because a five-hour window's reset is in the future for most of five hours, any
+unrelated death observed after a `rejected` inside that window parks the run. The PRD's "an
+unrelated death must not park" phrasing is true only of the elapsed-reset subset. Narrowing it with
+a subtype allowlist is policy the spec does not state; it was raised and the ruling was to keep the
+implemented reading.
+
+**The classifier is a PURE module with no I/O, no clock of its own and no SDK import**, taking
+frames and `now` as arguments. That is what lets three executors share it and none own it: the run
+executor (throws a typed `LimitReachedError` so the runner branches on a **type**, never on message
+text), the chat executor, and the judge runner. It also means the whole thing is testable against
+hand-written frames, which matters because these shapes come from the typings rather than from a
+frame anyone has observed in production.
+
+**Two `resetsAt` normalisations, decided once each and never re-derived downstream.** The SDK
+declares a bare unit-less `number`; the worker guesses seconds-versus-milliseconds **once**
+(threshold 10^12, three orders of magnitude from either live value) and everything downstream
+consumes the normalised form. The wire then carries **epoch milliseconds** to the server and an
+**ISO string** into the feed payload. The server re-validates rather than trusting the worker: a
+report outside 2001-09-09 … 2100 is discarded. That range check is not hygiene — it is what stops
+the park loop, because a 1970 instant yields a `retry_not_before` already in the past, the next
+promotion pass requeues the run straight into the exhausted window, and the cycle burns the whole
+budget in seconds. It is a plausibility filter on the **unit and encoding**; how far out a reset may
+legitimately be is `RUN_LIMIT_MAX_PARK`'s policy, and keeping the two separate is what lets one be
+an operator knob while the other stays a constant.
+
+**Which run kinds park is exhaustive over all five, because leaving one implicit is how a guard gets
+written by accident:** `issue`, `ci_fix` and `self_improve` park; `judge` and `chat` do not.
+
+- `ci_fix` and `self_improve` park because they ride the ordinary runner, the ordinary claim lane
+  and the ordinary gate — **excluding them would mean paying work to not have the feature**. Both
+  are created without a human in the loop and take the owner's default. `self_improve` is the kind
+  whose loss hurts most (long, repo-ful, auto-approved, expensive); it holds its one-active index
+  for the park window, which matches the engine's documented "a cycle is still in flight, skip the
+  tick", and a *failed* self-improve unblocks that index only by throwing the whole run away.
+- **`judge` is refused on a STRUCTURAL ground, not a policy one**: it runs in a different executor
+  with its own error path and its own cleanup, so parking it would duplicate detection, the park
+  report and a second on-disk carve-out into a second file for the cheapest run kind in the
+  product. Its value also decays (a judge parked for seven days reviews a run nobody remembers) and
+  losing it loses no user work. **The refusal is enforced server-side (`AND kind <> 'judge'` on the
+  park transition), not by worker discipline.** What judge gets instead is the better death.
+- **`chat` never parks and deliberately does NOT adopt the structured feed kinds.** A chat turn has
+  no countdown to carry, so the payload would reduce to a window name; adopting them would widen the
+  web lane into the chat render surface for no visible gain; and the path already renders
+  worker-authored text through its existing error kind, so there is **no new trust exposure** —
+  the one leg actually checked before ruling rather than reasoned about. Chat gets the sentence
+  upgraded from a bare subtype to "Anthropic usage limit reached (…) — ask again once it resets".
+
+## 434. PRD #35 — `retry_not_before` means "the earliest this user could spend ANYTHING", and it is computed at PARK time because nowhere else has the information
+
+Full argument in [`adr/0035-run-limit-retry.md`](../adr/0035-run-limit-retry.md); this is the
+contract a rebuild must satisfy.
+
+**The PRD's own recommendation — re-select the credential at claim, then recompute the gate from the
+newly chosen one — is NOT BUILDABLE AS WRITTEN, and that is the part not recoverable from the
+outcome.** `retry_not_before` gates **promotion**; PRD #111's auto-select runs at **claim**, which
+is strictly downstream. There is no instant at which the newly chosen credential is known and the
+gate has not already fired. A coherent goal expressed as an uncomputable mechanism.
+
+So the computation moves to where the information exists. **A promoted run pins nothing and
+re-enters the ordinary claim path; PRD #111's resolution path is untouched and gains no fourth
+mode.** What changes is the *meaning* of the stamp: at park time the server has the run, the user
+and — via the query auto-select already uses — every candidate's gauge row, so it computes *"the
+earliest moment this user could plausibly spend anything"*:
+
+```
+base := crossCheckedReset(worker-reported reset, gauge row for the DEAD credential)
+if alt, ok := NextAvailable(candidates, deadSecretID, policy, now); ok && alt < base { base = alt }
+retry_not_before = clamp(base + jitter(60..180s))
+```
+
+**`NextAvailable` is a pure function living in the auto-select package** — the one that already owns
+credential classification — because a second copy of the binding-window rule is exactly the drift
+that ownership exists to prevent. Excluding the dead credential, each candidate contributes:
+`eligible` ⇒ **`now`** (spendable immediately); measured-but-below-threshold ⇒ its **binding-window**
+reset (never `min(five, seven)`: only the binding window's replenishment raises headroom);
+not pooled / no reading / unmeasured / stale ⇒ **nothing**.
+
+**🔴 THE LOAD-BEARING ASYMMETRY IS THAT AN UNKNOWN CONTRIBUTES NOTHING IN EITHER DIRECTION, and both
+alternatives are actively wrong.** Pulling the floor to `now` breaks a poller-disabled deployment
+outright (every candidate classifies stale — which is what `UZI_USAGE_POLL_INTERVAL=0` produces, and
+what uzi's own e2e overlay sets): every parked run would promote instantly and thrash back into the
+same exhausted window. Pushing the floor out lets one never-polled token delay every park for a user
+with a perfectly good second credential. Contributing nothing is the only reading under which a
+gauge-less deployment behaves exactly as it does today.
+
+**Two no-regression properties are STRUCTURAL rather than tested-in, and they are the first thing to
+check if someone "simplifies" this.** A single-token user has one candidate, it is the dead one, it
+is excluded, nothing contributes, and the stamp is that credential's cross-checked reset — today's
+behaviour exactly. A poller-disabled deployment classifies everything stale, nothing contributes,
+and the stamp is the worker's reported reset — today's behaviour exactly. A run with **no recorded
+credential** skips both legs: the exclusion id is a **precondition closed inside the pure function**
+(`uuid.Nil` ⇒ no answer) rather than a caller's `if`, because without it the dead credential's own
+stale-but-eligible reading would vote for its own replacement and promote the run instantly.
+
+**The server's own clock beats the worker's, per window.** The dead credential's gauge row is in the
+same fetch, so the cross-check is free. `rate_limit_type` selects the column (`five_hour` ⇒ the
+five-hour reset; all four `seven_day*` members ⇒ the seven-day reset; `overage`/`unknown` ⇒ **no
+cross-check at all**, because a confidently wrong answer is worse than none), and the answer is
+`max(worker, gauge)` when the reading is fresh: both then describe the *same* window, and promoting
+before the later of them guarantees a re-park. **The per-window mapping is what stops `max` from
+over-delaying a five-hour block by a seven-day rollover.** This is accuracy, not security — the
+security properties come from the clamp and the retry budget and are unchanged.
+
+**🔴 THE 60-180s JITTER IS THE MECHANISM, NOT A GARNISH, and "the sweeper tick already spreads runs
+out" is exactly backwards.** Pool-awareness manufactures something that did not exist before it: a
+**correlated wave**. N runs parked against one exhausted credential all become promotable at roughly
+the same reset, and the promotion pass is a **single UPDATE releasing every eligible row in one
+tick** — the tick is what makes the staggering necessary, not what provides it. Without D2 those
+runs would simply have failed, N times, independently.
+
+**The jitter and PRD #111's in-flight counter are ONE mechanism, not two.** Claim ordering records
+each pick before the next run ranks, so jitter separates the promotions, claims serialize, and the
+existing counter sees each pick. **Widening that counter to include parked runs CANNOT work, and the
+refutation is recorded because it is the obvious fix and will be proposed again**: a parked run's
+recorded credential names the one it **spent**, not the one it is about to spend (nothing clears it
+until the next claim overwrites it), so counting parked runs piles phantom load onto the token that
+is already excluded for being empty and adds **exactly zero** asymmetry between the candidates the
+wave will converge on. The general form is the durable part: **the in-flight bias works because it
+is per-token asymmetric; a run that has not yet chosen contributes no asymmetry, and a load term
+applied equally to every candidate cannot change a ranking. Parked load is structurally
+unrankable.** The counter's exclusion of parked runs is therefore not a gap this design opened — it
+is correct, for this design's own reason: a counted run is one that has chosen.
+
+Also rejected: **staggering the claim** (duplicates the jitter one layer down — a claim follows its
+promotion within one poll interval, so jittered promotion already *is* a staggered claim); and
+**`LIMIT`ing the promotion batch** (converts a rare ranking collision into a **guaranteed** delay for
+the tail of every wave, since the tick can be minutes). **Accepted residual**: two promotions closer
+together than one claim round-trip can still converge. That race **predates this PRD** and PRD #111
+accepted it explicitly; this design makes it likelier by correlating promotions, and the jitter
+bounds it. If it converges on a token with real headroom, both runs simply run; only a near-empty
+token costs one re-park. **If it ever bites, the knob is the jitter RANGE, not the counter**, and
+the signal is more than one promotion on a single tick — already reported, so no new
+instrumentation.
+
+**Also rejected: dropping the stamped clock and asking "does this user have any credential with
+headroom?" in the promotion pass.** Three costs, the third decisive: it turns the only
+single-statement pass in the sweep into a per-user Go loop on a ticker; it is **broken outright with
+the poller disabled** (nothing ever has headroom, so no parked run ever promotes — and inverting it
+to fail-open promotes everything instantly instead); and the gauge lags the poll interval, so a run
+that just died on a limit can still read as having headroom, promote, re-park, and burn its budget
+to the cap in minutes.
+
+**The stamp is a FLOOR and floors can be wrong.** Another run may consume the alternative between
+park and promotion; the cost is one re-park. Stated residual, accepted: a user with more pooled
+credentials than the retry budget can burn it cycling through them, after which the run fails with
+"usage-limit retry budget exhausted" — which is honest. The owner ruled the budget default stays 5
+because it is a **retry** budget, not a credential-count budget.
+
+## 435. PRD #35 — the park acknowledgement contract: cleanup is skipped IFF the echoed status is `limit_wait`, never IFF `applied`
+
+**A park is the first NON-TERMINAL state report whose consequence is that the worker skips
+filesystem removals, and that is what broke the old contract.** The state-report call previously
+returned nothing and treated **any** 409 as an idempotent success — correct while every status was
+terminal, where "the server already moved on" genuinely is success. It now returns
+`{applied, status}`, read out of the response body that both the 200 and the 409 path **already**
+carried; no new endpoint and no new field were needed, the information was on the wire and being
+discarded.
+
+**🔴 THE DISCRIMINATOR IS `status === "limit_wait"`. AN `applied`-KEYED BRANCH LEAKS ON THE MOST
+COMMON CAUSE OF ALL.** "Not parked" has five causes and **three of them are DESIGNED outcomes**: the
+retry budget is exhausted, the computed stamp exceeded the park ceiling, or the run opted out and
+the server coerced the report. On all three the server **fails the run and answers 200** — a
+transition *was* applied, just not the requested one — so `applied` is **true** while the run is
+emphatically not parked. Since budget exhaustion is the ordinary end of a run that keeps hitting
+limits, i.e. exactly the population this feature serves, an `applied` branch would leak the clone,
+the plugin dir and up to ~170 MB of HOME on the normal path.
+
+Testing **one literal, positively**, also makes the default arm "clean up", so an unforeseen cause,
+a future status, an older server that echoes nothing, and a parse failure all land on the safe side
+**by construction**. An enumeration of the five causes goes stale; this cannot. The status reader is
+correspondingly **total**: every failure yields `undefined`, which reads as "not parked". A throw
+there would surface as a report that appears to have failed and would be retried against a server
+that already applied it.
+
+**On not-parked the worker sends NO further state report.** The server has already decided and
+recorded the outcome; a `failed` report on top of it would clobber a `cancelled` and would overwrite
+the server-composed limit sentence with a worker-composed one.
+
+**Refusals are reserved for causes where a 409 is TRUE.** The opt-out case is deliberately **coerced
+to a server-composed failure rather than refused**, because pushing the opt-in flag into the SQL
+predicate looks safer and is not: 0 rows ⇒ 409 ⇒ the worker treats it as "the server moved on" and
+exits, the report **vanishes**, and the run rots at `running` until `RUN_TIMEOUT` fails it with
+something misleading. Same branch point as the budget cap.
+
+**The on-disk carve-out is THREE removals, not two**, and preserving only some of them resumes into
+a session missing its worktree or its plugins: the runner clone, the **sibling** skills plugin dir
+(outside the clone, so removing the clone does not reach it), and the per-run HOME holding the
+resumable transcript. Exactly those three are skipped for a parked run and **nothing else in the
+teardown is**.
+
+**🔴 THE OTHER TEARDOWN STEPS MUST STILL RUN ON A PARK, AND THEY DO NOT FAIL ALIKE.** Guarding the
+whole block, or returning early, leaves a steering poller running and a gate deadline registered for
+what may be days. Two failure shapes, only one legible:
+
+- **Evicting the run's secrets from the logger fails SILENTLY.** Guarding it passes typecheck and
+  every runner test with exit 0, leaving a parked run's decrypted PAT and Anthropic token registered
+  for the length of the window while the worker goes on to serve other runs. The secrets are
+  re-delivered on the next claim, so this is not a cleanup nicety — it is the security half of the
+  same decision, and a test asserting it is the only thing between that mistake and a green build.
+- **Stopping the steering poller fails as a PROCESS HANG, not a red assertion** — the poller keeps
+  the event loop alive and the test file never exits. Under `node --test` a timeout prints `fail 0`,
+  so the tally says everything passed while the exit code says otherwise. A hang there is this bug
+  until proven otherwise.
+
+**A parked HOME has a SECOND independent protection, and losing either loses the transcript.** The
+first is the teardown carve-out above; the second is the HOME-reclaim sweep's terminal-status set,
+which must **never** gain `limit_wait`. A parked HOME is past the sweep's age filter (3h) for
+essentially its whole park (up to the 8d ceiling), so it becomes a candidate on **every** sweep and
+survives only because the API answers `limit_wait` and that value is absent from the set. The
+failure presents as "the resume started a fresh session" hours later with nothing pointing back at
+the sweep, which is why it is asserted by a test rather than left to a comment.
+
+**Two comments were made false by this change and were corrected in the commits that broke them**
+(the client's "an idempotent success for any state report", and the handler's "the run was already
+terminal"), and the 400 text enumerating valid states gained the new member. A 409 now means only
+*this report changed nothing*.
+
+**The parked disk cost is a real number to publish, not a rounding error**: ~167 MB of Go module
+cache measured under a single run HOME, so the worst case is roughly
+`RUN_LIMIT_MAX_WAITS`-concurrent-parked-runs × (clone + plugin dir + up to ~170 MB of HOME). The
+worker logs the preservation explicitly, because an operator reading disk pressure needs to connect
+it to a parked run rather than to a leak.
+
+## 436. PRD #35 — resume skips the gate it already passed: `plan_approved` is a GATE-BYPASS PRIMITIVE and its invariant lives in the query
+
+**The executor plans and gates unconditionally, regardless of whether it is resuming**, so a naive
+resume would re-generate a plan, re-park the run at `awaiting_approval` in front of a human who
+already approved it, and could fail outright when the resumed session declines to re-emit its plan
+signal. The run's own approval would have turned into a dead end.
+
+**The claim payload therefore gains `plan_approved`, derived SERVER-SIDE from two halves**: the
+human one (a consumed plan-approval input, projected in SQL as a cast boolean — sqlc's inference is
+weaker on expressions than on columns, and an uncast `EXISTS` types as `interface{}`), OR-ed in Go
+with the run's auto-approve flag. The plan text itself was **already** on the claim payload, so this
+is one new field, not two.
+
+**🔴 THE SKIP ALSO REQUIRES A NON-EMPTY PLAN.** An autopilot run never reports `awaiting_approval`,
+so its stored plan is NULL while `plan_approved` is true by virtue of auto-approve; skipping on that
+combination enters the implement loop **with no plan at all**. The contract is: **the server states
+the fact, the worker decides what it can do with it** — the worker skips only when `plan_approved`
+**and** the plan text is non-empty **and** the session is resumable. Accepted residual: an autopilot
+run re-plans on resume, costing one turn, because its resumed session still holds the plan in the
+transcript and it cannot gate anyway. Persisting the plan for autopilot runs would remove even that
+and is a different PRD's scope.
+
+*(Provenance, corrected: this is a DOCUMENTED DESIGN RULING, not something the implementation added
+on its own authority. Decision 6b's **original** rule lacked it; the **M0 design gate** added it
+deliberately, for exactly the autopilot reason above, and the code implements that ruling verbatim.
+An earlier version of this paragraph was headed "…AND THE PRD's RULE DID NOT", echoing the PRD
+addendum's own phrasing about its own superseded text — which reads, out of that context, as though
+the current PRD were incomplete and would send the next reader off to "fix" a decision that is
+already recorded there.)*
+
+**The runner is the only layer that knows all three facts** — the server said approved, a session id
+arrived, and issue #105's transcript check did not drop it — so it resolves them and hands the
+executor a single boolean plus the plan. Passing `plan_approved` through unconditionally would make
+the executor skip planning for a run whose session is gone: the one case where it must plan.
+
+**🔴 THE INVARIANT IS WRITTEN IN THE QUERY THAT ENFORCES IT, NOT IN THE PRD.** The natural
+derivation reuses the running-transition's predicate, whose own comment records an accepted
+residual: a consumed round-1 input lets a stale round-2 pre-gate report through. For that
+transition the residual hides a gate; **here it would tell the worker to implement an unreviewed
+plan** — the same residual with a materially worse blast radius. It is sound today for a
+**structural** reason, which is precisely why it must be written down rather than relied on:
+
+- a park is `running`-only (the positive source guard), and
+- a revise round sits at `awaiting_approval`, which the running transition refuses to leave without
+  a consumed approval.
+
+So **the ordinary multi-round revise flow cannot reach a park at all**, and the only surviving
+residual is the stale pre-gate report the existing comment already names. The required invariant,
+stated so a future change can be checked against it: **no `awaiting_approval` report rewrites the
+plan text after the consumed approval that made `plan_approved` true.** The soundness is a property
+of the **query pair**, not of the worker's loop. No tighter derivation is cheaply available — the
+run row carries no plan-set timestamp for the consumption timestamp to be compared against.
+
+**Skipping the gate is not a weakening of the approval guardrail.** The approval already happened,
+on this exact plan, and is recorded server-side. What is skipped is asking a human to approve the
+same plan a second time because the worker lost a token window; the alternative is not more
+oversight, it is an unattended run parked at a gate.
+
+**🔴 THE PERSISTED AGENT SELECTION RIDES THE CLAIM BESIDE `plan_approved`, AND BOTH HALVES MUST BE
+CONSUMED — HONOURING ONE WITHOUT THE OTHER HONOURS HALF A HUMAN DECISION.** They come from the same
+verdict, and Decision 6b's whole premise is that the gate may be skipped **because** the human
+approved; dropping the exclusions that were part of that same approval contradicts the premise the
+skip rests on. The worker takes the selection **unconditionally**, not gated on `plan_approved` — it
+is the run's selection whether or not this particular resume skips the gate, and the executor reads
+it only on the path that has no verdict of its own to supply one.
+
+**That contract was briefly HALF-LANDED, which is the shape worth recording: the server put the
+selection on the wire and the worker still resolved "absent", so the data was present and nothing
+read it.** A human who excluded a subagent at the gate got it back after a park, and no signal
+anywhere said so. A wire field is not a delivered decision until a consumer reads it.
+
+**⚠ THE REMAINING RESIDUAL IS NOW GENUINELY A FALLBACK — an OLDER SERVER that sends no selection —
+rather than the live path, and an earlier statement of the cost was wrong.** When the selection is
+absent the resume falls back to the documented default, and the cost is **not** merely dropped
+exclusions: the larger effect is the **source** — a human who chose their own templates gets the
+repo roster whenever the clone has agents, and those are the cloned repo's own agent files, a
+**different set**, not the same set differently filtered. The skill-scoping regime changes with the
+source too. The **security** claim does survive and was checked rather than assumed: repo agents
+carry their denied-tool set canonicalized against aliases, the executor re-enforces it, and the
+agent-guard hook's allow-set is rebuilt from the resolved selection. So this is a roster and scoping
+difference, **not a guardrail bypass** — but "not a bypass" must not be read as "no difference".
+
+**Affinity actually favours the prior worker, contrary to the first draft.** Promotion resets the
+row's update timestamp, so the claim path's affinity grace window **restarts** at promotion. Honest
+residual: if another of the user's workers claims after that grace, the session directory is absent
+there ⇒ fresh session plus branch-attach, and issue #105's dropped-resume path warns and seeds prior
+work rather than failing. The cost is conversation context, not the run. Most users run one worker.
+
+## 437. PRD #35 — there are TWO fields named `rate_limit_type` with different trust levels, and the SERVER composes the failure sentence
+
+**The worker forwards `rate_limit_type` as UNTRUSTED free text on purpose, so the authoritative copy
+of the vocabulary lives on the server side of the wire.** Validating it in the agent as well would
+put the enum on the untrusted side. Everything reaching the database, a DTO, the feed or Slack
+passes through one coercion first: the six SDK members plus the literal `"unknown"`, with absent
+staying absent (a NULL column and an `"unknown"` column mean different things and a support query
+must tell them apart).
+
+**The allowlist IS the whole sanitizer, and that is stronger than the stripping filters around it.**
+The state path has no self-reported-text sanitizer (that is the register path's) and this field
+deliberately gets no NUL strip either: an allowlist mapping everything outside a seven-member set to
+one literal means **no worker-controlled byte survives at all**, closing length, control characters,
+NUL and injection in one move rather than four.
+
+**A CHECK constraint closes the column in the same migration that adds it — a deliberate departure
+from the precedent one PRD earlier, on a discriminating fact.** That precedent left its column open
+because *its vocabulary was still moving inside its own PRD*; this one's six members are closed at
+authoring and nothing inside this PRD adds a seventh. Why bother at all, given the column is
+display-only: nothing branches on it, so **the database is the only reader positioned to notice a
+wrong value**. The CHECK is strictly weaker than the Go allowlist, so on the shipped path it can
+never fire — that is the point. It exists for the writers that bypass that path: a backfill, an
+admin tool, a second writer added later, or a refactor that moves the coercion.
+
+**🔴 THE TWO DRIFT DIRECTIONS ARE NOT SYMMETRIC AND ONLY ONE IS PINNED.** Go taught / SQL forgotten
+**fails hard** — a park carrying a new member raises a constraint violation at runtime, turning a
+display nicety into a failed run on a user's work — so it is pinned by a test that parses the CHECK
+out of the migration file and compares it to the Go list. SDK bumped / Go forgotten **fails soft by
+construction**: the new member arrives unrecognised, coerces to `"unknown"`, stores cleanly, and
+costs display fidelity on one field. That direction is **deliberately unpinned and it is not an
+oversight to be corrected**: the SDK typings live outside the Go module and are not committed, so a
+Go test reading them would be cache-invisible under the cross-module rule *and* would fail outright
+in CI, where that directory does not exist. **Nothing in this repo observes the SDK.**
+
+**🔴 THE SECOND FIELD WITH THAT NAME IS NOT ALLOWLISTED, AND GETTING THE TWO BACKWARDS IS A REAL
+HOLE IN ONE DIRECTION AND A LIE TO THE USER IN THE OTHER.** The run **row's** column is a safe enum;
+the `rate_limit_type` inside a feed-message payload is arbitrary worker JSON on a different write
+path, reaching the database through nothing but a NUL strip and a rune cap. The web therefore has
+**two** label functions and they behave differently on purpose:
+
+- the **DTO** path may render an unrecognised value verbatim (control/format characters stripped),
+  because a newer server can legitimately ship an SDK member this build has not heard of and
+  silently dropping it hides the one fact the user asked for;
+- the **feed** path resolves through a **closed lookup with a neutral fallback** and never echoes the
+  input — not even escaped, not even truncated — because on that path "a value this build has not
+  heard of" and "a hostile string" are indistinguishable. Every sentence that consumes it is written
+  to stay correct **without** the window name.
+
+The feed's timestamp is likewise parsed and **re-formatted**, so what renders is the build's own
+output rather than the payload's bytes. That leaves no path from a payload to the DOM carrying a
+worker-chosen string, which is a stronger property than escaping. The same split is applied one
+layer up in the shared reasoning: the CLI passes an unrecognised type through (it is versioned
+separately from the API, so inventing a rendering or dropping it are both worse) but still routes it
+through the terminal-cell sanitizer, because "server-controlled today" is exactly the assumption
+that rots.
+
+**The SERVER composes the opt-out failure sentence, from its own enum.** A worker-composed reason
+receives only a NUL strip and a rune cap, so "a compromised worker cannot smuggle a non-enum
+`rate_limit_type` past the server" would be **false on exactly the path a human reads**. Instead the
+worker sends the structured type and reset on the **failed** report too, and the server writes
+"Anthropic usage limit (`<type>`) reached; resets at `<ISO>`". Two constraints: **a terminal report
+is never failed on a technicality** (an unrecognised type coerces, an implausible timestamp is
+dropped, neither rejects the report), and **the replacement fires only when the fields are present**,
+so no other failure path in the product changes behaviour. One allowlist, both paths.
+
+**The consequence is stated plainly rather than papered over: the enum allowlist does not reach the
+chat path at all.** Chat's improved sentence interpolates the raw type into prose, which the run
+path forbids. That is not a violation — the rule guards the **persisted run field** rendered in the
+run view, the CLI and Slack, while a feed message is worker-authored text by design and already
+escaped as such — and it is **pre-existing** rather than introduced here.
+
+**The window type had to be a RUN COLUMN, not just a feed payload**, because the Slack context query
+is an explicit column list selected from the runs table and cannot reach a message payload. It is
+named to match the SDK field, the wire field, the DTO field, the payload key and the render, rather
+than taking a prefix for grouping and paying a rename at four boundaries.
+
+**The feed payload deliberately carries NO attempt number, and the code was right where the PRD was
+wrong.** The worker **cannot know it**: the count is incremented by the server *inside* the park
+transition, strictly after the message is emitted and after its batcher is closed, and the claim
+payload carries no prior value. Any emitted attempt is a stale N−1 that disagrees with the row it
+describes. The counterargument — a feed row is a historical record, so reading the live DTO instead
+gives three identical rows for a run that parked three times — is answered by the row's own gapless
+sequence number and timestamp, which always distinguish two parks. *(The stronger justification
+first offered, "distinguished by `resets_at` by construction", is recorded in corrected form:
+`resets_at` is **omitted** when the reset is unknown, which is exactly the case the fallback exists
+for, so two unknown-reset parks do emit identical payloads. Position in the feed is what always
+separates them.)* The live count is on the DTO, where it is always current.
+
+## 438. PRD #35 — the per-run opt-in is a RUN-VIEW toggle, and what this increment does NOT deliver
+
+Serves human: "each user can opt in per run or set a default in settings" (Feature #35), **as the
+owner reinterpreted it on 2026-07-27**. The requirement and the reinterpretation are the user's and
+live in `specs/human.md`; the **mechanism** below is ours.
+
+**The PRD prescribed a checkbox on a run-start modal. That modal does not exist and never did** —
+starting a run is a one-click call from two surfaces. Building one would change existing behaviour
+on every hand-started run, so the question was escalated rather than decided by the team. The shape
+the owner accepted:
+
+- **Start stays one click** and inherits the per-user default. No modal, no confirmation step, no
+  change to either existing surface.
+- **The flag ships as an optional field on run creation**, so CLI and API callers have per-run
+  control at creation time.
+- **The web's per-run control is a toggle on the RUN VIEW**, live while the run is non-terminal.
+
+**The coverage argument is what justifies the reinterpretation, and the toggle is a STRICTLY LARGER
+surface than the modal would have been — not a consolation prize.** A start-run modal can only reach
+runs a human starts by hand. Autopilot, `ci_fix` and `self_improve` runs are created by the poller
+and the self-improve engine with **no start affordance at all**, and two of those three park. The
+toggle covers every kind that can park, including the three the modal structurally could not. It
+also arrives at the better moment: a user learns they want to wait when they are looking at a run,
+not before it exists.
+
+**🔴 THE TOGGLE IS ABOUT THE NEXT LIMIT, NEVER THE CURRENT STATUS, and its name invites the opposite
+reading.** Flipping it off on an already-parked run does **not** un-park, cancel or fail it — cancel
+is the separate control for that — and flipping it on while parked is a no-op on this park. So a
+parked run is deliberately an **enabled** state for the toggle, which looks wrong at a glance and is
+not: a user who parked by accident wants to stop the *next* park. On a terminal run the endpoint
+no-ops and the UI renders nothing at all, rather than a disabled checkbox that only invites the
+question of why it is there. The endpoint is guarded by the same **negative** predicate as
+server-side cancel, which admits `limit_wait` for free.
+
+**The effective flag is resolved in the Go service layer and passed explicitly on EACH creation
+path, never defaulted in SQL.** There are **four** paths, not the one the PRD named, and a
+`DEFAULT false` column with a partial set of writers silently opts users out; pushing the defaulting
+into SQL means a fifth path added later misses it in silence. The flag is re-read from the row on
+**every** claim, like auto-approve, so a park-resume-park cycle keeps asking the row and a toggle
+flipped mid-flight takes effect on the next resume.
+
+**Surface constraints taken to avoid a collision rather than to sequence around one.** The board-card
+badge is a **zero-line change to the board page**, which a parallel PRD is rewriting: the badge
+taxonomy lives in its own module precisely so the mapping is unit-tested in isolation, and the board
+renders whatever it returns. The board's run projection is **not widened** — it is a deliberately
+narrow shape carrying no reset timestamps — so the card shows a **static** pill and **the countdown
+lives only on the run view**, which reads the full run. The two constraints compose: a board
+countdown would have forced both a projection widening and a board prop change. The pill is
+warn-toned and **deliberately not pulsing**: a pulse reads as live work and a parked run does
+nothing at all for what can be hours. The status-tone map is now **exported and asserted by a test**
+so the two tone surfaces agree, replacing a comment that claimed the mirror and was enforced by
+nothing.
+
+**The countdown reads the promotion stamp, not the reported reset, and the two routinely differ** —
+the stamp carries jitter, is clamped, is cross-checked and is pool-aware, so a user with a second
+credential can be promoted **hours before** the window it hit reopens. The reported reset renders as
+context only. Its formatter is its own, because the existing elapsed/duration helpers top out at
+hours and an eight-day wait would read "192h 0m"; it drops to seconds near zero, where a run about
+to resume is the one moment the exact number matters, and it returns nothing once the instant has
+passed so the surface says "resuming shortly" rather than counting into a negative — the promotion
+pass runs on a ticker, so an expired clock means waiting on the next tick, not late.
+
+**The CLI treats a park as a long silence to EXPLAIN, not to exit on.** The parked status is
+deliberately absent from the terminal-status set: stopping `--follow` on it would truncate the
+capture in the middle of a run that finishes normally hours later. Instead one notice fires on the
+**edge** into the park (and one on the way out), on **stderr** rather than the printer, because
+stdout carries NDJSON for an agent to parse line by line. `uzi run get` renders the opt-in flag on
+**every** run — it is meaningful before any park, and a conditional row would make "off"
+indistinguishable from an old CLI that does not know the field — and answers two different questions
+off the same columns, because the server leaves them in place across a promotion as history: on a
+parked run they say when it resumes, on a resumed one they say it spent part of its wall clock
+waiting. Attempt count renders without a denominator: the cap is one server constant, deliberately
+not on the DTO, and a denominator in a separately-released binary would be a second copy of it.
+Steer-queue labels gain a **suffix**, never a replacement: a park changes nothing about whether a
+follow-up was handed to the worker, only whether anything is currently acting on it.
+
+**🔴 WHAT THIS INCREMENT DOES NOT DELIVER.** *(This list previously opened "the feature is DORMANT
+until the opt-in path lands", which was true when written and stopped being true hours later. The
+opt-in path and the Slack surface have both landed; a stale "not delivered" list is worse than none,
+because it is read as a work queue.)*
+
+- **The end-to-end scenario is unbuilt** (opt-in park ⇒ promotion ⇒ resume skips the gate ⇒
+  completes; opt-out fails with the explanatory reason; cancel-while-parked). This is the one gap
+  that matters most against the fallback schedule above: the e2e overlay disables the usage poller,
+  which is precisely the configuration under which the exponential fallback becomes the *usual*
+  path, so the suite would exercise that branch by construction — and does not yet.
+- **The migration number was a draft, and the rule earned its keep here.** Drafted `00090` against a
+  live head of `00089_run_select_reason_check.sql`; PRD #102 merged to `main` first and took
+  `00090_issue_board_position.sql`, so this landed as **`00091_run_limit_wait.sql`** on the landing
+  rebase. The boot runner is strict, so landing below an already-applied head would have made every
+  upgraded instance refuse to boot — the collision was not hypothetical, it was one merge away.
+- **The rollback narrows the status domain and therefore FAILS LOUDLY if any run is parked. That is
+  correct and must not be "fixed" with a pre-emptive UPDATE**, which would silently rewrite a user's
+  parked run and lose work the up-migration promised to resume. That fail-loud property is entirely
+  load-bearing on the migration running inside a transaction, so the no-transaction annotation must
+  never be added to that file — run without it, the drops commit around the failing constraint and
+  the table is left with **no status CHECK at all**.
+
 ## 439. PRD #102 M1/M2 — `Backlog` and `Planned` are DIFFERENT KINDS of object, and one of the two renames must not reach the wire
 
 PRD #102 renames two board columns. They read as one change and are not: one is a
@@ -13929,3 +14590,300 @@ because of that, and none of them said so out loud except one SQL comment.
     cross-user order onto this one — a genuinely shared board is one `repos`/`issues`
     row per project rather than per connection, touching run ownership, PAT selection
     and every `*ForUser` query.
+
+# PRD #88 — Ask-user clarification: agent-initiated questions before and during a run
+
+Serves human Feature #88.
+
+**Numbering note, and the rule it corrects.** These start at 455, not at 447. "Next
+above the merged head" is **wrong by construction** — a merged tree cannot see what
+landed on `main` *after* the merge commit, nor what an unmerged sibling holds. Both
+had happened: 447 was `origin/main`'s (issue #177, landed after this branch's merge)
+and 448–454 were held by the in-flight PRD #175 branch. **The rule is "first free
+across all remotes"**, swept at write time, then re-derived above the live head at
+landing per the goose-style renumber rule. The 447–454 gap here is intended; closing
+it recreates the collision.
+
+## 455. PRD #88 — `awaiting_input` is a FIRST-CLASS run status, and `awaiting_approval` could not be reused
+
+- **A new status, not a reuse.** The obvious economy — park a question in
+  `awaiting_approval` and let the plan gate's plumbing carry it — is structurally
+  impossible, not merely untidy. `SetRunRunning`'s resume gate requires a **consumed
+  `approve_plan`** before it will un-park an `awaiting_approval` run, and an `answer`
+  can never satisfy that predicate. A question parked in the approval status would be
+  answerable and unresumable.
+- **The guard is TWO independent conjuncts, never one merged predicate.**
+  `AND (status <> 'awaiting_approval' OR EXISTS(… kind='approve_plan' …))` and
+  `AND (status <> 'awaiting_input' OR EXISTS(… kind='answer' …))`. A merged
+  `status NOT IN (…) OR kind IN (…)` would let a consumed `answer` satisfy the *plan*
+  gate and a consumed `approve_plan` satisfy the *question* gate — re-opening PRD
+  #44's F2 sideways. Consequence for tests: on a fixture where a run has **both**
+  inputs consumed, either half alone is sufficient, so no such fixture can observe
+  one clause being deleted. The discriminating fixture holds **exactly one**.
+- **A new status inherits nothing.** Every `status IN (…)` site that lists
+  `awaiting_approval` had to be enumerated and extended by hand: the DB CHECK, the
+  worker-death and register-time sweeps, `statusLabel` in the Slack notifier,
+  `knownRunStatuses` in the CLI, the web `RunStatus` union, the board's attention
+  treatment. The cost of the status IS that enumeration, and an enumeration is a
+  measurement with a shelf life — see §456's invariant for the same shape one level in.
+- **Deliberately NOT added: a health arm.** `awaiting_input` stays out of
+  `ListActiveRunsForHealth` and no `input_idle` reason exists. `SetRunAwaitingInput`
+  clears health on entry the way `SetRunAwaitingApproval` does, so there is no stale
+  flag to sweep; and the user is already told (Slack DM, board badge, CLI, run view),
+  so an idle nudge is a reminder layered on an existing notification rather than the
+  notification itself. Adding the status to the sweep **without** a matching arm is
+  the one combination that is pure cost: a per-tick self-clear that evaluates nothing.
+- **`awaiting_input` also had to be added to the register-time and stale-heartbeat
+  sweeps**, or a worker that restarts faster than `WORKER_HEARTBEAT_STALE` leaves the
+  run parked forever pointed at an execution that no longer exists, with the deadline
+  (worker-in-memory) gone and no user-visible signal. The requeue predicates are a
+  status enumeration, so they are exactly the sites a new status silently misses.
+- **The status domain is nine values**, and the migration that declares it carries the
+  **union** with the sibling PRD's `limit_wait`. A `DROP CONSTRAINT`+`ADD CONSTRAINT`
+  is absolute, so the last-running migration's list is the whole domain; ours runs
+  last because it is the only editable one (the sibling's is applied history). A
+  rebuild only needs the domain; the ordering argument is recorded because it is the
+  general rule for two branches widening the same CHECK.
+
+## 456. PRD #88 — staleness is keyed on question IDENTITY; every clock- and ordinal-based design died to ONE mechanism
+
+- **The problem.** A run may ask up to `QUESTION_MAX` questions. An answer written
+  against Q1 must never resolve Q2. Three mechanisms were proposed — `created_at >
+  awaiting_input_since`, `consumed_at > awaiting_input_since`, and a worker-side
+  generation counter — and **all three key the answer to WHEN it arrived relative to a
+  park**.
+- **All three are refuted by the requeue re-park.** A worker death re-queues the run;
+  the resume consumes the pending answer within one poll of starting (steering starts
+  before the checkout) and only then re-parks. So the honest answer arrives *before*
+  the new park and every when-based key rejects it: the user answered correctly, got a
+  success response and a Slack ✅, and the answer evaporated. The invalidating event is
+  one the user neither caused nor can see.
+- **Ruling: key on identity, which survives by construction.** `runs.open_question_id`
+  is stamped at park and **re-stamped to the same value** on a resume re-park;
+  `run_user_inputs.question_id` carries the answer's target. The resume guard is *a
+  consumed `answer` whose question id equals the run's current open question id*, so
+  the predicate is a no-op across a requeue. A NULL `open_question_id` makes the
+  equality NULL and the guard blocks — fail-closed. Identity also subsumes the
+  premature-answer case for free: an answer submitted when nothing is parked names no
+  open question.
+- **Do not build a counter BESIDE identity.** A conjunction is only as good as its
+  weaker clause: an arrival counter bumped at park with no grandfathering discards
+  exactly the pre-death answer identity exists to honour. One waiter, no counter,
+  identity as the only staleness key. The worker's `answerWaiter`/`answerBuffer` stay
+  distinct from the gate's slots, and the question path never touches `gateEpoch` —
+  `gatePlan` decides "first gate does not bump" from `gatedRuns`, so a bump from the
+  question path would shift the first plan gate off epoch 0.
+- **🔴 THE INVARIANT THAT KEEPS IDENTITY HONEST: no run-state setter may leave a
+  RESOLVED `open_question_id` behind.** Carried by two call sites (`SetRunRunning` and
+  `SetRunAwaitingApproval`) and by nothing else. It is not decorative: on the pre-run
+  path a park goes `awaiting_input → awaiting_approval` with **no intervening
+  `running` report**, so without the second clear the run reaches the plan gate still
+  carrying the resolved id; a requeue re-delivers it in the claim, the worker seeds
+  from that snapshot, and a **new** question reuses the id — at which point the
+  already-consumed `answer` satisfies the guard and the design degenerates to
+  has-ever-been-answered. Sufficient by enumeration: from `awaiting_input` the only
+  non-terminal destinations are `running` and `awaiting_approval`. **A third
+  non-terminal destination added later re-opens this and nothing would catch it**,
+  which is why the invariant is stated in the query comment rather than left implicit.
+- **The server-side clear is the ONLY defence**, because the worker seeds its map from
+  a claim snapshot taken before its own `running` report. A worker-side fix cannot
+  reach it.
+
+## 457. PRD #88 — the answer wire: a JSON body that NAMES its question, and Slack deriving that name from the card the reply FOLLOWS
+
+- **The `answer` steering body is JSON `{question_id, answers}`**, not a bare string.
+  Identity keying makes a plain-text body impossible, and `approve_plan` already
+  carries parsed JSON, so the shape is in-idiom. A **malformed body is rejected, never
+  defaulted** — the opposite of `parseAgentSelection`'s "malformed → own" fallback,
+  because there a fallback picks a safe default while here accepting an unidentifiable
+  answer is the exact harm the guard exists to prevent.
+- **The id is stored in a COLUMN, not extracted from the body in SQL.**
+  `body::jsonb ->> 'question_id'` is unsafe: `body` is bare `text` shared with prose
+  `follow_up` bodies, and the planner may evaluate the cast before the `kind='answer'`
+  filter that would make it well-formed, erroring the whole statement. The server
+  parses and validates, then persists to `run_user_inputs.question_id`.
+- **Web and CLI are safe for a reason Slack does not have: they ECHO BACK the id they
+  were shown.** Slack free text carries no id, so it must be **derived** — and
+  "whatever question is open at arrival time" is an arrival-time key wearing
+  identity's clothes, which re-admits precisely the Q1-reply-after-Q2-park case.
+- **Correct derivation: resolve to the question the reply FOLLOWS, by `ts`.** The
+  Slack anchor records the posted question's `question_id` **and** its `ts`. A reply
+  whose `ts` is after the current question's card answers the current question; a reply
+  before it answers a superseded one and is **rejected as stale** through an explicit
+  error, not dropped. `MessageTS` returns for this one job — deciding *which question
+  free text belongs to* — and is still not the staleness key. **The wire shape is
+  unchanged**: Slack submits the same JSON, so Slack is not a second contract.
+- **A `ts` comparison must validate the VALUE, not just the parse.**
+  `strconv.ParseFloat` returns `+Inf` with a **nil error** for five case-insensitive
+  spellings (`Inf`, `+Inf`, `Infinity`, …), and `+Inf` is after every real card, so an
+  error-only guard accepts a crafted timestamp and defeats the ordering entirely.
+  Meanwhile a genuine parse failure returns `0`, which the comparison already rejects —
+  so the error check on its own decided nothing. Require **finite on both sides**.
+- **Answer bodies are scrubbed and bounded server-side, inside `SubmitInput`**, so
+  every surface inherits it. Slack's reply path already scrubbed; the web and CLI paths
+  did not, and #88 changes the risk in kind because the agent now *asks the user for
+  information* — the prompt that elicits a credential paste — from question text that
+  is attacker-influenceable via the repo. The prompt separately forbids the lead from
+  ever asking for a credential, token or password. `ScrubSecrets` moved down into its
+  own package rather than importing `slacksvc` into the core service, which is
+  deliberately outside that import graph.
+- **Escape per field, never the assembled message.** Slack reuses PRD #41's
+  `ScrubSecrets → EscapeMrkdwn → truncate-on-rune-boundary → deep link as a separate
+  block` pipeline: escape the whole **untrusted** blob (which carries no trusted markup
+  of its own), then append trusted markup as its own block.
+- **`ask_user` is a SIGNAL tool, and it is extracted INSIDE the subagent guard.** If
+  `isSignalToolName` does not learn it, the model-authored question JSON also persists
+  as an ordinary `tool_use` message — a second, unpinned sink for attacker-influenceable
+  text that an escaped-render test on `kind=question` would not see. And a
+  prompt-injected **subagent** reaching `ask_user` posts attacker-chosen text into the
+  owner's Slack DM under uzi's bot identity: a phishing primitive, not a spurious park.
+
+## 458. PRD #88 — `ctx.askUser` fails OPEN, the caps ride the CLAIM CONFIG, and the honest ceilings multiply by the requeue budget
+
+- **`ctx.askUser` fails OPEN when unwired** — feed notice, run continues — which is
+  the **opposite** of `ctx.gatePlan`, which fails closed. A question the worker cannot
+  surface must not kill the run; a plan that cannot be gated must not proceed. The
+  asymmetry is the decision, and it is why the two must not be refactored into one
+  optional-callback helper.
+- **Bounds are worker-ENFORCED but claim-config-SUPPLIED.** `question_max` and
+  `question_timeout_seconds` ride the claim config like `plan_max_revisions`, **not** a
+  worker env var: the k8s worker renderer puts exactly one tuning var into a hosted
+  pod, so a worker-env knob would be unconfigurable on the runtime CLAUDE.md names
+  primary. "Worker-side" describes where the cap is *enforced* and says nothing about
+  where it is *configured*. Defaults 5 and 86400; a worker that receives neither falls
+  back to the same numbers, so an older server degrades to 5 rather than to unbounded.
+- **🔴 THE DOCUMENTED CEILINGS ARE PER-EXECUTION, AND THE HONEST ONES MULTIPLY.** Both
+  the counter and the deadline are worker-in-memory locals of `execute()`, so a requeue
+  restarts them. The true bounds are `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` and
+  `QUESTION_TIMEOUT × (RUN_MAX_REQUEUES + 1)` — ten questions on defaults, not five.
+  **Both caveats must be stated wherever either is**: documenting the timeout's and not
+  the cap's is worse than documenting neither, because a reader who finds one
+  reasonably infers the other has none.
+- **The two failures are asymmetric, deliberately.** Deadline expiry fails **CLOSED**
+  (the run fails, "clarification timed out"); a configurable default-action is out of
+  scope. Cap exhaustion does **NOT** fail — the lead is told the question could not be
+  asked and proceeds on best judgment, which is pre-#88 behaviour. Parking a run
+  because it asked too many questions would convert an assistance mechanism into a
+  guardrail, which it is not: `ask_user` is not one of the four `main`-protection
+  layers, so "don't weaken a layer" does not apply to it.
+- **Mixed-fleet skew is accepted and documented, not gated.** A run resumed onto a
+  pre-#88 worker degrades mid-run to *the agent proceeds on a guess* — exactly what the
+  tree did before this PRD, so not a regression against `main` — and pre-run to a
+  `REASON_NO_PLAN` failure whose text is misleading for whoever debugs it. Gating the
+  resume on `workers.version` was rejected on a second, independent ground: that field
+  is self-reported and sanitized as untrusted. **Accepted, documented cost:** the Slack
+  ✅ fires when `SubmitInput` returns, i.e. when the row was enqueued, so on a skewed
+  worker the user gets a checkmark for an answer destroyed in transit.
+
+## 459. PRD #88 — autopilot AUTO-RESOLVES and never parks; the open question is DERIVED from the feed, never carried on the wire
+
+- **An autopilot run must never enter `awaiting_input`.** The short-circuit sits in the
+  worker's ask path the way the auto-approve short-circuit sits in `gatePlan`: fed by
+  `claim.auto_approve`, it resolves immediately with a sentinel answer telling the lead
+  to proceed on its best judgment and record the assumption.
+- **And it must emit no `question` message.** The park and the message are separate
+  properties, and the second is the security-shaped one: a `question` in the feed of an
+  unattended run implies a human was consulted when none was. The short-circuit emits a
+  `status` message instead. Recorded because the two properties fail together under the
+  obvious mutation and separately under a targeted one — an assert-based test that
+  checks the park first aborts before ever evaluating the message property.
+- **No new DTO field and no new column for the open question.** It is derived from the
+  run feed by `seq` — latest of `{question, answer}` — exactly as the run view already
+  derives the gate state from the latest of `{plan, plan_revising}`. Web, Slack and CLI
+  share one derivation rule instead of three, and no surface reads a DTO field that
+  was never going to exist.
+- **The ordinal ("question 2 of this run") is COUNTED from `question` messages, not
+  carried.** A `generation` field was on the wire briefly, was never read back, and was
+  removed: it was a correctly-inert display value wearing the name of the mechanism
+  identity-keying had struck, blessed by a design doc calling it "the stale-answer
+  discriminator". The next person to "restore the missing check" would have
+  reintroduced the requeue rejection. In the feed the ordinal is a **fact** and, unlike
+  a worker-held counter, stays correct across a requeue.
+- **The live region for a new question is ALWAYS MOUNTED in the run view; only its
+  content changes, keyed on question identity.** Assistive tech announces *changes* to
+  a region that already existed, so a `role="status"` created in the same tick as its
+  first content is typically silent — it browser-tests as present and reaches no one.
+  The question panel itself therefore carries **no** `aria-live` and no `role="status"`,
+  pinned by an **absence test**, so that a later tidy-up moving the region "closer to
+  where it belongs" cannot silently reintroduce the bug.
+- **The mock engine is a CONTRACT, not a fixture.** `handleInput` had no `default` and
+  no exhaustiveness check, so `revise_plan` already fell through silently; `answer`
+  would have reproduced that exactly. It gained a `never` guard, and the mock parks
+  **twice**, because a one-question fixture cannot tell a real ordinal from a
+  hardcoded 1.
+
+## 460. PRD #88 — what this increment does NOT deliver, and the two deliberate non-fixes
+
+Recorded in `ai.md` rather than only in the MR because an MR description is ephemeral
+and a coverage claim is what a later reader most needs bounded. **"e2e green" will
+otherwise be read as covering all of these, and it covers none of them.**
+
+- **🔴 The k8s runtime was not exercised, and this one deviates from a stated
+  convention.** Everything here was validated on compose plus unit tests. The sharp
+  part is that §458's claim-config decision was made **precisely because** a worker env
+  knob is unreachable on a hosted worker — so the decision's own motivation is the
+  thing that went untested. Highest-value follow-up of the five for anyone re-running
+  this on the primary runtime.
+- **🔴 No requeue was exercised end to end.** §456's identity keying exists to protect
+  exactly one chain: park → worker death → requeue → resume → re-park → the pre-death
+  answer still honoured. The runner layer proves it with a seeded claim; the SQL layer
+  proves the sweeps. **Nothing kills a worker mid-park and watches the two halves join
+  up** — they meet only on paper, at the seam the whole design was built for.
+- **Slack has no e2e at all.** The M3 round trip is covered only by Go unit tests
+  against fakes, which includes §457's `ts`-ordered derivation — the subtlest mechanism
+  in this PRD, pinned at the unit layer and nowhere else. Nothing in any run posted to
+  or read from Slack.
+- **`executor=stub` only.** No live SDK session, so the prompt's "when to ask" guidance
+  and the credential prohibition are pinned by string assertions and by nothing
+  behavioural. A real lead deciding *when* to ask is untested by construction.
+- **`QUESTION_MAX` enforcement is documented, not tested**, and neither is §458's
+  `× (RUN_MAX_REQUEUES + 1)` bound.
+
+### Non-fix 1 — `FailRunAutoStop` GUARDS `awaiting_input`, and the clause is INERT TODAY ON PURPOSE
+
+**The guard ships.** `FailRunAutoStop`'s WHERE is
+`status NOT IN ('completed','failed','cancelled')` — a negative predicate that
+**admits a parked run** — followed by two explicit exclusions,
+`AND status <> 'limit_wait'` and `AND status <> 'awaiting_input'`, in the `.sql` and in
+the generated const that executes.
+
+**Nothing can reach the clause today**, because `workersvc/autostop.go`'s
+`if run.Status != "running"` already excludes every park. It was added anyway, and the
+reason is the decision worth keeping:
+
+- **The invariant is stated in a DIFFERENT PACKAGE from the one that enforces it.** A
+  backstop belongs where the guard is *enforced*, not where it currently happens to be
+  *derived*.
+- **That Go line's own comment does not mention parking at all** — it justifies itself
+  entirely in terms of `queued` and the requeue streak, because parking did not exist
+  when it was written. So the protection is not merely remote, it is undocumented at
+  the site a reader would check.
+- **Relaxing that one line — to cover `awaiting_approval`, say — would make parked runs
+  auto-stoppable with no SQL backstop and no failing test.** The clause costs one line
+  and removes that entire class.
+- **Auto-stopping a parked run would be wrong on the merits, not merely unreachable:**
+  its message writes are not in a permanent-failure loop, they have simply *stopped*,
+  because the worker went away by design and the server owns the resume.
+- `limit_wait` spent a clause on exactly this argument first; `awaiting_input` is the
+  same shape of park and inherits it verbatim.
+
+*(Recorded as a deferred omission for one commit, while `sqlc generate` could not reach
+its proxy, then landed. **An inert clause with no test is precisely the shape that gets
+deleted as dead code in a later tidy-up**, which is why the rationale lives here and in
+the query comment rather than only in a commit message.)*
+
+### Non-fix 2 — `uzi run answer` pulls the run's WHOLE message history to read one field
+
+Deliberate, with the trade stated rather than hidden. `openQuestion` calls `RunLogs`
+and walks backwards for the newest `question`, so a one-line command downloads the
+entire feed of a long run.
+
+- **Nothing new is exposed** — same route, same authorization as `uzi run logs`. The
+  cost is bandwidth and latency, not access.
+- **The asymmetry is what makes it worth recording:** `logs` is *expected* to be heavy
+  and `answer` is not, so the surprise lands on the verb nobody would profile.
+- **Fixing it needs a server-side "latest message of kind K" read that does not
+  exist.** Adding one for a single CLI verb was judged the wrong trade against §459's
+  one-derivation rule — which is exactly what keeps the CLI, the web UI and Slack from
+  drifting into three different notions of "the open question". **The cheap fix buys
+  bandwidth and spends the property that made the design coherent.**

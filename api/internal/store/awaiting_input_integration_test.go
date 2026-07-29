@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -27,6 +28,7 @@ import (
 
 type awaitingInputFixture struct {
 	q        *store.Queries
+	pool     *pgxpool.Pool
 	userID   uuid.UUID
 	repoID   uuid.UUID
 	workerID uuid.UUID
@@ -58,7 +60,7 @@ func setupAwaitingInput(ctx context.Context, t *testing.T, dsn string) (*awaitin
 		`INSERT INTO runs (id, user_id, repo_id, worker_id, issue_iid, issue_title, issue_description, status)
 		 VALUES ($1, $2, $3, $4, 1, 't', 'd', 'running')`, runID, userID, repoID, workerID)
 
-	return &awaitingInputFixture{q: store.New(pool), userID: userID, repoID: repoID, workerID: workerID, runID: runID},
+	return &awaitingInputFixture{q: store.New(pool), pool: pool, userID: userID, repoID: repoID, workerID: workerID, runID: runID},
 		func() { pool.Close() }
 }
 
@@ -247,10 +249,231 @@ func TestSetRunRunningAnswerGuardLiveDB(t *testing.T) {
 	}
 }
 
-// An approve_plan must not satisfy the QUESTION gate. Together with its mirror in the
-// plan-gate tests this is what pins the two clauses as independent — a merged
-// `status NOT IN (...) OR kind IN (...)` predicate would pass the happy paths above
-// and fail exactly here.
+// B2 regression, store half: leaving the park CLEARS the question id.
+//
+// Nothing else clears it, and a stale id is not inert — the claim payload re-delivers
+// open_question_id on every resume, so a worker restarting after an ANSWERED park
+// would seed its map with the resolved id and re-use it for a genuinely new question.
+// The guard would then degenerate to has-ever-been-answered and the old question's
+// answer would satisfy the new one. The worker half of this regression lives in
+// agent/test, because choosing the id is worker behaviour that no store test reaches.
+func TestSetRunRunningClearsOpenQuestionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["yes"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+	if rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	}); err != nil || rows != 1 {
+		t.Fatalf("SetRunRunning: rows=%d err=%v", rows, err)
+	}
+
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.OpenQuestionID.Valid {
+		t.Fatalf("open_question_id survived the resume as %q — a later resume would re-deliver it "+
+			"on the claim and the worker would re-use a RESOLVED question's id for a new question",
+			run.OpenQuestionID.String)
+	}
+
+	// And the clear is what makes the guard bite again: the run parks on a NEW
+	// question, and the old consumed answer must not resume it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-2"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("re-park: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 2,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("the answer to q-1 resumed a park on q-2 (%d rows)", rows)
+	}
+}
+
+// D-AG regression: the PRE-RUN path. A run that parks before it plans reaches the
+// plan gate WITHOUT an intervening `running` report, so SetRunRunning's clear is never
+// reached and only SetRunAwaitingApproval's can save it.
+//
+// This is the chain the runner-layer "B2, WORKER half" tests cannot express, and the
+// reason is worth stating: they reason about the id lifecycle correctly but assume
+// SetRunRunning always intervenes between a park and the next question. True mid-run,
+// false pre-run — and M4 added the pre-run path AFTER those tests were written. The
+// tests never became wrong, only insufficient, which is why nothing went red.
+func TestSetRunAwaitingApprovalClearsOpenQuestionLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	// 1. Park PRE-RUN on q-1 and answer it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("pre-run park: %v", err)
+	}
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["postgres"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+
+	// 2. The lead re-plans and submits. NO `running` report happens on this path —
+	//    that absence is the whole defect, so the test must not insert one.
+	if rows, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd: pgT("# plan"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil || rows != 1 {
+		t.Fatalf("SetRunAwaitingApproval: rows=%d err=%v", rows, err)
+	}
+
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.OpenQuestionID.Valid {
+		t.Fatalf("a resolved question id survived to the plan gate as %q — a worker death here "+
+			"re-delivers it on the claim, the worker re-uses it for a NEW question, and q-1's "+
+			"consumed answer then resumes that question (D-AG)", run.OpenQuestionID.String)
+	}
+
+	// 3. The consequence, asserted directly rather than inferred: park on a NEW
+	//    question and confirm q-1's still-consumed answer does not resume it.
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-2"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("re-park on q-2: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("q-1's consumed answer resumed a park on q-2 via the pre-run path (%d rows)", rows)
+	}
+}
+
+// B1 regression: the REGISTER-time orphan sweeps must see a parked run.
+//
+// The stale-heartbeat sweeps cannot cover this and a test of them cannot stand in:
+// RegisterWorker stamps last_heartbeat_at = now(), so a worker restarting faster than
+// WORKER_HEARTBEAT_STALE is never stale. This is the `docker compose down && up`
+// path that RequeueWorkerRuns' own comment names.
+func TestRegisterSweepsMoveAwaitingInputLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+
+	// Within budget → re-queued to the same worker for an affinity resume.
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+	if _, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	rows, err := f.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
+		WorkerID: pgU(f.workerID), MaxRequeues: 3,
+	})
+	if err != nil {
+		t.Fatalf("RequeueWorkerRuns: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("RequeueWorkerRuns left the parked run alone (%d rows) — an ordinary worker "+
+			"restart strands it in awaiting_input forever, pointing at dead execution", rows)
+	}
+	run, err := f.q.GetRunByID(ctx, f.runID)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+	if run.Status != "queued" {
+		t.Fatalf("status = %q, want queued", run.Status)
+	}
+
+	// Over budget → failed rather than re-queued.
+	f2, done2 := setupAwaitingInput(ctx, t, dsn)
+	defer done2()
+	if _, err := f2.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{
+		OpenQuestionID: pgT("q-1"), ID: f2.runID, WorkerID: pgU(f2.workerID),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	ids, err := f2.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+		FailureReason: pgT("worker restarted"), WorkerID: pgU(f2.workerID), MaxRequeues: 0,
+	})
+	if err != nil {
+		t.Fatalf("FailWorkerRunsOverCap: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("FailWorkerRunsOverCap left the parked run non-terminal (%d rows) — it would sit "+
+			"forever holding move_pending_since and a board card", len(ids))
+	}
+}
+
+// The two clauses are independent, pinned in BOTH directions.
+//
+// Direction 1 (this test): a consumed approve_plan must not resume a run parked on a
+// QUESTION. Direction 2 (the subtest below): a consumed answer must not resume a run
+// parked at the PLAN gate. A merged `status NOT IN (...) OR kind IN (...)` predicate
+// passes every happy path above and fails exactly here.
+//
+// Both live in this file on purpose, and what they uniquely catch is narrower than
+// two earlier versions of this comment claimed. Measured against a real Postgres, by
+// mutating the GENERATED const in runtime.sql.go (the .sql file is semantically inert
+// until sqlc regenerates):
+//
+//	                                    plan clause    the two clauses
+//	                                     DELETED         MERGED
+//	ClausesAreIndependent (dir 1)         pass            FAIL
+//	AnswerDoesNotSatisfyPlanGate (dir 2)  FAIL            FAIL
+//	SetRunRunningAnswerGuard              pass            FAIL
+//	AwaitingApprovalGuard (pre-existing)  FAIL            pass   ← blind to the merge
+//
+// So DELETING the plan clause was never invisible: the pre-existing PRD #44 F2 guard
+// test has always caught it. MERGING the two into one
+// `status NOT IN (...) OR kind IN (...)` predicate is the hole these tests exist for —
+// a merged predicate still satisfies every fixture holding the matching input kind,
+// so only a fixture holding the WRONG kind for its gate can tell the difference, and
+// that is exactly what direction 2 builds.
+//
+// Two corrections got us here and the second is the instructive one. The first
+// version pointed at "its mirror in the plan-gate tests", which did not exist —
+// run_running_guard_integration_test.go contains no `answer` at all. The second said
+// deletion left the suite green; it did not. Both were claims about what a test
+// guards, written without running the mutation they named. A comment that
+// misdescribes its own test's value fails the same way as one pointing at the wrong
+// file: it stops the next reader checking.
 func TestSetRunRunningClausesAreIndependentLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -287,6 +510,45 @@ func TestSetRunRunningClausesAreIndependentLiveDB(t *testing.T) {
 	}
 }
 
+// Direction 2: a consumed `answer` must not satisfy the PLAN gate. This is the half
+// that was missing, and it is the one that catches a merged predicate.
+func TestSetRunRunningAnswerDoesNotSatisfyPlanGateLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	f, done := setupAwaitingInput(ctx, t, dsn)
+	defer done()
+
+	if _, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		PlanMd: pgT("# plan"), ID: f.runID, WorkerID: pgU(f.workerID),
+	}); err != nil {
+		t.Fatalf("park at the plan gate: %v", err)
+	}
+	// EXACTLY ONE input kind, and it is the wrong one for this gate (D-B): on a run
+	// holding both, either clause alone would satisfy the predicate and no assertion
+	// could observe one being deleted.
+	if _, err := f.q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
+		RunID: f.runID, Body: pgT(`{"question_id":"q-1","answers":["yes"]}`), QuestionID: pgT("q-1"),
+	}); err != nil {
+		t.Fatalf("CreateRunAnswerInput: %v", err)
+	}
+	if _, err := f.q.ConsumeRunInputs(ctx, f.runID); err != nil {
+		t.Fatalf("ConsumeRunInputs: %v", err)
+	}
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		ID: f.runID, WorkerID: pgU(f.workerID), IterationCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("SetRunRunning: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("a consumed answer resumed a run parked at the PLAN gate (%d rows) — the two guard "+
+			"clauses have been merged, so an answer now approves a plan no human saw", rows)
+	}
+}
+
 // The CHECK constraints the migration widened, asserted directly: a bogus value must
 // still be rejected, so the widening did not simply drop the constraint.
 func TestAwaitingInputConstraintsLiveDB(t *testing.T) {
@@ -312,4 +574,28 @@ func TestAwaitingInputConstraintsLiveDB(t *testing.T) {
 	}); err == nil {
 		t.Fatal("the kind CHECK accepted a bogus value — the widening dropped the constraint instead of extending it")
 	}
+
+	// D-AF regression: runs_status_check must hold BOTH new statuses.
+	//
+	// This migration DROPs and re-ADDs runs_status_check, and it was authored when
+	// 00090 was head — before PRD #35 landed 'limit_wait'. Renumbering it above #35's
+	// migration made it run second, so a value list that forgot 'limit_wait' would
+	// silently narrow the domain back and reject every later park. The failure is
+	// invisible to every test that does not put a run in that status, which is why it
+	// is asserted here rather than left to the migration applying cleanly.
+	for _, st := range []string{"awaiting_input", "limit_wait", "awaiting_approval", "running"} {
+		if _, err := pgExec(ctx, f, st); err != nil {
+			t.Fatalf("runs_status_check rejected %q, which is a shipped status: %v", st, err)
+		}
+	}
+}
+
+// pgExec sets the fixture run's status directly, bypassing the typed setters, so the
+// CHECK is what is under test rather than a query's own guards.
+func pgExec(ctx context.Context, f *awaitingInputFixture, status string) (int64, error) {
+	tag, err := f.pool.Exec(ctx, `UPDATE runs SET status = $2 WHERE id = $1`, f.runID, status)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
