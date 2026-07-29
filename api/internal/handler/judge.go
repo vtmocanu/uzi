@@ -248,17 +248,34 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 //
 // The else is the point of this function, and it must never become an enumerated switch
 // over queued/claimed/running. The rows that reach here come from
-// GetActiveJudgeRunForTarget, whose predicate is the uq_runs_one_active_judge_per_target
-// index verbatim: status NOT IN ('completed','failed','cancelled'). That set is defined
-// by SUBTRACTION, so it contains every status runs.status legally admits minus three —
-// today that includes awaiting_approval (migration 00020) and awaiting_input (00092),
-// and it will silently include any status a future migration adds. A judge run does not
-// park at the approval gate today (the judge runner has no approval flow, and
-// auto_approve is autopilot-only), but the schema permits the value, so the query CAN
-// return it, and a switch that fell through to "" would ship state:"" and break the web
-// union "scheduled" | "running" — a blank chip in the one place the panel exists to
-// explain. Defaulting to "running" degrades an unknown active status to "a judge is
-// working on it", which is true of every member of that set by construction.
+// GetActiveJudgeRunForTarget, whose predicate carries the
+// uq_runs_one_active_judge_per_target index's active set: status NOT IN
+// ('completed','failed','cancelled'). That set is defined by SUBTRACTION, so it contains
+// every status runs.status legally admits minus three. Against the LIVE constraint
+// (runs_status_check, last rewritten by 00092, nine values) the whole set is:
+//
+//	queued, claimed, running, awaiting_approval, awaiting_input, limit_wait
+//
+// — and it will silently include any status a future migration adds. ALL SIX are
+// enumerated, because the subtraction is the whole argument and naming some members
+// while dropping others makes it read as a guess:
+//   - queued, claimed, running: where a judge run actually lives.
+//   - awaiting_approval (00020): out of reach today — the judge runner has no approval
+//     flow and auto_approve is autopilot-only.
+//   - awaiting_input (00092): no server-side kind guard at all — SetRunAwaitingInput is
+//     `WHERE id AND worker_id AND status NOT IN (terminal)`, so it is reachable the
+//     moment any runner asks a question under a judge run.
+//   - limit_wait (00091): out of reach behind TWO independent guards — CreateJudgeRun
+//     never stamps wait_on_limit, leaving the column's DEFAULT false, and SetRunLimitWait
+//     carries `AND kind <> 'judge'` (PRD #35 Decision 14). That statement is the only
+//     writer of the status.
+//
+// Out of reach is not impossible: the schema permits every one of these on a judge row
+// (runs_status_check does not condition on kind), so the query CAN return them, and a
+// switch that fell through to "" would ship state:"" and break the web union
+// "scheduled" | "running" — a blank chip in the one place the panel exists to
+// explain. Defaulting to "running" degrades an unknown active status to "a
+// judge is working on it", which is true of every member of that set by construction.
 //
 // TestPendingJudgeState asserts totality, including for a status this code has never
 // seen.

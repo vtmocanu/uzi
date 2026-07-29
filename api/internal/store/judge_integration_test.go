@@ -262,6 +262,29 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 					"predicate has drifted from uq_runs_one_active_judge_per_target", terminal, err)
 			}
 		}
+
+		// The kind term, which nothing above touches: every row carrying target_run_id so
+		// far is a judge run, so a query that dropped `kind = 'judge'` would still pass
+		// every assertion in this subtest. The probe is a NON-judge run pointed at this
+		// target and left ACTIVE, which the schema does admit: runs_kind_shape (00058)
+		// REQUIRES target_run_id on a judge row but never forbids it on any other kind, and
+		// uq_runs_one_active_judge_per_target is partial on kind='judge', so this row is
+		// outside the index and coexists with a judge on the same target without 23505.
+		//
+		// That is exactly the state a kind-less query would misreport: the judges are all
+		// terminal (the loop above just cancelled the last one), so a manual "Run judge"
+		// click here WOULD succeed, and the panel must offer the button rather than claim a
+		// judge is pending because some unrelated run points at this one.
+		decoyID := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, target_run_id)
+			 VALUES ($1, $2, $3, 44, 'Not a judge', 'desc', 'running', 'issue', $4)`,
+			decoyID, userID, repoID, targetID)
+		if _, err := q.GetActiveJudgeRunForTarget(ctx, pgtype.UUID{Bytes: targetID, Valid: true}); err != pgx.ErrNoRows {
+			t.Fatalf("an ACTIVE non-judge run carrying target_run_id resolved as a pending judge "+
+				"(got %v, want ErrNoRows) — the query has lost its kind = 'judge' term, and the panel "+
+				"would show \"judge pending\" for a target with no judge at all", err)
+		}
 	})
 }
 

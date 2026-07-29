@@ -87,11 +87,12 @@ func (s *Service) GetReviewForTarget(ctx context.Context, userID uuid.UUID, isAd
 // ever judged is (nil, nil).
 //
 // It is its own method rather than a widened GetReviewForTarget deliberately.
-// GetReviewForTarget has four callers, and three of them (issue-draft, issue-file, the
-// disposition write path) want a verdict to act on and have no use for a pending judge:
-// widening the signature would have made every one of them carry and discard a value,
-// and would have put a second query on write paths that do not need it. The panel is the
-// only caller that needs both, so the panel gets the method that fetches both.
+// GetReviewForTarget HAD four callers; the panel moved off it onto this method, leaving
+// three (issue-draft, issue-file, the disposition write path), and all three want a
+// verdict to act on and have no use for a pending judge. Widening the signature instead
+// would have made every one of them carry and discard a value, and would have put a
+// second query on write paths that do not need it. The panel is the only caller that
+// needs both, so the panel gets the method that fetches both.
 //
 // The visibility gate runs ONCE, before either read: an invisible run is ErrRunNotFound
 // with no pending-judge query issued at all, so this route can never be used to probe

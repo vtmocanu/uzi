@@ -20,15 +20,21 @@ import (
 // contain is "running", and nothing is ever "".
 //
 // The rows below are not a wish-list of statuses — they are the ones
-// GetActiveJudgeRunForTarget can actually hand back. Its predicate is
-// uq_runs_one_active_judge_per_target verbatim, `status NOT IN ('completed','failed',
-// 'cancelled')`, which is a set defined by SUBTRACTION: awaiting_approval (migration
-// 00020) and awaiting_input (00092) are inside it today, and a future migration widening
-// runs_status_check silently adds its new value too. That is why the "a status that does
-// not exist yet" case is in the table: an enumerated switch over queued/claimed/running
-// would pass every other row here and fall through to "" for that one, shipping
-// state:"" and breaking the clients' closed "scheduled" | "running" union — a blank chip
-// exactly where the panel is supposed to explain what is happening.
+// GetActiveJudgeRunForTarget can actually hand back. Its predicate carries the
+// uq_runs_one_active_judge_per_target active set, `status NOT IN ('completed','failed',
+// 'cancelled')`, which is a set defined by SUBTRACTION. Against the LIVE constraint
+// (runs_status_check, nine values as of 00092) that is SIX statuses — queued, claimed,
+// running, awaiting_approval, awaiting_input, limit_wait — and a future migration
+// widening runs_status_check silently adds its new value too.
+//
+// Every one of the six has a row, INCLUDING the two a judge run cannot reach today
+// (awaiting_approval and limit_wait), because the argument this table encodes is the
+// subtraction, not the reachable subset: enumerating some members and quietly dropping
+// others is how the set stops matching the constraint. That is also why "a status that
+// does not exist yet" is here — an enumerated switch over queued/claimed/running would
+// pass every other row and fall through to "" for that one, shipping state:"" and
+// breaking the clients' closed "scheduled" | "running" union — a blank chip exactly
+// where the panel is supposed to explain what is happening.
 func TestPendingJudgeState(t *testing.T) {
 	cases := []struct {
 		status string
@@ -41,7 +47,14 @@ func TestPendingJudgeState(t *testing.T) {
 		{"awaiting_approval", "running",
 			"INSIDE the index's active set (00020). A judge run cannot reach the approval gate today, " +
 				"but the schema permits the status, so the query can return it"},
-		{"awaiting_input", "running", "also inside the active set (00092), same argument"},
+		{"awaiting_input", "running",
+			"also inside the active set (00092) — and unlike the two above it has NO kind guard: " +
+				"SetRunAwaitingInput parks on (id, worker_id, non-terminal), judge included"},
+		{"limit_wait", "running",
+			"inside the active set too (00091), and out of reach only behind TWO guards — CreateJudgeRun " +
+				"leaves wait_on_limit at its DEFAULT false, and SetRunLimitWait (the only writer of the " +
+				"status) carries AND kind <> 'judge'. Enumerated anyway: the set is the constraint's, " +
+				"not the reachable subset's, and a guard is a fact about today's code"},
 		{"some_future_status", "running",
 			"the mapper must be total over a set defined by subtraction: an unknown active status " +
 				"degrades to 'a judge is working on it', which is true of every member by construction"},
