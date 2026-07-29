@@ -7433,6 +7433,9 @@ PRD #64 Decisions 1, 6, 7 (as amended); realized in `api/internal/middleware/cli
     `/api/admin/*`** that live in the swapped groups. Measured live consumers (post route-narrowing):
     `workersvc.GetRunForViewer`, `ListRunMessagesForViewer`, and `GetReviewForTarget` — the **trio** of
     run/transcript/verdict reads, each of which returns *any* user's data when `isAdmin` is true.
+    (Since PRD #119 the run-page verdict read enters through `GetRunReviewPanel`, which takes the same
+    `isAdmin` and gates through the same helper — the trio is unchanged, its third member renamed at
+    the panel's entry point; §462.)
     Without the mask, an admin's **default-scope `uzc_`** — the very token this PRD tells you to hand a
     CI job — would read every user's transcripts. The mask degrades every such handler to owner-only
     **for free, with zero handler changes**; `RequireAdminRO` then reduces to a bare `IsAdmin` check.
@@ -7656,10 +7659,15 @@ line, recorded per the phase-2 follow-ups.
 - **`uzi run review` is READ-ONLY** (PRD #64 D21). It maps to `GET /api/runs/{id}/review`; there is no
   `rejudge` verb, because re-running the judge mints a token-spending run (a webui action). Human
   output is the verdict line + one row per recommendation (category, target, confidence) with the
-  rationale beneath; `--json` passes the `{"review": … | null}` envelope through.
+  rationale beneath; `--json` emits a `{"review": … | null}` envelope.
+  - **~~`--json` passes the envelope through.~~ It never did — the JSON mode re-mints its own map
+    from the decoded DTOs, which is invisible while the envelope has one key and silently drops any
+    key the server adds. Corrected when `pending_judge` landed; see §463.**
   - **`null` review is exit 0 "not judged", NOT exit 4** — the endpoint returns 200 `{"review":null}`
     for a visible-but-unjudged run; mapping that to not-found would invent an error the API does not
-    raise. Reserve exit 4 for a real 404.
+    raise. Reserve exit 4 for a real 404. (Still true, but since PRD #119 a null review is TWO states:
+    the CLI prints "judge scheduled"/"judge in progress" when `pending_judge` is set and keeps "not
+    judged" for the genuinely-null case — §463.)
   - **A `status:"failed"` review renders the "judge incomplete" caveat** the run page shows. The wire
     value is `failed` (enum `{complete, failed}`), NOT `incomplete` — *"judge incomplete"* is only the
     badge wording in `docs/judge.md`; a `--json` consumer keying on `"incomplete"` matches nothing and
@@ -15541,3 +15549,130 @@ supersedes §451's fold.
   own numbers are meaningless while rendering them. The first arrived through a race, the
   second through unreachable copy. Worth pairing, because the next instance will arrive
   through a third route and the shape is the recognisable part.
+
+## 461. PRD #119 M1 — the pending read IS the index predicate, and the state mapper is TOTAL because the active set is defined by SUBTRACTION
+
+`GET /api/runs/{id}/review` answered `{"review": null}` for two different facts: a run
+nobody ever judged, and a run whose auto-enqueued judge is already in flight. The panel
+offered the same live **Run judge** button for both, and in the second case that click's
+only possible outcome was a 409 off the one-active-judge-per-target index. The increment
+is one new read plus one normalization, and each has exactly one correctness property.
+
+- **The read's predicate is a VERBATIM copy of `uq_runs_one_active_judge_per_target`
+  (00058), and that equivalence is the whole feature.** `GetActiveJudgeRunForTarget`
+  (`store/queries/judge.sql`) is `kind='judge' AND target_run_id=$1 AND status NOT IN
+  ('completed','failed','cancelled')` — the index's partial `WHERE` with its indexed
+  column spelled out; it is `GetActiveJudgeRunForWorkerTarget` minus the worker scope.
+  The UI must show "pending" in **precisely** the set of states where a manual click
+  reaches the index and raises 23505, and offer the button in **precisely** the set where
+  the click is the legitimate way to start a judge. Paraphrase either side and the two
+  sets drift: the panel then either hides a button that would have worked, or offers one
+  that can only produce an error toast — which is the confusion this increment exists to
+  remove, re-introduced. `TestJudgeQueriesLiveDB` pins the equivalence directly (a queued
+  judge found; a completed/failed/cancelled one not; another target's judge not).
+  - Because the index is UNIQUE over exactly this predicate, at most one row can match:
+    `LIMIT 1` is belt-and-braces, not a narrowing. Three columns are projected, not the
+    run row — this is a UI signal, not judge machinery.
+- **`state` is normalized SERVER-side by a mapper that is total BY CONSTRUCTION**
+  (`handler.pendingJudgeState`): `queued → "scheduled"`, **everything else →
+  `"running"`**. The `else` is the decision, and it must never become an enumerated
+  switch. The rows reaching it come from a predicate defined by SUBTRACTION, so its set
+  is "every status `runs.status` legally admits, minus three" — today that already
+  includes `awaiting_approval` (00020) and `awaiting_input` (00092), and it will silently
+  admit whatever a future migration adds to the CHECK. A `queued`/`claimed`/`running`
+  switch would fall through to `state:""` and break the clients' closed union
+  `"scheduled" | "running"` — a blank phrase in the one place the panel exists to
+  explain. Degrading an unknown active status to "a judge is working on it" is true of
+  every member of that set by construction.
+  - The totality is a **schema** argument, not an observed one: a judge run cannot park
+    at the approval gate today (the judge runner has no approval flow, `auto_approve` is
+    autopilot-only). `TestPendingJudgeState` asserts totality including for a status this
+    code has never seen.
+- **The service reports the RAW `runs.status`; only the DTO boundary owns display
+  vocabulary.** `workersvc.PendingJudge{Status, EnqueuedAt}` carries what the database
+  said, and `pendingJudgeToDTO` applies the mapping — so a second consumer cannot invent
+  a third spelling, and the closed union is a server promise the clients may lean on
+  rather than a convention each re-derives. The CLI's own phrase mapper
+  (`pendingJudgePhrase`, `cmd/uzi/run.go`) defaults in the same direction for a different
+  reason: an old CLI against a new server is the deployment order this repo ships in, and
+  the failure to avoid is a blank phrase in `run r1: judge `.
+
+## 462. PRD #119 M1 — `pending_judge` is a SIBLING key, and the panel got its own service method rather than a widened `GetReviewForTarget`
+
+- **A sibling key on the response object, never a field of `ReviewDTO`.** The pending
+  judge is present precisely when there may be no review at all (the common case: an
+  auto-judge enqueued the moment the run went terminal), so hanging it off `ReviewDTO`
+  would make it unreachable in the one state it exists to describe. `review`'s own shape
+  is untouched, which is what keeps every other consumer of the route unaffected.
+- **Both keys on EVERY success path, as an explicit `null` rather than an omitted key.**
+  An absent key and a null one are different claims: "no judge is coming" is a claim this
+  endpoint makes, not something a client should infer from silence. The old
+  `res == nil → {"review": nil}` early return is gone; there is one body, filled in.
+  (A pre-#119 server omits the key entirely, which decodes to the same nil the CLI reads
+  for "no judge in flight" — the compatibility is accidental but load-bearing, and the
+  fake client models both spellings as one reply.)
+- **`GetReviewForTarget` KEPT its signature; the panel got `GetRunReviewPanel`.** Three
+  of its four callers (issue-draft, issue-file, the disposition write path) want a
+  verdict to act on and have no use for a pending judge. Widening the result would have
+  made each of them carry and discard a value, and would have put a second query on write
+  paths that do not need it. The panel is the only caller that needs both, so the panel
+  gets the method that fetches both.
+- **The visibility gate runs ONCE, which is why the body was split.** `reviewForTarget`
+  is the ungated read; `GetRunReviewPanel` applies `GetRunForViewer` once and then runs
+  both reads behind it. An invisible run is `ErrRunNotFound` with **no pending-judge
+  query issued at all**, so the route cannot be used to probe whether some other user's
+  run is being judged. The `admin_ro` mask recorded at §278 is unchanged by the rename:
+  `GetRunReviewPanel` takes the same `isAdmin` and gates through the same helper, so the
+  run-page verdict read stays in §278's masked trio under its new entry point.
+
+## 463. PRD #119 M2/M4 — the poll's stop condition is TWO-SIDED, the 409 backstop discriminates on a MESSAGE, and the mock keys pending state by target id
+
+- **The poll stops on a landed verdict OR a cleared `pending_judge`, and the second is
+  not redundant.** A judge that goes `failed`/`cancelled` leaves the index's active set
+  and produces **no review at all**, so `updated_at` never moves and the cleared pending
+  is the ONLY thing that can end that poll. The absolute cap rose to 150 × 4s ≈ 10 min:
+  the old 15-try (~1 min) bound gave up while the judge it was waiting on was still
+  running. The cap must also `clearInterval` on the fetch-failure path — clearing the
+  local flag does not stop the timer while `pendingJudge` holds its last non-null value.
+- **The effect keys on a BOOLEAN "is anything pending", not on `pendingJudge` itself.**
+  A judge moving scheduled → running yields a new object on almost every tick; depending
+  on the object would tear down and re-create the interval, resetting the local `tries`
+  counter — turning a bounded poll into "poll forever" for exactly the judge that is
+  making progress. One effect run per in-flight episode.
+- **The disable, the label and the in-flight note are armed from SERVER truth, which is
+  the reload fix.** The old `queued` flag existed only in the tab that clicked, so a
+  reload mid-judge lost the note and re-offered the action. The "re-queued" line is
+  suppressed in exactly one case — pending with no review — because *re*-queued is a
+  claim about a run that has been judged before, and the empty-state copy directly below
+  already says a verdict is coming.
+- **The 409 handler STAYS and absorbs the click, discriminating on the message, and the
+  match is deliberately in the failing-safe direction.** The panel's pending answer is
+  point-in-time, so an auto-judge enqueueing between the fetch and the click still 409s:
+  the window shrinks, it does not close, and removing the handler on the theory that the
+  disabled button made it unreachable would be wrong. That click is absorbed into a
+  re-fetch rather than an error banner — the user asked for a judge and a judge is
+  running, which is a success being shown. But the same route answers 409 for
+  `ErrJudgeDisabled` ("run judging is disabled"), which must never be swallowed, and the
+  wire carries no error **code** to discriminate on — only the message. So the match is
+  the already-active message and everything else falls through to today's `Alert`: if the
+  server ever rewords that message this degrades to SHOWING the error (the pre-#119
+  behaviour), never to silently eating "judging is disabled".
+- **The mock keys pending state by TARGET run id, because the wire has no back-link to
+  derive it from.** A `Run` carries no `target_run_id`, and a mock must not invent wire
+  fields (`mockApi.test.ts` enforces exactly that for `set_via`), so an active judge
+  cannot be modelled as a mock judge `Run`. It is a `Record<targetRunId, PendingJudge>`
+  that `getRunReview` reads and `rerunJudge` 409s off **with the server's exact message**
+  — which is what makes the TOCTOU backstop exercisable in mock mode instead of only
+  against a live database. Three terminal fixtures cover the three panel states between
+  them: no review + scheduled, a review + running (re-judge in flight), and a review with
+  nothing pending (the enabled button stays demoable).
+- **CLI parity is TWO client-side changes, and the second is the one that hides.** The
+  typed client gains the field, **and** `runReviewShow`'s `--json` map must carry it:
+  that map IS the `--json` envelope, re-minted rather than proxied, so a key the server
+  adds and the map omits is invisible to every `--json` consumer even after the DTO has
+  it. (This supersedes §283's "passes the envelope through" — it never did; the claim was
+  accidentally true only while the envelope had one key.) `renderReview` takes the
+  pending judge as a second parameter because all four review×pending combinations are
+  real states and two of them used to print the same line; a re-judge in flight over an
+  existing verdict prints the review in full plus a `note:` that it is about to be
+  replaced, alongside — not instead of — the incomplete caveat.
