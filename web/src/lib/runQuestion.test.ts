@@ -7,6 +7,7 @@ import {
   encodeAnswerBody,
   parseAnswerPayload,
   parseQuestionPayload,
+  parseQuestionsForDisplay,
   questionOrdinal,
 } from "./runQuestion";
 
@@ -108,6 +109,37 @@ describe("parseQuestionPayload", () => {
     expect(parseQuestionPayload(null)).toBeNull();
     expect(parseQuestionPayload("q")).toBeNull();
     expect(parseQuestionPayload([{ question_id: "q" }])).toBeNull();
+  });
+});
+
+describe("parseQuestionsForDisplay (the DISPLAY half of the split)", () => {
+  // parseQuestionPayload answers "can this be ANSWERED?" and needs question_id, because
+  // the api rejects an answer that names no question. A feed row asks "can this be
+  // DISPLAYED?" and needs only the text. Running the strict parse at a display site
+  // conflated the two and threw away showable text — measured in the browser as a feed
+  // reading "unrenderable question event" under a card promising the question was there.
+  it("returns the questions with NO question_id at all", () => {
+    const qs = parseQuestionsForDisplay({ questions: [{ question: "Which cache TTL?", header: "TTL" }] });
+    expect(qs).toEqual([{ question: "Which cache TTL?", header: "TTL", options: [], multiSelect: false }]);
+    // And the strict parse still refuses the same payload — the two must not converge,
+    // or the panel would offer a composer whose every submit 400s.
+    expect(parseQuestionPayload({ questions: [{ question: "Which cache TTL?", header: "TTL" }] })).toBeNull();
+  });
+
+  it("returns [] when there is nothing renderable, so the caller can still fall back", () => {
+    expect(parseQuestionsForDisplay({ questions: [] })).toEqual([]);
+    expect(parseQuestionsForDisplay({ questions: [{ question: "  ", header: "h" }] })).toEqual([]);
+    expect(parseQuestionsForDisplay(null)).toEqual([]);
+    expect(parseQuestionsForDisplay("nope")).toEqual([]);
+  });
+
+  it("agrees with the strict parse on a WELL-FORMED payload", () => {
+    // The split must not become a second, drifting reading of the same bytes.
+    const payload = {
+      question_id: "q-1",
+      questions: [{ question: "Pick?", header: "H", options: [{ label: "a", description: "d" }], multiSelect: true }],
+    };
+    expect(parseQuestionsForDisplay(payload)).toEqual(parseQuestionPayload(payload)!.questions);
   });
 });
 

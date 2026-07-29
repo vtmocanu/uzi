@@ -1302,6 +1302,36 @@ describe("PlanPanel canSteer (PRE-EXISTING hole, fixed alongside PRD #88)", () =
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
   });
 
+  it("does not contradict itself: the HEADING follows canSteer like the subtitle", () => {
+    // Measured in the browser: a non-owner saw "Plan awaiting your approval" directly
+    // above "Only they can approve or reject it" — the subtitle was conditional and the
+    // heading was not. QuestionPanel's non-owner branch changes both; this is the older
+    // panel's half of the same fix, left incomplete.
+    gated();
+    expect(screen.getByText(/Plan awaiting the owner's approval/)).toBeTruthy();
+    expect(screen.queryByText(/awaiting your approval/)).toBeNull();
+  });
+
+  it("keeps the REVISED heading viewer-aware too", () => {
+    // A v2+ re-gate has its own heading string, so gating only the first would put the
+    // contradiction straight back for any run that was revised once.
+    render(
+      <PlanPanel
+        run={run({ repo_agents: [], own_agents: [] })}
+        messages={[
+          { seq: 1, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "a" }, created_at: "2026-07-28T00:00:00Z" },
+          { seq: 2, kind: "plan", agent: "lead", agent_instance: null, agent_label: null, payload: { plan_md: "b" }, created_at: "2026-07-28T00:00:02Z" },
+        ]}
+        busy={false}
+        canSteer={false}
+        onApprove={() => {}}
+        onReject={() => {}}
+      />,
+    );
+    expect(screen.getByText(/Updated plan awaiting the owner's approval/)).toBeTruthy();
+    expect(screen.queryByText(/awaiting your approval/)).toBeNull();
+  });
+
   it("keeps the plan READABLE — the reason a non-owner admin opens this page", () => {
     // Hiding the panel outright would turn a permissions boundary into a blank page.
     gated();

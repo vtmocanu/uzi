@@ -931,7 +931,18 @@ export function PlanPanel({
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">
-            {revised ? "Updated plan awaiting your approval" : "Plan awaiting your approval"}
+            {/* The HEADING is conditional on canSteer for the same reason the subtitle
+                below is. Leaving it unconditional put "Plan awaiting your approval"
+                directly above "Only they can approve or reject it" for a non-owner —
+                a card contradicting itself on adjacent lines. QuestionPanel's non-owner
+                branch changes both, and this is the older panel's half of that fix. */}
+            {!canSteer
+              ? revised
+                ? "Updated plan awaiting the owner's approval"
+                : "Plan awaiting the owner's approval"
+              : revised
+                ? "Updated plan awaiting your approval"
+                : "Plan awaiting your approval"}
             <VersionChip label={`v${currentVersion}`} />
           </h2>
           <p className="text-xs text-muted">

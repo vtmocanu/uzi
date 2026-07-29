@@ -123,9 +123,33 @@ export function parseQuestionPayload(payload: unknown): QuestionPayload | null {
   if (!rec) return null;
   const questionId = asString(rec["question_id"]).trim();
   if (questionId === "") return null;
-  const questions = parseQuestions(rec["questions"]);
+  const questions = parseQuestionsForDisplay(payload);
   if (questions.length === 0) return null;
   return { questionId, questions };
+}
+
+/**
+ * parseQuestionsForDisplay reads only the part a READER needs, with no `question_id`
+ * requirement. Returns [] when nothing is renderable.
+ *
+ * 🔴 THE SPLIT IS THE POINT. parseQuestionPayload answers "can this be ANSWERED?", which
+ * needs the id because the api rejects an answer that names no question. A feed row asks
+ * "can this be DISPLAYED?", which needs only the text. Running the answerability parse at
+ * a display site conflates the two and DISCARDS text that is perfectly showable.
+ *
+ * Measured in the browser: a seeded question missing its `question_id` but carrying
+ * "Which cache TTL?" rendered in the feed as the literal line `unrenderable question
+ * event` — while the panel above it told the user "the raw question is in the activity
+ * log below". The card's promise and the row's behaviour disagreed, and the user was left
+ * in the one state where they are already confused with nothing to read.
+ *
+ * So: the panel keeps the strict parse (offering a composer that cannot work is worse
+ * than offering none), and the feed keeps whatever it can show.
+ */
+export function parseQuestionsForDisplay(payload: unknown): AskQuestion[] {
+  const rec = asRecord(payload);
+  if (!rec) return [];
+  return parseQuestions(rec["questions"]);
 }
 
 /** parseAnswerPayload reads an `answer` message's payload for the feed row. A payload

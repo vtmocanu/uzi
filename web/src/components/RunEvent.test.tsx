@@ -391,16 +391,36 @@ describe("RunEventRow rendering", () => {
     expect(container.querySelector("[onmouseover]")).toBeNull();
   });
 
-  it("degrades a question with no question_id to the unrenderable line", () => {
-    // An id-less question can be displayed but never answered (the api rejects an answer
-    // that names no question), so it must not masquerade as an actionable one.
+  it("STILL RENDERS a question that carries no question_id — a row shows, it does not answer", () => {
+    // 🔴 THIS TEST ASSERTED THE OPPOSITE UNTIL THE SECOND BROWSER PASS, AND IT WAS PINNING
+    // THE DEFECT. Its reasoning was: "an id-less question can be displayed but never
+    // answered, so it must not masquerade as an actionable one." The first half is right
+    // and the conclusion does not follow — it applies the PANEL's requirement to the ROW.
+    // A feed row is not an actionable surface; it offers nothing to click. Refusing to
+    // draw it discarded text the user could read, and left the unreadable card promising
+    // "the raw question is in the activity log below" above a log that said only
+    // "unrenderable question event".
+    //
+    // The panel's strict parse is unchanged — see the paired test in
+    // mocks/unreadableQuestionPair.test.tsx, which is what keeps the two honest together.
     const { container } = render(
       <RunEventRow
-        msg={msg({ seq: 1, kind: "question", payload: { questions: [{ question: "q", header: "h" }] } })}
+        msg={msg({ seq: 1, kind: "question", payload: { questions: [{ question: "Which cache TTL?", header: "TTL" }] } })}
         live={false}
       />,
     );
-    expect(container.textContent).toContain("unrenderable question event");
+    expect(container.textContent).toContain("Which cache TTL?");
+    expect(container.textContent).not.toContain("unrenderable");
+  });
+
+  it("falls back to the unrenderable line only when NOTHING is renderable", () => {
+    for (const payload of [{ questions: [] }, { questions: [{ question: "  ", header: "h" }] }, {}]) {
+      const { container, unmount } = render(
+        <RunEventRow msg={msg({ seq: 1, kind: "question", payload })} live={false} />,
+      );
+      expect(container.textContent).toContain("unrenderable question event");
+      unmount();
+    }
   });
 
   it("renders the answer echo escaped, and names an empty answer rather than hiding it", () => {

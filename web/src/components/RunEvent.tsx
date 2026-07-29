@@ -14,7 +14,7 @@ import {
   TerminalIcon,
   ThoughtIcon,
 } from "./icons";
-import { parseAnswerPayload, parseQuestionPayload } from "../lib/runQuestion";
+import { parseAnswerPayload, parseQuestionsForDisplay } from "../lib/runQuestion";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -1115,8 +1115,15 @@ export const RunEventRow = memo(function RunEventRow({
     // React text children. Nothing here reaches href/title/style — option `label` in a
     // `title` attribute would be the one channel a subtree-text assertion cannot see.
     case "question": {
-      const q = parseQuestionPayload(msg.payload);
-      if (!q) return <UnrenderableRow kind={msg.kind} rec={rec} />;
+      // parseQuestionsForDisplay, NOT parseQuestionPayload. The strict parse requires a
+      // `question_id` because an answer must name one — but a feed row answers nothing,
+      // it only shows. Running the answerability parse here threw away perfectly
+      // displayable text: measured in the browser, a question missing its id rendered as
+      // the literal line "unrenderable question event" while the panel above it said "the
+      // raw question is in the activity log below". The row is what makes that sentence
+      // true, so the two are pinned together by a test that renders BOTH.
+      const questions = parseQuestionsForDisplay(msg.payload);
+      if (questions.length === 0) return <UnrenderableRow kind={msg.kind} rec={rec} />;
       return (
         <div className="rounded-md border border-warn/40 bg-warn/[0.08] px-2.5 py-1.5 text-sm">
           {/* No "question N of M" marker here. The ordinal used to ride the payload as
@@ -1130,7 +1137,7 @@ export const RunEventRow = memo(function RunEventRow({
             question for you
           </div>
           <ul className="space-y-2">
-            {q.questions.map((item, i) => (
+            {questions.map((item, i) => (
               <li key={i} className="space-y-1">
                 {item.header.trim() !== "" && (
                   <div className="text-xs font-semibold text-fg">
