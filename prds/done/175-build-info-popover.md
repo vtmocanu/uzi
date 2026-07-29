@@ -1,7 +1,15 @@
 # PRD #175: Build info in the UI — the version badge stops being a string and becomes a coordinate set
 
 **GitLab Issue**: [#175](https://gitlab.example.com/vtmocanu/uzi/-/issues/175)
-**Status**: Not started (Planned). Created 2026-07-27.
+**Status**: **Complete 2026-07-28.** Created 2026-07-27. Merged as [!144](https://gitlab.example.com/vtmocanu/uzi/-/merge_requests/144). All five milestones shipped, including M3, which was explicitly droppable and was not dropped.
+
+> **Delivered beyond the milestone list**, on the owner's approval after review: the `useAppVersion` dead-arm fix (OQ-C/D's inherited-open item — a failed `/api/version` had shown "version pending" forever instead of a degraded message), and the correction to the fleet-panel copy that fix made visible for the first time. Both are recorded in `specs/ai.md` §453-§454.
+>
+> **Two constraints were ratified into `specs/human.md`** (Feature #175, `[user 2026-07-28]`): that `uptime_seconds` is published on an unauthenticated endpoint at accepted severity Low, and that `uzi version --json` gained a `server` key. Everything else this PRD decided was the team's and lives in `specs/ai.md` §448-§454.
+>
+> **Two residuals are open by design, not by omission.** The CI stamping path (`$CI_JOB_STARTED_AT` and `$UZI_COMMIT_COUNT` expanding inside a `variables:` value) is established from GitLab's implementation source at two layers but has never been observed on our runner; a permanent echo-only `before_script` on `publish:api` answers it at the first tag pipeline, and a silent non-expansion degrades to an omitted field that looks identical to a dev build. Instance-level CI variables were not enumerated (admin scope required), so a same-named variable shadowing `UZI_COMMIT_COUNT` is unchecked.
+>
+> **Two findings were split out rather than fixed here**: [#180](https://gitlab.example.com/vtmocanu/uzi/-/issues/180) (the CLI renders server-supplied strings raw, ESC sequences included — house-wide, `uzi version` was only the command under review) and [#181](https://gitlab.example.com/vtmocanu/uzi/-/issues/181) (`specs/ai.md` has §403-§416 buried mid-file, invisible to the tail-based sweep its own numbering rule prescribes).
 **Priority**: Low — nothing is broken. `GET /api/version` works and the footer renders it. This buys instance-debuggability ("what exactly is deployed on dev-cluster right now") and a small amount of project identity.
 **Mockup**: [`prds/mockups/175-build-info-popover-mock.html`](mockups/175-build-info-popover-mock.html) — four surfaces mocked in uzi's own `ember`/`mission` chrome. Variant A (badge popover) is the one this PRD implements; the other three are kept in the file deliberately, as the record of what was rejected and why.
 
@@ -38,6 +46,14 @@ Enumerated because the back-compat claim depends on it being complete, and becau
 | Route classification tests | `tls_listener_routes_test.go:75`, `route_limiter_mounts_test.go:198` |
 
 **The `uzi` CLI is *not* a consumer** — `api/internal/uzicli/` contains no `/version` call at all; `uzi version` prints its own ldflags stamp. The two coordinates agree only because the same tag stamps both.
+
+> **SUPERSEDED 2026-07-28 by M4, which is this PRD's own milestone. Every clause of the sentence above is now false.** `api/internal/uzicli/client.go` issues `c.get(ctx, "/api/version", &out)` inside `(*HTTPClient).BuildInfo`, reached from `api/cmd/uzi/version.go`. The CLI is a real consumer, and the two coordinates no longer agree merely because one tag stamps both: `uzi version` reports the server's coordinate alongside its own.
+>
+> **Kept rather than rewritten, because the sentence is the PRD's founding premise.** The problem statement is built on the CLI *not* reading this endpoint — that is what made `handler.go`'s "so the SPA footer and the uzi CLI report one coordinate" a false claim worth a milestone. Deleting it would erase the reason M4 exists.
+>
+> **This is the fourth site of one claim, and the first three were caught while this one was missed.** `.claude/agent-team-tasks/prd-175-brief.md`'s "Cross-milestone: one owner for the doc end state" reasoned that an M1 replacement worded *"the CLI is not a consumer"* would ship wrong in the same MR, and assigned the end state for `handler.go`, `main.go` and `ARCHITECTURE.md`. Nobody applied that reasoning to the PRD's own table. A planning doc is exactly the artifact with no gate on it — nothing compiles it, no test reads it, and it is what the next person consults first.
+>
+> The line-number citations in the table above are **not** affected: they were verified accurate against `7bb07572`, the SHA this PRD anchors itself to, and their drift since is ordinary. Only this sentence is a content claim rather than a coordinate, and only it went stale.
 
 That matters more than a pedantic correction. `useAppVersion` feeds the **worker upgrade badge**, so this endpoint gates PRD #113's classification and is not merely cosmetic — see M2, where the tri-state that badge depends on is the single largest regression risk in this PRD.
 
@@ -116,3 +132,17 @@ Everything except `commits` is available with no new infrastructure, which is wh
   **If none is attractive, M3 is dropped and the PRD still delivers.**
 - **OQ-B — `uzi version`'s output shape is a contract change and needs confirmation before M4 starts.** Larger than the first draft framed it. Today the command is offline and instantaneous (`version.go:16-23`). Three affected audiences: agents parsing `--json`, which `docs/cli.md:13` sells as a contract; the Homebrew formula asserting on stdout; and humans. **Proposed shape: keep top-level `version` as the CLI's own coordinate and nest the server's under a `server` key**, so existing parsers are untouched. Confirm before implementing, not after.
 - **OQ-C + OQ-D — the signed-out shell and `uptime_seconds`, resolved together.** They are coupled and the first draft treated them as independent. `SidebarContent` is reachable only past `if (!user) return <PublicShell>` (`AppShell.tsx:670`), so today `uptime_seconds` would have exactly one consumer and it is authenticated. Answering "show the popover signed-out too" is precisely what makes "is uptime public?" a real question. **Recommendation: no signed-out popover** — it keeps the blast radius at zero and makes the uptime question moot. If it is yes, then either accept uptime as public and say so, or move it to an authenticated route and keep `/api/version` to build facts only.
+
+  > **RESOLVED 2026-07-28, and the sentence above is WRONG about why. Read the resolution, not the recommendation.**
+  >
+  > **Decision: no signed-out popover, and `uptime_seconds` is kept and declared public.** The *decision* is what this bullet recommended. The *reason* it gives does not hold, and an auditor and a reviewer refuted it independently, from different starting points, before any code was written.
+  >
+  > "It keeps the blast radius at zero and makes the uptime question moot" is a claim about the **UI**. The property is enforced at the **endpoint**, and the endpoint is unauthenticated. Re-derived at `0c56bcee`: `r.Get("/version", h.Version)` mounts directly under `r.Route("/api")` with only `Recoverer` + `RequestID` above it; `route_limiter_mounts_test.go:203` pins it `noLimiter`; `web` same-origin-proxies `/api/*`; and `deploy/chart/templates/web-ingress.yaml` publishes it at `path: /` with no auth annotation. So uptime in that body is world-readable, credential-free and unrate-limited **whether or not a signed-out popover exists**. Blast radius is "everyone who can reach the ingress", never zero. The signed-out popover changes **discoverability**, not exposure — so it was never the thing that made uptime public, and declining it does not make the question moot.
+  >
+  > **The real reason the field is kept: uptime is acceptable as public.** Severity Low. It discloses restart and patch cadence, and paired with `version` gives a freshness oracle ("this instance has been running build X unpatched for N days") plus an unauthenticated liveness probe. That is a judgement, and it is recorded here as one.
+  >
+  > **Every other field passes the already-public test on its own**, which is what isolates uptime as the single case needing a judgement: `version` == the chart's image tag; `commit` is already pushed as the Harbor tag `:$CI_COMMIT_SHORT_SHA` (`.gitlab-ci.yml:687`); `built_at` is implied by the release tag; `founded` and `commits` are consts and counts. **`uptime_seconds` is the only RUNTIME fact in a response otherwise made entirely of BUILD facts** — which is exactly the line this PRD's own rule at :63 draws, and the reason it needed answering rather than assuming.
+  >
+  > **Where the statement lives, and why not here.** In `api/internal/handler/handler.go`'s `Version` doc comment (the enforcement point), in `BuildInfoDTO`'s type doc, in `ARCHITECTURE.md`'s trust-boundaries section, and in `TestVersionEndpointCarriesNothingPrivate`, whose public-list comment splits "already public" from "considered disclosure" with uptime as the sole member of the second class. **A rule recorded only in a PRD has no gate on it** — and this PRD's own named follow-ups (an `/about` page, a signed-out footer) would silently republish the field with nothing in the code noticing.
+  >
+  > **The cost that is real, and is not about this decision:** `uptime_seconds` establishes a *category*. Once one runtime fact lives on this endpoint, "which replica", "how many replicas", "what region", "what pod" all become the same kind of request rather than obviously out of scope — and every one of those is identity- or topology-bearing. The counterweight is the closed-key-set gate, which is why that gate being genuinely closed matters more after this decision than before it.

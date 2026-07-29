@@ -4,6 +4,21 @@ Notable changes to uzi, loosely following [Keep a Changelog](https://keepachange
 Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
 file is not bumped per-commit; `[Unreleased]` collects everything since the last tag.
 
+## [Unreleased]
+
+### Fixed
+
+- **The release runbook no longer describes a skip-CI commit as merely a cold-cache
+  slowdown.** GitLab applies a skip-CI marker (`[skip ci]`, `[ci skip]`, at least, any
+  capitalization, anywhere in the message) to the commit, not the ref, so tagging one
+  skips the tag pipeline too and publishes nothing, while `git push` still reports
+  success and a bare `glab ci status` right after the push reports `main`'s pipeline,
+  not the tag's. `deploy/README.md` now calls this out separately from the cache note
+  it used to be folded into, names `glab ci status --branch <tag>` as the check that
+  actually looks at the right ref, and covers the recovery: trigger the pipeline
+  manually with `glab ci run --branch <tag>` rather than moving the tag (issue #178).
+- A repo with open issues but none carrying the PRD label no longer re-reads its entire open issue set on every poll: the PRD-labelled and additive open, no-label fetches (PRD #102 M6) now advance separate high-water marks instead of sharing one that could never move past zero when the PRD-labelled fetch came back empty (issue #177).
+
 ## [0.12.0] - 2026-07-28
 
 ### Added
@@ -21,6 +36,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   life is 48h and 10 questions on the defaults, not 24h and 5. Autopilot
   runs never park on a question — they proceed on their own best judgment
   and record the assumption in the feed instead (PRD #88).
+
+- **The footer version badge is now a build-info popover.** Hover, focus or tap it to see the
+  release version, the project's founding date, age (computed client-side, so it stays correct
+  between releases), and process uptime, plus, on a release image built in CI, the source commit,
+  build timestamp and commit count. `GET /api/version` keeps its `version` key unchanged, both
+  name and value, and adds the rest of those fields alongside it; unstamped fields are omitted
+  rather than zero-filled, so a local `docker compose` build reports only version, founding date
+  and uptime, and the commit count is available only on a tagged release build. `uzi version`
+  now reports the server's build info alongside its own: the CLI's own version stays top-level
+  and the server's nests under a `server` key, so existing `--json` parsers are unaffected
+  (PRD #175).
 
 - **Manual drag-to-reorder for board cards, a sort switcher, and a keyboard
   equivalent.** Drag a card within its column to set the board's order by

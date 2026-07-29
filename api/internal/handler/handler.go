@@ -5,6 +5,8 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -96,9 +98,30 @@ type Handler struct {
 	usagePoker UsagePoker
 	// version is the server build version, stamped into cmd/server via ldflags
 	// (Model B: == the release git tag) and served unauthenticated at GET
-	// /api/version so the SPA footer and the uzi CLI report one coordinate. Defaults
-	// to "dev" on an un-stamped local/compose build. Set via SetVersion.
+	// /api/version. Two consumers read it: the SPA, for the footer badge and for PRD
+	// #113's worker upgrade classification, and the uzi CLI, which reports it
+	// alongside its own ldflags stamp (PRD #175 M4). Defaults to "dev" on an
+	// un-stamped local/compose build. Set via SetVersion.
+	//
+	// (Before PRD #175 this comment said the endpoint existed "so the SPA footer and
+	// the uzi CLI report one coordinate", which was false as written: the CLI was not
+	// a consumer at all — api/internal/uzicli held no /version call, `uzi version`
+	// printed only its own stamp, and the two agreed solely because the same tag
+	// stamps both. #175 M4 made the shared coordinate real rather than assumed; the
+	// call is uzicli.(*HTTPClient).BuildInfo. Kept because the claim above was wrong
+	// once for a reason worth remembering — two coordinates agreeing is not the same
+	// as one being read.)
 	version string
+	// commit / builtAt / commits are the rest of GET /api/version's build coordinates
+	// (PRD #175), stamped into cmd/server by the same ldflags line as version and
+	// carried here as the raw strings the linker injected. Empty on every un-stamped
+	// build — a local `go build`, `docker compose build`, and the MR/main validation
+	// image, since only the tag (publish) build passes them — and an empty or
+	// unparseable value is OMITTED from the response rather than served as a zero.
+	// Set via SetBuildInfo.
+	commit  string
+	builtAt string
+	commits string
 	// now / startedAt serve PRD #113's upgrade classification. startedAt anchors the
 	// no-controller-signal grace for hosted workers: Model B rolls the api in the same
 	// release as the workers, so process start is a free proxy for "a release just
@@ -217,6 +240,35 @@ func (h *Handler) SetVersion(v string) {
 	}
 }
 
+// BuildStamp carries the ldflags-injected build coordinates from cmd/server into the
+// handler (PRD #175 M1). A struct rather than three positional parameters because
+// they are all strings: a positional signature could be miscalled with two of them
+// swapped and nothing — not the compiler, not vet — would say so.
+//
+// Every field is optional and none is validated here. Unstamped or unparseable
+// values are dropped at RESPONSE time rather than at set time, so the handler holds
+// exactly what the linker injected and one place decides what "unknown" means.
+type BuildStamp struct {
+	// Commit is the full 40-char source SHA (-X main.commit).
+	Commit string
+	// BuiltAt is the image build time, expected RFC3339 in UTC (-X main.builtAt).
+	BuiltAt string
+	// Commits is the commit count as a decimal string (-X main.commits, PRD #175 M3).
+	Commits string
+}
+
+// SetBuildInfo stamps the non-version build coordinates served at GET /api/version.
+// Called once in main alongside SetVersion with the ldflags-injected values.
+//
+// Unlike SetVersion — which must not let an empty stamp clobber the "dev" default —
+// this assigns unconditionally: there is no default to protect, and empty genuinely
+// means "this build does not know", which is what the response omits.
+func (h *Handler) SetBuildInfo(s BuildStamp) {
+	h.commit = strings.TrimSpace(s.Commit)
+	h.builtAt = strings.TrimSpace(s.BuiltAt)
+	h.commits = strings.TrimSpace(s.Commits)
+}
+
 // SetReconciler wires the poller's force-reconcile signal in after construction,
 // matching how the run-lifecycle collaborators are attached in main (the poller
 // is built after the handler's other deps). Safe to leave unset in tests.
@@ -270,11 +322,106 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// Version reports the server build version (Model B: the release git tag),
-// stamped via ldflags and defaulting to "dev" on a local build. Unauthenticated
-// like Health — the SPA footer reads it, and it carries no secret.
+// foundedDate is uzi's first commit date, and the `founded` field of GET
+// /api/version. Evidence: 366a282d "Initial commit", authored 2026-07-03. A const
+// because it is never going to change; the consumer computes the project's age from
+// it, so the age stays correct without a release.
+const foundedDate = "2026-07-03"
+
+// isFullSHA reports whether s is a full 40-character hex commit SHA.
+//
+// It exists so `commit` degrades the same way `built_at` and `commits` do. Without it
+// commit was the one stamp with no validity gate — served verbatim, any non-empty
+// string — so an unexpanded CI variable reached the wire as the literal
+// "$CI_COMMIT_SHA". That is the one shape this endpoint must not produce: a value that
+// looks like an answer. It also makes BuildInfoDTO.Commit's "the full 40-char source
+// SHA" an enforced property rather than an aspiration, which matters once a consumer
+// truncates it for display — the first seven characters of "$CI_COMMIT_SHA" are
+// "$CI_COM", and that reads like a short SHA.
+//
+// Uppercase is accepted. git and $CI_COMMIT_SHA both emit lowercase, so this will not
+// come up; rejecting a hex SHA over its case would be a surprising failure with no
+// upside.
+func isFullSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// Version reports this instance's build coordinates (PRD #175): the Model-B release
+// version, the project's founding date, this process's uptime, and — on a stamped
+// release image — the source commit, the build time and the commit count.
+//
+// Unauthenticated and unrate-limited like Health, and that is a deliberate standing
+// property rather than an oversight. It is also where the property is ENFORCED, which
+// is why the rest of this comment is here and not only in the PRD: the route is
+// mounted directly under r.Route("/api") with nothing above it but Recoverer and
+// RequestID, route_limiter_mounts_test.go pins it as noLimiter, and in k8s
+// deploy/chart/templates/web-ingress.yaml publishes the SPA origin at path `/` with
+// no auth annotation BY DEFAULT (both the path and the annotations are values, so a
+// hardened override could narrow them — the enforced property is the route mount
+// above, not the chart). So this body is world-readable, credential-free and unmetered
+// to anyone who can reach the ingress.
+//
+// Most of what it carries is public by construction — the version is the chart's
+// image tag, the commit is in the repo, built_at is implied by the
+// release, founded and commits are consts. `uptime_seconds` is NOT in that class and
+// is the one field that needs a decision rather than an observation: it is a RUNTIME
+// fact about this process, not a build fact about this image. It is published
+// DELIBERATELY (PRD #175, severity Low) because process age is worth real debugging
+// time and reveals no identity, no topology and no schedule.
+//
+// Two consequences worth stating where a reader will hit them. First, "it carries no
+// secret" is no longer the whole test — a field can be secret-free and still be a
+// runtime disclosure, so weigh both. Second, any NEW surface for this body
+// republishes uptime to a wider audience by default: the PRD's own named follow-ups,
+// an /about page and a signed-out footer, would both do it, and nothing in the code
+// would notice. If either ships, re-decide uptime rather than inheriting this one.
+//
+// A field that is neither public nor a considered disclosure — a hostname, an env
+// var, a filesystem path, a dependency inventory — does not belong here at all. This
+// is precisely the endpoint class where that conventionally goes wrong;
+// TestVersionEndpointCarriesNothingPrivate pins the key set closed so an addition is
+// a deliberate act.
+//
+// Unknown beats wrong throughout: a stamp that is absent or does not parse is omitted
+// rather than half-decoded into a plausible-looking value. See apitypes.BuildInfoDTO.
 func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]string{"version": h.version})
+	info := apitypes.BuildInfoDTO{
+		Version: h.version,
+		Founded: foundedDate,
+	}
+	if isFullSHA(h.commit) {
+		info.Commit = h.commit
+	}
+	if t, err := time.Parse(time.RFC3339, h.builtAt); err == nil {
+		// Re-formatted from the parsed value, so the wire carries one canonical
+		// spelling whatever offset notation CI stamped.
+		info.BuiltAt = t.UTC().Format(time.RFC3339)
+	}
+	if n, err := strconv.Atoi(h.commits); err == nil && n >= 0 {
+		info.Commits = &n
+	}
+	// A zero startedAt is the struct-literal Handler many tests build (see clock()),
+	// not a process that started at the epoch: report unknown rather than ~2 millennia.
+	if !h.startedAt.IsZero() {
+		secs := int64(h.clock().Sub(h.startedAt).Seconds())
+		if secs < 0 {
+			// An injected clock set behind startedAt. Report the floor; a negative
+			// age is never a truer answer than zero.
+			secs = 0
+		}
+		info.UptimeSeconds = &secs
+	}
+	httpx.JSON(w, http.StatusOK, info)
 }
 
 // Routes builds the API router. authLimiter is applied per-route to the
@@ -294,6 +441,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
+		// unauthenticated by design — see Version's doc comment before moving this
+		// line or wrapping this group in middleware.
 		r.Get("/version", h.Version)
 
 		r.Route("/auth", func(r chi.Router) {
