@@ -417,7 +417,14 @@ above).
   passes against a split-blind implementation; (d) two models sum per-model and
   per-agent correctly; (e) an unpriced model yields a partial total plus a
   populated `unpricedModels` rather than a silently low number.
-- [ ] **M3 — Run-page panel.** Estimate-led figure with confirmed beneath it,
+- [ ] **M3 — Run-page panel. BLOCKED ON [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**
+  That issue found, during this PRD's review, that the run page's existing token
+  columns already read a different population from every rollup surface: the
+  client reads the result frame's top-level `usage` (`runUsage.ts:175`) while the
+  server folds only `modelUsage`, and on run `84b6a933` seq 173 they differ by
+  2.5-3.2x. Adding an estimate column on top would put three populations in one
+  panel with two of them mislabelled. Land #195 first.
+  Estimate-led figure with confirmed beneath it,
   panel renders before the first result frame, per-model and per-agent estimate
   columns, explicit not-priced state, the `:262-264` footnote retired, mock
   scenarios for: pre-first-phase (estimate only), mid-run (both), unpriced model
