@@ -2500,9 +2500,20 @@ export const mockApi = {
       throw new ApiError(409, "a judge run is already in progress for this run");
     }
     // A mock judge run: no worker executes it, so the seeded review is unchanged —
-    // the panel just shows the "re-queued" note. Cloning the target run yields a
+    // the panel just shows the in-flight note. Cloning the target run yields a
     // valid Run shape for the envelope.
     const judge: Run = { ...run, id: nextRunId(), kind: "judge", status: "queued" };
+    // Register it as the target's ACTIVE judge, mirroring the row the real POST inserts
+    // (`queued` → the DTO's `scheduled`). Without this the mock told two lies at once:
+    // the next getRunReview kept answering pending_judge:null, so a re-run left the
+    // button disabled by the local flag but still LABELLED "Re-run judge" where the real
+    // server flips it to "Judge scheduled" on the very next poll; and nothing ever
+    // populated pendingJudges from the UI, so the 409 branch below — the panel's TOCTOU
+    // absorb path — was unreachable in mock mode and could not be demoed at all.
+    // The demo consequence is that the button stays disabled until a reload re-seeds the
+    // module. That is FAITHFUL: a real judge holds the target's active slot until it
+    // reaches a terminal status, and no mock worker will ever finish this one.
+    pendingJudges[id] = { state: "scheduled", enqueued_at: new Date().toISOString() };
     return delay({ run: judge }, 120);
   },
   getRunMessages: async (id: string, afterSeq = 0) => {

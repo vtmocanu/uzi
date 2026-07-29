@@ -75,6 +75,12 @@ function seed(): MockState {
   messages.set("run-limit-wait-due", mockLimitWaitMessages.map((m) => ({ ...m })));
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
+  // The never-judged control fixture (PRD #119): a terminal run with no review AND no
+  // pending judge, so the run page's unchanged "hasn't been judged yet" empty state and
+  // its live Run-judge button stay demoable — run-failed used to be that fixture and now
+  // carries a scheduled judge. An empty log rather than no entry: getRunMessages 404s on
+  // an unseeded id, which the real API does not do for a run that exists.
+  messages.set("run-unjudged", []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });

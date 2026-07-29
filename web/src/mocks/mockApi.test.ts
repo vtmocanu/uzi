@@ -154,6 +154,39 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     await expect(api.getRunReview("does-not-exist")).rejects.toMatchObject({ status: 404 });
   });
 
+  // 🔴 The demo is the only place these four states are ever LOOKED at — the panel's own
+  // tests mount JudgePanel against stubbed responses, so they stay green for a mock that
+  // can no longer reach a state at all. That is exactly how #119 shipped with the
+  // never-judged empty state (unchanged copy, ENABLED button) unreachable: run-failed was
+  // the one terminal run with no review and the PRD gave it a scheduled auto-judge.
+  // Asserted as a COVERAGE claim over the fixtures rather than by run id, so renaming or
+  // re-purposing any one of them is free and dropping a state is not.
+  it("keeps all four run-review panel states reachable from the fixtures (#119)", async () => {
+    installStorage();
+    const api = await reload();
+    const { mockRuns } = await import("./data");
+
+    const terminal = new Set(["completed", "failed", "cancelled"]);
+    const judgeable = mockRuns.filter(
+      (r) => terminal.has(r.status) && (r.kind === "issue" || r.kind === "ci_fix"),
+    );
+    const seen = new Set<string>();
+    for (const r of judgeable) {
+      const { review, pending_judge } = await api.getRunReview(r.id);
+      seen.add(`${review === null ? "no-review" : "review"}/${pending_judge?.state ?? "none"}`);
+    }
+
+    // never judged (enabled Run judge) / auto-judge coming / re-judge in flight over a
+    // verdict / settled verdict with a live Re-run judge.
+    for (const state of ["no-review/none", "no-review/scheduled", "review/running", "review/none"]) {
+      expect(
+        seen.has(state),
+        `no terminal, judge-eligible fixture renders the panel's "${state}" state — it ` +
+          `cannot be browsed in mock mode, which is where this panel gets validated`,
+      ).toBe(true);
+    }
+  });
+
   it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {
     installStorage();
     const api = await reload();
@@ -161,6 +194,22 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     const { run } = await api.rerunJudge("run-done");
     expect(run.kind).toBe("judge");
     expect(run.status).toBe("queued");
+
+    // …and it REGISTERS as the target's active judge, the way the real POST's inserted
+    // row does. Without this the mock answered pending_judge:null on the next read, so
+    // the panel's button stayed labelled "Re-run judge" where the server relabels it
+    // "Judge scheduled" on the next poll — the mock disagreeing with the API it stands in
+    // for, in exactly the state PRD #119 exists to render.
+    const after = await api.getRunReview("run-done");
+    expect(after.pending_judge).toEqual({ state: "scheduled", enqueued_at: expect.any(String) });
+
+    // And that makes the index's refusal reachable FROM THE UI: a second click on the
+    // same target 409s, which is the TOCTOU path the panel absorbs into a re-fetch. Only
+    // pre-seeded targets could produce it before.
+    await expect(api.rerunJudge("run-done")).rejects.toMatchObject({
+      status: 409,
+      message: "a judge run is already in progress for this run",
+    });
 
     // A still-queued run is not terminal, so it cannot be judged.
     await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });

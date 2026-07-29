@@ -505,7 +505,14 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(screen.getByText(/hasn't been judged yet/i)).toBeTruthy();
     fireEvent.click(btn);
     expect(mockApi.rerunJudge).toHaveBeenCalledWith("r1");
-    expect(await screen.findByText(/re-queued/i)).toBeTruthy();
+    // "Judge re-queued" verbatim, and ONLY on this arm: the note is armed here by the
+    // local optimistic flag, set right after THIS tab's POST resolved and before any
+    // fetch has returned — the one place the panel actually knows the viewer re-queued
+    // it. Two matches because the sr-only live region carries the same sentence.
+    const requeued = await screen.findAllByText(
+      "Judge re-queued — the new verdict will appear here when it finishes.",
+    );
+    expect(requeued).toHaveLength(2);
   });
 
   // ── Pending judge (PRD #119) ──────────────────────────────────────────────────────────
@@ -523,9 +530,12 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     const btn = await screen.findByRole("button", { name: "Judge scheduled" });
     expect((btn as HTMLButtonElement).disabled).toBe(true);
+    // Twice: the visible paragraph, and the sr-only live region that is the only thing
+    // announcing this state to a screen reader (the button carrying it is disabled, so
+    // it is out of the tab order and cannot be reached to hear the label).
     expect(
-      screen.getByText("Judge scheduled — the verdict will appear here when it finishes."),
-    ).toBeTruthy();
+      screen.getAllByText("Judge scheduled — the verdict will appear here when it finishes."),
+    ).toHaveLength(2);
     // The never-judged copy is the OTHER cause and must not appear for this one.
     expect(screen.queryByText(/hasn't been judged yet/i)).toBeNull();
     // The redundant click is gone: pressing the disabled button fires no POST.
@@ -539,9 +549,48 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     const btn = await screen.findByRole("button", { name: "Judge running…" });
     expect((btn as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText("Judge in progress…")).toBeTruthy();
+    expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
     fireEvent.click(btn);
     expect(mockApi.rerunJudge).not.toHaveBeenCalled();
+  });
+
+  // The live region itself, asserted by NAME rather than only through the two-match
+  // counts above: those pass for any second copy of the string, including a visible one.
+  // What a screen reader needs is specifically an sr-only polite status region that was
+  // ALREADY MOUNTED before the text arrived — a region created in the same render as its
+  // first message is typically silent, and looks perfectly correct in the DOM.
+  it("announces the pending state through an sr-only region mounted before its text (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    const { rerender } = render(<JudgePanel run={run({ status: "failed" })} />);
+    await screen.findByText(/hasn't been judged yet/i);
+
+    const live = document.querySelector('span.sr-only[role="status"]') as HTMLElement;
+    expect(live).toBeTruthy();
+    expect(live.getAttribute("aria-live")).toBe("polite");
+    // Mounted and EMPTY while nothing is in flight.
+    expect(live.textContent).toBe("");
+
+    // A judge appears on the next fetch: the SAME node gains the text, which is the
+    // change assistive tech announces.
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("running") });
+    rerender(<JudgePanel run={run({ id: "r2", status: "failed" })} />);
+    await screen.findByRole("button", { name: "Judge running…" });
+    expect(document.querySelector('span.sr-only[role="status"]')!.textContent).toBe(
+      "Judge in progress…",
+    );
+  });
+
+  // Exactly ONE region carries the sentence: two live regions on the same string make a
+  // screen reader say it twice, so the visible paragraph must stay purely visual.
+  it("does not double-announce the pending copy (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    await screen.findByRole("button", { name: "Judge scheduled" });
+
+    const regions = [...document.querySelectorAll('[role="status"][aria-live="polite"]')];
+    const carrying = regions.filter((r) => /A judge is scheduled/.test(r.textContent ?? ""));
+    expect(carrying).toHaveLength(1);
+    expect((carrying[0] as HTMLElement).classList.contains("sr-only")).toBe(true);
   });
 
   // The survives-a-reload case, and the reason it is asserted on a FRESH mount with no
@@ -554,9 +603,49 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
     const btn = await screen.findByRole("button", { name: "Judge running…" });
     expect((btn as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/re-queued/i)).toBeTruthy();
+    // NEUTRAL wording on this arm, and that is the point of asserting it on a fresh
+    // mount with no click: all the panel knows here is that the SERVER reports an active
+    // judge. It may have been auto-enqueued at the terminal transition, or started by
+    // another admin. "Judge re-queued" would tell this viewer they did something they
+    // did not do — and it is in the wrong tense besides, sitting next to a button that
+    // reads "Judge running…".
+    expect(
+      screen.getAllByText("A judge is running for this run — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    expect(screen.queryByText(/re-queued/i)).toBeNull();
     // The existing verdict keeps rendering underneath it.
     expect(screen.getByText("Issues found")).toBeTruthy();
+  });
+
+  // The scheduled sibling of the arm above: the note tracks pendingJudge.state, so it
+  // agrees with the button rather than describing a judge that is already running.
+  it("says SCHEDULED, not running, while the server-truth judge is still queued (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    await screen.findByRole("button", { name: "Judge scheduled" });
+    expect(
+      screen.getAllByText("A judge is scheduled for this run — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    expect(screen.queryByText(/re-queued/i)).toBeNull();
+  });
+
+  // The other arm, on the same panel state: once THIS tab has fired the POST — and only
+  // until the next fetch answers — "Judge re-queued" is an accurate claim and is kept
+  // verbatim. Same note, different sentence, because the two arms know different facts.
+  it("keeps the re-queued wording for this tab's own optimistic click (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockResolvedValue({
+      run: run({ id: "judge1", kind: "judge", status: "queued" }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(
+      await screen.findAllByText("Judge re-queued — the new verdict will appear here when it finishes."),
+    ).toHaveLength(2);
+    // Not the neutral server-truth sentence: nothing on the wire said a judge is active.
+    expect(screen.queryByText(/A judge is (scheduled|running) for this run/)).toBeNull();
   });
 
   // The TOCTOU backstop. The button is disabled whenever the last fetch saw a pending
@@ -625,7 +714,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(screen.getByText("Judge in progress…")).toBeTruthy();
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
@@ -652,7 +741,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(screen.getByText("Judge scheduled — the verdict will appear here when it finishes.")).toBeTruthy();
+      expect(
+        screen.getAllByText("Judge scheduled — the verdict will appear here when it finishes."),
+      ).toHaveLength(2);
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);

@@ -1382,6 +1382,43 @@ export function JudgePanel({ run }: { run: Run }) {
     </Button>
   );
 
+  // The in-flight note above the panel body. Its render condition is unchanged
+  // (`pendingJudge !== null ? review !== null : queued` — see the comment at its render
+  // site); what is state-driven is the WORDING, and the two arms deliberately say
+  // different things because they know different facts:
+  //   • armed from pendingJudge — SERVER truth. All it says is that a judge run for this
+  //     target is in the active set. It does NOT say who enqueued it: an auto-judge fires
+  //     at the terminal transition, and another admin viewing the same run gets the same
+  //     answer. "Judge re-queued" would assert "you re-queued this" to every viewer of a
+  //     judge nobody in this tab started, so this arm is neutral and keyed off the state
+  //     the server reported — which also puts it in the same tense as the button beside
+  //     it (scheduled / running) instead of contradicting it.
+  //   • armed from `queued` — this tab's own optimistic flag, set in the one place it can
+  //     be: immediately after THIS viewer's rerunJudge POST resolved, before the next
+  //     fetch has returned. There "re-queued" is exactly true, so it is kept verbatim.
+  // Both are null when nothing is in flight, which is what suppresses the note.
+  const inFlightNote =
+    pendingJudge !== null
+      ? review !== null
+        ? pendingJudge.state === "scheduled"
+          ? "A judge is scheduled for this run — the new verdict will appear here when it finishes."
+          : "A judge is running for this run — the new verdict will appear here when it finishes."
+        : null
+      : queued
+        ? "Judge re-queued — the new verdict will appear here when it finishes."
+        : null;
+  // The pending empty-state copy, hoisted so the live region below can announce the same
+  // sentence the sighted user reads rather than a second, drifting one.
+  const pendingEmptyCopy =
+    review !== null || pendingJudge === null
+      ? null
+      : pendingJudge.state === "scheduled"
+        ? "Judge scheduled — the verdict will appear here when it finishes."
+        : "Judge in progress…";
+  // Mutually exclusive by construction: inFlightNote needs a review (or no pendingJudge
+  // at all), pendingEmptyCopy needs no review AND a pendingJudge.
+  const judgeAnnounce = inFlightNote ?? pendingEmptyCopy ?? "";
+
   return (
     <Card className="space-y-4 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1408,29 +1445,43 @@ export function JudgePanel({ run }: { run: Run }) {
 
       {actionErr && <Alert message={actionErr} />}
       {loadErr && <Alert message={loadErr} />}
+      {/* ALWAYS MOUNTED, empty until a judge is in flight — the same convention as the
+          park region in RunView and the triage rows' announce span below, and mounted
+          unconditionally for the same reason: a live region that appears at the same
+          moment as its text is not reliably announced.
+          It is needed here because NOTHING else in this panel reaches a screen reader
+          when the judge state moves. The state changes with no user action at all (the
+          bounded poll swaps scheduled → running, and the verdict lands minutes later),
+          and the control that carries it is a DISABLED button — removed from the tab
+          order, so a keyboard/SR user cannot even land on it to hear the new label. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {judgeAnnounce}
+      </span>
       {/* Armed from server truth OR the local click (PRD #119): `queued` alone only
           existed in the tab that pressed the button, so a reload mid-judge lost the
           note and re-offered the action. pendingJudge is the same fact read from the
           server, so the in-flight state now shows on any load, to any viewer.
           Suppressed in exactly one case — a pending judge with NO review — because the
           empty state below already says a verdict is coming, and this line would sit
-          directly above it saying nearly the same sentence in the wrong tense:
-          "re-queued" is a claim about a run that HAS been judged before. */}
-      {(pendingJudge !== null ? review !== null : queued) && (
-        <p className="text-xs text-info">Judge re-queued — the new verdict will appear here when it finishes.</p>
-      )}
+          directly above it saying nearly the same sentence. (The wording of each arm is
+          decided at inFlightNote above, where the two arms' different knowledge is.) */}
+      {inFlightNote !== null && <p className="text-xs text-info">{inFlightNote}</p>}
 
       {!review ? (
         // The empty state is the whole point of PRD #119: "no verdict" has two causes
         // and they call for opposite affordances. With a pending judge the copy says a
         // verdict is coming (and the button above is disabled); without one it is the
         // unchanged never-judged copy next to a live Run-judge button.
-        pendingJudge !== null ? (
-          <p className="flex items-center gap-2 text-sm text-faint">
+        pendingEmptyCopy !== null ? (
+          // items-START, not items-center: the spinner is one line tall and the sentence
+          // is two at a narrow viewport (measured at 375px), where centering floated the
+          // spinner into the gap between the lines — 10px below the text it belongs to.
+          // No leading override is needed to keep it right on ONE line: both flex items
+          // inherit the paragraph's text-sm leading (1.25rem), so their line boxes are
+          // the same height and their first baselines already coincide.
+          <p className="flex items-start gap-2 text-sm text-faint">
             <Spinner />
-            {pendingJudge.state === "scheduled"
-              ? "Judge scheduled — the verdict will appear here when it finishes."
-              : "Judge in progress…"}
+            {pendingEmptyCopy}
           </p>
         ) : (
           <p className="text-sm text-faint">
