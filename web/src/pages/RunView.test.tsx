@@ -406,7 +406,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   }
 
   it("renders the verdict chip + recommendations for a judged run", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     expect(await screen.findByText("Issues found")).toBeTruthy();
@@ -421,6 +421,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // A rationale containing markup must appear as literal characters (React escapes
     // it) — proving no dangerouslySetInnerHTML / markdown parsing on judge output.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         summary_md: "<img src=x onerror=alert(1)> **not bold**",
         recommendations: [],
@@ -455,6 +456,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // survived four #124 commits in that blind spot. A field added to the DTO must be added
     // here too, or this case silently stops covering it.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         summary_md: `The review ${RLO}approved this change`,
         judge_model: `hai${RLO}ku`,
@@ -493,7 +495,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: null });
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     mockApi.rerunJudge.mockResolvedValue({
       run: run({ id: "judge1", kind: "judge", status: "queued" }),
     });
@@ -506,16 +508,170 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(await screen.findByText(/re-queued/i)).toBeTruthy();
   });
 
-  it("surfaces a re-run error", async () => {
+  // ── Pending judge (PRD #119) ──────────────────────────────────────────────────────────
+  // The panel's two "no verdict" causes are opposite affordances: nobody is judging this
+  // (offer the button) vs a judge is already coming (say so, and take the button away —
+  // its only possible outcome is the 409 from the one-active-judge-per-target index).
+  const pending = (state: "scheduled" | "running") => ({
+    state,
+    enqueued_at: "2026-03-01T00:00:00Z",
+  });
+
+  it("shows the scheduled copy and a disabled button for an unjudged run with a judge queued (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("scheduled") });
+    render(<JudgePanel run={run({ status: "failed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge scheduled" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      screen.getByText("Judge scheduled — the verdict will appear here when it finishes."),
+    ).toBeTruthy();
+    // The never-judged copy is the OTHER cause and must not appear for this one.
+    expect(screen.queryByText(/hasn't been judged yet/i)).toBeNull();
+    // The redundant click is gone: pressing the disabled button fires no POST.
+    fireEvent.click(btn);
+    expect(mockApi.rerunJudge).not.toHaveBeenCalled();
+  });
+
+  it("shows the in-progress copy and a disabled button once a worker has the judge (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: pending("running") });
+    render(<JudgePanel run={run({ status: "failed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Judge in progress…")).toBeTruthy();
+    fireEvent.click(btn);
+    expect(mockApi.rerunJudge).not.toHaveBeenCalled();
+  });
+
+  // The survives-a-reload case, and the reason it is asserted on a FRESH mount with no
+  // click in the test: before #119 the re-queued note and the disabled button came from a
+  // local flag that only existed in the tab that pressed the button, so any other viewer —
+  // or the same viewer after a reload — was re-offered an action that would only 409.
+  it("shows the re-judge-in-flight note over an existing verdict on a fresh mount (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: pending("running") });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/re-queued/i)).toBeTruthy();
+    // The existing verdict keeps rendering underneath it.
+    expect(screen.getByText("Issues found")).toBeTruthy();
+  });
+
+  // The TOCTOU backstop. The button is disabled whenever the last fetch saw a pending
+  // judge, but that answer is point-in-time: an auto-judge can enqueue between the fetch
+  // and the click. That 409 is absorbed — re-fetch, converge to pending — because the user
+  // asked for a judge and a judge is running; that is not an error to show them.
+  it("absorbs the already-active 409 into a re-fetch that converges to the pending state (#119)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
+      .mockResolvedValue({ review: review(), pending_judge: pending("running") });
     mockApi.rerunJudge.mockRejectedValue(
       new ApiError(409, "a judge run is already in progress for this run"),
     );
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Re-run judge"));
-    expect(await screen.findByText(/already in progress/i)).toBeTruthy();
+
+    // The panel converged to the server's answer…
+    const btn = await screen.findByRole("button", { name: "Judge running…" });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    // …and the raw 409 never reached the user as an error.
+    expect(screen.queryByText(/already in progress/i)).toBeNull();
+  });
+
+  // The route answers 409 for a SECOND reason — ErrJudgeDisabled — and that one must still
+  // surface: a user who turned the judge off has to see why nothing happened. Absorbing
+  // every 409 would swallow it into a silent, pointless re-fetch.
+  it("still surfaces the judge-disabled 409 rather than absorbing it (#119)", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockRejectedValue(new ApiError(409, "run judging is disabled"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(await screen.findByText(/run judging is disabled/i)).toBeTruthy();
+  });
+
+  it("surfaces a non-409 re-run error", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
+    mockApi.rerunJudge.mockRejectedValue(new ApiError(500, "internal error"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(await screen.findByText(/internal error/i)).toBeTruthy();
+    // A failed enqueue leaves the action available — nothing is in flight.
+    const btn = await screen.findByRole("button", { name: "Re-run judge" });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // The poll, on fake timers SCOPED to this test (no other JudgePanel test uses them).
+  // Two stop conditions matter and this covers the review-lands one; the other — a judge
+  // that goes failed/cancelled produces NO review, so a cleared pending_judge is the only
+  // thing that can end the poll — is covered by the next case.
+  it("polls while a judge is pending and swaps to the verdict when it lands (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        .mockResolvedValue({
+          review: review({ updated_at: "2026-03-02T00:00:00Z" }),
+          pending_judge: null,
+        });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("Judge in progress…")).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(screen.getByText("Issues found")).toBeTruthy();
+      expect(screen.getByText("Lost time to a missing tool.")).toBeTruthy();
+      // Pending cleared, so the action is offered again.
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling when a judge leaves the active set without producing a review (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      // A judge that fails/cancels: pending_judge clears and updated_at never moves,
+      // because there is no review at all. Only the cleared pending can end this poll.
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("scheduled") })
+        .mockResolvedValue({ review: null, pending_judge: null });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("Judge scheduled — the verdict will appear here when it finishes.")).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      // Back to the genuine never-judged state, with a live button.
+      expect(screen.getByText(/hasn't been judged yet/i)).toBeTruthy();
+      expect((screen.getByRole("button", { name: "Run judge" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+
+      // And the poll really stopped: no further fetches after the stop condition.
+      const callsAfterStop = mockApi.getRunReview.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview.mock.calls.length).toBe(callsAfterStop);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders nothing for an ineligible kind (chat) and never fetches a review", async () => {
@@ -532,6 +688,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // because the just-filed LOCAL state masked it; only a persisted link exercises coordKey.
   it("renders a persisted filed link as the filed row, not the idle button", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         filed_issues: [
           {
@@ -587,7 +744,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // the SEED, not on `value=`: these are controlled components, so the state IS the POST
   // body, and filtering the value would silently rewrite what the user typed.
   it("strips format characters from the SEEDED draft, before the user can edit it (#124)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -616,7 +773,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("opens the draft with templated fields on File issue click (state B)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -641,7 +798,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("files the issue and shows the created link (state C)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -669,7 +826,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("disables Create until a repo is picked when no default resolves (state D)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -698,7 +855,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("keeps the draft open and shows the error when the forge rejects (state E)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({
       repos: [repoOpt("repo1", "vtmocanu/uzi")],
     });
@@ -719,6 +876,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("flags a stale filed link (filed before the current review revision)", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         updated_at: "2026-02-01T00:00:00Z",
         filed_issues: [
@@ -740,7 +898,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("recovers from a draft-load failure with Retry and Cancel (no dead end)", async () => {
     const { ApiError } = await import("../lib/api");
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     mockApi.listRepos.mockResolvedValue({ repos: [] });
     mockApi.getIssueDraft.mockRejectedValue(new ApiError(500, "boom"));
     render(<JudgePanel run={run({ status: "completed" })} />);
@@ -771,6 +929,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("renders a status chip per row by the disposition→filed→to-do ladder", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [
           rec("rc1", "install_worker_tool", "shellcheck"),
@@ -835,7 +994,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Mark done sets a done disposition (no reason) and refetches the review", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Mark done"));
@@ -849,7 +1008,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Dismiss → Not an issue sets a not_an_issue dismissal", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Dismiss ▾"));
@@ -866,6 +1025,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("Undo clears the disposition via deleteDisposition and refetches", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         dispositions: [
           {
@@ -900,6 +1060,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("renders the stale note straight from the DTO's stale flag", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         dispositions: [
           {
@@ -931,6 +1092,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // ONE recommendation is rendered, but the server triage totals 5 — so the bar's
     // numbers can only come from review.triage, proving no TS re-derivation.
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         triage: {
           total: 5,
@@ -953,6 +1115,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
 
   it("collapse-dismissed toggle hides the dismissed rows", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [
           rec("rc1", "install_worker_tool", "shellcheck", "keep me"),
@@ -991,6 +1154,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   // issue link, but NOT the create-issue affordance (you can't file a second issue).
   it("a filed-then-done row keeps the issue link but drops the File-issue action", async () => {
     mockApi.getRunReview.mockResolvedValue({
+      pending_judge: null,
       review: review({
         recommendations: [rec("rc1", "add_agent", "deploy-agent")],
         filed_issues: [
@@ -1036,7 +1200,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("Escape closes the Dismiss menu and returns focus to the trigger (a11y)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     const trigger = await screen.findByRole("button", { name: /Dismiss/ });
@@ -1052,8 +1216,9 @@ describe("JudgePanel (PRD #46 M4)", () => {
     // Mount reads untriaged; the post-mutation refetch reads the row as done, so the row
     // swaps to the Undo branch and focus must land there.
     mockApi.getRunReview
-      .mockResolvedValueOnce({ review: review() })
+      .mockResolvedValueOnce({ review: review(), pending_judge: null })
       .mockResolvedValue({
+        pending_judge: null,
         review: review({
           dispositions: [
             {
@@ -1083,7 +1248,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
   });
 
   it("announces the mutation result via the polite live region (a11y)", async () => {
-    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.getRunReview.mockResolvedValue({ review: review(), pending_judge: null });
     render(<JudgePanel run={run({ status: "completed" })} />);
 
     fireEvent.click(await screen.findByText("Mark done"));

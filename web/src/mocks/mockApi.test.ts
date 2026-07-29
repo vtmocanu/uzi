@@ -131,13 +131,25 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     installStorage();
     const api = await reload();
 
-    const { review } = await api.getRunReview("run-done");
+    const { review, pending_judge } = await api.getRunReview("run-done");
     expect(review).not.toBeNull();
     expect(review!.verdict).toBe("issues");
     expect(review!.recommendations.length).toBeGreaterThan(0);
+    // run-done is the SETTLED fixture: a verdict and nothing in flight, so the panel's
+    // enabled Re-run-judge state stays demoable.
+    expect(pending_judge).toBeNull();
 
-    // A terminal run with no seeded review reads as null (not judged yet).
-    expect((await api.getRunReview("run-failed")).review).toBeNull();
+    // A terminal run with no seeded review reads as null (not judged yet) — but the
+    // envelope's sibling key says WHY (PRD #119): run-failed has an auto-judge already
+    // scheduled, which is the state review:null alone cannot express.
+    const failed = await api.getRunReview("run-failed");
+    expect(failed.review).toBeNull();
+    expect(failed.pending_judge).toEqual({ state: "scheduled", enqueued_at: expect.any(String) });
+
+    // A re-judge in flight over an existing verdict: both keys set at once.
+    const closed = await api.getRunReview("run-closed");
+    expect(closed.review).not.toBeNull();
+    expect(closed.pending_judge).toEqual({ state: "running", enqueued_at: expect.any(String) });
 
     await expect(api.getRunReview("does-not-exist")).rejects.toMatchObject({ status: 404 });
   });
@@ -152,6 +164,14 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
 
     // A still-queued run is not terminal, so it cannot be judged.
     await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });
+
+    // PRD #119: a target that already has an active judge 409s with the server's exact
+    // message — the unique index's refusal, and the one the panel absorbs into a
+    // re-fetch rather than an error banner.
+    await expect(api.rerunJudge("run-failed")).rejects.toMatchObject({
+      status: 409,
+      message: "a judge run is already in progress for this run",
+    });
   });
 });
 
@@ -305,7 +325,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     installStorage();
     const api = await reload();
 
-    // The endpoint answers an ENVELOPE, {review: ...|null}.
+    // The endpoint answers an ENVELOPE, {review: ...|null, pending_judge: ...|null}.
     const { review } = await api.getRunReview("run-closed");
     const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
     expect(disp).toBeTruthy();

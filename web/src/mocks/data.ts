@@ -17,6 +17,7 @@ import type {
   LatestRun,
   Memory,
   MyRateLimits,
+  PendingJudge,
   RateLimitSource,
   RecommendationCategory,
   Repo,
@@ -638,6 +639,27 @@ export const mockReviews: MockReview[] = [
     triage: { total: 3, todo: 1, filed: 1, done: 1, dismissed: 0, false_positives: 0 },
   },
 ];
+
+// ── Pending judges (PRD #119) ────────────────────────────────────────────────
+// The ACTIVE judge run per TARGET run id, mirroring the server's
+// uq_runs_one_active_judge_per_target read: at most one entry per target, and it is
+// orthogonal to whether a review exists. Keyed by target id rather than modelled as a
+// judge Run because the wire has no back-link to derive it from — the run DTO carries
+// no target_run_id — and a mock must not invent wire fields (see mockApi.test.ts's
+// set_via case). getRunReview reads it; rerunJudge 409s off it, the way the unique
+// index makes the real server 409.
+//
+// The three terminal fixtures cover the three panel states between them:
+//   run-failed  — no review + scheduled: the empty-state "verdict will appear here"
+//                 copy with the button disabled and relabelled "Judge scheduled";
+//   run-closed  — a seeded review + running: the re-judge-in-flight note over an
+//                 existing verdict;
+//   run-done    — a seeded review and NO entry: the settled panel with a live
+//                 Re-run judge button, which must stay demoable.
+export const mockPendingJudges: Record<string, PendingJudge> = {
+  "run-failed": { state: "scheduled", enqueued_at: minsAgo(2) },
+  "run-closed": { state: "running", enqueued_at: minsAgo(9) },
+};
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
 

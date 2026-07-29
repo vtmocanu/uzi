@@ -76,6 +76,35 @@ func TestReviewOverlayHandlesUnjudgedAndErrors(t *testing.T) {
 	}
 }
 
+// A nil review with an ACTIVE judge is not "has not been judged" — a verdict is
+// being written. The overlay says which, and a later load with no pending judge
+// clears the claim rather than leaving it stale.
+func TestReviewOverlayShowsPendingJudge(t *testing.T) {
+	for state, want := range map[string]string{
+		"scheduled": "a judge is scheduled for this run",
+		"running":   "a judge is in progress for this run",
+	} {
+		m := ownerModel(t, &uzicli.FakeClient{}, "r-own", ownedRun("r-own"))
+		m.detail.review.open = true
+		next, _ := m.Update(reviewLoadedMsg{runID: "r-own", pendingJudge: &apitypes.PendingJudgeDTO{State: state}})
+		m = next.(tuiModel)
+		out := m.View().Content
+		if !strings.Contains(out, want) {
+			t.Errorf("state %q: want %q\n%s", state, want, out)
+		}
+		if strings.Contains(out, "not been judged") {
+			t.Errorf("state %q: a run with a judge in flight still reads as never-judged\n%s", state, out)
+		}
+		// The judge finished (or died) and the next load carries no pending judge:
+		// the overlay must fall back, not keep asserting a judge is coming.
+		next, _ = m.Update(reviewLoadedMsg{runID: "r-own", review: nil, pendingJudge: nil})
+		m = next.(tuiModel)
+		if !strings.Contains(m.View().Content, "not been judged") {
+			t.Errorf("state %q: a cleared pending judge left a stale in-flight claim\n%s", state, m.View().Content)
+		}
+	}
+}
+
 // Resolve / dismiss / undo drive the real disposition calls, and a dismissal must
 // carry one of the server's closed reasons.
 func TestReviewDispositionKeys(t *testing.T) {

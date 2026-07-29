@@ -18,6 +18,7 @@ import {
   type Disposition,
   type FiledIssue,
   type IssueDraft,
+  type PendingJudge,
   type Repo,
   type ReviewRecommendation,
   type Run,
@@ -1174,8 +1175,12 @@ const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
 
 // JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
 // structured recommendations, plus the "re-run judge" action. It fetches its own
-// review (owner-or-admin scoped server-side) and, after a re-run, polls a bounded
-// number of times for the fresh verdict (the new judge run finishes asynchronously).
+// review (owner-or-admin scoped server-side) and, while a judge is in flight, polls a
+// bounded number of times for the fresh verdict (a judge run finishes asynchronously).
+// PRD #119: the same fetch also reports the ACTIVE judge run for this target, which is
+// what lets the panel tell "never judged" from "a verdict is already coming" — and,
+// because that answer is server truth rather than the local click flag, the in-flight
+// state survives a reload and is visible to anyone viewing the run.
 // All judge free text (summary, rationale, target) renders as escaped React text —
 // never markdown/HTML — since it is untrusted judge/worker output (audit carry-forward).
 export function JudgePanel({ run }: { run: Run }) {
@@ -1185,6 +1190,10 @@ export function JudgePanel({ run }: { run: Run }) {
   const [actionErr, setActionErr] = useState("");
   const [rerunning, setRerunning] = useState(false);
   const [queued, setQueued] = useState(false);
+  // Server truth: the active judge run for this target, or null (PRD #119). Set from
+  // EVERY getRunReview response — the mount fetch, the poll, and the 409 re-fetch — so
+  // it can never go stale against a response the panel already has in hand.
+  const [pendingJudge, setPendingJudge] = useState<PendingJudge | null>(null);
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -1196,8 +1205,9 @@ export function JudgePanel({ run }: { run: Run }) {
 
   const fetchReview = useCallback(async () => {
     try {
-      const { review } = await api.getRunReview(run.id);
+      const { review, pending_judge } = await api.getRunReview(run.id);
       setReview(review);
+      setPendingJudge(pending_judge);
       setLoadErr("");
     } catch (e) {
       setLoadErr(e instanceof ApiError ? e.message : "Failed to load the review");
@@ -1257,29 +1267,63 @@ export function JudgePanel({ run }: { run: Run }) {
   const [showDismissed, setShowDismissed] = useState(true);
   const dismissedCount = review?.triage?.dismissed ?? 0;
 
-  // Bounded background poll after a re-run: the fresh verdict arrives when the new
-  // judge run finishes, so check every few seconds for a changed updated_at, giving
-  // up after ~1 minute so a stuck/queued judge doesn't poll forever.
+  // polling is the effect's ONLY dependency that can change while a judge is in flight,
+  // and it is deliberately a BOOLEAN rather than `pendingJudge` itself. A judge moving
+  // scheduled → running produces a new pendingJudge object on (almost) every tick; had
+  // the effect depended on that object it would tear down and re-create the interval —
+  // resetting the local `tries` counter each time, which turns the cap into "poll
+  // forever" for exactly the judge that is making progress, and re-arming a 4s timer on
+  // every response. Keying on "is anything pending at all" means the effect runs once
+  // per in-flight episode: true on the first pending answer (or an optimistic click),
+  // false when the last one clears, and never in between.
+  const polling = queued || pendingJudge !== null;
+
+  // Bounded background poll while a judge is in flight (local optimistic `queued` OR
+  // server-truth pendingJudge — PRD #119 generalized this from the post-re-run-only
+  // poll). It stops on EITHER of two conditions, and both are load-bearing:
+  //   • the review's updated_at moved off the baseline (or a first-ever review landed)
+  //     — the verdict is here, swap the panel to it;
+  //   • the response's pending_judge is null — the judge left the active set.
+  // The second is not redundant: a judge that goes failed/cancelled leaves the active
+  // set and produces NO review at all, so updated_at never moves and pending_judge
+  // clearing is the ONLY thing that can end that poll. Cap is 150 tries × 4s ≈ 10
+  // minutes — a real judge takes minutes, and the old 15-try (~1 min) cap gave up while
+  // the judge it was waiting on was still running.
   useEffect(() => {
-    if (!queued) return;
+    if (!polling) return;
     let tries = 0;
     const id = setInterval(async () => {
       tries += 1;
-      let next: RunReview | null = null;
+      let next: { review: RunReview | null; pending_judge: PendingJudge | null } | null = null;
       try {
-        next = (await api.getRunReview(run.id)).review;
+        next = await api.getRunReview(run.id);
       } catch {
+        // Swallowed: a transient failure mid-poll is not worth an error banner over a
+        // panel that is already showing a correct in-flight state. The cap bounds it.
         next = null;
       }
-      if (next && next.updated_at !== baselineUpdatedAt.current) {
-        setReview(next);
+      if (!next) {
+        // The cap has to clear the interval on THIS path too, not just below. Reaching
+        // it only via setQueued(false) does not stop the timer: `polling` stays true
+        // while pendingJudge holds its last non-null value, so the effect never re-runs
+        // and never re-runs its cleanup — a permanently-failing endpoint would be
+        // polled every 4s until unmount.
+        if (tries >= 150) {
+          setQueued(false);
+          clearInterval(id);
+        }
+        return;
+      }
+      setPendingJudge(next.pending_judge);
+      const landed = next.review !== null && next.review.updated_at !== baselineUpdatedAt.current;
+      if (landed) setReview(next.review);
+      if (landed || next.pending_judge === null || tries >= 150) {
         setQueued(false);
-      } else if (tries >= 15) {
-        setQueued(false);
+        clearInterval(id);
       }
     }, 4000);
     return () => clearInterval(id);
-  }, [queued, run.id]);
+  }, [polling, run.id]);
 
   const rerun = async () => {
     setActionErr("");
@@ -1289,7 +1333,27 @@ export function JudgePanel({ run }: { run: Run }) {
       baselineUpdatedAt.current = review?.updated_at ?? null;
       setQueued(true);
     } catch (e) {
-      setActionErr(e instanceof ApiError ? e.message : "Could not re-run the judge");
+      // The 409 backstop (PRD #119). The button is disabled whenever the last fetch saw
+      // a pending judge, but that answer is POINT-IN-TIME: an auto-judge can enqueue in
+      // the gap between the fetch and the click (TOCTOU), so a click can still race into
+      // the one-active-judge-per-target index. The window shrinks; it does not close.
+      // On that 409 the click is ABSORBED — re-fetch, converge to the pending state, no
+      // error banner — because the user asked for a judge and a judge is running: that
+      // is a success they are being shown, not a failure.
+      //
+      // The route returns 409 for a SECOND, unrelated reason: ErrJudgeDisabled ("run
+      // judging is disabled", handler/judge.go). That one must never be swallowed — a
+      // user who turned the judge off has to see why nothing happened. The wire carries
+      // no error code to discriminate on, only the message, so we match the
+      // already-active message and let EVERYTHING else fall through to today's Alert.
+      // The match is deliberately in that direction: if the server ever rewords the
+      // already-active message, this degrades to showing the error (the pre-#119
+      // behaviour), never to silently eating "judging is disabled".
+      if (e instanceof ApiError && e.status === 409 && /already in progress/i.test(e.message)) {
+        await fetchReview();
+      } else {
+        setActionErr(e instanceof ApiError ? e.message : "Could not re-run the judge");
+      }
     } finally {
       setRerunning(false);
     }
@@ -1300,9 +1364,20 @@ export function JudgePanel({ run }: { run: Run }) {
     return <Card className="animate-pulse p-4 text-sm text-faint">Loading review…</Card>;
   }
 
-  const rerunLabel = review ? "Re-run judge" : "Run judge";
+  // Label precedence (PRD #119): this tab's own in-flight POST first, then the
+  // server's pending judge (whoever started it, whenever), then today's labels. A
+  // pending judge also DISABLES the button — the click's only outcome would be the
+  // 409 the panel now explains instead of provoking.
+  const pendingLabel =
+    pendingJudge === null ? null : pendingJudge.state === "scheduled" ? "Judge scheduled" : "Judge running…";
+  const rerunLabel = pendingLabel ?? (review ? "Re-run judge" : "Run judge");
   const rerunButton = (
-    <Button variant="secondary" size="sm" disabled={rerunning || queued} onClick={rerun}>
+    <Button
+      variant="secondary"
+      size="sm"
+      disabled={rerunning || queued || pendingJudge !== null}
+      onClick={rerun}
+    >
       {rerunning ? "Re-queuing…" : rerunLabel}
     </Button>
   );
@@ -1333,14 +1408,35 @@ export function JudgePanel({ run }: { run: Run }) {
 
       {actionErr && <Alert message={actionErr} />}
       {loadErr && <Alert message={loadErr} />}
-      {queued && (
+      {/* Armed from server truth OR the local click (PRD #119): `queued` alone only
+          existed in the tab that pressed the button, so a reload mid-judge lost the
+          note and re-offered the action. pendingJudge is the same fact read from the
+          server, so the in-flight state now shows on any load, to any viewer.
+          Suppressed in exactly one case — a pending judge with NO review — because the
+          empty state below already says a verdict is coming, and this line would sit
+          directly above it saying nearly the same sentence in the wrong tense:
+          "re-queued" is a claim about a run that HAS been judged before. */}
+      {(pendingJudge !== null ? review !== null : queued) && (
         <p className="text-xs text-info">Judge re-queued — the new verdict will appear here when it finishes.</p>
       )}
 
       {!review ? (
-        <p className="text-sm text-faint">
-          This run hasn't been judged yet. Running the judge reviews the run on your Anthropic token.
-        </p>
+        // The empty state is the whole point of PRD #119: "no verdict" has two causes
+        // and they call for opposite affordances. With a pending judge the copy says a
+        // verdict is coming (and the button above is disabled); without one it is the
+        // unchanged never-judged copy next to a live Run-judge button.
+        pendingJudge !== null ? (
+          <p className="flex items-center gap-2 text-sm text-faint">
+            <Spinner />
+            {pendingJudge.state === "scheduled"
+              ? "Judge scheduled — the verdict will appear here when it finishes."
+              : "Judge in progress…"}
+          </p>
+        ) : (
+          <p className="text-sm text-faint">
+            This run hasn't been judged yet. Running the judge reviews the run on your Anthropic token.
+          </p>
+        )
       ) : (
         <>
           {/* summary_md, each target and each rationale_md below are UNTRUSTED judge/worker

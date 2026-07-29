@@ -1297,6 +1297,24 @@ export interface RunReview {
   triage: TriageCounts;
 }
 
+// PendingJudge is the ACTIVE judge run for a target (PRD #119) — "a verdict is already
+// coming". It is the fact `review: null` alone cannot express: an unjudged run whose
+// auto-judge is already queued and one that was never judged at all look identical
+// through the review field, and the panel used to offer a Run-judge button in both —
+// a button whose only possible outcome in the first case is a 409 from the
+// one-active-judge-per-target index. This says which of the two it is.
+//
+// `state` is a CLOSED union here because the server normalizes it with a total mapper
+// (handler.pendingJudgeState): `queued` → "scheduled", every other status in the index's
+// active set (claimed, running, awaiting_approval, and anything a future migration adds)
+// → "running". The raw runs.status set is wider than these two and is allowed to grow;
+// learning that is the server's job, not a client's, so nothing here should widen the
+// union or default an unknown value. enqueued_at is the judge run's created_at.
+export interface PendingJudge {
+  state: "scheduled" | "running";
+  enqueued_at: string;
+}
+
 // IssueDraft is the templated, human-editable draft for filing a forge issue from a
 // recommendation (PRD #68 M2/M4). The body is server-rendered + sanitized (fenced/
 // stripped/scanned), but the panel treats title/description as INERT text (never Markdown)
@@ -2242,14 +2260,22 @@ const realApi = {
   setRunWaitOnLimit: (id: string, enabled: boolean) =>
     request<{ run: Run }>("PUT", `/runs/${id}/wait-on-limit`, { enabled }),
 
-  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  // ── Run judge review (PRD #46 M4, PRD #119) ────────────────────────────────
   // getRunReview reads the verdict + recommendations for the run page (owner-or-
-  // admin scoped server-side); review is null for a visible-but-unjudged run.
+  // admin scoped server-side) PLUS the active judge run for the target. BOTH keys are
+  // always present and either may be null, and they are independent: `review` is null
+  // for a visible-but-unjudged run, `pending_judge` is set whenever a judge run for
+  // this target is queued/claimed/running — including while a re-judge is in flight
+  // over an existing verdict. Callers must read the pair: review:null alone does not
+  // mean "nobody is judging this", which is exactly the confusion PRD #119 removes.
   // rerunJudge enqueues a fresh judge for a terminal run (owner-only spend), behind
   // the per-user spend limiter; the new verdict arrives asynchronously once the
   // judge run finishes, so callers re-fetch getRunReview.
   getRunReview: (id: string) =>
-    request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
+    request<{ review: RunReview | null; pending_judge: PendingJudge | null }>(
+      "GET",
+      `/runs/${id}/review`,
+    ),
   rerunJudge: (id: string) =>
     request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
 

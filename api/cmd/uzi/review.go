@@ -531,20 +531,27 @@ func dispositionOutcome(status, reason string) string {
 
 // runReviewShow is the shared body of `uzi review show` and the deprecated
 // `uzi run review` alias: fetch the run's review and render it (verdict +
-// recommendations + triage), or pass the {"review": …} envelope through with
-// --json. A nil review is a visible-but-unjudged run (exit 0), never a 404.
+// recommendations + triage), or emit the {"review": …, "pending_judge": …} envelope
+// with --json. A nil review is a visible-but-unjudged run (exit 0), never a 404 —
+// and since PRD #119 it is two states, told apart by pending_judge.
 func runReviewShow(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
-	rv, err := c.RunReview(cmd.Context(), id)
+	rv, pj, err := c.RunReview(cmd.Context(), id)
 	if err != nil {
 		return err
 	}
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		// Pass the envelope through: {"review": <dto>|null}, carrying the FULL rec
-		// ids (the short id is a human-render affordance only).
-		return p.JSON(map[string]any{"review": rv})
+		// This map IS the --json wire envelope. It is RE-MINTED here, not proxied:
+		// the client decodes the server body into typed DTOs and this line
+		// re-serializes them, so the response shape --json consumers see is the set
+		// of keys written on THIS line and nowhere else. A key the server adds and
+		// this map omits is invisible to every --json consumer even after the DTO
+		// gains the field — which is exactly what happened to pending_judge until it
+		// was added here. Carries the FULL rec ids (the short id is a human-render
+		// affordance only).
+		return p.JSON(map[string]any{"review": rv, "pending_judge": pj})
 	}
-	return renderReview(p, id, rv)
+	return renderReview(p, id, rv, pj)
 }
 
 // mapDismissReason maps the user-facing --reason flag (hyphenated) to its wire
@@ -575,7 +582,9 @@ func mapDismissReason(cmd *cobra.Command) (string, error) {
 //   - no match is a not-found with a refresh hint (the review may have changed
 //     under a re-judge).
 func resolveRecID(ctx context.Context, c uzicli.Client, runID, want string) (string, error) {
-	rv, err := c.RunReview(ctx, runID)
+	// The pending judge is irrelevant to id RESOLUTION — a rec id resolves against the
+	// review that exists now, and one being written concurrently has no ids yet.
+	rv, _, err := c.RunReview(ctx, runID)
 	if err != nil {
 		return "", err
 	}
