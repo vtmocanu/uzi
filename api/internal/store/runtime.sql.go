@@ -209,7 +209,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count
 `
 
 type ClaimRunParams struct {
@@ -324,6 +324,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.LimitWaitCount,
 		&i.RateLimitType,
 		&i.OpenQuestionID,
+		&i.ReviseCount,
 	)
 	return i, err
 }
@@ -521,7 +522,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve, wait_on_limit)
 VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7, $8)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count
 `
 
 type CreateRunParams struct {
@@ -630,6 +631,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.LimitWaitCount,
 		&i.RateLimitType,
 		&i.OpenQuestionID,
+		&i.ReviseCount,
 	)
 	return i, err
 }
@@ -710,37 +712,91 @@ func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) 
 }
 
 const createRunReviseInputIfUnderCap = `-- name: CreateRunReviseInputIfUnderCap :one
-WITH locked AS (
-    SELECT r.id AS run_id FROM runs r WHERE r.id = $3 FOR UPDATE
+WITH bumped AS (
+    UPDATE runs SET revise_count = runs.revise_count + 1
+    WHERE runs.id = $2 AND runs.revise_count < $3::int
+    RETURNING runs.id AS run_id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
-SELECT locked.run_id, 'revise_plan', $1
-FROM locked
-WHERE (
-    SELECT count(*) FROM run_user_inputs rui
-    WHERE rui.run_id = locked.run_id AND rui.kind = 'revise_plan'
-) < $2::int
+SELECT bumped.run_id, 'revise_plan', $1
+FROM bumped
 RETURNING id, run_id, kind, body, consumed_at, created_at, question_id
 `
 
 type CreateRunReviseInputIfUnderCapParams struct {
 	Body         pgtype.Text `json:"body"`
-	MaxRevisions int32       `json:"max_revisions"`
 	RunID        uuid.UUID   `json:"run_id"`
+	MaxRevisions int32       `json:"max_revisions"`
 }
 
 // Atomic capped enqueue of a revise_plan (PRD #41): insert ONLY while the run is still
-// under its lifetime revision cap, collapsing the count and the insert into ONE
-// statement so two concurrent submits (e.g. web + Slack on the same single-owner gate)
-// cannot both read N-1 and both insert an N+1th row (a count-then-insert TOCTOU). The
-// run row is taken FOR UPDATE in a leading CTE and the cap count reads through it (the
-// count filters on the locked id), so callers serialize on the run: a second caller
-// blocks until the first commits, then counts including the first's row. NO consumed_at
-// filter — a consumed revise still counts (same lifetime semantics as
-// CountRunReviseInputs). No row returned = the cap is already reached (or the run row is
-// gone); the caller maps that to ErrReviseCapReached.
+// under its lifetime revision cap, so two concurrent submits (e.g. web + Slack on the
+// same single-owner gate) cannot both read N-1 and both insert an N+1th row (a
+// count-then-insert TOCTOU). NO consumed_at filter — a consumed revise still counts
+// (same lifetime semantics as CountRunReviseInputs). No row returned = the cap is
+// already reached (or the run row is gone); the caller maps that to
+// ErrReviseCapReached.
+//
+// 🔴 THE CAP PREDICATE MUST REFERENCE ONLY COLUMNS OF THE `runs` ROW ITSELF.
+// ANY SUBQUERY IN THAT WHERE REINTRODUCES ISSUE #106.
+//
+// That is the entire mechanism, so read it before simplifying this back. Under READ
+// COMMITTED a statement's snapshot is taken when the statement starts. When an UPDATE
+// unblocks on a row lock, EvalPlanQual re-evaluates the qual against the NEW VERSION
+// OF THE LOCKED ROW — that is what makes `revise_count < @max_revisions` see the
+// winner's bump — but a subquery inside that same qual still evaluates under the
+// ORIGINAL statement snapshot. Postgres documents the updating command as seeing an
+// inconsistent snapshot: the effects of concurrent commands on the rows it is
+// updating, but not on other rows.
+//
+// This query previously did exactly that: it took the `runs` row FOR UPDATE in a
+// leading CTE and counted `run_user_inputs`, a DIFFERENT table, in the INSERT's WHERE.
+// The lock did not cover the count at all, so a caller that blocked still counted N-1
+// and inserted. Measured 100/100 over-cap with the interleave forced (#106), and the
+// over-cap row is DURABLE. Swapping the FOR UPDATE for a real `UPDATE runs ...
+// RETURNING id` does NOT fix it and was measured failing too: the snapshot is the
+// problem, not the lock strength. Only moving the counted fact onto the locked row
+// fixes it.
+//
+// 🔴 AND IT MUST NOT SET updated_at, which is a deliberate deviation from the house
+// style of CreateApprovePlanInput / CreateStopVerdictInput. ListActiveRunsForHealth
+// includes awaiting_approval and selects updated_at; healthTargetFor
+// (workersvc/health.go) times the approval_idle flag off it. A revise lands WHILE the
+// run is awaiting_approval, so a bump here would silently move when a health flag
+// fires. A stop verdict drives the run terminal, where healthTargetFor returns
+// healthOK, so ITS bump cannot change a flag outcome; a revise's can.
+//
+// runs.revise_count is the cap's source of truth (00092); count(*) of revise_plan rows
+// is the same fact in its other representation, and CountRunReviseInputs still reads
+// that one on purpose — a reporting view that read the counter would assert only that
+// the counter equals itself. TestReviseCountMatchesRowCountLiveDB pins the two
+// together, and its load-bearing case is that a REFUSED insert must move neither: put
+// the cap predicate on the INSERT instead of the UPDATE and the counter runs away
+// while the rows sit at cap, silently shrinking the run's remaining budget on every
+// rejected attempt.
+//
+// OWNERSHIP IS ENFORCED ONE CALL UPSTREAM, NOT HERE. The qual is `runs.id = @run_id`
+// with no user_id, so this statement will bump any run's counter it is handed. The
+// tenant check is workersvc.SubmitInput's `GetRun(ctx, userID, runID)`, which resolves
+// the run owner-scoped before reaching this branch — the house pattern, and identical
+// before the #106 fix. Stated so that dropping that GetRun is visibly load-bearing
+// rather than a tidy-up. Safe today additionally because runs.user_id is never updated
+// anywhere, so a resolved run cannot change owner underneath the write.
+//
+// @max_revisions crosses from Go as int32 and PLAN_MAX_REVISIONS is unvalidated at the
+// top end; a configured value at or above 2^31 wraps negative and refuses every revise.
+// Fail-closed, and unchanged by the #106 fix — recorded, not guarded.
+//
+// Every column reference in the WHERE and RETURNING is qualified with `runs.`, which
+// the plain shape does not require of Postgres but sqlc does: unqualified, its resolver
+// sees `id` in scope from both `runs` and the INSERT's target `run_user_inputs` and
+// fails the whole file with "column reference \"id\" is ambiguous" — attributed,
+// confusingly, to the NEXT query in the file rather than to this one. The SET target is
+// necessarily bare: Postgres rejects a qualified one outright (`UPDATE t SET t.n = ...`
+// gives `column "t" of relation "t" does not exist`), so "every reference in the UPDATE"
+// is not a rule anyone could follow — it was the wording here until it was measured.
 func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg CreateRunReviseInputIfUnderCapParams) (RunUserInput, error) {
-	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap, arg.Body, arg.MaxRevisions, arg.RunID)
+	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap, arg.Body, arg.RunID, arg.MaxRevisions)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,
@@ -1097,7 +1153,7 @@ func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (st
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -1164,12 +1220,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.LimitWaitCount,
 		&i.RateLimitType,
 		&i.OpenQuestionID,
+		&i.ReviseCount,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -1238,6 +1295,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.LimitWaitCount,
 		&i.RateLimitType,
 		&i.OpenQuestionID,
+		&i.ReviseCount,
 	)
 	return i, err
 }
@@ -1456,7 +1514,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -1526,6 +1584,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.LimitWaitCount,
 		&i.RateLimitType,
 		&i.OpenQuestionID,
+		&i.ReviseCount,
 	)
 	return i, err
 }
@@ -1771,7 +1830,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
@@ -1863,6 +1922,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.LimitWaitCount,
 			&i.Run.RateLimitType,
 			&i.Run.OpenQuestionID,
+			&i.Run.ReviseCount,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -2309,7 +2369,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        rv.verdict                AS judge_verdict,
        ru.input_tokens          AS usage_input_tokens,
@@ -2457,6 +2517,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.LimitWaitCount,
 			&i.Run.RateLimitType,
 			&i.Run.OpenQuestionID,
+			&i.Run.ReviseCount,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.ForgeType,

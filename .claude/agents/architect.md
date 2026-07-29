@@ -125,9 +125,10 @@ directly), `internal/forgesvc` (shared
 sync; forge is source of truth, `issues` is a cache, writes are forge-first),
 and `internal/secretbox` (AES-256-GCM at rest).
 
-ADRs live at root **`adr/NNNN-<slug>.md`, numbered by PRD number** (not by ADR
-sequence): `adr/0042-worker-run-concurrency.md` and `adr/0065-forgejo-driver.md`
-exist, linked from `ARCHITECTURE.md`. There is **no `docs/adr/` or `docs/design/` tree** -
+ADRs live at root **`adr/NNNN-<slug>.md`, numbered by TRACKING ITEM — a PRD
+number or an issue number** (never by ADR sequence): `adr/0042-worker-run-concurrency.md`
+and `adr/0065-forgejo-driver.md` are PRDs, `adr/0106-revise-cap-atomicity.md` is an
+issue. All are linked from `ARCHITECTURE.md`. There is **no `docs/adr/` or `docs/design/` tree** -
 do not create one. Design rationale otherwise lives in `prds/*.md` Decision Logs
 (completed PRDs move to `prds/done/`), linked from `ARCHITECTURE.md` rather than
 duplicated into it. Respect the specs contract:
