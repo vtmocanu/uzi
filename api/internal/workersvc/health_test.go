@@ -31,6 +31,18 @@ type healthFakeStore struct {
 	// returns above that query, so this is how a test proves the wedged case stops
 	// issuing one per tick — an assertion the returned flag alone cannot make.
 	windowCalls map[uuid.UUID]int
+	// verdictSince is the canned RunHasVerdictSinceGateOpened answer per run id
+	// (issue #182: "the owner already answered THIS gate"), and verdictErr forces the
+	// read to fail. The predicate itself is NOT reimplemented here on purpose — a
+	// per-kind assertion against a fake that re-derives the answer would only test the
+	// fake. The kind list and the >= boundary are pinned against a real Postgres by
+	// store.TestRunHasVerdictSinceGateOpenedLiveDB; this side pins the ARM.
+	verdictSince map[uuid.UUID]bool
+	verdictErr   error
+	// verdictCalls records every lookup's params, which is how a test proves the arm
+	// asks about THIS gate (GateOpenedAt == the run's updated_at) and that the three
+	// guards ahead of it short-circuit before any query is issued at all.
+	verdictCalls []store.RunHasVerdictSinceGateOpenedParams
 }
 
 func (f *healthFakeStore) ListActiveRunsForHealth(context.Context) ([]store.ListActiveRunsForHealthRow, error) {
@@ -45,6 +57,13 @@ func (f *healthFakeStore) ListRunToolWindow(_ context.Context, arg store.ListRun
 }
 func (f *healthFakeStore) CountOnlineWorkersForUser(context.Context, uuid.UUID) (int64, error) {
 	return f.onlineWorkers, nil
+}
+func (f *healthFakeStore) RunHasVerdictSinceGateOpened(_ context.Context, arg store.RunHasVerdictSinceGateOpenedParams) (bool, error) {
+	f.verdictCalls = append(f.verdictCalls, arg)
+	if f.verdictErr != nil {
+		return false, f.verdictErr
+	}
+	return f.verdictSince[arg.RunID], nil
 }
 func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealthParams) (int64, error) {
 	f.writes = append(f.writes, arg)
