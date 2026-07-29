@@ -72,6 +72,17 @@ const (
 	// is plain text with no CHECK (00057), and only runs.health is constrained, where
 	// 'looping' already exists.
 	reasonPersistFailing = "the agent's updates can't be saved, so it keeps resending them"
+	// reasonVerdictUndelivered is issue #182's reason: the owner answered the approval
+	// gate and the worker has not acted on it yet. Same contract as its siblings — no
+	// tool name, no repo content, no live duration.
+	//
+	// A NEW const rather than a reuse of reasonWaitingWorker, despite both mapping to
+	// the healthWaitingWorker enum: that one ("waiting for a worker to pick up this
+	// run") belongs to the queued arm and describes an UNCLAIMED run, while this
+	// describes a run whose worker already holds it. "response" rather than "approval"
+	// or "revision" so one string covers all four verdict kinds without leaking which
+	// decision the owner made.
+	reasonVerdictUndelivered = "the worker hasn't picked up your response yet"
 )
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
@@ -202,6 +213,20 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// approve them (Decision 8).
 		if r.AutoApprove || th.approval == 0 || !olderThan(now, r.UpdatedAt, th.approval) {
 			return healthOK, ""
+		}
+		// The gate is old — but "old" alone does not mean the OWNER is the one holding
+		// it up (issue #182). The revise path deliberately never touches runs (see
+		// CreateRunReviseInputIfUnderCap), so a user who requested changes at t+50m
+		// still hits this arm at t+60m and, before this check existed, was nudged to
+		// approve a plan they had already responded to. Between their response and the
+		// worker delivering the next plan version the run is waiting on the WORKER.
+		//
+		// Placed BEHIND the three guards above on purpose: that is what makes a per-run
+		// lookup affordable here (see the query's own comment for the indexing
+		// argument). It is also why this cannot become a projection on
+		// ListActiveRunsForHealth.
+		if s.verdictUndelivered(ctx, r) {
+			return healthWaitingWorker, reasonVerdictUndelivered
 		}
 		return healthApprovalIdle, reasonApprovalIdle
 	case "running":
@@ -417,6 +442,30 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 		return reasonNoWorker
 	}
 	return reasonWaitingWorker
+}
+
+// verdictUndelivered reports whether the run carries a gate verdict submitted AT OR AFTER
+// this gate opened — i.e. the owner has answered and the worker has not acted on it yet
+// (issue #182). The predicate, its `>=` boundary and the four-of-six kind list all live in
+// RunHasVerdictSinceGateOpened; read that comment before changing either side.
+//
+// r.UpdatedAt is passed as the episode boundary rather than re-read in SQL, so this asks
+// about exactly the gate the caller's threshold guard just aged.
+//
+// A read error degrades to false, which yields the pre-#182 approval_idle. That is the
+// conservative direction for a best-effort detector: a nudge the owner has already
+// answered is noise, while suppressing one on a gate nobody has touched would hide the
+// signal this arm exists to raise. Same shape as toolWindow's degrade-to-zero-value.
+func (s *Service) verdictUndelivered(ctx context.Context, r store.ListActiveRunsForHealthRow) bool {
+	ok, err := s.q.RunHasVerdictSinceGateOpened(ctx, store.RunHasVerdictSinceGateOpenedParams{
+		RunID:        r.ID,
+		GateOpenedAt: r.UpdatedAt,
+	})
+	if err != nil {
+		slog.Error("health: read gate verdict", "run_id", r.ID, "error", err)
+		return false
+	}
+	return ok
 }
 
 // healthThresholds reads all thresholds once per tick (the settings cache is a 5s
