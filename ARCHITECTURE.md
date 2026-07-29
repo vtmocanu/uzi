@@ -471,12 +471,22 @@ life (a DB partial unique index enforces at most one non-terminal run per
 issue). Status is a linear state machine:
 
 ```
-queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → running → completed
-                                                                             → failed
+queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
+                                                                                                                   → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
    ↳ (Anthropic usage limit, opt-in) → limit_wait → queued, up to RUN_LIMIT_MAX_WAITS → failed
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
+
+`running ⇄ awaiting_input` can fire twice over — once **pre-run**, ending the
+planning turn with a question instead of a plan, and again **mid-run**, at any
+point in the implement ⇄ review loop after approval — and the two resolve
+differently, so the single edge above is a simplification. **Mid-run**
+explicitly re-reports `running` (the next implement/review iteration does
+so) before continuing the loop it paused. **Pre-run** does not: nothing is
+reported between the answer and the planning turn's next move, and if that
+move is a plan, the run goes straight to `awaiting_approval` — the literal
+chain in the diagram above, with no intervening `running`.
 
 - **running → limit_wait** (PRD #35, opt-in per run or per user) — a run that
   exhausts the owner's Anthropic usage limit **parks** instead of failing: the
@@ -548,6 +558,57 @@ queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → r
   for the epoch mechanism (Decisions 2/3) and
   [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
   user-facing actions.
+- **running ⇄ awaiting_input — the run's third human-in-the-loop channel**
+  ([PRD #88](prds/88-ask-user-clarification.md)), beside the plan gate above
+  and user-initiated steering below. The lead calls an in-process `ask_user`
+  signal when it hits a fork it shouldn't resolve alone; the worker parks the
+  run, posts a `question` run-message, and awaits an `answer` steering input
+  the way `gatePlan` awaits a plan verdict. On answer it resumes the *same*
+  SDK session (no transcript replay) and continues — a **pre-run** question
+  (asked before `submit_plan`) resumes into a fresh planning turn that
+  eventually reaches the plan gate; a **mid-run** question resumes the
+  implement ⇄ review loop it interrupted. It is a distinct status rather than
+  a sub-state of `awaiting_approval`, because `SetRunRunning`'s resume
+  transition requires a *consumed* `approve_plan`, which an `answer` can
+  never satisfy — the plan gate's status could not be reused for a question.
+  It otherwise inherits `awaiting_approval`'s treatment everywhere that
+  matters: every worker-death sweep, the `busy`/`active_runs` and
+  rate-limit-window concurrency counts, and the board's move-pending
+  bookkeeping all list `awaiting_input` alongside `awaiting_approval`, so a
+  parked question is recoverable across a worker death, holds its worker
+  slot, and never wedges a board card. The resume guard is keyed on the open
+  **question's identity**, not on a timestamp or an arrival order: a
+  worker-death requeue re-parks on the *same* question id (re-stamped from
+  the claim), so an answer submitted just before the crash still resumes the
+  run afterwards, while an answer to an already-superseded question is
+  rejected. Bounded by an absolute answer deadline
+  (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a per-run question cap
+  (`QUESTION_MAX`, default 5), both enforced worker-side and both
+  **worker-in-memory** — a requeue resets both counters, so the honest
+  worst case over a run's life is each value **× (RUN_MAX_REQUEUES + 1)**,
+  not the configured value flat. **Only the deadline fails the run closed**
+  ("clarification timed out"); there is no configurable default action.
+  Exhausting the question cap does **not** fail the run — it emits a feed
+  notice and the lead proceeds on its own best judgment instead. (The one
+  cap-adjacent failure, a distinct message, is pre-run-only: looping on
+  questions without ever reaching a plan.)
+  **Autopilot never parks**: the same `claim.auto_approve` that
+  short-circuits `gatePlan` short-circuits `ask_user`, auto-resolving with a
+  frozen `"no human available — proceed on your best judgment, and note the
+  assumption you made"` answer instead. The wording is quoted exactly because
+  it is a frozen constant (`AUTOPILOT_SENTINEL_ANSWER`) that a test asserts
+  byte-for-byte: an approximate quote here would read as the spec and send
+  someone "fixing" the constant to match the doc. The question surfaces on every surface a
+  user might be watching — the run view (an "Answer required" composer), the
+  owner's opt-in Slack DM thread (free-text reply), and `uzi run answer` —
+  and all three derive the open question from the run feed rather than a
+  dedicated field, so no surface invents a question the others don't have. See
+  the PRD's Decision Log for the full mechanism (including the accepted
+  mixed-fleet-rollout residual: a run resumed onto a pre-#88 worker degrades
+  to guessing rather than asking, mid-run, and a pending answer in transit is
+  lost) and [docs/run-activity.md](docs/run-activity.md#answering-a-question),
+  [docs/slack.md](docs/slack.md#using-it) and [docs/cli.md](docs/cli.md#commands)
+  for the user-facing surfaces.
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
   failure carries a `failure_reason`.
@@ -742,8 +803,8 @@ uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slac
 
 - **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud — and, since PRD #41, gated plan bodies too (see Content minimization, below).
 - **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
-- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject and follow-up submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate.
-- **Content minimization — with one deliberate exception for the plan gate.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then a **whole-blob** mrkdwn escape (not the per-field rule above, since the blob carries no trusted markup of its own to preserve), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering.
+- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject, follow-up and clarification-answer submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate. A Slack answer additionally carries no id of its own, which makes *which question it answers* a derivation rather than a fact (PRD #88 M3). Web and CLI echo back the id they were shown; a free-text reply cannot, and the tempting derivation — "whichever question is open when it arrives" — is an **arrival-time key wearing identity's clothes**: a reply written against Q1 that lands after Q2 opened would be stamped with Q2's id *by the server*, and would then satisfy every downstream equality check precisely because the server supplied it, re-opening the race identity keying exists to close. So the reply is instead bound to the question it **follows**, by ordering its `ts` against the `ts` of the question message the notifier posted (`slack_run_messages.question_id` + `question_ts`); a reply predating the current card is refused as answering a superseded question, and an unorderable pair fails closed. That survives a requeue for free, because a re-park re-uses the question id, the notifier's identity dedupe therefore does not re-post, and the recorded `ts` still points at the original card. The body produced is the same `{question_id, answers}` shape (`workersvc.AnswerBody`, marshalled by the `gateSubmitter` adapter in `cmd/server`, so the wire shape is declared exactly once), and the server re-checks the id against `runs.open_question_id` — keeping the two facts independent: Slack says what the user answered, `workersvc` says whether that is still open.
+- **Content minimization — with two deliberate exceptions, the plan gate and the clarification question.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/done/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then a **whole-blob** mrkdwn escape (not the per-field rule above, since the blob carries no trusted markup of its own to preserve), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering. **The clarification question is the second exception, on the same terms** ([PRD #88](prds/88-ask-user-clarification.md) Decision 9): when a run parks at `awaiting_input`, the question body — headers, question text, and any suggested option labels and descriptions — is posted into the same 1:1 DM thread through the *same* pipeline (`ScrubSecrets` → whole-blob `EscapeMrkdwn` → rune-safe truncate → deep link as a separate block, `slacksvc.questionThreadBlocks`). It widens exposure the same way and for the same reason, and the same limit applies: question text is model-authored from repo and issue content, and only the four known token *patterns* are stripped, so a secret quoted verbatim into a question is not caught by any layer. Two things are specific to it. First, the text is **attacker-influenceable in a directed way** — an injected repo file can steer what the lead asks — so the question is treated as untrusted at every sink, and the lead's prompt forbids asking for a credential, token or password (D-G). Second, the widening runs in **both directions**: a question invites a human to type an answer back, and that answer is `ScrubSecrets`-ed and length-bounded in `workersvc.SubmitInput` so every surface inherits the scrub, not just the Slack one that always had it.
 - **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
 - **The primary directive is unaffected.** Slack can only approve, reject, request changes to (feeding text back into the same planning session), or otherwise thread-steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
 - **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
@@ -1052,8 +1113,12 @@ Rationale, the decision log, and the alternatives that were rejected are in
 ## Not yet in scope
 
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
-`AskUserQuestion` mid-run steering, WS wakeup for idle workers (a 3s poll is
-the MVP), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
+WS wakeup for idle workers (a 3s poll is the MVP), **PRD #84's
+capability-aware pre-run readiness check** (the lead can already `ask_user`
+before planning — see [Run lifecycle](#run-lifecycle) — but nothing yet
+decides automatically that an issue is missing capability/tool/size and
+calls it; #88 ships the mechanism, #84 owns that trigger and remains
+Draft), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
 static-provisioning subset of the item decided 2026-07-10, specs/ai.md §168 —
 a user-triggered click provisions a persistent worker via the dedicated
 controller described [above](#worker-controller-k8s-only); the controller

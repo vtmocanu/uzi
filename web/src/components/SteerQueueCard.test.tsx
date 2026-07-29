@@ -41,6 +41,26 @@ describe("SteerQueueCard delivery states (Decision 7)", () => {
     expect(screen.queryByText(/applies after approval/)).toBeNull();
   });
 
+  it("consumed + awaiting_input → names the ANSWER, not the approval (PRD #88)", () => {
+    // A follow-up submitted at a clarification park IS consumed immediately — the
+    // steering channel polls throughout — but it only takes effect on the worker's next
+    // turn, which does not come until the human answers. Reusing the gate's copy here
+    // would send the user hunting for a plan gate that is not there; a bare "Delivered"
+    // would claim the agent already has it in hand.
+    render(
+      <SteerQueueCard
+        inputs={[input({ consumed_at: "2026-07-28T00:00:01Z" })]}
+        terminal={false}
+        status="awaiting_input"
+        busy={false}
+        onStop={() => {}}
+        onSend={() => {}}
+      />,
+    );
+    expect(screen.getByText("Delivered — applies after you answer")).toBeTruthy();
+    expect(screen.queryByText(/applies after approval/)).toBeNull();
+  });
+
   it("consumed + awaiting_approval → 'Delivered — applies after approval' (the honest gate copy, S3)", () => {
     render(
       <SteerQueueCard

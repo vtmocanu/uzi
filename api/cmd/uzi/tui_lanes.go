@@ -242,8 +242,8 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	if isTerminalRunStatus(runStatus) {
 		return crewDone
 	}
-	// A gate, a usage-limit park or a missing worker blocks the WHOLE crew, so it
-	// dominates every lane.
+	// A gate, a usage-limit park, a clarification park or a missing worker blocks the
+	// WHOLE crew, so it dominates every lane.
 	//
 	// statusLimitWait is on this rung rather than left to fall through, and BOTH of the
 	// rungs below get it wrong in a different direction — which is why one rung placed
@@ -264,7 +264,14 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	// waiting, never stalled", and a criterion this file can satisfy locally must not be
 	// outsourced to another service getting its writes right. TestCrewStateForParkedRun
 	// pins it against exactly that stale value.
-	if runStatus == "awaiting_approval" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
+	//
+	// awaiting_input (PRD #88) rides the same rung, and BOTH arguments above transfer
+	// verbatim: a clarification park routinely outlasts the recency window, and
+	// SetRunAwaitingInput clears health on entry for precisely the reason described
+	// above — awaiting_input is likewise absent from ListActiveRunsForHealth's
+	// allowlist, so nothing downstream could clear a flag frozen at park time. It is on
+	// this rung rather than in atPlanGate, which is specifically the PLAN gate.
+	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == statusLimitWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

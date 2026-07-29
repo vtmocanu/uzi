@@ -4,7 +4,7 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, IssueProposal, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -22,6 +22,7 @@ import {
   mockLimitWaitMessages,
   mockProposals,
   mockRuns,
+  mockUnreadableQuestionMessages,
 } from "./data";
 
 export interface MockState {
@@ -62,6 +63,9 @@ function seed(): MockState {
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
   messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
+  // PRD #88: the run parked on a question the UI cannot render. Seeded rather than
+  // scripted, so the empty state is reachable by URL without walking the journey.
+  messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
   // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows. The
   // degraded-countdown fixture shares it — the rows are the same shape and it exists
@@ -137,11 +141,84 @@ export function appendMessage(
   return msg;
 }
 
+// The LatestRun fields a board card MIRRORS from the run row. Enumerated rather than
+// spread wholesale because LatestRun is a projection, not a subset: it carries derived
+// fields (run_count, is_mine, owner_name, worker_name) that a run patch must never
+// clobber, and Run carries a great deal a card has no business holding.
+const CARD_MIRRORED_FIELDS = [
+  "status",
+  "mr_iid",
+  "mr_web_url",
+  "mr_state",
+  "failure_reason",
+  "stop_kind",
+  "health",
+  "health_reason",
+  "health_since",
+] as const;
+
+// The other half of the partition: fields a card carries that a RUN PATCH must never
+// write. `id` is the join key; `updated_at` is stamped by syncCards itself; the rest are
+// projections the server computes for the board and that no run row holds.
+const CARD_OWN_FIELDS = [
+  "id",
+  "updated_at",
+  "owner_name",
+  "worker_name",
+  "is_mine",
+  "run_count",
+  "created_at",
+] as const;
+
+// 🔴 COMPILE-TIME EXHAUSTIVENESS, and it is the point of splitting the list in two.
+//
+// The two arrays above must PARTITION `keyof LatestRun`. Without this line the
+// enumeration is correct only when written: a field added to LatestRun elsewhere
+// produces NO conflict in a merge, NO type error, and NO failing test — the card simply
+// stops mirroring it, silently. That is the same shape as an enumeration invalidated by
+// something that moved in another file, which this repo has been bitten by before.
+//
+// If this stops compiling, LatestRun gained (or lost) a field: put it in exactly one of
+// the two lists. Do NOT widen the type to make it build.
+type UnpartitionedCardField = Exclude<
+  keyof LatestRun,
+  (typeof CARD_MIRRORED_FIELDS)[number] | (typeof CARD_OWN_FIELDS)[number]
+>;
+const _cardFieldsArePartitioned: UnpartitionedCardField extends never ? true : never = true;
+void _cardFieldsArePartitioned;
+
+// syncCards propagates a run patch onto any board card whose latest_run IS this run.
+//
+// 🔴 WITHOUT THIS THE DEMO CONTRADICTS ITSELF, measured in the browser: the board's
+// attention strip read "1 run needs an answer" while the very card it linked to was
+// badged "awaiting approval", because the strip comes from listRuns (live) and the card
+// from the board fixture (frozen at seed). Not specific to PRD #88 — every scripted
+// status transition has been invisible on the board since the mock was written; the
+// clarification park is just the first one whose strip and card were on screen together
+// to disagree out loud.
+//
+// It also makes the awaiting_input CARD reachable at all. The badge, the warn ring and
+// needsHumanAttention are product code with unit tests, but the surface was un-driven
+// end to end: no fixture seeds that status, so nothing but this sync can produce it.
+function syncCards(runId: string, patch: Partial<Run>): void {
+  for (const board of state.boards.values()) {
+    for (const card of board.cards) {
+      if (card.latest_run?.id !== runId) continue;
+      const merged = { ...card.latest_run, updated_at: new Date().toISOString() };
+      for (const key of CARD_MIRRORED_FIELDS) {
+        if (key in patch) (merged as Record<string, unknown>)[key] = patch[key];
+      }
+      card.latest_run = merged;
+    }
+  }
+}
+
 export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
   const run = state.runs.get(runId);
   if (!run) return undefined;
   const next = { ...run, ...patch, updated_at: new Date().toISOString() };
   state.runs.set(runId, next);
+  syncCards(runId, patch);
   if (patch.status && patch.status !== run.status) {
     broadcast(runId, { type: "state", status: patch.status as RunStatus });
   }
@@ -150,6 +227,14 @@ export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
 
 export function getRun(runId: string): Run | undefined {
   return state.runs.get(runId);
+}
+
+// listMessages is a read-only view of a run's log. The engine derives from it rather
+// than keeping a parallel counter, so a mock script folds the feed the same way the real
+// UI does — the derivation IS the contract under test (PRD #88 D-L), and a second source
+// of truth in the mock would be a place for the two to disagree.
+export function listMessages(runId: string): readonly RunMessage[] {
+  return state.messages.get(runId) ?? [];
 }
 
 let runCounter = 0;

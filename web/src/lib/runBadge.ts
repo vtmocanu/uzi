@@ -3,7 +3,12 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import { isTerminalRun, type LatestRun, type RunHealth, type StopKind } from "./api";
+import {
+  isTerminalRun,
+  type LatestRun,
+  type RunHealth,
+  type StopKind,
+} from "./api";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { stripUnsafeChars } from "./safeText";
 
@@ -12,14 +17,21 @@ import { stripUnsafeChars } from "./safeText";
 // (claimed/running), warning (awaiting, limit_wait), ok (completed), danger
 // (failure). Since PRD #35 that mirror is asserted by a test rather than only
 // claimed here — see the RUN_STATUS_TONES agreement case in runBadge.test.ts.
-export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
+export type BadgeTone =
+  "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
 // chip (rendered as a link to the merge request), carrying the derived MR-state
 // variant; kind "badge" is a plain pill.
 export type RunBadge =
   | { kind: "mr"; mrIid: number; mrState: MrChipState }
-  | { kind: "badge"; label: string; tone: BadgeTone; pulse: boolean; title?: string };
+  | {
+      kind: "badge";
+      label: string;
+      tone: BadgeTone;
+      pulse: boolean;
+      title?: string;
+    };
 
 // MrChipState is the MR chip's display variant (PRD #33 Decision 2, multica's
 // derived-status pattern): the single enum every chip surface renders from, so raw
@@ -82,11 +94,18 @@ export function mrChipTitle(state: MrChipState, forgeType: string): string {
 // An auto-stop is uzi killing a run because it was broken. That is breakage and its
 // owner needs to see it. Listing the members means the NEXT stop_kind added has to
 // make this choice deliberately instead of inheriting it.
-const HUMAN_STOP_KINDS: ReadonlySet<StopKind> = new Set<StopKind>(["cancelled", "plan_rejected"]);
+const HUMAN_STOP_KINDS: ReadonlySet<StopKind> = new Set<StopKind>([
+  "cancelled",
+  "plan_rejected",
+]);
 
-export function isStoppedRun(status: string, stopKind: StopKind | null | undefined): boolean {
+export function isStoppedRun(
+  status: string,
+  stopKind: StopKind | null | undefined,
+): boolean {
   if (status === "cancelled") return true;
-  if (status === "failed" && stopKind != null && HUMAN_STOP_KINDS.has(stopKind)) return true;
+  if (status === "failed" && stopKind != null && HUMAN_STOP_KINDS.has(stopKind))
+    return true;
   return false;
 }
 
@@ -95,8 +114,12 @@ export function isStoppedRun(status: string, stopKind: StopKind | null | undefin
 // and the board badge so one status is one color everywhere: a deliberate stop is
 // calm neutral, awaiting-approval is amber, a genuine failure is rose, completed
 // is green, claimed/running are sky. Shared by the issue-view history rows.
-export function runStatusTone(status: string, stopKind: StopKind | null | undefined): BadgeTone {
-  if (status === "awaiting_approval") return "warning";
+export function runStatusTone(
+  status: string,
+  stopKind: StopKind | null | undefined,
+): BadgeTone {
+  if (status === "awaiting_approval" || status === "awaiting_input")
+    return "warning";
   // PRD #35: a run parked on the owner's Anthropic usage limit. Warn, like the
   // other "blocked on something outside the run" state — never danger: it has not
   // failed and it resumes by itself.
@@ -142,7 +165,11 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
 // agent, and a run that is waiting on a clock by design would trip every one of
 // them. Adding the status here would put "⚠ stalled" on a run that is behaving
 // exactly as intended — the false alarm this design exists to avoid.
-const HEALTH_FLAGGABLE_STATUSES = new Set<string>(["queued", "running", "awaiting_approval"]);
+const HEALTH_FLAGGABLE_STATUSES = new Set<string>([
+  "queued",
+  "running",
+  "awaiting_approval",
+]);
 
 // healthFlagLabel is the short word for a flag, or null for "ok". Shared by the
 // board badge and the run-view header so the wording is defined once.
@@ -157,7 +184,10 @@ export function isHealthFlaggableStatus(status: string): boolean {
 
 // shouldShowHealthFlag is the single gate both surfaces use: a non-ok flag on a
 // flaggable status.
-export function shouldShowHealthFlag(health: RunHealth, status: string): boolean {
+export function shouldShowHealthFlag(
+  health: RunHealth,
+  status: string,
+): boolean {
   return health !== "ok" && isHealthFlaggableStatus(status);
 }
 
@@ -177,10 +207,15 @@ export type HealthFlaggable = {
 // caller falls through to the normal status badge. The elapsed counts from
 // health_since ("stuck for Xm"), not created_at. title carries the owner-only
 // reason when present (a non-owner's health_reason is null → no tooltip).
-export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | null {
+export function healthBadge(
+  run: HealthFlaggable,
+  nowMs: number,
+): RunBadge | null {
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
-  const elapsed = run.health_since ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}` : "";
+  const elapsed = run.health_since
+    ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}`
+    : "";
   return {
     kind: "badge",
     label: `⚠ ${label}${elapsed}`,
@@ -252,10 +287,32 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
       return { kind: "badge", label: "claimed", tone: "info", pulse: false };
     case "running": {
       const elapsed = formatElapsed(nowMs - Date.parse(run.created_at));
-      return { kind: "badge", label: `running ${elapsed}`, tone: "info", pulse: true };
+      return {
+        kind: "badge",
+        label: `running ${elapsed}`,
+        tone: "info",
+        pulse: true,
+      };
     }
     case "awaiting_approval":
-      return { kind: "badge", label: "awaiting approval", tone: "warning", pulse: false };
+      return {
+        kind: "badge",
+        label: "awaiting approval",
+        tone: "warning",
+        pulse: false,
+      };
+    // PRD #88. The default arm below would already produce a warning-toned "awaiting
+    // input" via runStatusTone… except it does not: the default hardcodes `neutral`.
+    // So this case is what stops a parked question rendering as a calm grey chip
+    // indistinguishable from `cancelled`. The label says "answer" rather than echoing
+    // the enum, because "awaiting input" reads as machine waiting for machine.
+    case "awaiting_input":
+      return {
+        kind: "badge",
+        label: "needs your answer",
+        tone: "warning",
+        pulse: false,
+      };
     // PRD #35: parked on the owner's Anthropic usage limit. STATIC — no countdown
     // and no elapsed, unlike the running badge above. LatestRun is a deliberately
     // narrow board projection that carries neither retry_not_before nor
@@ -270,7 +327,8 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         label: "limit wait",
         tone: "warning",
         pulse: false,
-        title: "Paused on an Anthropic usage limit. It resumes on its own when the window reopens.",
+        title:
+          "Paused on an Anthropic usage limit. It resumes on its own when the window reopens.",
       };
     case "failed":
       return {
@@ -284,10 +342,20 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
       // A completed run with an MR becomes a link chip (ok-accented), carrying the
       // derived MR-state variant so the board card can show merged/closed; without
       // an MR it must still be visible, so a plain ok "completed" badge stands in.
-      if (run.mr_iid != null) return { kind: "mr", mrIid: run.mr_iid, mrState: mrChipState(run.mr_state) };
+      if (run.mr_iid != null)
+        return {
+          kind: "mr",
+          mrIid: run.mr_iid,
+          mrState: mrChipState(run.mr_state),
+        };
       return { kind: "badge", label: "completed", tone: "ok", pulse: false };
     default:
-      return { kind: "badge", label: run.status.replace(/_/g, " "), tone: "neutral", pulse: false };
+      return {
+        kind: "badge",
+        label: run.status.replace(/_/g, " "),
+        tone: "neutral",
+        pulse: false,
+      };
   }
 }
 
@@ -320,4 +388,23 @@ export function retryHint(runCount: number): string | null {
 // a human is the blocker while a worker is held busy.
 export function isAwaitingApproval(status: string): boolean {
   return status === "awaiting_approval";
+}
+
+// isAwaitingInput is its PRD #88 SIBLING, deliberately not a widening of it. The two
+// human-in-the-loop reasons are a distinct run status precisely so a surface can tell
+// "approve my plan" from "answer my question" (PRD Decision 3); folding them into one
+// predicate would put back exactly what the status split removed, and the board strip
+// would then tell a user to approve a plan that does not exist.
+//
+// What they SHARE is the treatment: same warn tone, same loud card ring, same strip
+// (D-O #4). needsHumanAttention below is where that sharing is expressed, once.
+export function isAwaitingInput(status: string): boolean {
+  return status === "awaiting_input";
+}
+
+// needsHumanAttention is the union: a run parked on ANY human decision. Use it for
+// presentation that is identical for both (the card ring, the favicon dot); use the two
+// predicates above wherever the WORDING differs, which is anywhere a human reads it.
+export function needsHumanAttention(status: string): boolean {
+  return isAwaitingApproval(status) || isAwaitingInput(status);
 }

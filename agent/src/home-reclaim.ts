@@ -25,8 +25,8 @@ import { RUN_ID_RE } from "./util.js";
  *  - the status lookup 404'd → also unknown, skip. A 404 is *probably* a deleted
  *    run whose HOME is genuinely garbage, but "probably" is not the standard
  *    here, and the cost of being wrong is asymmetric;
- *  - any non-terminal status (`queued`, `claimed`, `running`, `awaiting_approval`)
- *    → the run may still resume into this HOME, skip.
+ *  - any non-terminal status (`queued`, `claimed`, `running`, `awaiting_approval`,
+ *    `awaiting_input`) → the run may still resume into this HOME, skip.
  *
  * A requeued run reads `queued`, and a run live on ANOTHER worker sharing the
  * volume reads `running` — both non-terminal, both skipped.
@@ -58,16 +58,19 @@ import { RUN_ID_RE } from "./util.js";
  * Run statuses a run never leaves. A run in one of these will never resume, so its
  * HOME cannot be wanted again.
  *
- * The `runs.status` CHECK now holds EIGHT values — queued / claimed / running /
- * awaiting_approval / limit_wait / completed / failed / cancelled — after migration
- * `00091` widened migration `00020`'s original seven with `limit_wait` (PRD #35).
+ * The `runs.status` CHECK now holds NINE values — queued / claimed / running /
+ * awaiting_approval / limit_wait / awaiting_input / completed / failed / cancelled —
+ * after PRD #35 widened migration `00020`'s original seven with `limit_wait` and
+ * PRD #88 added `awaiting_input`.
  *
- * 🔴 `limit_wait` IS NOT TERMINAL AND MUST NEVER BE ADDED TO THIS SET. Read the
- * DEFAULT_RECLAIM_MIN_AGE_MS comment below before touching it: a parked run's HOME
- * is past `minAgeMs` for essentially its whole park (the age filter is 3h, a park
- * runs to RUN_LIMIT_MAX_PARK, default 8d), so it becomes a candidate on EVERY sweep
- * and survives only because the API answers `limit_wait` and `limit_wait` is absent
- * here. Adding it deletes the ~170 MB SDK transcript the entire resume depends on.
+ * 🔴 NEITHER `limit_wait` NOR `awaiting_input` IS TERMINAL, AND NEITHER MAY EVER BE
+ * ADDED TO THIS SET. Read the DEFAULT_RECLAIM_MIN_AGE_MS comment below before
+ * touching it: a parked run's HOME is past `minAgeMs` for essentially its whole park
+ * (the age filter is 3h, a limit park runs to RUN_LIMIT_MAX_PARK, default 8d, and a
+ * clarification park waits on a human for up to QUESTION_TIMEOUT, default 24h), so it
+ * becomes a candidate on EVERY sweep and survives only because the API answers a
+ * non-terminal status and that status is absent here. Adding either deletes the
+ * ~170 MB SDK transcript the entire resume depends on.
  *
  * This is the SECOND of two independent protections for a parked HOME. The first is
  * the runner's cleanup carve-out, which skips the teardown deletion; this one skips
@@ -76,7 +79,11 @@ import { RUN_ID_RE } from "./util.js";
  * nothing pointing back here — which is why the guard is asserted in
  * home-reclaim.test.ts rather than left to this comment.
  */
-export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 /**
  * How stale a directory must be before it is even a candidate.
@@ -184,7 +191,8 @@ export async function reclaimStrandedRunHomes(
 ): Promise<ReclaimSummary> {
   const minAgeMs = opts.minAgeMs ?? DEFAULT_RECLAIM_MIN_AGE_MS;
   const maxEntries = opts.maxEntries ?? DEFAULT_RECLAIM_MAX_ENTRIES;
-  const maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
+  const maxConsecutiveFailures =
+    opts.maxConsecutiveFailures ?? DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES;
   const deadlineMs = opts.deadlineMs ?? DEFAULT_RECLAIM_DEADLINE_MS;
   const now = opts.now ?? Date.now;
   const startedAt = now();
@@ -207,14 +215,18 @@ export async function reclaimStrandedRunHomes(
     // A worker on a fresh volume has no agent-home yet — nothing to reclaim, and
     // nothing worth a warning.
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("run HOME reclaim could not read the HOME root", { home_root: homeRoot });
+      log.warn("run HOME reclaim could not read the HOME root", {
+        home_root: homeRoot,
+      });
     }
     return summary;
   }
 
   // Candidates first, so "how many did we not get to" is a subtraction from a list
   // that exists rather than a number nobody counted.
-  const candidates = entries.filter((e) => e.isDirectory() && RUN_ID_RE.test(e.name));
+  const candidates = entries.filter(
+    (e) => e.isDirectory() && RUN_ID_RE.test(e.name),
+  );
   summary.skippedNotRunDir = entries.length - candidates.length;
 
   for (const entry of candidates) {

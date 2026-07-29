@@ -14,6 +14,7 @@ import {
   TerminalIcon,
   ThoughtIcon,
 } from "./icons";
+import { parseAnswerPayload, parseQuestionsForDisplay } from "../lib/runQuestion";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -29,7 +30,9 @@ import {
 // ── payload probes ──────────────────────────────────────────────────────────
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
+  return v && typeof v === "object"
+    ? (v as Record<string, unknown>)
+    : undefined;
 }
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
@@ -101,7 +104,9 @@ export function toolSummary(name: string | undefined, input: unknown): string {
     case "WebSearch":
       return s("query");
     default: {
-      const pairs = Object.entries(rec).map(([k, v]) => `${k}: ${compactValue(v)}`);
+      const pairs = Object.entries(rec).map(
+        ([k, v]) => `${k}: ${compactValue(v)}`,
+      );
       return pairs.join(", ");
     }
   }
@@ -240,7 +245,13 @@ export function highlightShell(command: string): ReactNode[] {
     let j = i;
     while (j < n) {
       const cj = command[j];
-      if (SHELL_SPACE.has(cj) || SHELL_OP_START.has(cj) || cj === "'" || cj === '"') break;
+      if (
+        SHELL_SPACE.has(cj) ||
+        SHELL_OP_START.has(cj) ||
+        cj === "'" ||
+        cj === '"'
+      )
+        break;
       j++;
     }
     const word = command.slice(i, j);
@@ -278,7 +289,12 @@ export function CommandBlock({ command }: { command: string }) {
             states (user-approved deviation from the mock's line-clamp quirk). The
             cap is 2 × leading-relaxed(1.625) = 3.25em (em == the inherited
             text-xs), i.e. exactly two lines regardless of the outer padding. */}
-        <div className={cx("whitespace-pre-wrap break-words", clamped && "max-h-[3.25em] overflow-hidden")}>
+        <div
+          className={cx(
+            "whitespace-pre-wrap break-words",
+            clamped && "max-h-[3.25em] overflow-hidden",
+          )}
+        >
           <span aria-hidden="true" className="mr-2 select-none text-faint">
             ❯
           </span>
@@ -304,14 +320,18 @@ export function CommandBlock({ command }: { command: string }) {
 // resultToText flattens a tool_result's content — a string or an array of blocks
 // (mapUser passes SDK content through as-is) — into displayable text, reporting
 // whether a non-text block (e.g. an image) was dropped as a known lost signal.
-export function resultToText(content: unknown): { text: string; hadNonText: boolean } {
+export function resultToText(content: unknown): {
+  text: string;
+  hadNonText: boolean;
+} {
   if (typeof content === "string") return { text: content, hadNonText: false };
   if (Array.isArray(content)) {
     const parts: string[] = [];
     let hadNonText = false;
     for (const block of content) {
       const rec = asRecord(block);
-      const t = rec && rec["type"] === "text" ? asString(rec["text"]) : undefined;
+      const t =
+        rec && rec["type"] === "text" ? asString(rec["text"]) : undefined;
       if (t !== undefined) parts.push(t);
       else hadNonText = true;
     }
@@ -366,13 +386,18 @@ export type ResultState = "ok" | "error" | "blocked";
 // field (api/internal/workersvc/judge.go, toolResultOutcome → observedGreenTools), and
 // flipping a denial to non-error at the source would make a denied command count as
 // green evidence that it ran (PRD #116 Decision 2).
-export function classifyResultState(isError: boolean, text: string): ResultState {
+export function classifyResultState(
+  isError: boolean,
+  text: string,
+): ResultState {
   if (!isError) return "ok";
   for (const line of text.split("\n")) {
     let s = line.trimStart();
-    if (s.startsWith(TOOL_USE_ERROR_OPEN)) s = s.slice(TOOL_USE_ERROR_OPEN.length).trimStart();
+    if (s.startsWith(TOOL_USE_ERROR_OPEN))
+      s = s.slice(TOOL_USE_ERROR_OPEN.length).trimStart();
     const preamble = s.indexOf(HOOK_ERROR_PREAMBLE);
-    if (preamble !== -1) s = s.slice(preamble + HOOK_ERROR_PREAMBLE.length).trimStart();
+    if (preamble !== -1)
+      s = s.slice(preamble + HOOK_ERROR_PREAMBLE.length).trimStart();
     if (s.startsWith(GUARDRAIL_DENY_MARK)) return "blocked";
   }
   return "error";
@@ -417,9 +442,13 @@ export function describeStatus(payload: unknown): string {
       // line separately (PhaseUsage), because the frame's own total_cost_usd is
       // CUMULATIVE-across-resume (PRD #40 verdict b) and would over-read per phase.
       const bits: string[] = [];
-      if (typeof rec["duration_ms"] === "number") bits.push(formatDuration(rec["duration_ms"]));
-      if (typeof rec["num_turns"] === "number") bits.push(`${rec["num_turns"]} turns`);
-      return bits.length ? `agent finished (${bits.join(", ")})` : "agent finished";
+      if (typeof rec["duration_ms"] === "number")
+        bits.push(formatDuration(rec["duration_ms"]));
+      if (typeof rec["num_turns"] === "number")
+        bits.push(`${rec["num_turns"]} turns`);
+      return bits.length
+        ? `agent finished (${bits.join(", ")})`
+        : "agent finished";
     }
     return `status: result/${subtype}`;
   }
@@ -435,7 +464,9 @@ export function describeError(payload: unknown): string {
   const text = asString(rec["text"]);
   if (text !== undefined) return text;
   const subtype = asString(rec["subtype"]);
-  const errors = Array.isArray(rec["errors"]) ? rec["errors"].map(String).filter(Boolean) : [];
+  const errors = Array.isArray(rec["errors"])
+    ? rec["errors"].map(String).filter(Boolean)
+    : [];
   const joined = errors.join("; ");
   if (subtype && joined) return `${subtype}: ${joined}`;
   return subtype || joined || "error";
@@ -531,8 +562,11 @@ function MetaLine({ text, usage }: { text: string; usage?: PhaseUsage }) {
 function FinishTokens({ usage }: { usage: PhaseUsage }) {
   return (
     <span className="font-mono not-italic tabular-nums text-faint">
-      {formatTokens(usage.fresh)} in · {formatTokens(usage.cached)} cached · {formatTokens(usage.out)} out
-      {usage.costUsd > 0 && <span className="text-brand"> · {formatCost(usage.costUsd)}</span>}
+      {formatTokens(usage.fresh)} in · {formatTokens(usage.cached)} cached ·{" "}
+      {formatTokens(usage.out)} out
+      {usage.costUsd > 0 && (
+        <span className="text-brand"> · {formatCost(usage.costUsd)}</span>
+      )}
     </span>
   );
 }
@@ -574,21 +608,37 @@ function toolIcon(name: string): ReactNode {
 const INSTANT_MS = 100;
 const SLOW_MS = 60_000;
 
-function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMessage; live: boolean }) {
+function ToolDuration({
+  msg,
+  result,
+  live,
+}: {
+  msg: RunMessage;
+  result?: RunMessage;
+  live: boolean;
+}) {
   if (result) {
-    const raw = new Date(result.created_at).getTime() - new Date(msg.created_at).getTime();
+    const raw =
+      new Date(result.created_at).getTime() -
+      new Date(msg.created_at).getTime();
     const ms = Number.isFinite(raw) && raw >= 0 ? raw : 0;
     if (ms < INSTANT_MS) {
       // Suppress the meaningless "0.0s"; the raw value stays available in the title.
       return (
-        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted" title={`${Math.round(ms)}ms`}>
+        <span
+          className="ml-auto shrink-0 text-[11px] tabular-nums text-muted"
+          title={`${Math.round(ms)}ms`}
+        >
           instant
         </span>
       );
     }
     return (
       <span
-        className={cx("ml-auto shrink-0 text-[11px] tabular-nums", ms >= SLOW_MS ? "text-warn" : "text-muted")}
+        className={cx(
+          "ml-auto shrink-0 text-[11px] tabular-nums",
+          ms >= SLOW_MS ? "text-warn" : "text-muted",
+        )}
       >
         {formatDuration(ms)}
       </span>
@@ -601,14 +651,19 @@ function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMess
       </span>
     );
   }
-  return <span className="ml-auto shrink-0 text-[11px] italic text-muted">no result</span>;
+  return (
+    <span className="ml-auto shrink-0 text-[11px] italic text-muted">
+      no result
+    </span>
+  );
 }
 
 // ── per-kind rows ───────────────────────────────────────────────────────────
 
 // The neutral chip/body frame, shared by "ok" and "blocked" so a future tweak to
 // one cannot silently drift from the other.
-const NEUTRAL_CHIP = "border-edge bg-raised/50 text-muted hover:border-edge-strong";
+const NEUTRAL_CHIP =
+  "border-edge bg-raised/50 text-muted hover:border-edge-strong";
 const NEUTRAL_BODY = "border-edge bg-ink";
 
 // Per-state chip/body presentation (PRD #116 Decision 4). "blocked" reuses the
@@ -620,7 +675,16 @@ const NEUTRAL_BODY = "border-edge bg-ink";
 // 11px, `font-bold` closes the counter of ⊘ and it rasterises as a small amber
 // blob, confusable with the feed's agent-status dots. ✓/✗ read fine bold at that
 // size and keep it; ⊘ goes non-bold and a touch larger instead.
-const RESULT_TONE: Record<ResultState, { glyph: string; glyphClass: string; chip: string; body: string; aria: string }> = {
+const RESULT_TONE: Record<
+  ResultState,
+  {
+    glyph: string;
+    glyphClass: string;
+    chip: string;
+    body: string;
+    aria: string;
+  }
+> = {
   ok: {
     glyph: "✓",
     glyphClass: "font-bold text-ok",
@@ -651,7 +715,13 @@ const RESULT_TONE: Record<ResultState, { glyph: string; glyphClass: string; chip
 // always in the DOM (pairing/test assertions); a dropped non-text block surfaces
 // as a "[image omitted]" first line. Errors auto-expand with a danger tint; a
 // blocked result is handled-and-recovered, so it stays neutral and collapsed.
-function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: string }) {
+function ToolResultBody({
+  result,
+  toolName,
+}: {
+  result: RunMessage;
+  toolName?: string;
+}) {
   const rec = asRecord(result.payload) ?? {};
   const isError = rec["is_error"] === true;
   const { text, hadNonText } = resultToText(rec["content"]);
@@ -698,7 +768,9 @@ function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: s
     : showLabel;
 
   const bodyText = empty ? (hadNonText ? "" : "(no output)") : text;
-  const body = [hadNonText ? "[image omitted]" : "", bodyText].filter(Boolean).join("\n");
+  const body = [hadNonText ? "[image omitted]" : "", bodyText]
+    .filter(Boolean)
+    .join("\n");
 
   return (
     <div className="mt-1.5">
@@ -754,7 +826,15 @@ function RunningIndicator({ start }: { start: string }) {
   );
 }
 
-function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessage; live: boolean }) {
+function ToolUseRow({
+  msg,
+  result,
+  live,
+}: {
+  msg: RunMessage;
+  result?: RunMessage;
+  live: boolean;
+}) {
   const rec = asRecord(msg.payload) ?? {};
   const name = asString(rec["name"]) ?? "tool";
   const full = toolSummary(name, rec["input"]);
@@ -772,7 +852,10 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
     // itself no longer carries its own border — that produced a segmented rail.
     <div className="text-sm">
       <div className="flex items-center gap-2">
-        <span aria-hidden="true" className="inline-flex shrink-0 text-faint [font-size:14px]">
+        <span
+          aria-hidden="true"
+          className="inline-flex shrink-0 text-faint [font-size:14px]"
+        >
           {toolIcon(name)}
         </span>
         <span className="shrink-0 text-[11px] font-semibold uppercase tracking-wider text-muted">
@@ -784,7 +867,11 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
           </span>
         )}
         {argOverflow && (
-          <Expander open={open} onToggle={() => setOpen((o) => !o)} label={open ? "less" : "more"} />
+          <Expander
+            open={open}
+            onToggle={() => setOpen((o) => !o)}
+            label={open ? "less" : "more"}
+          />
         )}
         <ToolDuration msg={msg} result={result} live={live} />
       </div>
@@ -808,11 +895,38 @@ function ThinkingRow({ text }: { text: string }) {
           </span>
           thinking… {truncate(firstLine(text), 100)}
         </span>
-        <Expander open={open} onToggle={() => setOpen((o) => !o)} label={open ? "hide" : "show"} />
+        <Expander
+          open={open}
+          onToggle={() => setOpen((o) => !o)}
+          label={open ? "hide" : "show"}
+        />
       </div>
       {open && (
-        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-muted">{text}</pre>
+        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-muted">
+          {text}
+        </pre>
       )}
+    </div>
+  );
+}
+
+// The unknown-kind fallback line. Extracted from the `default:` arm — body unchanged —
+// because PRD #88's `question` row also lands here when its payload is unusable: a
+// question with no question_id can be shown but never answered (the api rejects an
+// id-less answer), so it degrades to the same muted line every other unrenderable
+// frame gets rather than rendering a composer whose every submit would 400.
+function UnrenderableRow({
+  kind,
+  rec,
+}: {
+  kind: string;
+  rec?: Record<string, unknown>;
+}) {
+  const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
+  return (
+    <div className="text-xs text-muted">
+      <span className="italic">unrenderable {kind} event</span>
+      {extract && <span className="ml-1 text-fg">— {truncate(extract)}</span>}
     </div>
   );
 }
@@ -861,17 +975,28 @@ function StandaloneResult({ result }: { result: RunMessage }) {
  * distinguishes the rows is `resets_at`, which differs per park by construction — so
  * no per-row information is lost by leaving the count out entirely.
  */
-function LimitRow({ payload, parked = false }: { payload?: Record<string, unknown>; parked?: boolean }) {
+function LimitRow({
+  payload,
+  parked = false,
+}: {
+  payload?: Record<string, unknown>;
+  parked?: boolean;
+}) {
   const window = feedWindowLabel(payload?.["rate_limit_type"]);
   const resetsAt = parseFeedInstant(payload?.["resets_at"]);
-  const detail = [window, resetsAt != null ? `resets ${new Date(resetsAt).toLocaleString()}` : null]
+  const detail = [
+    window,
+    resetsAt != null ? `resets ${new Date(resetsAt).toLocaleString()}` : null,
+  ]
     .filter((s): s is string => s != null)
     .join(" · ");
   return (
     <div
       className={cx(
         "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs",
-        parked ? "border-warn/40 bg-warn/10 text-warn" : "border-danger/40 bg-danger/10 text-danger",
+        parked
+          ? "border-warn/40 bg-warn/10 text-warn"
+          : "border-danger/40 bg-danger/10 text-danger",
       )}
     >
       <span aria-hidden="true">{parked ? "⏸" : "✗"}</span>
@@ -968,8 +1093,106 @@ export const RunEventRow = memo(function RunEventRow({
       const feedback = asString(rec?.["feedback"]) ?? "";
       return (
         <div className="rounded-md border border-brand/30 bg-brand/[0.08] px-2.5 py-1.5 text-sm">
-          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">requested changes</div>
-          {feedback ? <Markdown content={feedback} /> : <span className="text-xs text-faint">(no feedback text)</span>}
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">
+            requested changes
+          </div>
+          {feedback ? (
+            <Markdown content={feedback} />
+          ) : (
+            <span className="text-xs text-faint">(no feedback text)</span>
+          )}
+        </div>
+      );
+    }
+    // PRD #88: the lead asked the human a question and the run parked. The row is the
+    // durable record — the ANSWER affordance lives on the run panel (QuestionPanel), so
+    // this stays a read-only transcript entry and still renders long after the run
+    // resumed.
+    //
+    // Every string in the payload is model-authored from repo/issue content the agent
+    // read, i.e. attacker-influenceable. `question` goes through the hardened <Markdown>
+    // (no rehype-raw, so raw HTML is inert text); the header and each option render as
+    // React text children. Nothing here reaches href/title/style — option `label` in a
+    // `title` attribute would be the one channel a subtree-text assertion cannot see.
+    case "question": {
+      // parseQuestionsForDisplay, NOT parseQuestionPayload. The strict parse requires a
+      // `question_id` because an answer must name one — but a feed row answers nothing,
+      // it only shows. Running the answerability parse here threw away perfectly
+      // displayable text: measured in the browser, a question missing its id rendered as
+      // the literal line "unrenderable question event" while the panel above it said "the
+      // raw question is in the activity log below". The row is what makes that sentence
+      // true, so the two are pinned together by a test that renders BOTH.
+      const questions = parseQuestionsForDisplay(msg.payload);
+      if (questions.length === 0) return <UnrenderableRow kind={msg.kind} rec={rec} />;
+      return (
+        <div className="rounded-md border border-warn/40 bg-warn/[0.08] px-2.5 py-1.5 text-sm">
+          {/* No "question N of M" marker here. The ordinal used to ride the payload as
+              `generation` and no longer does (D-R): it is now counted from the feed,
+              which a single row cannot do — it holds one message. The panel above shows
+              it, where "which round am I on" is the question a reader actually has; a
+              feed row is already in chronological position, so the marker bought little
+              and plumbing a seq-keyed lookup through the memo boundary to restore it
+              would buy less. */}
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-warn">
+            question for you
+          </div>
+          <ul className="space-y-2">
+            {questions.map((item, i) => (
+              <li key={i} className="space-y-1">
+                {item.header.trim() !== "" && (
+                  <div className="text-xs font-semibold text-fg">
+                    {item.header}
+                  </div>
+                )}
+                <Markdown content={item.question} />
+                {item.options.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {item.options.map((o, j) => (
+                      <span
+                        key={j}
+                        className="rounded-full border border-edge-strong bg-raised px-2 py-[2px] text-[11px] text-muted"
+                      >
+                        {o.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+    // PRD #88: the human's answer, echoed once applied so the round-trip is auditable
+    // — the same role plan_feedback plays for a revision, and the same brand tone, so
+    // "this line is the user speaking" reads identically for both.
+    case "answer": {
+      const { answers } = parseAnswerPayload(msg.payload);
+      return (
+        <div className="rounded-md border border-brand/30 bg-brand/[0.08] px-2.5 py-1.5 text-sm">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">
+            your answer
+          </div>
+          {answers.length === 0 ? (
+            <span className="text-xs text-faint">(no answer text)</span>
+          ) : (
+            <ul className="space-y-1.5">
+              {answers.map((a, i) => (
+                <li key={i}>
+                  {a.trim() === "" ? (
+                    <span className="text-xs text-faint">
+                      (no answer given)
+                    </span>
+                  ) : (
+                    // The user's own text, but it round-trips through the server (and can
+                    // arrive from a Slack reply), so it is rendered through the same
+                    // escaped sink as everything else in the feed.
+                    <Markdown content={a} />
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       );
     }
@@ -984,14 +1207,7 @@ export const RunEventRow = memo(function RunEventRow({
     // is the one of the pair that reads as breakage.
     case "limit_hit":
       return <LimitRow payload={rec} />;
-    default: {
-      const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
-      return (
-        <div className="text-xs text-muted">
-          <span className="italic">unrenderable {msg.kind} event</span>
-          {extract && <span className="ml-1 text-fg">— {truncate(extract)}</span>}
-        </div>
-      );
-    }
+    default:
+      return <UnrenderableRow kind={msg.kind} rec={rec} />;
   }
 });

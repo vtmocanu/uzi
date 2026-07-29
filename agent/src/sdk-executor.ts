@@ -25,27 +25,72 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  Options as SdkOptions,
+  SDKMessage,
+  SpawnOptions,
+  SpawnedProcess,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildCheckEnv, buildSdkEnv } from "./sdk-env.js";
 import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
-import { installJsDeps, type JsDepsInstall, type JsDepsResult } from "./js-deps.js";
+import {
+  installJsDeps,
+  type JsDepsInstall,
+  type JsDepsResult,
+} from "./js-deps.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
-import { resolveAgentSelection, type AgentSelectionParse, type ClaimConfig } from "./protocol.js";
-import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
-import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
-import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
-import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
+import {
+  resolveAgentSelection,
+  type AgentSelectionParse,
+  type AskUserQuestion,
+  type ClaimConfig,
+} from "./protocol.js";
+import {
+  buildCIFixPlanPrompt,
+  buildImplementPrompt,
+  buildLeadSystemPrompt,
+  buildPlanPrompt,
+  buildRevisePlanPrompt,
+  buildSelfImprovePlanPrompt,
+  isNotCodePlan,
+} from "./prompt.js";
+import {
+  buildPreToolUseHook,
+  buildPathGuardHook,
+  buildAgentGuardHook,
+  NESTED_AGENT_TOOL,
+  ASYNC_DEFERRAL_TOOLS,
+} from "./guardrails.js";
+import {
+  buildSignalMcpServer,
+  isSignalToolName,
+  scanSignals,
+  SIGNAL_SERVER_NAME,
+} from "./signals.js";
+import {
+  classifyLimitFailure,
+  LimitReachedError,
+  RateLimitObserver,
+} from "./limit.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import type { WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { assistantModelOf, assistantUsageOf, isErrorResult, isResult, mapSdkMessage, orphanInstanceKind, sessionIdOf } from "./sdk-messages.js";
+import {
+  assistantModelOf,
+  assistantUsageOf,
+  isErrorResult,
+  isResult,
+  mapSdkMessage,
+  orphanInstanceKind,
+  sessionIdOf,
+} from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { clampToDirCharset, errMessage } from "./util.js";
 
@@ -68,8 +113,15 @@ const REASON_WALL = "run exceeded its wall-clock timeout";
 const REASON_IDLE = "run stalled: no agent activity within the idle timeout";
 const REASON_CANCELLED = "run cancelled";
 const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
-const REASON_NO_PLAN = "the agent ended the planning turn without submitting a plan";
-const REASON_MAX_ITERATIONS = "run reached the maximum implement/review iterations without completing";
+const REASON_NO_PLAN =
+  "the agent ended the planning turn without submitting a plan";
+/** PRD #88 M4: the lead kept asking instead of planning. Distinct from
+ *  REASON_NO_PLAN so an operator reading a failed run can tell "it never produced a
+ *  plan" from "it produced only questions" — different problems with different fixes. */
+const REASON_NO_PLAN_AFTER_CLARIFICATION =
+  "the agent kept asking clarifying questions without ever submitting a plan";
+const REASON_MAX_ITERATIONS =
+  "run reached the maximum implement/review iterations without completing";
 
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
@@ -132,6 +184,55 @@ interface TurnResult {
   done: boolean;
   /** PRD #72 M4: the PRD path the lead declared on signal_done, if any. */
   prdDonePath?: string;
+  /** PRD #88: questions the lead asked via ask_user during this turn. Present and
+   *  non-empty ⇒ the caller parks the run OUTSIDE driveTurn. */
+  questions?: AskUserQuestion[];
+}
+
+/** PRD #88 feed notices for a question that could NOT be put to a human. Both are
+ *  "the run continues on a guess", which is pre-#88 behaviour — worth saying on the
+ *  feed precisely because the lead had judged a guess costly enough to ask about. */
+const QUESTION_UNWIRED_NOTICE =
+  "The agent asked a clarifying question, but this run has no way to reach a human — it will proceed on its best judgment.";
+const QUESTION_CAP_NOTICE =
+  "The agent has already asked its maximum number of clarifying questions for this run — it will proceed on its best judgment.";
+
+/** Default question cap when the claim carries none (an older server, R8). Mirrors
+ *  the server's QUESTION_MAX default; the claim value wins when present. */
+const DEFAULT_QUESTION_MAX = 5;
+
+function questionMax(config: ClaimConfig | null): number {
+  const n = config?.question_max;
+  return typeof n === "number" && n > 0 ? n : DEFAULT_QUESTION_MAX;
+}
+
+/** Render the questions + answers back into the resumed session as a user turn. The
+ *  answers are USER text and the questions are the lead's own, so neither is framed
+ *  as an instruction beyond what it is. */
+function answeredPrompt(
+  questions: AskUserQuestion[],
+  answers: string[],
+): string {
+  const lines = questions.map((q, i) => {
+    const a = answers[i]?.trim();
+    return `Q: ${q.question}\nA: ${a && a.length > 0 ? a : "(no answer given)"}`;
+  });
+  return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\nContinue the work with these answers.`;
+}
+
+/** Wrap an answer (or a could-not-ask notice) for a PLANNING turn. The implement-loop
+ *  wording says "continue the work", which is wrong before a plan exists — here the
+ *  required next step is the plan itself, and saying so is what stops the lead from
+ *  treating the answer as permission to start implementing. */
+function buildPlanAfterAnswerPrompt(answerBlock: string): string {
+  return `${answerBlock}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
+}
+
+/** Told to the lead when its question could not be delivered. It must not simply
+ *  re-ask: nothing about the next turn makes a human any more reachable. */
+function unansweredPrompt(questions: AskUserQuestion[]): string {
+  const lines = questions.map((q) => `- ${q.question}`).join("\n");
+  return `Your question${questions.length > 1 ? "s" : ""} could not be put to a human on this run:\n\n${lines}\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.`;
 }
 
 /** Run-level watchdog/cancel state shared across the plan turn and every loop turn. */
@@ -188,7 +289,9 @@ export class SdkExecutor implements Executor {
     // provisionRoot/<runId>, OUTSIDE any clone (Decision 3), so the synthesized
     // devbox.json is never repo-borne.
     this.provisionHomeDir = opts.provisionHomeDir ?? this.homeDir;
-    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
+    this.provisionRoot =
+      opts.provisionRoot ??
+      path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
     this.installDeps = opts.installDeps ?? installJsDeps;
     // Docker wiring (PRD #83 M1): derive the two consumer facts ONCE. `dockerHost` set
@@ -220,10 +323,17 @@ export class SdkExecutor implements Executor {
    * The worker owns the gapless per-run seq, so the SERVER never writes these; it
    * hands the worker the {name, reason} list to emit. One status line per drop.
    */
-  private emitSkillDrops(ctx: RunContext, localDrops: readonly SkillDrop[]): void {
+  private emitSkillDrops(
+    ctx: RunContext,
+    localDrops: readonly SkillDrop[],
+  ): void {
     const all: SkillDrop[] = [...(ctx.skillsDropped ?? []), ...localDrops];
     for (const d of all) {
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: describeSkillDrop(d.name, d.reason) } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: describeSkillDrop(d.name, d.reason) },
+      });
     }
   }
 
@@ -281,7 +391,10 @@ export class SdkExecutor implements Executor {
     let depsTruncated = false;
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
-    const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
+    const maxIterations = positive(
+      ctx.config?.max_iterations,
+      DEFAULT_MAX_ITERATIONS,
+    );
     const maxRevisions = planMaxRevisionsOf(ctx.config);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -289,7 +402,10 @@ export class SdkExecutor implements Executor {
     // injection defense never loosens), rebuilt on every claim incl. resume. The
     // same prepareSkillPlugin path the stub executor uses, so the two never drift.
     // The worker owns the gapless seq, so it logs every dropped skill.
-    const prepared = await prepareSkillPlugin(ctx, resolveSkillCaps(ctx.config));
+    const prepared = await prepareSkillPlugin(
+      ctx,
+      resolveSkillCaps(ctx.config),
+    );
     const runSkills = prepared.runSkills;
     const skillsPluginPath = prepared.pluginPath;
     this.emitSkillDrops(ctx, prepared.drops);
@@ -298,7 +414,11 @@ export class SdkExecutor implements Executor {
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
-    const assembled = assembleAgents(ctx.agents ?? [], survivorNames, prepared.repoSurvivorNames);
+    const assembled = assembleAgents(
+      ctx.agents ?? [],
+      survivorNames,
+      prepared.repoSurvivorNames,
+    );
     // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
     // choice only takes effect after the plan is approved.
     const ownSubagentNames = Object.keys(assembled.subagents);
@@ -307,12 +427,24 @@ export class SdkExecutor implements Executor {
     // reuse; only the Agent-guard hook's allowSet is frozen at construction and so
     // must be REBUILT when the implement roster differs from the plan roster (PRD
     // #37 — an excluded or repo-sourced subagent must be denied by the guard).
-    const bashHook = buildPreToolUseHook(this.log, this.secretPaths, this.dockerWired);
+    const bashHook = buildPreToolUseHook(
+      this.log,
+      this.secretPaths,
+      this.dockerWired,
+    );
     const pathHook = buildPathGuardHook(ctx.worktreePath, this.log);
-    const preToolUse = (allowedSubagents: string[]): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
+    const preToolUse = (
+      allowedSubagents: string[],
+    ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
       { matcher: "Bash", hooks: [bashHook] },
-      { matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", hooks: [pathHook] },
-      { matcher: NESTED_AGENT_TOOL, hooks: [buildAgentGuardHook(allowedSubagents, this.log)] },
+      {
+        matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
+        hooks: [pathHook],
+      },
+      {
+        matcher: NESTED_AGENT_TOOL,
+        hooks: [buildAgentGuardHook(allowedSubagents, this.log)],
+      },
     ];
 
     // In-process MCP servers the LEAD (full toolset) reaches. The dep-free signal
@@ -331,7 +463,11 @@ export class SdkExecutor implements Executor {
       [SIGNAL_SERVER_NAME]: buildSignalMcpServer({ prdDonePath: isIssueRun }),
     };
     if (this.client) {
-      mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({ client: this.client, runId: ctx.runId, log: this.log }).server;
+      mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
+        client: this.client,
+        runId: ctx.runId,
+        log: this.log,
+      }).server;
     }
 
     const baseOptions: SdkOptions = {
@@ -345,13 +481,17 @@ export class SdkExecutor implements Executor {
       // independently of settingSources (SdkPluginConfig is a separate option),
       // so the isolation above never loosens. skipMcpDiscovery: this plugin ships
       // ONLY skills — the SDK host owns MCP, so never read a manifest/.mcp.json.
-      plugins: [{ type: "local", path: skillsPluginPath, skipMcpDiscovery: true }],
+      plugins: [
+        { type: "local", path: skillsPluginPath, skipMcpDiscovery: true },
+      ],
       // ALWAYS an explicit list — the full plugin-qualified run union. Omitting it
       // is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` when the
       // run has no skills disables all. Per-subagent scoping is each
       // AgentDefinition.skills; the lead is the main thread, covered by this union.
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
-      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { kind: ctx.kind }),
+      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
+        kind: ctx.kind,
+      }),
       agents: assembled.subagents,
       // In-process tools the lead calls: the signal server (gate the plan / mark
       // done, see signals.ts) plus, when a client is threaded, the memory server
@@ -379,15 +519,24 @@ export class SdkExecutor implements Executor {
     // model wins over the lead template's model for the main thread. Set the key
     // ONLY when a model is resolved — `model: undefined` must stay omitted (never
     // an explicit key), so an unset model falls back to the SDK/account default.
-    const leadModel = resolveLeadModel(ctx.config?.default_model, assembled.leadModel);
+    const leadModel = resolveLeadModel(
+      ctx.config?.default_model,
+      assembled.leadModel,
+    );
     if (leadModel) baseOptions.model = leadModel;
 
     const state: RunDrive = {
       currentChild: {},
-      wallRemainingMs: seconds(ctx.config?.run_timeout_seconds, DEFAULT_RUN_TIMEOUT_SECONDS),
+      wallRemainingMs: seconds(
+        ctx.config?.run_timeout_seconds,
+        DEFAULT_RUN_TIMEOUT_SECONDS,
+      ),
       reportedSessionId: false,
     };
-    const idleMs = seconds(ctx.config?.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS);
+    const idleMs = seconds(
+      ctx.config?.idle_timeout_seconds,
+      DEFAULT_IDLE_TIMEOUT_SECONDS,
+    );
 
     // Cancel/shutdown spans the whole run (all turns + the gate). It trips the
     // current turn's abort; the gate also unblocks via the steering verdict. It also
@@ -421,7 +570,10 @@ export class SdkExecutor implements Executor {
       // a token window — the alternative is not "more oversight", it is a run that
       // parks at awaiting_approval unattended and can then die on REASON_NO_PLAN when
       // the resumed session declines to re-emit signal_plan.
-      const preApproved = ctx.planApproved === true && !!ctx.sessionId && !!ctx.approvedPlan?.trim();
+      const preApproved =
+        ctx.planApproved === true &&
+        !!ctx.sessionId &&
+        !!ctx.approvedPlan?.trim();
 
       // Hoisted above the skip so the post-gate code (the ci_fix not_code check, the
       // planning label) reads the same values on both paths.
@@ -479,133 +631,208 @@ export class SdkExecutor implements Executor {
         ? { status: "ok", selection: ctx.approvedSelection }
         : { status: "absent" };
 
+      /** PRD #88: parks used so far, against QUESTION_MAX. Worker-side because a
+       *  question is an in-process ask_user signal — there is no run_user_inputs row
+       *  for the server to count, unlike a revise_plan.
+       *
+       *  Declared ABOVE the preApproved branch, not inside it, and that placement is
+       *  load-bearing twice over. The cap is per RUN: M4 lets the lead ask before it
+       *  plans, so a budget scoped to the planning branch would reset between the
+       *  planning and implement phases and silently be worth 2 x QUESTION_MAX. And a
+       *  PRE-APPROVED resume (PRD #35) skips the planning branch entirely while its
+       *  implement loop can still ask, so a budget declared in the else-block is not
+       *  merely mis-scoped there — it does not exist on that path at all.
+       *
+       *  NOT DURABLE, and the honest bound is worth stating because the other #88
+       *  bound already states its own: this is worker memory, so a worker death
+       *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
+       *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 10 on
+       *  defaults, not 5 — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
+       *  identical reason. Documenting one and not the other would be worse than
+       *  documenting neither: a reader who finds the timeout's caveat reasonably
+       *  infers the cap has none. */
+      const budget = { asked: 0 };
+
       if (preApproved) {
         ctx.emit({
           kind: "status",
           agent: "worker",
-          payload: { text: "resuming an already-approved plan — skipping the planning turn and the approval gate" },
+          payload: {
+            text: "resuming an already-approved plan — skipping the planning turn and the approval gate",
+          },
         });
         approvedPlan = ctx.approvedPlan!;
       } else {
-      // --- Phase 1: planning turn ------------------------------------------
-      // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
-      // (untrusted job logs) instead of a forge issue; everything else — the plan
-      // gate, the implement⇄review loop, the guardrails — is identical.
-      let planPrompt: string;
-      if (isCIFix) {
-        planPrompt = buildCIFixPlanPrompt({
-          ref: ctx.pipeline!.ref,
-          branch: ctx.branch,
-          pipelineWebURL: ctx.pipeline!.web_url,
-          failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
-          subagentNames: ownSubagentNames,
-          // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
-          // nonce-fenced cross-run memory back (empty/absent injects nothing).
-          memory: ctx.memory,
-          // Issue #105: only set when a dropped resume left this turn amnesiac on a
-          // branch that already carries pushed work.
-          priorWork: ctx.priorWork,
-          // Judge rec (run 51757591): the commit this branch was cut from, so the lead
-          // does not infer the parent from the clone's freshly-fetched default branch.
-          baseCommit: ctx.baseCommit,
-          defaultBranchCommit: ctx.defaultBranchCommit,
-        });
-      } else if (isSelfImprove) {
-        // The self_improve run's issue_description carries the untrusted improve_uzi
-        // backlog; the trusted "pick one / guardrails / tests" directive lives in the
-        // prompt builder, outside the untrusted fence (PRD #46 Decision 10, audit C1).
-        planPrompt = buildSelfImprovePlanPrompt({
-          branch: ctx.branch,
-          recommendations: ctx.issueDescription,
-          subagentNames: ownSubagentNames,
-          // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
-          // nonce-fenced cross-run memory back (empty/absent injects nothing).
-          memory: ctx.memory,
-          // Issue #105: see above — the fixed self_improve branch's prior cycles.
-          priorWork: ctx.priorWork,
-          // See above. The fixed self_improve branch is routinely seeded off a previous
-          // cycle's tip, so its base is the least guessable of the three kinds.
-          baseCommit: ctx.baseCommit,
-          defaultBranchCommit: ctx.defaultBranchCommit,
-        });
-      } else {
-        planPrompt = buildPlanPrompt({
-          issueIid: ctx.issueIid ?? 0,
-          issueTitle: ctx.issueTitle,
-          issueDescription: ctx.issueDescription,
-          branch: ctx.branch,
-          subagentNames: ownSubagentNames,
-          // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
-          // runner fetched it at claim time; empty/absent injects nothing).
-          memory: ctx.memory,
-          // Issue #105: see above — prior pushed work on this issue's branch.
-          priorWork: ctx.priorWork,
-          // See above.
-          baseCommit: ctx.baseCommit,
-          defaultBranchCommit: ctx.defaultBranchCommit,
-        });
-      }
-      const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: `starting SDK agent (${planningLabel})` } });
-      const plan = await this.driveTurn(ctx, baseOptions, resumeId, planPrompt, state, idleMs);
-      resumeId = plan.sessionId ?? resumeId;
-      // A planning turn that ends without a plan is an error — never push
-      // un-gated work, even if the lead prematurely signalled done.
-      if (plan.plan === undefined) throw new Error(REASON_NO_PLAN);
-
-      // --- Plan gate (+ revision loop, PRD #41) -----------------------------
-      // The gate can be re-entered N times under ONE approval budget: a `revise`
-      // verdict carries the reviewer's feedback, and the worker runs a fresh planning
-      // turn (resumed, so the planning context is retained) and re-gates the new plan.
-      // approve/reject/cancel are terminal; the runner advances the steering epoch each
-      // time a revise is taken. FAIL-CLOSED: the while-condition + the post-loop guards
-      // guarantee the only way past this block is an `approve` (see the explicit guard).
-      if (!ctx.gatePlan) throw new Error("plan gate is not wired for this run");
-      approvedPlan = plan.plan;
-      let verdict = await ctx.gatePlan(approvedPlan);
-      let revisions = 0;
-      while (verdict.kind === "revise") {
-        const feedback = verdict.feedback;
-        // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
-        // (and thus before the next gatePlan flushes the new plan), so the feed never
-        // lags the awaiting_approval re-report.
-        ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
-        // Belt-and-suspenders (PRD #41 Decision 3c): the SERVER enforces the same cap at
-        // submit time and won't enqueue a revise past it, so this should never trip. If it
-        // does, DO NOT run another planning turn — record it and re-gate the current plan so
-        // the run stays fail-closed rather than revising unbounded.
-        if (revisions >= maxRevisions) {
-          this.log.warn("plan revision budget exhausted; re-gating without a turn", { run_id: ctx.runId, max_revisions: maxRevisions });
-          ctx.emit({ kind: "status", agent: "worker", payload: { text: "revision budget exhausted — not revising the plan further" } });
-          verdict = await ctx.gatePlan(approvedPlan);
-          continue;
+        // --- Phase 1: planning turn ------------------------------------------
+        // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
+        // (untrusted job logs) instead of a forge issue; everything else — the plan
+        // gate, the implement⇄review loop, the guardrails — is identical.
+        let planPrompt: string;
+        if (isCIFix) {
+          planPrompt = buildCIFixPlanPrompt({
+            ref: ctx.pipeline!.ref,
+            branch: ctx.branch,
+            pipelineWebURL: ctx.pipeline!.web_url,
+            failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({
+              name: j.name,
+              stage: j.stage,
+              logTail: j.log_tail,
+            })),
+            subagentNames: ownSubagentNames,
+            // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
+            // nonce-fenced cross-run memory back (empty/absent injects nothing).
+            memory: ctx.memory,
+            // Issue #105: only set when a dropped resume left this turn amnesiac on a
+            // branch that already carries pushed work.
+            priorWork: ctx.priorWork,
+            // Judge rec (run 51757591): the commit this branch was cut from, so the lead
+            // does not infer the parent from the clone's freshly-fetched default branch.
+            baseCommit: ctx.baseCommit,
+            defaultBranchCommit: ctx.defaultBranchCommit,
+          });
+        } else if (isSelfImprove) {
+          // The self_improve run's issue_description carries the untrusted improve_uzi
+          // backlog; the trusted "pick one / guardrails / tests" directive lives in the
+          // prompt builder, outside the untrusted fence (PRD #46 Decision 10, audit C1).
+          planPrompt = buildSelfImprovePlanPrompt({
+            branch: ctx.branch,
+            recommendations: ctx.issueDescription,
+            subagentNames: ownSubagentNames,
+            // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
+            // nonce-fenced cross-run memory back (empty/absent injects nothing).
+            memory: ctx.memory,
+            // Issue #105: see above — the fixed self_improve branch's prior cycles.
+            priorWork: ctx.priorWork,
+            // See above. The fixed self_improve branch is routinely seeded off a previous
+            // cycle's tip, so its base is the least guessable of the three kinds.
+            baseCommit: ctx.baseCommit,
+            defaultBranchCommit: ctx.defaultBranchCommit,
+          });
+        } else {
+          planPrompt = buildPlanPrompt({
+            issueIid: ctx.issueIid ?? 0,
+            issueTitle: ctx.issueTitle,
+            issueDescription: ctx.issueDescription,
+            branch: ctx.branch,
+            subagentNames: ownSubagentNames,
+            // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
+            // runner fetched it at claim time; empty/absent injects nothing).
+            memory: ctx.memory,
+            // Issue #105: see above — prior pushed work on this issue's branch.
+            priorWork: ctx.priorWork,
+            // See above.
+            baseCommit: ctx.baseCommit,
+            defaultBranchCommit: ctx.defaultBranchCommit,
+          });
         }
-        revisions++;
-        ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
-        // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
-        // subagents (baseOptions), exactly like the first plan turn — the roster
-        // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
-        const turn = await this.driveTurn(ctx, baseOptions, resumeId, buildRevisePlanPrompt(feedback), state, idleMs);
-        resumeId = turn.sessionId ?? resumeId;
-        // A revision turn that submits no plan fails, same as the first planning turn —
-        // never push un-gated work.
-        if (turn.plan === undefined) throw new Error(REASON_NO_PLAN);
-        approvedPlan = turn.plan;
-        verdict = await ctx.gatePlan(approvedPlan);
-      }
-      if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
-      if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
-      // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
-      // bug (e.g. a future verdict variant) and must never fall through into implement.
-      if (verdict.kind !== "approve") throw new Error(`unexpected plan verdict: ${(verdict as { kind: string }).kind}`);
-      approvedSelection = verdict.selection;
+        const planningLabel = isCIFix
+          ? "diagnosing CI failure"
+          : isSelfImprove
+            ? "planning self-improvement"
+            : "planning";
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `starting SDK agent (${planningLabel})` },
+        });
+
+        const plan = await this.drivePlanningTurn(
+          ctx,
+          baseOptions,
+          resumeId,
+          planPrompt,
+          state,
+          idleMs,
+          budget,
+        );
+        resumeId = plan.sessionId ?? resumeId;
+
+        // --- Plan gate (+ revision loop, PRD #41) -----------------------------
+        // The gate can be re-entered N times under ONE approval budget: a `revise`
+        // verdict carries the reviewer's feedback, and the worker runs a fresh planning
+        // turn (resumed, so the planning context is retained) and re-gates the new plan.
+        // approve/reject/cancel are terminal; the runner advances the steering epoch each
+        // time a revise is taken. FAIL-CLOSED: the while-condition + the post-loop guards
+        // guarantee the only way past this block is an `approve` (see the explicit guard).
+        if (!ctx.gatePlan)
+          throw new Error("plan gate is not wired for this run");
+        approvedPlan = plan.plan;
+        let verdict = await ctx.gatePlan(approvedPlan);
+        let revisions = 0;
+        while (verdict.kind === "revise") {
+          const feedback = verdict.feedback;
+          // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
+          // (and thus before the next gatePlan flushes the new plan), so the feed never
+          // lags the awaiting_approval re-report.
+          ctx.emit({
+            kind: "plan_feedback",
+            agent: "worker",
+            payload: { feedback },
+          });
+          // Belt-and-suspenders (PRD #41 Decision 3c): the SERVER enforces the same cap at
+          // submit time and won't enqueue a revise past it, so this should never trip. If it
+          // does, DO NOT run another planning turn — record it and re-gate the current plan so
+          // the run stays fail-closed rather than revising unbounded.
+          if (revisions >= maxRevisions) {
+            this.log.warn(
+              "plan revision budget exhausted; re-gating without a turn",
+              { run_id: ctx.runId, max_revisions: maxRevisions },
+            );
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "revision budget exhausted — not revising the plan further",
+              },
+            });
+            verdict = await ctx.gatePlan(approvedPlan);
+            continue;
+          }
+          revisions++;
+          ctx.emit({
+            kind: "plan_revising",
+            agent: "worker",
+            payload: { round: revisions },
+          });
+          // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
+          // subagents (baseOptions), exactly like the first plan turn — the roster
+          // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
+          const turn = await this.drivePlanningTurn(
+            ctx,
+            baseOptions,
+            resumeId,
+            buildRevisePlanPrompt(feedback),
+            state,
+            idleMs,
+            budget,
+          );
+          resumeId = turn.sessionId ?? resumeId;
+          approvedPlan = turn.plan;
+          verdict = await ctx.gatePlan(approvedPlan);
+        }
+        if (verdict.kind === "reject")
+          throw new PlanRejectedError(verdict.reason);
+        if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
+        // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
+        // bug (e.g. a future verdict variant) and must never fall through into implement.
+        if (verdict.kind !== "approve")
+          throw new Error(
+            `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
+          );
+        approvedSelection = verdict.selection;
       } // end of the plan-and-gate block skipped by a pre-approved resume
 
       // A ci_fix run whose approved plan is a not_code verdict is done: no code to
       // implement, no branch to push. The run completes with the diagnosis as its
       // value (PRD #6). Detected AFTER approval so a human confirmed the verdict.
       if (isCIFix && isNotCodePlan(approvedPlan)) {
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: "diagnosis: not a code problem — completing with no fix" } });
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "diagnosis: not a code problem — completing with no fix",
+          },
+        });
         this.log.info("ci_fix run: not_code verdict", { run_id: ctx.runId });
         return { branch: ctx.branch, fixVerdict: "not_code" };
       }
@@ -632,7 +859,8 @@ export class SdkExecutor implements Executor {
       // `requires: "node_modules"` pre-flight passes, the check runs against a corrupt
       // tree, and it FAILS — accusing good code of failing, which is the one thing
       // self-improve.ts's status mapping exists to prevent.
-      ({ results: depsResults, truncated: depsTruncated } = await this.joinDepsInstall(ctx, depsInstall));
+      ({ results: depsResults, truncated: depsTruncated } =
+        await this.joinDepsInstall(ctx, depsInstall));
 
       // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
       // The plan turn ran with the OWN subagents; the approved selection now decides
@@ -647,7 +875,12 @@ export class SdkExecutor implements Executor {
       // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
       const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
-      if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
+      if (resolved.note)
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: resolved.note },
+        });
       const selection = resolved.selection;
       // Skill scoping is source-dependent from here (PRD #72 M1): `own` keeps the
       // per-template allocations assembled above; `repo` gives every subagent the
@@ -666,7 +899,10 @@ export class SdkExecutor implements Executor {
       const implementOptions: SdkOptions = {
         ...baseOptions,
         agents: selectedSubagents,
-        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo", kind: ctx.kind }),
+        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
+          repoSourced: selection.source === "repo",
+          kind: ctx.kind,
+        }),
         hooks: { PreToolUse: preToolUse(selectedNames) },
       };
       ctx.emit({
@@ -689,28 +925,79 @@ export class SdkExecutor implements Executor {
       for (;;) {
         iteration++;
         ctx.reportIteration?.(iteration);
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: `implement/review iteration ${iteration}` } });
-        const turn = await this.driveTurn(ctx, implementOptions, resumeId, buildImplementPrompt({
-          branch: ctx.branch,
-          subagentNames: selectedNames,
-          first: iteration === 1,
-          iteration,
-          followUp,
-          // #157: the join above populated these, so the first implement turn can be told
-          // which dirs are ready and which genuinely are not — the facts the plan turn
-          // could not have. Correct on the revise path too: the join runs after the LAST
-          // gate round, so however many revisions happened, these are the final outcomes.
-          deps: depsResults,
-          depsTruncated,
-          // First turn only (buildImplementPrompt gates it): this is the phase where the
-          // lead hands a subagent a diff command, which is where the wrong one was seen.
-          baseCommit: ctx.baseCommit,
-          defaultBranchCommit: ctx.defaultBranchCommit,
-        }), state, idleMs);
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `implement/review iteration ${iteration}` },
+        });
+        const turn = await this.driveTurn(
+          ctx,
+          implementOptions,
+          resumeId,
+          buildImplementPrompt({
+            branch: ctx.branch,
+            subagentNames: selectedNames,
+            first: iteration === 1,
+            iteration,
+            followUp,
+            // #157: the join above populated these, so the first implement turn can be told
+            // which dirs are ready and which genuinely are not — the facts the plan turn
+            // could not have. Correct on the revise path too: the join runs after the LAST
+            // gate round, so however many revisions happened, these are the final outcomes.
+            deps: depsResults,
+            depsTruncated,
+            // First turn only (buildImplementPrompt gates it): this is the phase where the
+            // lead hands a subagent a diff command, which is where the wrong one was seen.
+            baseCommit: ctx.baseCommit,
+            defaultBranchCommit: ctx.defaultBranchCommit,
+          }),
+          state,
+          idleMs,
+        );
         resumeId = turn.sessionId ?? resumeId;
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
         if (turn.done) break;
         if (iteration >= maxIterations) throw new Error(REASON_MAX_ITERATIONS);
+
+        // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
+        // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
+        // human cannot trip REASON_IDLE. That property is free by construction here,
+        // not something the park has to defend.
+        //
+        // The answer is fed to the next turn as an ordinary user turn (via followUp)
+        // rather than returned as the tool's result — the lead was told to end its
+        // turn after asking, so there is no tool call still open to return into. The
+        // resumed session keeps full context, so nothing is replayed.
+        //
+        // `iteration` is deliberately NOT advanced for the answer round-trip: a
+        // clarification is not an implement/review iteration, and counting it would
+        // let a talkative lead burn the loop budget on questions. The `continue`
+        // re-enters the loop, which increments — so the decrement below keeps the
+        // clarification turn free.
+        const asked = turn.questions;
+        if (asked?.length) {
+          const verdict = await this.askUserOrContinue(
+            ctx,
+            asked,
+            budget.asked,
+          );
+          if (verdict.parked) {
+            budget.asked++;
+            if (verdict.cancelled)
+              throw new PlanRejectedError(
+                "run cancelled while awaiting clarification",
+              );
+            followUp = verdict.followUp;
+            iteration--;
+            continue;
+          }
+          // Not parked: the cap is spent, or no askUser is wired. Either way the run
+          // continues on the lead's judgment; the notice is already on the feed.
+          followUp = verdict.followUp;
+          iteration--;
+          continue;
+        }
+
         // Fold any queued correction into the next turn (FIFO, one per turn).
         followUp = ctx.pullFollowUp?.();
       }
@@ -726,7 +1013,11 @@ export class SdkExecutor implements Executor {
       });
       // toolEnv (PRD #46 M9): the allowlisted provisioned tool env, so the self_improve
       // check runner can put the run's provisioned toolchains on its subprocess PATH.
-      const result: ExecutorResult = { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
+      const result: ExecutorResult = {
+        branch: ctx.branch,
+        agentSelection: { source: selection.source, agents: selectedNames },
+        toolEnv,
+      };
       // PRD #72 M4: forward the declared PRD path on `issue` runs only, clamped to
       // length. TRANSPORT HYGIENE ONLY — no path-shape checks here. The api owns
       // the grammar (api/internal/prdpath), and a second implementation of it would
@@ -759,7 +1050,10 @@ export class SdkExecutor implements Executor {
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile
       // symlinks). The nix STORE is global (on the data volume), NOT here, so this
       // never evicts the warm-start cache. Best-effort.
-      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+      if (provisionDir)
+        await fs
+          .rm(provisionDir, { recursive: true, force: true })
+          .catch(() => undefined);
     }
   }
 
@@ -789,17 +1083,28 @@ export class SdkExecutor implements Executor {
     toolEnv: Record<string, string> | undefined,
     signal: AbortSignal,
   ): Promise<JsDepsInstall> {
-    ctx.emit({ kind: "status", agent: "worker", payload: { text: "installing the repo's JS dependencies (in the background)" } });
-    return this.installDeps(ctx.worktreePath, buildCheckEnv(process.env, this.homeDir, toolEnv), { signal }).catch(
-      (err: unknown) => {
-        // Best-effort, always: provisioning can never fail the run. Unlike
-        // provisionRunTools (whose failure DOES fail the run — the agent would be
-        // missing its declared toolchain), a missing node_modules degrades to the
-        // agent installing them itself, exactly as it does today.
-        this.log.warn("JS dependency provisioning failed", { run_id: ctx.runId, error: errMessage(err) });
-        return { results: [], truncated: false };
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: "installing the repo's JS dependencies (in the background)",
       },
-    );
+    });
+    return this.installDeps(
+      ctx.worktreePath,
+      buildCheckEnv(process.env, this.homeDir, toolEnv),
+      { signal },
+    ).catch((err: unknown) => {
+      // Best-effort, always: provisioning can never fail the run. Unlike
+      // provisionRunTools (whose failure DOES fail the run — the agent would be
+      // missing its declared toolchain), a missing node_modules degrades to the
+      // agent installing them itself, exactly as it does today.
+      this.log.warn("JS dependency provisioning failed", {
+        run_id: ctx.runId,
+        error: errMessage(err),
+      });
+      return { results: [], truncated: false };
+    });
   }
 
   /**
@@ -807,28 +1112,163 @@ export class SdkExecutor implements Executor {
    * throws: the promise carries its own catch, and a provisioning result — however bad —
    * is information for the user, not a run failure.
    */
-  private async joinDepsInstall(ctx: RunContext, depsInstall: Promise<JsDepsInstall>): Promise<JsDepsInstall> {
+  private async joinDepsInstall(
+    ctx: RunContext,
+    depsInstall: Promise<JsDepsInstall>,
+  ): Promise<JsDepsInstall> {
     const { results, truncated } = await depsInstall;
     if (results.length === 0) {
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: "no JS dependencies to install (no lockfile found)" } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "no JS dependencies to install (no lockfile found)" },
+      });
       return { results, truncated };
     }
     // One line, naming every dir and — for anything that did not install — why. A
     // silent skip here resurfaces later as an inexplicable `vitest: not found`.
-    const installed = results.filter((r) => r.ok).map((r) => safeDirLabel(r.dir));
+    const installed = results
+      .filter((r) => r.ok)
+      .map((r) => safeDirLabel(r.dir));
     const skipped = results.filter((r) => !r.ok);
     const parts: string[] = [];
-    if (installed.length > 0) parts.push(`installed JS dependencies in ${installed.join(", ")}`);
+    if (installed.length > 0)
+      parts.push(`installed JS dependencies in ${installed.join(", ")}`);
     for (const s of skipped) parts.push(`${safeDirLabel(s.dir)}: ${s.detail}`);
     // Truncation goes on the FEED, not just in a log: without it the line above reads as
     // full coverage, and a `vitest: not found` in dir 13 becomes unexplainable.
-    if (truncated) parts.push("discovery hit its directory bound — some project dirs were not installed");
-    ctx.emit({ kind: "status", agent: "worker", payload: { text: parts.join(" — ") } });
-    this.log.info("JS dependency provisioning", { run_id: ctx.runId, results, truncated });
+    if (truncated)
+      parts.push(
+        "discovery hit its directory bound — some project dirs were not installed",
+      );
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: parts.join(" — ") },
+    });
+    this.log.info("JS dependency provisioning", {
+      run_id: ctx.runId,
+      results,
+      truncated,
+    });
     return { results, truncated };
   }
 
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
+  /**
+   * PRD #88 M4: drive a PLANNING turn, letting the lead ask the human first.
+   *
+   * Wraps both planning-turn sites — the first plan turn and #41's revision turn —
+   * because both end in `if (plan === undefined) throw REASON_NO_PLAN` and a pre-run
+   * question ends a planning turn with questions and NO plan. Without this, the
+   * feature's own pre-run path hard-fails the run it was meant to clarify. Fixing only
+   * the first site would leave a revision turn that asks a question failing exactly
+   * that way, which is the harder of the two to reproduce.
+   *
+   * The contract narrows rather than loosens: "no plan AND no questions" is still
+   * REASON_NO_PLAN, so a lead that simply ends its turn without planning still fails
+   * closed and un-gated work is still never pushed.
+   *
+   * On an answer the SAME session is resumed and re-planned, so the lead keeps its
+   * full planning context and nothing is replayed. It eventually reaches submit_plan
+   * and the normal plan gate; M4 adds no second gate.
+   */
+  private async drivePlanningTurn(
+    ctx: RunContext,
+    options: SdkOptions,
+    resumeId: string | undefined,
+    prompt: string,
+    state: RunDrive,
+    idleMs: number,
+    budget: { asked: number },
+  ): Promise<TurnResult & { plan: string }> {
+    let turnPrompt = prompt;
+    // Bounded independently of the park cap. The cap bounds how many times we ASK;
+    // this bounds how many times we re-plan, which also covers the rounds where the
+    // question could NOT be asked (cap spent, or askUser unwired) and the lead was
+    // told to proceed. Without it a lead that answers every answer with another
+    // question would loop here forever, never planning and never failing.
+    const maxRounds = questionMax(ctx.config ?? null) + 1;
+    for (let round = 0; ; round++) {
+      const turn = await this.driveTurn(
+        ctx,
+        options,
+        resumeId,
+        turnPrompt,
+        state,
+        idleMs,
+      );
+      resumeId = turn.sessionId ?? resumeId;
+      if (turn.plan !== undefined)
+        return { ...turn, sessionId: resumeId, plan: turn.plan };
+
+      const asked = turn.questions;
+      // The unchanged contract: a planning turn that neither planned nor asked is the
+      // original error. Never push un-gated work, even if the lead signalled done.
+      if (!asked?.length) throw new Error(REASON_NO_PLAN);
+      if (round >= maxRounds)
+        throw new Error(REASON_NO_PLAN_AFTER_CLARIFICATION);
+
+      const verdict = await this.askUserOrContinue(ctx, asked, budget.asked);
+      if (verdict.cancelled) throw new Error(REASON_CANCELLED);
+      if (verdict.parked) budget.asked++;
+      turnPrompt = buildPlanAfterAnswerPrompt(verdict.followUp);
+    }
+  }
+
+  /**
+   * PRD #88 M1: run one clarification park, or explain why it did not happen.
+   *
+   * Returns what the next turn should be told. Three non-park outcomes, all of which
+   * continue the run rather than ending it:
+   *
+   *  - No ctx.askUser wired ⇒ FAIL OPEN (a feed notice, proceed). The opposite of the
+   *    plan gate, which throws when ctx.gatePlan is missing. An ungated plan would
+   *    push unreviewed work; an unaskable question only loses a clarification, and
+   *    failing closed would kill runs on any executor that never wired it.
+   *  - The per-run cap is spent ⇒ notice, proceed. Without this a lead that answers
+   *    every answer with another question would park forever, one deadline at a time.
+   *  - A park that resolves with `cancel` ⇒ reported so the caller can abort.
+   */
+  private async askUserOrContinue(
+    ctx: RunContext,
+    questions: AskUserQuestion[],
+    questionsAsked: number,
+  ): Promise<{ parked: boolean; cancelled?: boolean; followUp: string }> {
+    const headers = questions.map((q) => q.header || q.question).join("; ");
+    if (!ctx.askUser) {
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: QUESTION_UNWIRED_NOTICE },
+      });
+      return { parked: false, followUp: unansweredPrompt(questions) };
+    }
+    const cap = questionMax(ctx.config ?? null);
+    if (questionsAsked >= cap) {
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `${QUESTION_CAP_NOTICE} (limit ${cap}). Asked: ${headers}`,
+        },
+      });
+      return { parked: false, followUp: unansweredPrompt(questions) };
+    }
+    const verdict = await ctx.askUser(questions);
+    if (verdict.kind === "cancel")
+      return { parked: true, cancelled: true, followUp: "" };
+    ctx.emit({
+      kind: "answer",
+      agent: "lead",
+      payload: { answers: verdict.answers },
+    });
+    return {
+      parked: true,
+      followUp: answeredPrompt(questions, verdict.answers),
+    };
+  }
+
   private async driveTurn(
     ctx: RunContext,
     baseOptions: SdkOptions,
@@ -849,7 +1289,9 @@ export class SdkExecutor implements Executor {
     else delete options.resume;
     // Spawn the CLI in its own process group so a watchdog trip can group-kill
     // the whole tree (default SDK spawn is not detached).
-    options.spawnClaudeCodeProcess = (spawnOpts: SpawnOptions): SpawnedProcess => {
+    options.spawnClaudeCodeProcess = (
+      spawnOpts: SpawnOptions,
+    ): SpawnedProcess => {
       const proc = this.spawn(spawnOpts);
       if (typeof proc.pid === "number") {
         state.currentChild.pid = proc.pid;
@@ -882,7 +1324,10 @@ export class SdkExecutor implements Executor {
     if (state.tripReason) throw new Error(state.tripReason);
     try {
       armIdle();
-      const queryInstance = this.queryFn({ prompt: promptStream(prompt), options });
+      const queryInstance = this.queryFn({
+        prompt: promptStream(prompt),
+        options,
+      });
       for await (const msg of queryInstance) {
         armIdle(); // any message is liveness
 
@@ -894,7 +1339,10 @@ export class SdkExecutor implements Executor {
             try {
               ctx.onSessionId?.(sid);
             } catch (err) {
-              this.log.warn("onSessionId handler threw", { run_id: ctx.runId, error: errMessage(err) });
+              this.log.warn("onSessionId handler threw", {
+                run_id: ctx.runId,
+                error: errMessage(err),
+              });
             }
           }
         }
@@ -924,16 +1372,20 @@ export class SdkExecutor implements Executor {
         rateLimits.observe(msg);
         const orphanKind = orphanInstanceKind(msg);
         if (orphanKind !== undefined) {
-          this.log.warn("frame carried parent_tool_use_id without subagent_type", {
-            run_id: ctx.runId,
-            kind: orphanKind,
-          });
+          this.log.warn(
+            "frame carried parent_tool_use_id without subagent_type",
+            {
+              run_id: ctx.runId,
+              kind: orphanKind,
+            },
+          );
         }
         const frameUsage = assistantUsageOf(msg);
         const frameModel = assistantModelOf(msg);
         let usageAttached = false;
         for (const em of mapSdkMessage(msg)) {
-          if (em.kind === "tool_use" && isSignalToolName(em.payload["name"])) continue;
+          if (em.kind === "tool_use" && isSignalToolName(em.payload["name"]))
+            continue;
           if (frameUsage && !usageAttached) {
             em.payload["usage"] = frameUsage;
             // PRD #93 Decision 2: `model` is CO-GATED with usage — same surviving
@@ -953,12 +1405,19 @@ export class SdkExecutor implements Executor {
         // if the lead somehow signals twice, the LAST declaration is the one that
         // describes the tree the worker is about to push (PRD #72 M4).
         if (sig.prdDonePath !== undefined) result.prdDonePath = sig.prdDonePath;
+        // PRD #88: accumulate across the turn rather than last-wins. A lead told to
+        // batch its questions into one call normally makes exactly one, but if it
+        // makes two we must ask both — dropping the earlier one would park the run on
+        // a question the lead is no longer waiting on.
+        if (sig.questions?.length)
+          result.questions = [...(result.questions ?? []), ...sig.questions];
 
         if (isResult(msg)) {
           resultFrame = msg;
           if (isErrorResult(msg)) {
             sawErrorResult = true;
-            errorSubtype = ((msg as { subtype?: unknown }).subtype as string) ?? "unknown";
+            errorSubtype =
+              ((msg as { subtype?: unknown }).subtype as string) ?? "unknown";
           }
           // The turn is done. Abort so a lingering background bash the agent left
           // running can't pin the iterator open (bottega's pattern).
@@ -975,8 +1434,13 @@ export class SdkExecutor implements Executor {
         //
         // The trip check above still wins: a cancel or watchdog that fired during a
         // limit-shaped turn is a deliberate stop, not something to park and resume.
-        const limit = classifyLimitFailure(resultFrame, rateLimits.latest, Date.now());
-        if (limit) throw new LimitReachedError({ ...limit, detail: errorSubtype });
+        const limit = classifyLimitFailure(
+          resultFrame,
+          rateLimits.latest,
+          Date.now(),
+        );
+        if (limit)
+          throw new LimitReachedError({ ...limit, detail: errorSubtype });
         throw new Error(`agent run failed: ${errorSubtype}`);
       }
       result.sessionId = turnSessionId;
@@ -1012,7 +1476,10 @@ export class SdkExecutor implements Executor {
       return;
     }
     state.wallArmedAt = Date.now();
-    state.wallTimer = setTimeout(() => this.trip(state, REASON_WALL), state.wallRemainingMs);
+    state.wallTimer = setTimeout(
+      () => this.trip(state, REASON_WALL),
+      state.wallRemainingMs,
+    );
     state.wallTimer.unref?.();
   }
 
@@ -1030,7 +1497,11 @@ export class SdkExecutor implements Executor {
 
 /** One-shot prompt stream: the SDK consumes the lead's user turn. */
 async function* promptStream(text: string): AsyncGenerator<unknown> {
-  yield { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+  yield {
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+  };
 }
 
 /** Convert an optional seconds value (any number tolerated) to ms. */
@@ -1055,7 +1526,8 @@ function positive(value: number | undefined, fallback: number): number {
  */
 function planMaxRevisionsOf(config: ClaimConfig | null | undefined): number {
   const v = config?.plan_max_revisions;
-  if (typeof v === "number" && Number.isFinite(v) && v >= 0) return Math.floor(v);
+  if (typeof v === "number" && Number.isFinite(v) && v >= 0)
+    return Math.floor(v);
   return DEFAULT_MAX_REVISIONS;
 }
 
@@ -1088,7 +1560,10 @@ function describeSkillDrop(name: string, reason: string): string {
  * an explicit empty override (an unset model falls back to the SDK/account
  * default). Null-model subagents follow the main thread, so this governs them too.
  */
-export function resolveLeadModel(configModel?: string, templateModel?: string): string | undefined {
+export function resolveLeadModel(
+  configModel?: string,
+  templateModel?: string,
+): string | undefined {
   return configModel || templateModel || undefined;
 }
 

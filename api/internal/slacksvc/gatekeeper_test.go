@@ -71,8 +71,19 @@ type fakeSubmitter struct {
 	runErr     error
 	submitted  []submittedInput
 	approvals  []submittedApproval
+	answers    []submittedAnswer
 	submitErr  error
 	approveErr error
+	answerErr  error
+}
+
+// submittedAnswer records a PRD #88 M3 clarification answer. The question id is the
+// interesting field: it is DERIVED server-side from the thread, so a test asserting on
+// it is asserting on the derivation, which is the whole risk.
+type submittedAnswer struct {
+	userID, runID uuid.UUID
+	questionID    string
+	text          string
 }
 
 func (f *fakeSubmitter) GetRun(context.Context, uuid.UUID, uuid.UUID) (store.Run, error) {
@@ -85,6 +96,10 @@ func (f *fakeSubmitter) SubmitInput(_ context.Context, userID, runID uuid.UUID, 
 func (f *fakeSubmitter) SubmitApproval(_ context.Context, userID, runID uuid.UUID, source string) error {
 	f.approvals = append(f.approvals, submittedApproval{userID, runID, source})
 	return f.approveErr
+}
+func (f *fakeSubmitter) SubmitAnswer(_ context.Context, userID, runID uuid.UUID, questionID, text string) error {
+	f.answers = append(f.answers, submittedAnswer{userID, runID, questionID, text})
+	return f.answerErr
 }
 
 func gateAction(actionID string, runID uuid.UUID) BlockAction {

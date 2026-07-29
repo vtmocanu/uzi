@@ -4,6 +4,8 @@ import (
 	"regexp"
 
 	"github.com/slack-go/slack/slackutilsx"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
 // EscapeMrkdwn neutralizes the Slack mrkdwn control characters (& < >) in an
@@ -19,30 +21,19 @@ func EscapeMrkdwn(s string) string {
 	return slackutilsx.EscapeMessage(s)
 }
 
-// Secret-value patterns uzi must never let reach a log or Slack. slackToken
-// covers xoxb- bot / xapp- app-level tokens (plus the other xox* families);
-// anthropicKey and gitlabPAT cover the credentials that ride run/agent context
-// so the outbound scrub is defense-in-depth against any of them leaking into a
-// Slack message (PRD #25: sk-ant-, glpat-, xoxb-, xapp-).
-var (
-	slackTokenPattern = regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`)
-	anthropicPattern  = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`)
-	gitlabPATPattern  = regexp.MustCompile(`glpat-[A-Za-z0-9_-]+`)
-	// uziTokenPattern covers uzi's own Bearer credentials — uzw_ (worker join token),
-	// uzc_ (user CLI token) and uza_ (admin_ro CLI token) (PRD #64 Risk 14). The CLI
-	// PRD tells users to put UZI_TOKEN in a GitLab CI variable, which creates the
-	// echo-into-a-trace path this scrub defends: a uzc_/uza_ minted here must never
-	// survive into an outbound Slack message. The {16,} body avoids matching the short
-	// "uzc_a1b2" display prefix (only 4 body chars), which is not a secret.
-	uziTokenPattern = regexp.MustCompile(`uz[caw]_[A-Za-z0-9_-]{16,}`)
-)
+// The secret-value patterns moved to internal/secretscrub in PRD #88 M1, unchanged.
+// They had to become reachable from workersvc.SubmitInput, which scrubs a
+// clarification ANSWER before persisting it (D-G) — and slacksvc is deliberately kept
+// out of the core service's import graph, so the shared thing moved down rather than
+// the importer reaching sideways. ScrubTokens/ScrubSecrets stay here as the names
+// every Slack call site already uses.
 
 // ScrubTokens replaces any Slack token substring with a placeholder. slack-go's
 // validation errors return Slack's error code (e.g. "invalid_auth"), not the
 // token, so this is defense-in-depth: even if a token ever reached an error
 // string, it would not surface to the admin or a log.
 func ScrubTokens(s string) string {
-	return slackTokenPattern.ReplaceAllString(s, "[redacted]")
+	return secretscrub.ScrubSlackTokens(s)
 }
 
 // ScrubSecrets is the widened outbound scrub (PRD #25 M2, extended PRD #64 M5):
@@ -51,11 +42,7 @@ func ScrubTokens(s string) string {
 // Slack passes through it as a last line of defense so a credential that somehow
 // reached a status/title string never leaves the box.
 func ScrubSecrets(s string) string {
-	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
-	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
-	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
-	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
-	return s
+	return secretscrub.Scrub(s)
 }
 
 // socketURLPattern matches a Socket Mode websocket URL, and ticketPattern its

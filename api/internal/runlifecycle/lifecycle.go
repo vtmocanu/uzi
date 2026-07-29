@@ -167,7 +167,10 @@ func reconcilerDecision(status string, origin pgtype.Text) decision {
 	// park routinely outlasts 30 minutes by design, so the warn would be the normal
 	// case rather than an exception. Notify's partial map is deliberately NOT
 	// extended: a park moves no card, so there is nothing to notify about.
-	case "queued", "claimed", "running", "awaiting_approval", "limit_wait":
+	//
+	// awaiting_input (PRD #88) is here for exactly the same reasons, and a
+	// clarification park outlasts 30 minutes just as routinely.
+	case "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait":
 		return decision{act: true, target: board.ColumnInProgress}
 	case "completed":
 		return decision{act: true, target: board.ColumnHumanReview}

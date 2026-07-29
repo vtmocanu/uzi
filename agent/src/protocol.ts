@@ -15,6 +15,10 @@ export const WORKER_API_PREFIX = "/api/worker";
 export type RunState =
   | "running"
   | "awaiting_approval"
+  /** PRD #88: parked on a clarification question. The state report MUST carry
+   *  open_question_id; the api rejects it otherwise, because a park with no question
+   *  identity can never satisfy SetRunRunning's resume guard. */
+  | "awaiting_input"
   | "limit_wait"
   | "completed"
   | "failed";
@@ -68,6 +72,15 @@ export type MessageKind =
   /** PRD #41: the lead is revising the plan for round N (payload `{ round: number }`);
    *  the UI derives its "revising" gate state from this. */
   | "plan_revising"
+  /** PRD #88: the lead is asking the human a question and the run is parking.
+   *  Payload is a QuestionPayload. Emitted BEFORE the awaiting_input state report,
+   *  so the question is durable before any surface learns the run parked — and so a
+   *  resumed worker can recover it. Every string in it is model-authored from
+   *  attacker-influenceable repo/issue content: escaped sinks only. */
+  | "question"
+  /** PRD #88: the answer that resolved a question (payload `{ question_id, answers }`),
+   *  echoed to the feed so the round-trip is auditable, mirroring plan_feedback. */
+  | "answer"
   /** PRD #35 Decision 10: the run is being PARKED until the owner's Anthropic usage
    *  window reopens. Payload `{ rate_limit_type?: string, resets_at?: string }` —
    *  both OMITTED rather than null when unknown, so "unknown" has one shape.
@@ -91,8 +104,65 @@ export type MessageKind =
   | "limit_hit";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
- *  for a new plan version at the gate, body = their feedback text). */
-export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel" | "revise_plan";
+ *  for a new plan version at the gate, body = their feedback text; PRD #88 adds
+ *  `answer` — the human's reply to an ask_user question, body = JSON AnswerBody).
+ *
+ *  Widening this union is NOT sufficient on its own: SteeringChannel.route() must
+ *  also learn the kind. `GET /inputs` is consume-on-read, so an unrouted kind is
+ *  marked consumed server-side and then dropped by route()'s default arm — the input
+ *  is destroyed with no error and no retry, and it looks exactly like a user who
+ *  never answered. route() takes a bare string, so nothing here typechecks that. */
+export type InputKind =
+  | "follow_up"
+  | "approve_plan"
+  | "reject_plan"
+  | "cancel"
+  | "revise_plan"
+  | "answer";
+
+/** One question in an ask_user call (PRD #88 M1), mirroring the local
+ *  AskUserQuestion tool's shape so the model has a familiar contract and the UI can
+ *  render it richly. Free-text answers are ALWAYS allowed, including when options are
+ *  offered — options are a convenience, never a closed set. */
+export interface AskUserQuestion {
+  /** The question itself. UNTRUSTED, model-authored. */
+  question: string;
+  /** A short label for the question. UNTRUSTED, worker-clamped. */
+  header: string;
+  /** Optional suggested answers. Absent or empty both mean "free text only". */
+  options?: { label: string; description: string }[];
+  /** Whether several options may be picked. Default false. */
+  multiSelect?: boolean;
+}
+
+/** Payload of a `question` run-message (PRD #88 M1). */
+export interface QuestionPayload {
+  /** The question's stable identity, minted by the worker at the first park and
+   *  RE-USED verbatim when a resumed worker re-parks on the same question. This is
+   *  what the answer names, and what SetRunRunning's resume guard compares.
+   *
+   *  It is the ONLY staleness key in this feature, deliberately. There is no
+   *  generation counter, no epoch and no timestamp anywhere on the answer path: every
+   *  such key is bumped by a requeue re-park, which would silently reject an answer
+   *  the user submitted correctly against the live question before the worker died.
+   *  Do not add one alongside this — a conjunction is only as good as its weaker
+   *  clause, so an arrival-ordinal check sitting next to identity would re-introduce
+   *  exactly the rejection identity exists to prevent. */
+  question_id: string;
+  questions: AskUserQuestion[];
+}
+
+/** Body of an `answer` steering input, and payload of the `answer` run-message
+ *  (PRD #88 M1). JSON rather than the bare prose every other kind carries, because
+ *  an answer must name the question it answers; `approve_plan` already establishes
+ *  the JSON-body idiom. Slack's inbound is free text, so the replier resolves the
+ *  thread anchor to the question id and constructs this same shape server-side —
+ *  one wire contract, not two. */
+export interface AnswerBody {
+  question_id: string;
+  /** Index-aligned with the question payload's `questions`. */
+  answers: string[];
+}
 
 /** runs.kind (PRD #6; PRD #46 adds "judge" and "self_improve"). self_improve is
  *  issue-shaped and runs the ordinary run lane (RunRunner), with a fixed branch and
@@ -274,6 +344,14 @@ export interface ClaimConfig {
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
   plan_max_revisions?: number;
+  /** PRD #88 clarification bounds: how many times one run may stop to ask the human,
+   *  and how long a single park waits before the run fails "clarification timed out".
+   *  Both enforced worker-side (a question is an in-process ask_user signal, so unlike
+   *  a revise_plan there is no input row for the server to count) but configured
+   *  server-side and shipped here, because a worker env var is unreachable on hosted
+   *  k8s. Absent or <= 0 from an older server ⇒ the worker's own defaults. */
+  question_max?: number;
+  question_timeout_seconds?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */
@@ -345,6 +423,12 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** PRD #88: the clarification question this run is ALREADY parked on, read from the
+   *  runs row and so re-delivered on every resume — the same shape as auto_approve and
+   *  for the same reason. A resumed worker re-parks with this SAME id rather than
+   *  minting a fresh one, which is what lets an answer the user submitted before the
+   *  worker died still name the open question and be honoured. Absent when not parked. */
+  open_question_id?: string | null;
   /** The run this JUDGE run reviews (PRD #46). Present only for kind="judge"; the
    *  worker fetches that run's trace via GET /worker/runs/{target_run_id}/trace. */
   target_run_id?: string | null;
@@ -667,7 +751,10 @@ export const AGENT_EXCLUSIONS_MAX = 32;
 
 /** JSON-encode a selection for the `approve_plan` input body. */
 export function encodeAgentSelection(selection: AgentSelection): string {
-  return JSON.stringify({ source: selection.source, exclusions: selection.exclusions });
+  return JSON.stringify({
+    source: selection.source,
+    exclusions: selection.exclusions,
+  });
 }
 
 /**
@@ -695,7 +782,9 @@ export type AgentSelectionParse =
  * carry nothing but identities; membership (⊂ the chosen roster) is the API's check
  * (and M3 re-clamps worker-side), not this one.
  */
-export function parseAgentSelection(raw: string | null | undefined): AgentSelectionParse {
+export function parseAgentSelection(
+  raw: string | null | undefined,
+): AgentSelectionParse {
   if (typeof raw !== "string" || raw.trim() === "") return { status: "absent" };
   let parsed: unknown;
   try {
@@ -703,19 +792,26 @@ export function parseAgentSelection(raw: string | null | undefined): AgentSelect
   } catch {
     return { status: "invalid" };
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { status: "invalid" };
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return { status: "invalid" };
 
-  const { source, exclusions } = parsed as { source?: unknown; exclusions?: unknown };
+  const { source, exclusions } = parsed as {
+    source?: unknown;
+    exclusions?: unknown;
+  };
   if (source !== "repo" && source !== "own") return { status: "invalid" };
 
-  if (exclusions === undefined || exclusions === null) return { status: "ok", selection: { source, exclusions: [] } };
-  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX) return { status: "invalid" };
+  if (exclusions === undefined || exclusions === null)
+    return { status: "ok", selection: { source, exclusions: [] } };
+  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX)
+    return { status: "invalid" };
 
   const out: string[] = [];
   for (const e of exclusions) {
     if (typeof e !== "string") return { status: "invalid" };
     const name = e.trim();
-    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return { status: "invalid" };
+    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name))
+      return { status: "invalid" };
     if (!out.includes(name)) out.push(name);
   }
   return { status: "ok", selection: { source, exclusions: out } };
@@ -746,7 +842,9 @@ export function resolveAgentSelection(
         note: "the submitted agent selection was malformed; using your own agent templates",
       };
     case "absent":
-      return { selection: { source: repoAvailable ? "repo" : "own", exclusions: [] } };
+      return {
+        selection: { source: repoAvailable ? "repo" : "own", exclusions: [] },
+      };
   }
 }
 
@@ -762,6 +860,11 @@ export interface StateRequest {
   status: RunState;
   /** awaiting_approval carries the captured plan. */
   plan_md?: string;
+  /** awaiting_input carries the identity of the question being asked (PRD #88).
+   *  REQUIRED on that transition — the api rejects the report without it, because a
+   *  park with no question identity can never satisfy the resume guard, so the run
+   *  would park and then be unresumable no matter what the user answered. */
+  open_question_id?: string;
   /** completed carries the pushed branch + opened MR. */
   branch?: string;
   mr_iid?: number;

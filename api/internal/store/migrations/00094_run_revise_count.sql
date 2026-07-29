@@ -5,10 +5,12 @@
 -- change lands with it in queries/runtime.sql.
 --
 -- NUMBER ASSIGNED AT LANDING. Drafted as 00092 against a live head of
--- 00091_run_limit_wait.sql. Per CLAUDE.md the renumber above the live head at the
--- landing rebase is mandatory rather than tidy: the boot runner is strict goose (no
--- allow-missing, store/migrate.go), so landing a version BELOW an already-applied
--- head makes every upgraded instance refuse to boot.
+-- 00091_run_limit_wait.sql; PRD #88 merged to main first and took BOTH
+-- 00092_run_awaiting_input.sql and 00093_slack_question_anchor.sql, so this renumbered
+-- to 00094 on the landing merge. Per CLAUDE.md that renumber is mandatory rather than
+-- tidy: the boot runner is strict goose (no allow-missing, store/migrate.go), so
+-- landing a version BELOW an already-applied head makes every upgraded instance refuse
+-- to boot. A collision at 00092 was exactly the shape that rule exists to prevent.
 
 -- WHY A COUNTER COLUMN AT ALL, when the count already exists as rows.
 --

@@ -3,8 +3,21 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentSelection, AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
-import type { PlanVerdict } from "./steering.js";
+import type {
+  AgentSelection,
+  AgentSource,
+  AgentTemplate,
+  AskUserQuestion,
+  ClaimConfig,
+  ClaimPipeline,
+  ClaimSkill,
+  ClaimSkillDrop,
+  FixVerdict,
+  MemoryEntry,
+  MessageKind,
+  RunKind,
+} from "./protocol.js";
+import type { AnswerVerdict, PlanVerdict } from "./steering.js";
 import type { PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { LimitReachedError } from "./limit.js";
@@ -134,6 +147,18 @@ export interface RunContext {
    * verdict (approve/reject/cancel), polled from /inputs. Absent in M2/M3.
    */
   gatePlan?(planMd: string): Promise<PlanVerdict>;
+  /**
+   * PRD #88 M1 clarification park. Called by the executor after a turn that made an
+   * ask_user call: the runner emits the `question` run-message, posts /state
+   * awaiting_input, and returns the human's answer (polled from /inputs).
+   *
+   * Optional, and the executor FAILS OPEN when it is absent — a feed notice and the
+   * run continues on the lead's best judgment. That is the opposite of gatePlan,
+   * which fails closed, and the asymmetry is deliberate: an ungated plan would push
+   * unreviewed work, whereas an unaskable question is only a lost opportunity to
+   * clarify. Failing closed here would kill runs on any executor that did not wire it.
+   */
+  askUser?(questions: AskUserQuestion[]): Promise<AnswerVerdict>;
   /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
   pullFollowUp?(): string | undefined;
   /** M4: report a running/iteration heartbeat (server persists via GREATEST). */
@@ -213,6 +238,13 @@ export const STUB_FAIL_SENTINEL = "UZI_STUB_FAIL";
  * SDK. Off unless present.
  */
 export const STUB_NOT_CODE_SENTINEL = "UZI_STUB_NOT_CODE";
+
+/** PRD #88 M4/M5: drives one ask_user park from the stub executor, so the whole
+ *  park → answer → resume path is provable end to end with no Anthropic session —
+ *  the same role STUB_NOT_CODE_SENTINEL plays for the ci_fix verdict and planGate
+ *  plays for the approval gate. Placed BEFORE the plan gate so it exercises M4's
+ *  pre-run park, which is the path that used to hard-fail on REASON_NO_PLAN. */
+export const STUB_ASK_SENTINEL = "UZI_STUB_ASK";
 
 /**
  * Sentinel that makes the stub die on a simulated Anthropic usage limit (PRD #35),
@@ -317,10 +349,30 @@ export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{
   label?: string;
 }> = [
   { agent: "lead", text: "parallel dispatch: units A (api) and B (web)" },
-  { agent: "coder", text: "unit A: editing the api scope", instance: "stub-inst-a", label: "API wiring" },
-  { agent: "reviewer", text: "review wave: auditing unit A", instance: "stub-inst-rev-a", label: "audit unit A" },
-  { agent: "coder", text: "unit B: editing the web scope", instance: "stub-inst-b", label: "web gate UX" },
-  { agent: "reviewer", text: "review wave: auditing unit B", instance: "stub-inst-rev-b", label: "audit unit B" },
+  {
+    agent: "coder",
+    text: "unit A: editing the api scope",
+    instance: "stub-inst-a",
+    label: "API wiring",
+  },
+  {
+    agent: "reviewer",
+    text: "review wave: auditing unit A",
+    instance: "stub-inst-rev-a",
+    label: "audit unit A",
+  },
+  {
+    agent: "coder",
+    text: "unit B: editing the web scope",
+    instance: "stub-inst-b",
+    label: "web gate UX",
+  },
+  {
+    agent: "reviewer",
+    text: "review wave: auditing unit B",
+    instance: "stub-inst-rev-b",
+    label: "audit unit B",
+  },
   { agent: "lead", text: "integration: scopes disjoint, committing once" },
 ];
 
@@ -337,7 +389,13 @@ export const STUB_RESULT_USAGE = {
   output_tokens: 6100,
 };
 export const STUB_RESULT_MODEL_USAGE = {
-  "claude-fable-5": { inputTokens: 21400, outputTokens: 6100, cacheReadInputTokens: 188000, cacheCreationInputTokens: 0, costUSD: 0.24 },
+  "claude-fable-5": {
+    inputTokens: 21400,
+    outputTokens: 6100,
+    cacheReadInputTokens: 188000,
+    cacheCreationInputTokens: 0,
+    costUSD: 0.24,
+  },
 };
 export const STUB_RESULT_COST_USD = 0.24;
 export const STUB_CODER_USAGE = {
@@ -393,7 +451,11 @@ export class StubExecutor implements Executor {
   ) {}
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
-    ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub executor starting" } });
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: "stub executor starting" },
+    });
 
     // Synthesize the skills plugin the SAME way the SDK executor does (shared
     // prepareSkillPlugin), then read it back and report exactly what landed on
@@ -401,47 +463,126 @@ export class StubExecutor implements Executor {
     // E2E, which runs the stub (no live SDK session). Dropped skills are logged
     // too. Non-fatal: a skills failure must never fail the stub's core commit path.
     try {
-      const prepared = await prepareSkillPlugin(ctx, resolveSkillCaps(ctx.config));
+      const prepared = await prepareSkillPlugin(
+        ctx,
+        resolveSkillCaps(ctx.config),
+      );
       const loaded = await readPluginSkillNames(prepared.pluginPath);
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: `plugin skills: ${loaded.join(", ") || "(none)"}`, plugin_skills: loaded } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `plugin skills: ${loaded.join(", ") || "(none)"}`,
+          plugin_skills: loaded,
+        },
+      });
       const drops = [...(ctx.skillsDropped ?? []), ...prepared.drops];
       for (const d of drops) {
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: `skill dropped: ${d.name} (${d.reason})`, dropped_skill: d.name, dropped_reason: d.reason } });
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `skill dropped: ${d.name} (${d.reason})`,
+            dropped_skill: d.name,
+            dropped_reason: d.reason,
+          },
+        });
       }
     } catch (err) {
-      this.log.warn("stub: skills plugin synthesis failed", { run_id: ctx.runId, error: String(err) });
+      this.log.warn("stub: skills plugin synthesis failed", {
+        run_id: ctx.runId,
+        error: String(err),
+      });
     }
 
     // Delivered agent templates (PRD #18 M7/M8): report the claim's template set so
     // a user-scoped template's delivery — after the server's allocation +
     // shared-precedence resolution — is observable in the E2E (the stub runs no lead).
     const agentNames = (ctx.agents ?? []).map((a) => a.name);
-    ctx.emit({ kind: "status", agent: "worker", payload: { text: `agents: ${agentNames.join(", ") || "(none)"}`, agents: agentNames } });
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: {
+        text: `agents: ${agentNames.join(", ") || "(none)"}`,
+        agents: agentNames,
+      },
+    });
 
     // Tool provisioning (PRD #18 M8): exercise the SAME path as the SDK executor
     // (provision-run.ts), against the E2E's stubbed devbox. No packages ⇒ a no-op;
     // a provision failure fails the run, matching the SDK executor. The provisioned
     // env is unused by the stub — the point is to prove the install path end to end.
     if (this.opts.homeDir) {
-      const provisionRoot = path.join(path.dirname(this.opts.homeDir), "provision");
+      const provisionRoot = path.join(
+        path.dirname(this.opts.homeDir),
+        "provision",
+      );
       const { provisionDir } = await provisionRunTools(ctx, {
         provisionRoot,
         homeDir: this.opts.homeDir,
         log: this.log,
         provision: this.opts.provision,
       });
-      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+      if (provisionDir)
+        await fs
+          .rm(provisionDir, { recursive: true, force: true })
+          .catch(() => undefined);
     }
 
     const isCIFix = ctx.kind === "ci_fix";
-    const label = isCIFix ? `CI fix on \`${ctx.branch}\`` : `issue #${ctx.issueIid}`;
+    const label = isCIFix
+      ? `CI fix on \`${ctx.branch}\``
+      : `issue #${ctx.issueIid}`;
     // A ci_fix run can conclude that the failure is not a code problem (PRD #6):
     // the E2E drives that path via the sentinel.
     const notCode =
       isCIFix &&
       (ctx.issueDescription.includes(STUB_NOT_CODE_SENTINEL) ||
         ctx.issueTitle.includes(STUB_NOT_CODE_SENTINEL) ||
-        (ctx.pipeline?.failed_jobs ?? []).some((j) => j.log_tail.includes(STUB_NOT_CODE_SENTINEL)));
+        (ctx.pipeline?.failed_jobs ?? []).some((j) =>
+          j.log_tail.includes(STUB_NOT_CODE_SENTINEL),
+        ));
+
+    // PRD #88 M4: a pre-run clarification, BEFORE the plan gate. Autopilot resolves it
+    // without parking (runner.askUser short-circuits on claim.auto_approve), so the
+    // same sentinel drives both the human path and the never-parks assertion.
+    if (
+      ctx.issueDescription.includes(STUB_ASK_SENTINEL) ||
+      ctx.issueTitle.includes(STUB_ASK_SENTINEL)
+    ) {
+      if (ctx.askUser) {
+        const verdict = await ctx.askUser([
+          {
+            question:
+              "The stub executor was asked to clarify something before planning. Any answer continues the run.",
+            header: "Stub clarification",
+            options: [
+              { label: "proceed", description: "carry on with the stub plan" },
+              {
+                label: "proceed differently",
+                description: "also carries on — the stub ignores the choice",
+              },
+            ],
+          },
+        ]);
+        if (verdict.kind === "cancel") throw new Error("run cancelled");
+        ctx.emit({
+          kind: "answer",
+          agent: "lead",
+          payload: { answers: verdict.answers },
+        });
+      } else {
+        // Fail OPEN, matching sdk-executor (D-A): a question the worker cannot
+        // surface must not kill the run.
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "stub clarification skipped — no askUser is wired for this run",
+          },
+        });
+      }
+    }
 
     // PRD #35 Decision 6b, stub half: a resume PAST an approval that already happened
     // must not ask for it again. Both conditions are required for the same reasons
@@ -468,15 +609,26 @@ export class StubExecutor implements Executor {
         ctx.emit({
           kind: "status",
           agent: "worker",
-          payload: { text: "resuming an already-approved plan — skipping the planning turn and the approval gate" },
+          payload: {
+            text: "resuming an already-approved plan — skipping the planning turn and the approval gate",
+          },
         });
       } else {
         const planMd = [
-          isCIFix ? `## Stub CI-fix diagnosis for \`${ctx.branch}\`` : `## Stub plan for issue #${ctx.issueIid}`,
+          isCIFix
+            ? `## Stub CI-fix diagnosis for \`${ctx.branch}\``
+            : `## Stub plan for issue #${ctx.issueIid}`,
           ``,
           ...(notCode
-            ? [`VERDICT: not_code`, ``, `The failure is an infra/flaky problem, not a code bug (stub diagnosis).`]
-            : [`- write a marker file documenting the run`, `- commit it on \`${ctx.branch}\``]),
+            ? [
+                `VERDICT: not_code`,
+                ``,
+                `The failure is an infra/flaky problem, not a code bug (stub diagnosis).`,
+              ]
+            : [
+                `- write a marker file documenting the run`,
+                `- commit it on \`${ctx.branch}\``,
+              ]),
           ``,
           `Generated by the stub executor to drive the plan-approval gate with`,
           `no live Anthropic session.`,
@@ -494,9 +646,17 @@ export class StubExecutor implements Executor {
           // Record the reviewer's feedback on the feed BEFORE the next gatePlan flushes
           // the revised plan, so the feed never lags the awaiting_approval re-report —
           // same ordering as the real executor.
-          ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback: verdict.feedback } });
+          ctx.emit({
+            kind: "plan_feedback",
+            agent: "worker",
+            payload: { feedback: verdict.feedback },
+          });
           round++;
-          ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round } });
+          ctx.emit({
+            kind: "plan_revising",
+            agent: "worker",
+            payload: { round },
+          });
           revisedPlan = `${revisedPlan}\n\n(revision ${round}: applied feedback)`;
           verdict = await ctx.gatePlan(revisedPlan);
         }
@@ -504,21 +664,35 @@ export class StubExecutor implements Executor {
         // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a
         // future PlanVerdict variant is added, these lines stop type-checking, forcing it
         // to be handled rather than silently falling through to an unapproved plan.
-        if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
+        if (verdict.kind === "reject")
+          throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error("run cancelled");
       }
       if (notCode) {
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub diagnosis: not a code problem" } });
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "stub diagnosis: not a code problem" },
+        });
         return { branch: ctx.branch, fixVerdict: "not_code" };
       }
       ctx.reportIteration?.(1);
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: "plan approved; implementing" } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "plan approved; implementing" },
+      });
     }
 
     // E2E failure hook: throw AFTER the (auto-)approved plan so the run fails
     // during "implementation", exercising the worker-terminated failure path.
-    if (ctx.issueDescription.includes(STUB_FAIL_SENTINEL) || ctx.issueTitle.includes(STUB_FAIL_SENTINEL)) {
-      throw new Error(`stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`);
+    if (
+      ctx.issueDescription.includes(STUB_FAIL_SENTINEL) ||
+      ctx.issueTitle.includes(STUB_FAIL_SENTINEL)
+    ) {
+      throw new Error(
+        `stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`,
+      );
     }
 
     // PRD #35 E2E hook: die on a simulated usage limit, but only on the FIRST
@@ -556,7 +730,10 @@ export class StubExecutor implements Executor {
     // per-agent attributed — the piece the live SDK would otherwise produce. Emits
     // are synchronous and ordered, so the downstream batcher assigns them a gapless
     // seq run; the trailing "committed" message keeps them mid-stream, not last.
-    if (ctx.issueDescription.includes(STUB_INTERLEAVE_SENTINEL) || ctx.issueTitle.includes(STUB_INTERLEAVE_SENTINEL)) {
+    if (
+      ctx.issueDescription.includes(STUB_INTERLEAVE_SENTINEL) ||
+      ctx.issueTitle.includes(STUB_INTERLEAVE_SENTINEL)
+    ) {
       STUB_INTERLEAVE_STREAM.forEach((frame, i) => {
         // Spread the optional PRD #99 fields only when the frame has them, so a
         // lead frame emits no agentInstance/agentLabel key at all (matching the
@@ -565,7 +742,9 @@ export class StubExecutor implements Executor {
         ctx.emit({
           kind: "text",
           agent: frame.agent,
-          ...(frame.instance !== undefined ? { agentInstance: frame.instance } : {}),
+          ...(frame.instance !== undefined
+            ? { agentInstance: frame.instance }
+            : {}),
           ...(frame.label !== undefined ? { agentLabel: frame.label } : {}),
           payload: { text: frame.text, step: i + 1 },
         });
@@ -597,19 +776,35 @@ export class StubExecutor implements Executor {
     // signing config on the host image can't block the commit.
     await this.git(ctx.worktreePath, ["add", "UZI_RUN.md"]);
     await this.git(ctx.worktreePath, [
-      "-c", "user.name=uzi-agent",
-      "-c", "user.email=uzi-agent@uzi.local",
-      "-c", "commit.gpgsign=false",
-      "commit", "-m", `uzi stub: work on ${label}`,
+      "-c",
+      "user.name=uzi-agent",
+      "-c",
+      "user.email=uzi-agent@uzi.local",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "-m",
+      `uzi stub: work on ${label}`,
     ]);
 
-    ctx.emit({ kind: "text", agent: "worker", payload: { text: "stub work committed locally" } });
+    ctx.emit({
+      kind: "text",
+      agent: "worker",
+      payload: { text: "stub work committed locally" },
+    });
 
     // PRD #40 M6: stand in for the live SDK's usage frames — a per-agent (coder)
     // message with per-call usage (Decision 11) and the terminal result frame with
     // cumulative usage + modelUsage (the API folds it into run_usage). Emitted on
     // every stub run, so a normal E2E run carries usage without a sentinel.
-    ctx.emit({ kind: "text", agent: "coder", payload: { text: "coder: implemented the change", usage: STUB_CODER_USAGE } });
+    ctx.emit({
+      kind: "text",
+      agent: "coder",
+      payload: {
+        text: "coder: implemented the change",
+        usage: STUB_CODER_USAGE,
+      },
+    });
     ctx.emit({
       kind: "status",
       agent: "lead",
@@ -624,7 +819,10 @@ export class StubExecutor implements Executor {
       },
     });
 
-    this.log.info("stub executor committed marker", { run_id: ctx.runId, branch: ctx.branch });
+    this.log.info("stub executor committed marker", {
+      run_id: ctx.runId,
+      branch: ctx.branch,
+    });
     return { branch: ctx.branch };
   }
 
@@ -635,7 +833,8 @@ export class StubExecutor implements Executor {
    * All pauses are well under the worker's own idle/run timeouts.
    */
   private async simulateHealth(ctx: RunContext): Promise<void> {
-    const has = (s: string) => ctx.issueDescription.includes(s) || ctx.issueTitle.includes(s);
+    const has = (s: string) =>
+      ctx.issueDescription.includes(s) || ctx.issueTitle.includes(s);
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const override = this.opts.healthPauseMs;
     const stallMs = override ?? STUB_HEALTH_STALL_MS;
@@ -646,9 +845,17 @@ export class StubExecutor implements Executor {
       // Go quiet past the stall threshold (detector flags `stalled`), then resume:
       // the activity bump self-clears the flag, and the short trailing pause keeps
       // the run running so the clear is observable before it completes.
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: pausing to simulate a stall" } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "stub: pausing to simulate a stall" },
+      });
       await sleep(stallMs);
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: resuming after the pause" } });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "stub: resuming after the pause" },
+      });
       await sleep(resumeMs);
       return;
     }
@@ -659,8 +866,20 @@ export class StubExecutor implements Executor {
       // Hold briefly so a sweep tick catches it before the run completes.
       for (let i = 0; i < 4; i++) {
         const id = `stub-loop-${i}`;
-        ctx.emit({ kind: "tool_use", agent: "worker", payload: { id, name: "Bash", input: { command: "go test ./..." } } });
-        ctx.emit({ kind: "tool_result", agent: "worker", payload: { tool_use_id: id, content: "same failing output", is_error: true } });
+        ctx.emit({
+          kind: "tool_use",
+          agent: "worker",
+          payload: { id, name: "Bash", input: { command: "go test ./..." } },
+        });
+        ctx.emit({
+          kind: "tool_result",
+          agent: "worker",
+          payload: {
+            tool_use_id: id,
+            content: "same failing output",
+            is_error: true,
+          },
+        });
       }
       await sleep(loopHoldMs);
       return;
@@ -671,9 +890,21 @@ export class StubExecutor implements Executor {
       // the newest message is an unmatched tool_use, so `stalled` is SUPPRESSED —
       // the run is working, not stuck. Close it out afterwards so the run completes.
       const id = "stub-inflight-0";
-      ctx.emit({ kind: "tool_use", agent: "worker", payload: { id, name: "Bash", input: { command: "make provision" } } });
+      ctx.emit({
+        kind: "tool_use",
+        agent: "worker",
+        payload: { id, name: "Bash", input: { command: "make provision" } },
+      });
       await sleep(stallMs);
-      ctx.emit({ kind: "tool_result", agent: "worker", payload: { tool_use_id: id, content: "provision finished", is_error: false } });
+      ctx.emit({
+        kind: "tool_result",
+        agent: "worker",
+        payload: {
+          tool_use_id: id,
+          content: "provision finished",
+          is_error: false,
+        },
+      });
       return;
     }
   }
@@ -699,7 +930,10 @@ export class StubExecutor implements Executor {
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     const wrapped = runnerCommand("git", ["-C", cwd, ...args]);
-    await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 60_000 });
+    await execFileAsync(wrapped.command, wrapped.args, {
+      env,
+      timeout: 60_000,
+    });
   }
 }
 
@@ -709,8 +943,13 @@ export class StubExecutor implements Executor {
  *  claim carried the names). Missing dir ⇒ no skills. */
 async function readPluginSkillNames(pluginPath: string): Promise<string[]> {
   try {
-    const entries = await fs.readdir(path.join(pluginPath, "skills"), { withFileTypes: true });
-    return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    const entries = await fs.readdir(path.join(pluginPath, "skills"), {
+      withFileTypes: true,
+    });
+    return entries
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
   } catch {
     return [];
   }
