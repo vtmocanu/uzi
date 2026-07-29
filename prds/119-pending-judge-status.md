@@ -217,7 +217,7 @@ Dependency: **M1 (API) blocks M2 (web) and M4 (CLI)** — both consume the new
 | 2 | M4 — CLI parity | M1 | `api/cmd/uzi/{review,run}.go`, `uzicli` client |
 | 3 | M5 — In-app + docs verification | M2, M4 | run-page verify (k8s-first), `docs/` if any |
 
-- [ ] **M1 — API: active-judge read + `pending_judge` DTO.** Add
+- [x] **M1 — API: active-judge read + `pending_judge` DTO.** Add
   `GetActiveJudgeRunForTarget` (predicate = index verbatim); `sqlc generate`.
   Extend the run-review read path to load + return the active judge run behind the
   existing `GetRunForViewer` visibility gate. Add `PendingJudgeDTO` + a **total**
@@ -232,7 +232,19 @@ Dependency: **M1 (API) blocks M2 (web) and M4 (CLI)** — both consume the new
   returns both null. `go build ./...` + `go test ./...` green; LiveDB sweep green
   via `./e2e/run-store-it.sh` (positive control: the named test `--- PASS`, no
   `--- SKIP`).
-- [ ] **M2 — Web: pending state + disabled button + poll.** api-client type;
+  - Landed as described, with two corrections found in review. The predicate is
+    the index's partial `WHERE` **with its indexed column spelled out** — not a
+    literal copy of the index text, as the first comments claimed; the
+    equivalence they assert does hold. The mapper's "incl. `awaiting_approval`"
+    was short: the live `runs_status_check` (00092, nine values) makes the
+    active set **six** — `queued`, `claimed`, `running`, `awaiting_approval`,
+    `awaiting_input`, `limit_wait` — and `awaiting_input` is the one a judge run
+    can genuinely reach, since `SetRunAwaitingInput` carries no kind guard.
+    Sweep: `RUN=240 PASS=240 FAIL=0 SKIP=0`,
+    `--- PASS: TestJudgeQueriesLiveDB/active_judge_for_target`. The predicate is
+    mutation-proven: folding the `NOT IN` reddens it, and so does folding
+    `kind = 'judge'` (pinned by a decoy non-judge run carrying `target_run_id`).
+- [x] **M2 — Web: pending state + disabled button + poll.** api-client type;
   panel empty-state copy + disabled/relabeled button when pending; re-judge-in-
   flight driven by server truth (survives reload); generalized bounded poll;
   keep the 409 (`ErrJudgeAlreadyActive`) handler and make it re-fetch the review
@@ -243,11 +255,31 @@ Dependency: **M1 (API) blocks M2 (web) and M4 (CLI)** — both consume the new
   `pending_judge:null` still offers the enabled **Run judge** button (the existing
   test, unchanged); (c) a present review + `pending_judge` shows the re-queued
   line with the button disabled. `npm test` + `npm run typecheck` green.
-- [ ] **M4 — CLI parity.** `uzi review show` / `uzi run show` print "judge
+  - All three tests exist and pass (115 files / 1593 tests). Two deltas from the
+    text above. The re-judge-in-flight line is no longer the "re-queued" one
+    when it comes from the server: armed from server truth it cannot assert
+    *this viewer* re-queued anything, so it reads "A judge is
+    scheduled/running for this run — …"; "Judge re-queued" is kept only on the
+    local optimistic arm, where it is accurate. And the poll's stop condition is
+    **one-sided**, not two: a landed verdict swaps the panel but does not stop
+    the poll, because `PostReview` authorizes against the still-ACTIVE judge
+    run, so the review row is written before the judge run goes terminal —
+    stopping on `landed` froze a disabled "Judge running…" button over the
+    verdict that had just arrived. Only a cleared `pending_judge` (or the cap)
+    stops it. Both bugs were invisible to the first suite; the three
+    fake-timer tests that now cover them were shown to fail before the fix.
+- [x] **M4 — CLI parity.** `uzi review show` / `uzi run show` print "judge
   scheduled" / "judge in progress" when `pending_judge` is set, "not judged"
   only when genuinely null. `uzicli` client type carries the field. **Tests**:
   extend the existing `commands_test.go` "not judged" case with a pending variant.
   `go test ./api/cmd/uzi/...` green.
+  - Note the `uzicli.Client.RunReview` signature had to change (it returns the
+    pending DTO alongside the review), which rippled to `FakeClient` and the TUI
+    overlay — `uzi run review` is a hidden alias onto the same `runReviewShow`,
+    so there is no second render path. `--json` carries `pending_judge` in both
+    the populated and the null case, pinned by a test that asserts the literal
+    output: the CLI re-mints that envelope client-side rather than proxying the
+    server body, so a server key not added there is silently invisible.
 - [ ] **M5 — Verify in-app + docs.** On the primary runtime (k8s-first per
   CLAUDE.md conventions; compose acceptable for this UI-only change), finish a
   real run with auto-judge on and confirm the panel shows scheduled → in progress
@@ -255,6 +287,20 @@ Dependency: **M1 (API) blocks M2 (web) and M4 (CLI)** — both consume the new
   Confirm the enabled-button path is unchanged for a run with no judge. Update
   any `docs/` page that describes the run-review panel; `npm run build` green
   (runs `check-docs`).
+  - **Left unchecked deliberately — the docs half landed, the runtime half did
+    not.** Done: `docs/judge.md` now covers both pending states on the run page
+    and in `uzi review show` (the page never mentioned the automatic post-run
+    enqueue at all, which is the root of the confusion this PRD fixes);
+    `npm run build` green including `check-docs`; and all four panel states were
+    driven in headless Chromium against `VITE_UZI_MOCK=1`, which is what found
+    that #119 had consumed the only terminal unjudged fixture and left the
+    unchanged never-judged state undemoable (a fifth fixture, `run-unjudged`,
+    restores it). **Not done: a real run on the primary runtime.** No cluster is
+    reachable from this worktree and CLAUDE.md forbids standing a stack up
+    casually, so nobody has watched scheduled → in progress → verdict against a
+    real judge, or reloaded mid-judge outside jsdom. That matters more than
+    usual here: the poll bug above was exactly the kind of defect a fake-timer
+    suite hid and a real browser session would have shown in seconds.
 
 ## Risks & mitigations
 
