@@ -668,13 +668,59 @@ describe("RunRunner — plan gate + steering end to end", () => {
       "completed",
       "it runs to completion unattended",
     );
-    // No `question` message either: nothing was asked of anyone, so nothing should
-    // appear on the feed claiming a human was consulted.
-    assert.strictEqual(
-      api.messages(claim.run_id).filter((m) => m.kind === "question").length,
-      0,
-    );
     assert.strictEqual(calls.length, 1, "one MR opened");
+    // The "no `question` message" half of Decision 8 deliberately lives in its OWN
+    // test below rather than as a fifth assertion here — see the comment there.
+  });
+
+  /**
+   * Decision 8's OTHER half, split out because as an assertion inside the test above
+   * it could not fail for the reason it exists.
+   *
+   * `assert` throws on the first failure, so any fold that makes an autopilot run
+   * park — the obvious one, disabling the short-circuit — reddens the FIRST assertion
+   * up there and every later one never evaluates. A control run using that fold
+   * therefore establishes only *the run does not park*, and establishes **nothing**
+   * about *no message claims a human was consulted*, even though both properties are
+   * "covered" by a test that goes red. That is the assert-shadowing class: a green
+   * suite and a red mutation can BOTH be true of a property nothing has measured.
+   *
+   * Discriminating fold, and it is not one anybody would reach for by accident:
+   * keep the short-circuit intact (no park, no `awaiting_input`, sentinel still
+   * returned) and change only the emitted message kind from `status` to `question`
+   * in `RunRunner.askUser`'s autopilot branch. Every assertion above still passes;
+   * this one reddens alone.
+   *
+   * The property is security-relevant rather than cosmetic: an unattended run that
+   * files a `question` message is claiming on the permanent feed — and, with Slack
+   * linked, in the owner's DM — that a human was consulted about a decision no human
+   * ever saw.
+   */
+  it("an autopilot run emits NO question message: nothing may claim a human was consulted", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(34, {
+      auto_approve: true,
+      issue_description: `clarify something first: ${STUB_ASK_SENTINEL}`,
+    });
+    await runner(
+      new StubExecutor(nullLogger(), { planGate: true }),
+      gitlab,
+    ).execute(claim);
+
+    const kinds = api.messages(claim.run_id).map((m) => m.kind);
+    // Positive control FIRST, so this can never pass by the run having done nothing:
+    // the stub echoes an `answer` only on a path that actually reached ctx.askUser.
+    assert.ok(
+      kinds.includes("answer"),
+      "fixture is inert: the run never reached the clarification path at all",
+    );
+    assert.strictEqual(
+      kinds.filter((k) => k === "question").length,
+      0,
+      "an autopilot run was auto-resolved with a sentinel, so no `question` message " +
+        "may reach the feed — it would tell the owner, on the record and in Slack, " +
+        "that they were asked something they were never asked",
+    );
   });
 
   // The byte-exact sentinel answer (frozen: the lead is told to record the assumption
