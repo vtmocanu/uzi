@@ -241,6 +241,44 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 	}
 }
 
+// pendingJudgeState normalizes a judge run's RAW runs.status into the two-value display
+// union the clients consume ("scheduled" | "running"), for PRD #119's pending-judge
+// signal. queued — enqueued, not yet claimed — is "scheduled"; EVERYTHING else is
+// "running".
+//
+// The else is the point of this function, and it must never become an enumerated switch
+// over queued/claimed/running. The rows that reach here come from
+// GetActiveJudgeRunForTarget, whose predicate is the uq_runs_one_active_judge_per_target
+// index verbatim: status NOT IN ('completed','failed','cancelled'). That set is defined
+// by SUBTRACTION, so it contains every status runs.status legally admits minus three —
+// today that includes awaiting_approval (migration 00020) and awaiting_input (00092),
+// and it will silently include any status a future migration adds. A judge run does not
+// park at the approval gate today (the judge runner has no approval flow, and
+// auto_approve is autopilot-only), but the schema permits the value, so the query CAN
+// return it, and a switch that fell through to "" would ship state:"" and break the web
+// union "scheduled" | "running" — a blank chip in the one place the panel exists to
+// explain. Defaulting to "running" degrades an unknown active status to "a judge is
+// working on it", which is true of every member of that set by construction.
+//
+// TestPendingJudgeState asserts totality, including for a status this code has never
+// seen.
+func pendingJudgeState(status string) string {
+	if status == "queued" {
+		return "scheduled"
+	}
+	return "running"
+}
+
+// pendingJudgeToDTO renders the service's PendingJudge (raw status + enqueue time) as the
+// wire DTO, applying the normalization above. The service deliberately reports the raw
+// runs.status and this boundary owns the display vocabulary.
+func pendingJudgeToDTO(p workersvc.PendingJudge) apitypes.PendingJudgeDTO {
+	return apitypes.PendingJudgeDTO{
+		State:      pendingJudgeState(p.Status),
+		EnqueuedAt: p.EnqueuedAt,
+	}
+}
+
 // dispStatus / dispReason read a disposition's fields for the triage bucketer, yielding the
 // "" undisposed sentinels when the coordinate carries no disposition.
 func dispStatus(disposed bool, d store.RecommendationDisposition) string {
@@ -257,11 +295,19 @@ func dispReason(disposed bool, d store.RecommendationDisposition) string {
 	return d.DismissReason.String
 }
 
-// GetRunReview serves the judge's verdict + recommendations for a run, for the
-// run-page panel (PRD #46 M4). Visibility is owner-or-admin via GetReviewForTarget
-// (GetRunForViewer-scoped): a run the caller can't see is 404. A visible but unjudged
-// run returns 200 with review:null so the panel can render "not judged yet" without
-// treating it as an error.
+// GetRunReview serves the run-page review panel: the judge's verdict + recommendations,
+// AND the active judge run for the target (PRD #46 M4, PRD #119 M1). Visibility is
+// owner-or-admin via GetRunReviewPanel (GetRunForViewer-scoped, applied once before
+// either read): a run the caller can't see is 404, and no pending-judge query is issued
+// for it.
+//
+// The response is {"review": …|null, "pending_judge": …|null} with BOTH keys always
+// present and either one nullable. They are independent: an unjudged run with an
+// auto-judge in flight is review:null + pending_judge set, which is precisely the state
+// the panel could not previously distinguish from "never judged" — it showed "not judged
+// yet" next to a live button whose only possible outcome was a 409 from the
+// one-active-judge-per-target index. A visible-but-unjudged run is still 200, never an
+// error.
 func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -273,7 +319,7 @@ func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid run id")
 		return
 	}
-	res, err := h.wsvc.GetReviewForTarget(r.Context(), user.ID, user.IsAdmin, id)
+	res, pending, err := h.wsvc.GetRunReviewPanel(r.Context(), user.ID, user.IsAdmin, id)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
@@ -283,11 +329,18 @@ func (h *Handler) GetRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if res == nil {
-		httpx.JSON(w, http.StatusOK, map[string]any{"review": nil})
-		return
+	// Both keys on EVERY success path. The nil branches emit an explicit null rather than
+	// omitting the key, so a client can always read the pair — an absent key and a null
+	// one are different claims, and "there is no judge coming" is a claim this endpoint
+	// makes, not something a client should infer from silence.
+	body := map[string]any{"review": nil, "pending_judge": nil}
+	if res != nil {
+		body["review"] = reviewToDTO(*res)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"review": reviewToDTO(*res)})
+	if pending != nil {
+		body["pending_judge"] = pendingJudgeToDTO(*pending)
+	}
+	httpx.JSON(w, http.StatusOK, body)
 }
 
 // RerunJudge enqueues a fresh judge run for a terminal run at the owner's request

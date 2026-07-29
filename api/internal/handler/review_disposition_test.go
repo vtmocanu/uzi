@@ -36,6 +36,15 @@ type dispStore struct {
 	filed   []store.RecommendationFiledIssue
 	disps   []store.RecommendationDisposition
 
+	// reviewErr, when set (pgx.ErrNoRows), models an UNJUDGED target — the run resolves
+	// but carries no verdict. The zero value keeps the judged behaviour every pre-#119
+	// test relies on.
+	reviewErr error
+	// pendingJudge backs the PRD #119 active-judge read the review READ path now makes.
+	// nil means "no judge in flight" (pgx.ErrNoRows), which is what every pre-#119 test
+	// expects and what keeps their assertions about the review half unchanged.
+	pendingJudge *store.GetActiveJudgeRunForTargetRow
+
 	// triageRows backs the global stats aggregate (ListJudgeTriageRowsForUser).
 	triageRows   []store.ListJudgeTriageRowsForUserRow
 	statsUserArg uuid.UUID
@@ -75,6 +84,9 @@ func (s *dispStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, erro
 
 func (s *dispStore) GetRunReviewForTarget(_ context.Context, _ uuid.UUID) (store.RunReview, error) {
 	s.note("GetRunReviewForTarget")
+	if s.reviewErr != nil {
+		return store.RunReview{}, s.reviewErr
+	}
 	return s.review, nil
 }
 func (s *dispStore) ListRecommendationsForReview(_ context.Context, _ uuid.UUID) ([]store.ReviewRecommendation, error) {
@@ -84,6 +96,13 @@ func (s *dispStore) ListRecommendationsForReview(_ context.Context, _ uuid.UUID)
 func (s *dispStore) ListFiledIssuesForReview(_ context.Context, _ uuid.UUID) ([]store.RecommendationFiledIssue, error) {
 	s.note("ListFiledIssuesForReview")
 	return s.filed, nil
+}
+func (s *dispStore) GetActiveJudgeRunForTarget(_ context.Context, _ pgtype.UUID) (store.GetActiveJudgeRunForTargetRow, error) {
+	s.note("GetActiveJudgeRunForTarget")
+	if s.pendingJudge == nil {
+		return store.GetActiveJudgeRunForTargetRow{}, pgx.ErrNoRows
+	}
+	return *s.pendingJudge, nil
 }
 func (s *dispStore) ListDispositionsForReview(_ context.Context, _ uuid.UUID) ([]store.RecommendationDisposition, error) {
 	s.note("ListDispositionsForReview")

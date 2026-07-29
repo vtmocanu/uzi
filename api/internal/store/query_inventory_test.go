@@ -453,6 +453,16 @@ var queryInventory = []queryPin{
 		"direct call, judge_integration_test.go:65 (TestClaimRunDockerRepoAllowlistLiveDB also calls it, but only as fixture setup)"},
 	{"GetActiveJudgeRunForWorkerTarget", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:91"},
+	{"GetActiveJudgeRunForTarget", "judge.sql", "TestJudgeQueriesLiveDB",
+		"direct call, judge_integration_test.go — the \"pending judge\" subtest (PRD #119 M1). " +
+			"The pin is the predicate↔index equivalence, not mere reachability: the subtest " +
+			"asserts an active judge IS found (queued AND a non-queued active status, so a " +
+			"queued-only narrowing reddens) and that each of completed/failed/cancelled is NOT " +
+			"(ErrNoRows), which is the uq_runs_one_active_judge_per_target active set spelled " +
+			"out one status at a time. It also pins the target scoping (a judge pointed at " +
+			"ANOTHER run is not returned) and the projection (status + created_at read back). " +
+			"A fold that drops any of the three terminal statuses, or the kind/target " +
+			"predicate, lands on a distinct assertion"},
 	{"ListToolTraceForRun", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go — a RENAME of ListToolResultPayloadsForRun, " +
 			"not an arrival (PRD #121 M3 widened it to kind IN (tool_use, tool_result) and " +

@@ -185,6 +185,84 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	}); err != pgx.ErrNoRows {
 		t.Fatalf("a terminal judge run must not resolve as active (want ErrNoRows), got %v", err)
 	}
+
+	// ── the pending-judge signal (PRD #119 M1): GetActiveJudgeRunForTarget ──
+	// This subtest is the pin for the load-bearing invariant: the query's predicate is a
+	// verbatim copy of uq_runs_one_active_judge_per_target, so "the panel shows pending"
+	// and "a manual re-judge click 23505s" must be the SAME set of states. It is asserted
+	// one status at a time rather than by inspection, because the two can only be proven
+	// equal by exercising the boundary: every terminal status individually absent, and a
+	// non-terminal status other than the enqueue-time 'queued' individually present.
+	t.Run("active judge for target", func(t *testing.T) {
+		// The first judge is terminal by now, so the target is free for a new one — which
+		// is itself the index's rule (a re-judge is legal once the prior judge settles).
+		pending, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+			UserID: userID, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true},
+			IssueTitle: "Judge: Do X (again)", IssueDescription: "",
+		})
+		if err != nil {
+			t.Fatalf("CreateJudgeRun (pending): %v", err)
+		}
+		// A SECOND target with its OWN active judge: the control for the target scoping.
+		// Without it, a query that dropped `target_run_id = $1` would still look right.
+		otherTargetID := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+			 VALUES ($1, $2, $3, 43, 'Do Y', 'desc', 'completed', 'issue')`, otherTargetID, userID, repoID)
+		otherJudge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
+			UserID: userID, TargetRunID: pgtype.UUID{Bytes: otherTargetID, Valid: true},
+			IssueTitle: "Judge: Do Y", IssueDescription: "",
+		})
+		if err != nil {
+			t.Fatalf("CreateJudgeRun (other target): %v", err)
+		}
+
+		// Freshly enqueued: 'queued', the state the panel renders as "Judge scheduled".
+		got, err := q.GetActiveJudgeRunForTarget(ctx, pgtype.UUID{Bytes: targetID, Valid: true})
+		if err != nil {
+			t.Fatalf("GetActiveJudgeRunForTarget (queued): %v", err)
+		}
+		if got.ID != pending.ID {
+			t.Fatalf("GetActiveJudgeRunForTarget = %v, want the pending judge %v", got.ID, pending.ID)
+		}
+		if got.Status != "queued" {
+			t.Fatalf("status = %q, want %q — the DTO's scheduled/running split reads this column", got.Status, "queued")
+		}
+		if !got.CreatedAt.Valid || !got.CreatedAt.Time.Equal(pending.CreatedAt.Time) {
+			t.Fatalf("created_at = %v, want the judge run's own created_at %v (it is the panel's enqueued_at)",
+				got.CreatedAt, pending.CreatedAt)
+		}
+
+		// Target scoping: the OTHER target resolves to ITS judge, never ours. Both are
+		// active at this instant, so a missing target predicate would cross the wires.
+		gotOther, err := q.GetActiveJudgeRunForTarget(ctx, pgtype.UUID{Bytes: otherTargetID, Valid: true})
+		if err != nil {
+			t.Fatalf("GetActiveJudgeRunForTarget (other target): %v", err)
+		}
+		if gotOther.ID != otherJudge.ID {
+			t.Fatalf("other target resolved to %v, want its OWN judge %v (target scoping)", gotOther.ID, otherJudge.ID)
+		}
+
+		// A NON-TERMINAL, non-'queued' status is still active — the "Judge in progress"
+		// half. 'queued'-only matching would pass every other assertion here.
+		mustExec(ctx, t, pool, `UPDATE runs SET status = 'running' WHERE id = $1`, pending.ID)
+		got, err = q.GetActiveJudgeRunForTarget(ctx, pgtype.UUID{Bytes: targetID, Valid: true})
+		if err != nil || got.ID != pending.ID || got.Status != "running" {
+			t.Fatalf("a 'running' judge must still resolve as active: %+v, %v", got, err)
+		}
+
+		// The three terminal statuses of the index predicate, each on its own: a judge in
+		// any of them has LEFT the active set, so the panel must fall back to the enabled
+		// button and a manual click would NOT 23505. Dropping any one from the query's
+		// NOT IN list reddens exactly this loop.
+		for _, terminal := range []string{"completed", "failed", "cancelled"} {
+			mustExec(ctx, t, pool, `UPDATE runs SET status = $1 WHERE id = $2`, terminal, pending.ID)
+			if _, err := q.GetActiveJudgeRunForTarget(ctx, pgtype.UUID{Bytes: targetID, Valid: true}); err != pgx.ErrNoRows {
+				t.Fatalf("a %q judge must not resolve as active (want ErrNoRows), got %v — the query's "+
+					"predicate has drifted from uq_runs_one_active_judge_per_target", terminal, err)
+			}
+		}
+	})
 }
 
 func countRecs(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uuid.UUID) int {

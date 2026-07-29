@@ -971,9 +971,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// closing a leak (follow-ups are never in run_messages). RequireUser so
 				// `uzi run inputs` reads it from a CLI token.
 				r.Get("/{id}/inputs", h.ListRunInputs)
-				// Judge surfacing (PRD #46 M4 / Decision 21): read the review
-				// (owner-or-admin, GetReviewForTarget → GetRunForViewer-scoped, capped by
-				// the same RequireUser masking as GetRun).
+				// Judge surfacing (PRD #46 M4 / Decision 21): read the review, plus the
+				// active judge run for the target (PRD #119 M1) — owner-or-admin,
+				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
+				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
 				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
 				// filing a forge issue from one recommendation. A READ (owner-or-admin,

@@ -275,6 +275,27 @@ type JudgeBulkDispositionRequest struct {
 	Scope  string                     `json:"scope"`
 }
 
+// PendingJudgeDTO is the ACTIVE judge run for a target (PRD #119 M1) — "a verdict is
+// already on its way", the fact the run page could not previously tell apart from "this
+// run was never judged".
+//
+// State is the NORMALIZED display value, never the raw runs.status: "scheduled" (the
+// judge is enqueued and unclaimed) or "running" (a worker has it). The mapping is done by
+// a TOTAL mapper server-side (handler.pendingJudgeState) so a client can treat the field
+// as the closed union "scheduled" | "running" — the raw status set is wider than those
+// two and is allowed to grow, and a client is the wrong place to learn that. EnqueuedAt
+// is the judge run's created_at.
+//
+// It is a SIBLING key on the review response — {"review": …, "pending_judge": …} — and
+// deliberately NOT a field of ReviewDTO. A pending judge is orthogonal to a verdict and
+// is present precisely when there may be no review at all (the common case: an
+// auto-judge enqueued the moment the run finished), so hanging it off ReviewDTO would
+// make it unreachable in the one state it exists to describe.
+type PendingJudgeDTO struct {
+	State      string    `json:"state"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {

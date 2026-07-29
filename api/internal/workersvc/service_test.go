@@ -155,14 +155,22 @@ type fakeStore struct {
 	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
 
 	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
-	runByIDPlain            store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
-	runByIDPlainErr         error
-	userByID                store.User
-	userByIDErr             error
-	createdJudgeRun         *store.CreateJudgeRunParams
-	createJudgeRunErr       error
-	activeJudgeRun          store.Run
-	activeJudgeRunErr       error
+	runByIDPlain      store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
+	runByIDPlainErr   error
+	userByID          store.User
+	userByIDErr       error
+	createdJudgeRun   *store.CreateJudgeRunParams
+	createJudgeRunErr error
+	activeJudgeRun    store.Run
+	activeJudgeRunErr error
+	// The PRD #119 pending-judge read (GetActiveJudgeRunForTarget). pendingJudgeErr is
+	// normally pgx.ErrNoRows — "no judge in flight" is the common case and is NOT an
+	// error to the service. pendingJudgeLookups records every target asked for, so a test
+	// can assert the read was never ISSUED (the not-visible case must short-circuit on
+	// the visibility gate, before any pending query).
+	pendingJudgeRow         store.GetActiveJudgeRunForTargetRow
+	pendingJudgeErr         error
+	pendingJudgeLookups     []pgtype.UUID
 	toolTraceRows           []store.ListToolTraceForRunRow
 	toolTraceRowsErr        error
 	runInputs               []store.RunUserInput
@@ -576,6 +584,13 @@ func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunPa
 }
 func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
 	return f.activeJudgeRun, f.activeJudgeRunErr
+}
+
+// The PRD #119 pending-judge read. It records the target it was asked for, which is how
+// the panel tests assert the query is NOT issued for a run the viewer cannot see.
+func (f *fakeStore) GetActiveJudgeRunForTarget(_ context.Context, targetRunID pgtype.UUID) (store.GetActiveJudgeRunForTargetRow, error) {
+	f.pendingJudgeLookups = append(f.pendingJudgeLookups, targetRunID)
+	return f.pendingJudgeRow, f.pendingJudgeErr
 }
 func (f *fakeStore) ListToolTraceForRun(context.Context, store.ListToolTraceForRunParams) ([]store.ListToolTraceForRunRow, error) {
 	return f.toolTraceRows, f.toolTraceRowsErr

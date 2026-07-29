@@ -30,6 +30,33 @@ WHERE worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
 LIMIT 1;
 
+-- name: GetActiveJudgeRunForTarget :one
+-- The ACTIVE judge run for a target, for the run page's pending-judge signal (PRD #119
+-- M1). This is GetActiveJudgeRunForWorkerTarget minus the worker scope: no worker owns
+-- this read, it answers "is a judge already coming for this run?" for whoever can see
+-- the target (owner-or-admin, enforced by GetRunForViewer BEFORE this read, never here).
+--
+-- The WHERE predicate is a VERBATIM copy of the uq_runs_one_active_judge_per_target
+-- partial unique index (00058) — kind='judge', the target, and the same
+-- NOT IN ('completed','failed','cancelled') active set. That equivalence is the whole
+-- point of the query and is load-bearing: the UI must show "pending" in PRECISELY the
+-- set of states where a manual "Run judge" click would hit the index and 23505, and
+-- offer the button in precisely the set where the click is the legitimate way to start
+-- one. Paraphrase the predicate and the two sets drift apart — the panel either hides a
+-- button that would have worked, or offers one that can only produce an error toast,
+-- which is the confusion #119 exists to remove. TestJudgeQueriesLiveDB pins the
+-- equivalence directly (an active judge found; a completed/failed/cancelled one not).
+--
+-- Because the index is UNIQUE over exactly this predicate, at most one row can ever
+-- match; LIMIT 1 is belt-and-braces, not a real narrowing. Only the three columns the
+-- panel needs are projected — this is a UI signal, not the judge machinery, so it
+-- deliberately does not return the whole run row the way the worker-scoped query does.
+SELECT id, status, created_at FROM runs
+WHERE kind = 'judge'
+  AND target_run_id = @target_run_id
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+LIMIT 1;
+
 -- name: ListToolTraceForRun :many
 -- The tool trace of a run — the agent's tool_use invocations AND their tool_result
 -- output — oldest first, capped by @lim. Input to the API-side command-not-found
