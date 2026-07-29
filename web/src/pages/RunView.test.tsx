@@ -697,10 +697,13 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect((btn as HTMLButtonElement).disabled).toBe(false);
   });
 
-  // The poll, on fake timers SCOPED to this test (no other JudgePanel test uses them).
-  // Two stop conditions matter and this covers the review-lands one; the other — a judge
-  // that goes failed/cancelled produces NO review, so a cleared pending_judge is the only
-  // thing that can end the poll — is covered by the next case.
+  // The poll, on fake timers SCOPED to this test (every JudgePanel test that uses them
+  // restores real timers in a finally). This is the happy path where the swap and the stop
+  // coincide: one response carries both the new verdict and a cleared pending_judge. The
+  // two are independent, though — a stop with no swap is the next case, and a swap with no
+  // stop is "keeps polling while the judge is still active" below — so read this one as
+  // "the verdict reaches the panel", not as "a landed verdict is what ends the poll" (it
+  // is not: only a cleared pending_judge or the cap stops it).
   it("polls while a judge is pending and swaps to the verdict when it lands (#119)", async () => {
     vi.useFakeTimers();
     try {
@@ -763,6 +766,125 @@ describe("JudgePanel (PRD #46 M4)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // The reload-mid-re-judge journey, which is the headline case #119 exists for: the poll
+  // now starts from SERVER truth, so it can begin on a mount that already has a verdict on
+  // screen. The baseline the poll compares against therefore has to be seeded by the FETCH,
+  // not only by a click — otherwise tick 1 compares the old, already-displayed verdict
+  // against a null baseline, calls it "landed", and kills the interval on its first tick
+  // while the judge that will actually replace it is still running.
+  it("keeps polling across ticks that re-serve the SAME old verdict on a fresh mount (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      const old = review({ updated_at: "2026-03-01T00:00:00Z", summary_md: "The old verdict." });
+      mockApi.getRunReview.mockResolvedValue({ review: old, pending_judge: pending("running") });
+      render(<JudgePanel run={run({ status: "completed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // Three ticks that all re-serve the SAME verdict with the judge still active. The
+      // poll must survive every one of them: nothing has changed since the mount fetch.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(12_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(4);
+      expect(screen.getByText("The old verdict.")).toBeTruthy();
+
+      // Now the judge finishes and the new verdict lands.
+      mockApi.getRunReview.mockResolvedValue({
+        review: review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." }),
+        pending_judge: null,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      expect(screen.queryByText("The old verdict.")).toBeNull();
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+      // Pending cleared, so the poll is done.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The ordering the API actually has: PostReview authorizes against the caller's STILL
+  // ACTIVE judge run (workersvc/judge_review.go authorizeJudgeTrace), so the review row is
+  // written BEFORE the judge leaves the active set — the worker reports completion later.
+  // A tick landing in that window legitimately sees (fresh review, pending_judge non-null),
+  // and it must swap the panel WITHOUT stopping: stopping there freezes a disabled
+  // "Judge running…" button over the verdict that already arrived.
+  it("swaps to a landed verdict but keeps polling while the judge is still active (#119)", async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh = review({ updated_at: "2026-03-02T00:00:00Z", summary_md: "The NEW verdict." });
+      mockApi.getRunReview
+        .mockResolvedValueOnce({ review: null, pending_judge: pending("running") })
+        // Tick 1: the verdict is written, the judge run has not gone terminal yet.
+        .mockResolvedValueOnce({ review: fresh, pending_judge: pending("running") })
+        // Tick 2+: the worker's completion report landed.
+        .mockResolvedValue({ review: fresh, pending_judge: null });
+      render(<JudgePanel run={run({ status: "failed" })} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getAllByText("Judge in progress…")).toHaveLength(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      // The verdict swapped in…
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("The NEW verdict.")).toBeTruthy();
+      // …and the panel still reports the judge as active, because the server does.
+      expect(
+        (screen.getByRole("button", { name: "Judge running…" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+
+      // The poll did NOT stop on the landed verdict: tick 2 runs and sees pending clear.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(3);
+      const btn = screen.getByRole("button", { name: "Re-run judge" });
+      expect((btn as HTMLButtonElement).disabled).toBe(false);
+
+      // …and once pending cleared, it stopped.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(mockApi.getRunReview).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Rollout skew: api and web are separate Deployments, so a web pod can talk to an api
+  // that predates the pending_judge key. The key is then ABSENT, destructuring to
+  // undefined — and `undefined !== null` is true, so every `pendingJudge !== null` guard
+  // walks straight into `pendingJudge.state` and throws during render. There is no
+  // ErrorBoundary in web/src, so that TypeError unmounts the whole app over a missing
+  // optional field. api/internal/uzicli/client.go handles the same skew on the CLI side.
+  it("treats an absent pending_judge as no pending judge rather than throwing (#119)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() } as unknown as Awaited<
+      ReturnType<typeof api.getRunReview>
+    >);
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const btn = await screen.findByRole("button", { name: "Re-run judge" });
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText("Issues found")).toBeTruthy();
   });
 
   it("renders nothing for an ineligible kind (chat) and never fetches a review", async () => {

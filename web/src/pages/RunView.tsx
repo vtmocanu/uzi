@@ -1197,8 +1197,16 @@ export function JudgePanel({ run }: { run: Run }) {
   // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
   // once for the panel; a failure just leaves the picker empty (the draft still opens).
   const [repos, setRepos] = useState<Repo[]>([]);
-  // The verdict's updated_at at the moment a re-run was fired; the poll below stops
-  // once the review's updated_at moves past it (or a first-ever review lands).
+  // The updated_at of the verdict CURRENTLY ON SCREEN (null when there is none). The poll
+  // below compares each response against it to decide whether a NEWER verdict arrived and
+  // the panel should swap to it.
+  //
+  // INVARIANT: this is written next to every setReview, and only there — the mount/409
+  // fetch and the poll's swap. That pairing is the whole point. #119 made the poll start
+  // from server truth rather than only from a click, so it can now begin on a mount that
+  // ALREADY HAS a verdict; a baseline seeded only by the click would then be null while
+  // the on-screen review has a real timestamp, and the very first tick would "detect" the
+  // old, already-displayed verdict as newly landed.
   const baselineUpdatedAt = useRef<string | null>(null);
 
   const eligible = JUDGE_ELIGIBLE_KINDS.has(run.kind);
@@ -1207,7 +1215,18 @@ export function JudgePanel({ run }: { run: Run }) {
     try {
       const { review, pending_judge } = await api.getRunReview(run.id);
       setReview(review);
-      setPendingJudge(pending_judge);
+      // Seed the poll's baseline to the verdict this fetch just put on screen (see the
+      // invariant at baselineUpdatedAt): without it a poll that starts from server truth
+      // on a fresh mount reads a null baseline against a real updated_at.
+      baselineUpdatedAt.current = review?.updated_at ?? null;
+      // `?? null`, not the raw value: api and web are separate Deployments, so during a
+      // rollout a web pod can be served by an api that predates the pending_judge key.
+      // Absent destructures to undefined, and `undefined !== null` is true — every
+      // `pendingJudge !== null` guard would then walk into `pendingJudge.state` and throw
+      // during render. There is no ErrorBoundary in web/src, so that TypeError would blank
+      // the whole app over a missing optional field. (api/internal/uzicli/client.go
+      // handles the same skew on the CLI side.)
+      setPendingJudge(pending_judge ?? null);
       setLoadErr("");
     } catch (e) {
       setLoadErr(e instanceof ApiError ? e.message : "Failed to load the review");
@@ -1279,16 +1298,29 @@ export function JudgePanel({ run }: { run: Run }) {
   const polling = queued || pendingJudge !== null;
 
   // Bounded background poll while a judge is in flight (local optimistic `queued` OR
-  // server-truth pendingJudge — PRD #119 generalized this from the post-re-run-only
-  // poll). It stops on EITHER of two conditions, and both are load-bearing:
-  //   • the review's updated_at moved off the baseline (or a first-ever review landed)
-  //     — the verdict is here, swap the panel to it;
-  //   • the response's pending_judge is null — the judge left the active set.
-  // The second is not redundant: a judge that goes failed/cancelled leaves the active
-  // set and produces NO review at all, so updated_at never moves and pending_judge
-  // clearing is the ONLY thing that can end that poll. Cap is 150 tries × 4s ≈ 10
-  // minutes — a real judge takes minutes, and the old 15-try (~1 min) cap gave up while
-  // the judge it was waiting on was still running.
+  // server-truth pendingJudge — PRD #119 generalized this from the post-re-run-only poll).
+  //
+  // A landed verdict drives the SWAP; it does NOT stop the poll. The only stop conditions
+  // are "the judge left the active set" and the cap. That split is forced by the API's
+  // write ordering: PostReview (api/internal/workersvc/judge_review.go) opens with
+  // authorizeJudgeTrace, which requires the calling worker to own a still-ACTIVE judge run
+  // — so the review row is written BEFORE the judge run goes terminal, and the run only
+  // leaves the active set on the worker's later completion report. A tick landing in that
+  // window legitimately sees (fresh review, pending_judge still non-null); stopping there
+  // would freeze a disabled "Judge running…" button and an in-flight note on top of a
+  // verdict that had already arrived, with nothing left to ever clear them. That window is
+  // the COMMON auto-judge path, not a race corner.
+  //
+  // Termination, given the swap no longer stops anything:
+  //   • judge that dies with no verdict — pending_judge clears, no review ever moves;
+  //     the cleared pending is what ends it, exactly as before;
+  //   • verdict lands (first-ever or a re-judge) — the swap happens, then the completion
+  //     report clears pending_judge a tick or two later and the poll ends;
+  //   • the local `queued` window before the server reports a pending judge — the first
+  //     response with pending_judge null ends it, same as before;
+  //   • everything else — the 150-try cap.
+  // Cap is 150 tries × 4s ≈ 10 minutes — a real judge takes minutes, and the old 15-try
+  // (~1 min) cap gave up while the judge it was waiting on was still running.
   useEffect(() => {
     if (!polling) return;
     let tries = 0;
@@ -1314,10 +1346,22 @@ export function JudgePanel({ run }: { run: Run }) {
         }
         return;
       }
-      setPendingJudge(next.pending_judge);
-      const landed = next.review !== null && next.review.updated_at !== baselineUpdatedAt.current;
-      if (landed) setReview(next.review);
-      if (landed || next.pending_judge === null || tries >= 150) {
+      // `?? null` for the rollout-skew reason documented in fetchReview: an api that
+      // predates the key would otherwise put `undefined` into state and throw on render.
+      const nextPending = next.pending_judge ?? null;
+      setPendingJudge(nextPending);
+      // A verdict NEWER than the one on screen: swap to it and advance the baseline in the
+      // same step, so the invariant holds and later ticks re-serving that same verdict do
+      // not read as another landing. Deliberately not a stop condition — see above.
+      const landed =
+        next.review !== null && next.review.updated_at !== baselineUpdatedAt.current
+          ? next.review
+          : null;
+      if (landed !== null) {
+        setReview(landed);
+        baselineUpdatedAt.current = landed.updated_at;
+      }
+      if (nextPending === null || tries >= 150) {
         setQueued(false);
         clearInterval(id);
       }
@@ -1330,7 +1374,11 @@ export function JudgePanel({ run }: { run: Run }) {
     setRerunning(true);
     try {
       await api.rerunJudge(run.id);
-      baselineUpdatedAt.current = review?.updated_at ?? null;
+      // No baseline write here on purpose. It used to live here, and being the ONLY writer
+      // is what left the baseline null on any poll that did not start from a click. Now
+      // that every setReview seeds it, `baselineUpdatedAt.current === review?.updated_at`
+      // already holds at this point and re-writing it would be a no-op — one that invites
+      // the same bug back by making "the click seeds the baseline" look load-bearing.
       setQueued(true);
     } catch (e) {
       // The 409 backstop (PRD #119). The button is disabled whenever the last fetch saw
