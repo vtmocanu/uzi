@@ -10,6 +10,23 @@ import type { AnswerVerdict, PlanVerdict } from "../src/steering.js";
 import type { AskUserQuestion } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
+// A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
+// never exists. Both halves matter. Non-existence is the point of these fixtures --
+// the executor must not require the worktree on disk -- so mkdtempSync is wrong here
+// even though it is right for the skills tests further down, which do need real files.
+// Uniqueness is a RACE FIX: skillsPluginDir() derives `<dirname>/.uzi-skills-<basename>`
+// as a SIBLING, the executor materializes that directory, and `node --test` runs test
+// FILES concurrently. This file and ask-user-executor.test.ts both used the literal
+// "/tmp/does-not-need-to-exist", so both drove the identical plugin dir and raced:
+// measured 1 failure in 6 on the isolated pair, surfacing as ENOTEMPTY from one file's
+// recursive remove or ENOENT from the other's mkdir. Two different literals would have
+// been the same defect with a longer fuse; the basename has to be unique.
+let nonexistentWorktreeSeq = 0;
+function nonexistentWorktree(): string {
+  return path.join(os.tmpdir(), `uzi-nonexistent-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
+}
+
+
 // PRD #88 M4/M5 at the executor level: the pre-run park (which must NOT hit
 // REASON_NO_PLAN at either planning-turn site), the answer-then-re-plan round trip,
 // the shared per-run question budget, and the unwired/cap fail-open paths.
@@ -94,7 +111,7 @@ function makeCtx(
     issueIid: 5,
     issueTitle: "Fix login",
     issueDescription: "please implement",
-    worktreePath: "/tmp/does-not-need-to-exist",
+    worktreePath: nonexistentWorktree(),
     branch: "agent/issue-5",
     emit: (m) => emits.push(m),
     oauthToken: OAUTH,
