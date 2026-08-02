@@ -349,6 +349,40 @@ unlike the npm half they genuinely cannot fold into a per-toolchain `validate:*`
 job — M5 **will** open lint-stage jobs, and every one of them goes into **both**
 lists in the commit that creates it.
 
+**AND M5 NOW INHERITS A COMPLETENESS PROPERTY, NOT MERELY A MEMBERSHIP RULE.** M3
+shipped the "both lists, always" rule while an existing job was violating it:
+`test:api-store-it` (`stage: test`, no `rules:` of its own, so it runs on tag
+pipelines) had been absent from **both** lists since `add0390d` introduced it, with
+no recorded reason anywhere. A `v*` tag therefore pushed every image, the OCI chart
+and the brew formula while the **sole CI coverage of the LiveDB suite** was failing
+— the one job `CLAUDE.md` identifies as the only thing that catches a
+`+goose`-poisoned migration, whose blast radius is every later migration staying
+unapplied at API boot. M3 added it to both, taking them to 12 and 14 entries, and
+corrected `.gate_needs`'s own header, whose *"The full validate+test+helm gate set"*
+admits exactly one reading and was false while that job was missing.
+
+**The check that finds this is stage-based, and the obvious one does not.** M3's
+first pass verified completeness with a filter keyed on job-name shape
+(`validate:*` / `test:*` / `lint:*` per component), which `test:api-store-it`
+satisfies in name and slips through in practice — it was reported as "no gate-shaped
+job is missing" while this hole was open. **Enumerate every job whose resolved
+`stage` is `validate`, `lint` or `test` and assert it appears in both lists**,
+resolving `stage` through `extends`. On the post-M3 tree that is 12 jobs, none
+missing from either, with the two lists differing only by the two `publish:assert-*`
+entries.
+
+**The `.gate_needs` half of that fix carries an unmeasured latency cost, taken
+deliberately** — its consumers are `.kaniko_build` and `e2e:kind-smoke`, so a
+`postgres:17` service container now sits on every MR's validation-build path for no
+correctness gain there. It was added anyway because the cost is unmeasured, and
+granting an exception on an unmeasured cost is the inversion this PRD exists to
+correct. **The criterion for revisiting needs no baseline**: `.kaniko_build` starts
+when the slowest of the twelve finishes, so compare `test:api-store-it`'s duration
+against the max of the other eleven — if it is not the max it added exactly zero, and
+if it is, the cost is store-it minus the runner-up. Read it on a warm pipeline, since
+pipeline 1's cold `lint` cache (~52s of golangci-lint building from source) would
+otherwise confound it.
+
 *Rejected — local-only enforcement (git-manager's model)*: explicitly
 rejected on git-manager's own evidence, quoted above. uzi has working CI;
 declining to use it would be a deliberate downgrade.

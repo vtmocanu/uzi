@@ -366,13 +366,15 @@ e2e exception below exists to prevent.
 **BOTH FIGURES ABOVE PREDATE THE LINT STEP** (PRD #103 M3 wired `lint:<component>` into
 every `gate:<component>`) and are left standing as the samples they were. Re-measured on
 the post-M3 tree, 2026-08-02, long-lived worktree, warm build cache: **`task gate`
-EXIT=0 in 126s** — same sample class as the 193s reading and *lower* than it, so the
-warm-cache run-to-run spread is wider than lint's contribution. Read that as **lint did
-not move this slot out of its envelope**, never as lint making the gate faster. The
-8m31s cold budget was not re-measured.
+EXIT=0 in 126-213s across three samples** (126 / 191 / 213). That range **straddles**
+the 193s pre-M3 warm reading, which is the real evidence and is stronger than any one
+sample: the warm-cache spread is wider than lint's contribution in **both** directions.
+Read that as **lint did not move this slot out of its envelope**, never as lint making
+the gate faster — which is what quoting only the low sample would invite. The 8m31s
+cold budget was not re-measured.
 
 Instead run the component gates for what the diff touched — re-measured post-M3 on the
-same run as the 126s, each with its lint step included: **`task gate:api` 51.8s,
+126s run, each with its lint step included: **`task gate:api` 51.8s,
 `gate:controller` 6.5s, `gate:web` 18.3s, `gate:agent` 25.9s**. (They replace a pre-M3
 sample of 43-66s / ~10s / 23s / 34s, which overlaps them.) Scoping to the touched
 component is already what the generic body above asks of you; these targets are how you

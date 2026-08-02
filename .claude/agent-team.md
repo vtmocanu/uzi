@@ -1407,16 +1407,18 @@ e2e exception below exists to prevent.
 **BOTH FIGURES ABOVE PREDATE THE LINT STEP** (PRD #103 M3 wired `lint:<component>`
 into every `gate:<component>`), so they are left standing as the samples they were
 rather than silently re-attributed. Re-measured on the post-M3 tree, 2026-08-02, in a
-long-lived worktree with a warm build cache: **`task gate` EXIT=0 in 126s**, which is
-the same sample class as the 193s reading and is *lower* than it — the run-to-run
-spread on a warm cache is wider than lint's contribution, so the honest statement is
-that **lint did not move this slot out of its envelope**, not that it made the gate
-faster. The 8m31s cold budget was NOT re-measured; lint adds roughly 12s of Go work
+long-lived worktree with a warm build cache: **`task gate` EXIT=0 in 126-213s across
+three samples** (126 / 191 / 213). That range **straddles** the 193s pre-M3 warm
+reading, which is the actual evidence here and is stronger than any single sample:
+the warm-cache run-to-run spread is wider than lint's contribution in **both**
+directions, so the honest statement is that **lint did not move this slot out of its
+envelope** — never that it made the gate faster. Quoting only the 126s would invite
+exactly that inference. The 8m31s cold budget was NOT re-measured; lint adds roughly 12s of Go work
 and 0.1s of npm work to it, which does not change how it should be read.
 
 **So scope it.** A change touching one component runs `task gate:<component>` and
-gets a complete answer in well under a minute — re-measured post-M3 on the same run
-as the 126s above: **api 51.8s, controller 6.5s, web 18.3s, agent 25.9s**, every one
+gets a complete answer in well under a minute — re-measured post-M3 on the **126s**
+run specifically: **api 51.8s, controller 6.5s, web 18.3s, agent 25.9s**, every one
 of them with its lint step included. (The pre-M3 sample these replace read api
 43-66s, controller ~10s, web 23s, agent 34s; the two sets overlap, which is the
 point.) That is what per-component gates are FOR (PRD #103

@@ -509,6 +509,12 @@ tasks:
       # nothing, delete it: errcheck then reads 50 forever, which is exactly the cap
       # reading this paragraph exists to prevent.
       #
+      # 🔴 THE COMMIT MESSAGE THAT INTRODUCED THIS COMMENT (490df687) STILL CARRIES
+      # THE WRONG VERSION AND IS IMMUTABLE. If you find "errcheck 36→79 is
+      # --max-same-issues" in `git log`, THIS is the correction. Named explicitly so
+      # the history stays honest rather than merely contradicting itself, and so a
+      # reader who greps the log lands here instead of on two disagreeing sources.
+      #
       # (Corrected 2026-08-02. This comment first read "errcheck 36→79 is
       # --max-same-issues, staticcheck 13→21 is --max-issues-per-linter",
       # attributing each delta to one flag from a 2-cell measurement that could not
