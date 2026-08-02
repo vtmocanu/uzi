@@ -71,11 +71,20 @@ sentence beside it is.
 
 ## For this repo (uzi)
 
-Dead-code slot: `none (gap)` — there is no `deadcode`, `knip`, or `golangci-lint
-unused` here yet (PRD #103 M4 adds them), so the deletion lens is entirely
-hand-grep for now. Note that the one known dead path found this way, the legacy
-`"Task"` switch case in `web/src/components/RunEvent.tsx`, is a dead *branch*,
-which none of those tools would have caught either.
+Dead-code slot: `none (gap)` — **but it is now PARTIALLY covered, and by M3
+rather than M4.** `golangci-lint unused` runs today, inside `task lint:api` /
+`lint:controller` and their CI jobs: it finds unused **unexported** symbols
+**within** a Go package. `deadcode` (cross-package reachability) and `knip`
+(unused TS exports, files, deps) are still absent and are PRD #103 M4's, so the
+deletion lens is still mostly hand-grep — just not entirely. Two limits worth
+holding: `unused` is **ratcheted** like every other Go linter here
+(`new-from-merge-base: origin/main` in `.golangci.yml`), so it will not surface
+pre-existing dead code in files your MR does not touch; and the one known dead
+path found by hand, the legacy `"Task"` switch case in
+`web/src/components/RunEvent.tsx`, is a dead *branch*, which none of these tools
+would catch. *(PRD #103 M3, 2026-08-02: this read "there is no `deadcode`,
+`knip`, or `golangci-lint unused` here yet (PRD #103 M4 adds them)", which M3
+made false on both halves — the tool exists, and it did not arrive with M4.)*
 
 Authoring rules to enforce: root `CLAUDE.md` and `ARCHITECTURE.md` (read it for any
 cross-service review). Load-bearing invariants to check against: `main` is never touched

@@ -66,11 +66,24 @@ own leak detector), never by inference from the dev host's green run.
 
 ## For this repo (uzi)
 
-Gate slots here are: **format `task fmt-check`, lint `none (gap)`, dead code
-`none (gap)`, coverage `none (gap)`** — this repo has no linter yet (PRD #103 M3
-builds one), so "run every slot" means fmt-check + vet + build + typecheck +
-test, which is what `task gate` runs. Do not go hunting for a lint command;
-there isn't one. `fmt-check:api` / `fmt-check:controller` run FIRST inside
+Gate slots here are: **format `task fmt-check`, lint `task lint`, dead code
+`none (gap)`, coverage `none (gap)`** — so "run every slot" means fmt-check +
+vet + build + lint + typecheck + test, which is what `task gate` runs.
+
+**The lint slot is ratcheted on the Go side and `task`'s echo cannot show it.**
+`.golangci.yml` carries `issues: {new-from-merge-base: origin/main,
+whole-files: true}`, so only findings your branch introduces block — and
+`whole-files` means **pre-existing findings in a file you merely touched block
+too**. That is the flag working, not a bug, and it is the adoption cost you will
+meet first. `task lint:api:all` / `lint:controller:all` print the unfiltered
+backlog (107 and 5 as of 2026-08-02); they are reported, never gating, and are
+not in `task gate`. If a lint target dies with `origin/main is unresolvable`,
+run `git fetch origin main` — **do not read the backlog it would otherwise
+print as your branch's findings.** *(PRD #103 M3, 2026-08-02: this paragraph
+said "this repo has no linter yet (PRD #103 M3 builds one)" and "Do not go
+hunting for a lint command; there isn't one". M3 landed golangci-lint for both
+Go modules and oxlint for both npm packages.)* `fmt-check:api` /
+`fmt-check:controller` run FIRST inside
 `gate:api` / `gate:controller`, so a component gate already covers the format
 slot; `task fmt-check` runs just that slot over both Go modules. It fails on any
 `gofmt` drift and names the files, module-relative (`internal/…`). *(PRD #103 M2,

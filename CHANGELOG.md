@@ -31,6 +31,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   Developer-facing only: no change to how uzi behaves.
   See [docs/dev-conventions.md](docs/dev-conventions.md).
 
+- **Contributor tooling: linting now runs in the gate and on every MR**, for the
+  first time in this repo. `task lint` covers all four components and each
+  `task gate:<component>` runs its own. Go gets golangci-lint (`errcheck`,
+  `staticcheck`, `ineffassign`, `unused`, `unparam`), ratcheted against
+  `origin/main` so only findings a branch introduces block; `web` and `agent` get
+  oxlint, configured so `react-hooks/rules-of-hooks` actually runs, which the
+  default severity tier does not reach. The 16 pre-existing TypeScript findings
+  were fixed rather than baselined. Part of PRD #103. Developer-facing only: no
+  change to how uzi behaves. See
+  [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on

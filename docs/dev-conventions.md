@@ -96,9 +96,33 @@ fail-closed behaviour lives in the line rather than in Task's errexit shell —
 And it is named `fmt-check` rather than `fmt` because nothing in the gate may be
 a fixing variant. All three reasons are written beside the recipe.
 
-There is no linter, no dead-code check and no coverage signal yet. That is
-PRD #103's remaining milestones, and a target for each arrives with the check
-itself rather than as an empty stub.
+There **is** a linter, as of PRD #103 M3: `task lint` runs all four components,
+and each `task gate:<component>` runs its own. Go (`api`, `controller`) is
+golangci-lint with `errcheck`, `staticcheck`, `ineffassign`, `unused` and
+`unparam`; `web` and `agent` are oxlint, whose configuration promotes
+`react-hooks/rules-of-hooks` explicitly because it is a `pedantic` rule that the
+`correctness` tier cannot reach.
+
+The Go half is **ratcheted** and the npm half is not, which is the one thing to
+know before your first red. `.golangci.yml` carries
+`issues: {new-from-merge-base: origin/main, whole-files: true}`, so only findings
+your branch introduces block — and `whole-files` means a pre-existing finding in a
+file you merely touched blocks too. That is deliberate, and it is the cost of
+adopting a linter on a codebase with a backlog. `task lint:api:all` and
+`task lint:controller:all` print that backlog unfiltered; they are reported, never
+gating, and are not part of `task gate`. The npm half needed no ratchet because
+its debt was 16 findings, all fixed in the same milestone.
+
+If a Go lint target exits with `origin/main is unresolvable`, run
+`git fetch origin main`. The guard exists because without the ref golangci-lint
+does not skip the ratchet — it reports the entire backlog behind a single warning
+line, which reads as a large new regression.
+
+There is still no dead-code check and no coverage signal. Those are PRD #103's M4
+and M6, and a target for each arrives with the check itself rather than as an
+empty stub. `unused` above partially covers dead code — unused unexported symbols
+within a Go package — but not cross-package reachability and nothing on the
+TypeScript side.
 
 ## Scripting the bot setup with `glab`
 

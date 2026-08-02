@@ -203,10 +203,46 @@ format         task fmt-check      # gofmt -l over both Go modules; fails on dri
                                    # prescribed is retired for VACUITY on a reformatted
                                    # tree -- an intersection against an empty set can
                                    # never fail -- NOT for having been broken; it worked.)
-lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
-                                   # task gate:api / gate:controller and in CI, but a
-                                   # vet is not a lint slot. (Was "in CI only"; PRD
-                                   # #103 M1 made the local half true too.)
+lint           task lint           # composite, all four components (M5 will append
+               task lint:api       # shell + YAML to it). Each gate:<c> already runs
+               task lint:controller
+               task lint:web       # its own lint:<c>, so a COMPONENT GATE ALREADY
+               task lint:agent     # COVERS THIS SLOT for that component -- same shape
+                                   # as the format slot above. Go is golangci-lint
+                                   # (errcheck, staticcheck, ineffassign, unused,
+                                   # unparam) via a pinned `go run ...@v2.12.2`; npm
+                                   # is oxlint 1.76.0 via each package's `npm run
+                                   # lint`. Ordering differs by component ON PURPOSE:
+                                   # lint runs AFTER build in the Go gates (it
+                                   # type-checks, so on a non-compiling tree it says
+                                   # "typechecking error" instead of the build error)
+                                   # and FIRST in the npm gates (~0.06s, not
+                                   # type-aware).
+                                   # 🔴 THE GO HALF IS RATCHETED AND TASK'S ECHO
+                                   # CANNOT SHOW IT. `issues: {new-from-merge-base:
+                                   # origin/main, whole-files: true}` lives in
+                                   # `.golangci.yml`, NOT on the command line, so the
+                                   # read-the-echo habit does not protect it -- read
+                                   # that file. Consequences you WILL hit: only
+                                   # findings your branch introduces block,
+                                   # `whole-files` makes PRE-EXISTING findings in a
+                                   # file you touched block too, and
+                                   # `task lint:api:all` / `lint:controller:all` are
+                                   # the unfiltered companions (reported, never
+                                   # gating, not in `task gate`).
+                                   # 🔴 AND IF `origin/main` DOES NOT RESOLVE, the run
+                                   # does NOT skip the ratchet: it reports the WHOLE
+                                   # backlog behind one buried warning line, which
+                                   # reads as a huge new regression. The targets carry
+                                   # a pre-flight that exits 2 saying so; if you see
+                                   # it, `git fetch origin main` -- do not start a
+                                   # burn-down and do not report the backlog as this
+                                   # branch's findings.
+                                   # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
+                                   # still runs inside gate:api / gate:controller as
+                                   # its OWN unratcheted step and is deliberately NOT
+                                   # folded in here -- folding it in would weaken it,
+                                   # since today every vet finding blocks.)
 typecheck      task typecheck:web
                task typecheck:agent
 test           task test:api               # -race -count=1
@@ -214,7 +250,12 @@ test           task test:api               # -race -count=1
                task test:web               # vitest
                task test:agent             # node --test via tsx, --test-timeout=30000
                task check-docs:web
-dead code      none (gap)
+dead code      none (gap)          # STILL A GAP (PRD #103 M4 owns it), but now
+                                   # PARTIALLY covered: the lint slot enables
+                                   # golangci-lint's `unused`, which finds unused
+                                   # UNEXPORTED symbols WITHIN a Go package. No
+                                   # cross-package reachability (that is `deadcode`),
+                                   # nothing about unused TS exports. Report the gap.
 coverage       none (gap)
 security scan  none (gap)          # auditor's slot regardless
 pre-commit     none (gap)          # only Entire's session-logging hooks exist
@@ -281,10 +322,22 @@ A second sample the same day, in a worktree with a WARM build cache, ran **193s*
 the same targets and EXIT=0, so the spread is the build cache rather than the machine.
 Treat 8m31s as the budget, not the expectation. **Do not start the full gate and abandon
 it at five minutes**; an inconclusive run reported as a failure is the exact damage the
-e2e exception below exists to prevent. Instead run the component gates for what the
-diff touched: **`task gate:api` 43-66s, `gate:controller` ~10s, `gate:web` 23s,
-`gate:agent` 34s** on that same run. Scoping to the touched component is already what
-the generic body above asks of you; these targets are how you do it here. Reserve the
+e2e exception below exists to prevent.
+
+**BOTH FIGURES ABOVE PREDATE THE LINT STEP** (PRD #103 M3 wired `lint:<component>` into
+every `gate:<component>`) and are left standing as the samples they were. Re-measured on
+the post-M3 tree, 2026-08-02, long-lived worktree, warm build cache: **`task gate`
+EXIT=0 in 126s** — same sample class as the 193s reading and *lower* than it, so the
+warm-cache run-to-run spread is wider than lint's contribution. Read that as **lint did
+not move this slot out of its envelope**, never as lint making the gate faster. The
+8m31s cold budget was not re-measured.
+
+Instead run the component gates for what the diff touched — re-measured post-M3 on the
+same run as the 126s, each with its lint step included: **`task gate:api` 51.8s,
+`gate:controller` 6.5s, `gate:web` 18.3s, `gate:agent` 25.9s**. (They replace a pre-M3
+sample of 43-66s / ~10s / 23s / 34s, which overlaps them.) Scoping to the touched
+component is already what the generic body above asks of you; these targets are how you
+do it here. Reserve the
 full `task gate` for a release or a cross-component change, and coordinate with the
 lead as you would for e2e.
 

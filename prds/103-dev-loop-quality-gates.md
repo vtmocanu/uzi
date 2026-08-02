@@ -313,6 +313,42 @@ therefore does **not** make lint gate test — everything still runs concurrentl
 and the pipeline fails if any job fails. Stated because the placement "between
 `validate` and `test`" reads as sequencing and is not.
 
+**PARTIAL DEVIATION, RECORDED DURING M3 (2026-08-02): the `lint` stage is used for
+the Go half only. The npm half folds into the existing `validate:web` /
+`validate:agent` jobs.** This decision prescribes seven new lint-stage jobs; M3
+shipped two (`lint:api`, `lint:controller`) and put `task lint:web` /
+`task lint:agent` inside jobs that already exist. The split is not a compromise
+between two readings — each half has its own reason:
+
+- **The Go jobs need `GIT_DEPTH: "0"`** for the merge-base ratchet. Putting that on
+  the shared `.go_job` template would give **five** jobs a full-history clone for a
+  check only two need; folding lint into `validate:api` instead would hand the full
+  clone to the one job whose `sqlc generate` + `git diff --exit-code` already makes
+  its git state load-bearing. A dedicated job isolates the clone-strategy change to
+  the job that needs it.
+- **The npm checks cost ~0.06s and ~0.05s** against a ~30s `npm ci` in each job, so
+  a separate job would pay a 500× setup overhead for the check. It also matches M1's
+  own Files section verbatim — *"M3 adds `task lint:web` to the first"*.
+
+**🔴 AND THE ANCHOR LISTS ARE A SECOND SINGLE-HOT-LINE CONTENTION THAT THE
+PARALLELIZATION SECTION DOES NOT LIST.** `.gate_needs` and `.publish_needs` in
+`.gitlab-ci.yml` enumerate gate jobs **by name**; `*gate_needs` is consumed by the
+kaniko build template and `e2e:kind-smoke`, `*publish_needs` by the publish-image
+template and `publish:chart`. **A new gate job absent from both means a `v*` tag
+pushes every image and the OCI chart to Harbor while that job is failing** — the
+pipeline reddens afterwards and the artifacts are already out. M3 took the two
+lists from 9 to 11 and from 11 to 13 entries. The Parallelization section names only
+`stages:` and the two `package.json` files; these two lists belong beside them, and
+they are worse than `stages:` in one respect: **appending resolves the merge but not
+the omission**, so a milestone that appends its job and forgets the lists produces a
+green MR pipeline and a silent tag-time hole.
+
+**M5 inherits this obligation in full, and it is part of its definition of done.**
+Its checks (`shellcheck`, `yamllint`, `gitleaks`, `govulncheck`) are repo-wide, so
+unlike the npm half they genuinely cannot fold into a per-toolchain `validate:*`
+job — M5 **will** open lint-stage jobs, and every one of them goes into **both**
+lists in the commit that creates it.
+
 *Rejected — local-only enforcement (git-manager's model)*: explicitly
 rejected on git-manager's own evidence, quoted above. uzi has working CI;
 declining to use it would be a deliberate downgrade.
@@ -1044,10 +1080,43 @@ which previously prescribed only the fail-open form.
 
 - [ ] **M3 — Linting: golangci-lint + oxlint, each ratcheted its own way**: `.golangci.yml`
       modelled on git-manager's (v2 schema, `staticcheck` `errcheck`
-      `ineffassign` `unused` `unparam` `goconst` on; each *disabled* linter
+      `ineffassign` `unused` `unparam` on; each *disabled* linter
       carries a one-line justification in the file, per that repo's
       convention) applied to both Go modules with per-linter test-file
-      exclusions. **oxlint** for `web/` and `agent/` per Decision 8 — including
+      exclusions.
+
+      *(**`goconst` was struck from that list during M3 implementation**, 2026-08-02,
+      and the disabled-linter convention above is where its justification now lives.
+      Amended rather than worked around, per the rule this document applies to
+      itself. Three reasons, measured at golangci-lint 2.12.2 / go1.26.5
+      darwin/arm64 **with `--max-issues-per-linter=0 --max-same-issues=0`**: it is
+      **1178 findings in `api`** uncapped (929 of them in `_test.go`), which is 90%
+      of the combined backlog; **all 21 non-test findings were read by hand and none
+      is a defect** — CLI subcommand names, JSON field names, and the
+      `queued → claimed → running` run-state vocabulary this PRD's own Architecture
+      section documents, which is a goconst finding at every switch arm; and
+      **`--whole-files` makes its blast radius 86 non-test files in `api` alone**, so
+      touching `internal/handler/auth.go` for any reason would demand extracting
+      `"status"` into a constant. That is the ratchet's sharpest edge pointed at the
+      linter with the least signal. The argument for it here was git-manager's "136
+      goconst warnings accumulated unnoticed" — but this document also quotes
+      git-manager's CLAUDE.md saying that repo has **no CI gate at all**, so the
+      lesson there is "no gate ⇒ accumulation", not "goconst has signal".*
+
+      *Every earlier goconst figure in the M3 design record was a **cap reading**:
+      the default `--max-issues-per-linter` is 50 and goconst reported exactly 50,
+      which is the tell nobody looks at because 50 is a plausible number. The two cap
+      flags are not redundant — on the shipped config `api` reads **56 capped against
+      107 uncapped** (`--max-same-issues` takes errcheck 36→79, `--max-issues-per-linter`
+      takes staticcheck 13→21), while `controller` reads **5 either way**. The smaller
+      module agreeing exactly is the camouflage.)*
+
+      **`govet` is also deliberately NOT in the golangci-lint set**, and it owes its
+      justification for the opposite reason: `task vet:api` / `vet:controller`
+      already run `go vet ./...` inside `gate:*` and in CI, **unratcheted**. Folding
+      it in would be a net weakening, since today every vet finding blocks and
+      ratcheted only new ones would. It is a golangci-lint default, so "the tool
+      enables it by default" is exactly the premise that will motivate re-adding it. **oxlint** for `web/` and `agent/` per Decision 8 — including
       its two silent-no-op traps: **the `react` plugin is off by default, and
       `rules-of-hooks` is `pedantic` rather than `correctness`**, so a config
       that enables the plugin and stops there still never runs the rule this
