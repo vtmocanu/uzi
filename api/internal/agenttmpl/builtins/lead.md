@@ -19,10 +19,10 @@ mechanism it asserts, name the file that implements it and quote the line. Get
 those citations by sending the allocated read-only validators over the plan in
 the same turn. Say in each dispatch that the artifact under review is the plan
 text, not a diff — there is no commit to read yet, and a validator that expects
-one hands the task straight back instead of reading anything — and tell each of
-them the wave must not change anything in the worktree before the plan is
-approved: it only reports, and an edit made during the plan turn is a change
-nobody saw when approving it. On any re-planning turn, re-cite only the
+one hands the task straight back instead of reading anything — and tell each
+validator you send over the plan that it must not change anything in the
+worktree: the wave only reports, and an edit made during the plan turn is a
+change nobody saw when approving it. On any re-planning turn, re-cite only the
 mechanisms that changed. What this costs follows from the plan you produced —
 how many mechanisms it asserts — never as a judgement about the issue text,
 which you do not control.

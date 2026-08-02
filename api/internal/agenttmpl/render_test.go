@@ -197,21 +197,35 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 //     the quoted phrase) failed this across two rounds, each after passing its
 //     own deletion fold. The fix is semantic, not length: every phrase below
 //     carries a token that states which turn it binds — `after an implementation
-//     unit lands`, `submit_plan`, `the plan text`, `before the plan is approved`,
-//     `during the plan turn`, `re-planning turn`, `the plan you produced`. A
-//     phrase carrying its turn survives relocation with the behaviour intact,
-//     which is why an anchored pin staying green under relocation is correct
-//     rather than blind.
+//     unit lands`, `submit_plan`, `the plan text`, `you send over the plan`,
+//     `during the plan turn`, `re-planning turn`, `the plan you produced`.
+//     WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE PIN CLAIMS, and getting this
+//     backwards is how two people fold the same mutation and report opposite
+//     verdicts. For a DESCRIPTIVE pin the behaviour is *the template states rule
+//     R*, so a relocated sentence still states it: green is correct there and
+//     relocation cannot produce a disconfirming answer at all — REVERSION (put
+//     the original site back to its un-anchored wording) is the fold that can.
+//     For a pin about something the lead must DO AT A PARTICULAR MOMENT, the
+//     behaviour is constituted by where the sentence sits, relocation destroys
+//     it, and relocation is still required. The tell is inside the phrase: a pin
+//     is relocation-proof exactly when nothing in it takes its meaning from a
+//     neighbouring sentence.
 //     The `anchor` field is that token, and the audit below asserts it is
 //     actually inside the phrase. Two rounds of hand-checking missed a
 //     freshly-anchored phrase each time; this is a manual property with nothing
-//     enforcing it, so it is enforced here.
-//  2. A constraint the lead must TRANSMIT has to be pinned as a transmission.
-//     A subagent's system prompt is its own template body and the lead cannot
-//     alter it, so the dispatch prompt is the only channel; `architect` and
-//     `tester` both ship with `Edit, Write`. The pin is therefore on `tell each
-//     of them …`, which the un-relayed wording (`That wave must not change
-//     anything in the worktree`) does not satisfy.
+//     enforcing it, so it is enforced here — but see property 4 for what that
+//     enforcement does and does not cover.
+//  2. A constraint the lead must TRANSMIT has to be pinned as a transmission,
+//     and the phrase has to NAME ITS RECIPIENTS. A subagent's system prompt is
+//     its own template body and the lead cannot alter it, so the dispatch prompt
+//     is the only channel; `architect` and `tester` both ship with `Edit, Write`.
+//     This pin read `tell each of them …` for two rounds, and `each of them`
+//     took its referent from the preceding sentence: relocated, it silently
+//     re-resolved to the post-implementation validators while the plan dispatch
+//     was told nothing — a behaviour destroyed and a different one created, with
+//     the pin green. Naming the recipients (`each validator you send over the
+//     plan`) removes the referent rather than anchoring around it, which is what
+//     makes this pin expressible as a substring at all.
 //  3. NONE OF THIS DETECTS AN INSERTION, and no amount of it ever will.
 //     `strings.Contains` is monotone under insertion: adding text can only turn
 //     a false into a true, never the reverse. So a paragraph inserted above this
@@ -222,6 +236,25 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 //     obvious patch, a negative assertion on the inserted wording, is the
 //     vacuous-negative trap (it guards a string nothing renders). Anchoring
 //     closed RELOCATION; insertion stays open and is caught by reading the diff.
+//  4. THE AUDIT IS A SYNTACTIC CONTAINMENT CHECK, and neither semantic property
+//     it would need is expressible as a substring relation. One root, two
+//     consequences, both open:
+//     (a) it cannot check the anchor NAMES A TURN — only that the declared token
+//     is present. Measured on this table: `anchor: ""` passes, because
+//     `Contains(x, "")` is always true, and so does a vague token like `again`.
+//     Applies to every pin; a better-chosen anchor fixes any instance, so this
+//     is a quality gap. A turn-token allowlist was considered and REJECTED — it
+//     would catch the vague token, leave (b) untouched, and go stale, so the
+//     audit would look stronger with the load-bearing hole in place.
+//     (b) it cannot check the behaviour is ANCHORABLE AT ALL. For a pin whose
+//     phrase carries a context-bound referent, no anchor fixes it. Measured
+//     against the previous commit's relay pin, which had a genuine anchor and
+//     nothing else changed: relocating that clause left the pin AND every audit
+//     assertion green over a template where the plan-turn dispatch is told
+//     nothing and the relocated `each of them` re-resolves to the
+//     post-implementation validators. That is why the fix here was to delete the
+//     referent (property 2) rather than anchor around it. Unfixable inside the
+//     anchor model; the model is provisional and #205 replaces it.
 //
 // Deleting a whole sentence reddens every case living in that sentence, and
 // sentence granularity is how anyone actually folds prose: measured, 2 for the
@@ -258,8 +291,8 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 			"the artifact under review is the plan text, not a diff",
 			"the plan text"},
 		{"the no-write rule is RELAYED to each dispatched validator",
-			"tell each of them the wave must not change anything in the worktree before the plan is approved",
-			"before the plan is approved"},
+			"tell each validator you send over the plan that it must not change anything in the worktree",
+			"you send over the plan"},
 		{"the no-write rule binds the PLAN TURN specifically",
 			"an edit made during the plan turn is a change nobody saw when approving it",
 			"during the plan turn"},
