@@ -82,6 +82,14 @@
 # exit status 7` with rc=201. Anything reading `$?` NUMERICALLY must know this;
 # `!= 0` is still a correct failure test.
 #
+# AND 201 IS NOT THE ONLY NONZERO. `201` means a target RAN AND FAILED; `1` means
+# task never got that far, because THIS FILE DID NOT PARSE. Measured 2026-08-02
+# while editing it: a `desc:` reading `... modules (fail-fast: stops at the first
+# module)` puts a bare `: ` inside a plain YAML scalar, which is illegal, and
+# every target disappears at once - so the symptom does not resemble the edit
+# that caused it. Read the code, not just its sign, and parse this file after
+# touching it.
+#
 # NO DEPENDENCY INSTALL STEP, DELIBERATELY. No `npm ci`, no `go mod download`.
 # CI does that in `.gitlab-ci.yml`'s `before_script`; locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
