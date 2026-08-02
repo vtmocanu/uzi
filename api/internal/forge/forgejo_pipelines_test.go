@@ -281,7 +281,7 @@ func TestForgejoPipelineErrorsAreRedacted(t *testing.T) {
 				"id": 1, "number": 12, "head": map[string]any{"sha": "deadbeef", "ref": "feature-x"},
 			})
 		},
-		"/repos/acme/widgets/actions/runs":         leak, // LatestPipeline + LatestMRPipeline (runs arm)
+		"/repos/acme/widgets/actions/runs":          leak, // LatestPipeline + LatestMRPipeline (runs arm)
 		"/repos/acme/widgets/actions/runs/555/jobs": leak, // ListPipelineJobs
 		"/repos/acme/widgets/actions/jobs/888/logs": leak, // JobLogTail
 	})

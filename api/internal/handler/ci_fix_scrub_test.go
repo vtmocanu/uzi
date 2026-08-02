@@ -26,9 +26,9 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 		// UZI_TOKEN in a GitLab CI variable, so a `uzi ...` invocation echoing its token
 		// into a trace is exactly the path this snapshot ingests. uzc_ (user), uza_
 		// (admin_ro) and uzw_ (worker) must all be stripped before the tail is frozen.
-		"uzc":     "UZI_TOKEN=uzc_" + secret + " in the env",
-		"uza":     "ran with uza_" + secret,
-		"uzw":     "worker joined as uzw_" + secret,
+		"uzc": "UZI_TOKEN=uzc_" + secret + " in the env",
+		"uza": "ran with uza_" + secret,
+		"uzw": "worker joined as uzw_" + secret,
 	}
 	for name, in := range cases {
 		out := scrubKnownTokens(in)

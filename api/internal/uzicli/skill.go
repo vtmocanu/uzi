@@ -93,9 +93,9 @@ type SkillStatusResult struct {
 // current, nothing written.
 type SkillInstallResult struct {
 	Path           string `json:"path"`
-	Wrote          bool   `json:"wrote"`            // the skill was (re)written this call
-	AlreadyCurrent bool   `json:"already_current"`  // on-disk already matched the embedded skill
-	BackedUp       bool   `json:"backed_up"`        // a user-edited SKILL.md was preserved
+	Wrote          bool   `json:"wrote"`           // the skill was (re)written this call
+	AlreadyCurrent bool   `json:"already_current"` // on-disk already matched the embedded skill
+	BackedUp       bool   `json:"backed_up"`       // a user-edited SKILL.md was preserved
 	BackupPath     string `json:"backup_path,omitempty"`
 }
 

@@ -51,13 +51,13 @@ var leadNameRe = agenttmpl.LeadNameRe
 // the template inherits all tools (matching the render semantics); model is
 // null when it inherits the model.
 type agentTemplateDTO struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Model       *string   `json:"model"`
-	Tools       []string  `json:"tools"`
-	PromptBody  string    `json:"prompt_body"`
-	IsBuiltin   bool      `json:"is_builtin"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Model       *string  `json:"model"`
+	Tools       []string `json:"tools"`
+	PromptBody  string   `json:"prompt_body"`
+	IsBuiltin   bool     `json:"is_builtin"`
 	// Scope is builtin|global|user (PRD #18 M6). IsBuiltin is retained as a compat
 	// flag kept in lockstep with Scope=='builtin' by builtin_scope_ck; the UI reads
 	// Scope for badges and the "my agents" grouping. UserID is set only for

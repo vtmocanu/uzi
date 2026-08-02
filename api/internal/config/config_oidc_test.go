@@ -176,8 +176,8 @@ func TestOIDCScopesForceOpenid(t *testing.T) {
 		want []string
 	}{
 		"custom without openid": {"profile email groups", []string{"openid", "profile", "email", "groups"}},
-		"custom with openid":     {"openid email", []string{"openid", "email"}},
-		"dedup":                  {"openid openid profile", []string{"openid", "profile"}},
+		"custom with openid":    {"openid email", []string{"openid", "email"}},
+		"dedup":                 {"openid openid profile", []string{"openid", "profile"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -73,10 +73,10 @@ func TestPipelineStatusesLiveDB(t *testing.T) {
 	}
 
 	// ── watched-ref selection fixtures ──
-	run(1, "agent/issue-1", "running", 0, 0, -5*time.Minute)                      // non-terminal → watched
-	run(2, "agent/issue-2", "completed", 5, -time.Hour, -6*time.Minute)           // terminal+MR, in window → watched (mr 5)
-	run(3, "agent/issue-3", "completed", 0, -time.Hour, -7*time.Minute)           // terminal, NO MR → NOT watched
-	run(4, "agent/issue-4", "completed", 9, -30*24*time.Hour, -8*time.Minute)     // terminal+MR but OUTSIDE window → NOT watched
+	run(1, "agent/issue-1", "running", 0, 0, -5*time.Minute)                  // non-terminal → watched
+	run(2, "agent/issue-2", "completed", 5, -time.Hour, -6*time.Minute)       // terminal+MR, in window → watched (mr 5)
+	run(3, "agent/issue-3", "completed", 0, -time.Hour, -7*time.Minute)       // terminal, NO MR → NOT watched
+	run(4, "agent/issue-4", "completed", 9, -30*24*time.Hour, -8*time.Minute) // terminal+MR but OUTSIDE window → NOT watched
 	// issue-5 has two runs on the same branch: an older completed+MR, a newer
 	// running. DISTINCT ON must collapse to the newest (running, no MR) → watched.
 	run(5, "agent/issue-5", "completed", 7, -time.Hour, -20*time.Minute)

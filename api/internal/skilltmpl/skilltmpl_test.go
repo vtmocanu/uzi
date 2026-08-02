@@ -59,13 +59,13 @@ func TestexampleCicdBuiltinPresent(t *testing.T) {
 
 func TestParseRejectsMalformed(t *testing.T) {
 	cases := map[string]string{
-		"no frontmatter":     "# just a body\n",
-		"unterminated":       "---\nname: x\ndescription: y\n",
-		"unknown key":        "---\nname: x\ndescription: y\nallowed-tools: Bash\n---\n\nbody\n",
-		"bad name":           "---\nname: Not_Kebab\ndescription: y\n---\n\nbody\n",
-		"empty description":  "---\nname: x\ndescription: \n---\n\nbody\n",
-		"empty body":         "---\nname: x\ndescription: y\n---\n\n",
-		"no blank line":      "---\nname: x\ndescription: y\n---\nbody\n",
+		"no frontmatter":    "# just a body\n",
+		"unterminated":      "---\nname: x\ndescription: y\n",
+		"unknown key":       "---\nname: x\ndescription: y\nallowed-tools: Bash\n---\n\nbody\n",
+		"bad name":          "---\nname: Not_Kebab\ndescription: y\n---\n\nbody\n",
+		"empty description": "---\nname: x\ndescription: \n---\n\nbody\n",
+		"empty body":        "---\nname: x\ndescription: y\n---\n\n",
+		"no blank line":     "---\nname: x\ndescription: y\n---\nbody\n",
 	}
 	for name, raw := range cases {
 		if _, err := Parse([]byte(raw)); err == nil {

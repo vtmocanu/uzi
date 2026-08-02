@@ -212,10 +212,10 @@ func TestListRunSkillAllocationsHardeningLiveDB(t *testing.T) {
 			mustExec(ctx, t, pool, `INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, $3)`, templateID, skillID, *userID)
 		}
 	}
-	alloc(global.ID, nil)   // legit shared
-	alloc(a1.ID, nil)       // CORRUPTED shared → points at userA's private skill
-	alloc(a1.ID, &userA)    // legit overlay (userA's own skill)
-	alloc(b1.ID, &userA)    // CORRUPTED overlay → userA overlay pointing at userB's private
+	alloc(global.ID, nil) // legit shared
+	alloc(a1.ID, nil)     // CORRUPTED shared → points at userA's private skill
+	alloc(a1.ID, &userA)  // legit overlay (userA's own skill)
+	alloc(b1.ID, &userA)  // CORRUPTED overlay → userA overlay pointing at userB's private
 
 	namesFor := func(who uuid.UUID) map[string]bool {
 		rows, err := q.ListRunSkillAllocations(ctx, pgUUID(who))
