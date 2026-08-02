@@ -541,6 +541,14 @@ tasks:
       # `cache clean` it printed 107, all repo-root-relative. The recorded backlog
       # figure is the 107.
       #
+      # THE TWO ARE DISJOINT POPULATIONS FROM TWO RUNS, NOT 107 REAL PLUS 13 STALE.
+      # Measured from the surviving log: of the 120, ZERO were repo-relative and all
+      # pointed into a SINGLE foreign tree. So do not reason about a 13-finding gap;
+      # there is no decomposition. Why that tree's own count was 120 rather than the
+      # ~107 an identical checkout would give CANNOT BE ESTABLISHED - it was deleted
+      # and no log of it survives, which is the failure this whole paragraph is about
+      # arriving in the evidence for it.
+      #
       # NOTE THE DIRECTION, because the documented version of this trap is the
       # OPPOSITE one: a poisoned cache makes the RATCHETED target go falsely GREEN
       # (the diff processor cannot match a foreign path against `git diff` and

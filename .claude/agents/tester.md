@@ -284,8 +284,17 @@ lint           task lint           # composite, all four components (M5 will app
                                    # whoever runs next, and a finding pathed into a
                                    # directory that NO LONGER EXISTS is worse than
                                    # one pointing at a live sibling, because nobody
-                                   # can go look at it. That is exactly how the 120
-                                   # above happened.
+                                   # can go look at it. That is how the 120 above
+                                   # happened -- CAUSE, NOT ARITHMETIC. Measured
+                                   # from the surviving log: all 120 findings
+                                   # carried `../` paths into a SINGLE foreign tree
+                                   # and ZERO were repo-relative, so the 120 and the
+                                   # 107 are DISJOINT POPULATIONS from two runs --
+                                   # not 107 real plus 13 stale. Why that tree's own
+                                   # count was 120 rather than ~107 cannot be
+                                   # established: it is deleted and no log survives.
+                                   # The evidence was destroyed by the exact failure
+                                   # this rule describes.
                                    # Observed live during M3's own audit, from a
                                    # sibling worktree.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`

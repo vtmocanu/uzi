@@ -1372,10 +1372,27 @@ lint           task lint           # composite, all four components (M5 will app
                                    # whoever runs next, and a finding pathed into a
                                    # directory that NO LONGER EXISTS is worse than
                                    # one pointing at a live sibling, because nobody
-                                   # can go look at it. That is exactly how the 120
-                                   # above happened: a validator built a throwaway
+                                   # can go look at it. That is how the 120 above
+                                   # happened: a validator built a throwaway
                                    # worktree for a cache probe, removed it, and
-                                   # left the entries behind.
+                                   # left the entries behind. CAUSE, NOT ARITHMETIC
+                                   # -- the owner claimed only the mechanism, and
+                                   # "exactly how" would claim a completeness
+                                   # nobody established.
+                                   # WHAT THE SURVIVING LOG DOES SHOW, MEASURED:
+                                   # all 120 findings carried `../` paths, ZERO were
+                                   # repo-relative, and every one pointed into a
+                                   # SINGLE foreign tree. So the 120 and the 107 are
+                                   # DISJOINT POPULATIONS FROM TWO DIFFERENT RUNS --
+                                   # there is no `107 + 13` decomposition, and any
+                                   # reasoning about a 13-finding gap is about a
+                                   # model this run does not fit.
+                                   # WHY THAT TREE'S OWN COUNT WAS 120 RATHER THAN
+                                   # ~107 CANNOT BE ESTABLISHED: it is deleted and
+                                   # no log of it survives. THE EVIDENCE WAS
+                                   # DESTROYED BY THE EXACT FAILURE THIS RULE
+                                   # DESCRIBES, which is the rule's justification
+                                   # rather than a hole in it.
                                    # (Was `none (gap)`; PRD #103 M3 closed it. `go vet`
                                    # still runs inside gate:api / gate:controller as
                                    # its OWN unratcheted step and is deliberately NOT
@@ -1734,6 +1751,27 @@ someone to "fix" the one that was already correct.
 *Also migrated from the PRD #98 checkpoint. Each keeps its incident: a rule without its
 evidence is one the next reader cannot calibrate. Live-DB mechanics (positive control, `-p 1`,
 compile-the-mutation) live in `CLAUDE.md`'s api section; these are the general ones.*
+
+- **PREFIX YOUR LONG-RUNNING PROBE COMMANDS WITH YOUR OWN ROLE NAME, in the echo:
+  `echo "=== [reviewer] go.mod hashes BEFORE ==="`, never `echo "=== BEFORE ==="`.**
+  Costs nothing, survives `pgrep -fl`, and it is the **positive** half of `CLAUDE.md`'s
+  process-ownership rule: that one tells you what to do when attribution FAILS (if you
+  cannot attribute a process, leave it), and nothing about making it succeed.
+  **`pgrep` output is the ONLY view another agent has of your process**, and every
+  other identifying channel on this team is shared — the shell snapshot is
+  per-CLI-session (measured 2026-08-02: three agents, one identical snapshot file),
+  cwd is a shared worktree *and* a shared scratchpad, and a log path identifies you
+  only if you happened to name it well.
+  **The incident: attribution succeeded once, by luck, and needed two coincidences** —
+  two agents happening to record their instrument choice in prose, *and* one of them
+  happening to leave a distinctive literal in argv. Its owner's own diagnosis:
+  *"the thing that actually made my argv distinctive was an echo string I wrote for
+  myself, which is an accident of style, not an identifier."* Meanwhile a wrong
+  attribution nearly landed on two different agents in turn, because the shared
+  signals do not merely fail — they **manufacture a confident match** with whoever you
+  check first. This rule turns the lucky match into a designed one. Read it as a pair
+  with the `CLAUDE.md` rule: **make your own processes attributable, and leave alone
+  the ones that are not.**
 
 - **A DELIVERED TASK DESCRIPTION CARRIES NEITHER ITS CURRENCY NOR ITS COMPLETION — check the
   task's STATUS before acting on its text.** A `TaskUpdate` wakes the named idle agent, which
