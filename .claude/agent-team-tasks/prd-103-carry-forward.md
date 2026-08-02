@@ -16,7 +16,20 @@ api errcheck   36 capped      79 uncapped
 controller     41 capped      41 uncapped     <- identical. THIS IS THE CAMOUFLAGE.
 ```
 
-**The two flags are not redundant** — one takes goconst 50→1178, the other takes errcheck 36→79. Recording a number with only one understates twice.
+**The two flags are not redundant, and they COMPOSE IN ORDER rather than each owning a linter.** Measured by the lead 2026-08-02 on the shipped `goconst`-off config, `cache clean` first, each flag isolated:
+
+```
+A  --new-from-merge-base=                                 56   errcheck 36  staticcheck 13
+B  --new-from-merge-base= --max-issues-per-linter=0       56   errcheck 36  staticcheck 13   <- NO CHANGE
+C  --new-from-merge-base= --max-same-issues=0             78   errcheck 50  staticcheck 21
+D  --new-from-merge-base= both                           107   errcheck 79  staticcheck 21
+```
+
+`--max-same-issues` folds duplicate messages **first**; `--max-issues-per-linter` then truncates the survivors at 50. So on this config `--max-issues-per-linter=0` **alone is a complete no-op** (nothing exceeds 50 until the fold is lifted), and errcheck only clears 50 once the other flag has fired.
+
+**The trap this creates is worse than the original.** Anyone checking "is the second flag load-bearing?" the obvious way runs row B, sees 56→56, and deletes it — after which errcheck reads **50 forever**, which is the tell this whole section is about.
+
+*(Corrected 2026-08-02, hours after this file was written. The first version said "one takes goconst 50→1178, the other takes errcheck 36→79", attributing each delta to a single flag. **That is the same carried-through-attribution error this section exists to warn about, written by the lead into the section warning about it** — and it was inherited from a Taskfile comment rather than derived. A tester independently endorsed the same wrong attribution from a 2-cell measurement that could not distinguish the hypotheses, while a reviewer's 2×2 refuted it; the matrix above is the lead's own re-derivation, run because the two disagreed. **Do not settle a disagreement by trusting the cheaper instrument.**)*
 
 **The camouflage is what makes this survive review.** A careful person sanity-checks "do the caps matter?" on the cheap module, gets the same number both ways, and concludes no. That happened to the auditor, to the lead's ruling, and to the architect's own ruling — the architect caught it in its own prior work.
 
@@ -90,3 +103,55 @@ A red is not a control. Each arm needs all four:
 M3's validator reports were long and correct. They also cost the lead a great deal of context, and there are three milestones left.
 
 **For M4/M5/M6, dispatches should ask for:** findings as a short ranked list; every measurement written to a file inside the worktree with the report naming the path; the tip SHA first; and no inline pasting of transcripts the lead can read. The evidence must still exist — it must simply not all arrive in a message.
+
+---
+
+# ADDENDUM — 2026-08-02, from M3's validation wave (after the design wave that produced items 1-9)
+
+## 10. golangci-lint TAKES A HOST-GLOBAL LOCK, NOT JUST A HOST-GLOBAL CACHE
+
+Item 4 covers the shared result *cache*. The **lock on the same directory** is the other half, and it is the one that bites a team running several agents at once:
+
+```
+[lint:api] Error: parallel golangci-lint is running
+[lint:api] The command is terminated due to an error: parallel golangci-lint is running
+[lint:api] exit status 3
+```
+
+It does not queue and does not retry — it exits immediately, which through `task` becomes rc 201 and **reads as a lint failure**. Hit live by the reviewer (which lost three measurement runs to it) and by the auditor, from different worktrees, during M3's validation wave.
+
+It fails in the safe direction (false red, never false green) but three things make it worth documenting: this repo's layout is a bare clone with many sibling worktrees; this team runs concurrent agents by design, so the collision condition is the normal state; and **`exit status 3` sits outside the Taskfile's own convention** (2 = broken instrument, 1 = findings), so the status cannot discriminate either. An automated reader testing `!= 0` records a RED gate over code that is fine.
+
+**Operationally, for M4/M5/M6: serialise anything that invokes golangci-lint across agents.** The lead must not have a tester calibrating while an auditor lints — and the tester's `cache clean` discipline (item 4) is defeated outright by a concurrent run from another worktree re-warming it.
+
+## 11. A THIRD FOLD NOBODY NAMED: `issues.uniq-by-line` DEDUPS ACROSS LINTERS
+
+Defaults to **true**. So a linter's reported count depends on **which other linters are enabled**:
+
+```
+shipped config, both cap flags cleared                        107   staticcheck 21
+  ... plus --uniq-by-line=false                               108   staticcheck 22
+with goconst additionally enabled, uniq on                   1284   staticcheck 20
+with goconst additionally enabled, uniq off                  1622   staticcheck 22
+```
+
+One finding of 108 today, which is why M3 did not restate its figure. **The reason it matters is M4 and M5, which add linters**: this is exactly how a `staticcheck` finding disappears from an "unfiltered" total without anyone touching staticcheck. Three folds now, not two — quote a count with all three cleared, or say which are not.
+
+## 12. A NEW devDependency SILENTLY BREAKS EVERY EXISTING CHECKOUT'S GATE
+
+`lint:web`/`lint:agent` → `npm run lint` → `oxlint`, a devDependency added by the branch. `npm run` puts `node_modules/.bin` on PATH and fails closed with `command not found`, so every checkout that does not reinstall gets a red gate that names a missing binary rather than a lint finding.
+
+**And in `agent/` the required remedy is the documented host-wide `agent-browser` clobber**, so a reader hits `oxlint: command not found`, finds the hazard documented, and finds no safe form — because the standing advice (symlink `node_modules` rather than install) **cannot apply to someone adding a devDependency**, which is precisely the operation that must write `package.json` and the lockfile.
+
+**The safe form is `npm install --ignore-scripts --save-dev --save-exact <pkg>@<version>`.** Not a general-principle suggestion: this repo already settled that flag for npm with its own measurements in `agent/src/js-deps.ts` (PRD #121), including that **a repo `.npmrc` with `ignore-scripts=false` does not override the CLI flag**. Caveat to state alongside it: `--ignore-scripts` can leave *other* packages unbuilt, and the recovery for that is the symlink route, never an unguarded re-install in `agent/`.
+
+**Any milestone adding a devDependency owes a CHANGELOG line and a `docs/dev-conventions.md` line saying so.** M4 adds `knip` to both packages; M6 adds `@vitest/coverage-v8` to `web/`.
+
+## 13. THE FAILURE THIS WAVE ACTUALLY PRODUCED, TWICE, IN BOTH DIRECTIONS
+
+Both instances are the same shape and neither was a careless agent.
+
+- **A tester endorsed a wrong comment from a 2-cell measurement.** It measured the endpoints (56, 107), which are consistent with several mechanisms, and reported the attribution it found in the comment it was checking. A reviewer's 2×2 refuted it. **An instrument that cannot return the disconfirming answer is not evidence**, and the endpoints could not.
+- **The lead wrote the identical error into item 1 of this file** — the section warning about carried-through numbers — hours after criticising it in others, and inherited it from the same Taskfile comment.
+
+**The generalisable rule, which is not "measure more carefully":** when two agents disagree on a measured fact, do not pick the more credible agent. Ask which instrument could have produced the disconfirming answer, and re-derive it yourself. Both times here, the cheaper instrument agreed with the existing written claim — which is the direction that never gets re-checked.
