@@ -188,7 +188,9 @@ dead code      none (gap)
 coverage       none (gap)
 security scan  none (gap)          # auditor's slot regardless
 pre-commit     none (gap)          # only Entire's session-logging hooks exist
-long-running   ./e2e/run-e2e.sh    # ~30 min (but see the samples below), exception applies
+long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
+                                   # Scope it instead -- see below.
+               ./e2e/run-e2e.sh    # ~30 min (but see the samples below), exception applies
 ```
 
 In linked worktrees a bare `go build`/`go test` can fail on VCS stamping. You cannot
@@ -235,6 +237,28 @@ only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates by invoki
 same `task` targets you do, but NOT e2e (it needs docker compose on the runner), so
 e2e stays the local pre-merge gate; `scripts/smoke.sh` runs in CI's `e2e:kind-smoke` on
 PROTECTED refs only, so it is a post-merge gate there and pre-merge only locally.
+
+**`task gate` also over-runs the `<5min` bound, and scoping is the fix.** Measured
+2026-08-02: **8m31s** (`elapsed 511s`, EXIT=0) serial, in a fresh worktree with a warm
+module cache and a cold build cache — a fresh checkout pays the whole `-race` compile.
+A second sample the same day, in a worktree with a WARM build cache, ran **193s** with
+the same targets and EXIT=0, so the spread is the build cache rather than the machine.
+Treat 8m31s as the budget, not the expectation. **Do not start the full gate and abandon
+it at five minutes**; an inconclusive run reported as a failure is the exact damage the
+e2e exception below exists to prevent. Instead run the component gates for what the
+diff touched: **`task gate:api` 43-66s, `gate:controller` ~10s, `gate:web` 23s,
+`gate:agent` 34s** on that same run. Scoping to the touched component is already what
+the generic body above asks of you; these targets are how you do it here. Reserve the
+full `task gate` for a release or a cross-component change, and coordinate with the
+lead as you would for e2e.
+
+**A bare substring is not a failure count.** Measured on a fully green `task gate`
+log: `grep -c -F 'FAIL'` returned **9**, `grep -c -- '--- FAIL'` returned **0** — all
+nine were *passing* tests whose names contain the substring (`✓ a FAILED /api/version
+reaches the fleet panel …`). Use `--- FAIL` for Go, vitest's summary line, and
+`ℹ fail` plus the exit code for `node --test`. Same family as two traps `CLAUDE.md`
+records in its api and agent sections: the `--- PASS` population mismatch, and
+`node --test` printing `ℹ fail 0` while tests are failing by timeout.
 
 **Long-gate exception to the generic `<5min` live-wait bound:** `./e2e/run-e2e.sh` runs
 far past the `<5min` bound in the generic body above (it cycles the whole stack and drives

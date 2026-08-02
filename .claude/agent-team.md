@@ -1157,8 +1157,37 @@ dead code      none (gap, noted 2026-07-26)
 coverage       none (gap, noted 2026-08-02)
 security scan  none (gap, noted 2026-07-21)
 pre-commit     none (gap, noted 2026-08-02)
-long-running   ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
+long-running   task gate           # ~8m30s from a fresh checkout; EXCEEDS the 5-min bound.
+               ./e2e/run-e2e.sh    # ~30 min; overrides the tester's 5-min bound
 ```
+
+**`task gate` is a LONG-RUNNING slot, and the mitigation is scope, not patience.**
+Measured 2026-08-02: `GATE_EXIT=0, elapsed 511s` (8m31s), serial, in a fresh worktree
+with a warm module cache and a cold build cache — a fresh checkout pays the whole
+`-race` compile. A second sample the same day, in a long-lived worktree whose build
+cache was already warm, ran **193s** with the identical target set and EXIT=0 — so the
+spread is the BUILD cache, not the machine and not the test count, and 8m31s is what a
+CI-like cold checkout costs. Read it as the budget rather than the expectation, exactly
+as the `~30 min` below is read. **This over-runs the generic 5-minute
+live-wait bound, and an over-run against a stated bound is what makes an agent
+abandon a gate and report an inconclusive run as a failure** — the same failure the
+e2e exception below exists to prevent.
+
+**So scope it.** A change touching one component runs `task gate:<component>` and
+gets a complete answer in well under a minute: **api 43-66s, controller ~10s, web
+23s, agent 34s** on the same run. That is what per-component gates are FOR (PRD #103
+Decision 2), and nothing else here tells a cold-starting teammate to prefer them.
+Reach for the full `task gate` before a release or when a change crosses components,
+and coordinate with the lead the way you would for e2e.
+
+**Read a gate's result by its DISCRIMINATING form, never a bare substring.** Measured
+on a fully green `task gate` log: `grep -c -F 'FAIL'` returned **9** and
+`grep -c -- '--- FAIL'` returned **0** — every one of the nine was a *passing* test
+whose NAME contains the substring (`✓ a FAILED /api/version reaches the fleet
+panel …`, `✔ … the liveness probe FAILS …`). The forms that discriminate: `--- FAIL`
+for Go, the summary line for vitest, `ℹ fail` plus the exit code for `node --test`.
+This is the same lesson as the `--- PASS` population trap in `CLAUDE.md`, arriving
+through test NAMES instead of through subtest indentation.
 
 **The `~30 min` above is left as written, deliberately, and here are the measurements
 against it.** *(Two samples, both on one machine, both reaching the final banner and the
