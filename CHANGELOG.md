@@ -54,7 +54,7 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
   unreachable function that existed was deleted rather than baselined. `web` and
   `agent` use knip, which gates unused files and dependencies at zero while
   reporting unused *exports* without failing the build; burning that tier down
-  is tracked separately. Neither tool sees a dead *branch*, which stays a review
+  is tracked as issue #206. Neither tool sees a dead *branch*, which stays a review
   question. Part of PRD #103; no new CI jobs. Developer-facing only: no change to
   how uzi behaves. **Existing checkouts need `npm install --ignore-scripts` in
   *both* `web/` and `agent/`** before `task gate:web` / `task gate:agent` will

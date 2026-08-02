@@ -60,7 +60,7 @@
   // for a warn tier it is inert. PRD #103 Decision 4 and M4's brief both offered it
   // as "a regression budget meanwhile"; it is not one, and the PRD is amended to say
   // so. The export tier therefore genuinely gates nothing until it is burned down
-  // and promoted -- tracked as a follow-up issue, not left implicit.
+  // and promoted -- tracked as issue #206, not left implicit.
   "rules": {
     // ERROR: zero findings today, so these gate at zero from day one.
     "files": "error",

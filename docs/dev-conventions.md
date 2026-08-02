@@ -35,12 +35,18 @@ already uses for `sqlc@v1.30.0`.
 
 ```sh
 task gate              # everything, serially
-task gate:api          # one component: fmt-check + vet + build + test
+task gate:api          # one component: fmt-check + vet + build + lint + deadcode + test
 task gate:controller   # same shape
-task gate:web          # check-docs + typecheck + test
-task gate:agent
+task gate:web          # lint + deadcode + check-docs + typecheck + test
+task gate:agent        # lint + deadcode + typecheck + test
 task fmt-check         # the format slot alone, both Go modules
+task lint              # the lint slot alone, all four components
+task deadcode          # the dead-code slot alone, all four components
 ```
+
+*(The three `gate:*` comments above were written before PRD #103 M3 and M4 and
+listed neither `lint` nor `deadcode`. Corrected 2026-08-02 with M4; the slots
+themselves are described further down this page.)*
 
 Individual slots exist too (`task test:api`, `task typecheck:web`,
 `task check-docs:web`, …), and `.gitlab-ci.yml` calls those fine-grained targets
@@ -171,7 +177,7 @@ and gate at zero. The **unused-export family is `warn`: printed in full on every
 run and setting no exit code** — 22 findings on `web` and 53 on `agent` as of
 2026-08-02. So a green `task deadcode:web` means no *gating* tier fired, not
 "no unused exports". Burning that tier down and promoting it to `error` is
-tracked separately; `--max-issues` is not a stopgap for it, because it counts
+tracked as issue #206; `--max-issues` is not a stopgap for it, because it counts
 error-severity issues only.
 
 **Neither tool sees a dead *branch*.** `deadcode` finds unreachable functions and

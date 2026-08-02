@@ -920,7 +920,7 @@ tasks:
       # unused FILES and DEPENDENCIES gate at zero. `--max-issues` is NOT a fallback
       # for the warn tier - measured, it counts error-severity issues only and exits
       # 0 with the warn findings printed. Burning the export tier down and promoting
-      # it to `error` is a follow-up issue, not this milestone.
+      # it to `error` is issue #206, not this milestone.
       #
       # 🔴 AND NEVER ADD `--fix`. knip's fix mode edits files in the repo (it strips
       # `export` keywords, and with --allow-remove-files deletes files). Nothing in

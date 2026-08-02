@@ -426,7 +426,7 @@ finding list, and blocking the gate until that list is zero is not an option.
 > both are corrected in place. The real options for gating unused exports
 > before the burn-down finishes are a diff-wrapper, promoting `exports` to
 > `error` with an `ignore` list, or accepting a reported-only tier. **M4 shipped
-> the third**, and filed the burn-down as a follow-up issue with its counts
+> the third**, and filed the burn-down as **issue #206** with its counts
 > (web 22, agent 53, 2026-08-02) so that "a warning nobody must act on" does not
 > become the end state by default.
 >
@@ -1412,8 +1412,8 @@ which previously prescribed only the fail-open form.
       >   `namespaceMembers` at `warn` — **reported on every run, gating
       >   nothing** — with `files`/`dependencies`/`devDependencies`/`unlisted`/
       >   `binaries`/`unresolved`/`duplicates` and the catalog pair at `error`,
-      >   gating at zero. The export burn-down (web 22, agent 53) is a
-      >   **follow-up issue**, not this milestone.
+      >   gating at zero. The export burn-down (web 22, agent 53) is
+      >   **issue #206**, not this milestone.
       > - **The wrapper was not the milestone.** `deadcode -test ./...` finds 1
       >   in `api` and 0 in `controller`. The function was deleted, both
       >   baselines ship **empty**, and both Go modules gate at **zero**. The
@@ -1668,7 +1668,7 @@ Three exceptions where "append at the end" is not enough:
    > now MET and demonstrated** (`probes/prd-103-m4-calibration.txt`): an
    > exported dead function gives `task lint:api` "0 issues." and
    > `task deadcode:api` a nonzero exit naming the symbol. The **unused-TS-export
-   > half is deliberately NOT met** and is tracked as a follow-up issue with its
+   > half is deliberately NOT met** and is tracked as **issue #206** with its
    > counts, rather than closed by a mechanism that does not work.
    >
    > One thing the criterion does not say and should: **the Go arm must use an
