@@ -1281,8 +1281,8 @@ still reused. See `CLAUDE.md`'s api section for the full measurement.
 ## The pattern worth inheriting, above any individual finding
 
 *Migrated from `.claude/agent-team-tasks/prd-98-m3-checkpoint.md` (PRD #98, 2026-07-21)
-before that file dies — `.gitignore:27` ignores `agent-team-tasks/`, so nothing written there
-survives the worktree. None of this is PRD-98-specific.*
+before that file dies — `.gitignore`'s `.claude/agent-team-tasks/` entry ignores it, so
+nothing written there survives the worktree. None of this is PRD-98-specific.*
 
 **Every substantive correction on that branch was someone applying a rule its own author had
 stated and not applied to themselves.** Not carelessness — the rule-holder is simply not the
