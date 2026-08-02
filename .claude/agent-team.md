@@ -231,12 +231,20 @@ decides where the next person spends their time. Re-derive those too.
   fails silent, and the surrounding output still looks like success.** Use a real array
   (`combo=(g1 g2); for g in "${combo[@]}"`), and give any mutation loop a counter asserting the
   expected number of substitutions actually applied.
-- **DIRECTORY-WIDE `gofmt -w` IS A TRAP IN THIS REPO, BECAUSE `gofmt -l ./api` IS NOT EMPTY.**
-  `gofmt -w internal/<pkg>/` reformats that pre-existing drift and sweeps files
-  you never touched into your commit, under your commit message. Scope it to your own files, by
-  name. The check that matters is `comm -12` between `gofmt -l` and your commit's file list being
-  **empty** — deliberately not a count, per the `format` slot in Quality gates, where a tally has
-  already produced one truncated-view error.
+- **RETIRED 2026-08-02 by PRD #103 M2 — the directory-wide-`gofmt -w` rule that stood here.**
+  It said a `gofmt -w internal/<pkg>/` sweeps pre-existing drift into your commit under your
+  commit message, because `gofmt -l ./api` was not empty, and it prescribed `comm -12` between
+  `gofmt -l` and your commit's file list as the check. M2's first commit cleared that drift (a
+  closed, dated measurement rather than a live tally: `gofmt -l ./api` listed 16 files at
+  `755861e8` under go1.26.5, and `./controller` was already empty), and its second added
+  `task fmt-check` — run first inside `gate:api` / `gate:controller` and first in CI's
+  `validate:api` / `validate:controller` — so there is nothing left for a directory-wide
+  `gofmt -w` to sweep, and any new drift reddens the gate rather than riding along in silence.
+  **The `comm -12` idiom is retired with it, twice over**: an intersection against an
+  always-empty set is a check that can never fail, and measured, the two sides do not even share
+  a path shape (a `dir:`-carrying target prints `internal/…`, `git diff --name-only` prints
+  `api/internal/…`), so it returned empty regardless of what it was fed. The count ban it cited
+  was sound; its evidence is preserved as a dated note in the `format` slot below.
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
@@ -1135,13 +1143,21 @@ it buffers, which under CI's `interruptible: true` means a cancelled job loses e
 line it had produced.
 
 ```
-format         none (gap)          # gofmt -l ./api reports pre-existing drift; run it
-                                   # for the current list. Do NOT record a count here:
-                                   # it read 26, then 25, and a stale tally invites the
-                                   # truncated-view error it already caused (a filtered
-                                   # 4-file view reported as the whole list, 2026-07-25).
-                                   # The check that matters is `comm -12` between
-                                   # gofmt -l and your commit's file list being EMPTY.
+format         task fmt-check      # gofmt -l over both Go modules; fails on drift and
+                                   # NAMES the files, module-relative (internal/...).
+                                   # Also runs FIRST inside gate:api / gate:controller
+                                   # and first in CI's validate:api / validate:controller,
+                                   # so a component gate already covers this slot.
+                                   # (Corrected 2026-08-02 by PRD #103 M2: this slot read
+                                   # `none (gap)` and told you gofmt -l ./api reports
+                                   # pre-existing drift. M2 cleared it and gated it, so
+                                   # that instruction now sends you looking for drift that
+                                   # does not exist. Its count ban was real and is kept as
+                                   # history: the tally read 26, then 25, and a filtered
+                                   # 4-file view was once reported as the whole list,
+                                   # 2026-07-25. The `comm -12` idiom it prescribed is
+                                   # retired -- with no pre-existing drift left, an
+                                   # intersection against an empty set can never fail.)
 lint           none (gap)          # no golangci-lint, no eslint. `go vet` runs inside
                                    # task gate:api / gate:controller and in CI, but a
                                    # vet is not a lint slot. (Was "go vet in CI only";

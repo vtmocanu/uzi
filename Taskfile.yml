@@ -133,15 +133,21 @@ tasks:
       - task: gate:agent
 
   gate:api:
-    desc: api - vet, build, test
+    desc: api - fmt-check, vet, build, test
     cmds:
+      # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
+      # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
+      # 48.7s for this whole gate, so a coder learns about a misformat in the first
+      # fifth of a second instead of after test:api's -race compile.
+      - task: fmt-check:api
       - task: vet:api
       - task: build:api
       - task: test:api
 
   gate:controller:
-    desc: controller - vet, build, test
+    desc: controller - fmt-check, vet, build, test
     cmds:
+      - task: fmt-check:controller
       - task: vet:controller
       - task: build:controller
       - task: test:controller
@@ -159,7 +165,75 @@ tasks:
       - task: typecheck:agent
       - task: test:agent
 
+  fmt-check:
+    # COMPOSES THE TWO PER-MODULE TARGETS; IT DOES NOT RE-SCOPE THEM. There must
+    # never be a root-scoped `gofmt -l .` in this file. A repo-root walk descends
+    # into dot-directories, and `.go_job` sets GOPATH=$CI_PROJECT_DIR/.go and
+    # GOCACHE=$CI_PROJECT_DIR/.gocache and runs `go mod download` before any script
+    # line - so in CI a root-scoped gofmt would traverse the populated module cache
+    # and red the gate on third-party source. Neither directory is in .gitignore,
+    # so nothing else would catch it.
+    desc: gofmt -l over both Go modules
+    cmds:
+      - task: fmt-check:api
+      - task: fmt-check:controller
+
   # ------------------------------------------------------------- api (Go) -----
+  fmt-check:api:
+    desc: gofmt -l over the api module (fails on drift, naming the files)
+    dir: api
+    cmds:
+      # 🔴 DO NOT SIMPLIFY THIS LINE TO `test -z "$(gofmt -l .)"`. It reads as the
+      # tidier spelling of the same check and it is not the same check. Measured
+      # 2026-08-02 on task 3.51.1 under `output: prefixed`, first by the lead and
+      # then independently reproduced before this target shipped:
+      #
+      #   tree                  form               task rc   stdout
+      #   drifted               assignment (below) 201       NAMES THE FILES
+      #   drifted               test -z "$(...)"   201       empty
+      #   a Go file that does   assignment (below) 201       the parse errors
+      #     not parse           test -z "$(...)"   0 GREEN   the parse errors
+      #
+      # Two independent reasons, and the second is the one the PRD did not have:
+      #
+      # 1. `gofmt -l` EXITS 0 WHETHER OR NOT IT LISTS ANYTHING (CLAUDE.md documents
+      #    this trap), so the gate must be on the OUTPUT, not the exit code. Both
+      #    forms get that right - but `test -z` SWALLOWS THE FILENAMES, and a gate
+      #    that reddens without naming the file is not the gate PRD #103 SC8 asks
+      #    for (a control that produces no output is not a control).
+      # 2. `test -z "$(...)"` FAILS OPEN ON A GO FILE THAT DOES NOT PARSE. gofmt
+      #    exits 2 and writes to stderr, so `$(…)` captures nothing and `test -z`
+      #    is TRUE. Under Task's errexit shell an ASSIGNMENT whose command
+      #    substitution fails aborts the script, while a substitution inside a
+      #    SIMPLE COMMAND does not - that POSIX distinction is the entire
+      #    difference. And because `output: prefixed` puts a recipe's stderr on
+      #    Task's stdout, the green run PRINTS the parse errors: visible-and-
+      #    ignored, which is worse than silent, because the error text reads as
+      #    the gate having done its job.
+      #
+      # Also forbidden here, all three for reasons above or in this file's header:
+      # no `{{.CLI_ARGS}}` (the splicing ban, and it would let a caller narrow the
+      # gate's scope); no `xargs`/`gofmt -d $out` "improvement" that unquotes the
+      # filename list; and no `vars: {DRIFT: {sh: gofmt -l api}}` + `test -z
+      # "{{.DRIFT}}"`, which is a banned dynamic root var AND splices shell output
+      # through text/template into `sh -c`.
+      #
+      # NO `sources:` ON THIS TARGET (header ban 1). A `**/*.go` fingerprint is
+      # MORE defensible here than anywhere else in this file - gofmt reads nothing
+      # across the module boundary, so the cross-module blind spot the header
+      # argues does not apply - and it is still wrong, for a reason specific to
+      # this check: A CHECKSUM OVER THE INPUTS CANNOT SEE THE GOFMT BINARY CHANGE.
+      # It would serve a stale green across exactly the toolchain bump most likely
+      # to introduce new drift. Reproduced by the auditor: a `sources:`-carrying
+      # fmt-check printed `up to date`, exited 0 and executed nothing.
+      #
+      # THE NAME IS `fmt-check`, NEVER `fmt`. `.claude/agents/tester.md` instructs
+      # testers to refuse a slot whose command looks like a fixing variant, `gofmt
+      # -w` and "a bare `fmt` target" named explicitly - so a target called `fmt`
+      # would be declined by the role that is supposed to run it. Do not tidy the
+      # suffix away.
+      - 'out="$(gofmt -l .)"; [ -z "$out" ] || { echo "$out"; exit 1; }'
+
   vet:api:
     desc: go vet over the api module
     dir: api
@@ -233,6 +307,17 @@ tasks:
       - go test -race -count=1 ./...
 
   # ------------------------------------------------------ controller (Go) -----
+  fmt-check:controller:
+    desc: gofmt -l over the controller module (fails on drift, naming the files)
+    dir: controller
+    cmds:
+      # Same recipe, same bans, same reasons - read fmt-check:api's comment before
+      # editing either. This module was ALREADY gofmt-clean when PRD #103 M2 landed
+      # (measured 2026-08-02 at 755861e8, go1.26.5: `gofmt -l ./controller` empty
+      # while ./api listed 16 files); the target exists to keep it that way. It
+      # ships with an empty backlog, which is not the same thing as a no-op.
+      - 'out="$(gofmt -l .)"; [ -z "$out" ] || { echo "$out"; exit 1; }'
+
   vet:controller:
     desc: go vet over the controller module
     dir: controller

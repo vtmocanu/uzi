@@ -66,11 +66,16 @@ own leak detector), never by inference from the dev host's green run.
 
 ## For this repo (uzi)
 
-Gate slots here are: **format `none (gap)`, lint `none (gap)`, dead code
-`none (gap)`, coverage `none (gap)`** — this repo has no linter or format check
-yet (PRD #103 builds them), so "run every slot" currently means vet + build +
-typecheck + test, which is what `task gate` runs. Do not go hunting for a lint
-command; there isn't one.
+Gate slots here are: **format `task fmt-check`, lint `none (gap)`, dead code
+`none (gap)`, coverage `none (gap)`** — this repo has no linter yet (PRD #103 M3
+builds one), so "run every slot" means fmt-check + vet + build + typecheck +
+test, which is what `task gate` runs. Do not go hunting for a lint command;
+there isn't one. `fmt-check:api` / `fmt-check:controller` run FIRST inside
+`gate:api` / `gate:controller`, so a component gate already covers the format
+slot; `task fmt-check` runs just that slot over both Go modules. It fails on any
+`gofmt` drift and names the files, module-relative (`internal/…`). *(PRD #103 M2,
+2026-08-02: this paragraph read "no linter or format check yet" and put `format`
+at `none (gap)`. M2 cleared the drift under `api/` and added the gate.)*
 
 **Every gate recipe lives in root `Taskfile.yml` and nowhere else** (PRD #103 M1);
 `task --list` enumerates it. Gates before reporting done: `task gate:api`

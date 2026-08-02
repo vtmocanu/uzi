@@ -35,10 +35,11 @@ already uses for `sqlc@v1.30.0`.
 
 ```sh
 task gate              # everything, serially
-task gate:api          # one component: vet + build + test
-task gate:controller
+task gate:api          # one component: fmt-check + vet + build + test
+task gate:controller   # same shape
 task gate:web          # check-docs + typecheck + test
 task gate:agent
+task fmt-check         # the format slot alone, both Go modules
 ```
 
 Individual slots exist too (`task test:api`, `task typecheck:web`,
@@ -73,9 +74,21 @@ The Taskfile installs nothing — no `npm ci`, no `go mod download`. Your
 `node_modules` and module cache are expected to exist; CI does that in its
 `before_script`.
 
-There is no linter, no format check, no dead-code check and no coverage signal
-yet. That is PRD #103's remaining milestones, and a target for each arrives with
-the check itself rather than as an empty stub.
+**The format check is `task fmt-check`** (`gofmt -l` over both Go modules, added
+by PRD #103 M2). It runs first inside `task gate:api` and `task gate:controller`,
+and first in CI's `validate:api` and `validate:controller`, because it costs
+fractions of a second and a misformat should surface before the `-race` compile.
+It fails on any drift and prints the offending files, module-relative
+(`internal/…`, not `api/internal/…`, because the targets carry `dir:`). Two
+things about it are deliberate and easy to undo by accident: the recipe assigns
+`gofmt -l`'s output to a variable rather than testing it inline, because the
+inline form both swallows the filenames and goes **green** on a Go file that does
+not parse; and the target is named `fmt-check` rather than `fmt` because nothing
+in the gate may be a fixing variant. Both reasons are written beside the recipe.
+
+There is no linter, no dead-code check and no coverage signal yet. That is
+PRD #103's remaining milestones, and a target for each arrives with the check
+itself rather than as an empty stub.
 
 ## Scripting the bot setup with `glab`
 

@@ -6,6 +6,17 @@ file is not bumped per-commit; `[Unreleased]` collects everything since the last
 
 ## [Unreleased]
 
+### Changed
+
+- **Contributor tooling: both Go modules are now `gofmt`-clean and a format check
+  runs in the gate.** `task fmt-check` fails on any formatting drift and names the
+  files; it also runs first inside `task gate:api` / `task gate:controller` and
+  first in CI's `validate:api` / `validate:controller`, so drift is caught on every
+  MR instead of accumulating. Part of the developer-loop quality-gate work in
+  PRD #103, which also moved every gate recipe into the root `Taskfile.yml`.
+  Developer-facing only: no change to how uzi behaves.
+  See [docs/dev-conventions.md](docs/dev-conventions.md).
+
 ### Fixed
 
 - **The run page's token counts were low, by 2.5x on output and up to 229x on

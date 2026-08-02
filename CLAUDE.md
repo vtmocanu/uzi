@@ -77,7 +77,8 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ### api (Go, chi + pgx + sqlc + goose)
 
 ```sh
-task gate:api                              # vet + build + test — NOT all tests, see live-DB note below
+task gate:api                              # fmt-check + vet + build + test — NOT all tests, see live-DB note below
+task fmt-check:api                         # the format slot alone (gofmt -l, names the drifted files)
 task test:api                              # the test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
 cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
@@ -158,6 +159,8 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 
 **`gofmt -l` EXITS 0 WHETHER OR NOT IT LISTS ANYTHING, so `gofmt -l <file> && echo "drift"` fires unconditionally and reports drift that does not exist.** Measure the *output* (`gofmt -l` printing nothing, `gofmt -d | wc -c` = 0), never the exit code. Same family as the classic "`$?` after a pipe reads the last command, not yours" caution, arriving through `&&` instead of a pipe — worth noting as such, because someone careful about the pipe form still walks into the `&&` form.
 
+**AND THE FORM THAT FIXES THAT ONE HAS ITS OWN, OPPOSITE FAILURE: `test -z "$(gofmt -l .)"` FAILS OPEN ON A GO FILE THAT DOES NOT PARSE.** Same exit-0 property, arriving from the other side. `gofmt` exits 2 and writes to stderr, so the command substitution captures nothing, `test -z` is trivially true, and the gate is **green on a tree holding a file that does not compile**. Reproduced three times independently on 2026-08-02, `task` 3.51.1, against `func broken( {` — by the reviewer, by the lead, and by the tester on a calibration built outside the repo — all three getting the same pair: the `test -z` form exits **0**, the assignment form exits **201** (`exit status 2`). Two details make it worse than the `&&` trap above. **The gate PRINTS the parse error and passes anyway**: under `output: prefixed` gofmt's stderr lands on Task's stdout, so a log skim shows error text beside a green job, and visible-and-ignored beats silent for producing a wrong conclusion — the error text reads as the gate having done its job. **And the fix is a shell subtlety, not a flag**: under errexit an *assignment* whose command substitution fails aborts the script, while a substitution inside a *simple command* does not. That POSIX distinction is the entire difference, which is exactly why the working form reads as a stylistic choice and gets "simplified" back by anyone who does not know. The form this repo ships, with both reasons written beside it, is `Taskfile.yml`'s `fmt-check:api` target — do not re-derive it here.
+
 **THREE GATE-STATUS REPORTS FAILED IN THE REASSURING DIRECTION IN ONE SESSION, AND THE THIRD DEFEATS THE OBVIOUS FIX.** Measured 2026-07-28 (PRD #175) by two agents. Filed here as the reporting-shaped sibling of the `gofmt` trap above, but it is **not api-only** — one of the three is the npm half:
 
 1. `go build && go vet ./... && go test ...; echo "[api green]"` — the `;` prints unconditionally. `go vet` died on a merge-conflict marker, the `&&` chain stopped, `go test` **never ran**, and the echo reported green over a suite that had not executed.
@@ -227,7 +230,8 @@ cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   
 ### controller (Go, hosted-worker controller — a SECOND, SEPARATE Go module)
 
 ```sh
-task gate:controller                       # vet + build + test
+task gate:controller                       # fmt-check + vet + build + test
+task fmt-check:controller                  # the format slot alone; `task fmt-check` does both modules
 task test:controller                       # -count=1, see below
 task vet:controller                        # or build:controller, individually
 ```
