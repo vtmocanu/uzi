@@ -155,3 +155,22 @@ Both instances are the same shape and neither was a careless agent.
 - **The lead wrote the identical error into item 1 of this file** — the section warning about carried-through numbers — hours after criticising it in others, and inherited it from the same Taskfile comment.
 
 **The generalisable rule, which is not "measure more carefully":** when two agents disagree on a measured fact, do not pick the more credible agent. Ask which instrument could have produced the disconfirming answer, and re-derive it yourself. Both times here, the cheaper instrument agreed with the existing written claim — which is the direction that never gets re-checked.
+
+## 14. SWEEP WORKTREES WITH `git worktree list`, NEVER A SIBLING-DIRECTORY LISTING
+
+Appending a section to `specs/ai.md` requires the highest existing number **across every worktree**, since siblings carry unmerged sections. An `ls`-based sweep of sibling directories misses two classes that `git worktree list` shows:
+
+- **`.bare`'s own detached checkout** — inside the bare-clone directory, not a sibling.
+- **worktrees living outside the repo directory entirely** — e.g. a scratchpad tree.
+
+Measured 2026-08-02: `ls`-based enumeration found **15**; `git worktree list` reports **21**. The two answers happened to agree on the maximum that day, which is exactly the kind of luck that retires a method's reputation without retiring the method. **The gap was in the enumeration, not the result** — do not conclude from a matching answer that the cheaper instrument was sufficient.
+
+## 15. A "NO-OP" FLAG MAY BE A PROPERTY OF THE DATA RATHER THAN OF THE FLAG
+
+Item 1 records that on the shipped `goconst`-off config, `--max-issues-per-linter=0` alone changes nothing. **That is true of this finding distribution, not of the flag.** The two caps sit **in series** — the same-issues fold runs first, so the per-linter cap can only bite on what survives it. With `goconst` enabled, 1178 findings cannot survive a cap of 50 unscathed and the flag is decisive.
+
+This is item 1's own camouflage recurring **one level down, inside the correction to it**: `controller` reading the same either way taught three agents the caps did not matter, and then the shipped config reading the same either way taught the same lesson about one of the two flags.
+
+**The cheap discriminator, which needs no second run:** a linter coming to rest on **exactly 50** once the fold is lifted is the cap binding, not a finding total. `50` is `--max-issues-per-linter`'s default, and a real count landing on a round default is the tell.
+
+**And the discipline that goes with it:** when a measurement comes from a probe config that differs from the shipped one, do not import its figures into a document about the shipped config. Carry the direction, the mechanism and the discriminator; leave the numbers where they were measured. A family of figures from a `goconst`+`govet`-enabled probe was already mislabelled once as "M3's linter set".
