@@ -1180,14 +1180,33 @@ Decision 2), and nothing else here tells a cold-starting teammate to prefer them
 Reach for the full `task gate` before a release or when a change crosses components,
 and coordinate with the lead the way you would for e2e.
 
-**Read a gate's result by its DISCRIMINATING form, never a bare substring.** Measured
-on a fully green `task gate` log: `grep -c -F 'FAIL'` returned **9** and
-`grep -c -- '--- FAIL'` returned **0** — every one of the nine was a *passing* test
-whose NAME contains the substring (`✓ a FAILED /api/version reaches the fleet
-panel …`, `✔ … the liveness probe FAILS …`). The forms that discriminate: `--- FAIL`
-for Go, the summary line for vitest, `ℹ fail` plus the exit code for `node --test`.
+**Read a gate's result by its DISCRIMINATING form, never a bare substring.** A bare
+`grep -c -F 'FAIL'` over a fully green `task gate` log is non-zero, because some
+*passing* test's NAME contains the word (`✓ a FAILED /api/version reaches the fleet
+panel …`, `✔ … the liveness probe FAILS …`) — cite `grep -c -F 'FAIL' <log>` vs
+`grep -c -- '--- FAIL' <log>` on your own run rather than trusting a number recorded
+here, since the count of name-matches moves with whatever the tree happens to be
+called (measured 2026-08-02: 9 on one `task gate` log, 8 on another after a merge
+that only *added* tests — nothing broke, the tree's vocabulary changed). The forms
+that discriminate **within their own component**: `--- FAIL` for Go, the summary
+line for vitest, `ℹ fail` plus the exit code for `node --test`.
+
+**None of those three forms tells you the COMPOSITE gate's result, and trusting one
+to do so is the same defect in the other direction.** Measured 2026-08-02 across
+three real `task gate` logs, one of them genuinely red: the red run's `--- FAIL`
+count was **also 0**, because its actual failure (`batcher-poison`) was a
+`node --test` failure, and Go's format never appears in a `node --test` failure. The
+only thing distinguishing that red log from the two green ones was `Failed to run
+task` (1 vs 0) and the exit code. So each per-component form only says something
+about its OWN component — a component whose runner never ran contributes nothing
+to another component's pattern, silently — and reading any one of them as a verdict
+on the whole gate is exactly the kind of bare-tally trust this repo's own rules
+warn against. **The composite verdict is the exit code** (`task` exits 201 on any
+failure, per Decision 2 of PRD #103); use the per-component forms only to find
+*which* component failed and *which* test, never to decide pass/fail on their own.
 This is the same lesson as the `--- PASS` population trap in `CLAUDE.md`, arriving
-through test NAMES instead of through subtest indentation.
+through test NAMES and cross-component blindness instead of through subtest
+indentation.
 
 **The `~30 min` above is left as written, deliberately, and here are the measurements
 against it.** *(Two samples, both on one machine, both reaching the final banner and the
