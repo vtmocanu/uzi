@@ -20,6 +20,8 @@ Note `go install` builds **from source**, so the resulting binary is **not** byt
 
 **The gate lives in `Taskfile.yml` at the repo root and that is the only place a gate recipe is written** (PRD #103 M1). `task --list` enumerates it; `task gate` runs everything; `task gate:api` / `gate:controller` / `gate:web` / `gate:agent` run one component. `.gitlab-ci.yml`'s **per-toolchain** gate jobs invoke the same targets, so local and CI cannot drift apart (`test:api-store-it` invokes none, by design: its ran/skipped assertion is CI-specific). Every load-bearing flag now lives in that file with its reason beside it — Task echoes each command before running it, so `-race`, `-count=1` and `--test-timeout=30000` are still visible in the output, and that echo is how you notice one going missing.
 
+**🔴 ONE SLOT IS EXEMPT FROM THAT ECHO PROPERTY, AND IT IS THE NEWEST ONE.** PRD #103 M3 put the Go lint ratchet — `issues: {new-from-merge-base: origin/main, whole-files: true}` — in **`.golangci.yml`**, not on `lint:api`'s command line, so `task`'s echo shows only `go run …golangci-lint@v2.12.2 run ./...` and the sentence above does **not** cover it. Traded deliberately: the CLI form would need either a variable spliced into a `cmds:` line (banned in `Taskfile.yml`'s header) or a flag set in the CI job only, and the second makes local and CI disagree about what a finding *is*, which is the divergence Success Criterion 1 exists to prevent. **Read `.golangci.yml` rather than the gate's output** for that one. Two consequences you will meet before you meet the file: only findings your branch introduces block, and `whole-files` makes pre-existing findings in a file you merely *touched* block too. `task lint:api:all` / `lint:controller:all` print the unfiltered backlog and gate nothing. And if `origin/main` does not resolve, golangci-lint does **not** skip the ratchet — it reports the whole backlog behind one buried warning line, which reads as an enormous new regression; the targets carry a pre-flight that exits 2 saying exactly that, so `git fetch origin main` rather than starting a burn-down. *(The npm half needs none of this: oxlint is unratcheted, and its severity lives in each package's `.oxlintrc.json` plus the `-D correctness` in its `lint` script, which Task's echo also cannot show — it echoes `npm run lint`.)*
+
 Two consequences worth knowing before you read a result:
 
 - **`task`'s own exit code is 201, not the underlying command's** (measured on 3.51.1: a component exiting 7 surfaces as `task: Failed to run task "gate": … exit status 7` with rc=201). `!= 0` is still a correct failure test; anything comparing `$?` to a specific number is not. **But `!= 0` covers two distinct meanings: `201` means a target RAN AND FAILED, while a malformed `Taskfile.yml` exits `109` with nothing having executed** — and that failure is **loud and self-locating**, printing `task: Failed to parse Taskfile.yml:` followed by the YAML error and its line number. Measured 2026-08-02, `task` 3.51.1: a `desc:` written `gofmt -l over both Go modules (fail-fast: stops at the first module)` puts a bare `: ` inside a plain YAML scalar, which is illegal; `task --list`, `--list-all`, a named target and a bare `task` all return **109** and all name the file and the line you just edited. *(Corrected 2026-08-02, same day: this said **1**, and added that "every target vanishes at once, so it does not look like the edit that caused it". **Both halves were wrong, and the second inverts the truth** — nothing vanishes silently; `task` names the line. The `1` was never `task`'s at all: it came from `python3 -c "import yaml…" && task …; echo $?`, where the YAML library exits 1, the `&&` short-circuits, and **`task` never runs** — so a python exit code was reported as task's. That is reporting-failure form (1) from the gate-status entry below, committed inside an entry about reading an instrument's output correctly.)*
@@ -77,8 +79,10 @@ Note `./e2e/run-store-it.sh` names its own container `uzi-store-it-$$` — insid
 ### api (Go, chi + pgx + sqlc + goose)
 
 ```sh
-task gate:api                              # fmt-check + vet + build + test — NOT all tests, see live-DB note below
+task gate:api                              # fmt-check + vet + build + lint + test — NOT all tests, see live-DB note below
 task fmt-check:api                         # the format slot alone (gofmt -l, names the drifted files)
+task lint:api                              # the lint slot alone — RATCHETED, see .golangci.yml
+task lint:api:all                          # the UNFILTERED backlog (reported, never gating, not in `task gate`)
 task test:api                              # the test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
 cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
@@ -176,7 +180,8 @@ x/mod treats **all** invalid versions as equal, so an un-normalized compare retu
 ### web (Vite + React + TS)
 
 ```sh
-task gate:web                              # check-docs + typecheck + test
+task gate:web                              # lint + check-docs + typecheck + test
+task lint:web                              # the lint slot alone (oxlint; NOT ratcheted)
 task test:web                              # vitest run
 task typecheck:web                         # or check-docs:web, individually
 cd web && npx vitest run src/pages/Foo.test.tsx    # single file — no target
@@ -233,7 +238,8 @@ Two refinements measured here, because both forms of that slip are easy to mis-s
 ### agent (Node 22 + tsx, Claude Agent SDK worker)
 
 ```sh
-task gate:agent                            # typecheck + test
+task gate:agent                            # lint + typecheck + test
+task lint:agent                            # the lint slot alone (oxlint; NOT ratcheted)
 task test:agent                            # node --test via tsx
 task typecheck:agent
 cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   # single file — no target
@@ -254,8 +260,10 @@ cd agent && node --import tsx --test --test-timeout=30000 test/worker.test.ts   
 ### controller (Go, hosted-worker controller — a SECOND, SEPARATE Go module)
 
 ```sh
-task gate:controller                       # fmt-check + vet + build + test
+task gate:controller                       # fmt-check + vet + build + lint + test
 task fmt-check:controller                  # the format slot alone; `task fmt-check` does both modules
+task lint:controller                       # the lint slot alone — RATCHETED, see .golangci.yml
+task lint:controller:all                   # the UNFILTERED backlog; `task lint` does all four components
 task test:controller                       # -count=1, see below
 task vet:controller                        # or build:controller, individually
 ```
