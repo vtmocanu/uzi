@@ -16173,13 +16173,31 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   another, that each matches exactly once, and that none swallows a phrase from the 14-set.
   That last one is not hypothetical: round two's ordering pin had swallowed `send all
   allocated read-only validators together in one wave` whole, silently retiring it.
-- **What anchoring buys is SEMANTIC, and the relocation control has to be read accordingly.**
-  An anchored phrase relocated into the other bullet stays green **and that is correct** —
-  the phrase names its own turn, so the behaviour travels with the sentence and nothing is
-  lost. The blind case is the unanchored one, where the pin stays green and the behaviour
-  does not travel. The discriminating fold is therefore not "relocate it" but "revert the
-  original site to the un-anchored wording": measured, all three formerly-blind pins red on
-  that fold, while the relocate-the-whole-anchored-phrase control is green.
+- **What anchoring buys is SEMANTIC, and WHICH FOLD DISCRIMINATES DEPENDS ON WHAT THE PIN
+  CLAIMS.** For a **descriptive** pin — *the template states rule R* — a relocated sentence
+  still states R, so green is correct and relocation cannot produce a disconfirming answer
+  at all; **reversion** (put the original site back to its un-anchored wording) is the fold
+  that can. Measured: all three formerly-blind pins red on reversion, while relocating the
+  whole anchored phrase is green. For a pin about something the lead must do **at a
+  particular moment**, position is not packaging — position is the content, relocation
+  destroys the behaviour and creates a different one, and relocation stays required.
+  **This distinction was learned the expensive way: the tester and the auditor folded the
+  same mutation and reported opposite verdicts, and both results were right — only one
+  *referent* was.** The durable form, well past this issue: *when two agents fold the same
+  mutation and disagree, settle what each of them takes "the behaviour" to be before
+  deciding which result is correct.* The reviewer's one-glance version: a pin is
+  relocation-proof exactly when its behaviour is fully determined by its own content, so
+  look for a context-bound referent inside the phrase.
+  The relay pin had one — `tell **each of them** …`, whose referent came from the preceding
+  sentence, so relocated it silently re-resolved to the post-implementation validators while
+  the plan dispatch was told nothing. **A substring is position-independent by definition,
+  so no anchor could ever have expressed that.** The fix was to delete the referent: the
+  clause now names its recipients (`tell each validator you send over the plan …`), which
+  dissolves the case rather than mitigating it. Verified by folding, and the result is worth
+  stating precisely because it contradicts the fix's own acceptance test: relocating the
+  **rewritten** clause is now **green, correctly** — the recipients travel with the sentence
+  — while reverting it to the pronoun form reds. The round-4 brief asked for a red on
+  relocation; that expectation belonged to the pre-fix pin.
   Two corrections to how this was written down before, both of which had reached this
   section: the earlier claim that **overlapping spans buy relocation-detection is false** —
   `strings.Contains` is per-occurrence, so two overlapping pins can be satisfied by two
@@ -16198,6 +16216,21 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   wording — is the vacuous-negative trap this repo already documents. Recorded so that
   "anchoring closed relocation" is never read as "the pins are now sufficient": insertion
   is caught by reading the diff, by nothing here.
+  **The AUDIT has its own residual, one root with two consequences, and it is stated rather
+  than closed on purpose** — a known limit written up as a believed-closed property is the
+  one thing that would make this unshippable, because #205 then loses the evidence that
+  motivates it. Root: the audit is a **syntactic containment** check, and neither semantic
+  property it would need is expressible as a substring relation. **(a) Quality gap** — it
+  cannot check the anchor *names a turn*, only that the declared token is present; measured,
+  `anchor: ""` passes (`Contains(x, "")` is always true) and so does a vague token like
+  `again`. Applies to every pin, and a better-chosen anchor fixes any instance. A turn-token
+  allowlist was **rejected**: it catches the vague token, leaves (b) untouched, and goes
+  stale, so the audit would look stronger with the load-bearing hole in place. **(b)
+  Expressiveness gap** — it cannot check the behaviour is *anchorable at all*. Measured on
+  `dcf9d0f9`'s relay pin, which carried a genuine anchor and where nothing else was changed:
+  relocating that one clause left the pin and every audit assertion green over a template
+  whose plan-turn dispatch is told nothing. No anchor fixes that case; deleting the referent
+  does, which is why it is not a mitigation.
   **Region-scoping** (assert each phrase against its region of the template rather than the
   whole flattened body) closes relocation by construction and lets every phrase shrink, and
   it is deliberately a **follow-up, not part of this change** — user/lead decision on the
@@ -16239,12 +16272,14 @@ agent does cheaply. `architect` shipped already and nothing sequenced it before 
   re-planning turn**, not a revise turn: there are two distinct re-entry paths, and they
   are the two factors above — `buildRevisePlanPrompt` (`sdk-executor.ts:804`) for a
   rejected plan, and `buildPlanAfterAnswerPrompt` (`:1215`, inside `drivePlanningTurn`)
-  for an answered question. A clause naming only revisions removes the ×4 and leaves the
-  ×6, taking the ceiling from 24 to about 6 rather than to 1, so "one clause bounds it"
-  was an over-claim on the first version of this sentence and the clause was widened to
-  match.
+  for an answered question. The **rejected** phrasing, naming only revisions, removes the ×4
+  and leaves the ×6: ceiling 24 → about 6, which is why "one clause bounds it" was an
+  over-claim on the first version of this sentence. **The shipped phrasing names any
+  re-planning turn, so it covers both paths and takes the ceiling to about 1 full wave** —
+  the re-entries after it re-cite only what changed.
 - **`docs/agent-templates.md` was the fifth file, and the run brief missed it.** Its
-  `:58-61` restated the post-implementation-only ordering and its frontmatter is
+  `:58-61` **as of `480c1b02`** (a reader at HEAD lands on the replacement, which says the
+  opposite) restated the post-implementation-only ordering, and its frontmatter is
   `audience: user`, so it renders in-app at `/docs/agent-templates`: shipping without it
   would have left uzi's own docs telling users the opposite of what its lead does. Found
   independently by reviewer, architect and auditor. The gate widened accordingly to
