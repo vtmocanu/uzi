@@ -10,7 +10,12 @@ in public (estimated tokens-out for the whole run reads lower than confirmed
 tokens-out for one phase). Both [open questions](#open-questions) are now
 answered: the headline estimate is approved, and uzi cannot distinguish a
 subscription token today, so M2 gains one storage change to remember it.
-**M3 is blocked on [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**
+~~**M3 is blocked on [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**~~
+**UNBLOCKED 2026-08-02**: #195 landed. The strip and the per-phase table now fold
+`modelUsage` per model, pinned to the server's `run_usage` rollup from both sides by a
+recorded fixture (`fixtures/run-usage/`, `adr/0195-run-usage-per-model-fold.md`). The
+three-populations problem below is now a two-populations problem, and the two that remain
+are the ones M3 is designed to label.
 
 ## Problem
 
@@ -224,15 +229,21 @@ one screen at one moment:
 
 | Surface in the panel | Tokens in | Reads |
 |---|---|---|
-| Stat strip + per-phase table | **725.2k** | result frame's top-level `usage` |
+| Stat strip + per-phase table | ~~**725.2k**~~ → **2.32M** | ~~result frame's top-level `usage`~~ → `modelUsage`, per model |
 | Board / `uzi run list` / admin (not in the panel) | **2.32M** | `modelUsage` |
 | Per-agent breakdown | **78.15M** | raw assistant frames, whole run |
 
-108x between smallest and largest. The strip-vs-board gap is
-[#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195); the per-agent
-inflation is the frame-vs-call duplication M0 identified. The existing footnote
-("may not sum to the run total") attributes all of it to attribution, which is
-only partly true.
+*Captured at 10:57Z on run `84b6a933`, before #195. The first row is struck because
+#195 landed on 2026-08-02: the strip and the table now read the same population as the
+board and agree with it exactly, per model, on all four token columns plus cost. The
+measurement is left in place rather than deleted, because the design consequence below
+was derived from it.*
+
+The gap was 108x between smallest and largest, and closing #195 removes the strip-vs-board
+half of it. **What remains is the per-agent inflation** — the frame-vs-call duplication M0
+identified. The existing footnote ("may not sum to the run total") attributed all of it to
+attribution, which was only partly true then and is now the whole story for the one row
+still divergent.
 
 **The design consequence: each dollar figure owns a table.** Rather than one
 blended total, the panel pairs each figure with the breakdown that derives it —
@@ -517,13 +528,55 @@ above).
   passes against a split-blind implementation; (d) two models sum per-model and
   per-agent correctly; (e) an unpriced model yields a partial total plus a
   populated `unpricedModels` rather than a silently low number.
-- [ ] **M3 — Run-page panel. BLOCKED ON [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195).**
+- [ ] **M3 — Run-page panel. ~~BLOCKED ON [#195](https://gitlab.example.com/vtmocanu/uzi/-/issues/195)~~ — UNBLOCKED 2026-08-02, #195 landed.**
   That issue found, during this PRD's review, that the run page's existing token
   columns already read a different population from every rollup surface: the
-  client reads the result frame's top-level `usage` (`runUsage.ts:175`) while the
-  server folds only `modelUsage`, and on run `84b6a933` seq 173 they differ by
-  2.5-3.2x. Adding an estimate column on top would put three populations in one
-  panel with two of them mislabelled. Land #195 first.
+  client read the result frame's top-level `usage` while the
+  server folds only `modelUsage`, and on run `84b6a933` seq 173 they differed by
+  2.5-3.2x. Adding an estimate column on top would have put three populations in one
+  panel with two of them mislabelled.
+
+  **What #195 actually settled, and two things M3 should take from it.** The
+  divergence was worse than stated here: **229x on input**, not 2.5-3.2x, which was
+  the ratio on output and cache_read only. And the fix was not the one that issue
+  proposed — summing `modelUsage` per frame is insufficient, because a model can be
+  present in one result frame and absent from a later one while the server retains it
+  via `GREATEST`. The client now keeps a per-model running high-water mark per column.
+  See `adr/0195-run-usage-per-model-fold.md`.
+
+  Two consequences for M3's own design:
+  - `RunUsage` now exposes **`modelTotals`** (one row per model, four token columns
+    plus quantized cost). M3's per-model estimate column should consume that rather
+    than re-deriving a per-model split, and it is currently read only by tests.
+  - **PREREQUISITE: fix the mock fixtures before building the panel against them.**
+    Four defects, all in `web/src/mocks/{data,engine}.ts`, all surfaced during #195's
+    review by validators rather than by anyone reading the mocks:
+
+    1. **The two populations carry identical numbers.** Result frames emit
+       `usage: {input_tokens: 21_400, cache_read_input_tokens: 188_000, output_tokens:
+       6_100}` beside a `modelUsage` saying exactly the same. Real frames diverge 2.5x
+       to 229x. So mock mode **structurally cannot reproduce the divergence class**
+       #195 was about, and a demo build shows M3 nothing real.
+    2. **Every result frame has exactly one model key** (all five: `data.ts` ×3,
+       `engine.ts` ×2). So the **per-model** dimension is unexercised in a browser,
+       which is the dimension M3's per-model cost column is built on.
+    3. **The fixtures contradict themselves about models**: `modelUsage` names
+       `claude-sonnet-5` while the per-agent table for that same run shows the run used
+       `claude-opus-4-8` **and** `claude-sonnet-5`.
+    4. **`engine.ts`'s turns read as cumulative when they are not.** Its second result
+       frame goes 9 → 61, which looks like a running total; real `num_turns` is
+       per-invocation, settled against the live DB (several runs go 13 → 2, and a
+       cumulative counter cannot decrease). **This one already cost us**: the browser
+       validator read the panel's "70 turns" against a declared 61, correctly concluded
+       something was double-counted, and filed a should-fix against `deriveRunUsage`.
+       There was no bug — the fixture manufactured it. web-ux suggests `num_turns: 52`
+       for that frame; treat that as its inference about the author's intent, not as
+       established.
+
+    **The fix is fixture data only**: one mock run with two model keys, a genuinely low
+    top-level `usage`, per-agent models consistent with `modelUsage`, and unambiguous
+    per-invocation turns. Do it first, or M3's cost column gets designed, demoed and
+    reviewed against data that cannot exhibit the conditions it must handle.
   Estimate-led figure with confirmed beneath it,
   panel renders before the first result frame, per-model and per-agent estimate
   columns, explicit not-priced state, the `:262-264` footnote retired, mock
