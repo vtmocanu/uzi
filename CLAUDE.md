@@ -409,7 +409,26 @@ It is a trap in the shape of a precaution: the escape a careful person adds to m
 
 **A FRESH INSTANCE, 2026-08-02, and the circumstance is the part worth recording: it happened to someone writing the commit that documents a grep instrument defect.** Verifying a cross-reference before committing, a non-`-F` grep for the literal `grep -c '^--- PASS'` returned **0** against this very file, where the literal was present **six** times at that moment — seven once this paragraph was written, a count invalidated by the act of recording it, which is Decision 10's point arriving in miniature. The pattern carries `^` and `---`, so it was read as a regex; `-F` returned the right answer immediately. The failure was *silent and in the reassuring direction* — a 0 reads as "that text is not there", which would have justified deleting a correct cross-reference. Nothing about knowing the rule prevented it: the check being run was itself a rigour step, which is exactly when a wrong instrument is least likely to be doubted. Same shape as the four-for-four ROLES finding in `.claude/agent-team.md`: holding a rule and applying it to yourself are separate skills.
 
-**The rule that survives every case above, needs no taxonomy, and does not depend on which grep is installed: use `-F` when you mean a literal.** And **verify restores with `git status`/`git diff`, not with a grep count** — not because grep miscounts, but because a literal count only tells you something if you already know how many occurrences ought to exist. The VCS does not require you to know that, which is exactly why it is the right instrument for "is the tree back where it was".
+**EVERY CASE ABOVE IS ABOUT A PATTERN MATCHING WRONGLY. THIS ONE IS ABOUT A FILE NEVER BEING READ, AND IT IS THE ONE THAT DEFEATS THE SWEEP THIS FILE MANDATES BY NAME.** Measured 2026-08-02 (PRD #103 M2), ugrep 7.5.0, on `.claude/agent-team-tasks/prd-103-m2.md`:
+
+```
+git ls-files --error-unmatch <file>       rc=0, TRACKED
+grep -rl -F 'gitleaks:allow' .            NOT found        <- 2 occurrences are in there
+grep -rl -F --hidden ...                  NOT found        <- the obvious fix does NOTHING
+grep -rl -F --no-ignore-files ...         found
+grep -c -F ... <file>                     2                <- named directly, it reads fine
+git grep -F ... -- <file>                 2                <- index-aware, finds it
+```
+
+**The file is TRACKED and simultaneously invisible to every recursive sweep.** Those two facts feel mutually exclusive and are not: git tracks it because it was force-added, and `grep` skips it because ugrep honours ignore files by default and the directory is still ignored. **"It is in git, so a sweep will find it" is the natural inference and it is false.** Three teeth:
+
+- **`--hidden` is the wrong axis** and is exactly the flag a careful person reaches for. The path is not hidden-in-the-sense-that-matters; it is *ignored*. The flag runs, changes nothing, and you conclude the file genuinely lacks the string.
+- **Plain `git check-ignore` FAILS OPEN on a tracked file** — silent, rc=1, i.e. "not ignored". So the natural way to diagnose this returns the reassuring answer. `git check-ignore -v --no-index` is required and names `.gitignore:44` instantly.
+- **It defeats the retire-a-string sweep.** The copy-change rule above says to grep the OLD string across the tree; a retired string surviving only in an ignored-but-tracked path is unreachable that way, and **the sweep reports clean**. Same shape as a vacuous negative assertion, arriving through file selection instead of through the assertion.
+
+**Use `git grep` when the question is about tracked content** — it reads the index, so ignored-but-tracked files are in scope by construction and no flag has to be remembered. Reach for `--no-ignore-files` only when you specifically need untracked files too. And the self-reference is the part worth remembering: **the file this hides is the spec for the milestone that found it.**
+
+**The rule that survives every case above, needs no taxonomy, and does not depend on which grep is installed: use `-F` when you mean a literal** — and, from the entry immediately above, **`git grep` when you mean tracked content**. And **verify restores with `git status`/`git diff`, not with a grep count** — not because grep miscounts, but because a literal count only tells you something if you already know how many occurrences ought to exist. The VCS does not require you to know that, which is exactly why it is the right instrument for "is the tree back where it was".
 
 ## Architecture
 
