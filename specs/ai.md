@@ -16063,3 +16063,98 @@ milestone measured — the form that fixes it going green on a non-parsing file 
 it. `api/internal/agenttmpl/builtins/tester.md` is deliberately **not** among the ten: it is
 product template content, decoupled from `.claude/agents/` (§Conventions), and a `gofmt` grep
 surfaces it looking editable.
+
+## 467. Issue #197 — the plan critique is a PROPERTY OF THE PLAN anchored on `submit_plan`, and it supersedes §190's read-only ordering
+
+**Supersedes §190 on one point and one only.** §190 records, in the present tense, that
+read-only work fans out "after an implementation unit lands". That is now the SECOND of two
+waves rather than the only one. Everything else §190 states stands unchanged: the
+allocation-agnostic wave, package/module-level disjointness, the explicit non-overlapping
+file scope per implementer, and the integrate-then-commit-then-gate sequence.
+
+The defect, found by dogfooding on issue #195: no reviewer, auditor or tester ever saw a
+plan, so a wrong plan was discovered only once it had been built. The approval gate does not
+close it — a human approving a plan does not go and read the migration to check whether the
+mechanism the plan asserts is the mechanism in the code, which is exactly what a read-only
+agent does cheaply. `architect` shipped already and nothing sequenced it before the coder.
+
+- **Rule shape: a property of the PLAN, not a procedural step** (user decision, 2026-08-02).
+  Before `submit_plan`, every mechanism the plan asserts must name the file that implements
+  it and quote the line; the read-only wave is the MEANS of getting those citations rather
+  than a separate ritual. Rejected: the skills-repo wording *"for anything beyond a small
+  fix, dispatch a DESIGN-CRITIQUE wave"*, whose skip predicate is graded by the same lead
+  whose plan is being critiqued. The property makes cost scale with the number of mechanisms
+  asserted — a one-line change asserts one and costs nothing extra, **with no rule skipped** —
+  and makes a deficient plan legible to the human at the gate, which is the gap the issue
+  opens with.
+- **Placement is the PLAN turn, and the reason is a ROSTER ASYMMETRY, not the argument above.**
+  The two phases do not run the same set. The plan turn runs the owner's own assembled roster
+  (`sdk-executor.ts:495` `agents: assembled.subagents`, guard `:512`
+  `preToolUse(ownSubagentNames)`); implement turns are REBUILT at the gate boundary from the
+  human's selection (`:901`, `:906`), and an absent selection resolves to source `repo`
+  whenever the clone carries a roster — the executor's own comment says so at `:602-605`,
+  in a passage correcting an earlier version of itself. So in the first implement turn the
+  critique agents may not exist at all. Second reason, same direction: a repo-sourced roster
+  cannot reach the plan turn, so a plan-time wave always runs uzi's own reviewed builtins.
+- **Anchor: `submit_plan`; `lead.md` alone, and NO `prompt.ts` change.** The system prompt is
+  phase-agnostic — the lead reads the identical sentence in the plan turn and in every
+  implement turn — so relative wording ("before the implementer") is unresolvable there.
+  `submit_plan` locates its own phase, is already named in the guardrail append
+  (`prompt.ts:44`), and all three plan prompts end with it (`:559` issue, `:783`
+  self-improve, `:907`/`:913` ci_fix). Note `delegatesLine` has **four** call sites, not the
+  two the run brief first claimed: `:546`, `:621`, `:778`, `:901`, while
+  `buildRevisePlanPrompt` (`:664`) has none. A `prompt.ts` line would state the rule twice
+  and pull `gate:agent` into the gate for no new capability.
+- **Three things the dispatch must carry, each mechanical, none of them flavour.** (a) The
+  artifact is the PLAN TEXT, not a diff: `reviewer.md:43-44`, `auditor.md:36-37` and
+  `tester.md:89-90` each tell their agent to surface missing context rather than guess and
+  to wait for re-delegation, so an unqualified dispatch returns bounce-backs instead of
+  citations and is worse than no wave. Editing those three bodies was rejected as the wrong
+  lever: it triples the scope and puts three more pin sets in play. (b) Report-only:
+  `architect.md:4` and `tester.md:4` both declare `Edit, Write`, `agents.ts` honours a
+  template's `tools` list verbatim, and the path hook only JAILS writes to the worktree
+  rather than denying them (`guardrails.ts:757`). A plan-turn write is an uncommitted change
+  the human never saw, which the first implement commit then sweeps in — it weakens the
+  APPROVAL GATE, not a guardrail layer. (c) Any bar is stated over the plan the lead
+  produced, never over the issue: `buildPlanPrompt` carries only the issue title and
+  description, which `UNTRUSTED_FRAME` (`prompt.ts:18`) declares attacker-controlled, and
+  there is no label or effort field — so "beyond a small fix" would be a predicate computed
+  from hostile text.
+- **Structure: a separate short paragraph above the bullet list, not a sixth bullet.** The
+  list encodes one contract (*what fans out in parallel*); the citation property is a
+  different axis (*what the plan must contain before `submit_plan`*). Mixing them in one list
+  is what let the auditor's mutant reuse a single clause for both meanings.
+- **The pins had to DISCRIMINATE — adding one would not have been enough.** Measured on the
+  pre-change tree (`480c1b02`): `always fans out`, `after an implementation unit lands` and
+  `Read-only work` each appeared **0 times** in `render_test.go`, so the ordering this issue
+  is about was entirely unpinned. The auditor's mutant deleted the post-implementation
+  ordering, replaced it with a plan-time wave reusing the pinned clause `send all allocated
+  read-only validators together in one wave`, and **all 14 pins stayed green** (control:
+  mutating one pinned phrase reds exactly 1 of 14, so the harness does discriminate). Those
+  14 are therefore kept **unedited** — the pinned clause excludes the prefix, so rewording
+  the prefix keeps it true — and `TestLeadPlanCritiquePhrases` adds six pins no single
+  sentence can satisfy for both meanings: one on the retained post-implementation ordering,
+  five on the plan-time property. The control was run **per behaviour, never as a tally**:
+  deleting each of the six from `lead.md` one at a time reddens exactly its own case, on
+  disjoint sets, with all three `TestLead*` tests present as `=== RUN` in every mutated run
+  (so no case was a compile error reading as silence) and the template restored from a `cp`
+  backup, never `git checkout --`. The first ordering fold capitalised the surviving clause
+  and reddened two cases; that was a defect in the fold, not an overlap in the pins, and it
+  is recorded because a control that reddens more than its own case is exactly as suspect as
+  one that reddens nothing.
+- **Reach: correct, fully gated, merged — and INERT on every install that has booted once.**
+  `queries/agent_templates.sql:74` is `ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING`,
+  and `store/agent_templates_builtins.go` states it in prose: an existing row, builtin or
+  admin-edited, is never overwritten. The only recovery is the admin-only, per-template,
+  verbatim **Reset to default**, which `CHANGELOG.md` now says in an operator note. A
+  propagation mechanism for builtin updates (schema + reconcile + UI, plus a policy question
+  about overriding admin customizations) and the missing `version:` field on `builtins/*.md`
+  (0 of 11) are the real fix and are filed separately — user decision 2026-08-02 was to ship
+  #197 small.
+- **`docs/agent-templates.md` was the fifth file, and the run brief missed it.** Its
+  `:58-61` restated the post-implementation-only ordering and its frontmatter is
+  `audience: user`, so it renders in-app at `/docs/agent-templates`: shipping without it
+  would have left uzi's own docs telling users the opposite of what its lead does. Found
+  independently by reviewer, architect and auditor. The gate widened accordingly to
+  `task gate:api` **and** `task gate:web` (the doc edit runs under `check-docs:web`), not
+  `task gate`.
