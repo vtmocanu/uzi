@@ -169,7 +169,12 @@ format         task fmt-check      # gofmt -l over both Go modules; fails on dri
                                    # NAMES the files, module-relative (internal/...), not
                                    # repo-root-relative. It is a CHECK, never a fixing
                                    # variant -- that is why it is not called `fmt`.
-                                   # Runs FIRST inside gate:api / gate:controller too.
+                                   # FAIL-FAST: with drift in both modules it stops at
+                                   # the api half and never reaches the controller one.
+                                   # What runs FIRST inside gate:api / gate:controller is
+                                   # the PER-MODULE fmt-check:api / fmt-check:controller,
+                                   # not this composite -- so gating a component already
+                                   # covers this slot for that component.
                                    # (Corrected 2026-08-02 by PRD #103 M2, which cleared
                                    # the drift under api/ and added this target. This line
                                    # read `none (gap)` and said gofmt -l ./api reports

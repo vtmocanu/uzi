@@ -75,16 +75,23 @@ The Taskfile installs nothing — no `npm ci`, no `go mod download`. Your
 `before_script`.
 
 **The format check is `task fmt-check`** (`gofmt -l` over both Go modules, added
-by PRD #103 M2). It runs first inside `task gate:api` and `task gate:controller`,
-and first in CI's `validate:api` and `validate:controller`, because it costs
-fractions of a second and a misformat should surface before the `-race` compile.
+by PRD #103 M2). It is a composite, and it is the per-module `fmt-check:api` and
+`fmt-check:controller` that run first inside `task gate:api` and
+`task gate:controller`, and first in CI's `validate:api` and `validate:controller`
+— they go first because they cost fractions of a second and a misformat should
+surface before the `-race` compile. The composite is fail-fast like every other
+composed target here: with drift in both modules it stops at the api half rather
+than reporting both.
+
 It fails on any drift and prints the offending files, module-relative
-(`internal/…`, not `api/internal/…`, because the targets carry `dir:`). Two
-things about it are deliberate and easy to undo by accident: the recipe assigns
+(`internal/…`, not `api/internal/…`, because the targets carry `dir:`). Three
+things about the recipe are deliberate and easy to undo by accident. It assigns
 `gofmt -l`'s output to a variable rather than testing it inline, because the
 inline form both swallows the filenames and goes **green** on a Go file that does
-not parse; and the target is named `fmt-check` rather than `fmt` because nothing
-in the gate may be a fixing variant. Both reasons are written beside the recipe.
+not parse. It carries an explicit `|| exit 1` on that assignment, so the
+fail-closed behaviour lives in the line rather than in Task's errexit shell.
+And it is named `fmt-check` rather than `fmt` because nothing in the gate may be
+a fixing variant. All three reasons are written beside the recipe.
 
 There is no linter, no dead-code check and no coverage signal yet. That is
 PRD #103's remaining milestones, and a target for each arrives with the check

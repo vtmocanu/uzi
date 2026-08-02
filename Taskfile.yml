@@ -173,7 +173,14 @@ tasks:
     # line - so in CI a root-scoped gofmt would traverse the populated module cache
     # and red the gate on third-party source. Neither directory is in .gitignore,
     # so nothing else would catch it.
-    desc: gofmt -l over both Go modules
+    #
+    # FAIL-FAST, NOT A COMBINED REPORT, consistent with `gate` and every other
+    # composed target here. Measured with drift in BOTH modules: this dies at
+    # fmt-check:api and fmt-check:controller never runs, so one invocation does
+    # not enumerate both modules. `desc:` says "over both Go modules" and that is
+    # the SCOPE, not a promise of a single combined listing. CI is unaffected -
+    # validate:api and validate:controller report independently.
+    desc: gofmt -l over both Go modules, fail-fast at the first drifted one
     cmds:
       - task: fmt-check:api
       - task: fmt-check:controller
@@ -211,6 +218,29 @@ tasks:
       #    ignored, which is worse than silent, because the error text reads as
       #    the gate having done its job.
       #
+      # THE `|| exit 1` IS THE WHOLE GUARANTEE, AND IT IS THERE SO THIS RECIPE
+      # DOES NOT DEPEND ON TASK'S SHELL. Reason 2 above is a statement about
+      # ERREXIT, not about this line: Task runs its recipes errexit, so the bare
+      # assignment already aborts. Measured 2026-08-02, same tree, one non-parsing
+      # file, gofmt exiting 2 --
+      #
+      #   sh -c   'out="$(gofmt -l .)"; ...'            rc=0   <- FAILS OPEN
+      #   sh -ec  'out="$(gofmt -l .)"; ...'            rc=2
+      #   sh -c   'out="$(gofmt -l .)" || exit 1; ...'  rc=1   <- intrinsic
+      #
+      # -- so the bare form's correctness lives in the shell's configuration while
+      # the comment above reads as though the recipe were guarded. `|| exit 1`
+      # moves the property into the line, where it survives a future `set +e`, a
+      # shell swap, or this recipe being copied somewhere with neither.
+      #
+      # ONE MEASURED SUBTLETY, BECAUSE IT INVERTS THE INTUITION: the fail-open
+      # window is exactly a tree with NO OTHER DRIFT. gofmt still LISTS every
+      # other misformatted file while erroring on the unparseable one, so on the
+      # 16-file drifted tree this milestone started from, the bare form under
+      # `sh -c` returned 1 and looked fine. Clearing the drift is what arms the
+      # hole. THE GATE'S OWN SUCCESS IS THE PRECONDITION FOR ITS FAILURE MODE,
+      # which is why this cannot be left to be noticed later.
+      #
       # Also forbidden here, all three for reasons above or in this file's header:
       # no `{{.CLI_ARGS}}` (the splicing ban, and it would let a caller narrow the
       # gate's scope); no `xargs`/`gofmt -d $out` "improvement" that unquotes the
@@ -232,7 +262,7 @@ tasks:
       # -w` and "a bare `fmt` target" named explicitly - so a target called `fmt`
       # would be declined by the role that is supposed to run it. Do not tidy the
       # suffix away.
-      - 'out="$(gofmt -l .)"; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      - 'out="$(gofmt -l .)" || exit 1; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:api:
     desc: go vet over the api module
@@ -316,7 +346,7 @@ tasks:
       # (measured 2026-08-02 at 755861e8, go1.26.5: `gofmt -l ./controller` empty
       # while ./api listed 16 files); the target exists to keep it that way. It
       # ships with an empty backlog, which is not the same thing as a no-op.
-      - 'out="$(gofmt -l .)"; [ -z "$out" ] || { echo "$out"; exit 1; }'
+      - 'out="$(gofmt -l .)" || exit 1; [ -z "$out" ] || { echo "$out"; exit 1; }'
 
   vet:controller:
     desc: go vet over the controller module

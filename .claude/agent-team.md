@@ -236,15 +236,28 @@ decides where the next person spends their time. Re-derive those too.
   commit message, because `gofmt -l ./api` was not empty, and it prescribed `comm -12` between
   `gofmt -l` and your commit's file list as the check. M2's first commit cleared that drift (a
   closed, dated measurement rather than a live tally: `gofmt -l ./api` listed 16 files at
-  `755861e8` under go1.26.5, and `./controller` was already empty), and its second added
-  `task fmt-check` — run first inside `gate:api` / `gate:controller` and first in CI's
-  `validate:api` / `validate:controller` — so there is nothing left for a directory-wide
-  `gofmt -w` to sweep, and any new drift reddens the gate rather than riding along in silence.
-  **The `comm -12` idiom is retired with it, twice over**: an intersection against an
-  always-empty set is a check that can never fail, and measured, the two sides do not even share
-  a path shape (a `dir:`-carrying target prints `internal/…`, `git diff --name-only` prints
-  `api/internal/…`), so it returned empty regardless of what it was fed. The count ban it cited
-  was sound; its evidence is preserved as a dated note in the `format` slot below.
+  `755861e8` under go1.26.5, and `./controller` was already empty), and its second added the
+  `fmt-check:api` / `fmt-check:controller` targets — run first inside `gate:api` /
+  `gate:controller` and first in CI's `validate:api` / `validate:controller` — so there is
+  nothing left for a directory-wide `gofmt -w` to sweep, and any new drift reddens the gate
+  rather than riding along in silence.
+  **The `comm -12` idiom is retired with it, for one reason and one only**: after commit 1 there
+  is no pre-existing drift, so the intersection is empty BY CONSTRUCTION and the check can never
+  fail. **The idiom itself worked and is not what is being retired here** — measured at
+  `755861e8`, `gofmt -l ./api` from the repo root and `git diff --name-only` against commit 1
+  both list the same 16 `api/internal/…` paths and `comm -12` returns all **16**. Do not rebuild
+  it against the new target either: a `dir:`-carrying target prints `internal/…` while
+  `git diff --name-only` prints `api/internal/…`, so a naive rewrite would return empty
+  regardless of input. The count ban it cited was sound; its evidence is preserved as a dated
+  note in the `format` slot below.
+  *(Corrected 2026-08-02, same day, one commit later: this bullet first said the idiom died
+  "twice over" and that the path shapes never matched, "so it returned empty regardless of what
+  it was fed" — labelled **measured** and false. The mismatch is a property of the NEW target,
+  which did not exist when the idiom was written; the idiom's left side was `gofmt -l ./api`
+  from the repo root, the same shape as its right side. A conditional warning about a rewrite
+  became an unconditional past-tense claim, in the one document about not trusting unverified
+  claims, and it retroactively defamed a check that worked. `cd37e182`'s commit message carries
+  the same false sentence and cannot be fixed there.)*
 - **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
   `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
   skipping in CI, silently, since they were written.** Check tests *ran*, not
@@ -1145,9 +1158,13 @@ line it had produced.
 ```
 format         task fmt-check      # gofmt -l over both Go modules; fails on drift and
                                    # NAMES the files, module-relative (internal/...).
-                                   # Also runs FIRST inside gate:api / gate:controller
-                                   # and first in CI's validate:api / validate:controller,
-                                   # so a component gate already covers this slot.
+                                   # It is FAIL-FAST: with drift in both modules it stops
+                                   # at the api half and never reaches the controller one.
+                                   # What runs first inside gate:api / gate:controller and
+                                   # first in CI's validate:api / validate:controller is
+                                   # the PER-MODULE fmt-check:api / fmt-check:controller,
+                                   # not this composite -- so a component gate already
+                                   # covers this slot for the component it gates.
                                    # (Corrected 2026-08-02 by PRD #103 M2: this slot read
                                    # `none (gap)` and told you gofmt -l ./api reports
                                    # pre-existing drift. M2 cleared it and gated it, so
